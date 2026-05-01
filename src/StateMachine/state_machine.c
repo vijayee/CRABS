@@ -3,6 +3,7 @@
 //
 
 #include "state_machine.h"
+#include "../Trigger/trigger.h"
 #include "../Util/allocator.h"
 #include <string.h>
 #include <stdlib.h>
@@ -55,7 +56,11 @@ bool operation_is_builtin(const char* type) {
           strcmp(type, CRABS_OP_UNLOCK) == 0 ||
           strcmp(type, CRABS_OP_FORCE_UNLOCK) == 0 ||
           strcmp(type, CRABS_OP_REFRESH_KEY) == 0 ||
-          strcmp(type, CRABS_OP_CHANGE_CONFIG) == 0);
+          strcmp(type, CRABS_OP_CHANGE_CONFIG) == 0 ||
+          strcmp(type, CRABS_OP_CREATE_TRIGGER) == 0 ||
+          strcmp(type, CRABS_OP_DELETE_TRIGGER) == 0 ||
+          strcmp(type, CRABS_OP_DISABLE_TRIGGER) == 0 ||
+          strcmp(type, CRABS_OP_ENABLE_TRIGGER) == 0);
 }
 
 operation_t* operation_create(const char* type) {
@@ -246,6 +251,14 @@ crabs_error_e state_machine_execute(state_t* state, operation_t* op) {
     result = state_machine_op_force_unlock(state, op);
   } else if (strcmp(op->type, CRABS_OP_CHANGE_CONFIG) == 0) {
     result = state_machine_op_change_config(state, op);
+  } else if (strcmp(op->type, CRABS_OP_CREATE_TRIGGER) == 0) {
+    result = state_machine_op_create_trigger(state, op);
+  } else if (strcmp(op->type, CRABS_OP_DELETE_TRIGGER) == 0) {
+    result = state_machine_op_delete_trigger(state, op);
+  } else if (strcmp(op->type, CRABS_OP_DISABLE_TRIGGER) == 0) {
+    result = state_machine_op_disable_trigger(state, op);
+  } else if (strcmp(op->type, CRABS_OP_ENABLE_TRIGGER) == 0) {
+    result = state_machine_op_enable_trigger(state, op);
   } else {
     result = CRABS_ERR_INVALID_PARAM;
   }
@@ -262,6 +275,12 @@ crabs_error_e state_machine_execute(state_t* state, operation_t* op) {
 
   // Record for idempotency
   record_processed_op(state, op->uuid);
+
+  // Step 9: Process triggers (Amendment 1, §5.2)
+  if (state->triggers != NULL && state->trigger_count > 0) {
+    uint64_t trigger_now_ms = (uint64_t)time(NULL) * 1000;
+    trigger_process_all(state, state->triggers, state->trigger_count, NULL, trigger_now_ms);
+  }
 
   return CRABS_SUCCESS;
 }

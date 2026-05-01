@@ -9,6 +9,9 @@
 #include <stdbool.h>
 #include "crabs.h"
 
+// Forward declaration (defined in Trigger/trigger.h)
+typedef struct trigger_t trigger_t;
+
 // ============================================================
 // Data Types (§5.1)
 // ============================================================
@@ -155,6 +158,8 @@ typedef struct state_t {
   machine_config_t config;
   uint8_t(*processed_ops)[CRABS_UUID_SIZE];
   uint64_t        processed_op_count;
+  trigger_t*      triggers;
+  uint32_t        trigger_count;
 } state_t;
 
 // ============================================================

@@ -3,6 +3,7 @@
 //
 
 #include "data_model.h"
+#include "../Trigger/trigger.h"
 #include "../Util/allocator.h"
 #include <string.h>
 #include <stdlib.h>
@@ -51,6 +52,8 @@ state_t* state_create(void) {
   state->log_count = 0;
   state->processed_ops = NULL;
   state->processed_op_count = 0;
+  state->triggers = NULL;
+  state->trigger_count = 0;
   state->config.max_lock_duration_ms = CRABS_DEFAULT_LOCK_MS;
   state->config.max_lock_extensions = CRABS_MAX_LOCK_EXTENDS;
   state->config.allow_force_unlock = true;
@@ -69,6 +72,14 @@ void state_destroy(state_t* state) {
   if (state->policies != NULL) free(state->policies);
   if (state->log != NULL) free(state->log);
   if (state->processed_ops != NULL) free(state->processed_ops);
+  if (state->triggers != NULL) {
+    for (uint32_t i = 0; i < state->trigger_count; i++) {
+      if (state->triggers[i].condition_ast != NULL) {
+        condition_node_destroy(state->triggers[i].condition_ast);
+      }
+    }
+    free(state->triggers);
+  }
   free(state);
 }
 

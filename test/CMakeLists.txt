@@ -20,6 +20,7 @@ if (BUILD_TESTING)
         test_serialization.cpp
         test_attribute_machine.cpp
         test_condition.cpp
+        test_trigger.cpp
     )
 
     add_dependencies(testcrabs crabs)

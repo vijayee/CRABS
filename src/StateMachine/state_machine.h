@@ -9,6 +9,7 @@
 #include <stdbool.h>
 #include "../CRABS/crabs.h"
 #include "../CRABS/data_model.h"
+#include "../Trigger/trigger.h"
 
 // ============================================================
 // Lock Claim (§7.2)
@@ -66,6 +67,12 @@ crabs_error_e  state_machine_op_rollback(state_t* state, operation_t* op);
 crabs_error_e  state_machine_op_unlock(state_t* state, operation_t* op);
 crabs_error_e  state_machine_op_force_unlock(state_t* state, operation_t* op);
 crabs_error_e  state_machine_op_change_config(state_t* state, operation_t* op);
+
+// Built-in trigger operations (Amendment 1, §4)
+crabs_error_e  state_machine_op_create_trigger(state_t* state, operation_t* op);
+crabs_error_e  state_machine_op_delete_trigger(state_t* state, operation_t* op);
+crabs_error_e  state_machine_op_disable_trigger(state_t* state, operation_t* op);
+crabs_error_e  state_machine_op_enable_trigger(state_t* state, operation_t* op);
 
 // Operation lifecycle
 operation_t*   operation_create(const char* type);

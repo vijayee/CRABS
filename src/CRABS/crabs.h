@@ -74,4 +74,10 @@ typedef enum {
 #define CRABS_OP_REFRESH_KEY   "__refresh_abe_key__"
 #define CRABS_OP_CHANGE_CONFIG "__change_config__"
 
+// Built-in Trigger Operations (Amendment 1, §4)
+#define CRABS_OP_CREATE_TRIGGER  "__create_trigger__"
+#define CRABS_OP_DELETE_TRIGGER  "__delete_trigger__"
+#define CRABS_OP_DISABLE_TRIGGER "__disable_trigger__"
+#define CRABS_OP_ENABLE_TRIGGER  "__enable_trigger__"
+
 #endif // CRABS_CRABS_H
