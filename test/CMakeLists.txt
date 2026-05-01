@@ -23,6 +23,7 @@ if (BUILD_TESTING)
         test_trigger.cpp
         test_integration.cpp
         test_data_model.cpp
+        test_protocol_ops.cpp
         test_cli.cpp
     )
 
