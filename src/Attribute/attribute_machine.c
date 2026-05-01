@@ -142,6 +142,9 @@ void attribute_machine_destroy(attribute_machine_t* am) {
       temp = next_temp;
     }
 
+    // Free keyring linked list
+    user_key_destroy_all(user);
+
     free(user);
     user = next_user;
   }
@@ -506,4 +509,138 @@ uint32_t attribute_machine_prune_expired_temporary(attribute_machine_t* am) {
   }
 
   return total_pruned;
+}
+
+// ============================================================
+// Key Ring Operations (v1.3 Amendment 3, §4.1)
+// ============================================================
+
+user_key_t* user_key_find(user_t* user, const char* key_id) {
+  if (user == NULL || key_id == NULL) return NULL;
+  user_key_t* key = user->keys;
+  while (key != NULL) {
+    if (strcmp(key->key_id, key_id) == 0) return key;
+    key = key->next;
+  }
+  return NULL;
+}
+
+user_key_t* user_key_find_active(user_t* user, signature_scheme_e scheme) {
+  if (user == NULL) return NULL;
+  user_key_t* key = user->keys;
+  while (key != NULL) {
+    if (key->is_active && key->scheme == scheme) return key;
+    key = key->next;
+  }
+  return NULL;
+}
+
+crabs_error_e user_key_register(user_t* user, const char* key_id,
+                                 signature_scheme_e scheme,
+                                 const uint8_t* public_key, uint32_t public_key_len,
+                                 const char* label) {
+  if (user == NULL || key_id == NULL || public_key == NULL || public_key_len == 0) {
+    return CRABS_ERR_INVALID_PARAM;
+  }
+  if (public_key_len > CRABS_MAX_PUBLIC_KEY) {
+    return CRABS_ERR_INVALID_PARAM;
+  }
+  if (scheme == SCHEME_UNSPECIFIED) {
+    return CRABS_ERR_INVALID_PARAM;
+  }
+  if (user->key_count >= CRABS_MAX_KEYS_PER_USER) {
+    return CRABS_ERR_INVALID_PARAM;
+  }
+  // Check for duplicate key_id
+  if (user_key_find(user, key_id) != NULL) {
+    return CRABS_ERR_DUPLICATE_OPERATION;
+  }
+
+  user_key_t* key = get_clear_memory(sizeof(user_key_t));
+  if (key == NULL) return CRABS_ERR_OOM;
+
+  strncpy(key->key_id, key_id, CRABS_MAX_KEY_ID - 1);
+  key->scheme = scheme;
+  memcpy(key->public_key, public_key, public_key_len);
+  key->public_key_len = public_key_len;
+  if (label != NULL) {
+    strncpy(key->label, label, CRABS_MAX_KEY_LABEL - 1);
+  }
+  key->is_active = true;
+  key->registered_at = 0;  // Caller should set if needed
+  key->last_used_at = 0;
+
+  // Prepend to linked list
+  key->next = user->keys;
+  user->keys = key;
+  user->key_count++;
+
+  // Set as default if this is the first key
+  if (user->default_key_id[0] == '\0') {
+    strncpy(user->default_key_id, key_id, CRABS_MAX_KEY_ID - 1);
+  }
+
+  return CRABS_SUCCESS;
+}
+
+crabs_error_e user_key_revoke(user_t* user, const char* key_id) {
+  if (user == NULL || key_id == NULL) return CRABS_ERR_INVALID_PARAM;
+  user_key_t* key = user_key_find(user, key_id);
+  if (key == NULL) return CRABS_ERR_RESOURCE_NOT_FOUND;
+
+  key->is_active = false;
+  user->key_version++;
+
+  // Count remaining active keys and find a replacement default if needed
+  uint32_t active_count = 0;
+  user_key_t* replacement = NULL;
+  user_key_t* iter = user->keys;
+  while (iter != NULL) {
+    if (iter->is_active) {
+      active_count++;
+      if (replacement == NULL && strcmp(iter->key_id, key_id) != 0) {
+        replacement = iter;
+      }
+    }
+    iter = iter->next;
+  }
+
+  // If this was the default key, transition to a replacement
+  if (strcmp(user->default_key_id, key_id) == 0) {
+    if (replacement != NULL) {
+      strncpy(user->default_key_id, replacement->key_id, CRABS_MAX_KEY_ID - 1);
+    } else {
+      user->default_key_id[0] = '\0';
+    }
+  }
+
+  // If no active keys remain, suspend the user
+  if (active_count == 0) {
+    user->status = USER_SUSPENDED;
+  }
+
+  return CRABS_SUCCESS;
+}
+
+crabs_error_e user_key_set_default(user_t* user, const char* key_id) {
+  if (user == NULL || key_id == NULL) return CRABS_ERR_INVALID_PARAM;
+  user_key_t* key = user_key_find(user, key_id);
+  if (key == NULL) return CRABS_ERR_RESOURCE_NOT_FOUND;
+  if (!key->is_active) return CRABS_ERR_INVALID_PARAM;
+
+  strncpy(user->default_key_id, key_id, CRABS_MAX_KEY_ID - 1);
+  return CRABS_SUCCESS;
+}
+
+void user_key_destroy_all(user_t* user) {
+  if (user == NULL) return;
+  user_key_t* key = user->keys;
+  while (key != NULL) {
+    user_key_t* next = key->next;
+    free(key);
+    key = next;
+  }
+  user->keys = NULL;
+  user->key_count = 0;
+  user->default_key_id[0] = '\0';
 }

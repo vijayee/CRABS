@@ -80,6 +80,7 @@ void operation_destroy(operation_t* op) {
   if (op->required_state != NULL) free(op->required_state);
   if (op->next_state != NULL) free(op->next_state);
   if (op->lock_claims != NULL) free(op->lock_claims);
+  if (op->co_signers != NULL) free(op->co_signers);
   free(op);
 }
 

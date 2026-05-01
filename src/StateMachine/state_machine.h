@@ -10,6 +10,7 @@
 #include "../CRABS/crabs.h"
 #include "../CRABS/data_model.h"
 #include "../Trigger/trigger.h"
+#include "../Crypto/sig_scheme.h"
 
 // ============================================================
 // Lock Claim (§7.2)
@@ -20,7 +21,20 @@ typedef struct {
 } lock_claim_t;
 
 // ============================================================
-// Operation (§7.1)
+// Co-Signature (v1.3 Amendment 3, §4.2)
+// ============================================================
+#define CRABS_MAX_CO_SIGNERS  8
+
+typedef struct {
+  char               signer_id[CRABS_MAX_USER_ID];
+  char               key_id[CRABS_MAX_KEY_ID];
+  signature_scheme_e  sig_scheme;
+  uint8_t            signature[CRABS_SIG_SIZE];
+  uint32_t           signature_len;
+} co_signature_t;
+
+// ============================================================
+// Operation (§7.1 + v1.3 §4.2)
 // ============================================================
 typedef struct {
   char     type[CRABS_MAX_OP_NAME];
@@ -40,6 +54,11 @@ typedef struct {
   uint64_t signer_key_version;
   uint64_t lamport_time;
   char     node_id[CRABS_MAX_USER_ID];
+  // v1.3: Scheme-aware signing
+  signature_scheme_e sig_scheme;
+  char               key_id[CRABS_MAX_KEY_ID];
+  co_signature_t*    co_signers;
+  uint32_t           co_signer_count;
 } operation_t;
 
 // ============================================================

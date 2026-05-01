@@ -9,6 +9,7 @@
 #include <stdbool.h>
 #include "../CRABS/crabs.h"
 #include "../CRABS/data_model.h"
+#include "../Crypto/sig_scheme.h"
 
 // ============================================================
 // User Status (§8.2)
@@ -41,18 +42,42 @@ typedef struct temp_attr_list_t {
 } temp_attr_list_t;
 
 // ============================================================
-// User Record (§8.2)
+// User Key (v1.3 Amendment 3, §4.1)
+// ============================================================
+#define CRABS_MAX_KEY_ID       64
+#define CRABS_MAX_KEY_LABEL    128
+#define CRABS_MAX_PUBLIC_KEY   512   // Max public key size across all schemes
+#define CRABS_MAX_KEYS_PER_USER 8
+
+typedef struct user_key_t {
+  char                  key_id[CRABS_MAX_KEY_ID];
+  signature_scheme_e    scheme;
+  uint8_t               public_key[CRABS_MAX_PUBLIC_KEY];
+  uint32_t              public_key_len;
+  char                  label[CRABS_MAX_KEY_LABEL];
+  uint64_t              registered_at;
+  uint64_t              last_used_at;
+  bool                  is_active;
+  struct user_key_t*    next;
+} user_key_t;
+
+// ============================================================
+// User Record (§8.2 + v1.3 §4.1)
 // ============================================================
 typedef struct user_t {
   char               user_id[CRABS_MAX_USER_ID];
   attribute_value_t  attributes[CRABS_MAX_ATTRIBUTES];
   uint32_t           attribute_count;
-  uint8_t            public_key[33];  // ECDSA compressed public key
+  uint8_t            public_key[33];  // Legacy ECDSA key (backward compat)
   user_status_e      status;
   uint64_t           key_version;
   uint64_t           created_at;
   uint64_t           updated_at;
-  temp_attr_list_t*  temp_attrs;  // Linked list of temporary attributes
+  temp_attr_list_t*  temp_attrs;
+  // v1.3: Multi-key support
+  user_key_t*        keys;                    // Linked list of registered keys
+  char               default_key_id[CRABS_MAX_KEY_ID]; // Default signing key
+  uint32_t           key_count;
   struct user_t*     next;
 } user_t;
 
@@ -104,5 +129,18 @@ crabs_error_e attribute_machine_issue_temporary(attribute_machine_t* am, const c
                                                   const char* value, const char* role,
                                                   uint64_t duration_ms);
 uint32_t      attribute_machine_prune_expired_temporary(attribute_machine_t* am);
+
+// ============================================================
+// Key Ring Operations (v1.3 Amendment 3, §4.1)
+// ============================================================
+user_key_t*   user_key_find(user_t* user, const char* key_id);
+user_key_t*   user_key_find_active(user_t* user, signature_scheme_e scheme);
+crabs_error_e user_key_register(user_t* user, const char* key_id,
+                                 signature_scheme_e scheme,
+                                 const uint8_t* public_key, uint32_t public_key_len,
+                                 const char* label);
+crabs_error_e user_key_revoke(user_t* user, const char* key_id);
+crabs_error_e user_key_set_default(user_t* user, const char* key_id);
+void          user_key_destroy_all(user_t* user);
 
 #endif // CRABS_ATTRIBUTE_MACHINE_H

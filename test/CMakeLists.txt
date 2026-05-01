@@ -28,6 +28,7 @@ if (BUILD_TESTING)
         test_crdt_extended.cpp
         test_trigger_contains.cpp
         test_sig_scheme.cpp
+        test_keyring.cpp
         test_cli.cpp
     )
 
