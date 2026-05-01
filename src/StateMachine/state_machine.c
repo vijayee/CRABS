@@ -5,6 +5,7 @@
 #include "state_machine.h"
 #include "../Trigger/trigger.h"
 #include "../Crypto/crypto.h"
+#include "../Crypto/sig_scheme.h"
 #include "../Attribute/attribute_machine.h"
 #include "../Condition/condition.h"
 #include "../Serialization/serialization.h"
@@ -277,10 +278,21 @@ crabs_error_e state_machine_execute(state_t* state, operation_t* op) {
       return CRABS_ERR_CRYPTOGRAPHIC_ERROR;
     }
 
-    verify_result_t vr = crypto_verify_operation_auth(
-        mk, pp.abe_policy, state->attr_machine,
-        ser->data, ser->len,
-        op->signature, op->signer_id, mode);
+    verify_result_t vr;
+    if (op->sig_scheme != SCHEME_UNSPECIFIED || op->key_id[0] != '\0') {
+      // v1.3: Scheme-aware verification
+      vr = crypto_verify_operation_auth_v2(
+          mk, pp.abe_policy, state->attr_machine,
+          ser->data, ser->len,
+          op->signature, CRABS_SIG_SIZE,
+          op->signer_id, op->key_id, op->sig_scheme, mode);
+    } else {
+      // Legacy ECDSA verification
+      vr = crypto_verify_operation_auth(
+          mk, pp.abe_policy, state->attr_machine,
+          ser->data, ser->len,
+          op->signature, op->signer_id, mode);
+    }
 
     crypto_abe_master_key_destroy(mk);
     serialized_buffer_destroy(ser);

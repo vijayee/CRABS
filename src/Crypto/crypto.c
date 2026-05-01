@@ -3,6 +3,7 @@
 //
 
 #include "crypto.h"
+#include "sig_scheme.h"
 #include "../Util/allocator.h"
 #include <openssl/ec.h>
 #include <openssl/ecdsa.h>
@@ -828,6 +829,185 @@ verify_result_t crypto_verify_operation_auth(
               strncpy(result.signer_id, user->user_id, CRABS_MAX_USER_ID - 1);
               return result;
             }
+          }
+        }
+      }
+      user = user->next;
+    }
+
+    result.error = CRABS_ERR_UNAUTHORIZED;
+  }
+
+  return result;
+}
+
+// ============================================================
+// Scheme-Aware Signature Verification (v1.3 §6)
+// ============================================================
+
+static crabs_error_e _verify_sig_with_scheme(
+    signature_scheme_e scheme,
+    const uint8_t* pk, uint32_t pk_len,
+    const uint8_t* msg, uint32_t msg_len,
+    const uint8_t* sig, uint32_t sig_len) {
+  if (scheme == SCHEME_UNSPECIFIED) {
+    // Legacy ECDSA path: fixed 33-byte public key, 64-byte signature
+    if (pk_len != 33 || sig_len != CRABS_SIG_SIZE) {
+      return CRABS_ERR_CRYPTOGRAPHIC_ERROR;
+    }
+    return crypto_ecdsa_verify(pk, msg, msg_len, sig) ? CRABS_SUCCESS : CRABS_ERR_CRYPTOGRAPHIC_ERROR;
+  }
+
+  // Dispatch through vtable registry
+  const signature_vtable_t* vt = crypto_sig_scheme_get(scheme);
+  if (vt == NULL || vt->verify == NULL) {
+    return CRABS_ERR_CRYPTOGRAPHIC_ERROR;
+  }
+  return vt->verify(pk, pk_len, msg, msg_len, sig, sig_len);
+}
+
+static crabs_error_e _verify_user_signature(
+    const user_t* user,
+    const char* key_id,
+    signature_scheme_e sig_scheme,
+    const uint8_t* serialized_op, size_t op_len,
+    const uint8_t* signature, uint32_t signature_len) {
+  if (sig_scheme == SCHEME_UNSPECIFIED && (key_id == NULL || key_id[0] == '\0')) {
+    // Legacy path: use user's default ECDSA key
+    return _verify_sig_with_scheme(SCHEME_UNSPECIFIED,
+                                    user->public_key, 33,
+                                    serialized_op, (uint32_t)op_len,
+                                    signature, signature_len);
+  }
+
+  // v1.3 path: resolve key from user's keyring
+  if (key_id != NULL && key_id[0] != '\0') {
+    user_key_t* key = user_key_find((user_t*)user, key_id);
+    if (key == NULL) return CRABS_ERR_RESOURCE_NOT_FOUND;
+    if (!key->is_active) return CRABS_ERR_UNAUTHORIZED;
+    if (sig_scheme != SCHEME_UNSPECIFIED && key->scheme != sig_scheme) {
+      return CRABS_ERR_CRYPTOGRAPHIC_ERROR;
+    }
+    return _verify_sig_with_scheme(key->scheme,
+                                    key->public_key, key->public_key_len,
+                                    serialized_op, (uint32_t)op_len,
+                                    signature, signature_len);
+  }
+
+  // No key_id but scheme specified: find user's default active key for that scheme
+  if (sig_scheme != SCHEME_UNSPECIFIED) {
+    user_key_t* key = user_key_find_active((user_t*)user, sig_scheme);
+    if (key == NULL) return CRABS_ERR_RESOURCE_NOT_FOUND;
+    return _verify_sig_with_scheme(key->scheme,
+                                    key->public_key, key->public_key_len,
+                                    serialized_op, (uint32_t)op_len,
+                                    signature, signature_len);
+  }
+
+  return CRABS_ERR_INVALID_PARAM;
+}
+
+verify_result_t crypto_verify_operation_auth_v2(
+    const abe_master_key_t* mk,
+    const char* abe_policy,
+    const attribute_machine_t* attr_machine,
+    const uint8_t* serialized_op, size_t op_len,
+    const uint8_t* signature, uint32_t signature_len,
+    const char* signer_id,
+    const char* key_id,
+    signature_scheme_e sig_scheme,
+    verify_mode_e mode) {
+  verify_result_t result = {
+    .authorized = false,
+    .error = CRABS_ERR_UNAUTHORIZED,
+    .signer_id = {'\0'}
+  };
+
+  if (!mk || !abe_policy || !serialized_op || op_len == 0) {
+    result.error = CRABS_ERR_INVALID_PARAM;
+    return result;
+  }
+
+  // Empty policy means no authorization required
+  if (strlen(abe_policy) == 0) {
+    result.authorized = true;
+    result.error = CRABS_SUCCESS;
+    if (signer_id) {
+      strncpy(result.signer_id, signer_id, CRABS_MAX_USER_ID - 1);
+    }
+    return result;
+  }
+
+  if (mode == VERIFY_MODE_A) {
+    // Mode A: Verify specific user
+    if (!signer_id || !attr_machine) {
+      result.error = CRABS_ERR_INVALID_PARAM;
+      return result;
+    }
+
+    user_t* user = attribute_machine_find_user((attribute_machine_t*)attr_machine, signer_id);
+    if (!user) {
+      result.error = CRABS_ERR_USER_NOT_FOUND;
+      return result;
+    }
+    if (user->status == USER_SUSPENDED) {
+      result.error = CRABS_ERR_USER_SUSPENDED;
+      return result;
+    }
+
+    // ABE policy check
+    char attr_string[CRABS_MAX_POLICY_EXPR];
+    _build_attr_string(user, attr_string, sizeof(attr_string));
+    if (!crypto_abe_eval_policy(abe_policy, attr_string)) {
+      result.error = CRABS_ERR_UNAUTHORIZED;
+      return result;
+    }
+
+    // Scheme-aware signature verification
+    crabs_error_e sig_rc = _verify_user_signature(user, key_id, sig_scheme,
+                                                    serialized_op, op_len,
+                                                    signature, signature_len);
+    if (sig_rc != CRABS_SUCCESS) {
+      result.error = sig_rc;
+      return result;
+    }
+
+    result.authorized = true;
+    result.error = CRABS_SUCCESS;
+    strncpy(result.signer_id, signer_id, CRABS_MAX_USER_ID - 1);
+
+  } else {
+    // Mode B: Verify against all registered users
+    if (!attr_machine) {
+      result.error = CRABS_ERR_INVALID_PARAM;
+      return result;
+    }
+
+    user_t* user = ((attribute_machine_t*)attr_machine)->users;
+    while (user != NULL) {
+      if (user->status != USER_SUSPENDED) {
+        char attr_string[CRABS_MAX_POLICY_EXPR];
+        _build_attr_string(user, attr_string, sizeof(attr_string));
+
+        if (crypto_abe_eval_policy(abe_policy, attr_string)) {
+          // Try verification with this user
+          crabs_error_e sig_rc;
+          if (sig_scheme != SCHEME_UNSPECIFIED || (key_id != NULL && key_id[0] != '\0')) {
+            sig_rc = _verify_user_signature(user, key_id, sig_scheme,
+                                             serialized_op, op_len,
+                                             signature, signature_len);
+          } else {
+            // No scheme or key_id specified: try legacy ECDSA
+            sig_rc = _verify_sig_with_scheme(SCHEME_UNSPECIFIED,
+                                              user->public_key, 33,
+                                              serialized_op, (uint32_t)op_len,
+                                              signature, signature_len);
+          }
+          if (sig_rc == CRABS_SUCCESS) {
+            result.authorized = true;
+            result.error = CRABS_SUCCESS;
+            strncpy(result.signer_id, user->user_id, CRABS_MAX_USER_ID - 1);
+            return result;
           }
         }
       }

@@ -121,6 +121,20 @@ verify_result_t crypto_verify_operation_auth(
     verify_mode_e mode);
 
 // ============================================================
+// Scheme-Aware Signature Verification (v1.3 §6)
+// ============================================================
+verify_result_t crypto_verify_operation_auth_v2(
+    const abe_master_key_t* mk,
+    const char* abe_policy,
+    const attribute_machine_t* attr_machine,
+    const uint8_t* serialized_op, size_t op_len,
+    const uint8_t* signature, uint32_t signature_len,
+    const char* signer_id,
+    const char* key_id,
+    signature_scheme_e sig_scheme,
+    verify_mode_e mode);
+
+// ============================================================
 // Key Envelope (§11.2)
 // ============================================================
 #define KEY_ENVELOPE_FORMAT_V1  0x01

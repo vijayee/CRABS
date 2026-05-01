@@ -30,6 +30,7 @@ if (BUILD_TESTING)
         test_sig_scheme.cpp
         test_keyring.cpp
         test_key_ops.cpp
+        test_scheme_verify.cpp
         test_cli.cpp
     )
 
