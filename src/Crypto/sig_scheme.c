@@ -1,0 +1,160 @@
+//
+// CRABS v1.3: Signature Scheme Registry & VTable (Amendment 3, §2-3)
+//
+
+#include "sig_scheme.h"
+#include "crypto.h"
+#include "../Util/allocator.h"
+#include <string.h>
+
+// ============================================================
+// Global Registry
+// ============================================================
+static signature_vtable_t* _registry[CRABS_MAX_REGISTERED_SCHEMES];
+static uint32_t _registry_count = 0;
+static bool _registry_initialized = false;
+
+// ============================================================
+// Registry API
+// ============================================================
+crabs_error_e crypto_sig_scheme_register(const signature_vtable_t* vtable) {
+  if (vtable == NULL) return CRABS_ERR_INVALID_PARAM;
+  if (vtable->generate_keypair == NULL) return CRABS_ERR_INVALID_PARAM;
+  if (vtable->sign == NULL) return CRABS_ERR_INVALID_PARAM;
+  if (vtable->verify == NULL) return CRABS_ERR_INVALID_PARAM;
+
+  if (crypto_sig_scheme_get(vtable->scheme_id) != NULL) {
+    return CRABS_ERR_SCHEME_ALREADY_REGISTERED;
+  }
+
+  if (_registry_count >= CRABS_MAX_REGISTERED_SCHEMES) {
+    return CRABS_ERR_OOM;
+  }
+
+  signature_vtable_t* entry = get_clear_memory(sizeof(signature_vtable_t));
+  memcpy(entry, vtable, sizeof(signature_vtable_t));
+  _registry[_registry_count++] = entry;
+  return CRABS_SUCCESS;
+}
+
+const signature_vtable_t* crypto_sig_scheme_get(signature_scheme_e scheme_id) {
+  for (uint32_t i = 0; i < _registry_count; i++) {
+    if (_registry[i] != NULL && _registry[i]->scheme_id == scheme_id) {
+      return _registry[i];
+    }
+  }
+  return NULL;
+}
+
+uint32_t crypto_sig_scheme_list(signature_scheme_e* out, uint32_t max_count) {
+  uint32_t count = _registry_count < max_count ? _registry_count : max_count;
+  for (uint32_t i = 0; i < count; i++) {
+    if (_registry[i] != NULL) {
+      out[i] = _registry[i]->scheme_id;
+    }
+  }
+  return count;
+}
+
+uint32_t crypto_sig_scheme_count(void) {
+  return _registry_count;
+}
+
+// ============================================================
+// Built-in ECDSA secp256k1 VTable Wrappers
+// ============================================================
+
+static crabs_error_e _ecdsa_generate_keypair(
+    uint8_t* pk, uint32_t* pk_len,
+    uint8_t* sk, uint32_t* sk_len) {
+  if (pk == NULL || pk_len == NULL || sk == NULL || sk_len == NULL) {
+    return CRABS_ERR_INVALID_PARAM;
+  }
+  if (*pk_len < 33 || *sk_len < 32) {
+    return CRABS_ERR_INVALID_PARAM;
+  }
+
+  ecdsa_keypair_t* kp = crypto_ecdsa_generate();
+  if (kp == NULL) return CRABS_ERR_CRYPTOGRAPHIC_ERROR;
+
+  memcpy(pk, kp->public_key, 33);
+  *pk_len = 33;
+  memcpy(sk, kp->private_key, 32);
+  *sk_len = 32;
+
+  crypto_ecdsa_keypair_destroy(kp);
+  return CRABS_SUCCESS;
+}
+
+static crabs_error_e _ecdsa_sign(
+    const uint8_t* sk, uint32_t sk_len,
+    const uint8_t* msg, uint32_t msg_len,
+    uint8_t* sig, uint32_t* sig_len) {
+  if (sk == NULL || msg == NULL || sig == NULL || sig_len == NULL) {
+    return CRABS_ERR_INVALID_PARAM;
+  }
+  if (sk_len != 32 || *sig_len < CRABS_SIG_SIZE) {
+    return CRABS_ERR_INVALID_PARAM;
+  }
+
+  crabs_error_e rc = crypto_ecdsa_sign(sk, msg, msg_len, sig);
+  if (rc != CRABS_SUCCESS) return rc;
+
+  *sig_len = CRABS_SIG_SIZE;
+  return CRABS_SUCCESS;
+}
+
+static crabs_error_e _ecdsa_verify(
+    const uint8_t* pk, uint32_t pk_len,
+    const uint8_t* msg, uint32_t msg_len,
+    const uint8_t* sig, uint32_t sig_len) {
+  if (pk == NULL || msg == NULL || sig == NULL) {
+    return CRABS_ERR_INVALID_PARAM;
+  }
+  if (pk_len != 33 || sig_len != CRABS_SIG_SIZE) {
+    return CRABS_ERR_INVALID_PARAM;
+  }
+
+  bool ok = crypto_ecdsa_verify(pk, msg, msg_len, sig);
+  return ok ? CRABS_SUCCESS : CRABS_ERR_CRYPTOGRAPHIC_ERROR;
+}
+
+// ============================================================
+// Built-in VTable Instance
+// ============================================================
+static signature_vtable_t _ecdsa_secp256k1_vtable = {
+  .scheme_id   = ECDSA_SECP256K1,
+  .name        = "ECDSA secp256k1",
+  .properties  = {
+    .scheme_id    = ECDSA_SECP256K1,
+    .security_level = 2,
+    .is_post_quantum = false,
+    .public_key_size  = 33,
+    .secret_key_size  = 32,
+    .signature_size   = 64,
+    .supports_batch_verification = false,
+    .supports_aggregation = false,
+    .supports_threshold = false,
+    .sign_speed   = 8,
+    .verify_speed = 8,
+    .keygen_speed = 7
+  },
+  .generate_keypair     = _ecdsa_generate_keypair,
+  .sign                 = _ecdsa_sign,
+  .verify               = _ecdsa_verify,
+  .verify_batch         = NULL,
+  .aggregate_signatures = NULL,
+  .export_public_key    = NULL,
+  .export_secret_key    = NULL,
+  .import_public_key    = NULL,
+  .import_secret_key    = NULL
+};
+
+// ============================================================
+// Initialization
+// ============================================================
+void crypto_sig_scheme_init(void) {
+  if (_registry_initialized) return;
+  _registry_initialized = true;
+  crypto_sig_scheme_register(&_ecdsa_secp256k1_vtable);
+}
