@@ -304,6 +304,10 @@ crabs_error_e state_machine_execute(state_t* state, operation_t* op) {
     result = state_machine_op_disable_trigger(state, op);
   } else if (strcmp(op->type, CRABS_OP_ENABLE_TRIGGER) == 0) {
     result = state_machine_op_enable_trigger(state, op);
+  } else if (strcmp(op->type, CRABS_OP_REFRESH_KEY) == 0) {
+    refresh_key_response_t refresh_resp;
+    memset(&refresh_resp, 0, sizeof(refresh_resp));
+    result = state_machine_op_refresh_key(state, op, &refresh_resp);
   } else {
     result = CRABS_ERR_INVALID_PARAM;
   }
@@ -506,5 +510,60 @@ crabs_error_e state_machine_op_change_config(state_t* state, operation_t* op) {
     char* eq = strchr(payload_str, '=');
     if (eq != NULL) state->config.allow_force_unlock = (strcmp(eq + 1, "true") == 0);
   }
+  return CRABS_SUCCESS;
+}
+
+// ============================================================
+// Key Refresh (§11.3, §8.5)
+// ============================================================
+crabs_error_e state_machine_op_refresh_key(state_t* state, operation_t* op,
+                                            refresh_key_response_t* response) {
+  if (state == NULL || op == NULL) return CRABS_ERR_INVALID_PARAM;
+  if (state->attr_machine == NULL) return CRABS_ERR_UNAUTHORIZED;
+  if (!state->node_key_valid) return CRABS_ERR_CRYPTOGRAPHIC_ERROR;
+
+  // Find the requesting user
+  user_t* user = attribute_machine_find_user(state->attr_machine, op->signer_id);
+  if (user == NULL) return CRABS_ERR_USER_NOT_FOUND;
+  if (user->status == USER_SUSPENDED) return CRABS_ERR_USER_SUSPENDED;
+
+  // Compute attributes hash for current attribute set
+  uint8_t attr_hash[CRABS_HASH_SIZE];
+  crabs_error_e rc = crypto_compute_attributes_hash(user, attr_hash);
+  if (rc != CRABS_SUCCESS) return rc;
+
+  // Generate ABE master key for envelope creation
+  abe_master_key_t* mk = crypto_abe_setup();
+  if (mk == NULL) return CRABS_ERR_CRYPTOGRAPHIC_ERROR;
+
+  // Create key envelope
+  uint64_t now_ms = (uint64_t)time(NULL) * 1000;
+  key_envelope_t* envelope = crypto_key_envelope_create(
+      mk, state->node_private_key, op->signer_id,
+      state->version, attr_hash, now_ms, 0);
+
+  crypto_abe_master_key_destroy(mk);
+
+  if (envelope == NULL) return CRABS_ERR_CRYPTOGRAPHIC_ERROR;
+
+  // Update user key_version to match state version (§8.5)
+  user->key_version = state->version;
+
+  // Store envelope in state for caller retrieval
+  if (state->last_refresh_envelope != NULL) {
+    crypto_key_envelope_destroy((key_envelope_t*)state->last_refresh_envelope);
+  }
+  state->last_refresh_envelope = envelope;
+
+  // Copy envelope to response (flat serialization)
+  if (response != NULL) {
+    size_t copy_size = sizeof(key_envelope_t);
+    if (copy_size > sizeof(response->envelope_data)) {
+      copy_size = sizeof(response->envelope_data);
+    }
+    memcpy(response->envelope_data, envelope, copy_size);
+    response->envelope_data_len = (uint32_t)copy_size;
+  }
+
   return CRABS_SUCCESS;
 }

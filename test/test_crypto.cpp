@@ -600,3 +600,205 @@ TEST_F(VerifyAuthTest, NullParams) {
   EXPECT_FALSE(vr.authorized);
   EXPECT_EQ(vr.error, CRABS_ERR_INVALID_PARAM);
 }
+
+// ============================================================
+// Key Envelope Tests (§11.2)
+// ============================================================
+
+class KeyEnvelopeTest : public ::testing::Test {
+protected:
+  void SetUp() override {
+    mk = crypto_abe_setup();
+    ASSERT_NE(mk, nullptr);
+    node_key = crypto_ecdsa_generate();
+    ASSERT_NE(node_key, nullptr);
+    am = attribute_machine_create("admin", admin_pk);
+    ASSERT_NE(am, nullptr);
+
+    // Register alice with role:admin
+    alice_key = crypto_ecdsa_generate();
+    ASSERT_NE(alice_key, nullptr);
+    crabs_error_e rc = attribute_machine_register_user(
+        am, "alice", alice_key->public_key, "role:admin");
+    EXPECT_EQ(rc, CRABS_SUCCESS);
+  }
+
+  void TearDown() override {
+    crypto_ecdsa_keypair_destroy(alice_key);
+    attribute_machine_destroy(am);
+    crypto_ecdsa_keypair_destroy(node_key);
+    crypto_abe_master_key_destroy(mk);
+  }
+
+  abe_master_key_t* mk = nullptr;
+  ecdsa_keypair_t* node_key = nullptr;
+  attribute_machine_t* am = nullptr;
+  ecdsa_keypair_t* alice_key = nullptr;
+  uint8_t admin_pk[33] = {0x02};
+};
+
+TEST_F(KeyEnvelopeTest, CreateAndVerify) {
+  user_t* alice = attribute_machine_find_user(am, "alice");
+  ASSERT_NE(alice, nullptr);
+
+  // Compute attributes hash
+  uint8_t attr_hash[CRABS_HASH_SIZE];
+  crabs_error_e rc = crypto_compute_attributes_hash(alice, attr_hash);
+  EXPECT_EQ(rc, CRABS_SUCCESS);
+
+  // Create envelope
+  uint64_t now_ms = 1000000;
+  key_envelope_t* env = crypto_key_envelope_create(
+      mk, node_key->private_key, "alice", 42, attr_hash, now_ms, 0);
+  ASSERT_NE(env, nullptr);
+
+  // Check envelope fields
+  EXPECT_EQ(env->format_version, KEY_ENVELOPE_FORMAT_V1);
+  EXPECT_STREQ(env->user_id, "alice");
+  EXPECT_EQ(env->state_version, 42u);
+  EXPECT_EQ(memcmp(env->attributes_hash, attr_hash, CRABS_HASH_SIZE), 0);
+  EXPECT_EQ(env->issued_at, now_ms);
+  EXPECT_EQ(env->expires_at, 0u);
+
+  // Verify with node's public key
+  bool valid = crypto_key_envelope_verify(node_key->public_key, env);
+  EXPECT_TRUE(valid);
+
+  // Verify with wrong key should fail
+  ecdsa_keypair_t* wrong_key = crypto_ecdsa_generate();
+  ASSERT_NE(wrong_key, nullptr);
+  valid = crypto_key_envelope_verify(wrong_key->public_key, env);
+  EXPECT_FALSE(valid);
+
+  crypto_ecdsa_keypair_destroy(wrong_key);
+  crypto_key_envelope_destroy(env);
+}
+
+TEST_F(KeyEnvelopeTest, CreateWithExpiry) {
+  user_t* alice = attribute_machine_find_user(am, "alice");
+  ASSERT_NE(alice, nullptr);
+
+  uint8_t attr_hash[CRABS_HASH_SIZE];
+  crypto_compute_attributes_hash(alice, attr_hash);
+
+  key_envelope_t* env = crypto_key_envelope_create(
+      mk, node_key->private_key, "alice", 10, attr_hash, 1000, 5000);
+  ASSERT_NE(env, nullptr);
+
+  EXPECT_EQ(env->expires_at, 5000u);
+  EXPECT_TRUE(crypto_key_envelope_verify(node_key->public_key, env));
+
+  crypto_key_envelope_destroy(env);
+}
+
+TEST_F(KeyEnvelopeTest, NullParams) {
+  uint8_t dummy_hash[CRABS_HASH_SIZE] = {0};
+
+  EXPECT_EQ(crypto_key_envelope_create(nullptr, node_key->private_key, "alice", 1, dummy_hash, 0, 0), nullptr);
+  EXPECT_EQ(crypto_key_envelope_create(mk, nullptr, "alice", 1, dummy_hash, 0, 0), nullptr);
+  EXPECT_EQ(crypto_key_envelope_create(mk, node_key->private_key, nullptr, 1, dummy_hash, 0, 0), nullptr);
+  EXPECT_EQ(crypto_key_envelope_create(mk, node_key->private_key, "alice", 1, nullptr, 0, 0), nullptr);
+}
+
+TEST_F(KeyEnvelopeTest, VerifyNullParams) {
+  EXPECT_FALSE(crypto_key_envelope_verify(nullptr, nullptr));
+  EXPECT_FALSE(crypto_key_envelope_verify(node_key->public_key, nullptr));
+}
+
+TEST_F(KeyEnvelopeTest, VerifyWrongFormatVersion) {
+  user_t* alice = attribute_machine_find_user(am, "alice");
+  ASSERT_NE(alice, nullptr);
+
+  uint8_t attr_hash[CRABS_HASH_SIZE];
+  crypto_compute_attributes_hash(alice, attr_hash);
+
+  key_envelope_t* env = crypto_key_envelope_create(
+      mk, node_key->private_key, "alice", 1, attr_hash, 0, 0);
+  ASSERT_NE(env, nullptr);
+
+  // Tamper with format version
+  env->format_version = 0x99;
+  EXPECT_FALSE(crypto_key_envelope_verify(node_key->public_key, env));
+
+  crypto_key_envelope_destroy(env);
+}
+
+TEST_F(KeyEnvelopeTest, AttributesHash) {
+  user_t* alice = attribute_machine_find_user(am, "alice");
+  ASSERT_NE(alice, nullptr);
+
+  // Same user should produce same hash
+  uint8_t hash1[CRABS_HASH_SIZE];
+  uint8_t hash2[CRABS_HASH_SIZE];
+  crabs_error_e rc = crypto_compute_attributes_hash(alice, hash1);
+  EXPECT_EQ(rc, CRABS_SUCCESS);
+  rc = crypto_compute_attributes_hash(alice, hash2);
+  EXPECT_EQ(rc, CRABS_SUCCESS);
+  EXPECT_EQ(memcmp(hash1, hash2, CRABS_HASH_SIZE), 0);
+
+  // Register bob with different attributes
+  ecdsa_keypair_t* bob_key = crypto_ecdsa_generate();
+  ASSERT_NE(bob_key, nullptr);
+  rc = attribute_machine_register_user(am, "bob", bob_key->public_key, "role:viewer");
+  EXPECT_EQ(rc, CRABS_SUCCESS);
+
+  user_t* bob = attribute_machine_find_user(am, "bob");
+  ASSERT_NE(bob, nullptr);
+
+  uint8_t bob_hash[CRABS_HASH_SIZE];
+  rc = crypto_compute_attributes_hash(bob, bob_hash);
+  EXPECT_EQ(rc, CRABS_SUCCESS);
+  // Different attributes should produce different hashes
+  EXPECT_NE(memcmp(hash1, bob_hash, CRABS_HASH_SIZE), 0);
+
+  crypto_ecdsa_keypair_destroy(bob_key);
+}
+
+TEST_F(KeyEnvelopeTest, AttributesHashNullParams) {
+  uint8_t hash[CRABS_HASH_SIZE];
+  EXPECT_EQ(crypto_compute_attributes_hash(nullptr, hash), CRABS_ERR_INVALID_PARAM);
+  EXPECT_EQ(crypto_compute_attributes_hash(nullptr, nullptr), CRABS_ERR_INVALID_PARAM);
+}
+
+// ============================================================
+// Key Compromise Recovery Tests (§11.4)
+// ============================================================
+
+TEST_F(KeyEnvelopeTest, RevokeAndRotate) {
+  user_t* alice = attribute_machine_find_user(am, "alice");
+  ASSERT_NE(alice, nullptr);
+  uint64_t orig_version = alice->key_version;
+
+  recovery_result_t* result = crypto_revoke_and_rotate(
+      mk, node_key->private_key, am, "alice", 1, 1000);
+  ASSERT_NE(result, nullptr);
+  ASSERT_NE(result->new_ecdsa_key, nullptr);
+  ASSERT_NE(result->new_envelope, nullptr);
+
+  // User should be suspended
+  EXPECT_EQ(alice->status, USER_SUSPENDED);
+
+  // Key version should be incremented
+  EXPECT_EQ(alice->key_version, orig_version + 1);
+
+  // Public key should be updated to new key
+  EXPECT_EQ(memcmp(alice->public_key, result->new_ecdsa_key->public_key, 33), 0);
+
+  // Envelope should be verifiable with node key
+  EXPECT_TRUE(crypto_key_envelope_verify(node_key->public_key, result->new_envelope));
+
+  crypto_recovery_result_destroy(result);
+}
+
+TEST_F(KeyEnvelopeTest, RevokeAndRotateUserNotFound) {
+  recovery_result_t* result = crypto_revoke_and_rotate(
+      mk, node_key->private_key, am, "nonexistent", 1, 1000);
+  EXPECT_EQ(result, nullptr);
+}
+
+TEST_F(KeyEnvelopeTest, RevokeAndRotateNullParams) {
+  EXPECT_EQ(crypto_revoke_and_rotate(nullptr, node_key->private_key, am, "alice", 1, 1000), nullptr);
+  EXPECT_EQ(crypto_revoke_and_rotate(mk, nullptr, am, "alice", 1, 1000), nullptr);
+  EXPECT_EQ(crypto_revoke_and_rotate(mk, node_key->private_key, nullptr, "alice", 1, 1000), nullptr);
+  EXPECT_EQ(crypto_revoke_and_rotate(mk, node_key->private_key, am, nullptr, 1, 1000), nullptr);
+}

@@ -74,6 +74,15 @@ crabs_error_e  state_machine_op_delete_trigger(state_t* state, operation_t* op);
 crabs_error_e  state_machine_op_disable_trigger(state_t* state, operation_t* op);
 crabs_error_e  state_machine_op_enable_trigger(state_t* state, operation_t* op);
 
+// Key refresh operation (§11.3)
+typedef struct {
+  uint8_t         envelope_data[1024];  // Serialized key envelope for transport
+  uint32_t        envelope_data_len;
+} refresh_key_response_t;
+
+crabs_error_e  state_machine_op_refresh_key(state_t* state, operation_t* op,
+                                             refresh_key_response_t* response);
+
 // Operation lifecycle
 operation_t*   operation_create(const char* type);
 void           operation_destroy(operation_t* op);

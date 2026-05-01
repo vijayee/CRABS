@@ -4,7 +4,9 @@
 
 #include "data_model.h"
 #include "../Trigger/trigger.h"
+#include "../Crypto/crypto.h"
 #include "../Util/allocator.h"
+#include <openssl/crypto.h>
 #include <string.h>
 #include <stdlib.h>
 
@@ -64,6 +66,12 @@ state_t* state_create(void) {
 
 void state_destroy(state_t* state) {
   if (state == NULL) return;
+  if (state->node_key_valid) {
+    OPENSSL_cleanse(state->node_private_key, 32);
+  }
+  if (state->last_refresh_envelope != NULL) {
+    crypto_key_envelope_destroy(state->last_refresh_envelope);
+  }
   data_item_t* item = state->items;
   while (item != NULL) {
     data_item_t* next = item->next;
@@ -82,6 +90,18 @@ void state_destroy(state_t* state) {
     free(state->triggers);
   }
   free(state);
+}
+
+crabs_error_e state_set_node_key(state_t* state,
+                                  const uint8_t private_key[32],
+                                  const uint8_t public_key[33]) {
+  if (state == NULL || private_key == NULL || public_key == NULL) {
+    return CRABS_ERR_INVALID_PARAM;
+  }
+  memcpy(state->node_private_key, private_key, 32);
+  memcpy(state->node_public_key, public_key, 33);
+  state->node_key_valid = true;
+  return CRABS_SUCCESS;
 }
 
 // ============================================================

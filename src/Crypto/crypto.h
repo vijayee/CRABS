@@ -120,4 +120,63 @@ verify_result_t crypto_verify_operation_auth(
     const char* signer_id,
     verify_mode_e mode);
 
+// ============================================================
+// Key Envelope (§11.2)
+// ============================================================
+#define KEY_ENVELOPE_FORMAT_V1  0x01
+
+typedef struct key_envelope_t {
+  uint8_t  format_version;                       // 0x01
+  char     user_id[CRABS_MAX_USER_ID];           // User identifier
+  uint64_t state_version;                        // State version when issued
+  uint8_t  attributes_hash[CRABS_HASH_SIZE];     // SHA-256 of attribute string
+  uint64_t issued_at;                            // Unix timestamp ms
+  uint64_t expires_at;                           // Expiry (0 = no expiry)
+  uint8_t  sk_abe[ABE_MASTER_KEY_SIZE];          // ABE secret key
+  uint8_t  signature[CRABS_SIG_SIZE];            // Node ECDSA signature
+} key_envelope_t;
+
+// Create a key envelope: generates ABE key, signs with node key
+key_envelope_t* crypto_key_envelope_create(
+    const abe_master_key_t* mk,
+    const uint8_t node_private_key[32],
+    const char* user_id,
+    uint64_t state_version,
+    const uint8_t attributes_hash[CRABS_HASH_SIZE],
+    uint64_t issued_at,
+    uint64_t expires_at);
+
+// Verify the node signature on a key envelope
+bool crypto_key_envelope_verify(
+    const uint8_t node_public_key[33],
+    const key_envelope_t* envelope);
+
+// Secure cleanup
+void crypto_key_envelope_destroy(key_envelope_t* envelope);
+
+// Compute SHA-256 hash of a user's attribute string
+crabs_error_e crypto_compute_attributes_hash(
+    const user_t* user,
+    uint8_t hash[CRABS_HASH_SIZE]);
+
+// ============================================================
+// Key Compromise Recovery (§11.4)
+// ============================================================
+typedef struct {
+  ecdsa_keypair_t* new_ecdsa_key;    // New ECDSA keypair for the user
+  key_envelope_t*  new_envelope;     // New ABE key envelope
+} recovery_result_t;
+
+// Revoke compromised keys and rotate: suspend user, generate new keys
+recovery_result_t* crypto_revoke_and_rotate(
+    const abe_master_key_t* mk,
+    const uint8_t node_private_key[32],
+    attribute_machine_t* attr_machine,
+    const char* user_id,
+    uint64_t state_version,
+    uint64_t issued_at);
+
+// Secure cleanup
+void crypto_recovery_result_destroy(recovery_result_t* result);
+
 #endif // CRABS_CRYPTO_H

@@ -32,6 +32,7 @@ protected:
     state_add_policy(state, CRABS_OP_ROLLBACK, "role:admin");
     state_add_policy(state, CRABS_OP_UNLOCK, "role:admin");
     state_add_policy(state, CRABS_OP_FORCE_UNLOCK, "role:admin");
+    state_add_policy(state, CRABS_OP_REFRESH_KEY, "role:admin");
 
     // Set a known UUID for testing
     memset(test_uuid, 0x42, CRABS_UUID_SIZE);
@@ -53,6 +54,12 @@ protected:
 
     // Attach attribute machine to state so ABE verification is enforced
     state->attr_machine = am;
+
+    // Generate and set node key for envelope signing (§11)
+    ecdsa_keypair_t* node_key = crypto_ecdsa_generate();
+    ASSERT_NE(node_key, nullptr);
+    state_set_node_key(state, node_key->private_key, node_key->public_key);
+    crypto_ecdsa_keypair_destroy(node_key);
   }
 
   void TearDown() override {
@@ -470,4 +477,55 @@ TEST_F(TestStateMachine, TestKeyVersionVerification_ZeroKeyVersion) {
 
   EXPECT_EQ(state_machine_execute(state, op), CRABS_SUCCESS);
   operation_destroy(op);
+}
+
+TEST_F(TestStateMachine, TestRefreshKey) {
+  // Record alice's key_version before refresh
+  user_t* alice = attribute_machine_find_user(am, "alice");
+  ASSERT_NE(alice, nullptr);
+  uint64_t old_version = alice->key_version;
+
+  // Create a refresh key operation (no resources needed)
+  operation_t* op = operation_create(CRABS_OP_REFRESH_KEY);
+  memcpy(op->uuid, test_uuid, CRABS_UUID_SIZE);
+  op->resource_count = 0;
+  strncpy(op->signer_id, "alice", CRABS_MAX_USER_ID - 1);
+  op->signer_key_version = old_version;
+  sign_operation(op);
+
+  crabs_error_e result = state_machine_execute(state, op);
+  EXPECT_EQ(result, CRABS_SUCCESS);
+
+  // Alice's key_version should be updated to match state version
+  EXPECT_NE(alice->key_version, old_version);
+
+  // Envelope should be stored in state for caller retrieval
+  EXPECT_NE(state->last_refresh_envelope, nullptr);
+  key_envelope_t* env = (key_envelope_t*)state->last_refresh_envelope;
+  EXPECT_EQ(env->format_version, KEY_ENVELOPE_FORMAT_V1);
+  EXPECT_STREQ(env->user_id, "alice");
+
+  // Envelope should be verifiable with node's public key
+  EXPECT_TRUE(crypto_key_envelope_verify(state->node_public_key, env));
+
+  operation_destroy(op);
+}
+
+TEST_F(TestStateMachine, TestRefreshKeyNoNodeKey) {
+  // Create a state without node key
+  state_t* no_key_state = state_create();
+  no_key_state->attr_machine = am;
+
+  operation_t* op = operation_create(CRABS_OP_REFRESH_KEY);
+  memcpy(op->uuid, test_uuid, CRABS_UUID_SIZE);
+  op->resource_count = 0;
+  strncpy(op->signer_id, "alice", CRABS_MAX_USER_ID - 1);
+  sign_operation(op);
+
+  crabs_error_e result = state_machine_execute(no_key_state, op);
+  EXPECT_EQ(result, CRABS_ERR_CRYPTOGRAPHIC_ERROR);
+
+  operation_destroy(op);
+  no_key_state->attr_machine = NULL;
+  state_destroy(no_key_state);
 }

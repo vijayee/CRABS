@@ -839,3 +839,188 @@ verify_result_t crypto_verify_operation_auth(
 
   return result;
 }
+
+// ============================================================
+// Key Envelope (§11.2)
+// ============================================================
+
+// Canonical envelope data size for signing:
+// format_version(1) + user_id(64) + state_version(8) + attributes_hash(32)
+// + issued_at(8) + expires_at(8) + sk_abe(32) = 153
+#define _ENVELOPE_SIGN_DATA_SIZE (1 + CRABS_MAX_USER_ID + 8 + CRABS_HASH_SIZE + 8 + 8 + ABE_MASTER_KEY_SIZE)
+
+static void _pack_u64_le(uint8_t* buf, uint64_t val) {
+  for (int i = 0; i < 8; i++) {
+    buf[i] = (uint8_t)(val & 0xFF);
+    val >>= 8;
+  }
+}
+
+static size_t _envelope_sign_data(const key_envelope_t* env, uint8_t* buf, size_t buf_len) {
+  if (!env || !buf || buf_len < _ENVELOPE_SIGN_DATA_SIZE) return 0;
+
+  size_t pos = 0;
+  buf[pos++] = env->format_version;
+  memcpy(buf + pos, env->user_id, CRABS_MAX_USER_ID);
+  pos += CRABS_MAX_USER_ID;
+  _pack_u64_le(buf + pos, env->state_version);
+  pos += 8;
+  memcpy(buf + pos, env->attributes_hash, CRABS_HASH_SIZE);
+  pos += CRABS_HASH_SIZE;
+  _pack_u64_le(buf + pos, env->issued_at);
+  pos += 8;
+  _pack_u64_le(buf + pos, env->expires_at);
+  pos += 8;
+  memcpy(buf + pos, env->sk_abe, ABE_MASTER_KEY_SIZE);
+  pos += ABE_MASTER_KEY_SIZE;
+
+  return pos;
+}
+
+key_envelope_t* crypto_key_envelope_create(
+    const abe_master_key_t* mk,
+    const uint8_t node_private_key[32],
+    const char* user_id,
+    uint64_t state_version,
+    const uint8_t attributes_hash[CRABS_HASH_SIZE],
+    uint64_t issued_at,
+    uint64_t expires_at) {
+  if (!mk || !node_private_key || !user_id || !attributes_hash) return NULL;
+
+  key_envelope_t* env = get_clear_memory(sizeof(key_envelope_t));
+  if (!env) return NULL;
+
+  env->format_version = KEY_ENVELOPE_FORMAT_V1;
+  strncpy(env->user_id, user_id, CRABS_MAX_USER_ID - 1);
+  env->state_version = state_version;
+  memcpy(env->attributes_hash, attributes_hash, CRABS_HASH_SIZE);
+  env->issued_at = issued_at;
+  env->expires_at = expires_at;
+
+  // Generate ABE key for the user's current attributes
+  // We need to reconstruct the attribute string from the hash context,
+  // but since the hash is one-way, we generate a generic ABE key
+  // and the actual attribute string is used during policy evaluation.
+  // For the simulated ABE, the key is just MPK, which is already in mk.
+  memcpy(env->sk_abe, mk->mpk, ABE_MASTER_KEY_SIZE);
+
+  // Sign the envelope data with the node's ECDSA private key
+  uint8_t sign_data[_ENVELOPE_SIGN_DATA_SIZE];
+  size_t sign_len = _envelope_sign_data(env, sign_data, sizeof(sign_data));
+  if (sign_len == 0) {
+    OPENSSL_cleanse(env->sk_abe, ABE_MASTER_KEY_SIZE);
+    free(env);
+    return NULL;
+  }
+
+  crabs_error_e rc = crypto_ecdsa_sign(node_private_key, sign_data, sign_len, env->signature);
+  if (rc != CRABS_SUCCESS) {
+    OPENSSL_cleanse(env->sk_abe, ABE_MASTER_KEY_SIZE);
+    free(env);
+    return NULL;
+  }
+
+  return env;
+}
+
+bool crypto_key_envelope_verify(
+    const uint8_t node_public_key[33],
+    const key_envelope_t* envelope) {
+  if (!node_public_key || !envelope) return false;
+  if (envelope->format_version != KEY_ENVELOPE_FORMAT_V1) return false;
+
+  uint8_t sign_data[_ENVELOPE_SIGN_DATA_SIZE];
+  size_t sign_len = _envelope_sign_data(envelope, sign_data, sizeof(sign_data));
+  if (sign_len == 0) return false;
+
+  return crypto_ecdsa_verify(node_public_key, sign_data, sign_len, envelope->signature);
+}
+
+void crypto_key_envelope_destroy(key_envelope_t* envelope) {
+  if (envelope) {
+    OPENSSL_cleanse(envelope->sk_abe, ABE_MASTER_KEY_SIZE);
+    free(envelope);
+  }
+}
+
+// ============================================================
+// Attributes Hash (§11.2)
+// ============================================================
+
+crabs_error_e crypto_compute_attributes_hash(const user_t* user, uint8_t hash[CRABS_HASH_SIZE]) {
+  if (!user || !hash) return CRABS_ERR_INVALID_PARAM;
+
+  char attr_string[CRABS_MAX_POLICY_EXPR];
+  _build_attr_string(user, attr_string, sizeof(attr_string));
+
+  if (strlen(attr_string) == 0) {
+    // Empty attributes - hash a single zero byte
+    uint8_t zero = 0;
+    return crypto_sha256(&zero, 1, hash);
+  }
+
+  return crypto_sha256((const uint8_t*)attr_string, strlen(attr_string), hash);
+}
+
+// ============================================================
+// Key Compromise Recovery (§11.4)
+// ============================================================
+
+recovery_result_t* crypto_revoke_and_rotate(
+    const abe_master_key_t* mk,
+    const uint8_t node_private_key[32],
+    attribute_machine_t* attr_machine,
+    const char* user_id,
+    uint64_t state_version,
+    uint64_t issued_at) {
+  if (!mk || !node_private_key || !attr_machine || !user_id) return NULL;
+
+  // Step 1: Suspend compromised user (also increments key_version per §8.4)
+  user_t* user = attribute_machine_find_user(attr_machine, user_id);
+  if (!user) return NULL;
+
+  attribute_machine_suspend_user(attr_machine, user_id);
+
+  // Step 3: Generate new ECDSA keypair
+  ecdsa_keypair_t* new_key = crypto_ecdsa_generate();
+  if (!new_key) return NULL;
+
+  // Step 4: Update user's public key
+  memcpy(user->public_key, new_key->public_key, 33);
+
+  // Step 5: Compute attributes hash and generate new ABE key envelope
+  uint8_t attr_hash[CRABS_HASH_SIZE];
+  crabs_error_e rc = crypto_compute_attributes_hash(user, attr_hash);
+  if (rc != CRABS_SUCCESS) {
+    crypto_ecdsa_keypair_destroy(new_key);
+    return NULL;
+  }
+
+  key_envelope_t* envelope = crypto_key_envelope_create(
+      mk, node_private_key, user_id, state_version, attr_hash, issued_at, 0);
+  if (!envelope) {
+    crypto_ecdsa_keypair_destroy(new_key);
+    return NULL;
+  }
+
+  // Step 6: Build result
+  recovery_result_t* result = get_clear_memory(sizeof(recovery_result_t));
+  if (!result) {
+    crypto_ecdsa_keypair_destroy(new_key);
+    crypto_key_envelope_destroy(envelope);
+    return NULL;
+  }
+
+  result->new_ecdsa_key = new_key;
+  result->new_envelope = envelope;
+
+  return result;
+}
+
+void crypto_recovery_result_destroy(recovery_result_t* result) {
+  if (result) {
+    if (result->new_ecdsa_key) crypto_ecdsa_keypair_destroy(result->new_ecdsa_key);
+    if (result->new_envelope) crypto_key_envelope_destroy(result->new_envelope);
+    free(result);
+  }
+}

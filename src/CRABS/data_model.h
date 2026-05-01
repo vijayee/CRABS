@@ -162,6 +162,10 @@ typedef struct state_t {
   trigger_t*      triggers;
   uint32_t        trigger_count;
   attribute_machine_t* attr_machine;  // For key verification and policy evaluation
+  uint8_t node_private_key[32];       // Node ECDSA private key for envelope signing (§11)
+  uint8_t node_public_key[33];        // Node ECDSA public key
+  bool    node_key_valid;             // Whether node keys are initialized
+  void*   last_refresh_envelope;      // Last key refresh envelope (key_envelope_t*, §11.3)
 } state_t;
 
 // ============================================================
@@ -180,6 +184,11 @@ void         data_item_destroy(data_item_t* item);
 // ============================================================
 state_t*     state_create(void);
 void         state_destroy(state_t* state);
+
+// Initialize node ECDSA keypair for envelope signing (§11)
+crabs_error_e state_set_node_key(state_t* state,
+                                  const uint8_t private_key[32],
+                                  const uint8_t public_key[33]);
 
 // ============================================================
 // State query helpers
