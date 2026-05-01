@@ -3,6 +3,7 @@ extern "C" {
 #include "../src/CRABS/crabs.h"
 #include "../src/CRABS/data_model.h"
 #include "../src/StateMachine/state_machine.h"
+#include "../src/Attribute/attribute_machine.h"
 }
 
 class TestStateMachine : public ::testing::Test {
@@ -337,4 +338,78 @@ TEST_F(TestStateMachine, TestChangeConfig) {
   EXPECT_EQ(state_machine_execute(state, op), CRABS_SUCCESS);
   EXPECT_EQ(state->config.max_lock_duration_ms, 10000);
   operation_destroy(op);
+}
+
+TEST_F(TestStateMachine, TestKeyVersionVerification_StaleKey) {
+  // Set up attribute machine with a user whose key_version is 2
+  uint8_t admin_pk[33];
+  memset(admin_pk, 0xAA, 33);
+  attribute_machine_t* am = attribute_machine_create("admin", admin_pk);
+  ASSERT_NE(am, nullptr);
+
+  uint8_t user_pk[33];
+  memset(user_pk, 0xBB, 33);
+  attribute_machine_register_user(am, "alice", user_pk, "");
+
+  // Set user's key_version to 2
+  user_t* user = attribute_machine_find_user(am, "alice");
+  ASSERT_NE(user, nullptr);
+  user->key_version = 2;
+
+  // Attach attribute machine to state
+  state->attr_machine = am;
+
+  // Create a lock operation with stale key_version=1
+  operation_t* op = make_lock_op();
+  op->signer_key_version = 1;  // Stale — user is on version 2
+
+  EXPECT_EQ(state_machine_execute(state, op), CRABS_ERR_KEY_STALE);
+  operation_destroy(op);
+
+  // Now with matching key_version=2 — should succeed
+  operation_t* op2 = make_lock_op();
+  memset(op2->uuid, 0x99, CRABS_UUID_SIZE);
+  op2->signer_key_version = 2;
+
+  EXPECT_EQ(state_machine_execute(state, op2), CRABS_SUCCESS);
+  operation_destroy(op2);
+
+  state->attr_machine = NULL;
+  attribute_machine_destroy(am);
+}
+
+TEST_F(TestStateMachine, TestKeyVersionVerification_NoAttrMachine) {
+  // Without attr_machine, key version check should be skipped
+  operation_t* op = make_lock_op();
+  op->signer_key_version = 99;  // Would be stale if attr_machine existed
+
+  EXPECT_EQ(state_machine_execute(state, op), CRABS_SUCCESS);
+  operation_destroy(op);
+}
+
+TEST_F(TestStateMachine, TestKeyVersionVerification_ZeroKeyVersion) {
+  uint8_t admin_pk[33];
+  memset(admin_pk, 0xAA, 33);
+  attribute_machine_t* am = attribute_machine_create("admin", admin_pk);
+  ASSERT_NE(am, nullptr);
+
+  uint8_t user_pk[33];
+  memset(user_pk, 0xBB, 33);
+  attribute_machine_register_user(am, "alice", user_pk, "");
+
+  user_t* user = attribute_machine_find_user(am, "alice");
+  ASSERT_NE(user, nullptr);
+  user->key_version = 5;
+
+  state->attr_machine = am;
+
+  // signer_key_version = 0 means "skip version check" (per spec §10.4)
+  operation_t* op = make_lock_op();
+  op->signer_key_version = 0;
+
+  EXPECT_EQ(state_machine_execute(state, op), CRABS_SUCCESS);
+  operation_destroy(op);
+
+  state->attr_machine = NULL;
+  attribute_machine_destroy(am);
 }

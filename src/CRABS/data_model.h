@@ -9,8 +9,9 @@
 #include <stdbool.h>
 #include "crabs.h"
 
-// Forward declaration (defined in Trigger/trigger.h)
+// Forward declarations
 typedef struct trigger_t trigger_t;
+typedef struct attribute_machine_t attribute_machine_t;
 
 // ============================================================
 // Data Types (§5.1)
@@ -160,6 +161,7 @@ typedef struct state_t {
   uint64_t        processed_op_count;
   trigger_t*      triggers;
   uint32_t        trigger_count;
+  attribute_machine_t* attr_machine;  // For key verification and policy evaluation
 } state_t;
 
 // ============================================================

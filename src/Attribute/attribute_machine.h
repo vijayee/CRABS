@@ -59,7 +59,7 @@ typedef struct user_t {
 // ============================================================
 // Attribute Machine (inherits state_t)
 // ============================================================
-typedef struct {
+typedef struct attribute_machine_t {
   state_t   base_state;
   user_t*   users;
   uint32_t  user_count;

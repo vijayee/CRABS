@@ -4,6 +4,8 @@
 
 #include "state_machine.h"
 #include "../Trigger/trigger.h"
+#include "../Crypto/crypto.h"
+#include "../Attribute/attribute_machine.h"
 #include "../Util/allocator.h"
 #include <string.h>
 #include <stdlib.h>
@@ -224,14 +226,19 @@ crabs_error_e state_machine_execute(state_t* state, operation_t* op) {
     }
   }
 
-  // Step 5: Policy check (stub — ABE verification deferred)
+  // Step 5: Policy check — ABE verification deferred to future integration
   const char* policy = state_find_policy(state, op->type);
   if (policy == NULL && op->resource_count > 0) {
     return CRABS_ERR_UNAUTHORIZED;
   }
 
-  // Step 6: Key version check (stub)
-  (void)op->signer_key_version;
+  // Step 6: Key version verification (§10.4)
+  if (op->signer_key_version > 0 && state->attr_machine != NULL) {
+    user_t* signer = attribute_machine_find_user(state->attr_machine, op->signer_id);
+    if (signer != NULL && signer->key_version != op->signer_key_version) {
+      return CRABS_ERR_KEY_STALE;
+    }
+  }
 
   // Step 7: Execute operation handler
   crabs_error_e result;

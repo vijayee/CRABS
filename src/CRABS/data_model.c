@@ -54,6 +54,7 @@ state_t* state_create(void) {
   state->processed_op_count = 0;
   state->triggers = NULL;
   state->trigger_count = 0;
+  state->attr_machine = NULL;
   state->config.max_lock_duration_ms = CRABS_DEFAULT_LOCK_MS;
   state->config.max_lock_extensions = CRABS_MAX_LOCK_EXTENDS;
   state->config.allow_force_unlock = true;
