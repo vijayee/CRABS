@@ -27,6 +27,7 @@ if (BUILD_TESTING)
         test_attr_machine_extended.cpp
         test_crdt_extended.cpp
         test_trigger_contains.cpp
+        test_sig_scheme.cpp
         test_cli.cpp
     )
 
