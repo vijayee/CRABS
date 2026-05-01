@@ -35,6 +35,22 @@ static const transition_t TRANSITIONS[] = {
   {PROTOCOL_ERROR,    CRABS_OP_ROLLBACK,      PROTOCOL_IDLE},
   {PROTOCOL_ERROR,    CRABS_OP_FORCE_UNLOCK,  PROTOCOL_IDLE},
   {PROTOCOL_MODIFIED, CRABS_OP_VERIFY,        PROTOCOL_ERROR},
+  // Key operations (v1.3 §5): valid in any state, no state change
+  {PROTOCOL_IDLE,     CRABS_OP_REGISTER_KEY,    PROTOCOL_IDLE},
+  {PROTOCOL_IDLE,     CRABS_OP_REVOKE_KEY,      PROTOCOL_IDLE},
+  {PROTOCOL_IDLE,     CRABS_OP_SET_DEFAULT_KEY,  PROTOCOL_IDLE},
+  {PROTOCOL_LOCKED,   CRABS_OP_REGISTER_KEY,    PROTOCOL_LOCKED},
+  {PROTOCOL_LOCKED,   CRABS_OP_REVOKE_KEY,      PROTOCOL_LOCKED},
+  {PROTOCOL_LOCKED,   CRABS_OP_SET_DEFAULT_KEY,  PROTOCOL_LOCKED},
+  {PROTOCOL_MODIFIED, CRABS_OP_REGISTER_KEY,    PROTOCOL_MODIFIED},
+  {PROTOCOL_MODIFIED, CRABS_OP_REVOKE_KEY,      PROTOCOL_MODIFIED},
+  {PROTOCOL_MODIFIED, CRABS_OP_SET_DEFAULT_KEY,  PROTOCOL_MODIFIED},
+  {PROTOCOL_VERIFIED, CRABS_OP_REGISTER_KEY,    PROTOCOL_VERIFIED},
+  {PROTOCOL_VERIFIED, CRABS_OP_REVOKE_KEY,      PROTOCOL_VERIFIED},
+  {PROTOCOL_VERIFIED, CRABS_OP_SET_DEFAULT_KEY,  PROTOCOL_VERIFIED},
+  {PROTOCOL_ERROR,    CRABS_OP_REGISTER_KEY,    PROTOCOL_ERROR},
+  {PROTOCOL_ERROR,    CRABS_OP_REVOKE_KEY,      PROTOCOL_ERROR},
+  {PROTOCOL_ERROR,    CRABS_OP_SET_DEFAULT_KEY,  PROTOCOL_ERROR},
 };
 
 bool state_machine_is_valid_transition(protocol_state_e current, const char* op_type) {
@@ -64,7 +80,10 @@ bool operation_is_builtin(const char* type) {
           strcmp(type, CRABS_OP_CREATE_TRIGGER) == 0 ||
           strcmp(type, CRABS_OP_DELETE_TRIGGER) == 0 ||
           strcmp(type, CRABS_OP_DISABLE_TRIGGER) == 0 ||
-          strcmp(type, CRABS_OP_ENABLE_TRIGGER) == 0);
+          strcmp(type, CRABS_OP_ENABLE_TRIGGER) == 0 ||
+          strcmp(type, CRABS_OP_REGISTER_KEY) == 0 ||
+          strcmp(type, CRABS_OP_REVOKE_KEY) == 0 ||
+          strcmp(type, CRABS_OP_SET_DEFAULT_KEY) == 0);
 }
 
 operation_t* operation_create(const char* type) {
@@ -309,6 +328,12 @@ crabs_error_e state_machine_execute(state_t* state, operation_t* op) {
     refresh_key_response_t refresh_resp;
     memset(&refresh_resp, 0, sizeof(refresh_resp));
     result = state_machine_op_refresh_key(state, op, &refresh_resp);
+  } else if (strcmp(op->type, CRABS_OP_REGISTER_KEY) == 0) {
+    result = state_machine_op_register_key(state, op);
+  } else if (strcmp(op->type, CRABS_OP_REVOKE_KEY) == 0) {
+    result = state_machine_op_revoke_key(state, op);
+  } else if (strcmp(op->type, CRABS_OP_SET_DEFAULT_KEY) == 0) {
+    result = state_machine_op_set_default_key(state, op);
   } else {
     result = CRABS_ERR_INVALID_PARAM;
   }
@@ -512,6 +537,147 @@ crabs_error_e state_machine_op_change_config(state_t* state, operation_t* op) {
     if (eq != NULL) state->config.allow_force_unlock = (strcmp(eq + 1, "true") == 0);
   }
   return CRABS_SUCCESS;
+}
+
+// ============================================================
+// Key Ring Operations (v1.3 Amendment 3, §5)
+// ============================================================
+
+crabs_error_e state_machine_op_register_key(state_t* state, operation_t* op) {
+  if (state == NULL || op == NULL) return CRABS_ERR_INVALID_PARAM;
+  if (state->attr_machine == NULL) return CRABS_ERR_UNAUTHORIZED;
+
+  user_t* user = attribute_machine_find_user(state->attr_machine, op->signer_id);
+  if (user == NULL) return CRABS_ERR_USER_NOT_FOUND;
+  if (user->status == USER_SUSPENDED) return CRABS_ERR_USER_SUSPENDED;
+
+  // Payload format: key_id=<id>;scheme=<num>;public_key_len=<len>;label=<label>
+  // public_key bytes follow in payload after the null-terminated config string
+  if (op->payload == NULL || op->payload_size == 0) return CRABS_ERR_INVALID_PARAM;
+
+  char key_id[CRABS_MAX_KEY_ID] = {0};
+  signature_scheme_e scheme = SCHEME_UNSPECIFIED;
+  uint32_t pk_len = 0;
+  char label[CRABS_MAX_KEY_LABEL] = {0};
+  const uint8_t* pk_data = NULL;
+
+  // Parse key-value config from payload
+  char buf[1024];
+  uint32_t copy_len = op->payload_size < sizeof(buf) - 1 ? op->payload_size : sizeof(buf) - 1;
+  memcpy(buf, op->payload, copy_len);
+  buf[copy_len] = '\0';
+
+  char* saveptr = NULL;
+  char* token = strtok_r(buf, ";", &saveptr);
+
+  while (token != NULL) {
+    while (*token == ' ') token++;
+    char* eq = strchr(token, '=');
+    if (eq == NULL) { token = strtok_r(NULL, ";", &saveptr); continue; }
+
+    *eq = '\0';
+    const char* key = token;
+    const char* val = eq + 1;
+
+    if (strcmp(key, "key_id") == 0) {
+      strncpy(key_id, val, CRABS_MAX_KEY_ID - 1);
+    } else if (strcmp(key, "scheme") == 0) {
+      scheme = (signature_scheme_e)atoi(val);
+    } else if (strcmp(key, "public_key_len") == 0) {
+      pk_len = (uint32_t)atoi(val);
+    } else if (strcmp(key, "label") == 0) {
+      strncpy(label, val, CRABS_MAX_KEY_LABEL - 1);
+    }
+
+    token = strtok_r(NULL, ";", &saveptr);
+  }
+
+  // Find the public key data after the config string's null terminator
+  // The config string ends at the first \0 in the payload
+  size_t config_strlen = strnlen((const char*)op->payload, op->payload_size);
+  if (config_strlen + 1 + pk_len > op->payload_size) {
+    return CRABS_ERR_INVALID_PARAM;
+  }
+  pk_data = op->payload + config_strlen + 1;
+
+  if (key_id[0] == '\0' || pk_len == 0 || pk_data == NULL) {
+    return CRABS_ERR_INVALID_PARAM;
+  }
+
+  return user_key_register(user, key_id, scheme, pk_data, pk_len,
+                           label[0] != '\0' ? label : NULL);
+}
+
+crabs_error_e state_machine_op_revoke_key(state_t* state, operation_t* op) {
+  if (state == NULL || op == NULL) return CRABS_ERR_INVALID_PARAM;
+  if (state->attr_machine == NULL) return CRABS_ERR_UNAUTHORIZED;
+
+  user_t* user = attribute_machine_find_user(state->attr_machine, op->signer_id);
+  if (user == NULL) return CRABS_ERR_USER_NOT_FOUND;
+  if (user->status == USER_SUSPENDED) return CRABS_ERR_USER_SUSPENDED;
+
+  // Payload format: key_id=<id>
+  if (op->payload == NULL || op->payload_size == 0) return CRABS_ERR_INVALID_PARAM;
+
+  char key_id[CRABS_MAX_KEY_ID] = {0};
+  char buf[256];
+  uint32_t copy_len = op->payload_size < sizeof(buf) - 1 ? op->payload_size : sizeof(buf) - 1;
+  memcpy(buf, op->payload, copy_len);
+  buf[copy_len] = '\0';
+
+  char* saveptr = NULL;
+  char* token = strtok_r(buf, ";", &saveptr);
+  while (token != NULL) {
+    while (*token == ' ') token++;
+    char* eq = strchr(token, '=');
+    if (eq == NULL) { token = strtok_r(NULL, ";", &saveptr); continue; }
+
+    *eq = '\0';
+    if (strcmp(token, "key_id") == 0) {
+      strncpy(key_id, eq + 1, CRABS_MAX_KEY_ID - 1);
+    }
+    token = strtok_r(NULL, ";", &saveptr);
+  }
+
+  if (key_id[0] == '\0') return CRABS_ERR_INVALID_PARAM;
+
+  return user_key_revoke(user, key_id);
+}
+
+crabs_error_e state_machine_op_set_default_key(state_t* state, operation_t* op) {
+  if (state == NULL || op == NULL) return CRABS_ERR_INVALID_PARAM;
+  if (state->attr_machine == NULL) return CRABS_ERR_UNAUTHORIZED;
+
+  user_t* user = attribute_machine_find_user(state->attr_machine, op->signer_id);
+  if (user == NULL) return CRABS_ERR_USER_NOT_FOUND;
+  if (user->status == USER_SUSPENDED) return CRABS_ERR_USER_SUSPENDED;
+
+  // Payload format: key_id=<id>
+  if (op->payload == NULL || op->payload_size == 0) return CRABS_ERR_INVALID_PARAM;
+
+  char key_id[CRABS_MAX_KEY_ID] = {0};
+  char buf[256];
+  uint32_t copy_len = op->payload_size < sizeof(buf) - 1 ? op->payload_size : sizeof(buf) - 1;
+  memcpy(buf, op->payload, copy_len);
+  buf[copy_len] = '\0';
+
+  char* saveptr = NULL;
+  char* token = strtok_r(buf, ";", &saveptr);
+  while (token != NULL) {
+    while (*token == ' ') token++;
+    char* eq = strchr(token, '=');
+    if (eq == NULL) { token = strtok_r(NULL, ";", &saveptr); continue; }
+
+    *eq = '\0';
+    if (strcmp(token, "key_id") == 0) {
+      strncpy(key_id, eq + 1, CRABS_MAX_KEY_ID - 1);
+    }
+    token = strtok_r(NULL, ";", &saveptr);
+  }
+
+  if (key_id[0] == '\0') return CRABS_ERR_INVALID_PARAM;
+
+  return user_key_set_default(user, key_id);
 }
 
 // ============================================================

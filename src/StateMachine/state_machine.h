@@ -93,6 +93,11 @@ crabs_error_e  state_machine_op_delete_trigger(state_t* state, operation_t* op);
 crabs_error_e  state_machine_op_disable_trigger(state_t* state, operation_t* op);
 crabs_error_e  state_machine_op_enable_trigger(state_t* state, operation_t* op);
 
+// Built-in key operations (v1.3 Amendment 3, §5)
+crabs_error_e  state_machine_op_register_key(state_t* state, operation_t* op);
+crabs_error_e  state_machine_op_revoke_key(state_t* state, operation_t* op);
+crabs_error_e  state_machine_op_set_default_key(state_t* state, operation_t* op);
+
 // Key refresh operation (§11.3)
 typedef struct {
   uint8_t         envelope_data[1024];  // Serialized key envelope for transport

@@ -29,6 +29,7 @@ if (BUILD_TESTING)
         test_trigger_contains.cpp
         test_sig_scheme.cpp
         test_keyring.cpp
+        test_key_ops.cpp
         test_cli.cpp
     )
 
