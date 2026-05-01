@@ -31,6 +31,7 @@ if (BUILD_TESTING)
         test_keyring.cpp
         test_key_ops.cpp
         test_scheme_verify.cpp
+        test_policy_config.cpp
         test_cli.cpp
     )
 

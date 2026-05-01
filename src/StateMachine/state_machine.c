@@ -310,6 +310,47 @@ crabs_error_e state_machine_execute(state_t* state, operation_t* op) {
     }
   }
 
+  // Step 6b: Scheme constraint enforcement (v1.3 §7)
+  if (op->sig_scheme != SCHEME_UNSPECIFIED && state->policies != NULL) {
+    const policy_t* policy = NULL;
+    for (uint32_t i = 0; i < state->policy_count; i++) {
+      if (strcmp(state->policies[i].operation, op->type) == 0) {
+        policy = &state->policies[i];
+        break;
+      }
+    }
+    if (policy != NULL && policy->allowed_scheme_count > 0) {
+      bool scheme_allowed = false;
+      for (uint32_t i = 0; i < policy->allowed_scheme_count; i++) {
+        if (policy->allowed_schemes[i] == op->sig_scheme) {
+          scheme_allowed = true;
+          break;
+        }
+      }
+      if (!scheme_allowed) {
+        return CRABS_ERR_UNAUTHORIZED;
+      }
+    }
+    if (policy != NULL && policy->min_key_version > 0 && state->attr_machine != NULL) {
+      user_t* signer = attribute_machine_find_user(state->attr_machine, op->signer_id);
+      if (signer != NULL && signer->key_version < policy->min_key_version) {
+        return CRABS_ERR_KEY_STALE;
+      }
+    }
+  }
+
+  // Step 6c: Co-signature threshold enforcement (v1.3 §4.2)
+  if (state->config.sig_config.co_sign_threshold > 0 && op->co_signer_count < state->config.sig_config.co_sign_threshold) {
+    // Check if this operation type requires co-signatures
+    // Only enforce if threshold is set and operation has fewer co-signers
+    if (op->co_signer_count > 0 || op->sig_scheme != SCHEME_UNSPECIFIED) {
+      // If co-signers are present or scheme is specified, enforce threshold
+      if (op->co_signer_count < state->config.sig_config.co_sign_threshold) {
+        return CRABS_ERR_UNAUTHORIZED;
+      }
+    }
+  }
+
   // Step 7: Execute operation handler
   crabs_error_e result;
   if (strcmp(op->type, CRABS_OP_LOCK) == 0) {
@@ -547,6 +588,22 @@ crabs_error_e state_machine_op_change_config(state_t* state, operation_t* op) {
   if (strstr(payload_str, "allow_force_unlock") != NULL) {
     char* eq = strchr(payload_str, '=');
     if (eq != NULL) state->config.allow_force_unlock = (strcmp(eq + 1, "true") == 0);
+  }
+  if (strstr(payload_str, "default_scheme") != NULL) {
+    char* eq = strchr(payload_str, '=');
+    if (eq != NULL) state->config.sig_config.default_scheme = (signature_scheme_e)atoi(eq + 1);
+  }
+  if (strstr(payload_str, "max_keys_per_user") != NULL) {
+    char* eq = strchr(payload_str, '=');
+    if (eq != NULL) state->config.sig_config.max_keys_per_user = (uint32_t)atol(eq + 1);
+  }
+  if (strstr(payload_str, "key_rotation_enabled") != NULL) {
+    char* eq = strchr(payload_str, '=');
+    if (eq != NULL) state->config.sig_config.key_rotation_enabled = (strcmp(eq + 1, "true") == 0);
+  }
+  if (strstr(payload_str, "co_sign_threshold") != NULL) {
+    char* eq = strchr(payload_str, '=');
+    if (eq != NULL) state->config.sig_config.co_sign_threshold = (uint32_t)atol(eq + 1);
   }
   return CRABS_SUCCESS;
 }

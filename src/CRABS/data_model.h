@@ -8,6 +8,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include "crabs.h"
+#include "../Crypto/sig_scheme.h"
 
 // Forward declarations
 typedef struct trigger_t trigger_t;
@@ -116,21 +117,40 @@ typedef struct data_item_t {
 } data_item_t;
 
 // ============================================================
-// Policy (§4.3)
+// Policy (§4.3 + v1.3 §7)
 // ============================================================
+#define CRABS_MAX_ALLOWED_SCHEMES  8
+
 typedef struct {
   char  operation[CRABS_MAX_OP_NAME];
   char  expression[CRABS_MAX_POLICY_EXPR];
+  // v1.3: Scheme constraints
+  signature_scheme_e allowed_schemes[CRABS_MAX_ALLOWED_SCHEMES];
+  uint32_t           allowed_scheme_count;
+  uint64_t           min_key_version;
 } policy_t;
 
 // ============================================================
-// Machine Configuration (§4.4)
+// Signature Configuration (v1.3 §8)
+// ============================================================
+#define CRABS_DEFAULT_MAX_KEYS   8
+
+typedef struct {
+  signature_scheme_e default_scheme;
+  uint32_t          max_keys_per_user;
+  bool              key_rotation_enabled;
+  uint32_t          co_sign_threshold;
+} signature_config_t;
+
+// ============================================================
+// Machine Configuration (§4.4 + v1.3 §8)
 // ============================================================
 typedef struct {
   uint64_t max_lock_duration_ms;
   uint32_t max_lock_extensions;
   bool     allow_force_unlock;
   char     bootstrap_admin[CRABS_MAX_USER_ID];
+  signature_config_t sig_config;
 } machine_config_t;
 
 // ============================================================
