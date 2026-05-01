@@ -21,6 +21,7 @@ if (BUILD_TESTING)
         test_attribute_machine.cpp
         test_condition.cpp
         test_trigger.cpp
+        test_integration.cpp
     )
 
     add_dependencies(testcrabs crabs)
