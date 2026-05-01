@@ -22,6 +22,7 @@ if (BUILD_TESTING)
         test_condition.cpp
         test_trigger.cpp
         test_integration.cpp
+        test_data_model.cpp
         test_cli.cpp
     )
 
