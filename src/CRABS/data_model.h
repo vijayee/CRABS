@@ -1,0 +1,185 @@
+//
+// Created by victor on 3/30/25.
+//
+
+#ifndef CRABS_DATA_MODEL_H
+#define CRABS_DATA_MODEL_H
+
+#include <stdint.h>
+#include <stdbool.h>
+#include "crabs.h"
+
+// ============================================================
+// Data Types (§5.1)
+// ============================================================
+typedef enum {
+  DATA_TYPE_COUNTER     = 0x01,  // G-Counter
+  DATA_TYPE_PN_COUNTER  = 0x02,  // PN-Counter
+  DATA_TYPE_SET         = 0x03,  // OR-Set
+  DATA_TYPE_2P_SET      = 0x04,  // Two-phase set
+  DATA_TYPE_REGISTER    = 0x05,  // LWW-Register
+  DATA_TYPE_DOCUMENT    = 0x06,  // RGA
+  DATA_TYPE_RESOURCE    = 0x07,  // PN-Counter + lock
+  DATA_TYPE_CUSTOM      = 0xFF   // User-defined
+} data_type_e;
+
+// ============================================================
+// CRDT Strategies (§5.1)
+// ============================================================
+typedef enum {
+  CRDT_G_COUNTER   = 0x01,
+  CRDT_PN_COUNTER  = 0x02,
+  CRDT_OR_SET      = 0x03,
+  CRDT_2P_SET      = 0x04,
+  CRDT_LWW_REG     = 0x05,
+  CRDT_RGA         = 0x06,
+  CRDT_CUSTOM      = 0xFF
+} crdt_type_e;
+
+// ============================================================
+// Protocol State (§6.2)
+// ============================================================
+typedef enum {
+  PROTOCOL_IDLE     = 0x00,
+  PROTOCOL_LOCKED   = 0x01,
+  PROTOCOL_MODIFIED = 0x02,
+  PROTOCOL_VERIFIED = 0x03,
+  PROTOCOL_ERROR    = 0x04
+} protocol_state_e;
+
+// ============================================================
+// Invariant Type (§5.3)
+// ============================================================
+typedef enum {
+  INVARIANT_GREATER_THAN  = 0x01,
+  INVARIANT_LESS_THAN     = 0x02,
+  INVARIANT_EQUAL_TO      = 0x03,
+  INVARIANT_NOT_EQUAL     = 0x04,
+  INVARIANT_DIVISIBLE_BY  = 0x05,
+  INVARIANT_UNIQUE        = 0x06,
+  INVARIANT_SUBSET_OF     = 0x07,
+  INVARIANT_NON_NEGATIVE  = 0x08,
+  INVARIANT_CUSTOM        = 0xFF
+} invariant_type_e;
+
+// ============================================================
+// Data Type Definition (§5.2)
+// ============================================================
+typedef struct {
+  uint8_t     type_id;
+  const char* name;
+  bool        requires_lock;
+} data_type_definition_t;
+
+// ============================================================
+// Invariant (§5.3)
+// ============================================================
+typedef struct {
+  invariant_type_e type;
+  int64_t          param;
+  const char*      error_message;
+} invariant_t;
+
+// ============================================================
+// Lock State (embedded in DataItem for RESOURCE type)
+// ============================================================
+typedef struct {
+  uint8_t  lock_token[CRABS_LOCK_TOKEN_SIZE];
+  bool     lock_token_valid;
+  char     lock_owner[CRABS_MAX_USER_ID];
+  uint64_t lock_expiry;
+  uint32_t lock_extensions;
+  void*    pre_lock_snapshot;
+} lock_state_t;
+
+// ============================================================
+// DataItem (§4.2)
+// ============================================================
+typedef struct data_item_t {
+  char             name[CRABS_MAX_USER_ID];
+  data_type_e      type;
+  crdt_type_e      crdt_type;
+  void*            value;
+  protocol_state_e protocol_state;
+  invariant_t*     invariants;
+  uint32_t         invariant_count;
+
+  // Lock state (only for RESOURCE type)
+  lock_state_t     lock_state;
+
+  // Pointer-based linking
+  struct data_item_t* next;
+} data_item_t;
+
+// ============================================================
+// Policy (§4.3)
+// ============================================================
+typedef struct {
+  char  operation[CRABS_MAX_OP_NAME];
+  char  expression[CRABS_MAX_POLICY_EXPR];
+} policy_t;
+
+// ============================================================
+// Machine Configuration (§4.4)
+// ============================================================
+typedef struct {
+  uint64_t max_lock_duration_ms;
+  uint32_t max_lock_extensions;
+  bool     allow_force_unlock;
+  char     bootstrap_admin[CRABS_MAX_USER_ID];
+} machine_config_t;
+
+// ============================================================
+// Log Entry (§7.4 step 9)
+// ============================================================
+typedef struct {
+  uint64_t version;
+  uint8_t  uuid[CRABS_UUID_SIZE];
+  char     type[CRABS_MAX_OP_NAME];
+  char     signer_id[CRABS_MAX_USER_ID];
+  uint64_t lamport_time;
+  char     node_id[CRABS_MAX_USER_ID];
+  uint8_t  state_hash[CRABS_HASH_SIZE];
+} log_entry_t;
+
+// ============================================================
+// State (§4.1)
+// ============================================================
+typedef struct state_t {
+  uint64_t        version;
+  data_item_t*    items;
+  policy_t*       policies;
+  uint32_t        policy_count;
+  log_entry_t*    log;
+  uint64_t        log_count;
+  machine_config_t config;
+  uint8_t(*processed_ops)[CRABS_UUID_SIZE];
+  uint64_t        processed_op_count;
+} state_t;
+
+// ============================================================
+// Data Type Definitions (built-in registry)
+// ============================================================
+extern const data_type_definition_t CRABS_BUILTIN_TYPES[8];
+
+// ============================================================
+// DataItem creation/destruction
+// ============================================================
+data_item_t* data_item_create(const char* name, data_type_e type, crdt_type_e crdt_type);
+void         data_item_destroy(data_item_t* item);
+
+// ============================================================
+// State creation/destruction
+// ============================================================
+state_t*     state_create(void);
+void         state_destroy(state_t* state);
+
+// ============================================================
+// State query helpers
+// ============================================================
+data_item_t* state_find_item(state_t* state, const char* name);
+crabs_error_e state_add_item(state_t* state, data_item_t* item);
+crabs_error_e state_add_policy(state_t* state, const char* operation, const char* expression);
+const char*  state_find_policy(state_t* state, const char* operation);
+
+#endif // CRABS_DATA_MODEL_H
