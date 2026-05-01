@@ -1,73 +1,96 @@
-CRABS Protocol Specification v1.0
-Cryptographic Role-based Attribute-gated Blockchain-like State Machines
-Document Status: Draft Specification
-Last Updated: April 30, 2026
-Protocol Version: 1.0.0
-License: MIT
+# CRABS Protocol Specification v1.0
 
-Table of Contents
-Introduction
-Notation and Conventions
-System Model
-Data Model
-Data Types
-Protocol State Machine
-Operations
-The Attribute Machine
-Locking Protocol
-Cryptographic Primitives
-Key Management
-CRDT Merge Rules
-Serialization
-Security Considerations
-Implementation Guidelines
-Test Vectors
-1. Introduction
-1.1 Purpose
+## *Cryptographic Attribute Based State Machines*
+
+---
+
+**Document Status:** Draft Specification  
+**Last Updated:** April 30, 2026  
+**Protocol Version:** 1.0.0  
+**License:** MIT
+
+---
+
+# Table of Contents
+
+1. [Introduction](#1-introduction)
+2. [Notation and Conventions](#2-notation-and-conventions)
+3. [System Model](#3-system-model)
+4. [Data Model](#4-data-model)
+5. [Data Types](#5-data-types)
+6. [Protocol State Machine](#6-protocol-state-machine)
+7. [Operations](#7-operations)
+8. [The Attribute Machine](#8-the-attribute-machine)
+9. [Locking Protocol](#9-locking-protocol)
+10. [Cryptographic Primitives](#10-cryptographic-primitives)
+11. [Key Management](#11-key-management)
+12. [CRDT Merge Rules](#12-crdt-merge-rules)
+13. [Serialization](#13-serialization)
+14. [Security Considerations](#14-security-considerations)
+15. [Implementation Guidelines](#15-implementation-guidelines)
+16. [Test Vectors](#16-test-vectors)
+
+---
+
+# 1. Introduction
+
+## 1.1 Purpose
+
 The CRABS protocol defines a framework for decentralized, attribute-based authorization using state machines whose state converges via Conflict-free Replicated Data Types (CRDTs). It unifies Attribute-Based Encryption (ABE) with protocol state machines to create a system where:
 
-Attributes are state — The set of all users and their attributes is the state of a protocol-governed machine
-Authorization is cryptographic — Operations are gated by ABE policies and authenticated via ECDSA signatures
-State is convergent — CRDT merge rules ensure all nodes reach the same state without consensus
-Resources are protected — Atomic multi-resource locking with timeout-based liveness guarantees
-1.2 Scope
+- **Attributes are state** — The set of all users and their attributes is the state of a protocol-governed machine
+- **Authorization is cryptographic** — Operations are gated by ABE policies and authenticated via ECDSA signatures
+- **State is convergent** — CRDT merge rules ensure all nodes reach the same state without consensus
+- **Resources are protected** — Atomic multi-resource locking with timeout-based liveness guarantees
+
+## 1.2 Scope
+
 This specification covers:
 
-The CRABS data model and type system
-The protocol state machine for resource lifecycle management
-The operation format and execution semantics
-The Attribute Machine for self-sovereign identity
-The locking protocol with atomic acquisition and timeout
-CRDT merge rules for all built-in types
-Key management and versioning
-Security properties and threat model
-1.3 Conformance
+- The CRABS data model and type system
+- The protocol state machine for resource lifecycle management
+- The operation format and execution semantics
+- The Attribute Machine for self-sovereign identity
+- The locking protocol with atomic acquisition and timeout
+- CRDT merge rules for all built-in types
+- Key management and versioning
+- Security properties and threat model
+
+## 1.3 Conformance
+
 A CRABS implementation MUST implement all REQUIRED components and SHOULD implement RECOMMENDED components. Implementation-defined behavior is explicitly noted.
 
-2. Notation and Conventions
-2.1 Data Types
-Notation	Description
-uint8_t	Unsigned 8-bit integer
-uint16_t	Unsigned 16-bit integer
-uint32_t	Unsigned 32-bit integer
-uint64_t	Unsigned 64-bit integer
-byte[N]	N-byte sequence
-string	UTF-8 encoded string, null-terminated
-T[]	Variable-length array of type T
-{k1: T1, k2: T2}	Map/dictionary type
-2.2 Cryptographic Primitives
-Notation	Description
-SHA256(x)	SHA-256 hash of data x
-ABE_setup()	Generate ABE master public/secret keys
-ABE_keygen(msk, mpk, attrs)	Generate ABE user key from attributes
-ABE_encrypt(mpk, msg, policy)	Encrypt message under policy
-ABE_decrypt(sk, ct)	Decrypt ciphertext with user key
-ECDSA_sign(sk, msg)	Sign message with ECDSA private key
-ECDSA_verify(pk, msg, sig)	Verify ECDSA signature
-RAND_bytes(buf, len)	Cryptographically secure random bytes
-2.3 Protocol Constants
-c
+---
 
+# 2. Notation and Conventions
+
+## 2.1 Data Types
+
+Notation	Description
+`uint8_t`	Unsigned 8-bit integer
+`uint16_t`	Unsigned 16-bit integer
+`uint32_t`	Unsigned 32-bit integer
+`uint64_t`	Unsigned 64-bit integer
+`byte[N]`	N-byte sequence
+`string`	UTF-8 encoded string, null-terminated
+`T[]`	Variable-length array of type T
+`{k1: T1, k2: T2}`	Map/dictionary type
+
+## 2.2 Cryptographic Primitives
+
+Notation	Description
+`SHA256(x)`	SHA-256 hash of data x
+`ABE_setup()`	Generate ABE master public/secret keys
+`ABE_keygen(msk, mpk, attrs)`	Generate ABE user key from attributes
+`ABE_encrypt(mpk, msg, policy)`	Encrypt message under policy
+`ABE_decrypt(sk, ct)`	Decrypt ciphertext with user key
+`ECDSA_sign(sk, msg)`	Sign message with ECDSA private key
+`ECDSA_verify(pk, msg, sig)`	Verify ECDSA signature
+`RAND_bytes(buf, len)`	Cryptographically secure random bytes
+
+## 2.3 Protocol Constants
+
+```c
 #define CRABS_HASH_SIZE         32   // SHA-256 output
 #define CRABS_SIG_SIZE          64   // ECDSA secp256k1 signature
 #define CRABS_MAX_USER_ID       64   // Maximum user ID length
@@ -78,39 +101,55 @@ c
 #define CRABS_MAX_LOG_ENTRIES   0    // Unlimited (0 = no limit)
 #define CRABS_DEFAULT_LOCK_MS   5000 // Default lock timeout (5 seconds)
 #define CRABS_MAX_LOCK_EXTENDS  3    // Maximum lock extensions
-3. System Model
-3.1 Participants
+```
+
+---
+
+# 3. System Model
+
+## 3.1 Participants
+
 Participant	Role	Description
-Node	State machine host	Maintains a replica of the state, processes operations
-User	Protocol participant	Has attributes, signs operations, holds ABE keys
-Attribute Machine	Root state machine	Governs all user attributes and policies
-Application Machine	Domain state machine	Governs application-specific state (treasury, documents, etc.)
-3.2 Network Model
-CRABS assumes an asynchronous network with the following properties:
+**Node**	State machine host	Maintains a replica of the state, processes operations
+**User**	Protocol participant	Has attributes, signs operations, holds ABE keys
+**Attribute Machine**	Root state machine	Governs all user attributes and policies
+**Application Machine**	Domain state machine	Governs application-specific state (treasury, documents, etc.)
 
-Messages may be delayed, reordered, or dropped
-Nodes communicate over point-to-point authenticated channels
-No global clock is assumed (though local clocks are used for lock expiry with generous margins)
-The network is eventually reliable (messages eventually arrive if retransmitted)
-3.3 Trust Model
+## 3.2 Network Model
+
+CRABS assumes an **asynchronous network** with the following properties:
+
+- Messages may be delayed, reordered, or dropped
+- Nodes communicate over point-to-point authenticated channels
+- No global clock is assumed (though local clocks are used for lock expiry with generous margins)
+- The network is eventually reliable (messages eventually arrive if retransmitted)
+
+## 3.3 Trust Model
+
 Trust Assumption	Description
-Honest majority of nodes	At least f+1 nodes behave correctly (for f Byzantine faults)
-Users control their signing keys	ECDSA private keys are stored securely by users
-ABE MSK is protected	The Master Secret Key is stored only on nodes, never exposed to users
-No quantum adversary	Bilinear pairings are assumed secure against classical attacks
-3.4 Consistency Model
-CRABS provides eventual consistency:
+**Honest majority of nodes**	At least f+1 nodes behave correctly (for f Byzantine faults)
+**Users control their signing keys**	ECDSA private keys are stored securely by users
+**ABE MSK is protected**	The Master Secret Key is stored only on nodes, never exposed to users
+**No quantum adversary**	Bilinear pairings are assumed secure against classical attacks
 
-All correct nodes that have processed the same set of operations will converge to the same state
-CRDT merge rules are deterministic and commutative
-Temporary divergence is possible during network partitions
-Lock acquisition provides a linearizability point for resource operations
-4. Data Model
-4.1 State Structure
-A CRABS state is a bag of named data items, each with a type, value, protocol state, and metadata:
+## 3.4 Consistency Model
 
-plaintext
+CRABS provides **eventual consistency**:
 
+- All correct nodes that have processed the same set of operations will converge to the same state
+- CRDT merge rules are deterministic and commutative
+- Temporary divergence is possible during network partitions
+- Lock acquisition provides a linearizability point for resource operations
+
+---
+
+# 4. Data Model
+
+## 4.1 State Structure
+
+A CRABS state is a **bag of named data items**, each with a type, value, protocol state, and metadata:
+
+```
 State = {
     version: uint64,
     items: {
@@ -125,9 +164,11 @@ State = {
     log: TransitionLog,
     config: MachineConfig
 }
-4.2 Data Item
-plaintext
+```
 
+## 4.2 Data Item
+
+```
 DataItem = {
     type: DataType,
     crdt_type: CrdtType,
@@ -142,45 +183,57 @@ DataItem = {
     lock_extensions: uint32,
     pre_lock_snapshot: any | null
 }
-4.3 Policy
+```
+
+## 4.3 Policy
+
 A policy maps an operation name to an ABE policy expression:
 
-plaintext
-
+```plaintext
 Policy = {
     operation: string,   // e.g., "transfer", "lock"
     expression: string   // e.g., "role:admin OR (role:member AND weight >= 3)"
 }
+```
+
 Policy expressions use the CP-ABE syntax:
 
 Expression	Meaning
-attr1 AND attr2	Both attributes required
-attr1 OR attr2	Either attribute sufficient
-2of3(attr1, attr2, attr3)	Any 2 of the 3 required
-(A OR B) AND C	Grouped expressions
-4.4 Machine Configuration
-plaintext
+`attr1 AND attr2`	Both attributes required
+`attr1 OR attr2`	Either attribute sufficient
+`2of3(attr1, attr2, attr3)`	Any 2 of the 3 required
+`(A OR B) AND C`	Grouped expressions
 
+## 4.4 Machine Configuration
+
+```plaintext
 MachineConfig = {
     max_lock_duration_ms: uint64,   // Default: 5000
     max_lock_extensions: uint32,    // Default: 3
     allow_force_unlock: bool,       // Default: true
     bootstrap_admin: string | null  // User ID of genesis admin
 }
-5. Data Types
-5.1 Built-in Types
-Type ID	Name	CRDT Strategy	Lock Required	Description
-0x01	COUNTER	G-Counter	No	Grow-only counter
-0x02	PN_COUNTER	PN-Counter	For transfers	Positive/negative counter
-0x03	SET	OR-Set	No	Observed-remove set
-0x04	2P_SET	Two-phase set	No	Add-then-remove set
-0x05	REGISTER	LWW-Register	No	Last-writer-wins register
-0x06	DOCUMENT	RGA	No	Replicated growable array
-0x07	RESOURCE	PN-Counter + lock	Yes	Scarce item with protocol
-0xFF	CUSTOM	User-defined	Configurable	Application-defined
-5.2 Type Definition
-plaintext
+```
 
+---
+
+# 5. Data Types
+
+## 5.1 Built-in Types
+
+Type ID	Name	CRDT Strategy	Lock Required	Description
+`0x01`	`COUNTER`	G-Counter	No	Grow-only counter
+`0x02`	`PN_COUNTER`	PN-Counter	For transfers	Positive/negative counter
+`0x03`	`SET`	OR-Set	No	Observed-remove set
+`0x04`	`2P_SET`	Two-phase set	No	Add-then-remove set
+`0x05`	`REGISTER`	LWW-Register	No	Last-writer-wins register
+`0x06`	`DOCUMENT`	RGA	No	Replicated growable array
+`0x07`	`RESOURCE`	PN-Counter + lock	**Yes**	Scarce item with protocol
+`0xFF`	`CUSTOM`	User-defined	Configurable	Application-defined
+
+## 5.2 Type Definition
+
+```
 DataTypeDefinition = {
     type_id: uint8,
     name: string,
@@ -188,9 +241,11 @@ DataTypeDefinition = {
     requires_lock: bool,
     default_invariants: Invariant[]
 }
-5.3 Invariants
-plaintext
+```
 
+## 5.3 Invariants
+
+```
 Invariant = {
     type: InvariantType,
     params: any,
@@ -208,12 +263,17 @@ InvariantType = enum {
     NON_NEGATIVE    = 0x08,  // value >= 0
     CUSTOM          = 0xFF   // User-defined callback
 }
-6. Protocol State Machine
-6.1 Resource Protocol States
-Every data item of type RESOURCE follows this protocol state machine:
+```
 
-plaintext
+---
 
+# 6. Protocol State Machine
+
+## 6.1 Resource Protocol States
+
+Every data item of type `RESOURCE` follows this protocol state machine:
+
+```plaintext
 ┌─────────────────────────────────────────────────────────────┐
 │                    RESOURCE PROTOCOL                          │
 │                                                              │
@@ -235,9 +295,11 @@ plaintext
 │    ERROR    ──__rollback__──► IDLE                           │
 │    ERROR    ──__force_unlock__──► IDLE                       │
 └─────────────────────────────────────────────────────────────┘
-6.2 Protocol State Encoding
-plaintext
+```
 
+## 6.2 Protocol State Encoding
+
+```
 ProtocolState = enum {
     IDLE    = 0x00,
     LOCKED  = 0x01,
@@ -245,23 +307,30 @@ ProtocolState = enum {
     VERIFIED = 0x03,
     ERROR   = 0x04
 }
-6.3 Valid Transition Table
-Current State	Operation	Next State	Condition
-IDLE	__lock__	LOCKED	Policy satisfied
-LOCKED	__extend__	LOCKED	Same owner, under limit
-LOCKED	Any user operation	MODIFIED	Lock token matches
-MODIFIED	__verify__	VERIFIED	All invariants pass
-MODIFIED	__verify__	ERROR	Any invariant fails
-MODIFIED	__rollback__	IDLE	Same owner
-VERIFIED	__unlock__	IDLE	Same owner
-LOCKED	__force_unlock__	IDLE	Lock expired
-MODIFIED	__force_unlock__	IDLE	Lock expired
-ERROR	__rollback__	IDLE	Anyone
-ERROR	__force_unlock__	IDLE	Lock expired
-7. Operations
-7.1 Operation Structure
-plaintext
+```
 
+## 6.3 Valid Transition Table
+
+Current State	Operation	Next State	Condition
+`IDLE`	`__lock__`	`LOCKED`	Policy satisfied
+`LOCKED`	`__extend__`	`LOCKED`	Same owner, under limit
+`LOCKED`	Any user operation	`MODIFIED`	Lock token matches
+`MODIFIED`	`__verify__`	`VERIFIED`	All invariants pass
+`MODIFIED`	`__verify__`	`ERROR`	Any invariant fails
+`MODIFIED`	`__rollback__`	`IDLE`	Same owner
+`VERIFIED`	`__unlock__`	`IDLE`	Same owner
+`LOCKED`	`__force_unlock__`	`IDLE`	Lock expired
+`MODIFIED`	`__force_unlock__`	`IDLE`	Lock expired
+`ERROR`	`__rollback__`	`IDLE`	Anyone
+`ERROR`	`__force_unlock__`	`IDLE`	Lock expired
+
+---
+
+# 7. Operations
+
+## 7.1 Operation Structure
+
+```
 Operation = {
     // Operation identity
     type: string,                    // e.g., "transfer", "__lock__"
@@ -291,19 +360,24 @@ Operation = {
     lamport_time: uint64,            // Lamport clock value
     node_id: string                  // Originating node ID
 }
-7.2 Lock Claim
-plaintext
+```
 
+## 7.2 Lock Claim
+
+```plaintext
 LockClaim = {
     resource: string,    // Resource name
     lock_token: byte[32] // Random token from lock acquisition
 }
-7.3 Built-in Operations
-7.3.1 __lock__
+```
+
+## 7.3 Built-in Operations
+
+### 7.3.1 `__lock__`
+
 Acquire exclusive access to one or more resources atomically.
 
-plaintext
-
+```plaintext
 Operation = {
     type: "__lock__",
     resources: ["<resource1>", "<resource2>", ...],
@@ -312,20 +386,23 @@ Operation = {
     policy: "<lock_policy>",
     // Lock tokens are generated by the node and returned in response
 }
-Response:
+```
 
-plaintext
+**Response:**
 
+```plaintext
 LockResponse = {
     success: bool,
     lock_tokens: byte[32][],  // One random token per resource
     expiry: uint64            // Lock expiration timestamp
 }
-7.3.2 __extend__
+```
+
+### 7.3.2 `__extend__`
+
 Extend an existing lock's expiry time.
 
-plaintext
-
+```
 Operation = {
     type: "__extend__",
     resources: ["<resource>"],
@@ -334,11 +411,13 @@ Operation = {
     lock_claims: [{resource: "<resource>", lock_token: <token>}],
     policy: "<lock_policy>"
 }
-7.3.3 __verify__
+```
+
+### 7.3.3 `__verify__`
+
 Check invariants on a modified resource.
 
-plaintext
-
+```
 Operation = {
     type: "__verify__",
     resources: ["<resource>"],
@@ -347,13 +426,15 @@ Operation = {
     lock_claims: [{resource: "<resource>", lock_token: <token>}],
     policy: "<lock_policy>"
 }
-Note: The state machine checks all invariants defined for the resource's type. If all pass, state becomes VERIFIED. If any fail, state becomes ERROR.
+```
 
-7.3.4 __rollback__
+**Note:** The state machine checks all invariants defined for the resource's type. If all pass, state becomes `VERIFIED`. If any fail, state becomes `ERROR`.
+
+### 7.3.4 `__rollback__`
+
 Revert a resource to its pre-lock state.
 
-plaintext
-
+```plaintext
 Operation = {
     type: "__rollback__",
     resources: ["<resource>"],
@@ -362,11 +443,13 @@ Operation = {
     lock_claims: [{resource: "<resource>", lock_token: <token>}],
     policy: "<lock_policy>"
 }
-7.3.5 __unlock__
+```
+
+### 7.3.5 `__unlock__`
+
 Release a lock after successful verification.
 
-plaintext
-
+```plaintext
 Operation = {
     type: "__unlock__",
     resources: ["<resource>"],
@@ -375,11 +458,13 @@ Operation = {
     lock_claims: [{resource: "<resource>", lock_token: <token>}],
     policy: "<lock_policy>"
 }
-7.3.6 __force_unlock__
+```
+
+### 7.3.6 `__force_unlock__`
+
 Release an expired lock (anyone can call).
 
-plaintext
-
+```
 Operation = {
     type: "__force_unlock__",
     resources: ["<resource>"],
@@ -388,11 +473,13 @@ Operation = {
     // No lock token required — anyone can force-unlock expired locks
     policy: "<force_unlock_policy>"
 }
-7.3.7 __refresh_abe_key__
+```
+
+### 7.3.7 `__refresh_abe_key__`
+
 Request a new ABE key derived from current attribute state.
 
-plaintext
-
+```
 Operation = {
     type: "__refresh_abe_key__",
     resources: [],
@@ -400,20 +487,24 @@ Operation = {
     policy: "role:member",
     // No resources to lock — this reads from the Attribute Machine
 }
-7.3.8 __change_config__
+```
+
+### 7.3.8 `__change_config__`
+
 Change the machine configuration (lock timeouts, etc.).
 
-plaintext
-
+```plaintext
 Operation = {
     type: "__change_config__",
     resources: [],
     payload: {"max_lock_duration_ms": 10000},
     policy: "role:admin AND weight >= 3"
 }
-7.4 Operation Execution Algorithm
-plaintext
+```
 
+## 7.4 Operation Execution Algorithm
+
+```
 Algorithm: EXECUTE_OPERATION
 
 Input:
@@ -495,11 +586,13 @@ Output:
     state.processed_ops.add(op.uuid)
 
 10. return SUCCESS
-7.5 Serialization for Signing
+```
+
+## 7.5 Serialization for Signing
+
 The serialization format for signing MUST be deterministic to ensure signature verification is portable across implementations:
 
-plaintext
-
+```plaintext
 Algorithm: SERIALIZE_FOR_SIGNING
 
 Input:
@@ -526,13 +619,19 @@ Output:
 2. return canonical_encode(fields)
    // Canonical encoding: sorted map keys, fixed-width integers,
    // length-prefixed strings, no whitespace
-8. The Attribute Machine
-8.1 Purpose
-The Attribute Machine is a CRABS state machine whose state IS the set of all users and their attributes. It is the root of trust for the entire system — all other machines reference its state for authorization decisions.
+```
 
-8.2 State Structure
-plaintext
+---
 
+# 8. The Attribute Machine
+
+## 8.1 Purpose
+
+The Attribute Machine is a CRABS state machine whose state IS the set of all users and their attributes. It is the **root of trust** for the entire system — all other machines reference its state for authorization decisions.
+
+## 8.2 State Structure
+
+```
 AttributeMachine State = {
     // Inherits all standard CRABS state fields
     
@@ -577,11 +676,13 @@ UserStatus = enum {
     SUSPENDED = 0x01,
     REVOKED  = 0x02
 }
-8.3 Genesis
+```
+
+## 8.3 Genesis
+
 The Attribute Machine is created with a single bootstrap admin:
 
-plaintext
-
+```plaintext
 Algorithm: ATTRIBUTE_MACHINE_GENESIS
 
 Input:
@@ -623,10 +724,13 @@ Output:
     })
 
 13. return state
-8.4 Attribute Operations
-8.4.1 Register User
-plaintext
+```
 
+## 8.4 Attribute Operations
+
+### 8.4.1 Register User
+
+```
 Algorithm: REGISTER_USER
 
 Operation:
@@ -640,9 +744,11 @@ Effect:
   3. Generate initial ABE key
   4. Return ABE key to user via secure channel
   5. Log: "{signer_id} registered {user_id} with {initial_attrs}"
-8.4.2 Grant Role
-plaintext
+```
 
+### 8.4.2 Grant Role
+
+```plaintext
 Algorithm: GRANT_ROLE
 
 Operation:
@@ -655,9 +761,11 @@ Effect:
   2. Add or update role attribute
   3. Increment target_user.key_version
   4. Log: "{signer_id} granted {role} to {target_user}"
-8.4.3 Self-Assert Attribute
-plaintext
+```
 
+### 8.4.3 Self-Assert Attribute
+
+```plaintext
 Algorithm: SELF_ASSERT
 
 Operation:
@@ -669,9 +777,11 @@ Effect:
   1. Add attribute with verified_by = null
   2. Increment signer's key_version
   3. Log: "{signer_id} self-asserted {attribute} = {value}"
-8.4.4 Verify Identity
-plaintext
+```
 
+### 8.4.4 Verify Identity
+
+```
 Algorithm: VERIFY_IDENTITY
 
 Operation:
@@ -684,9 +794,11 @@ Effect:
   2. Set attribute with verified_by = signer_id
   3. Increment target_user.key_version
   4. Log: "{signer_id} verified {target_user}'s {attribute} = {value}"
-8.4.5 Revoke Role
-plaintext
+```
 
+### 8.4.5 Revoke Role
+
+```
 Algorithm: REVOKE_ROLE
 
 Operation:
@@ -698,9 +810,11 @@ Effect:
   1. Remove the specified role attribute
   2. Increment target_user.key_version
   3. Log: "{signer_id} revoked {role} from {target_user}"
-8.5 Key Refresh
-plaintext
+```
 
+## 8.5 Key Refresh
+
+```
 Algorithm: REFRESH_ABE_KEY
 
 Input:
@@ -738,10 +852,15 @@ Output:
 13. user.updated_at = now()
 
 14. return envelope
-9. Locking Protocol
-9.1 Lock Manager
-plaintext
+```
 
+---
+
+# 9. Locking Protocol
+
+## 9.1 Lock Manager
+
+```
 LockManager = {
     config: {
         max_duration_ms: uint64,    // Default: 5000
@@ -760,9 +879,11 @@ LockManager = {
         ...
     }
 }
-9.2 Atomic Lock Acquisition
-plaintext
+```
 
+## 9.2 Atomic Lock Acquisition
+
+```plaintext
 Algorithm: ATOMIC_ACQUIRE_LOCKS
 
 Input:
@@ -819,9 +940,11 @@ rollback:
 39.     item.pre_lock_snapshot = null
 
 40. return LOCK_CONTENTION
-9.3 Lock Extension
-plaintext
+```
 
+## 9.3 Lock Extension
+
+```
 Algorithm: EXTEND_LOCK
 
 Input:
@@ -853,9 +976,11 @@ Output:
 8. item.lock_extensions += 1
 
 9. return {new_expiry: item.lock_expiry}
-9.4 Force Unlock
-plaintext
+```
 
+## 9.4 Force Unlock
+
+```plaintext
 Algorithm: FORCE_UNLOCK
 
 Input:
@@ -900,11 +1025,13 @@ Output:
      })
 
 15. return SUCCESS
-9.5 Lock Expiry Pruning
+```
+
+## 9.5 Lock Expiry Pruning
+
 Called at the start of every operation:
 
-plaintext
-
+```plaintext
 Algorithm: PRUNE_EXPIRED_LOCKS
 
 Input:
@@ -920,13 +1047,19 @@ Output:
 5.             FORCE_UNLOCK(state, name, "__system__")
 6.             pruned += 1
 7. return pruned
-10. Cryptographic Primitives
-10.1 ABE Scheme
-CRABS uses Ciphertext-Policy Attribute-Based Encryption (CP-ABE) as defined by Bethencourt, Sahai, and Waters (2007).
+```
 
-10.1.1 Setup
-plaintext
+---
 
+# 10. Cryptographic Primitives
+
+## 10.1 ABE Scheme
+
+CRABS uses **Ciphertext-Policy Attribute-Based Encryption (CP-ABE)** as defined by Bethencourt, Sahai, and Waters (2007).
+
+### 10.1.1 Setup
+
+```plaintext
 Algorithm: ABE_SETUP
 
 Output:
@@ -937,9 +1070,11 @@ Output:
 2. mpk = (g, g^α, e(g,g)^β, ...)
 3. msk = (β, g^α, ...)
 4. return (mpk, msk)
-10.1.2 Key Generation
-plaintext
+```
 
+### 10.1.2 Key Generation
+
+```plaintext
 Algorithm: ABE_KEYGEN
 
 Input:
@@ -954,9 +1089,11 @@ Output:
 2. Generate random r, r_j for each attribute j in S
 3. sk = (D = g^{(α+r)/β}, {D_j = g^r · H(j)^{r_j}, D'_j = g^{r_j}})
 4. return sk
-10.1.3 Encryption
-plaintext
+```
 
+### 10.1.3 Encryption
+
+```
 Algorithm: ABE_ENCRYPT
 
 Input:
@@ -972,9 +1109,11 @@ Output:
 3. ct = (T, C = msg · e(g,g)^{αs}, C' = g^s,
           {C_y = g^{q_y(0)}, C'_y = H(att(y))^{q_y(0)}})
 4. return ct
-10.1.4 Decryption
-plaintext
+```
 
+### 10.1.4 Decryption
+
+```plaintext
 Algorithm: ABE_DECRYPT
 
 Input:
@@ -990,12 +1129,15 @@ Output:
 4. If root satisfied: A = e(g,g)^{rs}
 5. msg = C / (e(C', D) / A) = C / e(g,g)^{αs}
 6. return msg
-10.2 ECDSA Signatures
-CRABS uses ECDSA with secp256k1 curve for operation signatures.
+```
 
-10.2.1 Signing
-plaintext
+## 10.2 ECDSA Signatures
 
+CRABS uses **ECDSA with secp256k1** curve for operation signatures.
+
+### 10.2.1 Signing
+
+```plaintext
 Algorithm: OPERATION_SIGN
 
 Input:
@@ -1009,9 +1151,11 @@ Output:
 2. hash = SHA256(msg_bytes)
 3. signature = ECDSA_sign(sk_ecdsa, hash)
 4. return signature
-10.2.2 Verification
-plaintext
+```
 
+### 10.2.2 Verification
+
+```plaintext
 Algorithm: OPERATION_VERIFY
 
 Input:
@@ -1025,11 +1169,13 @@ Output:
 1. msg_bytes = SERIALIZE_FOR_SIGNING(op)
 2. hash = SHA256(msg_bytes)
 3. return ECDSA_verify(pk_ecdsa, hash, signature)
-10.3 ABE-Gated Signatures
+```
+
+## 10.3 ABE-Gated Signatures
+
 The core authorization mechanism combines ABE and ECDSA:
 
-plaintext
-
+```
 Algorithm: VERIFY_OPERATION_AUTHORIZATION
 
 Input:
@@ -1070,9 +1216,11 @@ Output:
             if OPERATION_VERIFY(user.public_key, op, op.signature):
                 return true  // Some authorized user signed this
         return false  // No authorized user's key verifies the signature
-10.4 Key Version Verification
-plaintext
+```
 
+## 10.4 Key Version Verification
+
+```
 Algorithm: VERIFY_KEY_VERSION
 
 Input:
@@ -1097,10 +1245,15 @@ Output:
         //  Please refresh your key."
 
 5. return true
-11. Key Management
-11.1 Key Hierarchy
-plaintext
+```
 
+---
+
+# 11. Key Management
+
+## 11.1 Key Hierarchy
+
+```
 ┌─────────────────────────────────────────────────────────────┐
 │                    KEY HIERARCHY                              │
 │                                                              │
@@ -1132,9 +1285,11 @@ plaintext
 │    ├── Ephemeral: Generated per lock acquisition             │
 │    └── Expire: With the lock                                 │
 └─────────────────────────────────────────────────────────────┘
-11.2 Key Envelope Format
-plaintext
+```
 
+## 11.2 Key Envelope Format
+
+```
 KeyEnvelope = {
     format_version: uint8 = 0x01,
     user_id: string,
@@ -1145,9 +1300,11 @@ KeyEnvelope = {
     sk_abe: byte[],           // ABE secret key (implementation-specific)
     signature: byte[64]       // Signed by the node for authenticity
 }
-11.3 Key Refresh Flow
-plaintext
+```
 
+## 11.3 Key Refresh Flow
+
+```
 1. User detects their key is stale (operation rejected with KEY_STALE)
 
 2. User creates __refresh_abe_key__ operation:
@@ -1171,9 +1328,11 @@ plaintext
    b. Store new key
    c. Discard old key
    d. Retry failed operation with new key
-11.4 Key Compromise Recovery
-plaintext
+```
 
+## 11.4 Key Compromise Recovery
+
+```
 Algorithm: REVOKE_AND_ROTATE_KEYS
 
 Input:
@@ -1209,10 +1368,15 @@ Input:
 
 14. // Return new keys (delivered via secure out-of-band channel)
 15. return {sk_ecdsa: new_sk, sk_abe: new_sk_abe}
-12. CRDT Merge Rules
-12.1 General Merge Algorithm
-plaintext
+```
 
+---
+
+# 12. CRDT Merge Rules
+
+## 12.1 General Merge Algorithm
+
+```
 Algorithm: CRDT_MERGE
 
 Input:
@@ -1242,10 +1406,13 @@ Output:
 14. merged.version = max(state_a.version, state_b.version)
 
 15. return merged
-12.2 Per-Type Merge Functions
-12.2.1 G-Counter (COUNTER)
-plaintext
+```
 
+## 12.2 Per-Type Merge Functions
+
+### 12.2.1 G-Counter (COUNTER)
+
+```
 Algorithm: MERGE_G_COUNTER
 
 Input:
@@ -1263,9 +1430,11 @@ Output:
 4. return merged
 
 // Total value: sum of all elements
-12.2.2 PN-Counter (PN_COUNTER)
-plaintext
+```
 
+### 12.2.2 PN-Counter (PN_COUNTER)
+
+```plaintext
 Algorithm: MERGE_PN_COUNTER
 
 Input:
@@ -1279,9 +1448,11 @@ Output:
 3. return merged
 
 // Total value: sum(pos) - sum(neg)
-12.2.3 OR-Set (SET)
-plaintext
+```
 
+### 12.2.3 OR-Set (SET)
+
+```plaintext
 Algorithm: MERGE_OR_SET
 
 Input:
@@ -1298,9 +1469,11 @@ Output:
 // Add: element added with unique tag (node_id + counter)
 // Remove: element tag added to tombstones
 // Element is visible iff tag is in elements but not in tombstones
-12.2.4 Two-Phase Set (2P_SET)
-plaintext
+```
 
+### 12.2.4 Two-Phase Set (2P_SET)
+
+```plaintext
 Algorithm: MERGE_2P_SET
 
 Input:
@@ -1315,9 +1488,11 @@ Output:
 
 // Element is visible iff in add_set but not in remove_set
 // Once removed, cannot be re-added
-12.2.5 LWW-Register (REGISTER)
-plaintext
+```
 
+### 12.2.5 LWW-Register (REGISTER)
+
+```
 Algorithm: MERGE_LWW_REGISTER
 
 Input:
@@ -1337,9 +1512,11 @@ Output:
 9.     else:
 10.        merged = copy(a)
 11. return merged
-12.2.6 RGA (DOCUMENT)
-plaintext
+```
 
+### 12.2.6 RGA (DOCUMENT)
+
+```plaintext
 Algorithm: MERGE_RGA
 
 Input:
@@ -1362,11 +1539,13 @@ Output:
 7.         // order by (predecessor_id, node_id)
 8.         insert_at(merged, pos, node)
 9. return merged
-12.3 Lock State Merge
+```
+
+## 12.3 Lock State Merge
+
 Locks are NOT merged across replicas — they are local to each node. However, the lock timeout mechanism ensures convergence:
 
-plaintext
-
+```
 Algorithm: MERGE_LOCK_STATE
 
 Input:
@@ -1383,10 +1562,15 @@ Output:
 //   - Active locks are only meaningful on the node that granted them
 
 1. return lock_a  // Local lock state is authoritative
-13. Serialization
-13.1 State Serialization Format
-plaintext
+```
 
+---
+
+# 13. Serialization
+
+## 13.1 State Serialization Format
+
+```plaintext
 SerializedState = {
     magic: byte[4] = "CRAB",        // Magic bytes
     version: uint32 = 1,            // Serialization format version
@@ -1412,9 +1596,11 @@ SerializedState = {
     // Checksum
     checksum: byte[32]              // SHA256 of all preceding bytes
 }
-13.2 Data Item Serialization
-plaintext
+```
 
+## 13.2 Data Item Serialization
+
+```
 DataItemSerialized = {
     name_length: uint16,
     name: byte[name_length],
@@ -1426,130 +1612,168 @@ DataItemSerialized = {
     invariant_count: uint8,
     invariants: InvariantSerialized[invariant_count]
 }
-13.3 Operation Serialization (for signing)
-See Section 7.5 — SERIALIZE_FOR_SIGNING.
+```
 
-14. Security Considerations
-14.1 Threat Model
+## 13.3 Operation Serialization (for signing)
+
+See Section 7.5 — `SERIALIZE_FOR_SIGNING`.
+
+---
+
+# 14. Security Considerations
+
+## 14.1 Threat Model
+
 Threat	Description	Mitigation
-Key compromise	User's ECDSA key or ABE key is stolen	Key revocation protocol, key versioning
-MSK compromise	Master secret key is stolen	Threshold MSK (future work), MSK rotation
-Replay attack	Old operation is replayed	UUID uniqueness, Lamport clocks, processed_ops set
-Lock starvation	User holds lock indefinitely	Lock timeout, force-unlock
-Collusion	Users combine keys to gain unauthorized access	ABE collusion resistance (randomized keys)
-Sybil attack	Attacker creates many fake users	Registration policy (role:admin required)
-Timing attack	Attacker observes lock timing to infer information	Constant-time operations where possible
-State fork	Two nodes diverge permanently	CRDT merge guarantees eventual convergence
-14.2 Security Assumptions
-Hash function security: SHA-256 is collision-resistant
-Signature security: ECDSA with secp256k1 is existentially unforgeable
-Pairing security: The bilinear group is secure against the q-SDH and DLIN assumptions
-Randomness: All random values are generated with a CSPRNG
-Clock synchronization: Node clocks are within reasonable skew (NTP-synchronized)
-14.3 Operational Security
-MSK protection: The MSK MUST be stored encrypted at rest and only loaded into memory during key generation operations
-Key delivery: Initial ABE keys and ECDSA keypairs MUST be delivered via secure out-of-band channels
-Lock token entropy: Lock tokens MUST be generated with a CSPRNG (at least 256 bits of entropy)
-Log integrity: The transition log SHOULD be periodically hashed and the hash published to an external audit service
-Clock skew: Lock timeout values SHOULD be at least 2x the expected maximum network latency
-15. Implementation Guidelines
-15.1 Required Dependencies
+**Key compromise**	User's ECDSA key or ABE key is stolen	Key revocation protocol, key versioning
+**MSK compromise**	Master secret key is stolen	Threshold MSK (future work), MSK rotation
+**Replay attack**	Old operation is replayed	UUID uniqueness, Lamport clocks, processed_ops set
+**Lock starvation**	User holds lock indefinitely	Lock timeout, force-unlock
+**Collusion**	Users combine keys to gain unauthorized access	ABE collusion resistance (randomized keys)
+**Sybil attack**	Attacker creates many fake users	Registration policy (role:admin required)
+**Timing attack**	Attacker observes lock timing to infer information	Constant-time operations where possible
+**State fork**	Two nodes diverge permanently	CRDT merge guarantees eventual convergence
+
+## 14.2 Security Assumptions
+
+1. **Hash function security**: SHA-256 is collision-resistant
+2. **Signature security**: ECDSA with secp256k1 is existentially unforgeable
+3. **Pairing security**: The bilinear group is secure against the q-SDH and DLIN assumptions
+4. **Randomness**: All random values are generated with a CSPRNG
+5. **Clock synchronization**: Node clocks are within reasonable skew (NTP-synchronized)
+
+## 14.3 Operational Security
+
+1. **MSK protection**: The MSK MUST be stored encrypted at rest and only loaded into memory during key generation operations
+2. **Key delivery**: Initial ABE keys and ECDSA keypairs MUST be delivered via secure out-of-band channels
+3. **Lock token entropy**: Lock tokens MUST be generated with a CSPRNG (at least 256 bits of entropy)
+4. **Log integrity**: The transition log SHOULD be periodically hashed and the hash published to an external audit service
+5. **Clock skew**: Lock timeout values SHOULD be at least 2x the expected maximum network latency
+
+---
+
+# 15. Implementation Guidelines
+
+## 15.1 Required Dependencies
+
 Library	Version	Purpose
 openabe-c	≥ 0.1.0	CP-ABE implementation
 OpenSSL	≥ 1.1.1	ECDSA, SHA-256, CSPRNG
 PBC	≥ 0.5.14	Bilinear pairings (via openabe-c)
 GMP	≥ 6.0	Arbitrary precision arithmetic (via openabe-c)
-15.2 Implementation Checklist
+
+## 15.2 Implementation Checklist
+
 A conforming implementation MUST implement:
 
- State data model (Section 4)
- Built-in data types with CRDT merge (Sections 5, 12)
- Protocol state machine with all transitions (Section 6)
- Operation structure and execution (Section 7)
- All built-in operations (Section 7.3)
- Attribute Machine with all attribute operations (Section 8)
- Atomic lock acquisition (Section 9.2)
- Lock extension (Section 9.3)
- Force unlock (Section 9.4)
- Lock expiry pruning (Section 9.5)
- ABE key generation and verification (Section 10)
- ECDSA signing and verification (Section 10.2)
- ABE-gated signature verification (Section 10.3)
- Key version verification (Section 10.4)
- Key refresh flow (Section 11.3)
- State serialization (Section 13)
+- [ ] State data model (Section 4)
+- [ ] Built-in data types with CRDT merge (Sections 5, 12)
+- [ ] Protocol state machine with all transitions (Section 6)
+- [ ] Operation structure and execution (Section 7)
+- [ ] All built-in operations (Section 7.3)
+- [ ] Attribute Machine with all attribute operations (Section 8)
+- [ ] Atomic lock acquisition (Section 9.2)
+- [ ] Lock extension (Section 9.3)
+- [ ] Force unlock (Section 9.4)
+- [ ] Lock expiry pruning (Section 9.5)
+- [ ] ABE key generation and verification (Section 10)
+- [ ] ECDSA signing and verification (Section 10.2)
+- [ ] ABE-gated signature verification (Section 10.3)
+- [ ] Key version verification (Section 10.4)
+- [ ] Key refresh flow (Section 11.3)
+- [ ] State serialization (Section 13)
+
 A conforming implementation SHOULD implement:
 
- Key compromise recovery (Section 11.4)
- CRDT merge for all types (Section 12)
- Log integrity checks (Section 14.3.4)
-15.3 Test Vectors
+- [ ] Key compromise recovery (Section 11.4)
+- [ ] CRDT merge for all types (Section 12)
+- [ ] Log integrity checks (Section 14.3.4)
+
+## 15.3 Test Vectors
+
 Test vectors are provided in Appendix A for:
 
-Genesis state creation
-User registration
-Lock acquisition and release
-Operation signing and verification
-CRDT merge of concurrent operations
-Lock timeout and force-unlock
-Key refresh after attribute change
-Collusion resistance verification
-16. Test Vectors
-To be generated by reference implementation.
+1. Genesis state creation
+2. User registration
+3. Lock acquisition and release
+4. Operation signing and verification
+5. CRDT merge of concurrent operations
+6. Lock timeout and force-unlock
+7. Key refresh after attribute change
+8. Collusion resistance verification
 
-Appendix A: Glossary
+---
+
+# 16. Test Vectors
+
+*To be generated by reference implementation.*
+
+---
+
+# Appendix A: Glossary
+
 Term	Definition
-ABE	Attribute-Based Encryption — cryptographic primitive for policy-based access control
-Attribute Machine	The root CRABS state machine whose state is the set of all users and their attributes
-Capability Vault	Data structure mapping (operation, user_id) to ABE-encrypted ECDSA signing keys
-CP-ABE	Ciphertext-Policy ABE — policies are embedded in ciphertexts
-CRABS	Cryptographic Role-based Attribute-gated Blockchain-like State machine
-CRDT	Conflict-free Replicated Data Type — data structure that converges without consensus
-ECDSA	Elliptic Curve Digital Signature Algorithm — used for operation signatures
-Force Unlock	Releasing an expired lock, rolling back any unverified changes
-Invariant	Post-condition check on a data item's value (e.g., "must be ≥ 0")
-Lamport Clock	Logical clock for causal ordering of operations
-Lock Token	Random 32-byte value proving ownership of a lock
-Mode A	Audit mode — operation includes signer identity
-Mode B	Privacy mode — operation omits signer identity
-MSK	Master Secret Key — used to generate ABE user keys
-MPK	Master Public Key — used to encrypt data under policies
-Protocol State	The current state of a resource in its lifecycle (idle, locked, modified, etc.)
-Resource	A data item with inherent scarcity that requires locking for safe access
-Appendix B: Error Codes
+**ABE**	Attribute-Based Encryption — cryptographic primitive for policy-based access control
+**Attribute Machine**	The root CRABS state machine whose state is the set of all users and their attributes
+**Capability Vault**	Data structure mapping (operation, user_id) to ABE-encrypted ECDSA signing keys
+**CP-ABE**	Ciphertext-Policy ABE — policies are embedded in ciphertexts
+**CRABS**	Cryptographic Role-based Attribute-gated Blockchain-like State machine
+**CRDT**	Conflict-free Replicated Data Type — data structure that converges without consensus
+**ECDSA**	Elliptic Curve Digital Signature Algorithm — used for operation signatures
+**Force Unlock**	Releasing an expired lock, rolling back any unverified changes
+**Invariant**	Post-condition check on a data item's value (e.g., "must be ≥ 0")
+**Lamport Clock**	Logical clock for causal ordering of operations
+**Lock Token**	Random 32-byte value proving ownership of a lock
+**Mode A**	Audit mode — operation includes signer identity
+**Mode B**	Privacy mode — operation omits signer identity
+**MSK**	Master Secret Key — used to generate ABE user keys
+**MPK**	Master Public Key — used to encrypt data under policies
+**Protocol State**	The current state of a resource in its lifecycle (idle, locked, modified, etc.)
+**Resource**	A data item with inherent scarcity that requires locking for safe access
+
+---
+
+# Appendix B: Error Codes
+
 Code	Name	Description
-0x0000	SUCCESS	Operation completed successfully
-0x1001	PROTOCOL_VIOLATION	Resource is not in the required protocol state
-0x1002	LOCK_TOKEN_MISMATCH	Provided lock token does not match the resource's lock
-0x1003	LOCK_OWNER_MISMATCH	Operation signer does not match lock owner
-0x1004	LOCK_CONTENTION	Could not acquire all locks atomically
-0x1005	LOCK_NOT_EXPIRED	Cannot force-unlock a lock that hasn't expired
-0x1006	MAX_EXTENSIONS_REACHED	Lock has been extended the maximum number of times
-0x1007	FORCE_UNLOCK_DISABLED	This machine does not allow force-unlock
-0x2001	UNAUTHORIZED	Signer's attributes do not satisfy the operation's policy
-0x2002	KEY_STALE	Signer's ABE key version does not match current state
-0x2003	USER_NOT_FOUND	Specified user does not exist in the Attribute Machine
-0x2004	USER_SUSPENDED	Specified user is suspended
-0x3001	INVARIANT_VIOLATED	Operation result violates a data item's invariant
-0x3002	RESOURCE_NOT_FOUND	Specified resource does not exist in the state
-0x3003	DUPLICATE_OPERATION	Operation UUID has already been processed
-0x4001	SERIALIZATION_ERROR	Failed to serialize or deserialize state
-0x4002	CRYPTOGRAPHIC_ERROR	Underlying cryptographic primitive failed
-0x5001	INTERNAL_ERROR	Unexpected internal error
-Appendix C: Canonical Encoding
+`0x0000`	`SUCCESS`	Operation completed successfully
+`0x1001`	`PROTOCOL_VIOLATION`	Resource is not in the required protocol state
+`0x1002`	`LOCK_TOKEN_MISMATCH`	Provided lock token does not match the resource's lock
+`0x1003`	`LOCK_OWNER_MISMATCH`	Operation signer does not match lock owner
+`0x1004`	`LOCK_CONTENTION`	Could not acquire all locks atomically
+`0x1005`	`LOCK_NOT_EXPIRED`	Cannot force-unlock a lock that hasn't expired
+`0x1006`	`MAX_EXTENSIONS_REACHED`	Lock has been extended the maximum number of times
+`0x1007`	`FORCE_UNLOCK_DISABLED`	This machine does not allow force-unlock
+`0x2001`	`UNAUTHORIZED`	Signer's attributes do not satisfy the operation's policy
+`0x2002`	`KEY_STALE`	Signer's ABE key version does not match current state
+`0x2003`	`USER_NOT_FOUND`	Specified user does not exist in the Attribute Machine
+`0x2004`	`USER_SUSPENDED`	Specified user is suspended
+`0x3001`	`INVARIANT_VIOLATED`	Operation result violates a data item's invariant
+`0x3002`	`RESOURCE_NOT_FOUND`	Specified resource does not exist in the state
+`0x3003`	`DUPLICATE_OPERATION`	Operation UUID has already been processed
+`0x4001`	`SERIALIZATION_ERROR`	Failed to serialize or deserialize state
+`0x4002`	`CRYPTOGRAPHIC_ERROR`	Underlying cryptographic primitive failed
+`0x5001`	`INTERNAL_ERROR`	Unexpected internal error
+
+---
+
+# Appendix C: Canonical Encoding
+
 All data structures that are hashed or signed MUST use canonical encoding to ensure cross-implementation compatibility.
 
-C.1 Rules
-Integers: Fixed-width, little-endian byte order
-Strings: Length-prefixed (uint16 length + UTF-8 bytes)
-Byte arrays: Length-prefixed (uint32 length + bytes)
-Arrays: Length-prefixed (uint32 count + elements)
-Maps: Sorted by key (lexicographic byte order), then key-value pairs
-Enums: Single byte value
-No optional fields: All fields are present (use sentinel values for null)
-C.2 Example
-plaintext
+## C.1 Rules
 
+1. **Integers**: Fixed-width, little-endian byte order
+2. **Strings**: Length-prefixed (uint16 length + UTF-8 bytes)
+3. **Byte arrays**: Length-prefixed (uint32 length + bytes)
+4. **Arrays**: Length-prefixed (uint32 count + elements)
+5. **Maps**: Sorted by key (lexicographic byte order), then key-value pairs
+6. **Enums**: Single byte value
+7. **No optional fields**: All fields are present (use sentinel values for null)
+
+## C.2 Example
+
+```
 Operation canonical encoding:
 ┌──────────────────────────────────────────────┐
 │ type:         uint16 len + bytes              │
@@ -1570,6 +1794,6 @@ Operation canonical encoding:
 │ lamport_time: uint64                          │
 │ node_id:      uint16 len + bytes              │
 └──────────────────────────────────────────────┘
-End of CRABS Protocol Specification v1.0
+```
 
-🦀 "Hard shell. Sharp pincers. No backdoors."
+🦀 **"Hard shell. Sharp pincers. No backdoors."**
