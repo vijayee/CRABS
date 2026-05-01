@@ -42,7 +42,17 @@ typedef struct temp_attr_list_t {
 } temp_attr_list_t;
 
 // ============================================================
-// User Key (v1.3 Amendment 3, §4.1)
+// Key Lifecycle States (v1.3 §9)
+// ============================================================
+typedef enum {
+  KEY_ACTIVE    = 0x00,
+  KEY_SUSPENDED = 0x01,
+  KEY_REVOKED   = 0x02,
+  KEY_EXPIRED   = 0x03
+} key_status_e;
+
+// ============================================================
+// User Key (v1.3 Amendment 3, §4.1 + §9 Key Lifecycle)
 // ============================================================
 #define CRABS_MAX_KEY_ID       64
 #define CRABS_MAX_KEY_LABEL    128
@@ -57,7 +67,11 @@ typedef struct user_key_t {
   char                  label[CRABS_MAX_KEY_LABEL];
   uint64_t              registered_at;
   uint64_t              last_used_at;
-  bool                  is_active;
+  key_status_e          status;               // v1.3 §9: key lifecycle state
+  uint64_t              expires_at;           // 0 = no expiry
+  uint64_t              suspended_at;         // 0 = never suspended
+  uint64_t              revoked_at;           // 0 = never revoked
+  char                  predecessor_key_id[CRABS_MAX_KEY_ID]; // Key rotation chain
   struct user_key_t*    next;
 } user_key_t;
 
@@ -131,7 +145,7 @@ crabs_error_e attribute_machine_issue_temporary(attribute_machine_t* am, const c
 uint32_t      attribute_machine_prune_expired_temporary(attribute_machine_t* am);
 
 // ============================================================
-// Key Ring Operations (v1.3 Amendment 3, §4.1)
+// Key Ring Operations (v1.3 Amendment 3, §4.1 + §9 Key Lifecycle)
 // ============================================================
 user_key_t*   user_key_find(user_t* user, const char* key_id);
 user_key_t*   user_key_find_active(user_t* user, signature_scheme_e scheme);
@@ -142,5 +156,14 @@ crabs_error_e user_key_register(user_t* user, const char* key_id,
 crabs_error_e user_key_revoke(user_t* user, const char* key_id);
 crabs_error_e user_key_set_default(user_t* user, const char* key_id);
 void          user_key_destroy_all(user_t* user);
+
+// Key lifecycle operations (v1.3 §9)
+crabs_error_e user_key_suspend(user_t* user, const char* key_id);
+crabs_error_e user_key_activate(user_t* user, const char* key_id);
+crabs_error_e user_key_rotate(user_t* user, const char* old_key_id,
+                               const char* new_key_id, signature_scheme_e new_scheme,
+                               const uint8_t* new_public_key, uint32_t new_public_key_len,
+                               const char* new_label);
+const char*   user_key_status_name(key_status_e status);
 
 #endif // CRABS_ATTRIBUTE_MACHINE_H

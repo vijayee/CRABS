@@ -131,7 +131,7 @@ typedef struct {
 } policy_t;
 
 // ============================================================
-// Signature Configuration (v1.3 §8)
+// Signature Configuration (v1.3 §8 + §9 Key Lifecycle)
 // ============================================================
 #define CRABS_DEFAULT_MAX_KEYS   8
 
@@ -140,10 +140,36 @@ typedef struct {
   uint32_t          max_keys_per_user;
   bool              key_rotation_enabled;
   uint32_t          co_sign_threshold;
+  // v1.3 §9: Key lifecycle
+  bool              key_expiry_enabled;
+  uint64_t          default_key_ttl_ms;  // 0 = no expiry
+  uint64_t          max_key_age_ms;      // 0 = no max age
 } signature_config_t;
 
 // ============================================================
-// Machine Configuration (§4.4 + v1.3 §8)
+// Vault Configuration (v1.3 §10)
+// ============================================================
+#define CRABS_VAULT_ADDRESS_MAX  256
+#define CRABS_VAULT_TOKEN_MAX    128
+
+typedef enum {
+  VAULT_NONE       = 0x00,
+  VAULT_HASHICORP  = 0x01,
+  VAULT_AWS_KMS    = 0x02,
+  VAULT_HSM        = 0x03,
+  VAULT_CUSTOM     = 0xFF
+} vault_provider_e;
+
+typedef struct {
+  vault_provider_e provider;
+  char             address[CRABS_VAULT_ADDRESS_MAX];
+  char             auth_token[CRABS_VAULT_TOKEN_MAX];
+  bool             signing_delegated;  // vault_sign() instead of local sign
+  bool             rotation_delegated; // vault manages rotation
+} vault_config_t;
+
+// ============================================================
+// Machine Configuration (§4.4 + v1.3 §8 + §10)
 // ============================================================
 typedef struct {
   uint64_t max_lock_duration_ms;
@@ -151,6 +177,7 @@ typedef struct {
   bool     allow_force_unlock;
   char     bootstrap_admin[CRABS_MAX_USER_ID];
   signature_config_t sig_config;
+  vault_config_t     vault_config;      // v1.3 §10: vault integration
 } machine_config_t;
 
 // ============================================================

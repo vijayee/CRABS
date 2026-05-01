@@ -97,7 +97,7 @@ TEST(TestKeyOps, RegisterKeyBasic) {
   user_key_t* key = user_key_find(admin, "testkey");
   ASSERT_NE(key, nullptr);
   EXPECT_EQ(key->scheme, ECDSA_SECP256K1);
-  EXPECT_TRUE(key->is_active);
+  EXPECT_EQ(key->status, KEY_ACTIVE);
 
   operation_destroy(op);
   destroy_test_state(state);
@@ -194,7 +194,7 @@ TEST(TestKeyOps, RevokeKeyBasic) {
   // Verify key is now inactive
   user_key_t* key = user_key_find(admin, "mykey");
   ASSERT_NE(key, nullptr);
-  EXPECT_FALSE(key->is_active);
+  EXPECT_EQ(key->status, KEY_REVOKED);
 
   operation_destroy(op);
   destroy_test_state(state);
@@ -282,7 +282,7 @@ TEST(TestKeyOps, SetDefaultKeyRejectsInactiveKey) {
   op->payload_size = (uint32_t)payload_size;
 
   crabs_error_e rc = state_machine_execute(state, op);
-  EXPECT_EQ(rc, CRABS_ERR_INVALID_PARAM);
+  EXPECT_EQ(rc, CRABS_ERR_KEY_NOT_ACTIVE);
 
   operation_destroy(op);
   destroy_test_state(state);
@@ -342,7 +342,7 @@ TEST(TestKeyOps, RevokeKeyDirectHandler) {
 
   crabs_error_e rc = state_machine_op_revoke_key(state, op);
   EXPECT_EQ(rc, CRABS_SUCCESS);
-  EXPECT_FALSE(user_key_find(admin, "revme")->is_active);
+  EXPECT_EQ(user_key_find(admin, "revme")->status, KEY_REVOKED);
 
   operation_destroy(op);
   destroy_test_state(state);

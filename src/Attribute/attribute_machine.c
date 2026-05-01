@@ -529,7 +529,7 @@ user_key_t* user_key_find_active(user_t* user, signature_scheme_e scheme) {
   if (user == NULL) return NULL;
   user_key_t* key = user->keys;
   while (key != NULL) {
-    if (key->is_active && key->scheme == scheme) return key;
+    if (key->status == KEY_ACTIVE && key->scheme == scheme) return key;
     key = key->next;
   }
   return NULL;
@@ -566,7 +566,11 @@ crabs_error_e user_key_register(user_t* user, const char* key_id,
   if (label != NULL) {
     strncpy(key->label, label, CRABS_MAX_KEY_LABEL - 1);
   }
-  key->is_active = true;
+  key->status = KEY_ACTIVE;
+  key->expires_at = 0;
+  key->suspended_at = 0;
+  key->revoked_at = 0;
+  key->predecessor_key_id[0] = '\0';
   key->registered_at = 0;  // Caller should set if needed
   key->last_used_at = 0;
 
@@ -587,8 +591,10 @@ crabs_error_e user_key_revoke(user_t* user, const char* key_id) {
   if (user == NULL || key_id == NULL) return CRABS_ERR_INVALID_PARAM;
   user_key_t* key = user_key_find(user, key_id);
   if (key == NULL) return CRABS_ERR_RESOURCE_NOT_FOUND;
+  if (key->status == KEY_REVOKED) return CRABS_ERR_KEY_REVOKED;
 
-  key->is_active = false;
+  key->status = KEY_REVOKED;
+  key->revoked_at = 0;  // Caller should set if needed
   user->key_version++;
 
   // Count remaining active keys and find a replacement default if needed
@@ -596,7 +602,7 @@ crabs_error_e user_key_revoke(user_t* user, const char* key_id) {
   user_key_t* replacement = NULL;
   user_key_t* iter = user->keys;
   while (iter != NULL) {
-    if (iter->is_active) {
+    if (iter->status == KEY_ACTIVE) {
       active_count++;
       if (replacement == NULL && strcmp(iter->key_id, key_id) != 0) {
         replacement = iter;
@@ -626,7 +632,7 @@ crabs_error_e user_key_set_default(user_t* user, const char* key_id) {
   if (user == NULL || key_id == NULL) return CRABS_ERR_INVALID_PARAM;
   user_key_t* key = user_key_find(user, key_id);
   if (key == NULL) return CRABS_ERR_RESOURCE_NOT_FOUND;
-  if (!key->is_active) return CRABS_ERR_INVALID_PARAM;
+  if (key->status != KEY_ACTIVE) return CRABS_ERR_KEY_NOT_ACTIVE;
 
   strncpy(user->default_key_id, key_id, CRABS_MAX_KEY_ID - 1);
   return CRABS_SUCCESS;
@@ -643,4 +649,159 @@ void user_key_destroy_all(user_t* user) {
   user->keys = NULL;
   user->key_count = 0;
   user->default_key_id[0] = '\0';
+}
+
+// ============================================================
+// Key Lifecycle Operations (v1.3 §9)
+// ============================================================
+
+crabs_error_e user_key_suspend(user_t* user, const char* key_id) {
+  if (user == NULL || key_id == NULL) return CRABS_ERR_INVALID_PARAM;
+  user_key_t* key = user_key_find(user, key_id);
+  if (key == NULL) return CRABS_ERR_RESOURCE_NOT_FOUND;
+  if (key->status != KEY_ACTIVE) return CRABS_ERR_KEY_NOT_ACTIVE;
+
+  key->status = KEY_SUSPENDED;
+  key->suspended_at = 0;  // Caller should set if needed
+  user->key_version++;
+
+  // If this was the default key, find a replacement
+  if (strcmp(user->default_key_id, key_id) == 0) {
+    user_key_t* replacement = NULL;
+    user_key_t* iter = user->keys;
+    while (iter != NULL) {
+      if (iter->status == KEY_ACTIVE && strcmp(iter->key_id, key_id) != 0) {
+        replacement = iter;
+        break;
+      }
+      iter = iter->next;
+    }
+    if (replacement != NULL) {
+      strncpy(user->default_key_id, replacement->key_id, CRABS_MAX_KEY_ID - 1);
+    } else {
+      user->default_key_id[0] = '\0';
+    }
+  }
+
+  return CRABS_SUCCESS;
+}
+
+crabs_error_e user_key_activate(user_t* user, const char* key_id) {
+  if (user == NULL || key_id == NULL) return CRABS_ERR_INVALID_PARAM;
+  user_key_t* key = user_key_find(user, key_id);
+  if (key == NULL) return CRABS_ERR_RESOURCE_NOT_FOUND;
+  // Can only activate suspended keys (not revoked or expired)
+  if (key->status == KEY_REVOKED) return CRABS_ERR_KEY_REVOKED;
+  if (key->status == KEY_EXPIRED) return CRABS_ERR_KEY_EXPIRED;
+  if (key->status == KEY_ACTIVE) return CRABS_SUCCESS;  // Already active, idempotent
+
+  key->status = KEY_ACTIVE;
+  key->suspended_at = 0;
+  user->key_version++;
+
+  // If the user was suspended and now has an active key, reactivate
+  if (user->status == USER_SUSPENDED) {
+    // Check if user has at least one active key now
+    user_key_t* iter = user->keys;
+    bool has_active = false;
+    while (iter != NULL) {
+      if (iter->status == KEY_ACTIVE) {
+        has_active = true;
+        break;
+      }
+      iter = iter->next;
+    }
+    if (has_active) {
+      user->status = USER_ACTIVE;
+    }
+  }
+
+  return CRABS_SUCCESS;
+}
+
+crabs_error_e user_key_rotate(user_t* user, const char* old_key_id,
+                               const char* new_key_id, signature_scheme_e new_scheme,
+                               const uint8_t* new_public_key, uint32_t new_public_key_len,
+                               const char* new_label) {
+  if (user == NULL || old_key_id == NULL || new_key_id == NULL) {
+    return CRABS_ERR_INVALID_PARAM;
+  }
+  if (new_public_key == NULL || new_public_key_len == 0) {
+    return CRABS_ERR_INVALID_PARAM;
+  }
+  if (new_scheme == SCHEME_UNSPECIFIED) {
+    return CRABS_ERR_INVALID_PARAM;
+  }
+
+  user_key_t* old_key = user_key_find(user, old_key_id);
+  if (old_key == NULL) return CRABS_ERR_RESOURCE_NOT_FOUND;
+  if (old_key->status != KEY_ACTIVE) return CRABS_ERR_KEY_NOT_ACTIVE;
+
+  // Check max key limit before adding new key
+  uint32_t active_count = 0;
+  user_key_t* iter = user->keys;
+  while (iter != NULL) {
+    if (iter->status == KEY_ACTIVE) active_count++;
+    iter = iter->next;
+  }
+  if (active_count >= CRABS_MAX_KEYS_PER_USER) {
+    return CRABS_ERR_INVALID_PARAM;
+  }
+
+  // Check for duplicate new key_id
+  if (user_key_find(user, new_key_id) != NULL) {
+    return CRABS_ERR_DUPLICATE_OPERATION;
+  }
+
+  // Register the new key
+  crabs_error_e rc = user_key_register(user, new_key_id, new_scheme,
+                                        new_public_key, new_public_key_len, new_label);
+  if (rc != CRABS_SUCCESS) return rc;
+
+  // Link the new key to the old key via predecessor
+  user_key_t* new_key = user_key_find(user, new_key_id);
+  if (new_key != NULL) {
+    strncpy(new_key->predecessor_key_id, old_key_id, CRABS_MAX_KEY_ID - 1);
+  }
+
+  // Revoke the old key
+  rc = user_key_revoke(user, old_key_id);
+  if (rc != CRABS_SUCCESS) {
+    // Rollback: remove the newly registered key
+    user_key_t* prev = NULL;
+    user_key_t* cur = user->keys;
+    while (cur != NULL) {
+      if (strcmp(cur->key_id, new_key_id) == 0) {
+        if (prev == NULL) {
+          user->keys = cur->next;
+        } else {
+          prev->next = cur->next;
+        }
+        free(cur);
+        user->key_count--;
+        break;
+      }
+      prev = cur;
+      cur = cur->next;
+    }
+    return rc;
+  }
+
+  // If the old key was the default, set the new key as default
+  if (strcmp(user->default_key_id, old_key_id) == 0 ||
+      user->default_key_id[0] == '\0') {
+    strncpy(user->default_key_id, new_key_id, CRABS_MAX_KEY_ID - 1);
+  }
+
+  return CRABS_SUCCESS;
+}
+
+const char* user_key_status_name(key_status_e status) {
+  switch (status) {
+    case KEY_ACTIVE:    return "active";
+    case KEY_SUSPENDED: return "suspended";
+    case KEY_REVOKED:   return "revoked";
+    case KEY_EXPIRED:   return "expired";
+    default:            return "unknown";
+  }
 }

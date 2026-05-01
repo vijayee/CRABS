@@ -60,7 +60,14 @@ typedef enum {
   CRABS_ERR_INTERNAL               = 0x5001,
   CRABS_ERR_OOM                    = 0x5002,
   CRABS_ERR_INVALID_PARAM           = 0x5003,
-  CRABS_ERR_SCHEME_ALREADY_REGISTERED = 0x5004
+  CRABS_ERR_SCHEME_ALREADY_REGISTERED = 0x5004,
+
+  // 0x6xxx: Key lifecycle errors (v1.3 §9)
+  CRABS_ERR_KEY_SUSPENDED          = 0x6001,
+  CRABS_ERR_KEY_REVOKED            = 0x6002,
+  CRABS_ERR_KEY_EXPIRED            = 0x6003,
+  CRABS_ERR_KEY_NOT_ACTIVE         = 0x6004,
+  CRABS_ERR_VAULT_UNAVAILABLE      = 0x6005
 } crabs_error_e;
 
 // ============================================================
@@ -85,5 +92,10 @@ typedef enum {
 #define CRABS_OP_REGISTER_KEY     "__register_key__"
 #define CRABS_OP_REVOKE_KEY       "__revoke_key__"
 #define CRABS_OP_SET_DEFAULT_KEY  "__set_default_key__"
+
+// Key Lifecycle Operations (v1.3 §9)
+#define CRABS_OP_SUSPEND_KEY      "__suspend_key__"
+#define CRABS_OP_ACTIVATE_KEY     "__activate_key__"
+#define CRABS_OP_ROTATE_KEY       "__rotate_key__"
 
 #endif // CRABS_CRABS_H

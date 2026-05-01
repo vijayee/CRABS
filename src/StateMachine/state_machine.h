@@ -98,6 +98,11 @@ crabs_error_e  state_machine_op_register_key(state_t* state, operation_t* op);
 crabs_error_e  state_machine_op_revoke_key(state_t* state, operation_t* op);
 crabs_error_e  state_machine_op_set_default_key(state_t* state, operation_t* op);
 
+// Key lifecycle operations (v1.3 §9)
+crabs_error_e  state_machine_op_suspend_key(state_t* state, operation_t* op);
+crabs_error_e  state_machine_op_activate_key(state_t* state, operation_t* op);
+crabs_error_e  state_machine_op_rotate_key(state_t* state, operation_t* op);
+
 // Key refresh operation (§11.3)
 typedef struct {
   uint8_t         envelope_data[1024];  // Serialized key envelope for transport

@@ -884,7 +884,7 @@ static crabs_error_e _verify_user_signature(
   if (key_id != NULL && key_id[0] != '\0') {
     user_key_t* key = user_key_find((user_t*)user, key_id);
     if (key == NULL) return CRABS_ERR_RESOURCE_NOT_FOUND;
-    if (!key->is_active) return CRABS_ERR_UNAUTHORIZED;
+    if (key->status != KEY_ACTIVE) return CRABS_ERR_UNAUTHORIZED;
     if (sig_scheme != SCHEME_UNSPECIFIED && key->scheme != sig_scheme) {
       return CRABS_ERR_CRYPTOGRAPHIC_ERROR;
     }

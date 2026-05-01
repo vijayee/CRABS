@@ -61,7 +61,7 @@ TEST(TestKeyRing, FindReturnsKeyAfterRegister) {
   EXPECT_STREQ(found->key_id, "key1");
   EXPECT_EQ(found->scheme, ECDSA_SECP256K1);
   EXPECT_EQ(found->public_key_len, 33u);
-  EXPECT_TRUE(found->is_active);
+  EXPECT_EQ(found->status, KEY_ACTIVE);
 
   attribute_machine_destroy(am);
 }
@@ -161,7 +161,7 @@ TEST(TestKeyRing, RegisterBasicKey) {
   EXPECT_EQ(key->scheme, ECDSA_SECP256K1);
   EXPECT_EQ(key->public_key_len, 33u);
   EXPECT_STREQ(key->label, "primary key");
-  EXPECT_TRUE(key->is_active);
+  EXPECT_EQ(key->status, KEY_ACTIVE);
   EXPECT_EQ(admin->key_count, 1u);
 
   attribute_machine_destroy(am);
@@ -346,7 +346,7 @@ TEST(TestKeyRing, RevokeMarksKeyInactive) {
 
   user_key_t* key = user_key_find(admin, "key1");
   ASSERT_NE(key, nullptr);
-  EXPECT_FALSE(key->is_active);
+  EXPECT_EQ(key->status, KEY_REVOKED);
 
   attribute_machine_destroy(am);
 }
@@ -493,7 +493,7 @@ TEST(TestKeyRing, SetDefaultRejectsInactiveKey) {
   ASSERT_EQ(user_key_revoke(admin, "key2"), CRABS_SUCCESS);
 
   // Setting revoked key as default should fail
-  EXPECT_EQ(user_key_set_default(admin, "key2"), CRABS_ERR_INVALID_PARAM);
+  EXPECT_EQ(user_key_set_default(admin, "key2"), CRABS_ERR_KEY_NOT_ACTIVE);
 
   attribute_machine_destroy(am);
 }
