@@ -92,6 +92,17 @@ cli_result_e cli_cmd_op_submit(cli_node_t* node, const char* type,
                                  const char* payload_hex, const char* signer_id);
 
 // ============================================================
+// Dedup Commands
+// ============================================================
+cli_result_e cli_cmd_op_define(cli_node_t* node, const char* op_type_name,
+                                const char* dedup_type_str,
+                                const char* tracker_path,
+                                const char* flag_path,
+                                const char* condition);
+cli_result_e cli_cmd_op_check_dedup(cli_node_t* node, const char* op_type_name,
+                                      const char* signer_id);
+
+// ============================================================
 // Command Dispatch
 // ============================================================
 cli_result_e cli_dispatch(cli_node_t* node, int argc, char** argv);

@@ -5,6 +5,8 @@
 #include <gtest/gtest.h>
 extern "C" {
 #include "../src/CLI/cli.h"
+#include "../src/CRABS/data_model.h"
+#include "../src/CRDT/one_shot.h"
 }
 
 // ============================================================
@@ -441,4 +443,153 @@ TEST_F(TestCLI, LoadNullParams) {
 
 TEST_F(TestCLI, LoadNonexistentFile) {
   EXPECT_EQ(cli_node_load(node, "/tmp/nonexistent_crabs_file_12345"), CLI_ERR_IO);
+}
+
+// ============================================================
+// ONE_SHOT item type tests
+// ============================================================
+
+TEST_F(TestCLI, ItemAddOneShotSet) {
+  cli_node_init(node, "admin");
+  EXPECT_EQ(cli_cmd_item_add(node, "voters", "one_shot_set"), CLI_OK);
+
+  data_item_t* item = state_find_item(&node->attr_machine->base_state, "voters");
+  ASSERT_NE(item, nullptr);
+  EXPECT_EQ(item->type, DATA_TYPE_ONE_SHOT_SET);
+  EXPECT_EQ(item->crdt_type, CRDT_ONE_SHOT_SET);
+}
+
+TEST_F(TestCLI, ItemAddOneShotFlag) {
+  cli_node_init(node, "admin");
+  EXPECT_EQ(cli_cmd_item_add(node, "executed", "one_shot_flag"), CLI_OK);
+
+  data_item_t* item = state_find_item(&node->attr_machine->base_state, "executed");
+  ASSERT_NE(item, nullptr);
+  EXPECT_EQ(item->type, DATA_TYPE_ONE_SHOT_FLAG);
+  EXPECT_EQ(item->crdt_type, CRDT_ONE_SHOT_FLAG);
+}
+
+// ============================================================
+// Op Define and Check-Dedup tests
+// ============================================================
+
+TEST_F(TestCLI, OpDefinePerUser) {
+  cli_node_init(node, "admin");
+  cli_cmd_item_add(node, "voters", "one_shot_set");
+
+  EXPECT_EQ(cli_cmd_op_define(node, "vote", "per_user", "voters", NULL, NULL), CLI_OK);
+
+  // Verify the operation type was registered
+  const dedup_spec_t* spec = state_find_op_type_def(&node->attr_machine->base_state, "vote");
+  ASSERT_NE(spec, nullptr);
+  EXPECT_EQ(spec->type, DEDUP_PER_USER);
+  EXPECT_STREQ(spec->tracker_path, "voters");
+}
+
+TEST_F(TestCLI, OpDefineGlobal) {
+  cli_node_init(node, "admin");
+  cli_cmd_item_add(node, "executed", "one_shot_flag");
+
+  EXPECT_EQ(cli_cmd_op_define(node, "execute_proposal", "global", NULL, "executed", NULL), CLI_OK);
+
+  const dedup_spec_t* spec = state_find_op_type_def(&node->attr_machine->base_state, "execute_proposal");
+  ASSERT_NE(spec, nullptr);
+  EXPECT_EQ(spec->type, DEDUP_GLOBAL);
+  EXPECT_STREQ(spec->flag_path, "executed");
+}
+
+TEST_F(TestCLI, OpDefineCustom) {
+  cli_node_init(node, "admin");
+
+  EXPECT_EQ(cli_cmd_op_define(node, "spend", "custom", NULL, NULL, "balance >= amount"), CLI_OK);
+
+  const dedup_spec_t* spec = state_find_op_type_def(&node->attr_machine->base_state, "spend");
+  ASSERT_NE(spec, nullptr);
+  EXPECT_EQ(spec->type, DEDUP_CUSTOM);
+  EXPECT_STREQ(spec->condition, "balance >= amount");
+}
+
+TEST_F(TestCLI, OpDefineNone) {
+  cli_node_init(node, "admin");
+
+  EXPECT_EQ(cli_cmd_op_define(node, "comment", "none", NULL, NULL, NULL), CLI_OK);
+
+  const dedup_spec_t* spec = state_find_op_type_def(&node->attr_machine->base_state, "comment");
+  ASSERT_NE(spec, nullptr);
+  EXPECT_EQ(spec->type, DEDUP_NONE);
+}
+
+TEST_F(TestCLI, OpDefineInvalidDedupType) {
+  cli_node_init(node, "admin");
+
+  EXPECT_EQ(cli_cmd_op_define(node, "bad_op", "invalid_type", NULL, NULL, NULL), CLI_ERR_ARGS);
+}
+
+TEST_F(TestCLI, OpDefineUninitialized) {
+  EXPECT_EQ(cli_cmd_op_define(node, "vote", "per_user", "voters", NULL, NULL), CLI_ERR_NOT_INIT);
+}
+
+TEST_F(TestCLI, OpDefineNullParams) {
+  cli_node_init(node, "admin");
+  EXPECT_EQ(cli_cmd_op_define(node, NULL, "per_user", "voters", NULL, NULL), CLI_ERR_ARGS);
+  EXPECT_EQ(cli_cmd_op_define(node, "vote", NULL, "voters", NULL, NULL), CLI_ERR_ARGS);
+}
+
+TEST_F(TestCLI, OpCheckDedupPerUserPasses) {
+  cli_node_init(node, "admin");
+  cli_cmd_item_add(node, "voters", "one_shot_set");
+  cli_cmd_op_define(node, "vote", "per_user", "voters", NULL, NULL);
+
+  // Check dedup for "vote" by "alice" — should pass (empty set)
+  EXPECT_EQ(cli_cmd_op_check_dedup(node, "vote", "alice"), CLI_OK);
+}
+
+TEST_F(TestCLI, OpCheckDedupGlobalPasses) {
+  cli_node_init(node, "admin");
+  cli_cmd_item_add(node, "executed", "one_shot_flag");
+  cli_cmd_op_define(node, "execute_proposal", "global", NULL, "executed", NULL);
+
+  // Check dedup for "execute_proposal" by "carol" — should pass (flag is false)
+  EXPECT_EQ(cli_cmd_op_check_dedup(node, "execute_proposal", "carol"), CLI_OK);
+}
+
+TEST_F(TestCLI, OpCheckDedupNoSpecPasses) {
+  cli_node_init(node, "admin");
+
+  // No registered dedup spec for "unknown_op" — should pass
+  EXPECT_EQ(cli_cmd_op_check_dedup(node, "unknown_op", "alice"), CLI_OK);
+}
+
+TEST_F(TestCLI, OpCheckDedupUninitialized) {
+  EXPECT_EQ(cli_cmd_op_check_dedup(node, "vote", "alice"), CLI_ERR_NOT_INIT);
+}
+
+// ============================================================
+// Dispatch tests for new op subcommands
+// ============================================================
+
+TEST_F(TestCLI, DispatchOpDefine) {
+  cli_node_init(node, "admin");
+  cli_cmd_item_add(node, "voters", "one_shot_set");
+
+  char* argv[] = {(char*)"crabs_node", (char*)"op", (char*)"define",
+                  (char*)"vote", (char*)"per_user", (char*)"voters"};
+  EXPECT_EQ(cli_dispatch(node, 6, argv), CLI_OK);
+
+  const dedup_spec_t* spec = state_find_op_type_def(&node->attr_machine->base_state, "vote");
+  ASSERT_NE(spec, nullptr);
+  EXPECT_EQ(spec->type, DEDUP_PER_USER);
+}
+
+TEST_F(TestCLI, DispatchOpCheckDedup) {
+  cli_node_init(node, "admin");
+  cli_cmd_item_add(node, "voters", "one_shot_set");
+
+  char* define_argv[] = {(char*)"crabs_node", (char*)"op", (char*)"define",
+                         (char*)"vote", (char*)"per_user", (char*)"voters"};
+  EXPECT_EQ(cli_dispatch(node, 6, define_argv), CLI_OK);
+
+  char* check_argv[] = {(char*)"crabs_node", (char*)"op", (char*)"check-dedup",
+                         (char*)"vote", (char*)"alice"};
+  EXPECT_EQ(cli_dispatch(node, 5, check_argv), CLI_OK);
 }

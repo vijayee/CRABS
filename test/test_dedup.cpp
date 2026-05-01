@@ -865,3 +865,303 @@ TEST(DedupBuiltinOp, DefineOperationNoResourcesFails) {
   operation_destroy(op);
   state_destroy(state);
 }
+
+// ============================================================
+// v1.4 §13 Test Vectors: Dedup Idempotency Scenarios
+// ============================================================
+
+// §13.1 PER_USER — First Vote Succeeds
+TEST(TestVectorV14, PerUserFirstVoteSucceeds) {
+  // Setup: proposal_42.voters = ONE_SHOT_SET({})
+  state_t* state = state_create();
+  data_item_t* voters = data_item_create("proposal_42_voters",
+                                          DATA_TYPE_ONE_SHOT_SET, CRDT_ONE_SHOT_SET);
+  ASSERT_NE(voters, nullptr);
+  voters->value = one_shot_set_create();
+  ASSERT_NE(voters->value, nullptr);
+  state_add_item(state, voters);
+
+  // Operation 1: type="vote", signer_id="alice", dedup={PER_USER, tracker_path="proposal_42_voters"}
+  operation_t* op = operation_create("vote");
+  ASSERT_NE(op, nullptr);
+  memset(op->uuid, 0x01, CRABS_UUID_SIZE);
+  strncpy(op->signer_id, "alice", CRABS_MAX_USER_ID - 1);
+  op->lamport_time = 1;
+  op->dedup.type = DEDUP_PER_USER;
+  strncpy(op->dedup.tracker_path, "proposal_42_voters", CRABS_MAX_DEDUP_PATH - 1);
+
+  // Guard check: voters NOT CONTAINS alice? YES (empty)
+  crabs_error_e guard = dedup_check_guard(state, op);
+  EXPECT_EQ(guard, CRABS_SUCCESS);
+
+  // Mutation: voters.add("alice")
+  crabs_error_e mut = dedup_apply_mutation(state, op);
+  EXPECT_EQ(mut, CRABS_SUCCESS);
+
+  // Result: SUCCESS, voters = {"alice"}
+  EXPECT_TRUE(one_shot_set_contains((one_shot_set_t*)voters->value, "alice"));
+  EXPECT_EQ(one_shot_set_count((one_shot_set_t*)voters->value), 1u);
+
+  operation_destroy(op);
+  state_destroy(state);
+}
+
+// §13.2 PER_USER — Second Vote Rejected
+TEST(TestVectorV14, PerUserSecondVoteRejected) {
+  // Setup: proposal_42.voters = ONE_SHOT_SET({"alice"})
+  state_t* state = state_create();
+  data_item_t* voters = data_item_create("proposal_42_voters",
+                                          DATA_TYPE_ONE_SHOT_SET, CRDT_ONE_SHOT_SET);
+  ASSERT_NE(voters, nullptr);
+  voters->value = one_shot_set_create();
+  ASSERT_NE(voters->value, nullptr);
+  one_shot_set_add((one_shot_set_t*)voters->value, "alice");
+  state_add_item(state, voters);
+
+  // Operation 2: type="vote", signer_id="alice", dedup={PER_USER, tracker_path="proposal_42_voters"}
+  operation_t* op = operation_create("vote");
+  ASSERT_NE(op, nullptr);
+  memset(op->uuid, 0x02, CRABS_UUID_SIZE);
+  strncpy(op->signer_id, "alice", CRABS_MAX_USER_ID - 1);
+  op->lamport_time = 2;
+  op->dedup.type = DEDUP_PER_USER;
+  strncpy(op->dedup.tracker_path, "proposal_42_voters", CRABS_MAX_DEDUP_PATH - 1);
+
+  // Guard check: voters NOT CONTAINS alice? NO (already in set)
+  crabs_error_e guard = dedup_check_guard(state, op);
+  EXPECT_EQ(guard, CRABS_ERR_ALREADY_PERFORMED);
+
+  // Result: ALREADY_PERFORMED, voters = {"alice"} (unchanged)
+  EXPECT_EQ(one_shot_set_count((one_shot_set_t*)voters->value), 1u);
+
+  operation_destroy(op);
+  state_destroy(state);
+}
+
+// §13.3 PER_USER — Different User Can Vote
+TEST(TestVectorV14, PerUserDifferentUserCanVote) {
+  // Setup: proposal_42.voters = ONE_SHOT_SET({"alice"})
+  state_t* state = state_create();
+  data_item_t* voters = data_item_create("proposal_42_voters",
+                                          DATA_TYPE_ONE_SHOT_SET, CRDT_ONE_SHOT_SET);
+  ASSERT_NE(voters, nullptr);
+  voters->value = one_shot_set_create();
+  ASSERT_NE(voters->value, nullptr);
+  one_shot_set_add((one_shot_set_t*)voters->value, "alice");
+  state_add_item(state, voters);
+
+  // Operation 3: type="vote", signer_id="bob", dedup={PER_USER, tracker_path="proposal_42_voters"}
+  operation_t* op = operation_create("vote");
+  ASSERT_NE(op, nullptr);
+  memset(op->uuid, 0x03, CRABS_UUID_SIZE);
+  strncpy(op->signer_id, "bob", CRABS_MAX_USER_ID - 1);
+  op->lamport_time = 3;
+  op->dedup.type = DEDUP_PER_USER;
+  strncpy(op->dedup.tracker_path, "proposal_42_voters", CRABS_MAX_DEDUP_PATH - 1);
+
+  // Guard check: voters NOT CONTAINS bob? YES
+  crabs_error_e guard = dedup_check_guard(state, op);
+  EXPECT_EQ(guard, CRABS_SUCCESS);
+
+  // Mutation: voters.add("bob")
+  crabs_error_e mut = dedup_apply_mutation(state, op);
+  EXPECT_EQ(mut, CRABS_SUCCESS);
+
+  // Result: SUCCESS, voters = {"alice", "bob"}
+  EXPECT_TRUE(one_shot_set_contains((one_shot_set_t*)voters->value, "alice"));
+  EXPECT_TRUE(one_shot_set_contains((one_shot_set_t*)voters->value, "bob"));
+  EXPECT_EQ(one_shot_set_count((one_shot_set_t*)voters->value), 2u);
+
+  operation_destroy(op);
+  state_destroy(state);
+}
+
+// §13.4 GLOBAL — First Execution Succeeds
+TEST(TestVectorV14, GlobalFirstExecutionSucceeds) {
+  // Setup: proposal_42.executed = ONE_SHOT_FLAG({value: false})
+  state_t* state = state_create();
+  data_item_t* flag = data_item_create("proposal_42_executed",
+                                        DATA_TYPE_ONE_SHOT_FLAG, CRDT_ONE_SHOT_FLAG);
+  ASSERT_NE(flag, nullptr);
+  flag->value = one_shot_flag_create();
+  ASSERT_NE(flag->value, nullptr);
+  state_add_item(state, flag);
+
+  // Operation 1: type="execute_proposal", signer_id="carol", dedup={GLOBAL, flag_path="proposal_42_executed"}
+  operation_t* op = operation_create("execute_proposal");
+  ASSERT_NE(op, nullptr);
+  memset(op->uuid, 0x04, CRABS_UUID_SIZE);
+  strncpy(op->signer_id, "carol", CRABS_MAX_USER_ID - 1);
+  op->lamport_time = 4;
+  op->dedup.type = DEDUP_GLOBAL;
+  strncpy(op->dedup.flag_path, "proposal_42_executed", CRABS_MAX_DEDUP_PATH - 1);
+
+  // Guard check: executed == false? YES
+  crabs_error_e guard = dedup_check_guard(state, op);
+  EXPECT_EQ(guard, CRABS_SUCCESS);
+
+  // Mutation: executed.set("carol")
+  crabs_error_e mut = dedup_apply_mutation(state, op);
+  EXPECT_EQ(mut, CRABS_SUCCESS);
+
+  // Result: SUCCESS, executed = {value: true, set_by: "carol"}
+  EXPECT_TRUE(one_shot_flag_value((one_shot_flag_t*)flag->value));
+  EXPECT_STREQ(((one_shot_flag_t*)flag->value)->set_by, "carol");
+
+  operation_destroy(op);
+  state_destroy(state);
+}
+
+// §13.5 GLOBAL — Second Execution Rejected
+TEST(TestVectorV14, GlobalSecondExecutionRejected) {
+  // Setup: proposal_42.executed = ONE_SHOT_FLAG({value: true, set_by: "carol"})
+  state_t* state = state_create();
+  data_item_t* flag = data_item_create("proposal_42_executed",
+                                        DATA_TYPE_ONE_SHOT_FLAG, CRDT_ONE_SHOT_FLAG);
+  ASSERT_NE(flag, nullptr);
+  flag->value = one_shot_flag_create();
+  ASSERT_NE(flag->value, nullptr);
+  one_shot_flag_set((one_shot_flag_t*)flag->value, "carol", 1);
+  state_add_item(state, flag);
+
+  // Operation 2: type="execute_proposal", signer_id="dave", dedup={GLOBAL, flag_path="proposal_42_executed"}
+  operation_t* op = operation_create("execute_proposal");
+  ASSERT_NE(op, nullptr);
+  memset(op->uuid, 0x05, CRABS_UUID_SIZE);
+  strncpy(op->signer_id, "dave", CRABS_MAX_USER_ID - 1);
+  op->lamport_time = 5;
+  op->dedup.type = DEDUP_GLOBAL;
+  strncpy(op->dedup.flag_path, "proposal_42_executed", CRABS_MAX_DEDUP_PATH - 1);
+
+  // Guard check: executed == false? NO (already true)
+  crabs_error_e guard = dedup_check_guard(state, op);
+  EXPECT_EQ(guard, CRABS_ERR_ALREADY_EXECUTED);
+
+  // Result: ALREADY_EXECUTED, executed = {value: true, set_by: "carol"} (unchanged)
+  EXPECT_TRUE(one_shot_flag_value((one_shot_flag_t*)flag->value));
+  EXPECT_STREQ(((one_shot_flag_t*)flag->value)->set_by, "carol");
+
+  operation_destroy(op);
+  state_destroy(state);
+}
+
+// §13.6 CRDT Merge — Concurrent Votes
+TEST(TestVectorV14, CrdtMergeConcurrentVotes) {
+  // Setup: proposal_42.voters = ONE_SHOT_SET({})
+  // Node A and Node B both receive Alice's vote concurrently
+
+  // Create two independent states
+  state_t* state_a = state_create();
+  data_item_t* voters_a = data_item_create("proposal_42_voters",
+                                            DATA_TYPE_ONE_SHOT_SET, CRDT_ONE_SHOT_SET);
+  ASSERT_NE(voters_a, nullptr);
+  voters_a->value = one_shot_set_create();
+  ASSERT_NE(voters_a->value, nullptr);
+  state_add_item(state_a, voters_a);
+
+  state_t* state_b = state_create();
+  data_item_t* voters_b = data_item_create("proposal_42_voters",
+                                            DATA_TYPE_ONE_SHOT_SET, CRDT_ONE_SHOT_SET);
+  ASSERT_NE(voters_b, nullptr);
+  voters_b->value = one_shot_set_create();
+  ASSERT_NE(voters_b->value, nullptr);
+  state_add_item(state_b, voters_b);
+
+  // Node A: alice votes — guard passes, mutation adds alice
+  operation_t* op_a = operation_create("vote");
+  ASSERT_NE(op_a, nullptr);
+  memset(op_a->uuid, 0x0A, CRABS_UUID_SIZE);
+  strncpy(op_a->signer_id, "alice", CRABS_MAX_USER_ID - 1);
+  op_a->lamport_time = 10;
+  op_a->dedup.type = DEDUP_PER_USER;
+  strncpy(op_a->dedup.tracker_path, "proposal_42_voters", CRABS_MAX_DEDUP_PATH - 1);
+
+  crabs_error_e guard_a = dedup_check_guard(state_a, op_a);
+  EXPECT_EQ(guard_a, CRABS_SUCCESS);
+  dedup_apply_mutation(state_a, op_a);
+  // State A: voters = {"alice"}, count = 1
+
+  // Node B: same operation from alice — guard passes (empty set)
+  crabs_error_e guard_b = dedup_check_guard(state_b, op_a);
+  EXPECT_EQ(guard_b, CRABS_SUCCESS);
+  dedup_apply_mutation(state_b, op_a);
+  // State B: voters = {"alice"}, count = 1
+
+  // Merge: voters_a ∪ voters_b = {"alice"}
+  one_shot_set_t* merged = one_shot_set_merge((one_shot_set_t*)voters_a->value,
+                                               (one_shot_set_t*)voters_b->value);
+  ASSERT_NE(merged, nullptr);
+
+  // Result: Alice's vote counted ONCE
+  EXPECT_TRUE(one_shot_set_contains(merged, "alice"));
+  EXPECT_EQ(one_shot_set_count(merged), 1u);
+
+  one_shot_set_destroy(merged);
+  operation_destroy(op_a);
+  state_destroy(state_a);
+  state_destroy(state_b);
+}
+
+// §13.7 CRDT Merge — Concurrent Different Users
+TEST(TestVectorV14, CrdtMergeConcurrentDifferentUsers) {
+  // Setup: proposal_42.voters = ONE_SHOT_SET({})
+
+  // Create two independent states
+  state_t* state_a = state_create();
+  data_item_t* voters_a = data_item_create("proposal_42_voters",
+                                            DATA_TYPE_ONE_SHOT_SET, CRDT_ONE_SHOT_SET);
+  ASSERT_NE(voters_a, nullptr);
+  voters_a->value = one_shot_set_create();
+  ASSERT_NE(voters_a->value, nullptr);
+  state_add_item(state_a, voters_a);
+
+  state_t* state_b = state_create();
+  data_item_t* voters_b = data_item_create("proposal_42_voters",
+                                            DATA_TYPE_ONE_SHOT_SET, CRDT_ONE_SHOT_SET);
+  ASSERT_NE(voters_b, nullptr);
+  voters_b->value = one_shot_set_create();
+  ASSERT_NE(voters_b->value, nullptr);
+  state_add_item(state_b, voters_b);
+
+  // Node A receives Alice's vote
+  operation_t* op_alice = operation_create("vote");
+  ASSERT_NE(op_alice, nullptr);
+  memset(op_alice->uuid, 0x0B, CRABS_UUID_SIZE);
+  strncpy(op_alice->signer_id, "alice", CRABS_MAX_USER_ID - 1);
+  op_alice->lamport_time = 11;
+  op_alice->dedup.type = DEDUP_PER_USER;
+  strncpy(op_alice->dedup.tracker_path, "proposal_42_voters", CRABS_MAX_DEDUP_PATH - 1);
+
+  dedup_check_guard(state_a, op_alice);
+  dedup_apply_mutation(state_a, op_alice);
+  // State A: voters = {"alice"}
+
+  // Node B receives Bob's vote
+  operation_t* op_bob = operation_create("vote");
+  ASSERT_NE(op_bob, nullptr);
+  memset(op_bob->uuid, 0x0C, CRABS_UUID_SIZE);
+  strncpy(op_bob->signer_id, "bob", CRABS_MAX_USER_ID - 1);
+  op_bob->lamport_time = 12;
+  op_bob->dedup.type = DEDUP_PER_USER;
+  strncpy(op_bob->dedup.tracker_path, "proposal_42_voters", CRABS_MAX_DEDUP_PATH - 1);
+
+  dedup_check_guard(state_b, op_bob);
+  dedup_apply_mutation(state_b, op_bob);
+  // State B: voters = {"bob"}
+
+  // Merge: {"alice"} ∪ {"bob"} = {"alice", "bob"}
+  one_shot_set_t* merged = one_shot_set_merge((one_shot_set_t*)voters_a->value,
+                                               (one_shot_set_t*)voters_b->value);
+  ASSERT_NE(merged, nullptr);
+
+  // Result: Both votes counted
+  EXPECT_TRUE(one_shot_set_contains(merged, "alice"));
+  EXPECT_TRUE(one_shot_set_contains(merged, "bob"));
+  EXPECT_EQ(one_shot_set_count(merged), 2u);
+
+  one_shot_set_destroy(merged);
+  operation_destroy(op_alice);
+  operation_destroy(op_bob);
+  state_destroy(state_a);
+  state_destroy(state_b);
+}

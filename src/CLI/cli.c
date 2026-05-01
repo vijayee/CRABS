@@ -64,6 +64,11 @@ const char* cli_error_string(crabs_error_e err) {
     case CRABS_ERR_RESOURCE_NOT_FOUND:    return "resource_not_found";
     case CRABS_ERR_DUPLICATE_OPERATION:   return "duplicate_operation";
     case CRABS_ERR_TYPE_MISMATCH:        return "type_mismatch";
+    case CRABS_ERR_ALREADY_PERFORMED:    return "already_performed";
+    case CRABS_ERR_ALREADY_EXECUTED:     return "already_executed";
+    case CRABS_ERR_CONDITION_NOT_MET:    return "condition_not_met";
+    case CRABS_ERR_TRACKER_NOT_FOUND:    return "tracker_not_found";
+    case CRABS_ERR_FLAG_NOT_FOUND:       return "flag_not_found";
     case CRABS_ERR_SERIALIZATION_ERROR:   return "serialization_error";
     case CRABS_ERR_CRYPTOGRAPHIC_ERROR:   return "cryptographic_error";
     case CRABS_ERR_INTERNAL:              return "internal_error";
@@ -399,6 +404,8 @@ static data_type_e _parse_data_type(const char* str) {
   if (strcmp(str, "register") == 0)      return DATA_TYPE_REGISTER;
   if (strcmp(str, "document") == 0)      return DATA_TYPE_DOCUMENT;
   if (strcmp(str, "resource") == 0)      return DATA_TYPE_RESOURCE;
+  if (strcmp(str, "one_shot_set") == 0)  return DATA_TYPE_ONE_SHOT_SET;
+  if (strcmp(str, "one_shot_flag") == 0) return DATA_TYPE_ONE_SHOT_FLAG;
   return DATA_TYPE_CUSTOM;
 }
 
@@ -409,6 +416,8 @@ static crdt_type_e _parse_crdt_type(const char* str) {
   if (strcmp(str, "2p_set") == 0)       return CRDT_2P_SET;
   if (strcmp(str, "lww_reg") == 0)      return CRDT_LWW_REG;
   if (strcmp(str, "rga") == 0)          return CRDT_RGA;
+  if (strcmp(str, "one_shot_set") == 0)  return CRDT_ONE_SHOT_SET;
+  if (strcmp(str, "one_shot_flag") == 0) return CRDT_ONE_SHOT_FLAG;
   return CRDT_CUSTOM;
 }
 
@@ -648,6 +657,112 @@ cli_result_e cli_cmd_op_submit(cli_node_t* node, const char* type,
 }
 
 // ============================================================
+// Dedup Commands
+// ============================================================
+
+static dedup_type_e _parse_dedup_type(const char* str, bool* valid) {
+  if (strcmp(str, "none") == 0)      { *valid = true; return DEDUP_NONE; }
+  if (strcmp(str, "per_user") == 0)  { *valid = true; return DEDUP_PER_USER; }
+  if (strcmp(str, "global") == 0)    { *valid = true; return DEDUP_GLOBAL; }
+  if (strcmp(str, "custom") == 0)    { *valid = true; return DEDUP_CUSTOM; }
+  *valid = false;
+  return DEDUP_NONE;
+}
+
+cli_result_e cli_cmd_op_define(cli_node_t* node, const char* op_type_name,
+                                const char* dedup_type_str,
+                                const char* tracker_path,
+                                const char* flag_path,
+                                const char* condition) {
+  if (node == NULL || !node->initialized) return CLI_ERR_NOT_INIT;
+  if (op_type_name == NULL || dedup_type_str == NULL) return CLI_ERR_ARGS;
+
+  bool dedup_valid = false;
+  dedup_type_e dtype = _parse_dedup_type(dedup_type_str, &dedup_valid);
+  if (!dedup_valid) {
+    printf("Error: Invalid dedup type '%s'. Use none|per_user|global|custom.\n", dedup_type_str);
+    return CLI_ERR_ARGS;
+  }
+
+  operation_t* op = operation_create(CRABS_OP_DEFINE_OPERATION);
+  if (op == NULL) return CLI_ERR_EXEC;
+
+  op->resource_count = 1;
+  op->resources = get_clear_memory(CRABS_MAX_USER_ID);
+  strncpy(op->resources[0], op_type_name, CRABS_MAX_USER_ID - 1);
+  strncpy(op->signer_id, node->attr_machine->users ? node->attr_machine->users->user_id : "admin",
+          CRABS_MAX_USER_ID - 1);
+
+  op->dedup.type = dtype;
+  if (dtype == DEDUP_PER_USER) {
+    if (tracker_path == NULL) {
+      operation_destroy(op);
+      printf("Error: PER_USER dedup requires a tracker_path.\n");
+      return CLI_ERR_ARGS;
+    }
+    strncpy(op->dedup.tracker_path, tracker_path, CRABS_MAX_DEDUP_PATH - 1);
+  } else if (dtype == DEDUP_GLOBAL) {
+    if (flag_path == NULL) {
+      operation_destroy(op);
+      printf("Error: GLOBAL dedup requires a flag_path.\n");
+      return CLI_ERR_ARGS;
+    }
+    strncpy(op->dedup.flag_path, flag_path, CRABS_MAX_DEDUP_PATH - 1);
+  } else if (dtype == DEDUP_CUSTOM) {
+    if (condition == NULL) {
+      operation_destroy(op);
+      printf("Error: CUSTOM dedup requires a condition expression.\n");
+      return CLI_ERR_ARGS;
+    }
+    strncpy(op->dedup.condition, condition, CRABS_MAX_POLICY_EXPR - 1);
+  }
+
+  crabs_error_e err = state_machine_op_define_operation(&node->attr_machine->base_state, op);
+  operation_destroy(op);
+
+  if (err != CRABS_SUCCESS) {
+    printf("Error: Define operation '%s' failed: %s\n", op_type_name, cli_error_string(err));
+    return CLI_ERR_EXEC;
+  }
+
+  printf("Operation type '%s' defined with dedup=%s.\n", op_type_name, dedup_type_str);
+  return CLI_OK;
+}
+
+cli_result_e cli_cmd_op_check_dedup(cli_node_t* node, const char* op_type_name,
+                                      const char* signer_id) {
+  if (node == NULL || !node->initialized) return CLI_ERR_NOT_INIT;
+  if (op_type_name == NULL) return CLI_ERR_ARGS;
+
+  operation_t* op = operation_create(op_type_name);
+  if (op == NULL) return CLI_ERR_EXEC;
+
+  if (signer_id) {
+    strncpy(op->signer_id, signer_id, CRABS_MAX_USER_ID - 1);
+  }
+
+  crabs_error_e err = state_machine_op_check_dedup(&node->attr_machine->base_state, op);
+  operation_destroy(op);
+
+  if (err == CRABS_SUCCESS) {
+    printf("Dedup check passed for '%s'.\n", op_type_name);
+    return CLI_OK;
+  } else if (err == CRABS_ERR_ALREADY_PERFORMED) {
+    printf("Dedup check rejected for '%s': already performed.\n", op_type_name);
+    return CLI_ERR_EXEC;
+  } else if (err == CRABS_ERR_ALREADY_EXECUTED) {
+    printf("Dedup check rejected for '%s': already executed.\n", op_type_name);
+    return CLI_ERR_EXEC;
+  } else if (err == CRABS_ERR_CONDITION_NOT_MET) {
+    printf("Dedup check rejected for '%s': condition not met.\n", op_type_name);
+    return CLI_ERR_EXEC;
+  } else {
+    printf("Dedup check error for '%s': %s\n", op_type_name, cli_error_string(err));
+    return CLI_ERR_EXEC;
+  }
+}
+
+// ============================================================
 // Command Dispatch
 // ============================================================
 
@@ -667,7 +782,7 @@ static void _print_user_usage(void) {
 }
 
 static void _print_item_usage(void) {
-  printf("  item add <name> <type>   Add a data item (counter|pn_counter|set|2p_set|register|document|resource)\n");
+  printf("  item add <name> <type>   Add a data item (counter|pn_counter|set|2p_set|register|document|resource|one_shot_set|one_shot_flag)\n");
   printf("  item list                 List data items\n");
 }
 
@@ -682,7 +797,9 @@ static void _print_key_usage(void) {
 }
 
 static void _print_op_usage(void) {
-  printf("  op submit <type> [payload_hex] [signer_id]   Submit an operation\n");
+  printf("  op submit <type> [payload_hex] [signer_id]           Submit an operation\n");
+  printf("  op define <op_type> <dedup_type> [tracker|flag|condition]  Define operation type with dedup\n");
+  printf("  op check-dedup <op_type> [signer_id]                 Check dedup for operation type\n");
 }
 
 void cli_print_usage(const char* prog) {
@@ -881,7 +998,8 @@ cli_result_e cli_dispatch(cli_node_t* node, int argc, char** argv) {
       _print_op_usage();
       return CLI_ERR_ARGS;
     }
-    if (strcmp(argv[2], "submit") == 0) {
+    const char* sub = argv[2];
+    if (strcmp(sub, "submit") == 0) {
       if (argc < 4) {
         printf("Usage: op submit <type> [payload_hex] [signer_id]\n");
         return CLI_ERR_ARGS;
@@ -890,7 +1008,34 @@ cli_result_e cli_dispatch(cli_node_t* node, int argc, char** argv) {
                                 argc > 4 ? argv[4] : NULL,
                                 argc > 5 ? argv[5] : NULL);
     }
-    printf("Unknown op subcommand: %s\n", argv[2]);
+    if (strcmp(sub, "define") == 0) {
+      if (argc < 5) {
+        printf("Usage: op define <op_type> <dedup_type> [tracker_path|flag_path|condition]\n");
+        printf("  dedup_type: none|per_user|global|custom\n");
+        printf("  For per_user: op define <op_type> per_user <tracker_path>\n");
+        printf("  For global: op define <op_type> global <flag_path>\n");
+        printf("  For custom: op define <op_type> custom <condition>\n");
+        printf("  For none: op define <op_type> none\n");
+        return CLI_ERR_ARGS;
+      }
+      const char* path = argc > 5 ? argv[5] : NULL;
+      bool dedup_valid = false;
+      dedup_type_e dtype = _parse_dedup_type(argv[4], &dedup_valid);
+      const char* tracker = NULL, *flag = NULL, *cond = NULL;
+      if (dtype == DEDUP_PER_USER) tracker = path;
+      else if (dtype == DEDUP_GLOBAL) flag = path;
+      else if (dtype == DEDUP_CUSTOM) cond = path;
+      return cli_cmd_op_define(node, argv[3], argv[4], tracker, flag, cond);
+    }
+    if (strcmp(sub, "check-dedup") == 0) {
+      if (argc < 4) {
+        printf("Usage: op check-dedup <op_type> [signer_id]\n");
+        return CLI_ERR_ARGS;
+      }
+      return cli_cmd_op_check_dedup(node, argv[3],
+                                      argc > 4 ? argv[4] : NULL);
+    }
+    printf("Unknown op subcommand: %s\n", sub);
     _print_op_usage();
     return CLI_ERR_ARGS;
   }
