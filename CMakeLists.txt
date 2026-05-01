@@ -19,4 +19,8 @@ else()
     message(FATAL_ERROR "OpenSSL not found.")
 endif()
 
+# CLI executable
+add_executable(crabs_node src/CLI/main.c src/CLI/cli.c)
+target_link_libraries(crabs_node PRIVATE crabs ${OPENSSL_LIBRARIES})
+
 add_subdirectory(test)
