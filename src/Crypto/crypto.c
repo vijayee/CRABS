@@ -198,7 +198,7 @@ void crypto_ecdsa_keypair_destroy(ecdsa_keypair_t* keypair) {
 crabs_error_e crypto_ecdsa_sign(const uint8_t private_key[32],
                                  const uint8_t* message, size_t message_len,
                                  uint8_t signature[CRABS_SIG_SIZE]) {
-  if (!message || !signature) {
+  if (!private_key || !message || !signature) {
     return CRABS_ERR_INVALID_PARAM;
   }
 
@@ -239,7 +239,7 @@ crabs_error_e crypto_ecdsa_sign(const uint8_t private_key[32],
 bool crypto_ecdsa_verify(const uint8_t public_key[33],
                           const uint8_t* message, size_t message_len,
                           const uint8_t signature[CRABS_SIG_SIZE]) {
-  if (!message || !signature) {
+  if (!public_key || !message || !signature) {
     return false;
   }
 
