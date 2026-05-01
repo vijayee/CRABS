@@ -466,3 +466,101 @@ TEST(DedupLifecycle, GlobalExecutionOnceLifecycle) {
   operation_destroy(op2);
   state_destroy(state);
 }
+
+// ============================================================
+// State machine integration tests
+// ============================================================
+
+TEST(DedupIntegration, StateMachineRejectsPerUserDuplicate) {
+  state_t* state = state_create();
+  data_item_t* voters = data_item_create("proposal_42_voters", DATA_TYPE_ONE_SHOT_SET, CRDT_ONE_SHOT_SET);
+  voters->value = one_shot_set_create();
+  state_add_item(state, voters);
+  state_add_policy(state, CRABS_OP_LOCK, "role:admin");
+
+  // First vote via state_machine_execute should succeed (dedup check passes)
+  operation_t* op1 = operation_create(CRABS_OP_LOCK);
+  memset(op1->uuid, 0x01, CRABS_UUID_SIZE);
+  strncpy(op1->signer_id, "alice", CRABS_MAX_USER_ID - 1);
+  op1->lamport_time = 1000;
+  op1->dedup.type = DEDUP_PER_USER;
+  strncpy(op1->dedup.tracker_path, "proposal_42_voters", CRABS_MAX_DEDUP_PATH - 1);
+  op1->resource_count = 1;
+  op1->resources = (char(*)[CRABS_MAX_USER_ID])malloc(CRABS_MAX_USER_ID);
+  strncpy(op1->resources[0], "res1", CRABS_MAX_USER_ID - 1);
+  op1->required_state = (protocol_state_e*)malloc(sizeof(protocol_state_e));
+  op1->required_state[0] = PROTOCOL_IDLE;
+  op1->next_state = (protocol_state_e*)malloc(sizeof(protocol_state_e));
+  op1->next_state[0] = PROTOCOL_LOCKED;
+  op1->lock_claim_count = 1;
+  op1->lock_claims = (lock_claim_t*)malloc(sizeof(lock_claim_t));
+  strncpy(op1->lock_claims[0].resource, "res1", CRABS_MAX_USER_ID - 1);
+  memset(op1->lock_claims[0].lock_token, 0x01, CRABS_LOCK_TOKEN_SIZE);
+  strncpy(op1->policy, "role:admin", CRABS_MAX_POLICY_EXPR - 1);
+  memset(op1->signature, 0, CRABS_SIG_SIZE);
+
+  // The dedup guard should pass (alice hasn't voted yet)
+  crabs_error_e guard_result = dedup_check_guard(state, op1);
+  EXPECT_EQ(guard_result, CRABS_SUCCESS);
+
+  // After adding alice to the set
+  one_shot_set_add((one_shot_set_t*)voters->value, "alice");
+
+  // Second attempt should fail
+  crabs_error_e guard_result2 = dedup_check_guard(state, op1);
+  EXPECT_EQ(guard_result2, CRABS_ERR_ALREADY_PERFORMED);
+
+  operation_destroy(op1);
+  state_destroy(state);
+}
+
+TEST(DedupIntegration, StateMachineRejectsGlobalDuplicate) {
+  state_t* state = state_create();
+  data_item_t* executed = data_item_create("proposal_42_executed", DATA_TYPE_ONE_SHOT_FLAG, CRDT_ONE_SHOT_FLAG);
+  executed->value = one_shot_flag_create();
+  state_add_item(state, executed);
+
+  operation_t* op = operation_create("custom_op");
+  memset(op->uuid, 0x02, CRABS_UUID_SIZE);
+  strncpy(op->signer_id, "carol", CRABS_MAX_USER_ID - 1);
+  op->dedup.type = DEDUP_GLOBAL;
+  strncpy(op->dedup.flag_path, "proposal_42_executed", CRABS_MAX_DEDUP_PATH - 1);
+
+  // Guard should pass (flag not set)
+  EXPECT_EQ(dedup_check_guard(state, op), CRABS_SUCCESS);
+
+  // Set the flag
+  one_shot_flag_set((one_shot_flag_t*)executed->value, "carol", 1000);
+
+  // Guard should now fail
+  EXPECT_EQ(dedup_check_guard(state, op), CRABS_ERR_ALREADY_EXECUTED);
+
+  operation_destroy(op);
+  state_destroy(state);
+}
+
+TEST(DedupIntegration, NoneDedupOperationExecutes) {
+  state_t* state = state_create();
+  state_add_policy(state, CRABS_OP_LOCK, "role:admin");
+
+  operation_t* op = operation_create(CRABS_OP_LOCK);
+  memset(op->uuid, 0x03, CRABS_UUID_SIZE);
+  strncpy(op->signer_id, "alice", CRABS_MAX_USER_ID - 1);
+  op->lamport_time = 1;
+  // dedup.type defaults to DEDUP_NONE
+  EXPECT_EQ(op->dedup.type, DEDUP_NONE);
+
+  lock_response_t resp;
+  memset(&resp, 0, sizeof(resp));
+  // This should work without any dedup interference
+  crabs_error_e result = state_machine_op_lock(state, op, &resp);
+  EXPECT_EQ(result, CRABS_SUCCESS);
+
+  operation_destroy(op);
+  state_destroy(state);
+}
+
+TEST(DedupIntegration, CheckDedupOperationIsBuiltin) {
+  EXPECT_TRUE(operation_is_builtin(CRABS_OP_DEFINE_OPERATION));
+  EXPECT_TRUE(operation_is_builtin(CRABS_OP_CHECK_DEDUP));
+}

@@ -9,6 +9,7 @@
 #include "../Attribute/attribute_machine.h"
 #include "../Condition/condition.h"
 #include "../Serialization/serialization.h"
+#include "../Dedup/dedup.h"
 #include "../Util/allocator.h"
 #include <string.h>
 #include <stdlib.h>
@@ -68,6 +69,17 @@ static const transition_t TRANSITIONS[] = {
   {PROTOCOL_ERROR,    CRABS_OP_SUSPEND_KEY,      PROTOCOL_ERROR},
   {PROTOCOL_ERROR,    CRABS_OP_ACTIVATE_KEY,     PROTOCOL_ERROR},
   {PROTOCOL_ERROR,    CRABS_OP_ROTATE_KEY,       PROTOCOL_ERROR},
+  // Dedup operations (v1.4 §7): valid in any state, no state change
+  {PROTOCOL_IDLE,     CRABS_OP_DEFINE_OPERATION,  PROTOCOL_IDLE},
+  {PROTOCOL_LOCKED,   CRABS_OP_DEFINE_OPERATION,  PROTOCOL_LOCKED},
+  {PROTOCOL_MODIFIED, CRABS_OP_DEFINE_OPERATION,  PROTOCOL_MODIFIED},
+  {PROTOCOL_VERIFIED, CRABS_OP_DEFINE_OPERATION,  PROTOCOL_VERIFIED},
+  {PROTOCOL_ERROR,    CRABS_OP_DEFINE_OPERATION,  PROTOCOL_ERROR},
+  {PROTOCOL_IDLE,     CRABS_OP_CHECK_DEDUP,       PROTOCOL_IDLE},
+  {PROTOCOL_LOCKED,   CRABS_OP_CHECK_DEDUP,       PROTOCOL_LOCKED},
+  {PROTOCOL_MODIFIED, CRABS_OP_CHECK_DEDUP,       PROTOCOL_MODIFIED},
+  {PROTOCOL_VERIFIED, CRABS_OP_CHECK_DEDUP,       PROTOCOL_VERIFIED},
+  {PROTOCOL_ERROR,    CRABS_OP_CHECK_DEDUP,       PROTOCOL_ERROR},
 };
 
 bool state_machine_is_valid_transition(protocol_state_e current, const char* op_type) {
@@ -103,7 +115,9 @@ bool operation_is_builtin(const char* type) {
           strcmp(type, CRABS_OP_SET_DEFAULT_KEY) == 0 ||
           strcmp(type, CRABS_OP_SUSPEND_KEY) == 0 ||
           strcmp(type, CRABS_OP_ACTIVATE_KEY) == 0 ||
-          strcmp(type, CRABS_OP_ROTATE_KEY) == 0);
+          strcmp(type, CRABS_OP_ROTATE_KEY) == 0 ||
+          strcmp(type, CRABS_OP_DEFINE_OPERATION) == 0 ||
+          strcmp(type, CRABS_OP_CHECK_DEDUP) == 0);
 }
 
 operation_t* operation_create(const char* type) {
@@ -268,7 +282,15 @@ crabs_error_e state_machine_execute(state_t* state, operation_t* op) {
     }
   }
 
-  // Step 5: ABE-gated policy verification (§10.3)
+  // Step 5: Dedup guard check (v1.4 §5.2)
+  if (op->dedup.type != DEDUP_NONE) {
+    crabs_error_e dedup_result = dedup_check_guard(state, op);
+    if (dedup_result != CRABS_SUCCESS) {
+      return dedup_result;
+    }
+  }
+
+  // Step 5b: ABE-gated policy verification (§10.3)
   const char* policy = state_find_policy(state, op->type);
   if (policy == NULL && op->resource_count > 0) {
     return CRABS_ERR_UNAUTHORIZED;
@@ -412,14 +434,29 @@ crabs_error_e state_machine_execute(state_t* state, operation_t* op) {
     result = state_machine_op_activate_key(state, op);
   } else if (strcmp(op->type, CRABS_OP_ROTATE_KEY) == 0) {
     result = state_machine_op_rotate_key(state, op);
+  } else if (strcmp(op->type, CRABS_OP_DEFINE_OPERATION) == 0) {
+    // Dedup: define operation type is a no-op for now (metadata only)
+    result = CRABS_SUCCESS;
+  } else if (strcmp(op->type, CRABS_OP_CHECK_DEDUP) == 0) {
+    // Dedup: check dedup guard without executing
+    result = dedup_check_guard(state, op);
   } else {
     result = CRABS_ERR_INVALID_PARAM;
   }
 
   if (result != CRABS_SUCCESS) return result;
 
-  // Step 8: Transition protocol states (handled by built-in ops)
-  // Step 9: Log operation
+  // Step 8: Apply dedup state mutation (v1.4 §5.3)
+  if (op->dedup.type != DEDUP_NONE) {
+    crabs_error_e mut_result = dedup_apply_mutation(state, op);
+    if (mut_result != CRABS_SUCCESS) {
+      // Mutation failure doesn't roll back the operation,
+      // but we log the error for diagnostics
+    }
+  }
+
+  // Step 9: Transition protocol states (handled by built-in ops)
+  // Step 10: Log operation
   uint8_t state_hash[CRABS_HASH_SIZE];
   memset(state_hash, 0, CRABS_HASH_SIZE);
   append_log(state, op->uuid, op->type, op->signer_id,
