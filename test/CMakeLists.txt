@@ -25,6 +25,8 @@ if (BUILD_TESTING)
         test_data_model.cpp
         test_protocol_ops.cpp
         test_attr_machine_extended.cpp
+        test_crdt_extended.cpp
+        test_trigger_contains.cpp
         test_cli.cpp
     )
 
