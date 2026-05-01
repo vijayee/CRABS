@@ -59,7 +59,8 @@ typedef enum {
   // 0x5xxx: Internal errors
   CRABS_ERR_INTERNAL               = 0x5001,
   CRABS_ERR_OOM                    = 0x5002,
-  CRABS_ERR_INVALID_PARAM           = 0x5003
+  CRABS_ERR_INVALID_PARAM           = 0x5003,
+  CRABS_ERR_SCHEME_ALREADY_REGISTERED = 0x5004
 } crabs_error_e;
 
 // ============================================================
@@ -79,5 +80,10 @@ typedef enum {
 #define CRABS_OP_DELETE_TRIGGER  "__delete_trigger__"
 #define CRABS_OP_DISABLE_TRIGGER "__disable_trigger__"
 #define CRABS_OP_ENABLE_TRIGGER  "__enable_trigger__"
+
+// Built-in Key Operations (v1.3 Amendment 3, §5)
+#define CRABS_OP_REGISTER_KEY     "__register_key__"
+#define CRABS_OP_REVOKE_KEY       "__revoke_key__"
+#define CRABS_OP_SET_DEFAULT_KEY  "__set_default_key__"
 
 #endif // CRABS_CRABS_H
