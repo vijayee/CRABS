@@ -119,5 +119,6 @@ const signature_vtable_t* crypto_sig_scheme_get(signature_scheme_e scheme_id);
 uint32_t       crypto_sig_scheme_list(signature_scheme_e* out, uint32_t max_count);
 uint32_t       crypto_sig_scheme_count(void);
 void           crypto_sig_scheme_init(void);
+void           crypto_sig_scheme_cleanup(void);
 
 #endif // CRABS_SIG_SCHEME_H

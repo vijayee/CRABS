@@ -270,3 +270,32 @@ TEST(TestSigScheme, ECDSAOptionalFunctionsNull) {
   EXPECT_EQ(vt->import_public_key, nullptr);
   EXPECT_EQ(vt->import_secret_key, nullptr);
 }
+
+// ============================================================
+// Cleanup
+// ============================================================
+
+TEST(TestSigScheme, CleanupResetsRegistry) {
+  crypto_sig_scheme_init();
+  EXPECT_EQ(crypto_sig_scheme_count(), 1u);
+
+  crypto_sig_scheme_cleanup();
+  EXPECT_EQ(crypto_sig_scheme_count(), 0u);
+  EXPECT_EQ(crypto_sig_scheme_get(ECDSA_SECP256K1), nullptr);
+}
+
+TEST(TestSigScheme, ReinitAfterCleanup) {
+  crypto_sig_scheme_init();
+  crypto_sig_scheme_cleanup();
+
+  crypto_sig_scheme_init();
+  EXPECT_EQ(crypto_sig_scheme_count(), 1u);
+  const signature_vtable_t* vt = crypto_sig_scheme_get(ECDSA_SECP256K1);
+  ASSERT_NE(vt, nullptr);
+}
+
+TEST(TestSigScheme, ListNullBuffer) {
+  crypto_sig_scheme_init();
+  uint32_t count = crypto_sig_scheme_list(nullptr, 32);
+  EXPECT_EQ(count, 0u);
+}

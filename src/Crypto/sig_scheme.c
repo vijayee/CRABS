@@ -47,6 +47,7 @@ const signature_vtable_t* crypto_sig_scheme_get(signature_scheme_e scheme_id) {
 }
 
 uint32_t crypto_sig_scheme_list(signature_scheme_e* out, uint32_t max_count) {
+  if (out == NULL) return 0;
   uint32_t count = _registry_count < max_count ? _registry_count : max_count;
   for (uint32_t i = 0; i < count; i++) {
     if (_registry[i] != NULL) {
@@ -127,6 +128,7 @@ static signature_vtable_t _ecdsa_secp256k1_vtable = {
   .name        = "ECDSA secp256k1",
   .properties  = {
     .scheme_id    = ECDSA_SECP256K1,
+    .name         = "ECDSA secp256k1",
     .security_level = 2,
     .is_post_quantum = false,
     .public_key_size  = 33,
@@ -157,4 +159,15 @@ void crypto_sig_scheme_init(void) {
   if (_registry_initialized) return;
   _registry_initialized = true;
   crypto_sig_scheme_register(&_ecdsa_secp256k1_vtable);
+}
+
+void crypto_sig_scheme_cleanup(void) {
+  for (uint32_t i = 0; i < _registry_count; i++) {
+    if (_registry[i] != NULL) {
+      free(_registry[i]);
+      _registry[i] = NULL;
+    }
+  }
+  _registry_count = 0;
+  _registry_initialized = false;
 }
