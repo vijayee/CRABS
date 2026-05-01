@@ -338,6 +338,14 @@ static bool _parse_primary(parser_ctx_t* ctx, primary_t* result) {
 // ============================================================
 // Parser: parse a list of values in parentheses
 // ============================================================
+static void _free_value_list(char** values, uint32_t count) {
+  if (values == NULL) return;
+  for (uint32_t i = 0; i < count; i++) {
+    if (values[i] != NULL) free(values[i]);
+  }
+  free(values);
+}
+
 static bool _parse_value_list(parser_ctx_t* ctx, char*** values, uint32_t* count) {
   *values = NULL;
   *count = 0;
@@ -349,6 +357,8 @@ static bool _parse_value_list(parser_ctx_t* ctx, char*** values, uint32_t* count
 
   primary_t elem;
   if (!_parse_primary(ctx, &elem)) {
+    _free_value_list(*values, 0);
+    *values = NULL;
     return false;
   }
   (*values)[0] = strdup(elem.path);
@@ -359,17 +369,31 @@ static bool _parse_value_list(parser_ctx_t* ctx, char*** values, uint32_t* count
     if (*count >= capacity) {
       capacity *= 2;
       char** new_values = realloc(*values, capacity * sizeof(char*));
-      if (new_values == NULL) return false;
+      if (new_values == NULL) {
+        _free_value_list(*values, *count);
+        *values = NULL;
+        *count = 0;
+        ctx->has_error = true;
+        return false;
+      }
       *values = new_values;
     }
     if (!_parse_primary(ctx, &elem)) {
+      _free_value_list(*values, *count);
+      *values = NULL;
+      *count = 0;
       return false;
     }
     (*values)[*count] = strdup(elem.path);
     (*count)++;
   }
 
-  if (!_parser_expect(ctx, TOK_RPAREN)) return false;
+  if (!_parser_expect(ctx, TOK_RPAREN)) {
+    _free_value_list(*values, *count);
+    *values = NULL;
+    *count = 0;
+    return false;
+  }
 
   return true;
 }
@@ -751,9 +775,11 @@ condition_node_t* condition_node_create_contains(const char* set_path, contains_
   node->contains_type = type;
   node->negated = negated;
   node->element_count = count;
-  node->element_values = get_memory(count * sizeof(char*));
-  for (uint32_t i = 0; i < count; i++) {
-    node->element_values[i] = strdup(values[i]);
+  if (count > 0 && values != NULL) {
+    node->element_values = get_memory(count * sizeof(char*));
+    for (uint32_t i = 0; i < count; i++) {
+      node->element_values[i] = strdup(values[i]);
+    }
   }
   return node;
 }
@@ -827,6 +853,12 @@ int64_t condition_resolve_path(const state_t* state, const char* path) {
 // CONTAINS evaluation helper
 // ============================================================
 static bool _evaluate_contains(const condition_node_t* node, const state_t* state) {
+  if (node->element_count == 0 || node->element_values == NULL) {
+    // No elements to check: CONTAINS_ANY → false, CONTAINS_ALL → true
+    bool result = (node->contains_type == CONTAINS_ALL);
+    return node->negated ? !result : result;
+  }
+
   data_item_t* item = _find_item_by_path(state, node->set_path);
   if (item == NULL) {
     return node->negated; // Not found: negated=true means NOT in set = true
