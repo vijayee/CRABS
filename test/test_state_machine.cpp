@@ -288,6 +288,43 @@ TEST_F(TestStateMachine, TestLockTokenEntropy) {
   operation_destroy(op2);
 }
 
+TEST_F(TestStateMachine, TestRollbackRestoresOriginalValue) {
+  data_item_t* item = state_find_item(state, "test_resource");
+  ASSERT_NE(item, nullptr);
+  int64_t original_value = *(int64_t*)item->value;
+
+  // Lock
+  operation_t* lock_op = make_lock_op();
+  EXPECT_EQ(state_machine_execute(state, lock_op), CRABS_SUCCESS);
+  operation_destroy(lock_op);
+
+  // Get fresh pointer after lock
+  item = state_find_item(state, "test_resource");
+  ASSERT_NE(item, nullptr);
+
+  // Modify value
+  *(int64_t*)item->value = original_value + 100;
+  item->protocol_state = PROTOCOL_MODIFIED;
+
+  // Rollback should restore original value
+  operation_t* rollback_op = operation_create(CRABS_OP_ROLLBACK);
+  memset(rollback_op->uuid, 0x50, CRABS_UUID_SIZE);
+  rollback_op->resources = (char(*)[CRABS_MAX_USER_ID])malloc(sizeof(char[CRABS_MAX_USER_ID]));
+  strncpy(rollback_op->resources[0], "test_resource", CRABS_MAX_USER_ID - 1);
+  rollback_op->resource_count = 1;
+  rollback_op->required_state = (protocol_state_e*)malloc(sizeof(protocol_state_e));
+  rollback_op->required_state[0] = PROTOCOL_MODIFIED;
+  rollback_op->lock_claims = (lock_claim_t*)malloc(sizeof(lock_claim_t));
+  strncpy(rollback_op->lock_claims[0].resource, "test_resource", CRABS_MAX_USER_ID - 1);
+  memcpy(rollback_op->lock_claims[0].lock_token, item->lock_state.lock_token, CRABS_LOCK_TOKEN_SIZE);
+  rollback_op->lock_claim_count = 1;
+  strncpy(rollback_op->signer_id, "alice", CRABS_MAX_USER_ID - 1);
+
+  EXPECT_EQ(state_machine_execute(state, rollback_op), CRABS_SUCCESS);
+  EXPECT_EQ(*(int64_t*)item->value, original_value);
+  operation_destroy(rollback_op);
+}
+
 TEST_F(TestStateMachine, TestChangeConfig) {
   const char* payload_str = "max_lock_duration_ms=10000";
   operation_t* op = operation_create(CRABS_OP_CHANGE_CONFIG);

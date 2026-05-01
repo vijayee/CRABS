@@ -303,8 +303,17 @@ crabs_error_e state_machine_op_lock(state_t* state, operation_t* op, lock_respon
     item->lock_state.lock_extensions = 0;
 
     if (item->value != NULL) {
-      item->lock_state.pre_lock_snapshot = get_memory(8);
-      memcpy(item->lock_state.pre_lock_snapshot, &now_ms, 8);
+      size_t value_size = 0;
+      if (item->type == DATA_TYPE_COUNTER || item->type == DATA_TYPE_PN_COUNTER ||
+          item->type == DATA_TYPE_RESOURCE) {
+        value_size = sizeof(int64_t);
+      } else if (item->type == DATA_TYPE_REGISTER) {
+        value_size = sizeof(int64_t);
+      }
+      if (value_size > 0) {
+        item->lock_state.pre_lock_snapshot = get_memory(value_size);
+        memcpy(item->lock_state.pre_lock_snapshot, item->value, value_size);
+      }
     }
 
     item->protocol_state = PROTOCOL_LOCKED;
@@ -360,9 +369,16 @@ crabs_error_e state_machine_op_rollback(state_t* state, operation_t* op) {
         item->protocol_state != PROTOCOL_ERROR) {
       return CRABS_ERR_PROTOCOL_VIOLATION;
     }
-    if (item->lock_state.pre_lock_snapshot != NULL) {
-      if (item->value != NULL) {
-        memcpy(item->value, item->lock_state.pre_lock_snapshot, 8);
+    if (item->lock_state.pre_lock_snapshot != NULL && item->value != NULL) {
+      size_t value_size = 0;
+      if (item->type == DATA_TYPE_COUNTER || item->type == DATA_TYPE_PN_COUNTER ||
+          item->type == DATA_TYPE_RESOURCE) {
+        value_size = sizeof(int64_t);
+      } else if (item->type == DATA_TYPE_REGISTER) {
+        value_size = sizeof(int64_t);
+      }
+      if (value_size > 0) {
+        memcpy(item->value, item->lock_state.pre_lock_snapshot, value_size);
       }
     }
     item->protocol_state = PROTOCOL_IDLE;
