@@ -9,7 +9,9 @@
 #include <openssl/evp.h>
 #include <openssl/rand.h>
 #include <openssl/obj_mac.h>
+#include <openssl/hmac.h>
 #include <string.h>
+#include <ctype.h>
 
 // ============================================================
 // Internal: Convert OpenSSL DER signature to raw r||s format
@@ -188,6 +190,7 @@ ecdsa_keypair_t* crypto_ecdsa_generate(void) {
 // ============================================================
 void crypto_ecdsa_keypair_destroy(ecdsa_keypair_t* keypair) {
   if (keypair) {
+    OPENSSL_cleanse(keypair->private_key, 32);
     free(keypair);
   }
 }
@@ -327,52 +330,347 @@ crabs_error_e crypto_random_bytes(uint8_t* buf, size_t len) {
 }
 
 // ============================================================
-// ABE Stub Implementations
+// ABE Policy Evaluation (§10.1) — AND/OR/attribute matching
 // ============================================================
 
-abe_key_t* crypto_abe_setup(void) {
-  // Stub: not yet implemented
-  return NULL;
+static bool _attr_in_list(const char* attr, const char* attr_list) {
+  if (!attr || !attr_list) return false;
+
+  size_t attr_len = strlen(attr);
+  const char* p = attr_list;
+
+  while (*p) {
+    while (*p == ' ' || *p == ',') p++;
+    if (*p == '\0') break;
+
+    const char* start = p;
+    while (*p && *p != ',') p++;
+    size_t tok_len = (size_t)(p - start);
+
+    while (tok_len > 0 && start[tok_len - 1] == ' ') tok_len--;
+
+    if (tok_len == attr_len && strncmp(start, attr, attr_len) == 0) {
+      return true;
+    }
+  }
+  return false;
 }
 
-void crypto_abe_key_destroy(abe_key_t* key) {
-  if (key) {
-    free(key->data);
-    free(key);
+static bool _eval_policy_expr(const char** pp, const char* attrs) {
+  while (**pp == ' ') (*pp)++;
+
+  if (strncmp(*pp, "AND", 3) == 0 && !isalpha((unsigned char)(*pp)[3])) {
+    // AND node: (left right) — both must match
+    *pp += 3;
+    while (**pp == ' ') (*pp)++;
+    bool left = _eval_policy_expr(pp, attrs);
+    bool right = _eval_policy_expr(pp, attrs);
+    return left && right;
+  }
+
+  if (strncmp(*pp, "OR", 2) == 0 && !isalpha((unsigned char)(*pp)[2])) {
+    // OR node: either must match
+    *pp += 2;
+    while (**pp == ' ') (*pp)++;
+    bool left = _eval_policy_expr(pp, attrs);
+    bool right = _eval_policy_expr(pp, attrs);
+    return left || right;
+  }
+
+  if (**pp == '(') {
+    (*pp)++;
+    bool result = _eval_policy_expr(pp, attrs);
+    while (**pp == ' ') (*pp)++;
+    if (**pp == ')') (*pp)++;
+    return result;
+  }
+
+  // Parse attribute token
+  const char* start = *pp;
+  while (**pp && **pp != ' ' && **pp != ')' && **pp != ',') (*pp)++;
+  size_t len = (size_t)(*pp - start);
+  if (len == 0) return false;
+
+  char attr[CRABS_MAX_POLICY_EXPR];
+  if (len >= sizeof(attr)) len = sizeof(attr) - 1;
+  memcpy(attr, start, len);
+  attr[len] = '\0';
+
+  return _attr_in_list(attr, attrs);
+}
+
+bool crypto_abe_eval_policy(const char* policy, const char* attrs) {
+  if (!policy || !attrs) return false;
+  if (strlen(policy) == 0) return true;
+
+  const char* p = policy;
+  bool result = _eval_policy_expr(&p, attrs);
+  return result;
+}
+
+// ============================================================
+// ABE Setup — Generate MSK and derive MPK (§10.1)
+// ============================================================
+
+abe_master_key_t* crypto_abe_setup(void) {
+  abe_master_key_t* mk = get_clear_memory(sizeof(abe_master_key_t));
+  if (!mk) return NULL;
+
+  if (crypto_random_bytes(mk->msk, ABE_MASTER_KEY_SIZE) != CRABS_SUCCESS) {
+    free(mk);
+    return NULL;
+  }
+
+  if (crypto_sha256(mk->msk, ABE_MASTER_KEY_SIZE, mk->mpk) != CRABS_SUCCESS) {
+    OPENSSL_cleanse(mk->msk, ABE_MASTER_KEY_SIZE);
+    free(mk);
+    return NULL;
+  }
+
+  return mk;
+}
+
+void crypto_abe_master_key_destroy(abe_master_key_t* mk) {
+  if (mk) {
+    OPENSSL_cleanse(mk->msk, ABE_MASTER_KEY_SIZE);
+    free(mk);
   }
 }
 
-abe_key_t* crypto_abe_keygen(const abe_key_t* msk, const abe_key_t* mpk, const char* attrs) {
-  // Stub: not yet implemented
-  (void)msk;
-  (void)mpk;
-  (void)attrs;
-  return NULL;
+// ============================================================
+// ABE Keygen — Derive user secret key from MSK + attrs (§10.1)
+// ============================================================
+
+static uint32_t _count_attrs(const char* attrs) {
+  if (!attrs || *attrs == '\0') return 0;
+  uint32_t count = 1;
+  const char* p = attrs;
+  while (*p) {
+    if (*p == ',') count++;
+    p++;
+  }
+  return count;
 }
 
-abe_ciphertext_t* crypto_abe_encrypt(const abe_key_t* mpk, const uint8_t* msg, size_t msg_len, const char* policy) {
-  // Stub: not yet implemented
-  (void)mpk;
-  (void)msg;
-  (void)msg_len;
-  (void)policy;
-  return NULL;
+abe_user_key_t* crypto_abe_keygen(const abe_master_key_t* mk, const char* attrs) {
+  if (!mk || !attrs) return NULL;
+
+  abe_user_key_t* sk = get_clear_memory(sizeof(abe_user_key_t));
+  if (!sk) return NULL;
+
+  strncpy(sk->attrs, attrs, CRABS_MAX_POLICY_EXPR - 1);
+  sk->attrs[CRABS_MAX_POLICY_EXPR - 1] = '\0';
+  sk->attr_count = _count_attrs(sk->attrs);
+
+  // Store MPK in user key for simulated ABE key derivation
+  // In production CP-ABE, this would be a proper attribute-based secret key
+  memcpy(sk->key, mk->mpk, ABE_MASTER_KEY_SIZE);
+
+  return sk;
+}
+
+void crypto_abe_user_key_destroy(abe_user_key_t* sk) {
+  if (sk) {
+    OPENSSL_cleanse(sk->key, ABE_MASTER_KEY_SIZE);
+    free(sk);
+  }
+}
+
+// ============================================================
+// ABE Encrypt — AES-256-GCM with policy-derived key (§10.1)
+// ============================================================
+
+static crabs_error_e _derive_encryption_key(const abe_master_key_t* mk,
+                                              const char* policy,
+                                              uint8_t key[32]) {
+  // Key = HMAC-SHA256(MPK, policy)
+  // Both encrypt and decrypt can derive this if they have MPK
+  unsigned int hmac_len = 32;
+  if (!HMAC(EVP_sha256(), mk->mpk, ABE_MASTER_KEY_SIZE,
+             (const unsigned char*)policy, strlen(policy),
+             key, &hmac_len)) {
+    return CRABS_ERR_CRYPTOGRAPHIC_ERROR;
+  }
+  return CRABS_SUCCESS;
+}
+
+static crabs_error_e _derive_decryption_key(const abe_user_key_t* sk,
+                                              const char* policy,
+                                              uint8_t key[32]) {
+  // Same derivation: HMAC-SHA256(MPK, policy)
+  // We embed MPK in the user key for simulation purposes
+  // In production ABE, this would use bilinear pairings
+  unsigned int hmac_len = 32;
+  if (!HMAC(EVP_sha256(), sk->key, ABE_MASTER_KEY_SIZE,
+             (const unsigned char*)policy, strlen(policy),
+             key, &hmac_len)) {
+    return CRABS_ERR_CRYPTOGRAPHIC_ERROR;
+  }
+  return CRABS_SUCCESS;
+}
+
+static crabs_error_e _aes_gcm_encrypt(const uint8_t key[32],
+                                        const uint8_t* msg, size_t msg_len,
+                                        uint8_t nonce[ABE_NONCE_SIZE],
+                                        uint8_t tag[ABE_TAG_SIZE],
+                                        uint8_t** ct_out, size_t* ct_len) {
+  EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
+  if (!ctx) return CRABS_ERR_CRYPTOGRAPHIC_ERROR;
+
+  if (crypto_random_bytes(nonce, ABE_NONCE_SIZE) != CRABS_SUCCESS) {
+    EVP_CIPHER_CTX_free(ctx);
+    return CRABS_ERR_CRYPTOGRAPHIC_ERROR;
+  }
+
+  if (EVP_EncryptInit_ex(ctx, EVP_aes_256_gcm(), NULL, NULL, NULL) != 1 ||
+      EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_IVLEN, ABE_NONCE_SIZE, NULL) != 1 ||
+      EVP_EncryptInit_ex(ctx, NULL, NULL, key, nonce) != 1) {
+    EVP_CIPHER_CTX_free(ctx);
+    return CRABS_ERR_CRYPTOGRAPHIC_ERROR;
+  }
+
+  *ct_out = get_clear_memory(msg_len + 16);
+  if (!*ct_out) {
+    EVP_CIPHER_CTX_free(ctx);
+    return CRABS_ERR_OOM;
+  }
+
+  int out_len = 0;
+  if (EVP_EncryptUpdate(ctx, *ct_out, &out_len, msg, (int)msg_len) != 1) {
+    free(*ct_out);
+    *ct_out = NULL;
+    EVP_CIPHER_CTX_free(ctx);
+    return CRABS_ERR_CRYPTOGRAPHIC_ERROR;
+  }
+  *ct_len = (size_t)out_len;
+
+  int final_len = 0;
+  if (EVP_EncryptFinal_ex(ctx, *ct_out + out_len, &final_len) != 1) {
+    free(*ct_out);
+    *ct_out = NULL;
+    EVP_CIPHER_CTX_free(ctx);
+    return CRABS_ERR_CRYPTOGRAPHIC_ERROR;
+  }
+  *ct_len += (size_t)final_len;
+
+  if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_GET_TAG, ABE_TAG_SIZE, tag) != 1) {
+    free(*ct_out);
+    *ct_out = NULL;
+    EVP_CIPHER_CTX_free(ctx);
+    return CRABS_ERR_CRYPTOGRAPHIC_ERROR;
+  }
+
+  EVP_CIPHER_CTX_free(ctx);
+  return CRABS_SUCCESS;
+}
+
+abe_ciphertext_t* crypto_abe_encrypt(const abe_master_key_t* mk,
+                                       const uint8_t* msg, size_t msg_len,
+                                       const char* policy) {
+  if (!mk || !msg || !policy) return NULL;
+
+  uint8_t enc_key[32];
+  if (_derive_encryption_key(mk, policy, enc_key) != CRABS_SUCCESS) {
+    return NULL;
+  }
+
+  abe_ciphertext_t* ct = get_clear_memory(sizeof(abe_ciphertext_t));
+  if (!ct) {
+    OPENSSL_cleanse(enc_key, sizeof(enc_key));
+    return NULL;
+  }
+
+  strncpy(ct->policy, policy, CRABS_MAX_POLICY_EXPR - 1);
+  ct->policy[CRABS_MAX_POLICY_EXPR - 1] = '\0';
+
+  crabs_error_e rc = _aes_gcm_encrypt(enc_key, msg, msg_len,
+                                        ct->nonce, ct->tag,
+                                        &ct->ciphertext, &ct->ct_len);
+  if (rc != CRABS_SUCCESS) {
+    OPENSSL_cleanse(enc_key, sizeof(enc_key));
+    free(ct);
+    return NULL;
+  }
+
+  OPENSSL_cleanse(enc_key, sizeof(enc_key));
+  return ct;
 }
 
 void crypto_abe_ciphertext_destroy(abe_ciphertext_t* ct) {
   if (ct) {
-    free(ct->data);
+    if (ct->ciphertext) {
+      OPENSSL_cleanse(ct->ciphertext, ct->ct_len);
+      free(ct->ciphertext);
+    }
     free(ct);
   }
 }
 
-int crypto_abe_decrypt(const abe_key_t* sk, const abe_ciphertext_t* ct, uint8_t** out, size_t* out_len) {
-  // Stub: not yet implemented
-  (void)sk;
-  (void)ct;
-  (void)out;
-  (void)out_len;
-  return -1;
+// ============================================================
+// ABE Decrypt — Check policy + AES-256-GCM decrypt (§10.1)
+// ============================================================
+
+static crabs_error_e _aes_gcm_decrypt(const uint8_t key[32],
+                              const abe_ciphertext_t* ct,
+                              uint8_t** out, size_t* out_len) {
+  EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
+  if (!ctx) return CRABS_ERR_CRYPTOGRAPHIC_ERROR;
+
+  if (EVP_DecryptInit_ex(ctx, EVP_aes_256_gcm(), NULL, NULL, NULL) != 1 ||
+      EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_IVLEN, ABE_NONCE_SIZE, NULL) != 1 ||
+      EVP_DecryptInit_ex(ctx, NULL, NULL, key, ct->nonce) != 1 ||
+      EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_TAG, ABE_TAG_SIZE, (void*)ct->tag) != 1) {
+    EVP_CIPHER_CTX_free(ctx);
+    return CRABS_ERR_CRYPTOGRAPHIC_ERROR;
+  }
+
+  *out = get_clear_memory(ct->ct_len + 16);
+  if (!*out) {
+    EVP_CIPHER_CTX_free(ctx);
+    return CRABS_ERR_OOM;
+  }
+
+  int dec_len = 0;
+  if (EVP_DecryptUpdate(ctx, *out, &dec_len, ct->ciphertext, (int)ct->ct_len) != 1) {
+    OPENSSL_cleanse(*out, ct->ct_len);
+    free(*out);
+    *out = NULL;
+    EVP_CIPHER_CTX_free(ctx);
+    return CRABS_ERR_CRYPTOGRAPHIC_ERROR;
+  }
+
+  int final_len = 0;
+  if (EVP_DecryptFinal_ex(ctx, *out + dec_len, &final_len) != 1) {
+    OPENSSL_cleanse(*out, ct->ct_len);
+    free(*out);
+    *out = NULL;
+    EVP_CIPHER_CTX_free(ctx);
+    return CRABS_ERR_CRYPTOGRAPHIC_ERROR;
+  }
+  *out_len = (size_t)(dec_len + final_len);
+
+  EVP_CIPHER_CTX_free(ctx);
+  return CRABS_SUCCESS;
+}
+
+crabs_error_e crypto_abe_decrypt(const abe_user_key_t* sk, const abe_ciphertext_t* ct,
+                         uint8_t** out, size_t* out_len) {
+  if (!sk || !ct || !out || !out_len) return CRABS_ERR_INVALID_PARAM;
+
+  // Check if user attributes satisfy the policy
+  if (!crypto_abe_eval_policy(ct->policy, sk->attrs)) {
+    return CRABS_ERR_UNAUTHORIZED;
+  }
+
+  // Derive the same encryption key: HMAC-SHA256(user_key, policy)
+  uint8_t enc_key[32];
+  if (_derive_decryption_key(sk, ct->policy, enc_key) != CRABS_SUCCESS) {
+    return CRABS_ERR_CRYPTOGRAPHIC_ERROR;
+  }
+
+  crabs_error_e rc = _aes_gcm_decrypt(enc_key, ct, out, out_len);
+  OPENSSL_cleanse(enc_key, sizeof(enc_key));
+  return rc;
 }
 
 // ============================================================
@@ -389,4 +687,155 @@ bool crypto_verify_operation(const uint8_t public_key[33],
                               const uint8_t* serialized_op, size_t op_len,
                               const uint8_t signature[CRABS_SIG_SIZE]) {
   return crypto_ecdsa_verify(public_key, serialized_op, op_len, signature);
+}
+
+// ============================================================
+// ABE-Gated Signature Verification (§10.3)
+// ============================================================
+
+static void _build_attr_string(const user_t* user, char* buf, size_t buf_len) {
+  if (!user || !buf || buf_len == 0) {
+    if (buf) buf[0] = '\0';
+    return;
+  }
+
+  size_t pos = 0;
+  for (uint32_t i = 0; i < user->attribute_count && pos < buf_len - 1; i++) {
+    if (pos > 0 && pos < buf_len - 1) {
+      buf[pos++] = ',';
+    }
+    // Extract the value portion after the colon from "type:value" format
+    const char* attr = user->attributes[i].value;
+    const char* colon = strchr(attr, ':');
+    const char* value = colon ? colon + 1 : attr;
+    size_t val_len = strlen(value);
+    if (pos + val_len >= buf_len - 1) {
+      val_len = buf_len - pos - 1;
+    }
+    memcpy(buf + pos, value, val_len);
+    pos += val_len;
+  }
+
+  // Append temporary attribute values
+  temp_attr_list_t* temp = user->temp_attrs;
+  while (temp != NULL && pos < buf_len - 1) {
+    if (pos > 0 && pos < buf_len - 1) {
+      buf[pos++] = ',';
+    }
+    // Use the value portion of temp attrs
+    const char* value = temp->value;
+    size_t val_len = strlen(value);
+    if (pos + val_len >= buf_len - 1) {
+      val_len = buf_len - pos - 1;
+    }
+    memcpy(buf + pos, value, val_len);
+    pos += val_len;
+    temp = temp->next;
+  }
+
+  buf[pos] = '\0';
+}
+
+verify_result_t crypto_verify_operation_auth(
+    const abe_master_key_t* mk,
+    const char* abe_policy,
+    const attribute_machine_t* attr_machine,
+    const uint8_t* serialized_op, size_t op_len,
+    const uint8_t signature[CRABS_SIG_SIZE],
+    const char* signer_id,
+    verify_mode_e mode) {
+  verify_result_t result = {
+    .authorized = false,
+    .error = CRABS_ERR_UNAUTHORIZED,
+    .signer_id = {'\0'}
+  };
+
+  if (!mk || !abe_policy || !serialized_op || op_len == 0) {
+    result.error = CRABS_ERR_INVALID_PARAM;
+    return result;
+  }
+
+  // Empty policy means no authorization required
+  if (strlen(abe_policy) == 0) {
+    result.authorized = true;
+    result.error = CRABS_SUCCESS;
+    if (signer_id) {
+      strncpy(result.signer_id, signer_id, CRABS_MAX_USER_ID - 1);
+    }
+    return result;
+  }
+
+  if (mode == VERIFY_MODE_A) {
+    // Mode A: Verify specific user via ECDSA + ABE policy check
+    if (!signer_id || !attr_machine) {
+      result.error = CRABS_ERR_INVALID_PARAM;
+      return result;
+    }
+
+    // Find the user in the attribute machine
+    user_t* user = attribute_machine_find_user((attribute_machine_t*)attr_machine, signer_id);
+    if (!user) {
+      result.error = CRABS_ERR_USER_NOT_FOUND;
+      return result;
+    }
+
+    // Check user is not suspended
+    if (user->status == USER_SUSPENDED) {
+      result.error = CRABS_ERR_USER_SUSPENDED;
+      return result;
+    }
+
+    // Build attribute string from user's attributes
+    char attr_string[CRABS_MAX_POLICY_EXPR];
+    _build_attr_string(user, attr_string, sizeof(attr_string));
+
+    // Check if user's attributes satisfy the ABE policy
+    if (!crypto_abe_eval_policy(abe_policy, attr_string)) {
+      result.error = CRABS_ERR_UNAUTHORIZED;
+      return result;
+    }
+
+    // Verify ECDSA signature
+    if (!crypto_ecdsa_verify(user->public_key, serialized_op, op_len, signature)) {
+      result.error = CRABS_ERR_CRYPTOGRAPHIC_ERROR;
+      return result;
+    }
+
+    result.authorized = true;
+    result.error = CRABS_SUCCESS;
+    strncpy(result.signer_id, signer_id, CRABS_MAX_USER_ID - 1);
+
+  } else {
+    // Mode B: Verify against all registered users via trial policy check
+    if (!attr_machine) {
+      result.error = CRABS_ERR_INVALID_PARAM;
+      return result;
+    }
+
+    // Iterate all users, check if any satisfy the policy and have a valid signature
+    user_t* user = ((attribute_machine_t*)attr_machine)->users;
+    while (user != NULL) {
+      if (user->status != USER_SUSPENDED) {
+        char attr_string[CRABS_MAX_POLICY_EXPR];
+        _build_attr_string(user, attr_string, sizeof(attr_string));
+
+        if (crypto_abe_eval_policy(abe_policy, attr_string)) {
+          // Check signature if provided
+          if (signature != NULL) {
+            if (crypto_ecdsa_verify(user->public_key, serialized_op, op_len, signature)) {
+              result.authorized = true;
+              result.error = CRABS_SUCCESS;
+              strncpy(result.signer_id, user->user_id, CRABS_MAX_USER_ID - 1);
+              return result;
+            }
+          }
+        }
+      }
+      user = user->next;
+    }
+
+    result.error = CRABS_ERR_UNAUTHORIZED;
+  }
+
+  return result;
 }

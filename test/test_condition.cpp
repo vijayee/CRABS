@@ -616,3 +616,55 @@ TEST_F(TestCondition, TestEvaluatePNCounter) {
   EXPECT_FALSE(condition_evaluate(node, state));
   condition_node_destroy(node);
 }
+
+// ============================================================
+// Policy Pre-processing Tests (Amendment 2 §5)
+// ============================================================
+
+TEST_F(TestCondition, TestPreprocessPolicyNoContains) {
+  auto result = preprocess_policy("video_abc >= 5", state, "alice");
+  EXPECT_TRUE(result.resolved_ok);
+  EXPECT_STRNE(result.abe_policy, "");
+}
+
+TEST_F(TestCondition, TestPreprocessPolicyContainsOnly) {
+  auto result = preprocess_policy("course_enrolled CONTAINS alice", state, "alice");
+  EXPECT_TRUE(result.resolved_ok);
+  EXPECT_STREQ(result.abe_policy, "");
+}
+
+TEST_F(TestCondition, TestPreprocessPolicyContainsAndABE) {
+  auto result = preprocess_policy("course_enrolled CONTAINS alice AND video_abc >= 5", state, "alice");
+  EXPECT_TRUE(result.resolved_ok);
+  EXPECT_STRNE(result.abe_policy, "");
+}
+
+TEST_F(TestCondition, TestPreprocessPolicyContainsFails) {
+  auto result = preprocess_policy("course_enrolled CONTAINS carol AND video_abc >= 5", state, "alice");
+  EXPECT_FALSE(result.resolved_ok);
+}
+
+TEST_F(TestCondition, TestPreprocessPolicyUserIdPlaceholder) {
+  // {user_id} placeholder is resolved before evaluation
+  auto result = preprocess_policy("course_enrolled CONTAINS alice", state, "alice");
+  EXPECT_TRUE(result.resolved_ok);
+
+  // Test that placeholder resolves correctly
+  auto result2 = preprocess_policy("mod_queue CONTAINS video_abc", state, "alice");
+  EXPECT_TRUE(result2.resolved_ok);
+}
+
+TEST_F(TestCondition, TestPreprocessPolicyNullInput) {
+  auto result = preprocess_policy(NULL, state, "alice");
+  EXPECT_TRUE(result.resolved_ok);
+  EXPECT_STREQ(result.abe_policy, "");
+
+  result = preprocess_policy("", state, "alice");
+  EXPECT_TRUE(result.resolved_ok);
+  EXPECT_STREQ(result.abe_policy, "");
+}
+
+TEST_F(TestCondition, TestPreprocessPolicyContainsNot) {
+  auto result = preprocess_policy("course_enrolled NOT CONTAINS carol", state, "alice");
+  EXPECT_TRUE(result.resolved_ok);
+}

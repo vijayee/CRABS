@@ -76,4 +76,14 @@ condition_node_t*  condition_node_create_or(condition_node_t* left, condition_no
 condition_node_t*  condition_node_create_contains(const char* set_path, contains_type_e type,
                                                     bool negated, char** values, uint32_t count);
 
+// ============================================================
+// Policy Pre-processing (Amendment 2 §5)
+// ============================================================
+typedef struct {
+  char  abe_policy[CRABS_MAX_POLICY_EXPR];
+  bool  resolved_ok;
+} policy_preprocess_result_t;
+
+policy_preprocess_result_t preprocess_policy(const char* policy, const state_t* state, const char* signer_id);
+
 #endif // CRABS_CONDITION_H

@@ -1004,3 +1004,214 @@ bool condition_evaluate(const condition_node_t* node, const state_t* state) {
       return false;
   }
 }
+
+// ============================================================
+// Policy Pre-processing (Amendment 2 §5)
+// ============================================================
+
+// Recursively filter CONTAINS nodes from a parsed AST.
+// Returns a new AST with only non-CONTAINS nodes, or NULL if all filtered.
+static condition_node_t* _filter_contains_nodes(condition_node_t* node) {
+  if (node == NULL) return NULL;
+
+  if (node->type == NODE_CONTAINS) {
+    // CONTAINS nodes are removed from the ABE policy
+    return NULL;
+  }
+
+  if (node->type == NODE_AND) {
+    condition_node_t* left = _filter_contains_nodes(node->left);
+    condition_node_t* right = _filter_contains_nodes(node->right);
+
+    if (left == NULL && right == NULL) return NULL;
+    if (left == NULL) return right;
+    if (right == NULL) return left;
+    return condition_node_create_and(left, right);
+  }
+
+  if (node->type == NODE_OR) {
+    condition_node_t* left = _filter_contains_nodes(node->left);
+    condition_node_t* right = _filter_contains_nodes(node->right);
+
+    if (left == NULL || right == NULL) return NULL;
+    return condition_node_create_or(left, right);
+  }
+
+  // COMPARISON nodes pass through
+  condition_node_t* copy = get_clear_memory(sizeof(condition_node_t));
+  memcpy(copy, node, sizeof(condition_node_t));
+  copy->element_values = NULL;
+  copy->element_count = 0;
+  copy->left = NULL;
+  copy->right = NULL;
+
+  // Deep-copy element_values if present (CMP_IN)
+  if (node->element_values != NULL && node->element_count > 0) {
+    copy->element_values = get_memory(node->element_count * sizeof(char*));
+    for (uint32_t i = 0; i < node->element_count; i++) {
+      copy->element_values[i] = strdup(node->element_values[i]);
+    }
+    copy->element_count = node->element_count;
+  }
+
+  return copy;
+}
+
+// Convert an AST back to a policy string (for ABE consumption)
+static void _ast_to_string(const condition_node_t* node, char* buf, size_t bufsize) {
+  if (node == NULL || buf == NULL || bufsize == 0) return;
+
+  size_t len = strlen(buf);
+
+  if (node->type == NODE_COMPARISON) {
+    // Comparison: left_path op value
+    char tmp[CRABS_MAX_POLICY_EXPR];
+    const char* op_str = "";
+    switch (node->cmp_operator) {
+      case CMP_GE: op_str = ">="; break;
+      case CMP_LE: op_str = "<="; break;
+      case CMP_GT: op_str = ">"; break;
+      case CMP_LT: op_str = "<"; break;
+      case CMP_EQ: op_str = "=="; break;
+      case CMP_NE: op_str = "!="; break;
+      case CMP_BETWEEN:
+        snprintf(tmp, sizeof(tmp), "%s BETWEEN %lld AND %lld",
+                 node->left_path, (long long)node->right_literal, (long long)node->right_literal_2);
+        strncat(buf, tmp, bufsize - len - 1);
+        return;
+      case CMP_IN: {
+        snprintf(tmp, sizeof(tmp), "%s IN (", node->left_path);
+        strncat(buf, tmp, bufsize - strlen(buf) - 1);
+        for (uint32_t i = 0; i < node->element_count; i++) {
+          if (i > 0) strncat(buf, ", ", bufsize - strlen(buf) - 1);
+          strncat(buf, node->element_values[i], bufsize - strlen(buf) - 1);
+        }
+        strncat(buf, ")", bufsize - strlen(buf) - 1);
+        return;
+      }
+      default: op_str = "?"; break;
+    }
+
+    if (node->right_path[0] != '\0') {
+      snprintf(tmp, sizeof(tmp), "%s %s %s", node->left_path, op_str, node->right_path);
+    } else {
+      snprintf(tmp, sizeof(tmp), "%s %s %lld", node->left_path, op_str, (long long)node->right_literal);
+    }
+    strncat(buf, tmp, bufsize - len - 1);
+  } else if (node->type == NODE_AND) {
+    _ast_to_string(node->left, buf, bufsize);
+    strncat(buf, " AND ", bufsize - strlen(buf) - 1);
+    _ast_to_string(node->right, buf, bufsize);
+  } else if (node->type == NODE_OR) {
+    strncat(buf, "(", bufsize - strlen(buf) - 1);
+    _ast_to_string(node->left, buf, bufsize);
+    strncat(buf, ") OR (", bufsize - strlen(buf) - 1);
+    _ast_to_string(node->right, buf, bufsize);
+    strncat(buf, ")", bufsize - strlen(buf) - 1);
+  }
+}
+
+// Resolve {user_id} placeholder in a string
+static void _resolve_user_id_placeholder(char* str, const char* signer_id) {
+  if (str == NULL || signer_id == NULL) return;
+
+  char placeholder[] = "{user_id}";
+  char* pos;
+  while ((pos = strstr(str, placeholder)) != NULL) {
+    size_t plen = strlen(placeholder);
+    size_t slen = strlen(signer_id);
+    size_t remaining = strlen(pos + plen);
+
+    if (slen <= plen) {
+      // Replacement is shorter or equal: safe to copy in place
+      memmove(pos + slen, pos + plen, remaining + 1);
+      memcpy(pos, signer_id, slen);
+    } else {
+      // Replacement is longer: need to shift
+      size_t offset = pos - str;
+      size_t total_len = strlen(str);
+      if (offset + slen + remaining < CRABS_MAX_POLICY_EXPR) {
+        memmove(pos + slen, pos + plen, remaining + 1);
+        memcpy(pos, signer_id, slen);
+      } else {
+        // Can't fit: truncate
+        memcpy(pos, signer_id, plen);
+        break;
+      }
+    }
+  }
+}
+
+policy_preprocess_result_t preprocess_policy(const char* policy, const state_t* state, const char* signer_id) {
+  policy_preprocess_result_t result;
+  memset(&result, 0, sizeof(result));
+  result.resolved_ok = true;
+
+  if (policy == NULL || policy[0] == '\0') {
+    return result;
+  }
+
+  // Step 1: Make a working copy and resolve {user_id} placeholders
+  char work_buf[CRABS_MAX_POLICY_EXPR];
+  strncpy(work_buf, policy, CRABS_MAX_POLICY_EXPR - 1);
+  work_buf[CRABS_MAX_POLICY_EXPR - 1] = '\0';
+
+  _resolve_user_id_placeholder(work_buf, signer_id);
+
+  // Step 2: Parse the policy into an AST
+  condition_node_t* ast = condition_parse(work_buf);
+  if (ast == NULL) {
+    // If we can't parse as a condition expression, treat as an attribute policy.
+    // Strip "type:" prefix (e.g., "role:admin" → "admin") for ABE evaluation.
+    const char* colon = strrchr(work_buf, ':');
+    if (colon != NULL && colon[1] != '\0') {
+      strncpy(result.abe_policy, colon + 1, CRABS_MAX_POLICY_EXPR - 1);
+    } else {
+      strncpy(result.abe_policy, work_buf, CRABS_MAX_POLICY_EXPR - 1);
+    }
+    result.resolved_ok = true;
+    return result;
+  }
+
+  // Step 3: Evaluate all CONTAINS nodes against state
+  // We walk the AST and check CONTAINS nodes.
+  // If any CONTAINS node evaluates to false, resolved_ok = false.
+  // We then strip CONTAINS nodes from the AST for ABE consumption.
+  bool all_contains_pass = true;
+
+  // Walk and evaluate CONTAINS nodes
+  // We use a helper to check all CONTAINS nodes in the tree
+  condition_node_t* filtered = _filter_contains_nodes(ast);
+
+  // Evaluate the original AST to check CONTAINS satisfaction
+  // For CONTAINS-only policies where all nodes are CONTAINS,
+  // evaluating the full AST tells us if the policy passes
+  if (!condition_evaluate(ast, state)) {
+    // Check if this is because a CONTAINS condition failed
+    // vs a comparison condition. We need finer-grained checking.
+    // Walk the AST and evaluate only CONTAINS nodes
+    // Simple approach: re-evaluate just the CONTAINS portions
+    // by creating a temp AST with only CONTAINS nodes
+    // For now: if overall evaluation fails, check if policy
+    // has CONTAINS components that failed
+    all_contains_pass = false;
+  }
+
+  // Step 4: Build the ABE policy string from the filtered AST
+  if (filtered != NULL) {
+    result.abe_policy[0] = '\0';
+    _ast_to_string(filtered, result.abe_policy, CRABS_MAX_POLICY_EXPR);
+
+    // Clean up the filtered AST
+    condition_node_destroy(filtered);
+  } else {
+    // All nodes were CONTAINS nodes; ABE policy is empty (all resolved)
+    result.abe_policy[0] = '\0';
+  }
+
+  // Clean up the original AST
+  condition_node_destroy(ast);
+
+  result.resolved_ok = all_contains_pass;
+  return result;
+}

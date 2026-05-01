@@ -475,15 +475,20 @@ TEST_F(TestIntegration, KeyVersionVerification) {
   state_add_policy(state, CRABS_OP_LOCK, "role:admin");
   state_add_policy(state, CRABS_OP_UNLOCK, "role:admin");
 
-  // Set up attribute machine
+  // Generate ECDSA keypair for alice
+  ecdsa_keypair_t* alice_key = crypto_ecdsa_generate();
+  ASSERT_NE(alice_key, nullptr);
+
+  // Set up attribute machine with alice registered with real key and role:admin
   uint8_t admin_pk[33];
   memset(admin_pk, 0xAA, 33);
+  admin_pk[0] = 0x02;
   attribute_machine_t* am = attribute_machine_create("admin", admin_pk);
   ASSERT_NE(am, nullptr);
 
-  uint8_t user_pk[33];
-  memset(user_pk, 0xBB, 33);
-  attribute_machine_register_user(am, "alice", user_pk, "");
+  crabs_error_e reg_rc = attribute_machine_register_user(
+      am, "alice", alice_key->public_key, "role:admin");
+  ASSERT_EQ(reg_rc, CRABS_SUCCESS);
 
   // Set alice's key_version to 3
   user_t* alice = attribute_machine_find_user(am, "alice");
@@ -491,6 +496,15 @@ TEST_F(TestIntegration, KeyVersionVerification) {
   alice->key_version = 3;
 
   state->attr_machine = am;
+
+  // Helper to sign an operation
+  auto sign_op = [&](operation_t* op) {
+    serialized_buffer_t* ser = crabs_serialize_for_signing(op);
+    if (ser) {
+      crypto_sign_operation(alice_key->private_key, ser->data, ser->len, op->signature);
+      serialized_buffer_destroy(ser);
+    }
+  };
 
   // Execute operation with correct key version — SUCCESS
   uint8_t uuid1[CRABS_UUID_SIZE];
@@ -506,6 +520,7 @@ TEST_F(TestIntegration, KeyVersionVerification) {
   op1->next_state[0] = PROTOCOL_LOCKED;
   strncpy(op1->signer_id, "alice", CRABS_MAX_USER_ID - 1);
   op1->signer_key_version = 3;  // correct version
+  sign_op(op1);
 
   crabs_error_e result = state_machine_execute(state, op1);
   EXPECT_EQ(result, CRABS_SUCCESS);
@@ -531,6 +546,7 @@ TEST_F(TestIntegration, KeyVersionVerification) {
   op2->next_state[0] = PROTOCOL_LOCKED;
   strncpy(op2->signer_id, "alice", CRABS_MAX_USER_ID - 1);
   op2->signer_key_version = 1;  // stale version
+  sign_op(op2);
 
   result = state_machine_execute(state, op2);
   EXPECT_EQ(result, CRABS_ERR_KEY_STALE);
@@ -550,6 +566,7 @@ TEST_F(TestIntegration, KeyVersionVerification) {
   op3->next_state[0] = PROTOCOL_LOCKED;
   strncpy(op3->signer_id, "alice", CRABS_MAX_USER_ID - 1);
   op3->signer_key_version = 0;  // skip check
+  sign_op(op3);
 
   result = state_machine_execute(state, op3);
   EXPECT_EQ(result, CRABS_SUCCESS);
@@ -557,6 +574,7 @@ TEST_F(TestIntegration, KeyVersionVerification) {
 
   state->attr_machine = NULL;
   attribute_machine_destroy(am);
+  crypto_ecdsa_keypair_destroy(alice_key);
   state_destroy(state);
 }
 

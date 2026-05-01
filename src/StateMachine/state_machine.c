@@ -6,6 +6,8 @@
 #include "../Trigger/trigger.h"
 #include "../Crypto/crypto.h"
 #include "../Attribute/attribute_machine.h"
+#include "../Condition/condition.h"
+#include "../Serialization/serialization.h"
 #include "../Util/allocator.h"
 #include <string.h>
 #include <stdlib.h>
@@ -226,10 +228,46 @@ crabs_error_e state_machine_execute(state_t* state, operation_t* op) {
     }
   }
 
-  // Step 5: Policy check — ABE verification deferred to future integration
+  // Step 5: ABE-gated policy verification (§10.3)
   const char* policy = state_find_policy(state, op->type);
   if (policy == NULL && op->resource_count > 0) {
     return CRABS_ERR_UNAUTHORIZED;
+  }
+  if (policy != NULL && strlen(policy) > 0 && state->attr_machine != NULL) {
+    // Resolve CONTAINS operators in the policy
+    policy_preprocess_result_t pp = preprocess_policy(policy, state, op->signer_id);
+    if (!pp.resolved_ok) {
+      return CRABS_ERR_UNAUTHORIZED;
+    }
+
+    // Determine verification mode from the operation
+    verify_mode_e mode = (op->signer_id[0] != '\0') ? VERIFY_MODE_A : VERIFY_MODE_B;
+
+    // Serialize operation for signature verification
+    serialized_buffer_t* ser = crabs_serialize_for_signing(op);
+    if (ser == NULL) {
+      return CRABS_ERR_SERIALIZATION_ERROR;
+    }
+
+    // Use a temporary master key for policy-only verification
+    // In production, this would be provided by the key management system
+    abe_master_key_t* mk = crypto_abe_setup();
+    if (mk == NULL) {
+      serialized_buffer_destroy(ser);
+      return CRABS_ERR_CRYPTOGRAPHIC_ERROR;
+    }
+
+    verify_result_t vr = crypto_verify_operation_auth(
+        mk, pp.abe_policy, state->attr_machine,
+        ser->data, ser->len,
+        op->signature, op->signer_id, mode);
+
+    crypto_abe_master_key_destroy(mk);
+    serialized_buffer_destroy(ser);
+
+    if (!vr.authorized) {
+      return vr.error;
+    }
   }
 
   // Step 6: Key version verification (§10.4)

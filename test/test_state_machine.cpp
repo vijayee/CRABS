@@ -4,12 +4,16 @@ extern "C" {
 #include "../src/CRABS/data_model.h"
 #include "../src/StateMachine/state_machine.h"
 #include "../src/Attribute/attribute_machine.h"
+#include "../src/Crypto/crypto.h"
+#include "../src/Serialization/serialization.h"
 }
 
 class TestStateMachine : public ::testing::Test {
 protected:
   state_t* state;
   uint8_t test_uuid[CRABS_UUID_SIZE];
+  attribute_machine_t* am;
+  ecdsa_keypair_t* alice_key;
 
   void SetUp() override {
     state = state_create();
@@ -21,7 +25,7 @@ protected:
     res->value = val;
     state_add_item(state, res);
 
-    // Add a policy for lock operations
+    // Add policies for lock operations
     state_add_policy(state, CRABS_OP_LOCK, "role:admin");
     state_add_policy(state, CRABS_OP_EXTEND, "role:admin");
     state_add_policy(state, CRABS_OP_VERIFY, "role:admin");
@@ -31,10 +35,31 @@ protected:
 
     // Set a known UUID for testing
     memset(test_uuid, 0x42, CRABS_UUID_SIZE);
+
+    // Generate ECDSA keypair for alice
+    alice_key = crypto_ecdsa_generate();
+    ASSERT_NE(alice_key, nullptr);
+
+    // Create attribute machine and register alice with role:admin
+    uint8_t admin_pk[33];
+    memset(admin_pk, 0xAA, 33);
+    admin_pk[0] = 0x02;
+    am = attribute_machine_create("admin", admin_pk);
+    ASSERT_NE(am, nullptr);
+
+    crabs_error_e rc = attribute_machine_register_user(
+        am, "alice", alice_key->public_key, "role:admin");
+    ASSERT_EQ(rc, CRABS_SUCCESS);
+
+    // Attach attribute machine to state so ABE verification is enforced
+    state->attr_machine = am;
   }
 
   void TearDown() override {
+    state->attr_machine = NULL;
     state_destroy(state);
+    attribute_machine_destroy(am);
+    crypto_ecdsa_keypair_destroy(alice_key);
   }
 
   operation_t* make_lock_op() {
@@ -48,7 +73,16 @@ protected:
     op->next_state = (protocol_state_e*)malloc(sizeof(protocol_state_e));
     op->next_state[0] = PROTOCOL_LOCKED;
     strncpy(op->signer_id, "alice", CRABS_MAX_USER_ID - 1);
+    sign_operation(op);
     return op;
+  }
+
+  void sign_operation(operation_t* op) {
+    serialized_buffer_t* ser = crabs_serialize_for_signing(op);
+    if (ser != NULL) {
+      crypto_sign_operation(alice_key->private_key, ser->data, ser->len, op->signature);
+      serialized_buffer_destroy(ser);
+    }
   }
 };
 
@@ -99,6 +133,7 @@ TEST_F(TestStateMachine, TestLockThenExtend) {
   extend_op->next_state = (protocol_state_e*)malloc(sizeof(protocol_state_e));
   extend_op->next_state[0] = PROTOCOL_LOCKED;
   strncpy(extend_op->signer_id, "alice", CRABS_MAX_USER_ID - 1);
+  sign_operation(extend_op);
 
   crabs_error_e result = state_machine_execute(state, extend_op);
   EXPECT_EQ(result, CRABS_SUCCESS);
@@ -139,6 +174,7 @@ TEST_F(TestStateMachine, TestLockVerifyUnlockCycle) {
   memcpy(verify_op->lock_claims[0].lock_token, item->lock_state.lock_token, CRABS_LOCK_TOKEN_SIZE);
   verify_op->lock_claim_count = 1;
   strncpy(verify_op->signer_id, "alice", CRABS_MAX_USER_ID - 1);
+  sign_operation(verify_op);
 
   EXPECT_EQ(state_machine_execute(state, verify_op), CRABS_SUCCESS);
   EXPECT_EQ(item->protocol_state, PROTOCOL_VERIFIED);
@@ -159,6 +195,7 @@ TEST_F(TestStateMachine, TestLockVerifyUnlockCycle) {
   memcpy(unlock_op->lock_claims[0].lock_token, item->lock_state.lock_token, CRABS_LOCK_TOKEN_SIZE);
   unlock_op->lock_claim_count = 1;
   strncpy(unlock_op->signer_id, "alice", CRABS_MAX_USER_ID - 1);
+  sign_operation(unlock_op);
 
   EXPECT_EQ(state_machine_execute(state, unlock_op), CRABS_SUCCESS);
   EXPECT_EQ(item->protocol_state, PROTOCOL_IDLE);
@@ -182,11 +219,14 @@ TEST_F(TestStateMachine, TestLockTokenMismatch) {
   bad_op->resource_count = 1;
   bad_op->required_state = (protocol_state_e*)malloc(sizeof(protocol_state_e));
   bad_op->required_state[0] = PROTOCOL_MODIFIED;
+  bad_op->next_state = (protocol_state_e*)malloc(sizeof(protocol_state_e));
+  bad_op->next_state[0] = PROTOCOL_VERIFIED;
   bad_op->lock_claims = (lock_claim_t*)malloc(sizeof(lock_claim_t));
   strncpy(bad_op->lock_claims[0].resource, "test_resource", CRABS_MAX_USER_ID - 1);
   memset(bad_op->lock_claims[0].lock_token, 0xFF, CRABS_LOCK_TOKEN_SIZE); // wrong token
   bad_op->lock_claim_count = 1;
   strncpy(bad_op->signer_id, "alice", CRABS_MAX_USER_ID - 1);
+  sign_operation(bad_op);
 
   EXPECT_EQ(state_machine_execute(state, bad_op), CRABS_ERR_LOCK_TOKEN_MISMATCH);
   operation_destroy(bad_op);
@@ -207,11 +247,14 @@ TEST_F(TestStateMachine, TestRollback) {
   rollback_op->resource_count = 1;
   rollback_op->required_state = (protocol_state_e*)malloc(sizeof(protocol_state_e));
   rollback_op->required_state[0] = PROTOCOL_MODIFIED;
+  rollback_op->next_state = (protocol_state_e*)malloc(sizeof(protocol_state_e));
+  rollback_op->next_state[0] = PROTOCOL_IDLE;
   rollback_op->lock_claims = (lock_claim_t*)malloc(sizeof(lock_claim_t));
   strncpy(rollback_op->lock_claims[0].resource, "test_resource", CRABS_MAX_USER_ID - 1);
   memcpy(rollback_op->lock_claims[0].lock_token, item->lock_state.lock_token, CRABS_LOCK_TOKEN_SIZE);
   rollback_op->lock_claim_count = 1;
   strncpy(rollback_op->signer_id, "alice", CRABS_MAX_USER_ID - 1);
+  sign_operation(rollback_op);
 
   EXPECT_EQ(state_machine_execute(state, rollback_op), CRABS_SUCCESS);
   EXPECT_EQ(item->protocol_state, PROTOCOL_IDLE);
@@ -236,6 +279,10 @@ TEST_F(TestStateMachine, TestResourceNotFound) {
   op->resource_count = 1;
   op->required_state = (protocol_state_e*)malloc(sizeof(protocol_state_e));
   op->required_state[0] = PROTOCOL_IDLE;
+  op->next_state = (protocol_state_e*)malloc(sizeof(protocol_state_e));
+  op->next_state[0] = PROTOCOL_LOCKED;
+  strncpy(op->signer_id, "alice", CRABS_MAX_USER_ID - 1);
+  sign_operation(op);
 
   EXPECT_EQ(state_machine_execute(state, op), CRABS_ERR_RESOURCE_NOT_FOUND);
   operation_destroy(op);
@@ -282,6 +329,7 @@ TEST_F(TestStateMachine, TestLockTokenEntropy) {
   op2->next_state = (protocol_state_e*)malloc(sizeof(protocol_state_e));
   op2->next_state[0] = PROTOCOL_LOCKED;
   strncpy(op2->signer_id, "alice", CRABS_MAX_USER_ID - 1);
+  sign_operation(op2);
   EXPECT_EQ(state_machine_execute(state, op2), CRABS_SUCCESS);
 
   // Tokens should differ (with overwhelming probability if CSPRNG)
@@ -315,11 +363,14 @@ TEST_F(TestStateMachine, TestRollbackRestoresOriginalValue) {
   rollback_op->resource_count = 1;
   rollback_op->required_state = (protocol_state_e*)malloc(sizeof(protocol_state_e));
   rollback_op->required_state[0] = PROTOCOL_MODIFIED;
+  rollback_op->next_state = (protocol_state_e*)malloc(sizeof(protocol_state_e));
+  rollback_op->next_state[0] = PROTOCOL_IDLE;
   rollback_op->lock_claims = (lock_claim_t*)malloc(sizeof(lock_claim_t));
   strncpy(rollback_op->lock_claims[0].resource, "test_resource", CRABS_MAX_USER_ID - 1);
   memcpy(rollback_op->lock_claims[0].lock_token, item->lock_state.lock_token, CRABS_LOCK_TOKEN_SIZE);
   rollback_op->lock_claim_count = 1;
   strncpy(rollback_op->signer_id, "alice", CRABS_MAX_USER_ID - 1);
+  sign_operation(rollback_op);
 
   EXPECT_EQ(state_machine_execute(state, rollback_op), CRABS_SUCCESS);
   EXPECT_EQ(*(int64_t*)item->value, original_value);
@@ -333,6 +384,8 @@ TEST_F(TestStateMachine, TestChangeConfig) {
   op->payload = (uint8_t*)strdup(payload_str);
   op->payload_size = strlen(payload_str);
   op->resource_count = 0;
+  strncpy(op->signer_id, "alice", CRABS_MAX_USER_ID - 1);
+  sign_operation(op);
 
   state_add_policy(state, CRABS_OP_CHANGE_CONFIG, "role:admin");
   EXPECT_EQ(state_machine_execute(state, op), CRABS_SUCCESS);
@@ -341,67 +394,75 @@ TEST_F(TestStateMachine, TestChangeConfig) {
 }
 
 TEST_F(TestStateMachine, TestKeyVersionVerification_StaleKey) {
-  // Set up attribute machine with a user whose key_version is 2
-  uint8_t admin_pk[33];
-  memset(admin_pk, 0xAA, 33);
-  attribute_machine_t* am = attribute_machine_create("admin", admin_pk);
-  ASSERT_NE(am, nullptr);
-
-  uint8_t user_pk[33];
-  memset(user_pk, 0xBB, 33);
-  attribute_machine_register_user(am, "alice", user_pk, "");
-
   // Set user's key_version to 2
   user_t* user = attribute_machine_find_user(am, "alice");
   ASSERT_NE(user, nullptr);
   user->key_version = 2;
 
-  // Attach attribute machine to state
-  state->attr_machine = am;
-
-  // Create a lock operation with stale key_version=1
-  operation_t* op = make_lock_op();
+  // Create a lock operation with stale key_version=1 (must set before signing)
+  operation_t* op = operation_create(CRABS_OP_LOCK);
+  memcpy(op->uuid, test_uuid, CRABS_UUID_SIZE);
+  op->resources = (char(*)[CRABS_MAX_USER_ID])malloc(sizeof(char[CRABS_MAX_USER_ID]));
+  strncpy(op->resources[0], "test_resource", CRABS_MAX_USER_ID - 1);
+  op->resource_count = 1;
+  op->required_state = (protocol_state_e*)malloc(sizeof(protocol_state_e));
+  op->required_state[0] = PROTOCOL_IDLE;
+  op->next_state = (protocol_state_e*)malloc(sizeof(protocol_state_e));
+  op->next_state[0] = PROTOCOL_LOCKED;
+  strncpy(op->signer_id, "alice", CRABS_MAX_USER_ID - 1);
   op->signer_key_version = 1;  // Stale — user is on version 2
+  sign_operation(op);
 
   EXPECT_EQ(state_machine_execute(state, op), CRABS_ERR_KEY_STALE);
   operation_destroy(op);
 
   // Now with matching key_version=2 — should succeed
-  operation_t* op2 = make_lock_op();
+  operation_t* op2 = operation_create(CRABS_OP_LOCK);
   memset(op2->uuid, 0x99, CRABS_UUID_SIZE);
+  op2->resources = (char(*)[CRABS_MAX_USER_ID])malloc(sizeof(char[CRABS_MAX_USER_ID]));
+  strncpy(op2->resources[0], "test_resource", CRABS_MAX_USER_ID - 1);
+  op2->resource_count = 1;
+  op2->required_state = (protocol_state_e*)malloc(sizeof(protocol_state_e));
+  op2->required_state[0] = PROTOCOL_IDLE;
+  op2->next_state = (protocol_state_e*)malloc(sizeof(protocol_state_e));
+  op2->next_state[0] = PROTOCOL_LOCKED;
+  strncpy(op2->signer_id, "alice", CRABS_MAX_USER_ID - 1);
   op2->signer_key_version = 2;
+  sign_operation(op2);
 
   EXPECT_EQ(state_machine_execute(state, op2), CRABS_SUCCESS);
   operation_destroy(op2);
-
-  state->attr_machine = NULL;
-  attribute_machine_destroy(am);
 }
 
 TEST_F(TestStateMachine, TestKeyVersionVerification_NoAttrMachine) {
   // Without attr_machine, key version check should be skipped
-  operation_t* op = make_lock_op();
+  state->attr_machine = NULL;
+
+  operation_t* op = operation_create(CRABS_OP_LOCK);
+  memset(op->uuid, 0x48, CRABS_UUID_SIZE);
+  op->resources = (char(*)[CRABS_MAX_USER_ID])malloc(sizeof(char[CRABS_MAX_USER_ID]));
+  strncpy(op->resources[0], "test_resource", CRABS_MAX_USER_ID - 1);
+  op->resource_count = 1;
+  op->required_state = (protocol_state_e*)malloc(sizeof(protocol_state_e));
+  op->required_state[0] = PROTOCOL_IDLE;
+  op->next_state = (protocol_state_e*)malloc(sizeof(protocol_state_e));
+  op->next_state[0] = PROTOCOL_LOCKED;
+  strncpy(op->signer_id, "alice", CRABS_MAX_USER_ID - 1);
   op->signer_key_version = 99;  // Would be stale if attr_machine existed
 
+  // Without attr_machine, step 5 ABE verification is skipped entirely
   EXPECT_EQ(state_machine_execute(state, op), CRABS_SUCCESS);
   operation_destroy(op);
+
+  // Restore attr_machine for TearDown
+  state->attr_machine = am;
 }
 
 TEST_F(TestStateMachine, TestKeyVersionVerification_ZeroKeyVersion) {
-  uint8_t admin_pk[33];
-  memset(admin_pk, 0xAA, 33);
-  attribute_machine_t* am = attribute_machine_create("admin", admin_pk);
-  ASSERT_NE(am, nullptr);
-
-  uint8_t user_pk[33];
-  memset(user_pk, 0xBB, 33);
-  attribute_machine_register_user(am, "alice", user_pk, "");
-
+  // Set user's key_version to 5
   user_t* user = attribute_machine_find_user(am, "alice");
   ASSERT_NE(user, nullptr);
   user->key_version = 5;
-
-  state->attr_machine = am;
 
   // signer_key_version = 0 means "skip version check" (per spec §10.4)
   operation_t* op = make_lock_op();
@@ -409,7 +470,4 @@ TEST_F(TestStateMachine, TestKeyVersionVerification_ZeroKeyVersion) {
 
   EXPECT_EQ(state_machine_execute(state, op), CRABS_SUCCESS);
   operation_destroy(op);
-
-  state->attr_machine = NULL;
-  attribute_machine_destroy(am);
 }
