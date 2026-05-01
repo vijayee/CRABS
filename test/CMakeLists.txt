@@ -19,6 +19,7 @@ if (BUILD_TESTING)
         test_crypto.cpp
         test_serialization.cpp
         test_attribute_machine.cpp
+        test_condition.cpp
     )
 
     add_dependencies(testcrabs crabs)
