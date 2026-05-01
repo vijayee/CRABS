@@ -59,6 +59,8 @@ typedef struct {
   char               key_id[CRABS_MAX_KEY_ID];
   co_signature_t*    co_signers;
   uint32_t           co_signer_count;
+  // v1.4: Dedup specification
+  dedup_spec_t       dedup;
 } operation_t;
 
 // ============================================================

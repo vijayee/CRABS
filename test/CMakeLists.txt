@@ -34,6 +34,7 @@ if (BUILD_TESTING)
         test_policy_config.cpp
         test_key_lifecycle.cpp
         test_one_shot.cpp
+        test_dedup.cpp
         test_cli.cpp
     )
 

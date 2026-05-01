@@ -67,7 +67,14 @@ typedef enum {
   CRABS_ERR_KEY_REVOKED            = 0x6002,
   CRABS_ERR_KEY_EXPIRED            = 0x6003,
   CRABS_ERR_KEY_NOT_ACTIVE         = 0x6004,
-  CRABS_ERR_VAULT_UNAVAILABLE      = 0x6005
+  CRABS_ERR_VAULT_UNAVAILABLE      = 0x6005,
+
+  // 0x7xxx: Dedup errors (v1.4 §6)
+  CRABS_ERR_ALREADY_PERFORMED     = 0x7001,
+  CRABS_ERR_ALREADY_EXECUTED      = 0x7002,
+  CRABS_ERR_CONDITION_NOT_MET     = 0x7003,
+  CRABS_ERR_TRACKER_NOT_FOUND    = 0x7004,
+  CRABS_ERR_FLAG_NOT_FOUND       = 0x7005
 } crabs_error_e;
 
 // ============================================================
@@ -97,5 +104,9 @@ typedef enum {
 #define CRABS_OP_SUSPEND_KEY      "__suspend_key__"
 #define CRABS_OP_ACTIVATE_KEY     "__activate_key__"
 #define CRABS_OP_ROTATE_KEY       "__rotate_key__"
+
+// Dedup Operations (v1.4 §7)
+#define CRABS_OP_DEFINE_OPERATION  "__define_operation_type__"
+#define CRABS_OP_CHECK_DEDUP       "__check_dedup__"
 
 #endif // CRABS_CRABS_H

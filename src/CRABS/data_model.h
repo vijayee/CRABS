@@ -185,6 +185,55 @@ typedef struct {
 } machine_config_t;
 
 // ============================================================
+// Dedup Specification (v1.4 §3)
+// ============================================================
+#define CRABS_MAX_DEDUP_PATH     128
+#define CRABS_MAX_DEDUP_MESSAGE  256
+
+typedef enum {
+  DEDUP_NONE   = 0x00,
+  DEDUP_PER_USER = 0x01,
+  DEDUP_GLOBAL   = 0x02,
+  DEDUP_CUSTOM   = 0xFF
+} dedup_type_e;
+
+typedef enum {
+  MUTATION_SET_ADD           = 0x01,
+  MUTATION_FLAG_SET          = 0x02,
+  MUTATION_COUNTER_INCREMENT = 0x03,
+  MUTATION_ASSIGN            = 0x04,
+  MUTATION_CUSTOM            = 0xFF
+} mutation_type_e;
+
+typedef struct {
+  mutation_type_e type;
+  // For MUTATION_SET_ADD
+  char set_path[CRABS_MAX_DEDUP_PATH];
+  char element_value[CRABS_MAX_USER_ID];
+  // For MUTATION_FLAG_SET
+  char flag_path[CRABS_MAX_DEDUP_PATH];
+  // For MUTATION_COUNTER_INCREMENT
+  char counter_path[CRABS_MAX_DEDUP_PATH];
+  int64_t delta;
+  // For MUTATION_ASSIGN
+  char target_path[CRABS_MAX_DEDUP_PATH];
+  char value[CRABS_MAX_DEDUP_PATH];
+} state_mutation_t;
+
+typedef struct {
+  dedup_type_e type;
+  // For DEDUP_PER_USER
+  char tracker_path[CRABS_MAX_DEDUP_PATH];
+  // For DEDUP_GLOBAL
+  char flag_path[CRABS_MAX_DEDUP_PATH];
+  // For DEDUP_CUSTOM
+  char condition[CRABS_MAX_POLICY_EXPR];
+  state_mutation_t update;
+  // Rejection message
+  char rejection_message[CRABS_MAX_DEDUP_MESSAGE];
+} dedup_spec_t;
+
+// ============================================================
 // Log Entry (§7.4 step 9)
 // ============================================================
 typedef struct {
