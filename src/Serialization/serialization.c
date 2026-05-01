@@ -1,0 +1,836 @@
+//
+// Created by victor on 4/30/25.
+//
+
+#include "serialization.h"
+#include "../Util/allocator.h"
+#include <string.h>
+#include <openssl/sha.h>
+
+// ============================================================
+// Write buffer helper
+// ============================================================
+typedef struct {
+  uint8_t* data;
+  size_t   len;
+  size_t   offset;
+} write_buf_t;
+
+static write_buf_t* _write_buf_create(size_t initial_cap) {
+  write_buf_t* buf = get_clear_memory(sizeof(write_buf_t));
+  buf->data = get_memory(initial_cap);
+  buf->len = initial_cap;
+  buf->offset = 0;
+  return buf;
+}
+
+static void _write_buf_ensure(write_buf_t* buf, size_t additional) {
+  if (buf->offset + additional <= buf->len) return;
+  size_t new_len = buf->len * 2;
+  while (new_len < buf->offset + additional) {
+    new_len *= 2;
+  }
+  uint8_t* new_data = get_memory(new_len);
+  memcpy(new_data, buf->data, buf->offset);
+  free(buf->data);
+  buf->data = new_data;
+  buf->len = new_len;
+}
+
+static void _write_uint8(write_buf_t* buf, uint8_t val) {
+  _write_buf_ensure(buf, 1);
+  buf->data[buf->offset++] = val;
+}
+
+static void _write_uint16_le(write_buf_t* buf, uint16_t val) {
+  _write_buf_ensure(buf, 2);
+  buf->data[buf->offset++] = (uint8_t)(val & 0xFF);
+  buf->data[buf->offset++] = (uint8_t)((val >> 8) & 0xFF);
+}
+
+static void _write_uint32_le(write_buf_t* buf, uint32_t val) {
+  _write_buf_ensure(buf, 4);
+  buf->data[buf->offset++] = (uint8_t)(val & 0xFF);
+  buf->data[buf->offset++] = (uint8_t)((val >> 8) & 0xFF);
+  buf->data[buf->offset++] = (uint8_t)((val >> 16) & 0xFF);
+  buf->data[buf->offset++] = (uint8_t)((val >> 24) & 0xFF);
+}
+
+static void _write_uint64_le(write_buf_t* buf, uint64_t val) {
+  _write_buf_ensure(buf, 8);
+  for (int i = 0; i < 8; i++) {
+    buf->data[buf->offset++] = (uint8_t)((val >> (i * 8)) & 0xFF);
+  }
+}
+
+static void _write_bytes(write_buf_t* buf, const uint8_t* data, size_t len) {
+  if (data == NULL || len == 0) return;
+  _write_buf_ensure(buf, len);
+  memcpy(buf->data + buf->offset, data, len);
+  buf->offset += len;
+}
+
+static void _write_string16(write_buf_t* buf, const char* str) {
+  if (str == NULL) {
+    _write_uint16_le(buf, 0);
+    return;
+  }
+  uint16_t slen = (uint16_t)strlen(str);
+  _write_uint16_le(buf, slen);
+  _write_bytes(buf, (const uint8_t*)str, slen);
+}
+
+static void _write_bytes32(write_buf_t* buf, const uint8_t* data, uint32_t len) {
+  _write_uint32_le(buf, len);
+  if (data != NULL && len > 0) {
+    _write_bytes(buf, data, len);
+  }
+}
+
+static void _write_bool8(write_buf_t* buf, bool val) {
+  _write_uint8(buf, val ? 1 : 0);
+}
+
+// ============================================================
+// Read buffer helper
+// ============================================================
+typedef struct {
+  const uint8_t* data;
+  size_t         len;
+  size_t         offset;
+} read_buf_t;
+
+static bool _read_uint8(read_buf_t* buf, uint8_t* out) {
+  if (buf->offset + 1 > buf->len) return false;
+  *out = buf->data[buf->offset++];
+  return true;
+}
+
+static bool _read_uint16_le(read_buf_t* buf, uint16_t* out) {
+  if (buf->offset + 2 > buf->len) return false;
+  *out = (uint16_t)(buf->data[buf->offset] |
+                    (buf->data[buf->offset + 1] << 8));
+  buf->offset += 2;
+  return true;
+}
+
+static bool _read_uint32_le(read_buf_t* buf, uint32_t* out) {
+  if (buf->offset + 4 > buf->len) return false;
+  *out = (uint32_t)(buf->data[buf->offset] |
+                     ((uint32_t)buf->data[buf->offset + 1] << 8) |
+                     ((uint32_t)buf->data[buf->offset + 2] << 16) |
+                     ((uint32_t)buf->data[buf->offset + 3] << 24));
+  buf->offset += 4;
+  return true;
+}
+
+static bool _read_uint64_le(read_buf_t* buf, uint64_t* out) {
+  if (buf->offset + 8 > buf->len) return false;
+  *out = 0;
+  for (int i = 0; i < 8; i++) {
+    *out |= ((uint64_t)buf->data[buf->offset + i]) << (i * 8);
+  }
+  buf->offset += 8;
+  return true;
+}
+
+static bool _read_bytes(read_buf_t* buf, uint8_t* out, size_t len) {
+  if (buf->offset + len > buf->len) return false;
+  memcpy(out, buf->data + buf->offset, len);
+  buf->offset += len;
+  return true;
+}
+
+static bool _read_string16(read_buf_t* buf, char* out, size_t max_len) {
+  uint16_t slen;
+  if (!_read_uint16_le(buf, &slen)) return false;
+  if (slen > buf->len - buf->offset) return false;
+  size_t copy_len = slen < (max_len - 1) ? slen : (max_len - 1);
+  if (slen > 0) {
+    memcpy(out, buf->data + buf->offset, copy_len);
+    buf->offset += slen;
+  }
+  out[copy_len] = '\0';
+  return true;
+}
+
+static bool _read_bytes32(read_buf_t* buf, uint8_t** out, uint32_t* out_len) {
+  uint32_t len;
+  if (!_read_uint32_le(buf, &len)) return false;
+  if (len > buf->len - buf->offset) return false;
+  *out_len = len;
+  if (len > 0) {
+    *out = get_memory(len);
+    memcpy(*out, buf->data + buf->offset, len);
+    buf->offset += len;
+  } else {
+    *out = NULL;
+  }
+  return true;
+}
+
+// ============================================================
+// Serialized buffer helpers
+// ============================================================
+serialized_buffer_t* serialized_buffer_create(size_t len) {
+  serialized_buffer_t* buf = get_clear_memory(sizeof(serialized_buffer_t));
+  buf->data = get_clear_memory(len);
+  buf->len = len;
+  return buf;
+}
+
+void serialized_buffer_destroy(serialized_buffer_t* buf) {
+  if (buf == NULL) return;
+  if (buf->data != NULL) free(buf->data);
+  free(buf);
+}
+
+// ============================================================
+// Data item serialization (§13.2)
+// ============================================================
+static void _serialize_data_item(write_buf_t* buf, const data_item_t* item) {
+  // name_length + name
+  _write_string16(buf, item->name);
+
+  // type_id
+  _write_uint8(buf, (uint8_t)item->type);
+
+  // crdt_type_id
+  _write_uint8(buf, (uint8_t)item->crdt_type);
+
+  // protocol_state
+  _write_uint8(buf, (uint8_t)item->protocol_state);
+
+  // value: For simple types, serialize the value as bytes
+  // We'll store a serialized representation of the CRDT value
+  // For now, we serialize value_length + value bytes
+  // The value pointer points to type-specific data; for counters it's int64_t,
+  // for registers it's lww_register_t*, etc.
+  // We serialize value as raw bytes; the type_id tells the deserializer how to interpret
+  if (item->value != NULL) {
+    if (item->type == DATA_TYPE_COUNTER || item->type == DATA_TYPE_PN_COUNTER ||
+        item->type == DATA_TYPE_RESOURCE) {
+      // int64_t value
+      uint8_t val_bytes[sizeof(int64_t)];
+      int64_t val = *(int64_t*)item->value;
+      for (int i = 0; i < 8; i++) {
+        val_bytes[i] = (uint8_t)((val >> (i * 8)) & 0xFF);
+      }
+      _write_bytes32(buf, val_bytes, sizeof(int64_t));
+    } else if (item->type == DATA_TYPE_REGISTER) {
+      // int64_t value
+      uint8_t val_bytes[sizeof(int64_t)];
+      int64_t val = *(int64_t*)item->value;
+      for (int i = 0; i < 8; i++) {
+        val_bytes[i] = (uint8_t)((val >> (i * 8)) & 0xFF);
+      }
+      _write_bytes32(buf, val_bytes, sizeof(int64_t));
+    } else {
+      // Generic: just write 0 length for unsupported types
+      _write_bytes32(buf, NULL, 0);
+    }
+  } else {
+    _write_bytes32(buf, NULL, 0);
+  }
+
+  // invariant_count
+  _write_uint8(buf, (uint8_t)item->invariant_count);
+
+  // invariants
+  for (uint32_t i = 0; i < item->invariant_count; i++) {
+    _write_uint8(buf, (uint8_t)item->invariants[i].type);
+    _write_uint64_le(buf, (uint64_t)item->invariants[i].param);
+    _write_string16(buf, item->invariants[i].error_message);
+  }
+}
+
+static bool _deserialize_data_item(read_buf_t* buf, data_item_t* item) {
+  // name
+  if (!_read_string16(buf, item->name, CRABS_MAX_USER_ID)) return false;
+
+  // type_id
+  uint8_t type_id;
+  if (!_read_uint8(buf, &type_id)) return false;
+  item->type = (data_type_e)type_id;
+
+  // crdt_type_id
+  uint8_t crdt_type_id;
+  if (!_read_uint8(buf, &crdt_type_id)) return false;
+  item->crdt_type = (crdt_type_e)crdt_type_id;
+
+  // protocol_state
+  uint8_t ps;
+  if (!_read_uint8(buf, &ps)) return false;
+  item->protocol_state = (protocol_state_e)ps;
+
+  // value
+  uint8_t* val_data = NULL;
+  uint32_t val_len = 0;
+  if (!_read_bytes32(buf, &val_data, &val_len)) return false;
+
+  if (val_data != NULL && val_len > 0) {
+    if (item->type == DATA_TYPE_COUNTER || item->type == DATA_TYPE_PN_COUNTER ||
+        item->type == DATA_TYPE_RESOURCE) {
+      int64_t* val = get_memory(sizeof(int64_t));
+      *val = 0;
+      for (int i = 0; i < 8 && i < (int)val_len; i++) {
+        *val |= ((int64_t)val_data[i]) << (i * 8);
+      }
+      item->value = val;
+    } else if (item->type == DATA_TYPE_REGISTER) {
+      int64_t* val = get_memory(sizeof(int64_t));
+      *val = 0;
+      for (int i = 0; i < 8 && i < (int)val_len; i++) {
+        *val |= ((int64_t)val_data[i]) << (i * 8);
+      }
+      item->value = val;
+    } else {
+      // Store as raw bytes for unknown types
+      item->value = get_memory(val_len);
+      memcpy(item->value, val_data, val_len);
+    }
+    free(val_data);
+  } else {
+    item->value = NULL;
+  }
+
+  // invariant_count
+  uint8_t inv_count;
+  if (!_read_uint8(buf, &inv_count)) return false;
+  item->invariant_count = inv_count;
+
+  // invariants - allocate invariants array with enough extra space
+  // to embed the error_message strings inline after the array, so that
+  // free(item->invariants) also frees the string data
+  if (inv_count > 0) {
+    // First pass: compute total string space needed
+    size_t str_space = 0;
+    size_t saved_offset = buf->offset;
+    uint8_t* msg_lens = get_clear_memory(inv_count * sizeof(uint8_t) + inv_count * sizeof(uint16_t));
+    uint16_t* msg_lens_arr = (uint16_t*)(msg_lens + inv_count);
+    for (uint8_t i = 0; i < inv_count; i++) {
+      uint8_t inv_type;
+      if (!_read_uint8(buf, &inv_type)) { free(msg_lens); return false; }
+      uint64_t param;
+      if (!_read_uint64_le(buf, &param)) { free(msg_lens); return false; }
+      uint16_t msg_len;
+      if (!_read_uint16_le(buf, &msg_len)) { free(msg_lens); return false; }
+      msg_lens_arr[i] = msg_len;
+      str_space += msg_len + 1; // +1 for null terminator
+      if (msg_len > 0 && msg_len <= buf->len - buf->offset) {
+        buf->offset += msg_len;
+      }
+    }
+    buf->offset = saved_offset;
+
+    // Allocate invariants array + string space
+    item->invariants = get_clear_memory(inv_count * sizeof(invariant_t) + str_space);
+    char* str_pool = (char*)(item->invariants + inv_count);
+
+    // Second pass: deserialize
+    for (uint8_t i = 0; i < inv_count; i++) {
+      uint8_t inv_type;
+      if (!_read_uint8(buf, &inv_type)) { free(msg_lens); return false; }
+      item->invariants[i].type = (invariant_type_e)inv_type;
+
+      uint64_t param;
+      if (!_read_uint64_le(buf, &param)) { free(msg_lens); return false; }
+      item->invariants[i].param = (int64_t)param;
+
+      uint16_t msg_len;
+      if (!_read_uint16_le(buf, &msg_len)) { free(msg_lens); return false; }
+      if (msg_len > 0 && msg_len <= buf->len - buf->offset) {
+        memcpy(str_pool, buf->data + buf->offset, msg_len);
+        str_pool[msg_len] = '\0';
+        item->invariants[i].error_message = str_pool;
+        str_pool += msg_len + 1;
+        buf->offset += msg_len;
+      } else {
+        item->invariants[i].error_message = NULL;
+      }
+    }
+    free(msg_lens);
+  } else {
+    item->invariants = NULL;
+  }
+
+  // Initialize lock_state
+  memset(&item->lock_state, 0, sizeof(lock_state_t));
+  item->next = NULL;
+
+  return true;
+}
+
+// ============================================================
+// Policy serialization
+// ============================================================
+static void _serialize_policy(write_buf_t* buf, const policy_t* policy) {
+  _write_string16(buf, policy->operation);
+  _write_string16(buf, policy->expression);
+}
+
+static bool _deserialize_policy(read_buf_t* buf, policy_t* policy) {
+  if (!_read_string16(buf, policy->operation, CRABS_MAX_OP_NAME)) return false;
+  if (!_read_string16(buf, policy->expression, CRABS_MAX_POLICY_EXPR)) return false;
+  return true;
+}
+
+// ============================================================
+// Config serialization
+// ============================================================
+static void _serialize_config(write_buf_t* buf, const machine_config_t* config) {
+  _write_uint64_le(buf, config->max_lock_duration_ms);
+  _write_uint32_le(buf, config->max_lock_extensions);
+  _write_bool8(buf, config->allow_force_unlock);
+  _write_string16(buf, config->bootstrap_admin);
+}
+
+static bool _deserialize_config(read_buf_t* buf, machine_config_t* config) {
+  if (!_read_uint64_le(buf, &config->max_lock_duration_ms)) return false;
+  uint32_t max_ext;
+  if (!_read_uint32_le(buf, &max_ext)) return false;
+  config->max_lock_extensions = max_ext;
+  uint8_t allow;
+  if (!_read_uint8(buf, &allow)) return false;
+  config->allow_force_unlock = (allow != 0);
+  if (!_read_string16(buf, config->bootstrap_admin, CRABS_MAX_USER_ID)) return false;
+  return true;
+}
+
+// ============================================================
+// Log entry serialization
+// ============================================================
+static void _serialize_log_entry(write_buf_t* buf, const log_entry_t* entry) {
+  _write_uint64_le(buf, entry->version);
+  _write_bytes(buf, entry->uuid, CRABS_UUID_SIZE);
+  _write_string16(buf, entry->type);
+  _write_string16(buf, entry->signer_id);
+  _write_uint64_le(buf, entry->lamport_time);
+  _write_string16(buf, entry->node_id);
+  _write_bytes(buf, entry->state_hash, CRABS_HASH_SIZE);
+}
+
+static bool _deserialize_log_entry(read_buf_t* buf, log_entry_t* entry) {
+  if (!_read_uint64_le(buf, &entry->version)) return false;
+  if (!_read_bytes(buf, entry->uuid, CRABS_UUID_SIZE)) return false;
+  if (!_read_string16(buf, entry->type, CRABS_MAX_OP_NAME)) return false;
+  if (!_read_string16(buf, entry->signer_id, CRABS_MAX_USER_ID)) return false;
+  if (!_read_uint64_le(buf, &entry->lamport_time)) return false;
+  if (!_read_string16(buf, entry->node_id, CRABS_MAX_USER_ID)) return false;
+  if (!_read_bytes(buf, entry->state_hash, CRABS_HASH_SIZE)) return false;
+  return true;
+}
+
+// ============================================================
+// State serialization (§13.1)
+// ============================================================
+serialized_buffer_t* crabs_serialize_state(const state_t* state) {
+  if (state == NULL) return NULL;
+
+  write_buf_t* buf = _write_buf_create(4096);
+
+  // Magic bytes: "CRAB" = 0x43, 0x52, 0x41, 0x42
+  _write_uint8(buf, 0x43);
+  _write_uint8(buf, 0x52);
+  _write_uint8(buf, 0x41);
+  _write_uint8(buf, 0x42);
+
+  // Version
+  _write_uint32_le(buf, CRABS_SERIAL_VERSION);
+
+  // state_version
+  _write_uint64_le(buf, state->version);
+
+  // Count items
+  uint32_t item_count = 0;
+  data_item_t* item = state->items;
+  while (item != NULL) {
+    item_count++;
+    item = item->next;
+  }
+
+  // item_count
+  _write_uint32_le(buf, item_count);
+
+  // policy_count
+  _write_uint32_le(buf, state->policy_count);
+
+  // log_count
+  _write_uint32_le(buf, (uint32_t)state->log_count);
+
+  // items
+  item = state->items;
+  while (item != NULL) {
+    _serialize_data_item(buf, item);
+    item = item->next;
+  }
+
+  // policies
+  for (uint32_t i = 0; i < state->policy_count; i++) {
+    _serialize_policy(buf, &state->policies[i]);
+  }
+
+  // config
+  _serialize_config(buf, &state->config);
+
+  // log entries
+  for (uint64_t i = 0; i < state->log_count; i++) {
+    _serialize_log_entry(buf, &state->log[i]);
+  }
+
+  // Checksum: SHA-256 of all preceding bytes
+  uint8_t hash[CRABS_HASH_SIZE];
+  SHA256(buf->data, buf->offset, hash);
+  _write_bytes(buf, hash, CRABS_HASH_SIZE);
+
+  // Create output
+  serialized_buffer_t* result = serialized_buffer_create(buf->offset);
+  memcpy(result->data, buf->data, buf->offset);
+  result->len = buf->offset;
+
+  free(buf->data);
+  free(buf);
+  return result;
+}
+
+state_t* crabs_deserialize_state(const uint8_t* data, size_t len) {
+  if (data == NULL || len < CRABS_HASH_SIZE + 4 + 4 + 8 + 4 + 4 + 4) {
+    return NULL;
+  }
+
+  read_buf_t buf;
+  buf.data = data;
+  buf.len = len;
+  buf.offset = 0;
+
+  // Verify checksum first
+  uint8_t computed_hash[CRABS_HASH_SIZE];
+  SHA256(data, len - CRABS_HASH_SIZE, computed_hash);
+  if (memcmp(computed_hash, data + len - CRABS_HASH_SIZE, CRABS_HASH_SIZE) != 0) {
+    return NULL;
+  }
+
+  // Magic bytes
+  uint8_t magic[4];
+  for (int i = 0; i < 4; i++) {
+    if (!_read_uint8(&buf, &magic[i])) return NULL;
+  }
+  if (magic[0] != 0x43 || magic[1] != 0x52 || magic[2] != 0x41 || magic[3] != 0x42) {
+    return NULL;
+  }
+
+  // Version
+  uint32_t version;
+  if (!_read_uint32_le(&buf, &version)) return NULL;
+  if (version != CRABS_SERIAL_VERSION) return NULL;
+
+  state_t* state = state_create();
+
+  // state_version
+  if (!_read_uint64_le(&buf, &state->version)) goto fail;
+
+  // item_count
+  uint32_t item_count;
+  if (!_read_uint32_le(&buf, &item_count)) goto fail;
+
+  // policy_count
+  uint32_t policy_count;
+  if (!_read_uint32_le(&buf, &policy_count)) goto fail;
+
+  // log_count
+  uint32_t log_count;
+  if (!_read_uint32_le(&buf, &log_count)) goto fail;
+
+  // items
+  data_item_t* tail = NULL;
+  for (uint32_t i = 0; i < item_count; i++) {
+    data_item_t* item = get_clear_memory(sizeof(data_item_t));
+    if (!_deserialize_data_item(&buf, item)) {
+      data_item_destroy(item);
+      goto fail;
+    }
+    if (state->items == NULL) {
+      state->items = item;
+      tail = item;
+    } else {
+      tail->next = item;
+      tail = item;
+    }
+  }
+
+  // policies
+  if (policy_count > 0) {
+    state->policies = get_clear_memory(policy_count * sizeof(policy_t));
+    state->policy_count = policy_count;
+    for (uint32_t i = 0; i < policy_count; i++) {
+      if (!_deserialize_policy(&buf, &state->policies[i])) goto fail;
+    }
+  }
+
+  // config
+  if (!_deserialize_config(&buf, &state->config)) goto fail;
+
+  // log entries
+  if (log_count > 0) {
+    state->log = get_clear_memory(log_count * sizeof(log_entry_t));
+    state->log_count = log_count;
+    for (uint32_t i = 0; i < log_count; i++) {
+      if (!_deserialize_log_entry(&buf, &state->log[i])) goto fail;
+    }
+  }
+
+  return state;
+
+fail:
+  state_destroy(state);
+  return NULL;
+}
+
+// ============================================================
+// Operation serialization
+// ============================================================
+serialized_buffer_t* crabs_serialize_operation(const operation_t* op) {
+  if (op == NULL) return NULL;
+
+  write_buf_t* buf = _write_buf_create(1024);
+
+  // type (length-prefixed string)
+  _write_string16(buf, op->type);
+
+  // uuid (16 bytes raw)
+  _write_bytes(buf, op->uuid, CRABS_UUID_SIZE);
+
+  // payload (length-prefixed bytes)
+  _write_bytes32(buf, op->payload, op->payload_size);
+
+  // resource_count
+  _write_uint32_le(buf, op->resource_count);
+
+  // resources (array of length-prefixed strings)
+  for (uint32_t i = 0; i < op->resource_count; i++) {
+    _write_string16(buf, op->resources[i]);
+  }
+
+  // required_state (array of uint8)
+  _write_uint32_le(buf, op->resource_count);
+  for (uint32_t i = 0; i < op->resource_count; i++) {
+    _write_uint8(buf, (uint8_t)op->required_state[i]);
+  }
+
+  // next_state (array of uint8)
+  _write_uint32_le(buf, op->resource_count);
+  for (uint32_t i = 0; i < op->resource_count; i++) {
+    _write_uint8(buf, (uint8_t)op->next_state[i]);
+  }
+
+  // lock_claim_count
+  _write_uint32_le(buf, op->lock_claim_count);
+
+  // lock_claims (for each: resource string + lock_token 32 bytes)
+  for (uint32_t i = 0; i < op->lock_claim_count; i++) {
+    _write_string16(buf, op->lock_claims[i].resource);
+    _write_bytes(buf, op->lock_claims[i].lock_token, CRABS_LOCK_TOKEN_SIZE);
+  }
+
+  // policy (length-prefixed string)
+  _write_string16(buf, op->policy);
+
+  // signature (64 bytes raw)
+  _write_bytes(buf, op->signature, CRABS_SIG_SIZE);
+
+  // signer_id (length-prefixed string)
+  _write_string16(buf, op->signer_id);
+
+  // signer_key_version
+  _write_uint64_le(buf, op->signer_key_version);
+
+  // lamport_time
+  _write_uint64_le(buf, op->lamport_time);
+
+  // node_id (length-prefixed string)
+  _write_string16(buf, op->node_id);
+
+  // payload_format
+  _write_uint8(buf, op->payload_format);
+
+  // Create output
+  serialized_buffer_t* result = serialized_buffer_create(buf->offset);
+  memcpy(result->data, buf->data, buf->offset);
+  result->len = buf->offset;
+
+  free(buf->data);
+  free(buf);
+  return result;
+}
+
+operation_t* crabs_deserialize_operation(const uint8_t* data, size_t len) {
+  if (data == NULL || len == 0) return NULL;
+
+  read_buf_t buf;
+  buf.data = data;
+  buf.len = len;
+  buf.offset = 0;
+
+  operation_t* op = operation_create("");
+  if (op == NULL) return NULL;
+
+  // type
+  if (!_read_string16(&buf, op->type, CRABS_MAX_OP_NAME)) goto fail;
+
+  // uuid
+  if (!_read_bytes(&buf, op->uuid, CRABS_UUID_SIZE)) goto fail;
+
+  // payload
+  uint8_t* payload = NULL;
+  uint32_t payload_size = 0;
+  if (!_read_bytes32(&buf, &payload, &payload_size)) goto fail;
+  op->payload = payload;
+  op->payload_size = payload_size;
+
+  // resource_count
+  uint32_t resource_count;
+  if (!_read_uint32_le(&buf, &resource_count)) goto fail;
+  op->resource_count = resource_count;
+
+  // resources
+  if (resource_count > 0) {
+    op->resources = get_clear_memory(resource_count * CRABS_MAX_USER_ID);
+    for (uint32_t i = 0; i < resource_count; i++) {
+      if (!_read_string16(&buf, op->resources[i], CRABS_MAX_USER_ID)) goto fail;
+    }
+  }
+
+  // required_state
+  uint32_t rs_count;
+  if (!_read_uint32_le(&buf, &rs_count)) goto fail;
+  if (rs_count > 0) {
+    op->required_state = get_clear_memory(rs_count * sizeof(protocol_state_e));
+    for (uint32_t i = 0; i < rs_count; i++) {
+      uint8_t ps;
+      if (!_read_uint8(&buf, &ps)) goto fail;
+      op->required_state[i] = (protocol_state_e)ps;
+    }
+  }
+
+  // next_state
+  uint32_t ns_count;
+  if (!_read_uint32_le(&buf, &ns_count)) goto fail;
+  if (ns_count > 0) {
+    op->next_state = get_clear_memory(ns_count * sizeof(protocol_state_e));
+    for (uint32_t i = 0; i < ns_count; i++) {
+      uint8_t ps;
+      if (!_read_uint8(&buf, &ps)) goto fail;
+      op->next_state[i] = (protocol_state_e)ps;
+    }
+  }
+
+  // lock_claim_count
+  uint32_t lc_count;
+  if (!_read_uint32_le(&buf, &lc_count)) goto fail;
+  op->lock_claim_count = lc_count;
+
+  // lock_claims
+  if (lc_count > 0) {
+    op->lock_claims = get_clear_memory(lc_count * sizeof(lock_claim_t));
+    for (uint32_t i = 0; i < lc_count; i++) {
+      if (!_read_string16(&buf, op->lock_claims[i].resource, CRABS_MAX_USER_ID)) goto fail;
+      if (!_read_bytes(&buf, op->lock_claims[i].lock_token, CRABS_LOCK_TOKEN_SIZE)) goto fail;
+    }
+  }
+
+  // policy
+  if (!_read_string16(&buf, op->policy, CRABS_MAX_POLICY_EXPR)) goto fail;
+
+  // signature
+  if (!_read_bytes(&buf, op->signature, CRABS_SIG_SIZE)) goto fail;
+
+  // signer_id
+  if (!_read_string16(&buf, op->signer_id, CRABS_MAX_USER_ID)) goto fail;
+
+  // signer_key_version
+  if (!_read_uint64_le(&buf, &op->signer_key_version)) goto fail;
+
+  // lamport_time
+  if (!_read_uint64_le(&buf, &op->lamport_time)) goto fail;
+
+  // node_id
+  if (!_read_string16(&buf, op->node_id, CRABS_MAX_USER_ID)) goto fail;
+
+  // payload_format
+  uint8_t pf;
+  if (!_read_uint8(&buf, &pf)) goto fail;
+  op->payload_format = pf;
+
+  return op;
+
+fail:
+  operation_destroy(op);
+  return NULL;
+}
+
+// ============================================================
+// Canonical encoding for signing (§7.5)
+// ============================================================
+serialized_buffer_t* crabs_serialize_for_signing(const operation_t* op) {
+  if (op == NULL) return NULL;
+
+  write_buf_t* buf = _write_buf_create(1024);
+
+  // 1. op.type (length-prefixed string)
+  _write_string16(buf, op->type);
+
+  // 2. op.uuid (16 bytes raw)
+  _write_bytes(buf, op->uuid, CRABS_UUID_SIZE);
+
+  // 3. op.payload (length-prefixed bytes)
+  _write_bytes32(buf, op->payload, op->payload_size);
+
+  // 4. op.resources (length-prefixed array of length-prefixed strings)
+  _write_uint32_le(buf, op->resource_count);
+  for (uint32_t i = 0; i < op->resource_count; i++) {
+    _write_string16(buf, op->resources[i]);
+  }
+
+  // 5. op.required_state (array of uint8)
+  _write_uint32_le(buf, op->resource_count);
+  for (uint32_t i = 0; i < op->resource_count; i++) {
+    _write_uint8(buf, (uint8_t)op->required_state[i]);
+  }
+
+  // 6. op.next_state (array of uint8)
+  _write_uint32_le(buf, op->resource_count);
+  for (uint32_t i = 0; i < op->resource_count; i++) {
+    _write_uint8(buf, (uint8_t)op->next_state[i]);
+  }
+
+  // 7. op.lock_claims (for each: resource length-prefixed string, then 32 bytes lock_token)
+  _write_uint32_le(buf, op->lock_claim_count);
+  for (uint32_t i = 0; i < op->lock_claim_count; i++) {
+    _write_string16(buf, op->lock_claims[i].resource);
+    _write_bytes(buf, op->lock_claims[i].lock_token, CRABS_LOCK_TOKEN_SIZE);
+  }
+
+  // 8. op.policy (length-prefixed string)
+  _write_string16(buf, op->policy);
+
+  // 9. op.signer_id (length-prefixed string)
+  _write_string16(buf, op->signer_id);
+
+  // 10. op.signer_key_version (uint64)
+  _write_uint64_le(buf, op->signer_key_version);
+
+  // 11. op.lamport_time (uint64)
+  _write_uint64_le(buf, op->lamport_time);
+
+  // 12. op.node_id (length-prefixed string)
+  _write_string16(buf, op->node_id);
+
+  // Create output
+  serialized_buffer_t* result = serialized_buffer_create(buf->offset);
+  memcpy(result->data, buf->data, buf->offset);
+  result->len = buf->offset;
+
+  free(buf->data);
+  free(buf);
+  return result;
+}

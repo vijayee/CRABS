@@ -17,6 +17,8 @@ if (BUILD_TESTING)
         test_state_machine.cpp
         test_crdt.cpp
         test_crypto.cpp
+        test_serialization.cpp
+        test_attribute_machine.cpp
     )
 
     add_dependencies(testcrabs crabs)
