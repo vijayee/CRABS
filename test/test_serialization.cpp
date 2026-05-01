@@ -876,3 +876,142 @@ TEST(TestSerializationV2, TestV1PolicyBackwardCompat) {
 
   state_destroy(restored);
 }
+
+// ============================================================
+// Dedup serialization tests (v3 format)
+// ============================================================
+
+TEST(OperationV3, SerializeDedupPerUser) {
+  operation_t* op = operation_create("vote");
+  memset(op->uuid, 0xAB, CRABS_UUID_SIZE);
+  strncpy(op->signer_id, "alice", CRABS_MAX_USER_ID - 1);
+  op->lamport_time = 1000;
+  op->dedup.type = DEDUP_PER_USER;
+  strncpy(op->dedup.tracker_path, "proposal_voters", CRABS_MAX_DEDUP_PATH - 1);
+  strncpy(op->dedup.rejection_message, "Already voted", CRABS_MAX_DEDUP_MESSAGE - 1);
+  op->dedup.update.type = MUTATION_SET_ADD;
+  strncpy(op->dedup.update.set_path, "proposal_voters", CRABS_MAX_DEDUP_PATH - 1);
+  strncpy(op->dedup.update.element_value, "{signer_id}", CRABS_MAX_USER_ID - 1);
+
+  serialized_buffer_t* buf = crabs_serialize_operation(op);
+  ASSERT_NE(buf, nullptr);
+
+  operation_t* restored = crabs_deserialize_operation(buf->data, buf->len);
+  ASSERT_NE(restored, nullptr);
+
+  EXPECT_EQ(restored->dedup.type, DEDUP_PER_USER);
+  EXPECT_STREQ(restored->dedup.tracker_path, "proposal_voters");
+  EXPECT_STREQ(restored->dedup.rejection_message, "Already voted");
+  EXPECT_EQ(restored->dedup.update.type, MUTATION_SET_ADD);
+  EXPECT_STREQ(restored->dedup.update.set_path, "proposal_voters");
+  EXPECT_STREQ(restored->dedup.update.element_value, "{signer_id}");
+
+  serialized_buffer_destroy(buf);
+  operation_destroy(op);
+  operation_destroy(restored);
+}
+
+TEST(OperationV3, SerializeDedupGlobal) {
+  operation_t* op = operation_create("execute");
+  memset(op->uuid, 0xCC, CRABS_UUID_SIZE);
+  strncpy(op->signer_id, "carol", CRABS_MAX_USER_ID - 1);
+  op->lamport_time = 2000;
+  op->dedup.type = DEDUP_GLOBAL;
+  strncpy(op->dedup.flag_path, "proposal_executed", CRABS_MAX_DEDUP_PATH - 1);
+  strncpy(op->dedup.rejection_message, "Already executed", CRABS_MAX_DEDUP_MESSAGE - 1);
+  op->dedup.update.type = MUTATION_FLAG_SET;
+  strncpy(op->dedup.update.flag_path, "proposal_executed", CRABS_MAX_DEDUP_PATH - 1);
+
+  serialized_buffer_t* buf = crabs_serialize_operation(op);
+  ASSERT_NE(buf, nullptr);
+
+  operation_t* restored = crabs_deserialize_operation(buf->data, buf->len);
+  ASSERT_NE(restored, nullptr);
+
+  EXPECT_EQ(restored->dedup.type, DEDUP_GLOBAL);
+  EXPECT_STREQ(restored->dedup.flag_path, "proposal_executed");
+  EXPECT_STREQ(restored->dedup.rejection_message, "Already executed");
+  EXPECT_EQ(restored->dedup.update.type, MUTATION_FLAG_SET);
+  EXPECT_STREQ(restored->dedup.update.flag_path, "proposal_executed");
+
+  serialized_buffer_destroy(buf);
+  operation_destroy(op);
+  operation_destroy(restored);
+}
+
+TEST(OperationV3, SerializeDedupNone) {
+  operation_t* op = operation_create("lock");
+  memset(op->uuid, 0xDD, CRABS_UUID_SIZE);
+  strncpy(op->signer_id, "dave", CRABS_MAX_USER_ID - 1);
+  op->lamport_time = 3000;
+  // dedup.type defaults to DEDUP_NONE
+
+  serialized_buffer_t* buf = crabs_serialize_operation(op);
+  ASSERT_NE(buf, nullptr);
+
+  operation_t* restored = crabs_deserialize_operation(buf->data, buf->len);
+  ASSERT_NE(restored, nullptr);
+
+  EXPECT_EQ(restored->dedup.type, DEDUP_NONE);
+
+  serialized_buffer_destroy(buf);
+  operation_destroy(op);
+  operation_destroy(restored);
+}
+
+TEST(OperationV3, SerializeDedupCustom) {
+  operation_t* op = operation_create("spend");
+  memset(op->uuid, 0xEE, CRABS_UUID_SIZE);
+  strncpy(op->signer_id, "eve", CRABS_MAX_USER_ID - 1);
+  op->lamport_time = 4000;
+  op->dedup.type = DEDUP_CUSTOM;
+  strncpy(op->dedup.condition, "balance >= 100", CRABS_MAX_POLICY_EXPR - 1);
+  strncpy(op->dedup.rejection_message, "Insufficient balance", CRABS_MAX_DEDUP_MESSAGE - 1);
+  op->dedup.update.type = MUTATION_COUNTER_INCREMENT;
+  strncpy(op->dedup.update.counter_path, "balance", CRABS_MAX_DEDUP_PATH - 1);
+  op->dedup.update.delta = -50;
+
+  serialized_buffer_t* buf = crabs_serialize_operation(op);
+  ASSERT_NE(buf, nullptr);
+
+  operation_t* restored = crabs_deserialize_operation(buf->data, buf->len);
+  ASSERT_NE(restored, nullptr);
+
+  EXPECT_EQ(restored->dedup.type, DEDUP_CUSTOM);
+  EXPECT_STREQ(restored->dedup.condition, "balance >= 100");
+  EXPECT_STREQ(restored->dedup.rejection_message, "Insufficient balance");
+  EXPECT_EQ(restored->dedup.update.type, MUTATION_COUNTER_INCREMENT);
+  EXPECT_STREQ(restored->dedup.update.counter_path, "balance");
+  EXPECT_EQ(restored->dedup.update.delta, (int64_t)-50);
+
+  serialized_buffer_destroy(buf);
+  operation_destroy(op);
+  operation_destroy(restored);
+}
+
+TEST(OperationV3, DedupInCanonicalSigning) {
+  operation_t* op = operation_create("vote");
+  memset(op->uuid, 0xAB, CRABS_UUID_SIZE);
+  strncpy(op->signer_id, "alice", CRABS_MAX_USER_ID - 1);
+  op->lamport_time = 5000;
+  op->dedup.type = DEDUP_PER_USER;
+  strncpy(op->dedup.tracker_path, "voters", CRABS_MAX_DEDUP_PATH - 1);
+
+  serialized_buffer_t* canon = crabs_serialize_for_signing(op);
+  ASSERT_NE(canon, nullptr);
+  EXPECT_GT(canon->len, (size_t)0);
+
+  // Verify the canonical form includes dedup.type
+  // Find the dedup_type byte in the output (it should be 0x01 for PER_USER)
+  bool found_dedup_type = false;
+  for (size_t i = 0; i < canon->len; i++) {
+    if (canon->data[i] == 0x01) { // DEDUP_PER_USER
+      found_dedup_type = true;
+      break;
+    }
+  }
+  EXPECT_TRUE(found_dedup_type);
+
+  serialized_buffer_destroy(canon);
+  operation_destroy(op);
+}

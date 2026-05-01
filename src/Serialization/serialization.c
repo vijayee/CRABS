@@ -63,6 +63,10 @@ static void _write_uint64_le(write_buf_t* buf, uint64_t val) {
   }
 }
 
+static void _write_int64_le(write_buf_t* buf, int64_t val) {
+  _write_uint64_le(buf, (uint64_t)val);
+}
+
 static void _write_bytes(write_buf_t* buf, const uint8_t* data, size_t len) {
   if (data == NULL || len == 0) return;
   _write_buf_ensure(buf, len);
@@ -132,6 +136,10 @@ static bool _read_uint64_le(read_buf_t* buf, uint64_t* out) {
   }
   buf->offset += 8;
   return true;
+}
+
+static bool _read_int64_le(read_buf_t* buf, int64_t* out) {
+  return _read_uint64_le(buf, (uint64_t*)out);
 }
 
 static bool _read_bytes(read_buf_t* buf, uint8_t* out, size_t len) {
@@ -672,6 +680,9 @@ serialized_buffer_t* crabs_serialize_operation(const operation_t* op) {
 
   write_buf_t* buf = _write_buf_create(1024);
 
+  // Operation format version
+  _write_uint32_le(buf, 3); // v3: adds dedup_spec
+
   // type (length-prefixed string)
   _write_string16(buf, op->type);
 
@@ -746,6 +757,26 @@ serialized_buffer_t* crabs_serialize_operation(const operation_t* op) {
     _write_bytes32(buf, op->co_signers[i].signature, op->co_signers[i].signature_len);
   }
 
+  // v1.4: dedup_spec
+  _write_uint8(buf, (uint8_t)op->dedup.type);
+  if (op->dedup.type != DEDUP_NONE) {
+    _write_string16(buf, op->dedup.tracker_path);
+    _write_string16(buf, op->dedup.flag_path);
+    _write_string16(buf, op->dedup.condition);
+    _write_string16(buf, op->dedup.rejection_message);
+    // state_mutation
+    _write_uint8(buf, (uint8_t)op->dedup.update.type);
+    if (op->dedup.update.type != MUTATION_CUSTOM && op->dedup.update.type != 0) {
+      _write_string16(buf, op->dedup.update.set_path);
+      _write_string16(buf, op->dedup.update.element_value);
+      _write_string16(buf, op->dedup.update.flag_path);
+      _write_string16(buf, op->dedup.update.counter_path);
+      _write_int64_le(buf, op->dedup.update.delta);
+      _write_string16(buf, op->dedup.update.target_path);
+      _write_string16(buf, op->dedup.update.value);
+    }
+  }
+
   // Create output
   serialized_buffer_t* result = serialized_buffer_create(buf->offset);
   memcpy(result->data, buf->data, buf->offset);
@@ -766,6 +797,11 @@ operation_t* crabs_deserialize_operation(const uint8_t* data, size_t len) {
 
   operation_t* op = operation_create("");
   if (op == NULL) return NULL;
+
+  // Operation format version
+  uint32_t op_version;
+  if (!_read_uint32_le(&buf, &op_version)) goto fail;
+  if (op_version < 1 || op_version > 3) goto fail;
 
   // type
   if (!_read_string16(&buf, op->type, CRABS_MAX_OP_NAME)) goto fail;
@@ -893,6 +929,35 @@ operation_t* crabs_deserialize_operation(const uint8_t* data, size_t len) {
     }
   }
 
+  // v3: dedup_spec (only for version >= 3)
+  if (op_version >= 3) {
+    uint8_t dedup_type;
+    if (!_read_uint8(&buf, &dedup_type)) goto fail;
+    op->dedup.type = (dedup_type_e)dedup_type;
+
+    if (op->dedup.type != DEDUP_NONE) {
+      if (!_read_string16(&buf, op->dedup.tracker_path, CRABS_MAX_DEDUP_PATH)) goto fail;
+      if (!_read_string16(&buf, op->dedup.flag_path, CRABS_MAX_DEDUP_PATH)) goto fail;
+      if (!_read_string16(&buf, op->dedup.condition, CRABS_MAX_POLICY_EXPR)) goto fail;
+      if (!_read_string16(&buf, op->dedup.rejection_message, CRABS_MAX_DEDUP_MESSAGE)) goto fail;
+
+      // state_mutation
+      uint8_t mut_type;
+      if (!_read_uint8(&buf, &mut_type)) goto fail;
+      op->dedup.update.type = (mutation_type_e)mut_type;
+
+      if (mut_type != MUTATION_CUSTOM && mut_type != 0) {
+        if (!_read_string16(&buf, op->dedup.update.set_path, CRABS_MAX_DEDUP_PATH)) goto fail;
+        if (!_read_string16(&buf, op->dedup.update.element_value, CRABS_MAX_USER_ID)) goto fail;
+        if (!_read_string16(&buf, op->dedup.update.flag_path, CRABS_MAX_DEDUP_PATH)) goto fail;
+        if (!_read_string16(&buf, op->dedup.update.counter_path, CRABS_MAX_DEDUP_PATH)) goto fail;
+        if (!_read_int64_le(&buf, &op->dedup.update.delta)) goto fail;
+        if (!_read_string16(&buf, op->dedup.update.target_path, CRABS_MAX_DEDUP_PATH)) goto fail;
+        if (!_read_string16(&buf, op->dedup.update.value, CRABS_MAX_DEDUP_PATH)) goto fail;
+      }
+    }
+  }
+
   return op;
 
 fail:
@@ -962,6 +1027,16 @@ serialized_buffer_t* crabs_serialize_for_signing(const operation_t* op) {
 
   // 14. op.key_id (length-prefixed string)
   _write_string16(buf, op->key_id);
+
+  // 15. op.dedup (v1.4: included in canonical form per §7.5)
+  _write_uint8(buf, (uint8_t)op->dedup.type);
+  if (op->dedup.type != DEDUP_NONE) {
+    _write_string16(buf, op->dedup.tracker_path);
+    _write_string16(buf, op->dedup.flag_path);
+    _write_string16(buf, op->dedup.condition);
+    // Note: rejection_message and state_mutation are NOT included in canonical form
+    // They are part of the operation payload, not the signature domain
+  }
 
   // Create output
   serialized_buffer_t* result = serialized_buffer_create(buf->offset);

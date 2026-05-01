@@ -16,7 +16,7 @@
 // Magic bytes and format version (§13.1)
 // ============================================================
 #define CRABS_SERIAL_MAGIC      0x42415243  // "CRAB" in little-endian
-#define CRABS_SERIAL_VERSION    2           // v2: adds sig_scheme, key_id, co_signers, sig_config, vault_config
+#define CRABS_SERIAL_VERSION    3           // v3: adds dedup_spec fields
 
 // ============================================================
 // Serialized buffer
