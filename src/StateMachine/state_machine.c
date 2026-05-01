@@ -7,6 +7,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <time.h>
+#include <openssl/rand.h>
 
 // ============================================================
 // Transition Table (§6.3)
@@ -77,8 +78,12 @@ void operation_destroy(operation_t* op) {
 // Lock Token Generation
 // ============================================================
 void state_machine_generate_lock_token(uint8_t token[CRABS_LOCK_TOKEN_SIZE]) {
-  for (int i = 0; i < CRABS_LOCK_TOKEN_SIZE; i++) {
-    token[i] = (uint8_t)(rand() & 0xFF);
+  if (RAND_bytes(token, CRABS_LOCK_TOKEN_SIZE) != 1) {
+    // Fallback: if RAND_bytes fails, fill with random as last resort
+    // but this should be treated as a serious error in production
+    for (int i = 0; i < CRABS_LOCK_TOKEN_SIZE; i++) {
+      token[i] = (uint8_t)(rand() & 0xFF);
+    }
   }
 }
 

@@ -257,6 +257,37 @@ TEST_F(TestStateMachine, TestOperationIsBuiltin) {
   EXPECT_FALSE(operation_is_builtin("custom_transfer"));
 }
 
+TEST_F(TestStateMachine, TestLockTokenEntropy) {
+  operation_t* op = make_lock_op();
+  EXPECT_EQ(state_machine_execute(state, op), CRABS_SUCCESS);
+  data_item_t* item = state_find_item(state, "test_resource");
+  ASSERT_NE(item, nullptr);
+
+  uint8_t token1[CRABS_LOCK_TOKEN_SIZE];
+  memcpy(token1, item->lock_state.lock_token, CRABS_LOCK_TOKEN_SIZE);
+  operation_destroy(op);
+
+  // Reset state and lock again - tokens must differ
+  item->protocol_state = PROTOCOL_IDLE;
+  item->lock_state.lock_token_valid = false;
+
+  operation_t* op2 = operation_create(CRABS_OP_LOCK);
+  memset(op2->uuid, 0x55, CRABS_UUID_SIZE);
+  op2->resources = (char(*)[CRABS_MAX_USER_ID])malloc(sizeof(char[CRABS_MAX_USER_ID]));
+  strncpy(op2->resources[0], "test_resource", CRABS_MAX_USER_ID - 1);
+  op2->resource_count = 1;
+  op2->required_state = (protocol_state_e*)malloc(sizeof(protocol_state_e));
+  op2->required_state[0] = PROTOCOL_IDLE;
+  op2->next_state = (protocol_state_e*)malloc(sizeof(protocol_state_e));
+  op2->next_state[0] = PROTOCOL_LOCKED;
+  strncpy(op2->signer_id, "alice", CRABS_MAX_USER_ID - 1);
+  EXPECT_EQ(state_machine_execute(state, op2), CRABS_SUCCESS);
+
+  // Tokens should differ (with overwhelming probability if CSPRNG)
+  EXPECT_NE(memcmp(token1, item->lock_state.lock_token, CRABS_LOCK_TOKEN_SIZE), 0);
+  operation_destroy(op2);
+}
+
 TEST_F(TestStateMachine, TestChangeConfig) {
   const char* payload_str = "max_lock_duration_ms=10000";
   operation_t* op = operation_create(CRABS_OP_CHANGE_CONFIG);
