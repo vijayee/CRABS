@@ -24,6 +24,7 @@ if (BUILD_TESTING)
         test_integration.cpp
         test_data_model.cpp
         test_protocol_ops.cpp
+        test_attr_machine_extended.cpp
         test_cli.cpp
     )
 
