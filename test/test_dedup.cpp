@@ -5,6 +5,7 @@ extern "C" {
 #include "../src/CRABS/data_model.h"
 #include "../src/StateMachine/state_machine.h"
 #include "../src/CRDT/one_shot.h"
+#include "../src/CRDT/crdt_merge.h"
 }
 
 // ============================================================
@@ -563,4 +564,304 @@ TEST(DedupIntegration, NoneDedupOperationExecutes) {
 TEST(DedupIntegration, CheckDedupOperationIsBuiltin) {
   EXPECT_TRUE(operation_is_builtin(CRABS_OP_DEFINE_OPERATION));
   EXPECT_TRUE(operation_is_builtin(CRABS_OP_CHECK_DEDUP));
+}
+
+// ============================================================
+// DEDUP_CUSTOM condition evaluation tests (v1.4 §6)
+// ============================================================
+
+class DedupCustomTest : public ::testing::Test {
+protected:
+  void SetUp() override {
+    state = state_create();
+    // Create a G-Counter for condition evaluation
+    data_item_t* counter = data_item_create("vote_count", DATA_TYPE_COUNTER, CRDT_G_COUNTER);
+    g_counter_t* gc = g_counter_create();
+    g_counter_increment(gc, "node1", 5);
+    counter->value = gc;
+    state_add_item(state, counter);
+
+    // Create a set for CONTAINS evaluation
+    data_item_t* voters = data_item_create("proposal_voters", DATA_TYPE_ONE_SHOT_SET, CRDT_ONE_SHOT_SET);
+    voters->value = one_shot_set_create();
+    state_add_item(state, voters);
+  }
+
+  void TearDown() override {
+    state_destroy(state);
+  }
+
+  state_t* state;
+};
+
+TEST_F(DedupCustomTest, CustomConditionPasses) {
+  operation_t* op = operation_create("spend");
+  op->dedup.type = DEDUP_CUSTOM;
+  strncpy(op->dedup.condition, "vote_count >= 3", CRABS_MAX_POLICY_EXPR - 1);
+  strncpy(op->signer_id, "alice", CRABS_MAX_USER_ID - 1);
+
+  EXPECT_EQ(dedup_check_guard(state, op), CRABS_SUCCESS);
+
+  operation_destroy(op);
+}
+
+TEST_F(DedupCustomTest, CustomConditionFails) {
+  operation_t* op = operation_create("spend");
+  op->dedup.type = DEDUP_CUSTOM;
+  strncpy(op->dedup.condition, "vote_count >= 100", CRABS_MAX_POLICY_EXPR - 1);
+  strncpy(op->signer_id, "alice", CRABS_MAX_USER_ID - 1);
+
+  EXPECT_EQ(dedup_check_guard(state, op), CRABS_ERR_CONDITION_NOT_MET);
+
+  operation_destroy(op);
+}
+
+TEST_F(DedupCustomTest, CustomEmptyConditionFails) {
+  operation_t* op = operation_create("spend");
+  op->dedup.type = DEDUP_CUSTOM;
+  // Empty condition string → should fail
+  op->dedup.condition[0] = '\0';
+
+  EXPECT_EQ(dedup_check_guard(state, op), CRABS_ERR_CONDITION_NOT_MET);
+
+  operation_destroy(op);
+}
+
+TEST_F(DedupCustomTest, CustomConditionTrueLiteral) {
+  operation_t* op = operation_create("any_op");
+  op->dedup.type = DEDUP_CUSTOM;
+  strncpy(op->dedup.condition, "vote_count >= 1", CRABS_MAX_POLICY_EXPR - 1);
+
+  EXPECT_EQ(dedup_check_guard(state, op), CRABS_SUCCESS);
+
+  operation_destroy(op);
+}
+
+// ============================================================
+// Operation type definition registry tests (v1.4 §7)
+// ============================================================
+
+TEST(OpTypeDef, RegisterAndFind) {
+  state_t* state = state_create();
+
+  dedup_spec_t spec;
+  memset(&spec, 0, sizeof(spec));
+  spec.type = DEDUP_PER_USER;
+  strncpy(spec.tracker_path, "voters", CRABS_MAX_DEDUP_PATH - 1);
+
+  crabs_error_e rc = state_register_op_type_def(state, "vote", &spec);
+  EXPECT_EQ(rc, CRABS_SUCCESS);
+
+  const dedup_spec_t* found = state_find_op_type_def(state, "vote");
+  ASSERT_NE(found, nullptr);
+  EXPECT_EQ(found->type, DEDUP_PER_USER);
+  EXPECT_STREQ(found->tracker_path, "voters");
+
+  state_destroy(state);
+}
+
+TEST(OpTypeDef, FindNonexistent) {
+  state_t* state = state_create();
+
+  const dedup_spec_t* found = state_find_op_type_def(state, "nonexistent");
+  EXPECT_EQ(found, nullptr);
+
+  state_destroy(state);
+}
+
+TEST(OpTypeDef, UpdateExisting) {
+  state_t* state = state_create();
+
+  dedup_spec_t spec1;
+  memset(&spec1, 0, sizeof(spec1));
+  spec1.type = DEDUP_PER_USER;
+  strncpy(spec1.tracker_path, "voters", CRABS_MAX_DEDUP_PATH - 1);
+
+  crabs_error_e rc = state_register_op_type_def(state, "vote", &spec1);
+  EXPECT_EQ(rc, CRABS_SUCCESS);
+
+  // Update with global dedup
+  dedup_spec_t spec2;
+  memset(&spec2, 0, sizeof(spec2));
+  spec2.type = DEDUP_GLOBAL;
+  strncpy(spec2.flag_path, "vote_executed", CRABS_MAX_DEDUP_PATH - 1);
+
+  rc = state_register_op_type_def(state, "vote", &spec2);
+  EXPECT_EQ(rc, CRABS_SUCCESS);
+
+  const dedup_spec_t* found = state_find_op_type_def(state, "vote");
+  ASSERT_NE(found, nullptr);
+  EXPECT_EQ(found->type, DEDUP_GLOBAL);
+  EXPECT_STREQ(found->flag_path, "vote_executed");
+
+  state_destroy(state);
+}
+
+TEST(OpTypeDef, NullParams) {
+  crabs_error_e rc = state_register_op_type_def(NULL, "vote", NULL);
+  EXPECT_EQ(rc, CRABS_ERR_INVALID_PARAM);
+
+  state_t* state = state_create();
+  dedup_spec_t spec;
+  memset(&spec, 0, sizeof(spec));
+  rc = state_register_op_type_def(state, NULL, &spec);
+  EXPECT_EQ(rc, CRABS_ERR_INVALID_PARAM);
+  state_destroy(state);
+}
+
+// ============================================================
+// Built-in operation handler tests (v1.4 §7)
+// ============================================================
+
+TEST(DedupBuiltinOp, DefineOperationRegistersType) {
+  state_t* state = state_create();
+
+  operation_t* op = operation_create(CRABS_OP_DEFINE_OPERATION);
+  memset(op->uuid, 0x01, CRABS_UUID_SIZE);
+  strncpy(op->signer_id, "admin", CRABS_MAX_USER_ID - 1);
+  op->lamport_time = 1;
+  // The operation type name being defined is carried in resources[0]
+  op->resource_count = 1;
+  op->resources = (char(*)[CRABS_MAX_USER_ID])malloc(CRABS_MAX_USER_ID);
+  strncpy(op->resources[0], "vote", CRABS_MAX_USER_ID - 1);
+  op->dedup.type = DEDUP_PER_USER;
+  strncpy(op->dedup.tracker_path, "voters", CRABS_MAX_DEDUP_PATH - 1);
+
+  crabs_error_e result = state_machine_op_define_operation(state, op);
+  EXPECT_EQ(result, CRABS_SUCCESS);
+
+  // Look up the registered type for "vote"
+  const dedup_spec_t* found = state_find_op_type_def(state, "vote");
+  ASSERT_NE(found, nullptr);
+  EXPECT_EQ(found->type, DEDUP_PER_USER);
+  EXPECT_STREQ(found->tracker_path, "voters");
+
+  operation_destroy(op);
+  state_destroy(state);
+}
+
+TEST(DedupBuiltinOp, CheckDedupWithRegisteredSpec) {
+  state_t* state = state_create();
+
+  // Register a "vote" operation type with PER_USER dedup
+  dedup_spec_t vote_spec;
+  memset(&vote_spec, 0, sizeof(vote_spec));
+  vote_spec.type = DEDUP_PER_USER;
+  strncpy(vote_spec.tracker_path, "voters", CRABS_MAX_DEDUP_PATH - 1);
+  state_register_op_type_def(state, "vote", &vote_spec);
+
+  // Create the tracking set
+  data_item_t* voters = data_item_create("voters", DATA_TYPE_ONE_SHOT_SET, CRDT_ONE_SHOT_SET);
+  voters->value = one_shot_set_create();
+  state_add_item(state, voters);
+
+  // Check dedup using the registered spec - should pass for new user
+  operation_t* op = operation_create(CRABS_OP_CHECK_DEDUP);
+  memset(op->uuid, 0x01, CRABS_UUID_SIZE);
+  strncpy(op->signer_id, "alice", CRABS_MAX_USER_ID - 1);
+  op->lamport_time = 1;
+  // Use the "vote" type for lookup - the check_dedup handler looks up the registered spec
+  strncpy(op->type, "vote", CRABS_MAX_OP_NAME - 1);
+
+  crabs_error_e result = state_machine_op_check_dedup(state, op);
+  EXPECT_EQ(result, CRABS_SUCCESS);
+
+  operation_destroy(op);
+  state_destroy(state);
+}
+
+TEST(DedupBuiltinOp, CheckDedupRejectsWithRegisteredSpec) {
+  state_t* state = state_create();
+
+  // Register a "vote" operation type with PER_USER dedup
+  dedup_spec_t vote_spec;
+  memset(&vote_spec, 0, sizeof(vote_spec));
+  vote_spec.type = DEDUP_PER_USER;
+  strncpy(vote_spec.tracker_path, "voters", CRABS_MAX_DEDUP_PATH - 1);
+  state_register_op_type_def(state, "vote", &vote_spec);
+
+  // Create the tracking set with alice already in it
+  data_item_t* voters = data_item_create("voters", DATA_TYPE_ONE_SHOT_SET, CRDT_ONE_SHOT_SET);
+  voters->value = one_shot_set_create();
+  one_shot_set_add((one_shot_set_t*)voters->value, "alice");
+  state_add_item(state, voters);
+
+  // Check dedup - should fail for alice
+  operation_t* op = operation_create("vote");
+  memset(op->uuid, 0x01, CRABS_UUID_SIZE);
+  strncpy(op->signer_id, "alice", CRABS_MAX_USER_ID - 1);
+  op->lamport_time = 1;
+
+  crabs_error_e result = state_machine_op_check_dedup(state, op);
+  EXPECT_EQ(result, CRABS_ERR_ALREADY_PERFORMED);
+
+  operation_destroy(op);
+  state_destroy(state);
+}
+
+TEST(DedupBuiltinOp, CheckDedupNoSpecPasses) {
+  state_t* state = state_create();
+
+  // No registered spec for "unknown_op"
+  operation_t* op = operation_create("unknown_op");
+  memset(op->uuid, 0x01, CRABS_UUID_SIZE);
+  strncpy(op->signer_id, "alice", CRABS_MAX_USER_ID - 1);
+  op->lamport_time = 1;
+
+  crabs_error_e result = state_machine_op_check_dedup(state, op);
+  EXPECT_EQ(result, CRABS_SUCCESS);
+
+  operation_destroy(op);
+  state_destroy(state);
+}
+
+TEST(DedupBuiltinOp, CheckDedupInlineSpecOverridesRegistered) {
+  state_t* state = state_create();
+
+  // Register a "vote" operation type with PER_USER dedup
+  dedup_spec_t vote_spec;
+  memset(&vote_spec, 0, sizeof(vote_spec));
+  vote_spec.type = DEDUP_PER_USER;
+  strncpy(vote_spec.tracker_path, "voters", CRABS_MAX_DEDUP_PATH - 1);
+  state_register_op_type_def(state, "vote", &vote_spec);
+
+  // Create the tracking set with alice already in it
+  data_item_t* voters = data_item_create("voters", DATA_TYPE_ONE_SHOT_SET, CRDT_ONE_SHOT_SET);
+  voters->value = one_shot_set_create();
+  one_shot_set_add((one_shot_set_t*)voters->value, "alice");
+  state_add_item(state, voters);
+
+  // Operation with DEDUP_NONE inline (default zero value) — check_dedup looks up
+  // the registered spec for "vote" since inline is DEDUP_NONE
+  operation_t* op = operation_create("vote");
+  memset(op->uuid, 0x01, CRABS_UUID_SIZE);
+  strncpy(op->signer_id, "alice", CRABS_MAX_USER_ID - 1);
+  op->lamport_time = 1;
+  // dedup.type defaults to DEDUP_NONE — check_dedup uses registered spec
+
+  // alice is already in the voters set, so the registered PER_USER spec should reject
+  crabs_error_e result = state_machine_op_check_dedup(state, op);
+  EXPECT_EQ(result, CRABS_ERR_ALREADY_PERFORMED);
+
+  operation_destroy(op);
+  state_destroy(state);
+}
+
+TEST(DedupBuiltinOp, DefineOperationNoResourcesFails) {
+  state_t* state = state_create();
+
+  operation_t* op = operation_create(CRABS_OP_DEFINE_OPERATION);
+  memset(op->uuid, 0x01, CRABS_UUID_SIZE);
+  strncpy(op->signer_id, "admin", CRABS_MAX_USER_ID - 1);
+  op->lamport_time = 1;
+  // No resources — should fail
+  op->resource_count = 0;
+  op->resources = NULL;
+  op->dedup.type = DEDUP_PER_USER;
+
+  crabs_error_e result = state_machine_op_define_operation(state, op);
+  EXPECT_EQ(result, CRABS_ERR_INVALID_PARAM);
+
+  operation_destroy(op);
+  state_destroy(state);
 }

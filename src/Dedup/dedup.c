@@ -4,6 +4,7 @@
 
 #include "dedup.h"
 #include "../Util/allocator.h"
+#include "../Condition/condition.h"
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -69,10 +70,13 @@ crabs_error_e dedup_check_guard(const state_t* state, const operation_t* op) {
     }
 
     case DEDUP_CUSTOM: {
-      // For CUSTOM, the condition expression is evaluated
-      // This uses the existing condition evaluator
-      // For now, return SUCCESS as condition evaluation is a separate module
-      return CRABS_SUCCESS;
+      // Evaluate the condition expression against the current state
+      if (op->dedup.condition[0] == '\0') return CRABS_ERR_CONDITION_NOT_MET;
+      condition_node_t* ast = condition_parse(op->dedup.condition);
+      if (ast == NULL) return CRABS_ERR_CONDITION_NOT_MET;
+      bool result = condition_evaluate(ast, state);
+      condition_node_destroy(ast);
+      return result ? CRABS_SUCCESS : CRABS_ERR_CONDITION_NOT_MET;
     }
 
     default:

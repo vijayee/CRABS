@@ -83,6 +83,7 @@ void state_destroy(state_t* state) {
   if (state->policies != NULL) free(state->policies);
   if (state->log != NULL) free(state->log);
   if (state->processed_ops != NULL) free(state->processed_ops);
+  if (state->op_type_defs != NULL) free(state->op_type_defs);
   if (state->triggers != NULL) {
     for (uint32_t i = 0; i < state->trigger_count; i++) {
       if (state->triggers[i].condition_ast != NULL) {
@@ -147,4 +148,43 @@ const char* state_find_policy(state_t* state, const char* operation) {
     }
   }
   return NULL;
+}
+
+// ============================================================
+// Operation type definition registry (v1.4 §7)
+// ============================================================
+const dedup_spec_t* state_find_op_type_def(const state_t* state, const char* op_type) {
+  if (state == NULL || op_type == NULL) return NULL;
+  for (uint32_t i = 0; i < state->op_type_def_count; i++) {
+    if (strcmp(state->op_type_defs[i].op_type, op_type) == 0) {
+      return &state->op_type_defs[i].dedup;
+    }
+  }
+  return NULL;
+}
+
+crabs_error_e state_register_op_type_def(state_t* state, const char* op_type, const dedup_spec_t* dedup) {
+  if (state == NULL || op_type == NULL || dedup == NULL) return CRABS_ERR_INVALID_PARAM;
+
+  // Check if already registered — update if so
+  for (uint32_t i = 0; i < state->op_type_def_count; i++) {
+    if (strcmp(state->op_type_defs[i].op_type, op_type) == 0) {
+      state->op_type_defs[i].dedup = *dedup;
+      return CRABS_SUCCESS;
+    }
+  }
+
+  // Check capacity
+  if (state->op_type_def_count >= CRABS_MAX_OP_TYPE_DEFS) return CRABS_ERR_OOM;
+
+  uint32_t idx = state->op_type_def_count;
+  state->op_type_def_count++;
+  op_type_def_t* new_defs = realloc(state->op_type_defs, state->op_type_def_count * sizeof(op_type_def_t));
+  if (new_defs == NULL) return CRABS_ERR_OOM;
+  state->op_type_defs = new_defs;
+
+  strncpy(state->op_type_defs[idx].op_type, op_type, CRABS_MAX_OP_NAME - 1);
+  state->op_type_defs[idx].op_type[CRABS_MAX_OP_NAME - 1] = '\0';
+  state->op_type_defs[idx].dedup = *dedup;
+  return CRABS_SUCCESS;
 }

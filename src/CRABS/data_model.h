@@ -234,6 +234,16 @@ typedef struct {
 } dedup_spec_t;
 
 // ============================================================
+// Operation Type Definition (v1.4 §7)
+// ============================================================
+#define CRABS_MAX_OP_TYPE_DEFS  32
+
+typedef struct {
+  char          op_type[CRABS_MAX_OP_NAME];
+  dedup_spec_t  dedup;
+} op_type_def_t;
+
+// ============================================================
 // Log Entry (§7.4 step 9)
 // ============================================================
 typedef struct {
@@ -266,6 +276,9 @@ typedef struct state_t {
   uint8_t node_public_key[33];        // Node ECDSA public key
   bool    node_key_valid;             // Whether node keys are initialized
   void*   last_refresh_envelope;      // Last key refresh envelope (key_envelope_t*, §11.3)
+  // v1.4: Operation type definitions (§7)
+  op_type_def_t* op_type_defs;
+  uint32_t       op_type_def_count;
 } state_t;
 
 // ============================================================
@@ -297,5 +310,9 @@ data_item_t* state_find_item(state_t* state, const char* name);
 crabs_error_e state_add_item(state_t* state, data_item_t* item);
 crabs_error_e state_add_policy(state_t* state, const char* operation, const char* expression);
 const char*  state_find_policy(state_t* state, const char* operation);
+
+// Operation type definition registry (v1.4 §7)
+const dedup_spec_t* state_find_op_type_def(const state_t* state, const char* op_type);
+crabs_error_e state_register_op_type_def(state_t* state, const char* op_type, const dedup_spec_t* dedup);
 
 #endif // CRABS_DATA_MODEL_H

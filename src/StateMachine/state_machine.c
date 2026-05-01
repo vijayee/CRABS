@@ -435,11 +435,9 @@ crabs_error_e state_machine_execute(state_t* state, operation_t* op) {
   } else if (strcmp(op->type, CRABS_OP_ROTATE_KEY) == 0) {
     result = state_machine_op_rotate_key(state, op);
   } else if (strcmp(op->type, CRABS_OP_DEFINE_OPERATION) == 0) {
-    // Dedup: define operation type is a no-op for now (metadata only)
-    result = CRABS_SUCCESS;
+    result = state_machine_op_define_operation(state, op);
   } else if (strcmp(op->type, CRABS_OP_CHECK_DEDUP) == 0) {
-    // Dedup: check dedup guard without executing
-    result = dedup_check_guard(state, op);
+    result = state_machine_op_check_dedup(state, op);
   } else {
     result = CRABS_ERR_INVALID_PARAM;
   }
@@ -1016,4 +1014,44 @@ crabs_error_e state_machine_op_refresh_key(state_t* state, operation_t* op,
   }
 
   return CRABS_SUCCESS;
+}
+
+// ============================================================
+// Dedup Built-in Operations (v1.4 §7)
+// ============================================================
+
+crabs_error_e state_machine_op_define_operation(state_t* state, operation_t* op) {
+  if (state == NULL || op == NULL) return CRABS_ERR_INVALID_PARAM;
+
+  // The operation type name to define is carried in resources[0]
+  if (op->resource_count == 0 || op->resources == NULL) return CRABS_ERR_INVALID_PARAM;
+
+  crabs_error_e rc = state_register_op_type_def(state, op->resources[0], &op->dedup);
+  if (rc != CRABS_SUCCESS) return rc;
+
+  return CRABS_SUCCESS;
+}
+
+crabs_error_e state_machine_op_check_dedup(state_t* state, operation_t* op) {
+  if (state == NULL || op == NULL) return CRABS_ERR_INVALID_PARAM;
+
+  // If the operation has a dedup spec, use it directly
+  if (op->dedup.type != DEDUP_NONE) {
+    return dedup_check_guard(state, op);
+  }
+
+  // Otherwise, look up the registered dedup spec for this operation type
+  const dedup_spec_t* registered = state_find_op_type_def(state, op->type);
+  if (registered == NULL) return CRABS_SUCCESS; // No dedup spec → passes
+
+  // Create a temporary copy of the operation with the registered dedup spec
+  operation_t* check_op = operation_create(op->type);
+  if (check_op == NULL) return CRABS_ERR_OOM;
+  check_op->dedup = *registered;
+  strncpy(check_op->signer_id, op->signer_id, CRABS_MAX_USER_ID - 1);
+  check_op->lamport_time = op->lamport_time;
+
+  crabs_error_e result = dedup_check_guard(state, check_op);
+  operation_destroy(check_op);
+  return result;
 }
