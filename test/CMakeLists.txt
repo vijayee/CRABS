@@ -16,6 +16,7 @@ if (BUILD_TESTING)
         test_refcounter.cpp
         test_state_machine.cpp
         test_crdt.cpp
+        test_crypto.cpp
     )
 
     add_dependencies(testcrabs crabs)
