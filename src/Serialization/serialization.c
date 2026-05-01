@@ -367,11 +367,36 @@ static bool _deserialize_data_item(read_buf_t* buf, data_item_t* item) {
 static void _serialize_policy(write_buf_t* buf, const policy_t* policy) {
   _write_string16(buf, policy->operation);
   _write_string16(buf, policy->expression);
+
+  // v1.3: scheme constraints (clamp to MAX_ALLOWED_SCHEMES)
+  uint32_t scheme_count = policy->allowed_scheme_count < CRABS_MAX_ALLOWED_SCHEMES ?
+                          policy->allowed_scheme_count : CRABS_MAX_ALLOWED_SCHEMES;
+  _write_uint32_le(buf, scheme_count);
+  for (uint32_t i = 0; i < scheme_count; i++) {
+    _write_uint8(buf, (uint8_t)policy->allowed_schemes[i]);
+  }
+  _write_uint64_le(buf, policy->min_key_version);
 }
 
-static bool _deserialize_policy(read_buf_t* buf, policy_t* policy) {
+static bool _deserialize_policy(read_buf_t* buf, policy_t* policy, uint32_t serial_version) {
   if (!_read_string16(buf, policy->operation, CRABS_MAX_OP_NAME)) return false;
   if (!_read_string16(buf, policy->expression, CRABS_MAX_POLICY_EXPR)) return false;
+
+  if (serial_version >= 2) {
+    // v1.3: scheme constraints
+    uint32_t scheme_count;
+    if (!_read_uint32_le(buf, &scheme_count)) return false;
+    policy->allowed_scheme_count = scheme_count < CRABS_MAX_ALLOWED_SCHEMES ?
+                                   scheme_count : CRABS_MAX_ALLOWED_SCHEMES;
+    for (uint32_t i = 0; i < policy->allowed_scheme_count; i++) {
+      uint8_t scheme;
+      if (!_read_uint8(buf, &scheme)) return false;
+      policy->allowed_schemes[i] = (signature_scheme_e)scheme;
+    }
+    if (!_read_uint64_le(buf, &policy->min_key_version)) return false;
+  }
+  // v1: allowed_schemes and min_key_version remain zero-initialized (defaults)
+
   return true;
 }
 
@@ -383,9 +408,25 @@ static void _serialize_config(write_buf_t* buf, const machine_config_t* config) 
   _write_uint32_le(buf, config->max_lock_extensions);
   _write_bool8(buf, config->allow_force_unlock);
   _write_string16(buf, config->bootstrap_admin);
+
+  // v1.3: sig_config
+  _write_uint8(buf, (uint8_t)config->sig_config.default_scheme);
+  _write_uint32_le(buf, config->sig_config.max_keys_per_user);
+  _write_bool8(buf, config->sig_config.key_rotation_enabled);
+  _write_uint32_le(buf, config->sig_config.co_sign_threshold);
+  _write_bool8(buf, config->sig_config.key_expiry_enabled);
+  _write_uint64_le(buf, config->sig_config.default_key_ttl_ms);
+  _write_uint64_le(buf, config->sig_config.max_key_age_ms);
+
+  // v1.3: vault_config
+  _write_uint8(buf, (uint8_t)config->vault_config.provider);
+  _write_string16(buf, config->vault_config.address);
+  _write_string16(buf, config->vault_config.auth_token);
+  _write_bool8(buf, config->vault_config.signing_delegated);
+  _write_bool8(buf, config->vault_config.rotation_delegated);
 }
 
-static bool _deserialize_config(read_buf_t* buf, machine_config_t* config) {
+static bool _deserialize_config(read_buf_t* buf, machine_config_t* config, uint32_t serial_version) {
   if (!_read_uint64_le(buf, &config->max_lock_duration_ms)) return false;
   uint32_t max_ext;
   if (!_read_uint32_le(buf, &max_ext)) return false;
@@ -394,6 +435,43 @@ static bool _deserialize_config(read_buf_t* buf, machine_config_t* config) {
   if (!_read_uint8(buf, &allow)) return false;
   config->allow_force_unlock = (allow != 0);
   if (!_read_string16(buf, config->bootstrap_admin, CRABS_MAX_USER_ID)) return false;
+
+  // v2 fields: sig_config and vault_config
+  if (serial_version >= 2) {
+    // sig_config
+    uint8_t scheme;
+    if (!_read_uint8(buf, &scheme)) return false;
+    config->sig_config.default_scheme = (signature_scheme_e)scheme;
+    uint32_t max_keys;
+    if (!_read_uint32_le(buf, &max_keys)) return false;
+    config->sig_config.max_keys_per_user = max_keys;
+    uint8_t rot_enabled;
+    if (!_read_uint8(buf, &rot_enabled)) return false;
+    config->sig_config.key_rotation_enabled = (rot_enabled != 0);
+    uint32_t co_sign;
+    if (!_read_uint32_le(buf, &co_sign)) return false;
+    config->sig_config.co_sign_threshold = co_sign;
+    uint8_t expiry_en;
+    if (!_read_uint8(buf, &expiry_en)) return false;
+    config->sig_config.key_expiry_enabled = (expiry_en != 0);
+    if (!_read_uint64_le(buf, &config->sig_config.default_key_ttl_ms)) return false;
+    if (!_read_uint64_le(buf, &config->sig_config.max_key_age_ms)) return false;
+
+    // vault_config
+    uint8_t provider;
+    if (!_read_uint8(buf, &provider)) return false;
+    config->vault_config.provider = (vault_provider_e)provider;
+    if (!_read_string16(buf, config->vault_config.address, CRABS_VAULT_ADDRESS_MAX)) return false;
+    if (!_read_string16(buf, config->vault_config.auth_token, CRABS_VAULT_TOKEN_MAX)) return false;
+    uint8_t sig_del;
+    if (!_read_uint8(buf, &sig_del)) return false;
+    config->vault_config.signing_delegated = (sig_del != 0);
+    uint8_t rot_del;
+    if (!_read_uint8(buf, &rot_del)) return false;
+    config->vault_config.rotation_delegated = (rot_del != 0);
+  }
+  // v1: sig_config and vault_config remain zero-initialized (defaults)
+
   return true;
 }
 
@@ -522,7 +600,7 @@ state_t* crabs_deserialize_state(const uint8_t* data, size_t len) {
   // Version
   uint32_t version;
   if (!_read_uint32_le(&buf, &version)) return NULL;
-  if (version != CRABS_SERIAL_VERSION) return NULL;
+  if (version < 1 || version > CRABS_SERIAL_VERSION) return NULL;
 
   state_t* state = state_create();
 
@@ -563,12 +641,12 @@ state_t* crabs_deserialize_state(const uint8_t* data, size_t len) {
     state->policies = get_clear_memory(policy_count * sizeof(policy_t));
     state->policy_count = policy_count;
     for (uint32_t i = 0; i < policy_count; i++) {
-      if (!_deserialize_policy(&buf, &state->policies[i])) goto fail;
+      if (!_deserialize_policy(&buf, &state->policies[i], version)) goto fail;
     }
   }
 
   // config
-  if (!_deserialize_config(&buf, &state->config)) goto fail;
+  if (!_deserialize_config(&buf, &state->config, version)) goto fail;
 
   // log entries
   if (log_count > 0) {
@@ -653,6 +731,21 @@ serialized_buffer_t* crabs_serialize_operation(const operation_t* op) {
   // payload_format
   _write_uint8(buf, op->payload_format);
 
+  // v1.3: sig_scheme
+  _write_uint8(buf, (uint8_t)op->sig_scheme);
+
+  // v1.3: key_id (length-prefixed string)
+  _write_string16(buf, op->key_id);
+
+  // v1.3: co_signer_count + co_signers
+  _write_uint32_le(buf, op->co_signer_count);
+  for (uint32_t i = 0; i < op->co_signer_count; i++) {
+    _write_string16(buf, op->co_signers[i].signer_id);
+    _write_string16(buf, op->co_signers[i].key_id);
+    _write_uint8(buf, (uint8_t)op->co_signers[i].sig_scheme);
+    _write_bytes32(buf, op->co_signers[i].signature, op->co_signers[i].signature_len);
+  }
+
   // Create output
   serialized_buffer_t* result = serialized_buffer_create(buf->offset);
   memcpy(result->data, buf->data, buf->offset);
@@ -690,6 +783,7 @@ operation_t* crabs_deserialize_operation(const uint8_t* data, size_t len) {
   // resource_count
   uint32_t resource_count;
   if (!_read_uint32_le(&buf, &resource_count)) goto fail;
+  if (resource_count > CRABS_MAX_RESOURCES) goto fail;
   op->resource_count = resource_count;
 
   // resources
@@ -703,6 +797,7 @@ operation_t* crabs_deserialize_operation(const uint8_t* data, size_t len) {
   // required_state
   uint32_t rs_count;
   if (!_read_uint32_le(&buf, &rs_count)) goto fail;
+  if (rs_count > CRABS_MAX_RESOURCES) goto fail;
   if (rs_count > 0) {
     op->required_state = get_clear_memory(rs_count * sizeof(protocol_state_e));
     for (uint32_t i = 0; i < rs_count; i++) {
@@ -715,6 +810,7 @@ operation_t* crabs_deserialize_operation(const uint8_t* data, size_t len) {
   // next_state
   uint32_t ns_count;
   if (!_read_uint32_le(&buf, &ns_count)) goto fail;
+  if (ns_count > CRABS_MAX_RESOURCES) goto fail;
   if (ns_count > 0) {
     op->next_state = get_clear_memory(ns_count * sizeof(protocol_state_e));
     for (uint32_t i = 0; i < ns_count; i++) {
@@ -727,6 +823,7 @@ operation_t* crabs_deserialize_operation(const uint8_t* data, size_t len) {
   // lock_claim_count
   uint32_t lc_count;
   if (!_read_uint32_le(&buf, &lc_count)) goto fail;
+  if (lc_count > CRABS_MAX_RESOURCES) goto fail;
   op->lock_claim_count = lc_count;
 
   // lock_claims
@@ -760,6 +857,41 @@ operation_t* crabs_deserialize_operation(const uint8_t* data, size_t len) {
   uint8_t pf;
   if (!_read_uint8(&buf, &pf)) goto fail;
   op->payload_format = pf;
+
+  // v1.3: sig_scheme
+  uint8_t scheme;
+  if (!_read_uint8(&buf, &scheme)) goto fail;
+  op->sig_scheme = (signature_scheme_e)scheme;
+
+  // v1.3: key_id (length-prefixed string)
+  if (!_read_string16(&buf, op->key_id, CRABS_MAX_KEY_ID)) goto fail;
+
+  // v1.3: co_signer_count + co_signers
+  uint32_t cs_count;
+  if (!_read_uint32_le(&buf, &cs_count)) goto fail;
+  op->co_signer_count = cs_count;
+  if (cs_count > 0) {
+    if (cs_count > CRABS_MAX_CO_SIGNERS) goto fail;
+    op->co_signers = get_clear_memory(cs_count * sizeof(co_signature_t));
+    for (uint32_t i = 0; i < cs_count; i++) {
+      if (!_read_string16(&buf, op->co_signers[i].signer_id, CRABS_MAX_USER_ID)) goto fail;
+      if (!_read_string16(&buf, op->co_signers[i].key_id, CRABS_MAX_KEY_ID)) goto fail;
+      uint8_t cs_scheme;
+      if (!_read_uint8(&buf, &cs_scheme)) goto fail;
+      op->co_signers[i].sig_scheme = (signature_scheme_e)cs_scheme;
+      uint8_t* cs_sig = NULL;
+      uint32_t cs_sig_len = 0;
+      if (!_read_bytes32(&buf, &cs_sig, &cs_sig_len)) goto fail;
+      if (cs_sig != NULL && cs_sig_len <= CRABS_SIG_SIZE) {
+        memcpy(op->co_signers[i].signature, cs_sig, cs_sig_len);
+        op->co_signers[i].signature_len = cs_sig_len;
+        free(cs_sig);
+      } else if (cs_sig != NULL) {
+        free(cs_sig);
+        goto fail;
+      }
+    }
+  }
 
   return op;
 
@@ -824,6 +956,12 @@ serialized_buffer_t* crabs_serialize_for_signing(const operation_t* op) {
 
   // 12. op.node_id (length-prefixed string)
   _write_string16(buf, op->node_id);
+
+  // 13. op.sig_scheme (uint8)
+  _write_uint8(buf, (uint8_t)op->sig_scheme);
+
+  // 14. op.key_id (length-prefixed string)
+  _write_string16(buf, op->key_id);
 
   // Create output
   serialized_buffer_t* result = serialized_buffer_create(buf->offset);

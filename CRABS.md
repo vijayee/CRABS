@@ -1,4 +1,4 @@
-# CRABS: Cryptographic Role-based Attribute-gated Blockchain-like State Machines
+# CRABS: Cryptographic Attribute-Based State Machines
 
 ### *A Protocol for Self-Sovereign Attribute-Based Authorization with Convergent State*
 

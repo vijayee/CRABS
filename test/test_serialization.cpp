@@ -1,9 +1,14 @@
 #include <gtest/gtest.h>
+#include <vector>
+#include <cstring>
 extern "C" {
 #include "../src/Serialization/serialization.h"
 #include "../src/CRABS/crabs.h"
 #include "../src/CRABS/data_model.h"
 #include "../src/StateMachine/state_machine.h"
+#include "../src/Crypto/sig_scheme.h"
+#include "../src/Attribute/attribute_machine.h"
+#include <openssl/sha.h>
 }
 
 // ============================================================
@@ -510,4 +515,364 @@ TEST(TestSerialization, TestBufferCreateDestroy) {
   serialized_buffer_destroy(buf);
   // Should not crash on null
   serialized_buffer_destroy(NULL);
+}
+
+// ============================================================
+// v1.3 Serialization v2 tests
+// ============================================================
+
+TEST(TestSerializationV2, TestOperationRoundTripWithSigScheme) {
+  operation_t* op = operation_create(CRABS_OP_LOCK);
+  memset(op->uuid, 0xAB, CRABS_UUID_SIZE);
+  strncpy(op->signer_id, "alice", CRABS_MAX_USER_ID - 1);
+  op->sig_scheme = ECDSA_SECP256K1;
+  strncpy(op->key_id, "key-001", CRABS_MAX_KEY_ID - 1);
+  op->resource_count = 0;
+
+  serialized_buffer_t* buf = crabs_serialize_operation(op);
+  ASSERT_NE(buf, nullptr);
+
+  operation_t* restored = crabs_deserialize_operation(buf->data, buf->len);
+  ASSERT_NE(restored, nullptr);
+
+  EXPECT_EQ(restored->sig_scheme, ECDSA_SECP256K1);
+  EXPECT_STREQ(restored->key_id, "key-001");
+
+  serialized_buffer_destroy(buf);
+  operation_destroy(op);
+  operation_destroy(restored);
+}
+
+TEST(TestSerializationV2, TestOperationRoundTripWithCoSigners) {
+  operation_t* op = operation_create(CRABS_OP_LOCK);
+  memset(op->uuid, 0xCD, CRABS_UUID_SIZE);
+  strncpy(op->signer_id, "alice", CRABS_MAX_USER_ID - 1);
+  op->sig_scheme = ECDSA_P256;
+  strncpy(op->key_id, "key-002", CRABS_MAX_KEY_ID - 1);
+  op->resource_count = 0;
+
+  // Add 2 co-signers
+  op->co_signer_count = 2;
+  op->co_signers = (co_signature_t*)calloc(2, sizeof(co_signature_t));
+  strncpy(op->co_signers[0].signer_id, "bob", CRABS_MAX_USER_ID - 1);
+  strncpy(op->co_signers[0].key_id, "bob-key-1", CRABS_MAX_KEY_ID - 1);
+  op->co_signers[0].sig_scheme = ECDSA_SECP256K1;
+  memset(op->co_signers[0].signature, 0xAA, CRABS_SIG_SIZE);
+  op->co_signers[0].signature_len = CRABS_SIG_SIZE;
+
+  strncpy(op->co_signers[1].signer_id, "carol", CRABS_MAX_USER_ID - 1);
+  strncpy(op->co_signers[1].key_id, "carol-key-1", CRABS_MAX_KEY_ID - 1);
+  op->co_signers[1].sig_scheme = ED25519;
+  memset(op->co_signers[1].signature, 0xBB, CRABS_SIG_SIZE);
+  op->co_signers[1].signature_len = CRABS_SIG_SIZE;
+
+  serialized_buffer_t* buf = crabs_serialize_operation(op);
+  ASSERT_NE(buf, nullptr);
+
+  operation_t* restored = crabs_deserialize_operation(buf->data, buf->len);
+  ASSERT_NE(restored, nullptr);
+
+  EXPECT_EQ(restored->co_signer_count, (uint32_t)2);
+  EXPECT_STREQ(restored->co_signers[0].signer_id, "bob");
+  EXPECT_STREQ(restored->co_signers[0].key_id, "bob-key-1");
+  EXPECT_EQ(restored->co_signers[0].sig_scheme, ECDSA_SECP256K1);
+  EXPECT_EQ(restored->co_signers[0].signature_len, (uint32_t)CRABS_SIG_SIZE);
+  EXPECT_EQ(memcmp(restored->co_signers[0].signature, op->co_signers[0].signature, CRABS_SIG_SIZE), 0);
+
+  EXPECT_STREQ(restored->co_signers[1].signer_id, "carol");
+  EXPECT_STREQ(restored->co_signers[1].key_id, "carol-key-1");
+  EXPECT_EQ(restored->co_signers[1].sig_scheme, ED25519);
+
+  serialized_buffer_destroy(buf);
+  operation_destroy(op);
+  operation_destroy(restored);
+}
+
+TEST(TestSerializationV2, TestConfigRoundTripWithSigConfig) {
+  state_t* state = state_create();
+  state->config.sig_config.default_scheme = ECDSA_P256;
+  state->config.sig_config.max_keys_per_user = 4;
+  state->config.sig_config.key_rotation_enabled = true;
+  state->config.sig_config.co_sign_threshold = 2;
+  state->config.sig_config.key_expiry_enabled = true;
+  state->config.sig_config.default_key_ttl_ms = 86400000;
+  state->config.sig_config.max_key_age_ms = 31536000000;
+
+  serialized_buffer_t* buf = crabs_serialize_state(state);
+  ASSERT_NE(buf, nullptr);
+
+  state_t* restored = crabs_deserialize_state(buf->data, buf->len);
+  ASSERT_NE(restored, nullptr);
+
+  EXPECT_EQ(restored->config.sig_config.default_scheme, ECDSA_P256);
+  EXPECT_EQ(restored->config.sig_config.max_keys_per_user, (uint32_t)4);
+  EXPECT_EQ(restored->config.sig_config.key_rotation_enabled, true);
+  EXPECT_EQ(restored->config.sig_config.co_sign_threshold, (uint32_t)2);
+  EXPECT_EQ(restored->config.sig_config.key_expiry_enabled, true);
+  EXPECT_EQ(restored->config.sig_config.default_key_ttl_ms, (uint64_t)86400000);
+  EXPECT_EQ(restored->config.sig_config.max_key_age_ms, (uint64_t)31536000000);
+
+  serialized_buffer_destroy(buf);
+  state_destroy(state);
+  state_destroy(restored);
+}
+
+TEST(TestSerializationV2, TestConfigRoundTripWithVaultConfig) {
+  state_t* state = state_create();
+  state->config.vault_config.provider = VAULT_HASHICORP;
+  strncpy(state->config.vault_config.address, "https://vault.example.com:8200", CRABS_VAULT_ADDRESS_MAX - 1);
+  strncpy(state->config.vault_config.auth_token, "s.xtUa7gHAk1vY9x5j", CRABS_VAULT_TOKEN_MAX - 1);
+  state->config.vault_config.signing_delegated = true;
+  state->config.vault_config.rotation_delegated = false;
+
+  serialized_buffer_t* buf = crabs_serialize_state(state);
+  ASSERT_NE(buf, nullptr);
+
+  state_t* restored = crabs_deserialize_state(buf->data, buf->len);
+  ASSERT_NE(restored, nullptr);
+
+  EXPECT_EQ(restored->config.vault_config.provider, VAULT_HASHICORP);
+  EXPECT_STREQ(restored->config.vault_config.address, "https://vault.example.com:8200");
+  EXPECT_STREQ(restored->config.vault_config.auth_token, "s.xtUa7gHAk1vY9x5j");
+  EXPECT_EQ(restored->config.vault_config.signing_delegated, true);
+  EXPECT_EQ(restored->config.vault_config.rotation_delegated, false);
+
+  serialized_buffer_destroy(buf);
+  state_destroy(state);
+  state_destroy(restored);
+}
+
+TEST(TestSerializationV2, TestPolicyRoundTripWithSchemeConstraints) {
+  state_t* state = state_create();
+  state_add_policy(state, CRABS_OP_LOCK, "role:admin");
+
+  // Set scheme constraints on the policy
+  state->policies[0].allowed_scheme_count = 2;
+  state->policies[0].allowed_schemes[0] = ECDSA_SECP256K1;
+  state->policies[0].allowed_schemes[1] = ED25519;
+  state->policies[0].min_key_version = 3;
+
+  serialized_buffer_t* buf = crabs_serialize_state(state);
+  ASSERT_NE(buf, nullptr);
+
+  state_t* restored = crabs_deserialize_state(buf->data, buf->len);
+  ASSERT_NE(restored, nullptr);
+
+  EXPECT_EQ(restored->policy_count, (uint32_t)1);
+  EXPECT_EQ(restored->policies[0].allowed_scheme_count, (uint32_t)2);
+  EXPECT_EQ(restored->policies[0].allowed_schemes[0], ECDSA_SECP256K1);
+  EXPECT_EQ(restored->policies[0].allowed_schemes[1], ED25519);
+  EXPECT_EQ(restored->policies[0].min_key_version, (uint64_t)3);
+
+  serialized_buffer_destroy(buf);
+  state_destroy(state);
+  state_destroy(restored);
+}
+
+TEST(TestSerializationV2, TestV1BackwardCompatRejectsInvalidVersion) {
+  // Craft a v0 (invalid) serialized state
+  state_t* state = state_create();
+  serialized_buffer_t* buf = crabs_serialize_state(state);
+  ASSERT_NE(buf, nullptr);
+
+  // Patch version field (offset 4, uint32 LE) to 0
+  buf->data[4] = 0;
+  buf->data[5] = 0;
+  buf->data[6] = 0;
+  buf->data[7] = 0;
+
+  // Recompute checksum (last 32 bytes)
+  uint8_t hash[32];
+  SHA256(buf->data, buf->len - 32, hash);
+  memcpy(buf->data + buf->len - 32, hash, 32);
+
+  state_t* result = crabs_deserialize_state(buf->data, buf->len);
+  EXPECT_EQ(result, nullptr);
+
+  serialized_buffer_destroy(buf);
+  state_destroy(state);
+}
+
+TEST(TestSerializationV2, TestV1BackwardCompatAcceptsV1) {
+  // Build a v1-format buffer: same as v2 but with version=1 and no v2 fields
+  // We construct this manually since the serializer always writes v2
+  state_t* state = state_create();
+  state->version = 7;
+  state->config.max_lock_duration_ms = 5000;
+  state->config.max_lock_extensions = 3;
+  state->config.allow_force_unlock = true;
+  strncpy(state->config.bootstrap_admin, "admin", CRABS_MAX_USER_ID - 1);
+
+  // Serialize as v2 first, then rebuild as v1
+  // v1 layout: magic(4) + version(4) + state_version(8) + item_count(4) + policy_count(4) + log_count(4)
+  //   + items + policies(v1: no scheme fields) + config(v1: no sig_config/vault_config) + log + checksum
+
+  // Build a v1 buffer manually
+  // We'll use a write-buffer approach
+  std::vector<uint8_t> v1buf;
+  auto write_u8 = [&](uint8_t v) { v1buf.push_back(v); };
+  auto write_u16 = [&](uint16_t v) { v1buf.push_back(v & 0xFF); v1buf.push_back((v >> 8) & 0xFF); };
+  auto write_u32 = [&](uint32_t v) { for(int i=0;i<4;i++) v1buf.push_back((v>>(i*8))&0xFF); };
+  auto write_u64 = [&](uint64_t v) { for(int i=0;i<8;i++) v1buf.push_back((v>>(i*8))&0xFF); };
+  auto write_str16 = [&](const char* s) {
+    uint16_t slen = s ? strlen(s) : 0;
+    write_u16(slen);
+    for(uint16_t i=0;i<slen;i++) v1buf.push_back((uint8_t)s[i]);
+  };
+
+  // Magic
+  v1buf.push_back(0x43); v1buf.push_back(0x52); v1buf.push_back(0x41); v1buf.push_back(0x42);
+  // Version = 1
+  write_u32(1);
+  // state_version
+  write_u64(state->version);
+  // item_count = 0
+  write_u32(0);
+  // policy_count = 0
+  write_u32(0);
+  // log_count = 0
+  write_u32(0);
+  // config (v1: only base fields)
+  write_u64(state->config.max_lock_duration_ms);
+  write_u32(state->config.max_lock_extensions);
+  write_u8(state->config.allow_force_unlock ? 1 : 0);
+  write_str16(state->config.bootstrap_admin);
+
+  // Checksum
+  uint8_t v1hash[32];
+  SHA256(v1buf.data(), v1buf.size(), v1hash);
+  for (int i = 0; i < 32; i++) v1buf.push_back(v1hash[i]);
+
+  // Deserialize v1
+  state_t* restored = crabs_deserialize_state(v1buf.data(), v1buf.size());
+  ASSERT_NE(restored, nullptr);
+
+  // Base config should be correct
+  EXPECT_EQ(restored->version, (uint64_t)7);
+  EXPECT_EQ(restored->config.max_lock_duration_ms, (uint64_t)5000);
+  EXPECT_EQ(restored->config.max_lock_extensions, (uint32_t)3);
+  EXPECT_EQ(restored->config.allow_force_unlock, true);
+  EXPECT_STREQ(restored->config.bootstrap_admin, "admin");
+
+  // v1 defaults: sig_config and vault_config should be zero-initialized
+  EXPECT_EQ(restored->config.sig_config.default_scheme, SCHEME_UNSPECIFIED);
+  EXPECT_EQ(restored->config.sig_config.max_keys_per_user, (uint32_t)0);
+  EXPECT_EQ(restored->config.sig_config.key_rotation_enabled, false);
+  EXPECT_EQ(restored->config.vault_config.provider, VAULT_NONE);
+
+  state_destroy(state);
+  state_destroy(restored);
+}
+
+TEST(TestSerializationV2, TestCanonicalEncodingWithSchemeFields) {
+  operation_t* op = operation_create(CRABS_OP_VERIFY);
+  memset(op->uuid, 0x42, CRABS_UUID_SIZE);
+  op->resource_count = 1;
+  op->resources = (char(*)[CRABS_MAX_USER_ID])malloc(CRABS_MAX_USER_ID);
+  strncpy(op->resources[0], "test_resource", CRABS_MAX_USER_ID - 1);
+  op->required_state = (protocol_state_e*)malloc(sizeof(protocol_state_e));
+  op->required_state[0] = PROTOCOL_MODIFIED;
+  op->next_state = (protocol_state_e*)malloc(sizeof(protocol_state_e));
+  op->next_state[0] = PROTOCOL_VERIFIED;
+  strncpy(op->signer_id, "bob", CRABS_MAX_USER_ID - 1);
+  op->lamport_time = 99;
+  strncpy(op->node_id, "node2", CRABS_MAX_USER_ID - 1);
+  op->sig_scheme = ED25519;
+  strncpy(op->key_id, "bob-ed-key", CRABS_MAX_KEY_ID - 1);
+
+  // Serialize twice - should be deterministic
+  serialized_buffer_t* buf1 = crabs_serialize_for_signing(op);
+  serialized_buffer_t* buf2 = crabs_serialize_for_signing(op);
+  ASSERT_NE(buf1, nullptr);
+  ASSERT_NE(buf2, nullptr);
+  EXPECT_EQ(buf1->len, buf2->len);
+  EXPECT_EQ(memcmp(buf1->data, buf2->data, buf1->len), 0);
+
+  // Change sig_scheme and key_id should produce different encoding
+  op->sig_scheme = ECDSA_SECP256K1;
+  strncpy(op->key_id, "bob-ecdsa-key", CRABS_MAX_KEY_ID - 1);
+  serialized_buffer_t* buf3 = crabs_serialize_for_signing(op);
+  ASSERT_NE(buf3, nullptr);
+  EXPECT_NE(buf1->len, buf3->len);  // Different key_id length means different total
+
+  serialized_buffer_destroy(buf1);
+  serialized_buffer_destroy(buf2);
+  serialized_buffer_destroy(buf3);
+  operation_destroy(op);
+}
+
+TEST(TestSerializationV2, TestOperationWithNoCoSigners) {
+  operation_t* op = operation_create(CRABS_OP_REGISTER_KEY);
+  memset(op->uuid, 0xEF, CRABS_UUID_SIZE);
+  strncpy(op->signer_id, "admin", CRABS_MAX_USER_ID - 1);
+  op->sig_scheme = ECDSA_SECP256K1;
+  strncpy(op->key_id, "admin-key-1", CRABS_MAX_KEY_ID - 1);
+  op->co_signer_count = 0;
+  op->co_signers = NULL;
+  op->resource_count = 0;
+
+  serialized_buffer_t* buf = crabs_serialize_operation(op);
+  ASSERT_NE(buf, nullptr);
+
+  operation_t* restored = crabs_deserialize_operation(buf->data, buf->len);
+  ASSERT_NE(restored, nullptr);
+
+  EXPECT_EQ(restored->sig_scheme, ECDSA_SECP256K1);
+  EXPECT_STREQ(restored->key_id, "admin-key-1");
+  EXPECT_EQ(restored->co_signer_count, (uint32_t)0);
+  EXPECT_EQ(restored->co_signers, nullptr);
+
+  serialized_buffer_destroy(buf);
+  operation_destroy(op);
+  operation_destroy(restored);
+}
+
+TEST(TestSerializationV2, TestV1PolicyBackwardCompat) {
+  // Manually build a v1 buffer with a policy (no scheme fields)
+  std::vector<uint8_t> v1buf;
+  auto write_u8 = [&](uint8_t v) { v1buf.push_back(v); };
+  auto write_u16 = [&](uint16_t v) { v1buf.push_back(v & 0xFF); v1buf.push_back((v >> 8) & 0xFF); };
+  auto write_u32 = [&](uint32_t v) { for(int i=0;i<4;i++) v1buf.push_back((v>>(i*8))&0xFF); };
+  auto write_u64 = [&](uint64_t v) { for(int i=0;i<8;i++) v1buf.push_back((v>>(i*8))&0xFF); };
+  auto write_str16 = [&](const char* s) {
+    uint16_t slen = s ? strlen(s) : 0;
+    write_u16(slen);
+    for(uint16_t i=0;i<slen;i++) v1buf.push_back((uint8_t)s[i]);
+  };
+
+  // Magic
+  v1buf.push_back(0x43); v1buf.push_back(0x52); v1buf.push_back(0x41); v1buf.push_back(0x42);
+  // Version = 1
+  write_u32(1);
+  // state_version = 1
+  write_u64(1);
+  // item_count = 0
+  write_u32(0);
+  // policy_count = 1
+  write_u32(1);
+  // log_count = 0
+  write_u32(0);
+  // policy (v1: only operation + expression)
+  write_str16("__lock__");
+  write_str16("role:admin");
+  // config (v1: only base fields)
+  write_u64(5000);  // max_lock_duration_ms
+  write_u32(3);     // max_lock_extensions
+  write_u8(1);      // allow_force_unlock
+  write_str16("admin");
+
+  // Checksum
+  uint8_t v1hash[32];
+  SHA256(v1buf.data(), v1buf.size(), v1hash);
+  for (int i = 0; i < 32; i++) v1buf.push_back(v1hash[i]);
+
+  state_t* restored = crabs_deserialize_state(v1buf.data(), v1buf.size());
+  ASSERT_NE(restored, nullptr);
+
+  EXPECT_EQ(restored->policy_count, (uint32_t)1);
+  // v1 policy should have zero scheme constraints
+  EXPECT_EQ(restored->policies[0].allowed_scheme_count, (uint32_t)0);
+  EXPECT_EQ(restored->policies[0].min_key_version, (uint64_t)0);
+
+  state_destroy(restored);
 }
