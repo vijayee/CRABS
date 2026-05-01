@@ -33,6 +33,7 @@ if (BUILD_TESTING)
         test_scheme_verify.cpp
         test_policy_config.cpp
         test_key_lifecycle.cpp
+        test_one_shot.cpp
         test_cli.cpp
     )
 

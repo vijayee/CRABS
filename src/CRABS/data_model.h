@@ -25,6 +25,8 @@ typedef enum {
   DATA_TYPE_REGISTER    = 0x05,  // LWW-Register
   DATA_TYPE_DOCUMENT    = 0x06,  // RGA
   DATA_TYPE_RESOURCE    = 0x07,  // PN-Counter + lock
+  DATA_TYPE_ONE_SHOT_SET  = 0x08,  // Add-only set (v1.4 §2)
+  DATA_TYPE_ONE_SHOT_FLAG = 0x09,  // Monotonic boolean flag (v1.4 §2)
   DATA_TYPE_CUSTOM      = 0xFF   // User-defined
 } data_type_e;
 
@@ -38,6 +40,8 @@ typedef enum {
   CRDT_2P_SET      = 0x04,
   CRDT_LWW_REG     = 0x05,
   CRDT_RGA         = 0x06,
+  CRDT_ONE_SHOT_SET  = 0x08,  // v1.4 §2
+  CRDT_ONE_SHOT_FLAG = 0x09,  // v1.4 §2
   CRDT_CUSTOM      = 0xFF
 } crdt_type_e;
 
@@ -218,7 +222,7 @@ typedef struct state_t {
 // ============================================================
 // Data Type Definitions (built-in registry)
 // ============================================================
-extern const data_type_definition_t CRABS_BUILTIN_TYPES[8];
+extern const data_type_definition_t CRABS_BUILTIN_TYPES[10];
 
 // ============================================================
 // DataItem creation/destruction

@@ -10,15 +10,17 @@
 #include <string.h>
 #include <stdlib.h>
 
-const data_type_definition_t CRABS_BUILTIN_TYPES[8] = {
-  {0x01, "COUNTER",    false},
-  {0x02, "PN_COUNTER", true},
-  {0x03, "SET",        false},
-  {0x04, "2P_SET",     false},
-  {0x05, "REGISTER",   false},
-  {0x06, "DOCUMENT",   false},
-  {0x07, "RESOURCE",   true},
-  {0xFF, "CUSTOM",     false},
+const data_type_definition_t CRABS_BUILTIN_TYPES[10] = {
+  {0x01, "COUNTER",        false},
+  {0x02, "PN_COUNTER",     true},
+  {0x03, "SET",            false},
+  {0x04, "2P_SET",         false},
+  {0x05, "REGISTER",       false},
+  {0x06, "DOCUMENT",       false},
+  {0x07, "RESOURCE",       true},
+  {0x08, "ONE_SHOT_SET",   false},
+  {0x09, "ONE_SHOT_FLAG",  false},
+  {0xFF, "CUSTOM",         false},
 };
 
 data_item_t* data_item_create(const char* name, data_type_e type, crdt_type_e crdt_type) {

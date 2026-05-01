@@ -9,6 +9,7 @@
 #include <stdbool.h>
 #include "../CRABS/crabs.h"
 #include "../CRABS/data_model.h"
+#include "one_shot.h"
 
 // ============================================================
 // G-Counter (12.2.1)

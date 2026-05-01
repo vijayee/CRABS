@@ -3,6 +3,7 @@
 //
 
 #include "crdt_merge.h"
+#include "one_shot.h"
 #include "../Util/allocator.h"
 #include <string.h>
 #include <stdlib.h>
@@ -597,6 +598,18 @@ void* crdt_merge_value(data_type_e type, crdt_type_e crdt_type,
       lww_register_t* b = (lww_register_t*)value_b;
       if (a == NULL && b == NULL) return NULL;
       return lww_register_merge(a, b);
+    }
+    case CRDT_ONE_SHOT_SET: {
+      one_shot_set_t* a = (one_shot_set_t*)value_a;
+      one_shot_set_t* b = (one_shot_set_t*)value_b;
+      if (a == NULL && b == NULL) return NULL;
+      return one_shot_set_merge(a, b);
+    }
+    case CRDT_ONE_SHOT_FLAG: {
+      one_shot_flag_t* a = (one_shot_flag_t*)value_a;
+      one_shot_flag_t* b = (one_shot_flag_t*)value_b;
+      if (a == NULL && b == NULL) return NULL;
+      return one_shot_flag_merge(a, b);
     }
     case CRDT_RGA:
     case CRDT_CUSTOM:
