@@ -97,6 +97,13 @@ protected:
   }
 
   void TearDown() override {
+    // Free CRDT struct values manually since data_item_destroy uses free()
+    for (data_item_t* item = state->items; item != NULL; item = item->next) {
+      if (item->value != NULL) {
+        crdt_value_destroy(item->crdt_type, item->value);
+        item->value = NULL;
+      }
+    }
     state_destroy(state);
   }
 
@@ -226,6 +233,24 @@ protected:
   }
 
   void TearDown() override {
+    // Free CRDT struct values manually.
+    // Skip COUNTER/PN_COUNTER as they may store raw int64_t handled by free().
+    for (data_item_t* item = state->items; item != NULL; item = item->next) {
+      if (item->value != NULL) {
+        switch (item->crdt_type) {
+          case CRDT_ONE_SHOT_SET:
+          case CRDT_ONE_SHOT_FLAG:
+          case CRDT_OR_SET:
+          case CRDT_2P_SET:
+          case CRDT_LWW_REG:
+            crdt_value_destroy(item->crdt_type, item->value);
+            item->value = NULL;
+            break;
+          default:
+            break;
+        }
+      }
+    }
     state_destroy(state);
   }
 
@@ -432,6 +457,10 @@ TEST(DedupLifecycle, PerUserVoteOnceLifecycle) {
   operation_destroy(op1);
   operation_destroy(op2);
   operation_destroy(op3);
+  // Clean up CRDT values before state_destroy
+  for (data_item_t* it = state->items; it != NULL; it = it->next) {
+    if (it->value != NULL) { crdt_value_destroy(it->crdt_type, it->value); it->value = NULL; }
+  }
   state_destroy(state);
 }
 
@@ -465,6 +494,10 @@ TEST(DedupLifecycle, GlobalExecutionOnceLifecycle) {
 
   operation_destroy(op1);
   operation_destroy(op2);
+  // Clean up CRDT values before state_destroy
+  for (data_item_t* it = state->items; it != NULL; it = it->next) {
+    if (it->value != NULL) { crdt_value_destroy(it->crdt_type, it->value); it->value = NULL; }
+  }
   state_destroy(state);
 }
 
@@ -512,6 +545,10 @@ TEST(DedupIntegration, StateMachineRejectsPerUserDuplicate) {
   EXPECT_EQ(guard_result2, CRABS_ERR_ALREADY_PERFORMED);
 
   operation_destroy(op1);
+  // Clean up CRDT values before state_destroy
+  for (data_item_t* it = state->items; it != NULL; it = it->next) {
+    if (it->value != NULL) { crdt_value_destroy(it->crdt_type, it->value); it->value = NULL; }
+  }
   state_destroy(state);
 }
 
@@ -537,6 +574,10 @@ TEST(DedupIntegration, StateMachineRejectsGlobalDuplicate) {
   EXPECT_EQ(dedup_check_guard(state, op), CRABS_ERR_ALREADY_EXECUTED);
 
   operation_destroy(op);
+  // Clean up CRDT values before state_destroy
+  for (data_item_t* it = state->items; it != NULL; it = it->next) {
+    if (it->value != NULL) { crdt_value_destroy(it->crdt_type, it->value); it->value = NULL; }
+  }
   state_destroy(state);
 }
 
@@ -558,6 +599,10 @@ TEST(DedupIntegration, NoneDedupOperationExecutes) {
   EXPECT_EQ(result, CRABS_SUCCESS);
 
   operation_destroy(op);
+  // Clean up CRDT values before state_destroy
+  for (data_item_t* it = state->items; it != NULL; it = it->next) {
+    if (it->value != NULL) { crdt_value_destroy(it->crdt_type, it->value); it->value = NULL; }
+  }
   state_destroy(state);
 }
 
@@ -588,6 +633,13 @@ protected:
   }
 
   void TearDown() override {
+    // Free CRDT struct values manually since data_item_destroy uses free()
+    for (data_item_t* item = state->items; item != NULL; item = item->next) {
+      if (item->value != NULL) {
+        crdt_value_destroy(item->crdt_type, item->value);
+        item->value = NULL;
+      }
+    }
     state_destroy(state);
   }
 
@@ -657,6 +709,10 @@ TEST(OpTypeDef, RegisterAndFind) {
   EXPECT_EQ(found->type, DEDUP_PER_USER);
   EXPECT_STREQ(found->tracker_path, "voters");
 
+  // Clean up CRDT values before state_destroy
+  for (data_item_t* it = state->items; it != NULL; it = it->next) {
+    if (it->value != NULL) { crdt_value_destroy(it->crdt_type, it->value); it->value = NULL; }
+  }
   state_destroy(state);
 }
 
@@ -666,6 +722,10 @@ TEST(OpTypeDef, FindNonexistent) {
   const dedup_spec_t* found = state_find_op_type_def(state, "nonexistent");
   EXPECT_EQ(found, nullptr);
 
+  // Clean up CRDT values before state_destroy
+  for (data_item_t* it = state->items; it != NULL; it = it->next) {
+    if (it->value != NULL) { crdt_value_destroy(it->crdt_type, it->value); it->value = NULL; }
+  }
   state_destroy(state);
 }
 
@@ -694,6 +754,10 @@ TEST(OpTypeDef, UpdateExisting) {
   EXPECT_EQ(found->type, DEDUP_GLOBAL);
   EXPECT_STREQ(found->flag_path, "vote_executed");
 
+  // Clean up CRDT values before state_destroy
+  for (data_item_t* it = state->items; it != NULL; it = it->next) {
+    if (it->value != NULL) { crdt_value_destroy(it->crdt_type, it->value); it->value = NULL; }
+  }
   state_destroy(state);
 }
 
@@ -706,6 +770,10 @@ TEST(OpTypeDef, NullParams) {
   memset(&spec, 0, sizeof(spec));
   rc = state_register_op_type_def(state, NULL, &spec);
   EXPECT_EQ(rc, CRABS_ERR_INVALID_PARAM);
+  // Clean up CRDT values before state_destroy
+  for (data_item_t* it = state->items; it != NULL; it = it->next) {
+    if (it->value != NULL) { crdt_value_destroy(it->crdt_type, it->value); it->value = NULL; }
+  }
   state_destroy(state);
 }
 
@@ -737,6 +805,10 @@ TEST(DedupBuiltinOp, DefineOperationRegistersType) {
   EXPECT_STREQ(found->tracker_path, "voters");
 
   operation_destroy(op);
+  // Clean up CRDT values before state_destroy
+  for (data_item_t* it = state->items; it != NULL; it = it->next) {
+    if (it->value != NULL) { crdt_value_destroy(it->crdt_type, it->value); it->value = NULL; }
+  }
   state_destroy(state);
 }
 
@@ -767,6 +839,10 @@ TEST(DedupBuiltinOp, CheckDedupWithRegisteredSpec) {
   EXPECT_EQ(result, CRABS_SUCCESS);
 
   operation_destroy(op);
+  // Clean up CRDT values before state_destroy
+  for (data_item_t* it = state->items; it != NULL; it = it->next) {
+    if (it->value != NULL) { crdt_value_destroy(it->crdt_type, it->value); it->value = NULL; }
+  }
   state_destroy(state);
 }
 
@@ -796,6 +872,10 @@ TEST(DedupBuiltinOp, CheckDedupRejectsWithRegisteredSpec) {
   EXPECT_EQ(result, CRABS_ERR_ALREADY_PERFORMED);
 
   operation_destroy(op);
+  // Clean up CRDT values before state_destroy
+  for (data_item_t* it = state->items; it != NULL; it = it->next) {
+    if (it->value != NULL) { crdt_value_destroy(it->crdt_type, it->value); it->value = NULL; }
+  }
   state_destroy(state);
 }
 
@@ -812,6 +892,10 @@ TEST(DedupBuiltinOp, CheckDedupNoSpecPasses) {
   EXPECT_EQ(result, CRABS_SUCCESS);
 
   operation_destroy(op);
+  // Clean up CRDT values before state_destroy
+  for (data_item_t* it = state->items; it != NULL; it = it->next) {
+    if (it->value != NULL) { crdt_value_destroy(it->crdt_type, it->value); it->value = NULL; }
+  }
   state_destroy(state);
 }
 
@@ -844,6 +928,10 @@ TEST(DedupBuiltinOp, CheckDedupInlineSpecOverridesRegistered) {
   EXPECT_EQ(result, CRABS_ERR_ALREADY_PERFORMED);
 
   operation_destroy(op);
+  // Clean up CRDT values before state_destroy
+  for (data_item_t* it = state->items; it != NULL; it = it->next) {
+    if (it->value != NULL) { crdt_value_destroy(it->crdt_type, it->value); it->value = NULL; }
+  }
   state_destroy(state);
 }
 
@@ -863,6 +951,10 @@ TEST(DedupBuiltinOp, DefineOperationNoResourcesFails) {
   EXPECT_EQ(result, CRABS_ERR_INVALID_PARAM);
 
   operation_destroy(op);
+  // Clean up CRDT values before state_destroy
+  for (data_item_t* it = state->items; it != NULL; it = it->next) {
+    if (it->value != NULL) { crdt_value_destroy(it->crdt_type, it->value); it->value = NULL; }
+  }
   state_destroy(state);
 }
 
@@ -903,6 +995,10 @@ TEST(TestVectorV14, PerUserFirstVoteSucceeds) {
   EXPECT_EQ(one_shot_set_count((one_shot_set_t*)voters->value), 1u);
 
   operation_destroy(op);
+  // Clean up CRDT values before state_destroy
+  for (data_item_t* it = state->items; it != NULL; it = it->next) {
+    if (it->value != NULL) { crdt_value_destroy(it->crdt_type, it->value); it->value = NULL; }
+  }
   state_destroy(state);
 }
 
@@ -935,6 +1031,10 @@ TEST(TestVectorV14, PerUserSecondVoteRejected) {
   EXPECT_EQ(one_shot_set_count((one_shot_set_t*)voters->value), 1u);
 
   operation_destroy(op);
+  // Clean up CRDT values before state_destroy
+  for (data_item_t* it = state->items; it != NULL; it = it->next) {
+    if (it->value != NULL) { crdt_value_destroy(it->crdt_type, it->value); it->value = NULL; }
+  }
   state_destroy(state);
 }
 
@@ -973,6 +1073,10 @@ TEST(TestVectorV14, PerUserDifferentUserCanVote) {
   EXPECT_EQ(one_shot_set_count((one_shot_set_t*)voters->value), 2u);
 
   operation_destroy(op);
+  // Clean up CRDT values before state_destroy
+  for (data_item_t* it = state->items; it != NULL; it = it->next) {
+    if (it->value != NULL) { crdt_value_destroy(it->crdt_type, it->value); it->value = NULL; }
+  }
   state_destroy(state);
 }
 
@@ -1009,6 +1113,10 @@ TEST(TestVectorV14, GlobalFirstExecutionSucceeds) {
   EXPECT_STREQ(((one_shot_flag_t*)flag->value)->set_by, "carol");
 
   operation_destroy(op);
+  // Clean up CRDT values before state_destroy
+  for (data_item_t* it = state->items; it != NULL; it = it->next) {
+    if (it->value != NULL) { crdt_value_destroy(it->crdt_type, it->value); it->value = NULL; }
+  }
   state_destroy(state);
 }
 
@@ -1042,6 +1150,10 @@ TEST(TestVectorV14, GlobalSecondExecutionRejected) {
   EXPECT_STREQ(((one_shot_flag_t*)flag->value)->set_by, "carol");
 
   operation_destroy(op);
+  // Clean up CRDT values before state_destroy
+  for (data_item_t* it = state->items; it != NULL; it = it->next) {
+    if (it->value != NULL) { crdt_value_destroy(it->crdt_type, it->value); it->value = NULL; }
+  }
   state_destroy(state);
 }
 
@@ -1098,6 +1210,12 @@ TEST(TestVectorV14, CrdtMergeConcurrentVotes) {
 
   one_shot_set_destroy(merged);
   operation_destroy(op_a);
+  for (data_item_t* it = state_a->items; it != NULL; it = it->next) {
+    if (it->value != NULL) { crdt_value_destroy(it->crdt_type, it->value); it->value = NULL; }
+  }
+  for (data_item_t* it = state_b->items; it != NULL; it = it->next) {
+    if (it->value != NULL) { crdt_value_destroy(it->crdt_type, it->value); it->value = NULL; }
+  }
   state_destroy(state_a);
   state_destroy(state_b);
 }
@@ -1162,6 +1280,12 @@ TEST(TestVectorV14, CrdtMergeConcurrentDifferentUsers) {
   one_shot_set_destroy(merged);
   operation_destroy(op_alice);
   operation_destroy(op_bob);
+  for (data_item_t* it = state_a->items; it != NULL; it = it->next) {
+    if (it->value != NULL) { crdt_value_destroy(it->crdt_type, it->value); it->value = NULL; }
+  }
+  for (data_item_t* it = state_b->items; it != NULL; it = it->next) {
+    if (it->value != NULL) { crdt_value_destroy(it->crdt_type, it->value); it->value = NULL; }
+  }
   state_destroy(state_a);
   state_destroy(state_b);
 }

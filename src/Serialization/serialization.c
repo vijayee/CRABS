@@ -1617,6 +1617,7 @@ crabs_ot_data_item_t* crabs_deserialize_ot_data(const uint8_t* data, size_t len,
   uint32_t op_count;
   if (!_read_uint32_le(&buf, &op_count)) goto fail;
   if (op_count > 0) {
+    free(item->op_log);
     item->op_log = get_clear_memory(sizeof(crabs_ot_operation_t) * op_count);
     if (item->op_log == NULL) goto fail;
     item->op_log_capacity = op_count;

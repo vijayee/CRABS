@@ -231,6 +231,14 @@ TEST(TestCRDTExtended, StateMergeWithDifferentItems) {
   EXPECT_NE(state_find_item(dst, "item_dst"), nullptr);
   EXPECT_NE(state_find_item(dst, "item_src"), nullptr);
 
+  // Clean up CRDT values before state_destroy (data_item_destroy uses free()
+  // which doesn't clean up CRDT struct internals)
+  for (data_item_t* it = dst->items; it != NULL; it = it->next) {
+    if (it->value != NULL) { crdt_value_destroy(it->crdt_type, it->value); it->value = NULL; }
+  }
+  for (data_item_t* it = src->items; it != NULL; it = it->next) {
+    if (it->value != NULL) { crdt_value_destroy(it->crdt_type, it->value); it->value = NULL; }
+  }
   state_destroy(dst);
   state_destroy(src);
 }
@@ -260,6 +268,12 @@ TEST(TestCRDTExtended, StateMergeWithPNCounter) {
   pn_counter_t* pnc = (pn_counter_t*)merged->value;
   EXPECT_EQ(pn_counter_value(pnc), 13);
 
+  for (data_item_t* it = dst->items; it != NULL; it = it->next) {
+    if (it->value != NULL) { crdt_value_destroy(it->crdt_type, it->value); it->value = NULL; }
+  }
+  for (data_item_t* it = src->items; it != NULL; it = it->next) {
+    if (it->value != NULL) { crdt_value_destroy(it->crdt_type, it->value); it->value = NULL; }
+  }
   state_destroy(dst);
   state_destroy(src);
 }

@@ -80,6 +80,7 @@ TEST(TestTriggerOps, CreateDestroy) {
 
   trigger_t* t = trigger_create("trig1", "Test trigger", "state.version > 5",
                                  effect, 1000, false, "admin");
+  free(effect);
   ASSERT_NE(t, nullptr);
   EXPECT_STREQ(t->trigger_id, "trig1");
   EXPECT_STREQ(t->description, "Test trigger");
@@ -96,6 +97,7 @@ TEST(TestTriggerOps, CreateOneShot) {
       "badge", "role", 10000, "level3");
   trigger_t* t = trigger_create("trig2", "One-shot trigger", "state.version > 0",
                                  effect, 0, true, "admin");
+  free(effect);
   ASSERT_NE(t, nullptr);
   EXPECT_TRUE(t->one_shot);
 
@@ -149,6 +151,7 @@ TEST_F(TestTriggerIntegration, ProcessDisabledTrigger) {
       "clearance", "dept", 5000, "confidential");
   trigger_t* t = trigger_create("trig1", "Disabled", "state.version >= 0",
                                   effect, 0, false, "admin");
+  free(effect);
   t->enabled = false;
 
   uint32_t fired = trigger_process_all(state, t, 1, am, 1000);
@@ -162,6 +165,7 @@ TEST_F(TestTriggerIntegration, ProcessOneShotFiresOnceOnly) {
       "badge", "dept", 10000, "level3");
   trigger_t* t = trigger_create("trig1", "One-shot", "state.version >= 0",
                                   effect, 0, true, "admin");
+  free(effect);
 
   // First process should fire
   uint32_t fired1 = trigger_process_all(state, t, 1, am, 1000);
@@ -179,6 +183,7 @@ TEST_F(TestTriggerIntegration, ProcessWithCooldown) {
       "clearance", "dept", 5000, "confidential");
   trigger_t* t = trigger_create("trig1", "Cooldown test", "state.version >= 0",
                                   effect, 5000, false, "admin");
+  free(effect);
 
   // First fire
   uint32_t fired1 = trigger_process_all(state, t, 1, am, 1000);
@@ -200,6 +205,7 @@ TEST_F(TestTriggerIntegration, ProcessWithExpiry) {
       "temp", "dept", 5000, "val");
   trigger_t* t = trigger_create("trig1", "Expiring", "state.version >= 0",
                                   effect, 0, false, "admin");
+  free(effect);
   t->expires_at = 5000;
 
   // Before expiry - should fire
@@ -238,6 +244,7 @@ TEST_F(TestTriggerIntegration, CreateTriggerViaStateMachine) {
   op->payload_format = 0x01;
 
   serialized_buffer_t* ser = crabs_serialize_for_signing(op);
+  serialized_buffer_destroy(ser);
   // Can't sign without a real key registered in attr_machine for admin...
   // Just test the null-params path instead
   operation_destroy(op);

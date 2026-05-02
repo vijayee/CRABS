@@ -210,6 +210,8 @@ TEST(TestKeyRing, RegisterRejectsNullParams) {
   EXPECT_EQ(user_key_register(nullptr, "key1", ECDSA_SECP256K1, pk, 33, "label"), CRABS_ERR_INVALID_PARAM);
   EXPECT_EQ(user_key_register(admin, nullptr, ECDSA_SECP256K1, pk, 33, "label"), CRABS_ERR_INVALID_PARAM);
   EXPECT_EQ(user_key_register(admin, "key1", ECDSA_SECP256K1, nullptr, 33, "label"), CRABS_ERR_INVALID_PARAM);
+
+  attribute_machine_destroy(am);
 }
 
 TEST(TestKeyRing, RegisterRejectsOversizedPublicKey) {
@@ -255,6 +257,8 @@ TEST(TestKeyRing, RegisterRejectsDuplicateKeyId) {
   ASSERT_EQ(user_key_register(admin, "key1", ECDSA_SECP256K1, pk, 33, "primary"), CRABS_SUCCESS);
   EXPECT_EQ(user_key_register(admin, "key1", ECDSA_SECP256K1, pk, 33, "duplicate"),
             CRABS_ERR_DUPLICATE_OPERATION);
+
+  attribute_machine_destroy(am);
 }
 
 TEST(TestKeyRing, RegisterRejectsAtMaxKeys) {

@@ -604,6 +604,9 @@ crabs_error_e state_machine_op_lock(state_t* state, operation_t* op, lock_respon
         value_size = sizeof(int64_t);
       }
       if (value_size > 0) {
+        if (item->lock_state.pre_lock_snapshot != NULL) {
+          free(item->lock_state.pre_lock_snapshot);
+        }
         item->lock_state.pre_lock_snapshot = get_memory(value_size);
         memcpy(item->lock_state.pre_lock_snapshot, item->value, value_size);
       }

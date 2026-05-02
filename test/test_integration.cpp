@@ -181,6 +181,12 @@ TEST_F(TestIntegration, CRDTMergeBetweenReplicas) {
   // Assert version is max(5, 10) = 10
   EXPECT_EQ(state_a->version, 10u);
 
+  for (data_item_t* it = state_a->items; it != NULL; it = it->next) {
+    if (it->value != NULL) { crdt_value_destroy(it->crdt_type, it->value); it->value = NULL; }
+  }
+  for (data_item_t* it = state_b->items; it != NULL; it = it->next) {
+    if (it->value != NULL) { crdt_value_destroy(it->crdt_type, it->value); it->value = NULL; }
+  }
   state_destroy(state_a);
   state_destroy(state_b);
 }
@@ -324,6 +330,9 @@ TEST_F(TestIntegration, ThresholdTriggerFire) {
   ASSERT_NE(policy, nullptr);
   EXPECT_STREQ(policy, "threshold_reached");
 
+  for (data_item_t* it = state->items; it != NULL; it = it->next) {
+    if (it->value != NULL) { crdt_value_destroy(it->crdt_type, it->value); it->value = NULL; }
+  }
   state_destroy(state);
 }
 
@@ -403,7 +412,9 @@ TEST_F(TestIntegration, SerializationRoundTrip) {
   EXPECT_EQ(restored->config.allow_force_unlock, false);
   EXPECT_STREQ(restored->config.bootstrap_admin, "admin_user");
 
+  free((void*)invs[0].error_message);
   serialized_buffer_destroy(buf);
+  // Items store raw int64_t values, properly handled by data_item_destroy's free()
   state_destroy(state);
   state_destroy(restored);
 }
@@ -621,5 +632,8 @@ TEST_F(TestIntegration, ConditionEvaluation) {
   EXPECT_FALSE(result);
 
   condition_node_destroy(cond);
+  for (data_item_t* it = state->items; it != NULL; it = it->next) {
+    if (it->value != NULL) { crdt_value_destroy(it->crdt_type, it->value); it->value = NULL; }
+  }
   state_destroy(state);
 }

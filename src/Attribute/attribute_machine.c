@@ -3,7 +3,12 @@
 //
 
 #include "attribute_machine.h"
+#include "../Trigger/trigger.h"
+#include "../Crypto/crypto.h"
+#include "../Condition/condition.h"
 #include "../Util/allocator.h"
+#include "../CRDT/crdt_merge.h"
+#include <openssl/crypto.h>
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -149,10 +154,15 @@ void attribute_machine_destroy(attribute_machine_t* am) {
     user = next_user;
   }
 
-  // Destroy base state items
+  // Destroy base state items — clean up CRDT values before data_item_destroy
+  // since data_item_destroy uses free() which doesn't clean up CRDT struct internals
   data_item_t* item = am->base_state.items;
   while (item != NULL) {
     data_item_t* next = item->next;
+    if (item->value != NULL) {
+      crdt_value_destroy(item->crdt_type, item->value);
+      item->value = NULL;
+    }
     data_item_destroy(item);
     item = next;
   }
@@ -160,6 +170,20 @@ void attribute_machine_destroy(attribute_machine_t* am) {
   if (am->base_state.policies != NULL) free(am->base_state.policies);
   if (am->base_state.log != NULL) free(am->base_state.log);
   if (am->base_state.processed_ops != NULL) free(am->base_state.processed_ops);
+  if (am->base_state.op_type_defs != NULL) free(am->base_state.op_type_defs);
+  if (am->base_state.abe_mk != NULL) crypto_abe_master_key_destroy(am->base_state.abe_mk);
+  if (am->base_state.node_key_valid) OPENSSL_cleanse(am->base_state.node_private_key, 32);
+  if (am->base_state.triggers != NULL) {
+    for (uint32_t i = 0; i < am->base_state.trigger_count; i++) {
+      if (am->base_state.triggers[i].condition_ast != NULL) {
+        condition_node_destroy(am->base_state.triggers[i].condition_ast);
+      }
+    }
+    free(am->base_state.triggers);
+  }
+  if (am->base_state.last_refresh_envelope != NULL) {
+    crypto_key_envelope_destroy(am->base_state.last_refresh_envelope);
+  }
 
   free(am);
 }

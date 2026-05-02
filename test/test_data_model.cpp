@@ -673,6 +673,7 @@ TEST(TestDataModel, InvariantViolationRejected) {
   EXPECT_EQ(rc, CRABS_ERR_INVARIANT_VIOLATED);
   operation_destroy(verify_op);
 
+  free((void*)counter->invariants[0].error_message);
   state_destroy(state);
 }
 

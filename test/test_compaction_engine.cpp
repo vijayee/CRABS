@@ -200,7 +200,8 @@ TEST(CompactionEngine, CompactItemORSetWithTombstones) {
   EXPECT_EQ(result, CRABS_COMPACTION_OK);
   EXPECT_EQ(engine.compaction_count, 1u);
 
-  // Old value is now freed by crabs_compact_item
+  // crabs_compact_item replaces item->value with visible set; destroy it
+  crdt_value_destroy(item->crdt_type, item->value);
   item->value = nullptr;
   data_item_destroy(item);
   state_destroy(state);
@@ -231,7 +232,8 @@ TEST(CompactionEngine, CompactItem2PSet) {
   EXPECT_EQ(result, CRABS_COMPACTION_OK);
   EXPECT_EQ(engine.compaction_count, 1u);
 
-  // Old value is now freed by crabs_compact_item
+  // crabs_compact_item replaces item->value with visible set; destroy it
+  crdt_value_destroy(item->crdt_type, item->value);
   item->value = nullptr;
   data_item_destroy(item);
   state_destroy(state);
@@ -333,7 +335,8 @@ TEST(CompactionEngine, StatisticsAfterCompact) {
   crabs_compact_item(&engine, state, item, 1000);
   EXPECT_EQ(crabs_engine_compaction_count(&engine), 1u);
 
-  // Old value is now freed by crabs_compact_item
+  // crabs_compact_item replaces item->value with visible set; destroy it
+  crdt_value_destroy(item->crdt_type, item->value);
   item->value = nullptr;
   data_item_destroy(item);
   state_destroy(state);
@@ -368,8 +371,10 @@ TEST(CompactionEngine, UnsafeCompactionStrongSafety) {
   crabs_compaction_result_e result = crabs_compact_item(&engine, state, item, 1000);
   EXPECT_TRUE(result == CRABS_COMPACTION_OK || result == CRABS_COMPACTION_UNSAFE);
 
-  // Old value only freed on OK
-  if (result != CRABS_COMPACTION_OK) {
+  if (result == CRABS_COMPACTION_OK) {
+    // crabs_compact_item replaced item->value with visible set; destroy it
+    crdt_value_destroy(item->crdt_type, item->value);
+  } else {
     or_set_destroy(set);
   }
   item->value = nullptr;
@@ -445,7 +450,8 @@ TEST(CompactionEngine, LastCompactionTime) {
   crabs_compact_item(&engine, state, item, 5000);
   EXPECT_EQ(item->last_compaction_time, 5000u);
 
-  // Old value is now freed by crabs_compact_item
+  // crabs_compact_item replaces item->value with visible set; destroy it
+  crdt_value_destroy(item->crdt_type, item->value);
   item->value = nullptr;
   data_item_destroy(item);
   state_destroy(state);

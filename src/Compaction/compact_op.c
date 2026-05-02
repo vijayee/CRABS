@@ -273,7 +273,12 @@ crabs_error_e crabs_compact_ot_item(
     case DATA_TYPE_OT_ORDERED_SET: {
       crabs_ot_ordered_set_t* old_set = (crabs_ot_ordered_set_t*)item->value;
       crabs_ot_ordered_set_t* new_set = (crabs_ot_ordered_set_t*)visible;
-      // Keep the ot_data reference from the old set
+      // Destroy the new set's ot_data (created by extract_visible)
+      // before transferring the old set's ot_data
+      if (new_set->ot_data != NULL) {
+        crabs_ot_data_item_destroy(new_set->ot_data);
+        new_set->ot_data = NULL;
+      }
       new_set->ot_data = old_set->ot_data;
       old_set->ot_data = NULL;  // Prevent double-free
       crabs_ot_ordered_set_destroy(old_set);
@@ -282,8 +287,12 @@ crabs_error_e crabs_compact_ot_item(
     }
     case DATA_TYPE_OT_DOCUMENT: {
       crabs_ot_document_t* old_doc = (crabs_ot_document_t*)item->value;
-      // Transfer ot_data
-      ((crabs_ot_document_t*)visible)->ot_data = old_doc->ot_data;
+      crabs_ot_document_t* new_doc = (crabs_ot_document_t*)visible;
+      if (new_doc->ot_data != NULL) {
+        crabs_ot_data_item_destroy(new_doc->ot_data);
+        new_doc->ot_data = NULL;
+      }
+      new_doc->ot_data = old_doc->ot_data;
       old_doc->ot_data = NULL;
       crabs_ot_document_destroy(old_doc);
       item->value = visible;
@@ -291,8 +300,12 @@ crabs_error_e crabs_compact_ot_item(
     }
     case DATA_TYPE_OT_TREE: {
       crabs_ot_tree_t* old_tree = (crabs_ot_tree_t*)item->value;
-      // Transfer ot_data
-      ((crabs_ot_tree_t*)visible)->ot_data = old_tree->ot_data;
+      crabs_ot_tree_t* new_tree = (crabs_ot_tree_t*)visible;
+      if (new_tree->ot_data != NULL) {
+        crabs_ot_data_item_destroy(new_tree->ot_data);
+        new_tree->ot_data = NULL;
+      }
+      new_tree->ot_data = old_tree->ot_data;
       old_tree->ot_data = NULL;
       crabs_ot_tree_destroy(old_tree);
       item->value = visible;

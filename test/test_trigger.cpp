@@ -21,6 +21,13 @@ protected:
   }
 
   void TearDown() override {
+    // Free CRDT struct values manually since data_item_destroy uses free()
+    for (data_item_t* item = state->items; item != NULL; item = item->next) {
+      if (item->value != NULL) {
+        crdt_value_destroy(item->crdt_type, item->value);
+        item->value = NULL;
+      }
+    }
     state_destroy(state);
   }
 };

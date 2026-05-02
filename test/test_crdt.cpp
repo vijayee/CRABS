@@ -543,6 +543,12 @@ TEST(TestCRDTMerge, TestStateMergeBasic) {
   data_item_t* new_item = state_find_item(dst, "counter2");
   ASSERT_NE(new_item, nullptr);
 
+  for (data_item_t* it = dst->items; it != NULL; it = it->next) {
+    if (it->value != NULL) { crdt_value_destroy(it->crdt_type, it->value); it->value = NULL; }
+  }
+  for (data_item_t* it = src->items; it != NULL; it = it->next) {
+    if (it->value != NULL) { crdt_value_destroy(it->crdt_type, it->value); it->value = NULL; }
+  }
   state_destroy(dst);
   state_destroy(src);
 }

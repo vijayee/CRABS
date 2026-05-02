@@ -416,6 +416,8 @@ TEST(TestSerialization, TestSerializeStateWithInvariants) {
   EXPECT_EQ(restored_item->invariants[1].type, INVARIANT_NON_NEGATIVE);
   EXPECT_STREQ(restored_item->invariants[1].error_message, "must be non-negative");
 
+  free((void*)invs[0].error_message);
+  free((void*)invs[1].error_message);
   serialized_buffer_destroy(buf);
   state_destroy(state);
   state_destroy(restored);
