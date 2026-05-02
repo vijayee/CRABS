@@ -84,19 +84,19 @@ ctest
 
 | Document | Description |
 |---|---|
-| [CRABS Protocol Specification](./CRABS%20Protocol%20Specification.md) | Core protocol specification (v1.5) |
-| [Amendment 1](./CRABS%20Protocol%20Specification%20v1.1%20Amendment%201.md) | State machine execution and locking protocol |
-| [Amendment 2](./CRABS%20Protocol%20Specification%20v1.2%20Amendment%202.md) | CRDT merge rules and type system |
-| [Amendment 3](./CRABS%20Protocol%20Specification%20v1.3%20Amendment%203.md) | OT/CRDT hybrid types |
-| [Amendment 4](./CRABS%20Protocol%20Specification%20v1.4%20Amendment%204.md) | Idempotent operations and dedup |
-| [Amendment 5](./CRABS%20Protocol%20Specification%20v1.5.2%20Amendment%205.md) | Tombstone compaction |
+| [CRABS Protocol Specification](./docs/CRABS%20Protocol%20Specification.md) | Core protocol specification (v1.5) |
+| [Amendment 1](./docs/CRABS%20Protocol%20Specification%20v1.1%20Amendment%201.md) | State machine execution and locking protocol |
+| [Amendment 2](./docs/CRABS%20Protocol%20Specification%20v1.2%20Amendment%202.md) | CRDT merge rules and type system |
+| [Amendment 3](./docs/CRABS%20Protocol%20Specification%20v1.3%20Amendment%203.md) | OT/CRDT hybrid types |
+| [Amendment 4](./docs/CRABS%20Protocol%20Specification%20v1.4%20Amendment%204.md) | Idempotent operations and dedup |
+| [Amendment 5](./docs/CRABS%20Protocol%20Specification%20v1.5.2%20Amendment%205.md) | Tombstone compaction |
 
 ## Research Papers
 
-- [CRABS (Short Paper)](./CRABS.md) — Core protocol, algorithms, and security analysis
-- [CRABS (Extended)](./CRABS%20Extended.md) — OT/CRDT hybrids, threshold triggers, cryptographic agility, and compaction
-- [CRABS.pdf](./CRABS.pdf) — Short paper in LaTeX PDF format
-- [CRABS_Extended.pdf](./CRABS_Extended.pdf) — Extended paper in LaTeX PDF format
+- [CRABS (Short Paper)](./docs/CRABS.md) — Core protocol, algorithms, and security analysis
+- [CRABS (Extended)](./docs/CRABS%20Extended.md) — OT/CRDT hybrids, threshold triggers, cryptographic agility, and compaction
+- [CRABS.pdf](./docs/CRABS.pdf) — Short paper in LaTeX PDF format
+- [CRABS_Extended.pdf](./docs/CRABS_Extended.pdf) — Extended paper in LaTeX PDF format
 
 ## Use Cases
 
