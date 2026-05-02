@@ -132,6 +132,11 @@ crabs_error_e state_set_node_key(state_t* state,
   return CRABS_SUCCESS;
 }
 
+void state_set_compaction_config(state_t* state, void* config) {
+  if (state == NULL) return;
+  state->compaction_config = config;
+}
+
 // ============================================================
 // State query helpers
 // ============================================================

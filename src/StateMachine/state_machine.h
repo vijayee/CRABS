@@ -112,6 +112,10 @@ crabs_error_e  state_machine_op_check_dedup(state_t* state, operation_t* op);
 // Compaction built-in operation (v1.5.2 §4.3)
 crabs_error_e  state_machine_op_compact(state_t* state, operation_t* op);
 
+// Auto-compact items that need compaction (v1.5.2 §4)
+// Returns count of items compacted. Requires compaction_config on state.
+uint32_t       state_machine_auto_compact(state_t* state);
+
 // Key refresh operation (§11.3)
 typedef struct {
   uint8_t         envelope_data[1024];  // Serialized key envelope for transport

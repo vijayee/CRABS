@@ -25,6 +25,9 @@ void crabs_tombstone_config_init(crabs_tombstone_config_t* config) {
   config->auto_compact_interval_ms = CRABS_DEFAULT_AUTO_COMPACT_INTERVAL_MS;
   config->log_level = 1;  // errors only
   config->safety_level = CRABS_SAFETY_QUORUM;
+  config->min_compaction_interval_ms = CRABS_DEFAULT_MIN_COMPACTION_INTERVAL_MS;
+  config->max_compactions_per_window = CRABS_DEFAULT_MAX_COMPACTIONS_PER_WINDOW;
+  config->compaction_rate_window_ms = CRABS_DEFAULT_COMPACTION_RATE_WINDOW_MS;
 }
 
 void crabs_tombstone_config_init_strategy(crabs_tombstone_config_t* config,
@@ -37,6 +40,7 @@ void crabs_tombstone_config_init_strategy(crabs_tombstone_config_t* config,
       config->max_tombstone_ratio = 1.0;  // Never compact
       config->auto_compact_interval_ms = 0;
       config->safety_level = CRABS_SAFETY_FORCE;
+      config->allow_force = true;         // FORCE allowed for manual compaction
       break;
     case CRABS_COMPACT_TIME_BASED:
       config->compaction_interval_ms = 30000;  // 30 seconds

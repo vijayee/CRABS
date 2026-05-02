@@ -123,8 +123,8 @@ bool crabs_check_compaction_safety(const crabs_tombstone_config_t* config,
 
   switch (config->safety_level) {
     case CRABS_SAFETY_FORCE:
-      // Force compaction — always safe
-      return true;
+      // Force compaction — only allowed if config->allow_force is true
+      return config->allow_force;
 
     case CRABS_SAFETY_STRONG:
       // All peers must have acknowledged — local VC must dominate peer VC

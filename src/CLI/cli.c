@@ -775,7 +775,7 @@ cli_result_e cli_cmd_compact(cli_node_t* node) {
   crabs_compaction_engine_init(&engine, NULL);
   crabs_register_crdt_vtables(&engine.registry);
 
-  crabs_error_e err = crabs_op_compact(&engine, node->state);
+  crabs_error_e err = crabs_op_compact_now(&engine, node->state);
 
   if (err == CRABS_SUCCESS) {
     printf("Compaction completed. Items compacted: %llu, Skipped: %llu, Unsafe: %llu\n",

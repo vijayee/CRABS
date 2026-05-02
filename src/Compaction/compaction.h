@@ -44,6 +44,9 @@ typedef enum {
 #define CRABS_DEFAULT_COMPACTION_INTERVAL_MS   60000  // 60 seconds
 #define CRABS_DEFAULT_EMERGENCY_TOMBSTONE_COUNT 10000
 #define CRABS_DEFAULT_AUTO_COMPACT_INTERVAL_MS  300000 // 5 minutes
+#define CRABS_DEFAULT_MIN_COMPACTION_INTERVAL_MS 10000 // 10 seconds minimum between compactions
+#define CRABS_DEFAULT_MAX_COMPACTIONS_PER_WINDOW 5      // Max 5 compactions per rate window
+#define CRABS_DEFAULT_COMPACTION_RATE_WINDOW_MS  60000 // 1-minute rate window
 
 typedef struct {
   crabs_compaction_strategy_e strategy;
@@ -55,6 +58,10 @@ typedef struct {
   uint64_t auto_compact_interval_ms;   // Interval for automatic periodic compaction
   uint8_t  log_level;                  // 0=none, 1=errors, 2=info, 3=debug
   crabs_safety_level_e safety_level;   // Safety level for compaction
+  // Security mitigations (v1.5.2 §4.4)
+  uint64_t min_compaction_interval_ms; // Minimum time between compactions on the same item
+  uint32_t max_compactions_per_window; // Max compaction operations per rate window
+  uint64_t compaction_rate_window_ms;  // Rate window duration in ms
 } crabs_tombstone_config_t;
 
 // ============================================================

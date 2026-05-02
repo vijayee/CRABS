@@ -291,6 +291,8 @@ typedef struct state_t {
   // v1.4: Operation type definitions (§7)
   op_type_def_t* op_type_defs;
   uint32_t       op_type_def_count;
+  // v1.5.2 §4: Compaction config (crabs_tombstone_config_t*, if set auto-compaction runs after OT ops)
+  void* compaction_config;
 } state_t;
 
 // ============================================================
@@ -309,6 +311,10 @@ void         data_item_destroy(data_item_t* item);
 // ============================================================
 state_t*     state_create(void);
 void         state_destroy(state_t* state);
+
+// Set compaction config on state (enables auto-compaction after OT ops)
+// Pass NULL to disable. config is NOT owned by state (caller must keep alive).
+void         state_set_compaction_config(state_t* state, void* config);
 
 // Initialize node ECDSA keypair for envelope signing (§11)
 crabs_error_e state_set_node_key(state_t* state,

@@ -14,6 +14,9 @@
 #include "vector_clock.h"
 #include "../CRABS/data_model.h"
 
+// Get current wall-clock time in milliseconds (since epoch)
+uint64_t crabs_engine_get_time_ms(void);
+
 // ============================================================
 // Compaction Result (v1.5.2 §4)
 // ============================================================
@@ -24,6 +27,8 @@ typedef enum {
   CRABS_COMPACTION_UNSAFE      = 2,  // Safety check failed
   CRABS_COMPACTION_UNSUPPORTED = 3,  // No vtable registered for this type
   CRABS_COMPACTION_ERROR       = 4,  // Generic error
+  CRABS_COMPACTION_RATE_LIMITED = 5, // Rate limit exceeded (v1.5.2 §4.4)
+  CRABS_COMPACTION_INTERVAL    = 6, // Minimum interval not elapsed (v1.5.2 §4.4)
 } crabs_compaction_result_e;
 
 // ============================================================
@@ -55,6 +60,9 @@ typedef struct {
   uint64_t                     compaction_count;
   uint64_t                     skipped_count;
   uint64_t                     unsafe_count;
+  // Rate limiting (v1.5.2 §4.4)
+  uint64_t                     rate_window_start_ms;  // Start of current rate window
+  uint32_t                     rate_window_count;     // Compactions in current window
 } crabs_compaction_engine_t;
 
 // Initialize compaction engine with global config
@@ -106,8 +114,25 @@ uint32_t crabs_engine_run_compaction(crabs_compaction_engine_t* engine,
 
 // Execute the __compact__ built-in operation on the state machine.
 // Compacts all items that need compaction according to engine config.
+// Uses the provided current_time_ms for last_compaction_time tracking.
 crabs_error_e crabs_op_compact(crabs_compaction_engine_t* engine,
-                                state_t* state);
+                                state_t* state,
+                                uint64_t current_time_ms);
+
+// Convenience wrapper that uses current wall-clock time.
+crabs_error_e crabs_op_compact_now(crabs_compaction_engine_t* engine,
+                                    state_t* state);
+
+// ============================================================
+// Periodic Compaction Entry Point (v1.5.2 §4.2)
+// ============================================================
+
+// Check if periodic compaction should run, and if so, run it.
+// Returns the number of items compacted (0 if skipped).
+// This is the primary entry point for timer-based compaction.
+uint32_t crabs_engine_periodic_compaction(crabs_compaction_engine_t* engine,
+                                            state_t* state,
+                                            uint64_t current_time_ms);
 
 // ============================================================
 // Engine Statistics

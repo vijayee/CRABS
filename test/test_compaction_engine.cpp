@@ -290,7 +290,7 @@ TEST(CompactionEngine, OpCompactEmptyState) {
   crabs_compaction_engine_init(&engine, nullptr);
 
   state_t* state = state_create();
-  crabs_error_e err = crabs_op_compact(&engine, state);
+  crabs_error_e err = crabs_op_compact_now(&engine, state);
   EXPECT_EQ(err, CRABS_SUCCESS);
 
   state_destroy(state);
@@ -298,7 +298,7 @@ TEST(CompactionEngine, OpCompactEmptyState) {
 }
 
 TEST(CompactionEngine, OpCompactNull) {
-  EXPECT_EQ(crabs_op_compact(nullptr, nullptr), CRABS_ERR_INVALID_PARAM);
+  EXPECT_EQ(crabs_op_compact_now(nullptr, nullptr), CRABS_ERR_INVALID_PARAM);
 }
 
 // ============================================================

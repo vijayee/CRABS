@@ -469,6 +469,12 @@ crabs_error_e state_machine_execute(state_t* state, operation_t* op) {
     }
   }
 
+  // Step 8b: Auto-compaction check after OT operations (v1.5.2 §4)
+  if (state->compaction_config != NULL &&
+      strcmp(op->type, CRABS_OP_EXECUTE_OT) == 0) {
+    state_machine_auto_compact(state);
+  }
+
   // Step 9: Transition protocol states (handled by built-in ops)
   // Step 10: Log operation
   uint8_t state_hash[CRABS_HASH_SIZE];
@@ -1043,10 +1049,36 @@ crabs_error_e state_machine_op_compact(state_t* state, operation_t* op) {
   crabs_compaction_engine_init(&engine, NULL);
   crabs_register_crdt_vtables(&engine.registry);
 
-  crabs_error_e err = crabs_op_compact(&engine, state);
+  crabs_error_e err = crabs_op_compact_now(&engine, state);
   crabs_compaction_engine_destroy(&engine);
 
   return err;
+}
+
+// Auto-compaction check for items that need compaction (v1.5.2 §4)
+// Called internally after OT operations if compaction_config is set on state.
+uint32_t state_machine_auto_compact(state_t* state) {
+  if (state == NULL || state->compaction_config == NULL) return 0;
+
+  crabs_compaction_engine_t engine;
+  crabs_tombstone_config_t* config =
+    (crabs_tombstone_config_t*)state->compaction_config;
+  crabs_compaction_engine_init(&engine, config);
+  crabs_register_crdt_vtables(&engine.registry);
+
+  uint64_t now_ms = (uint64_t)time(NULL) * 1000;
+  uint32_t compacted = 0;
+  data_item_t* item = state->items;
+  while (item != NULL) {
+    if (crabs_needs_compaction(config, &engine.registry, item)) {
+      crabs_compaction_result_e r = crabs_compact_item(&engine, state, item, now_ms);
+      if (r == CRABS_COMPACTION_OK) compacted++;
+    }
+    item = item->next;
+  }
+
+  crabs_compaction_engine_destroy(&engine);
+  return compacted;
 }
 
 // ============================================================

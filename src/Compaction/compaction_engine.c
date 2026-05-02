@@ -8,6 +8,15 @@
 #include "compaction_engine.h"
 #include "compact_op.h"
 #include <string.h>
+#include <time.h>
+
+// ============================================================
+// Time Helper
+// ============================================================
+
+uint64_t crabs_engine_get_time_ms(void) {
+  return (uint64_t)time(NULL) * 1000;
+}
 
 // ============================================================
 // Engine Init/Destroy
@@ -30,6 +39,8 @@ void crabs_compaction_engine_init(crabs_compaction_engine_t* engine,
   engine->compaction_count = 0;
   engine->skipped_count = 0;
   engine->unsafe_count = 0;
+  engine->rate_window_start_ms = 0;
+  engine->rate_window_count = 0;
 }
 
 void crabs_compaction_engine_destroy(crabs_compaction_engine_t* engine) {
@@ -95,6 +106,34 @@ crabs_compaction_result_e crabs_compact_item(
   const crabs_tombstone_config_t* config = crabs_engine_get_config(engine, item);
   if (config == NULL) return CRABS_COMPACTION_ERROR;
 
+  // Security check: minimum interval between compactions (v1.5.2 §4.4)
+  if (config->min_compaction_interval_ms > 0 &&
+      item->last_compaction_time > 0 &&
+      current_time_ms >= item->last_compaction_time) {
+    uint64_t elapsed = current_time_ms - item->last_compaction_time;
+    if (elapsed < config->min_compaction_interval_ms) {
+      return CRABS_COMPACTION_INTERVAL;
+    }
+  }
+
+  // Security check: rate limiting (v1.5.2 §4.4)
+  if (config->max_compactions_per_window > 0 && config->compaction_rate_window_ms > 0) {
+    // Check if we need to reset the rate window
+    if (engine->rate_window_start_ms > 0 &&
+        current_time_ms >= engine->rate_window_start_ms &&
+        (current_time_ms - engine->rate_window_start_ms) >= config->compaction_rate_window_ms) {
+      engine->rate_window_start_ms = current_time_ms;
+      engine->rate_window_count = 0;
+    }
+    // Initialize window on first use
+    if (engine->rate_window_start_ms == 0) {
+      engine->rate_window_start_ms = current_time_ms;
+    }
+    if (engine->rate_window_count >= config->max_compactions_per_window) {
+      return CRABS_COMPACTION_RATE_LIMITED;
+    }
+  }
+
   // Step 1: Check if type supports compaction
   if (!crabs_type_supports_compaction(&engine->registry, (uint32_t)item->type) &&
       item->ot_data == NULL) {
@@ -144,6 +183,7 @@ crabs_compaction_result_e crabs_compact_item(
   // Update compaction tracking
   item->last_compaction_time = current_time_ms;
   engine->compaction_count++;
+  engine->rate_window_count++;
 
   return CRABS_COMPACTION_OK;
 }
@@ -209,16 +249,35 @@ uint32_t crabs_engine_run_compaction(crabs_compaction_engine_t* engine,
 // ============================================================
 
 crabs_error_e crabs_op_compact(crabs_compaction_engine_t* engine,
-                                state_t* state) {
+                                state_t* state,
+                                uint64_t current_time_ms) {
   if (engine == NULL || state == NULL) return CRABS_ERR_INVALID_PARAM;
 
   data_item_t* item = state->items;
   while (item != NULL) {
-    crabs_compact_item(engine, state, item, 0);
+    crabs_compact_item(engine, state, item, current_time_ms);
     item = item->next;
   }
 
   return CRABS_SUCCESS;
+}
+
+crabs_error_e crabs_op_compact_now(crabs_compaction_engine_t* engine,
+                                    state_t* state) {
+  uint64_t now_ms = crabs_engine_get_time_ms();
+  return crabs_op_compact(engine, state, now_ms);
+}
+
+// ============================================================
+// Periodic Compaction Entry Point (v1.5.2 §4.2)
+// ============================================================
+
+uint32_t crabs_engine_periodic_compaction(crabs_compaction_engine_t* engine,
+                                            state_t* state,
+                                            uint64_t current_time_ms) {
+  if (engine == NULL || state == NULL) return 0;
+  if (!crabs_engine_should_compact(engine, current_time_ms)) return 0;
+  return crabs_engine_run_compaction(engine, state, current_time_ms);
 }
 
 // ============================================================
