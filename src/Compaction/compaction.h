@@ -67,6 +67,9 @@ typedef struct {
   void*    (*extract_visible)(const void* item);
   void*    (*rebuild_from_visible)(const void* visible);
   bool     (*compaction_safe)(const void* item, const state_t* state);
+  // v1.5.2 §2: Extended vtable functions
+  double   (*estimated_savings)(const void* item);   // Estimated savings ratio (0.0-1.0)
+  void     (*describe_tombstones)(const void* item, char* buf, uint32_t buf_size);  // Human-readable description
 } crabs_compaction_vtable_t;
 
 // ============================================================
@@ -130,5 +133,18 @@ const char* crabs_compaction_strategy_name(crabs_compaction_strategy_e strategy)
 
 // Get safety level name string
 const char* crabs_safety_level_name(crabs_safety_level_e level);
+
+// Check if a data type supports compaction (has a registered vtable)
+bool crabs_type_supports_compaction(const crabs_compaction_registry_t* registry,
+                                    uint32_t type_id);
+
+// Estimate savings ratio for a data item (0.0-1.0)
+double crabs_estimated_savings(const crabs_compaction_registry_t* registry,
+                               const data_item_t* item);
+
+// Get human-readable description of tombstones for a data item
+void crabs_describe_tombstones(const crabs_compaction_registry_t* registry,
+                                const data_item_t* item,
+                                char* buf, uint32_t buf_size);
 
 #endif // CRABS_COMPACTION_H

@@ -80,7 +80,12 @@ typedef enum {
   CRABS_ERR_NO_OT_OPS            = 0x8001,
   CRABS_ERR_NOT_OT_TYPE          = 0x8002,
   CRABS_ERR_OT_TRANSFORM_DEPTH   = 0x8003,
-  CRABS_ERR_OT_POSITION_BOUNDS   = 0x8004
+  CRABS_ERR_OT_POSITION_BOUNDS   = 0x8004,
+
+  // 0x9xxx: Compaction errors (v1.6 §6)
+  CRABS_ERR_COMPACTION_NOT_SUPPORTED = 0x9001,
+  CRABS_ERR_COMPACTION_NOT_SAFE     = 0x9002,
+  CRABS_ERR_COMPACTION_IN_PROGRESS  = 0x9003
 } crabs_error_e;
 
 // ============================================================

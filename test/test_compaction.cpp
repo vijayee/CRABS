@@ -245,3 +245,122 @@ TEST(Compaction, SafetyLevelValues) {
   EXPECT_EQ(CRABS_SAFETY_TIMESTAMP, 2);
   EXPECT_EQ(CRABS_SAFETY_FORCE, 3);
 }
+
+// ============================================================
+// Error Code Tests
+// ============================================================
+
+TEST(Compaction, ErrorCodes) {
+  EXPECT_EQ(CRABS_ERR_COMPACTION_NOT_SUPPORTED, 0x9001);
+  EXPECT_EQ(CRABS_ERR_COMPACTION_NOT_SAFE, 0x9002);
+  EXPECT_EQ(CRABS_ERR_COMPACTION_IN_PROGRESS, 0x9003);
+}
+
+// ============================================================
+// Type Support Tests
+// ============================================================
+
+TEST(Compaction, TypeSupportsCompactionRegistered) {
+  crabs_compaction_registry_t registry;
+  crabs_compaction_registry_init(&registry);
+
+  crabs_compaction_vtable_t vtable = {
+    .count_tombstones = mock_count_tombstones,
+    .count_visible = mock_count_visible,
+  };
+  crabs_compaction_register(&registry, DATA_TYPE_OT_ORDERED_SET, &vtable);
+
+  EXPECT_TRUE(crabs_type_supports_compaction(&registry, DATA_TYPE_OT_ORDERED_SET));
+}
+
+TEST(Compaction, TypeSupportsCompactionNotRegistered) {
+  crabs_compaction_registry_t registry;
+  crabs_compaction_registry_init(&registry);
+
+  EXPECT_FALSE(crabs_type_supports_compaction(&registry, DATA_TYPE_COUNTER));
+}
+
+TEST(Compaction, TypeSupportsCompactionNullRegistry) {
+  EXPECT_FALSE(crabs_type_supports_compaction(nullptr, DATA_TYPE_COUNTER));
+}
+
+// ============================================================
+// Estimated Savings Tests
+// ============================================================
+
+static double mock_estimated_savings(const void* item) {
+  (void)item;
+  return 0.75;
+}
+
+TEST(Compaction, EstimatedSavingsWithVtable) {
+  crabs_compaction_registry_t registry;
+  crabs_compaction_registry_init(&registry);
+
+  crabs_compaction_vtable_t vtable = {
+    .count_tombstones = mock_count_tombstones,
+    .count_visible = mock_count_visible,
+    .estimated_savings = mock_estimated_savings,
+  };
+  crabs_compaction_register(&registry, DATA_TYPE_OT_ORDERED_SET, &vtable);
+
+  data_item_t* item = data_item_create("test", DATA_TYPE_OT_ORDERED_SET, CRDT_OR_SET);
+  double savings = crabs_estimated_savings(&registry, item);
+  EXPECT_DOUBLE_EQ(savings, 0.75);
+  data_item_destroy(item);
+}
+
+TEST(Compaction, EstimatedSavingsFallback) {
+  crabs_compaction_registry_t registry;
+  crabs_compaction_registry_init(&registry);
+
+  // Register vtable without estimated_savings — should fall back to ratio
+  crabs_compaction_vtable_t vtable = {
+    .count_tombstones = mock_count_tombstones,
+    .count_visible = mock_count_visible,
+  };
+  crabs_compaction_register(&registry, DATA_TYPE_OT_ORDERED_SET, &vtable);
+
+  data_item_t* item = data_item_create("test", DATA_TYPE_OT_ORDERED_SET, CRDT_OR_SET);
+  double savings = crabs_estimated_savings(&registry, item);
+  // mock_count_tombstones returns 10, mock_count_visible returns 20
+  // ratio = 10 / (10+20) = 0.333...
+  EXPECT_NEAR(savings, 0.333, 0.01);
+  data_item_destroy(item);
+}
+
+TEST(Compaction, EstimatedSavingsNullParams) {
+  EXPECT_EQ(crabs_estimated_savings(nullptr, nullptr), 0.0);
+}
+
+// ============================================================
+// Describe Tombstones Tests
+// ============================================================
+
+TEST(Compaction, DescribeTombstonesFallback) {
+  crabs_compaction_registry_t registry;
+  crabs_compaction_registry_init(&registry);
+
+  crabs_compaction_vtable_t vtable = {
+    .count_tombstones = mock_count_tombstones,
+    .count_visible = mock_count_visible,
+  };
+  crabs_compaction_register(&registry, DATA_TYPE_OT_ORDERED_SET, &vtable);
+
+  data_item_t* item = data_item_create("test", DATA_TYPE_OT_ORDERED_SET, CRDT_OR_SET);
+  char buf[128];
+  crabs_describe_tombstones(&registry, item, buf, sizeof(buf));
+  EXPECT_NE(buf[0], '\0');
+  data_item_destroy(item);
+}
+
+TEST(Compaction, DescribeTombstonesNullParams) {
+  char buf[128];
+  crabs_describe_tombstones(nullptr, nullptr, buf, sizeof(buf));
+  EXPECT_STREQ(buf, "no item");
+}
+
+TEST(Compaction, DescribeTombstonesNullBuffer) {
+  crabs_describe_tombstones(nullptr, nullptr, nullptr, 0);
+  // Should not crash
+}

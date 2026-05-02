@@ -6,7 +6,7 @@
 //
 
 #include "compaction.h"
-#include "../Util/allocator.h"
+#include <stdio.h>
 #include <string.h>
 
 // ============================================================
@@ -182,4 +182,48 @@ const char* crabs_safety_level_name(crabs_safety_level_e level) {
     case CRABS_SAFETY_FORCE:    return "FORCE";
     default:                     return "UNKNOWN";
   }
+}
+
+bool crabs_type_supports_compaction(const crabs_compaction_registry_t* registry,
+                                     uint32_t type_id) {
+  return crabs_compaction_get_vtable(registry, type_id) != NULL;
+}
+
+double crabs_estimated_savings(const crabs_compaction_registry_t* registry,
+                               const data_item_t* item) {
+  if (registry == NULL || item == NULL) return 0.0;
+  const crabs_compaction_vtable_t* vtable =
+    crabs_compaction_get_vtable(registry, (uint32_t)item->type);
+  if (vtable == NULL || vtable->estimated_savings == NULL) {
+    // Fall back to ratio calculation
+    uint64_t tombstones = crabs_tombstone_count(registry, item);
+    uint64_t visible = crabs_visible_size(registry, item);
+    uint64_t total = tombstones + visible;
+    if (total == 0) return 0.0;
+    return (double)tombstones / (double)total;
+  }
+  return vtable->estimated_savings(item->value);
+}
+
+void crabs_describe_tombstones(const crabs_compaction_registry_t* registry,
+                                const data_item_t* item,
+                                char* buf, uint32_t buf_size) {
+  if (buf == NULL || buf_size == 0) return;
+  buf[0] = '\0';
+
+  if (registry == NULL || item == NULL) {
+    snprintf(buf, buf_size, "no item");
+    return;
+  }
+
+  const crabs_compaction_vtable_t* vtable =
+    crabs_compaction_get_vtable(registry, (uint32_t)item->type);
+  if (vtable == NULL || vtable->describe_tombstones == NULL) {
+    uint64_t tombstones = crabs_tombstone_count(registry, item);
+    uint64_t visible = crabs_visible_size(registry, item);
+    snprintf(buf, buf_size, "tombstones=%lu visible=%lu",
+             (unsigned long)tombstones, (unsigned long)visible);
+    return;
+  }
+  vtable->describe_tombstones(item->value, buf, buf_size);
 }
