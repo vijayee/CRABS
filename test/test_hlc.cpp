@@ -578,3 +578,234 @@ TEST(HLCGeneration, DefaultTimeSourceFallsBackToSystemClock) {
   crabs_physical_time_t t = crabs_hlc_get_physical_time(&state);
   EXPECT_TRUE(t.valid);
 }
+
+// ============================================================
+// HLC Receive Algorithm Tests (§4.2, §5, §12.4-12.6)
+// ============================================================
+
+// Null pointer tests
+TEST(HLCReceive, NullPointers) {
+  crabs_hlc_state_t state;
+  crabs_hlc_state_init(&state, "alice");
+  crabs_hlc_t received = {36000, 0, 0, "bob"};
+
+  EXPECT_EQ(crabs_hlc_receive(NULL, &received), CRABS_HLC_REJECTED_SKEW);
+  EXPECT_EQ(crabs_hlc_receive(&state, NULL), CRABS_HLC_REJECTED_SKEW);
+}
+
+// §12.4: BOUNDED Strategy — Accept
+TEST(HLCReceive, BoundedAccept) {
+  // Node A: local time = (36000, 0), max_skew_ms = 5000
+  // Received from Node B: (36002, 0, 0, "bob") — 2 seconds ahead
+  crabs_hlc_state_t state = make_mock_state("alice", 36000, 0);
+  state.receive_strategy = HLC_STRATEGY_BOUNDED;
+  state.max_skew_ms = 5000;
+
+  crabs_hlc_t received = {36002, 0, 0, "bob"};
+  crabs_hlc_receive_result_e result = crabs_hlc_receive(&state, &received);
+
+  EXPECT_EQ(result, CRABS_HLC_ACCEPTED);
+  // State should be updated to max(local, received) = (36002, 0, 0)
+  EXPECT_EQ(state.last.physical_seconds, 36002u);
+  EXPECT_EQ(state.last.physical_nanos, 0u);
+  EXPECT_EQ(state.last.logical_counter, 0u);
+}
+
+// §12.5: BOUNDED Strategy — Reject (time travel attack)
+TEST(HLCReceive, BoundedRejectFuture) {
+  // Node A: local time = (36000, 0), max_skew_ms = 5000
+  // Received from Node M: (99999, 0, 0, "malicious") — far in future
+  crabs_hlc_state_t state = make_mock_state("alice", 36000, 0);
+  state.receive_strategy = HLC_STRATEGY_BOUNDED;
+  state.max_skew_ms = 5000;
+
+  crabs_hlc_t received = {99999, 0, 0, "malicious"};
+  uint64_t rejections_before = state.time_travel_attempts_rejected;
+  crabs_hlc_receive_result_e result = crabs_hlc_receive(&state, &received);
+
+  EXPECT_EQ(result, CRABS_HLC_REJECTED_SKEW);
+  EXPECT_EQ(state.time_travel_attempts_rejected, rejections_before + 1);
+  // State should NOT be updated
+  EXPECT_EQ(state.last.physical_seconds, 0u);  // Initial state unchanged
+}
+
+// BOUNDED Strategy — Reject past (too far behind)
+TEST(HLCReceive, BoundedRejectPast) {
+  // Node A: local time = (36000, 0), max_skew_ms = 5000
+  // Received from Node M: (35000, 0, 0, "old") — 10 seconds behind
+  crabs_hlc_state_t state = make_mock_state("alice", 36000, 0);
+  state.receive_strategy = HLC_STRATEGY_BOUNDED;
+  state.max_skew_ms = 5000;
+
+  crabs_hlc_t received = {35000, 0, 0, "old"};
+  uint64_t rejections_before = state.time_travel_attempts_rejected;
+  crabs_hlc_receive_result_e result = crabs_hlc_receive(&state, &received);
+
+  EXPECT_EQ(result, CRABS_HLC_REJECTED_SKEW);
+  EXPECT_EQ(state.time_travel_attempts_rejected, rejections_before + 1);
+}
+
+// NAIVE Strategy — Accept everything
+TEST(HLCReceive, NaiveAcceptsAll) {
+  crabs_hlc_state_t state = make_mock_state("alice", 36000, 0);
+  state.receive_strategy = HLC_STRATEGY_NAIVE;
+
+  // Even far-future timestamps accepted
+  crabs_hlc_t received = {99999, 0, 0, "malicious"};
+  crabs_hlc_receive_result_e result = crabs_hlc_receive(&state, &received);
+
+  EXPECT_EQ(result, CRABS_HLC_ACCEPTED);
+  // State should be updated to max(local, received) = (99999, 0, 0)
+  EXPECT_EQ(state.last.physical_seconds, 99999u);
+}
+
+// §12.6: STRICT Strategy — accept but don't update
+TEST(HLCReceive, StrictNoUpdate) {
+  // Node A: state.last = (36000, 500, 3, "alice")
+  // strict_mode = true
+  // Received from Node B: (99999, 0, 0, "bob")
+  crabs_hlc_state_t state = make_mock_state("alice", 36000, 500000000);
+  state.receive_strategy = HLC_STRATEGY_STRICT;
+  state.strict_mode = true;
+
+  // First, set state to a known timestamp
+  state.last.physical_seconds = 36000;
+  state.last.physical_nanos = 500000000;
+  state.last.logical_counter = 3;
+
+  crabs_hlc_t received = {99999, 0, 0, "bob"};
+  crabs_hlc_receive_result_e result = crabs_hlc_receive(&state, &received);
+
+  EXPECT_EQ(result, CRABS_HLC_ACCEPTED_STRICT);
+  // State should be UNCHANGED
+  EXPECT_EQ(state.last.physical_seconds, 36000u);
+  EXPECT_EQ(state.last.physical_nanos, 500000000u);
+  EXPECT_EQ(state.last.logical_counter, 3u);
+}
+
+// Max rule: received ahead of local
+TEST(HLCReceive, MaxRuleReceivedAhead) {
+  crabs_hlc_state_t state = make_mock_state("alice", 36000, 0);
+  state.receive_strategy = HLC_STRATEGY_NAIVE;
+  // Set state to a known timestamp
+  state.last = {36000, 0, 0, "alice"};
+
+  crabs_hlc_t received = {36001, 500000000, 0, "bob"};
+  crabs_hlc_receive(&state, &received);
+
+  // max(local=36000.0, received=36001.500) = 36001.500
+  // max is ahead of last → reset counter
+  EXPECT_EQ(state.last.physical_seconds, 36001u);
+  EXPECT_EQ(state.last.physical_nanos, 500000000u);
+  EXPECT_EQ(state.last.logical_counter, 0u);
+}
+
+// Max rule: received same time as last — take max of counters
+TEST(HLCReceive, MaxRuleSameTimeMaxCounter) {
+  crabs_hlc_state_t state = make_mock_state("alice", 36000, 500000000);
+  state.receive_strategy = HLC_STRATEGY_NAIVE;
+  state.last = {36000, 500000000, 3, "alice"};
+
+  crabs_hlc_t received = {36000, 500000000, 7, "bob"};
+  crabs_hlc_receive(&state, &received);
+
+  // Same time → take max(3, 7) + 1 = 8
+  EXPECT_EQ(state.last.physical_seconds, 36000u);
+  EXPECT_EQ(state.last.physical_nanos, 500000000u);
+  EXPECT_EQ(state.last.logical_counter, 8u);
+}
+
+// Max rule: local counter higher than received
+TEST(HLCReceive, MaxRuleSameTimeLocalCounterHigher) {
+  crabs_hlc_state_t state = make_mock_state("alice", 36000, 500000000);
+  state.receive_strategy = HLC_STRATEGY_NAIVE;
+  state.last = {36000, 500000000, 10, "alice"};
+
+  crabs_hlc_t received = {36000, 500000000, 3, "bob"};
+  crabs_hlc_receive(&state, &received);
+
+  // Same time → take max(10, 3) + 1 = 11
+  EXPECT_EQ(state.last.logical_counter, 11u);
+}
+
+// BOUNDED: time source unavailable → reject
+TEST(HLCReceive, BoundedRejectNoTimeSource) {
+  crabs_hlc_state_t state;
+  crabs_hlc_state_init(&state, "alice");
+  state.receive_strategy = HLC_STRATEGY_BOUNDED;
+  state.max_skew_ms = 5000;
+  state.time_source_ops = &g_mock_ops;
+
+  g_mock_time.valid = false;
+
+  crabs_hlc_t received = {36000, 0, 0, "bob"};
+  crabs_hlc_receive_result_e result = crabs_hlc_receive(&state, &received);
+
+  EXPECT_EQ(result, CRABS_HLC_REJECTED_SKEW);
+}
+
+// Statistics tracking
+TEST(HLCReceive, StatisticsTracking) {
+  crabs_hlc_state_t state = make_mock_state("alice", 36000, 0);
+  state.receive_strategy = HLC_STRATEGY_BOUNDED;
+  state.max_skew_ms = 5000;
+
+  EXPECT_EQ(state.time_travel_attempts_rejected, 0u);
+
+  // First rejection
+  crabs_hlc_t future = {99999, 0, 0, "malicious"};
+  crabs_hlc_receive(&state, &future);
+  EXPECT_EQ(state.time_travel_attempts_rejected, 1u);
+
+  // Second rejection
+  crabs_hlc_receive(&state, &future);
+  EXPECT_EQ(state.time_travel_attempts_rejected, 2u);
+}
+
+// QUORUM strategy (stub) — accepts
+TEST(HLCReceive, QuorumStubAccepts) {
+  crabs_hlc_state_t state = make_mock_state("alice", 36000, 0);
+  state.receive_strategy = HLC_STRATEGY_QUORUM;
+
+  crabs_hlc_t received = {36001, 0, 0, "bob"};
+  crabs_hlc_receive_result_e result = crabs_hlc_receive(&state, &received);
+
+  // Stub accepts (no network infrastructure to collect confirmations)
+  EXPECT_EQ(result, CRABS_HLC_ACCEPTED);
+}
+
+// TRUSTED strategy (stub) — accepts
+TEST(HLCReceive, TrustedStubAccepts) {
+  crabs_hlc_state_t state = make_mock_state("alice", 36000, 0);
+  state.receive_strategy = HLC_STRATEGY_TRUSTED;
+
+  crabs_hlc_t received = {36001, 0, 0, "bob"};
+  crabs_hlc_receive_result_e result = crabs_hlc_receive(&state, &received);
+
+  // Stub accepts (no verification infrastructure)
+  EXPECT_EQ(result, CRABS_HLC_ACCEPTED);
+}
+
+// Multiple receives in sequence
+TEST(HLCReceive, MultipleReceives) {
+  crabs_hlc_state_t state = make_mock_state("alice", 36000, 0);
+  state.receive_strategy = HLC_STRATEGY_NAIVE;
+  state.last = {36000, 0, 0, "alice"};
+
+  // Receive timestamp ahead
+  crabs_hlc_t r1 = {36001, 0, 0, "bob"};
+  crabs_hlc_receive(&state, &r1);
+  EXPECT_EQ(state.last.physical_seconds, 36001u);
+
+  // Receive another timestamp ahead with same time but higher counter
+  crabs_hlc_t r2 = {36001, 0, 5, "carol"};
+  crabs_hlc_receive(&state, &r2);
+  EXPECT_EQ(state.last.logical_counter, 6u);  // max(0, 5) + 1
+
+  // Receive timestamp behind — state unchanged (already ahead)
+  crabs_hlc_t r3 = {36000, 500000000, 10, "dave"};
+  crabs_hlc_receive(&state, &r3);
+  // State stays at (36001, 0, 6) since max(local=36001, received=36000.5) = 36001
+  // which equals last, so we go to the "same time" branch with max counter
+  EXPECT_EQ(state.last.physical_seconds, 36001u);
+}
