@@ -217,6 +217,25 @@ bool invariant_check(invariant_t* inv, void* value, data_type_e type) {
 }
 
 // ============================================================
+// HLC-aware Lock Expiry (v1.6 Amd6 §8)
+// ============================================================
+bool state_machine_lock_expired(state_t* state, const lock_state_t* lock, uint64_t now_ms) {
+  if (state == NULL || lock == NULL) return true;
+
+  crabs_ordering_config_t* config = state_get_ordering_config(state);
+  if (config != NULL && config->ordering_system == CRABS_ORDERING_HLC) {
+    // HLC-based expiry: use crabs_hlc_lock_expired
+    crabs_hlc_state_t hlc_state;
+    crabs_hlc_state_init(&hlc_state, "");
+    return crabs_hlc_lock_expired(&hlc_state, &lock->lock_acquired_at,
+                                   state->config.max_lock_duration_ms +
+                                   (uint64_t)lock->lock_extensions * state->config.max_lock_duration_ms);
+  }
+
+  // Fallback: wall-clock millisecond comparison
+  return now_ms >= lock->lock_expiry;
+}
+
 // Lock Pruning (§7.4 step 1)
 // ============================================================
 uint32_t state_machine_prune_expired(state_t* state, uint64_t now_ms) {
@@ -224,7 +243,7 @@ uint32_t state_machine_prune_expired(state_t* state, uint64_t now_ms) {
   data_item_t* item = state->items;
   while (item != NULL) {
     if (item->type == DATA_TYPE_RESOURCE && item->protocol_state != PROTOCOL_IDLE) {
-      if (now_ms >= item->lock_state.lock_expiry) {
+      if (state_machine_lock_expired(state, &item->lock_state, now_ms)) {
         item->protocol_state = PROTOCOL_IDLE;
         item->lock_state.lock_token_valid = false;
         memset(item->lock_state.lock_owner, 0, CRABS_MAX_USER_ID);
@@ -538,8 +557,8 @@ crabs_error_e state_machine_op_lock(state_t* state, operation_t* op, lock_respon
     if (item->type != DATA_TYPE_RESOURCE) return CRABS_ERR_TYPE_MISMATCH;
     if (item->protocol_state != PROTOCOL_IDLE) return CRABS_ERR_PROTOCOL_VIOLATION;
     if (item->lock_state.lock_token_valid) {
-      uint64_t now_ms = (uint64_t)time(NULL) * 1000;
-      if (now_ms < item->lock_state.lock_expiry) {
+      uint64_t lock_check_ms = (uint64_t)time(NULL) * 1000;
+      if (!state_machine_lock_expired(state, &item->lock_state, lock_check_ms)) {
         return CRABS_ERR_LOCK_OWNER_MISMATCH;
       }
     }
@@ -548,9 +567,19 @@ crabs_error_e state_machine_op_lock(state_t* state, operation_t* op, lock_respon
   uint64_t now_ms = (uint64_t)time(NULL) * 1000;
   uint64_t expiry = now_ms + state->config.max_lock_duration_ms;
 
+  // v1.6 Amd6 §8: Set HLC acquired_at if using HLC ordering
+  crabs_hlc_t acquired_at = {0, 0, 0, {'\0'}};
+  crabs_ordering_config_t* config = state_get_ordering_config(state);
+  if (config != NULL && config->ordering_system == CRABS_ORDERING_HLC) {
+    crabs_hlc_state_t hlc_state;
+    crabs_hlc_state_init(&hlc_state, op->node_id);
+    acquired_at = crabs_hlc_next(&hlc_state);
+  }
+
   response->success = true;
   response->token_count = op->resource_count;
   response->expiry = expiry;
+  response->acquired_at = acquired_at;
 
   for (uint32_t i = 0; i < op->resource_count; i++) {
     data_item_t* item = state_find_item(state, op->resources[i]);
@@ -562,6 +591,7 @@ crabs_error_e state_machine_op_lock(state_t* state, operation_t* op, lock_respon
     strncpy(item->lock_state.lock_owner, op->signer_id, CRABS_MAX_USER_ID - 1);
     item->lock_state.lock_expiry = expiry;
     item->lock_state.lock_extensions = 0;
+    item->lock_state.lock_acquired_at = acquired_at;
 
     if (item->value != NULL) {
       size_t value_size = 0;
@@ -671,7 +701,7 @@ crabs_error_e state_machine_op_force_unlock(state_t* state, operation_t* op) {
   for (uint32_t i = 0; i < op->resource_count; i++) {
     data_item_t* item = state_find_item(state, op->resources[i]);
     if (item == NULL) return CRABS_ERR_RESOURCE_NOT_FOUND;
-    if (now_ms < item->lock_state.lock_expiry) {
+    if (!state_machine_lock_expired(state, &item->lock_state, now_ms)) {
       return CRABS_ERR_LOCK_NOT_EXPIRED;
     }
     item->protocol_state = PROTOCOL_IDLE;

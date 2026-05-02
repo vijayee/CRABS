@@ -147,6 +147,37 @@ void crabs_hlc_normalize(crabs_hlc_t* hlc) {
 }
 
 // ============================================================
+// HLC Lock Integration (v1.6 Amd6 §8)
+// ============================================================
+
+int crabs_hlc_lock_priority(const crabs_hlc_t* lock_a, const crabs_hlc_t* lock_b) {
+  // Earlier timestamp wins (first-come, first-served)
+  return crabs_hlc_compare(lock_a, lock_b);
+}
+
+crabs_hlc_t crabs_hlc_add_duration(crabs_hlc_t hlc, uint64_t duration_ms) {
+  // Split duration into seconds + nanos to avoid uint64 overflow
+  uint64_t add_seconds = duration_ms / 1000ULL;
+  uint64_t add_nanos = (duration_ms % 1000ULL) * 1000000ULL;
+
+  hlc.physical_seconds += add_seconds;
+  hlc.physical_nanos += add_nanos;
+  crabs_hlc_normalize(&hlc);
+  return hlc;
+}
+
+bool crabs_hlc_lock_expired(crabs_hlc_state_t* state,
+                              const crabs_hlc_t* acquired_at,
+                              uint64_t duration_ms) {
+  if (state == NULL || acquired_at == NULL) return true;
+
+  crabs_hlc_t now = crabs_hlc_next(state);
+  crabs_hlc_t expiry = crabs_hlc_add_duration(*acquired_at, duration_ms);
+
+  return crabs_hlc_compare(&now, &expiry) > 0;
+}
+
+// ============================================================
 // HLC Difference (v1.6 Amd6 §4.2)
 // ============================================================
 

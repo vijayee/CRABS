@@ -1148,3 +1148,141 @@ TEST(HLCSerialization, CanonicalSigningHLCOperation) {
   serialized_buffer_destroy(sig_data);
   serialized_buffer_destroy(lamport_data);
 }
+
+// ============================================================
+// HLC Lock Integration Tests (v1.6 Amd6 §8)
+// ============================================================
+
+TEST(HLCLockIntegration, LockPriorityEarlierWins) {
+  // Earlier timestamp wins (first-come, first-served)
+  crabs_hlc_t earlier = {1000, 500000000, 0, "alice"};
+  crabs_hlc_t later = {1000, 600000000, 0, "bob"};
+
+  int result = crabs_hlc_lock_priority(&earlier, &later);
+  EXPECT_LT(result, 0);  // earlier wins → returns negative
+}
+
+TEST(HLCLockIntegration, LockPriorityLaterLoses) {
+  crabs_hlc_t earlier = {1000, 500000000, 0, "alice"};
+  crabs_hlc_t later = {1000, 600000000, 0, "bob"};
+
+  int result = crabs_hlc_lock_priority(&later, &earlier);
+  EXPECT_GT(result, 0);  // later loses → returns positive
+}
+
+TEST(HLCLockIntegration, LockPriorityTiebreakerNodeId) {
+  crabs_hlc_t a = {1000, 500000000, 5, "alice"};
+  crabs_hlc_t b = {1000, 500000000, 5, "bob"};
+
+  // Same timestamp and counter, node_id breaks tie
+  int result = crabs_hlc_lock_priority(&a, &b);
+  EXPECT_LT(result, 0);  // "alice" < "bob" lexicographically
+}
+
+TEST(HLCLockIntegration, LockPrioritySameTimestamp) {
+  crabs_hlc_t a = {1000, 500000000, 5, "alice"};
+  crabs_hlc_t b = {1000, 500000000, 5, "alice"};
+
+  int result = crabs_hlc_lock_priority(&a, &b);
+  EXPECT_EQ(result, 0);
+}
+
+TEST(HLCLockIntegration, LockPriorityNullPointers) {
+  crabs_hlc_t hlc = {1000, 500000000, 0, "alice"};
+  // crabs_hlc_compare: NULL is treated as less than any value
+  EXPECT_EQ(crabs_hlc_lock_priority(NULL, &hlc), -1);
+  EXPECT_EQ(crabs_hlc_lock_priority(&hlc, NULL), 1);
+  EXPECT_EQ(crabs_hlc_lock_priority(NULL, NULL), 0);
+}
+
+TEST(HLCLockIntegration, AddDurationBasic) {
+  crabs_hlc_t base = {1000, 500000000, 0, "alice"};
+  // Add 500ms = 500,000,000 nanos
+  // 500M + 500M = 1,000,000,000 → normalization: seconds += 1, nanos = 0
+  crabs_hlc_t result = crabs_hlc_add_duration(base, 500);
+  EXPECT_EQ(result.physical_seconds, 1001u);
+  EXPECT_EQ(result.physical_nanos, 0u);
+}
+
+TEST(HLCLockIntegration, AddDurationNanosecondOverflow) {
+  crabs_hlc_t base = {1000, 800000000, 0, "alice"};
+  // Add 300ms = 300,000,000 nanos → 800M + 300M = 1,100,000,000
+  crabs_hlc_t result = crabs_hlc_add_duration(base, 300);
+  EXPECT_EQ(result.physical_seconds, 1001u);
+  EXPECT_EQ(result.physical_nanos, 100000000u);
+  EXPECT_EQ(result.logical_counter, 0u);
+}
+
+TEST(HLCLockIntegration, AddDurationZero) {
+  crabs_hlc_t base = {1000, 500000000, 5, "alice"};
+  crabs_hlc_t result = crabs_hlc_add_duration(base, 0);
+  EXPECT_EQ(result.physical_seconds, 1000u);
+  EXPECT_EQ(result.physical_nanos, 500000000u);
+  EXPECT_EQ(result.logical_counter, 5u);
+}
+
+TEST(HLCLockIntegration, AddDurationLargeValue) {
+  crabs_hlc_t base = {1000, 0, 0, "alice"};
+  // Add 5000 seconds = 5,000,000 ms
+  crabs_hlc_t result = crabs_hlc_add_duration(base, 5000000);
+  EXPECT_EQ(result.physical_seconds, 6000u);
+  EXPECT_EQ(result.physical_nanos, 0u);
+}
+
+TEST(HLCLockIntegration, AddDurationPreservesNodeId) {
+  crabs_hlc_t base = {1000, 500000000, 0, "testnode"};
+  crabs_hlc_t result = crabs_hlc_add_duration(base, 100);
+  EXPECT_STREQ(result.node_id, "testnode");
+}
+
+TEST(HLCLockIntegration, LockExpiredBasic) {
+  crabs_hlc_state_t state;
+  crabs_hlc_state_init(&state, "test");
+
+  // Acquired in the past — lock should be expired
+  crabs_hlc_t acquired_at = {1000, 0, 0, "test"};
+  bool expired = crabs_hlc_lock_expired(&state, &acquired_at, 5000);
+  EXPECT_TRUE(expired);  // acquired_at is far in the past, duration is only 5s
+}
+
+TEST(HLCLockIntegration, LockExpiredNullPointers) {
+  crabs_hlc_state_t state;
+  crabs_hlc_state_init(&state, "test");
+  crabs_hlc_t acquired = {1000, 0, 0, "test"};
+  EXPECT_TRUE(crabs_hlc_lock_expired(NULL, &acquired, 5000));
+  EXPECT_TRUE(crabs_hlc_lock_expired(&state, NULL, 5000));
+}
+
+TEST(HLCLockIntegration, StateMachineLockExpiredLamportMode) {
+  // In Lamport mode (default), lock expiry uses wall-clock millisecond comparison
+  state_t* state = state_create();
+  lock_state_t lock = {};
+  lock.lock_expiry = 10000;
+  lock.lock_acquired_at = {0, 0, 0, ""};
+
+  // now_ms = 5000, expiry = 10000 → not expired
+  EXPECT_FALSE(state_machine_lock_expired(state, &lock, 5000));
+  // now_ms = 10001, expiry = 10000 → expired
+  EXPECT_TRUE(state_machine_lock_expired(state, &lock, 10001));
+
+  state_destroy(state);
+}
+
+TEST(HLCLockIntegration, StateMachineLockExpiredHLCMode) {
+  // In HLC mode, lock expiry uses HLC timestamps
+  state_t* state = state_create();
+  crabs_ordering_config_t config;
+  crabs_ordering_config_init_hlc(&config, HLC_STRATEGY_BOUNDED);
+  state_set_ordering_config(state, &config);
+
+  lock_state_t lock = {};
+  lock.lock_expiry = 10000;
+  // Acquired at a far-past timestamp — should be expired with short duration
+  lock.lock_acquired_at = {1000, 0, 0, "test"};
+
+  // Even with generous duration, acquired_at is decades in the past
+  bool expired = state_machine_lock_expired(state, &lock, 0);
+  EXPECT_TRUE(expired);
+
+  state_destroy(state);
+}

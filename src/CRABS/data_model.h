@@ -106,6 +106,7 @@ typedef struct {
   uint64_t lock_expiry;
   uint32_t lock_extensions;
   void*    pre_lock_snapshot;
+  crabs_hlc_t lock_acquired_at;  // v1.6 Amd6 §8: HLC timestamp when lock was acquired
 } lock_state_t;
 
 // ============================================================

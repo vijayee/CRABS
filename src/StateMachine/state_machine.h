@@ -75,6 +75,7 @@ typedef struct {
   uint8_t   lock_tokens[CRABS_MAX_RESOURCES][CRABS_LOCK_TOKEN_SIZE];
   uint32_t  token_count;
   uint64_t  expiry;
+  crabs_hlc_t acquired_at;  // v1.6 Amd6 §8: HLC timestamp when lock was acquired
 } lock_response_t;
 
 // ============================================================
@@ -139,6 +140,11 @@ bool           operation_is_builtin(const char* type);
 // Returns: -1 if a < b, 0 if equal, 1 if a > b
 // Rule: Lamport operations always sort before HLC operations.
 int            crabs_operation_compare(const operation_t* a, const operation_t* b);
+
+// HLC-aware lock expiry check (v1.6 Amd6 §8)
+// When ordering_config is HLC, uses crabs_hlc_lock_expired for expiry check.
+// Otherwise falls back to wall-clock millisecond comparison using now_ms.
+bool           state_machine_lock_expired(state_t* state, const lock_state_t* lock, uint64_t now_ms);
 
 // Misc
 void           state_machine_generate_lock_token(uint8_t token[CRABS_LOCK_TOKEN_SIZE]);

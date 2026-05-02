@@ -219,6 +219,27 @@ crabs_hlc_receive_result_e crabs_hlc_receive(crabs_hlc_state_t* state,
                                                const crabs_hlc_t* received);
 
 // ============================================================
+// HLC Lock Integration (v1.6 Amd6 §8)
+// ============================================================
+
+// Compare two lock claims using HLC ordering.
+// The operation with the EARLIER timestamp wins (first-come, first-served).
+// Returns: -1 if a wins, 1 if b wins, 0 if tie (use node_id).
+int crabs_hlc_lock_priority(const crabs_hlc_t* lock_a, const crabs_hlc_t* lock_b);
+
+// Add a duration in milliseconds to an HLC timestamp.
+// Handles nanosecond overflow normalization.
+// Returns the resulting timestamp (also normalized in-place if hlc is modified).
+crabs_hlc_t crabs_hlc_add_duration(crabs_hlc_t hlc, uint64_t duration_ms);
+
+// Check if a lock has expired using HLC timestamps.
+// Computes expiry = acquired_at + duration_ms, then compares with current time.
+// Returns true if expired, false if still valid.
+bool crabs_hlc_lock_expired(crabs_hlc_state_t* state,
+                              const crabs_hlc_t* acquired_at,
+                              uint64_t duration_ms);
+
+// ============================================================
 // HLC Serialization (v1.6 Amd6 §9)
 // ============================================================
 
