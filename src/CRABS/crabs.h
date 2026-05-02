@@ -74,7 +74,13 @@ typedef enum {
   CRABS_ERR_ALREADY_EXECUTED      = 0x7002,
   CRABS_ERR_CONDITION_NOT_MET     = 0x7003,
   CRABS_ERR_TRACKER_NOT_FOUND    = 0x7004,
-  CRABS_ERR_FLAG_NOT_FOUND       = 0x7005
+  CRABS_ERR_FLAG_NOT_FOUND       = 0x7005,
+
+  // 0x8xxx: OT errors (v1.5 §8)
+  CRABS_ERR_NO_OT_OPS            = 0x8001,
+  CRABS_ERR_NOT_OT_TYPE          = 0x8002,
+  CRABS_ERR_OT_TRANSFORM_DEPTH   = 0x8003,
+  CRABS_ERR_OT_POSITION_BOUNDS   = 0x8004
 } crabs_error_e;
 
 // ============================================================
@@ -108,5 +114,8 @@ typedef enum {
 // Dedup Operations (v1.4 §7)
 #define CRABS_OP_DEFINE_OPERATION  "__define_operation_type__"
 #define CRABS_OP_CHECK_DEDUP       "__check_dedup__"
+
+// OT Operations (v1.5 §8)
+#define CRABS_OP_EXECUTE_OT        "__execute_ot__"
 
 #endif // CRABS_CRABS_H

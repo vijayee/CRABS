@@ -10,6 +10,7 @@
 #include "../Condition/condition.h"
 #include "../Serialization/serialization.h"
 #include "../Dedup/dedup.h"
+#include "../OT/ot_execution.h"
 #include "../Util/allocator.h"
 #include <string.h>
 #include <stdlib.h>
@@ -438,6 +439,9 @@ crabs_error_e state_machine_execute(state_t* state, operation_t* op) {
     result = state_machine_op_define_operation(state, op);
   } else if (strcmp(op->type, CRABS_OP_CHECK_DEDUP) == 0) {
     result = state_machine_op_check_dedup(state, op);
+  } else if (strcmp(op->type, CRABS_OP_EXECUTE_OT) == 0) {
+    // OT operation: extract, transform, and apply (v1.5 §8)
+    result = crabs_execute_ot_operation(state, op);
   } else {
     result = CRABS_ERR_INVALID_PARAM;
   }

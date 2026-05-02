@@ -5,6 +5,9 @@
 #include "data_model.h"
 #include "../Trigger/trigger.h"
 #include "../Crypto/crypto.h"
+#include "../OT/ot_ordered_set.h"
+#include "../OT/ot_document.h"
+#include "../OT/ot_tree.h"
 #include "../Util/allocator.h"
 #include <openssl/crypto.h>
 #include <string.h>
@@ -42,7 +45,29 @@ void data_item_destroy(data_item_t* item) {
   if (item == NULL) return;
   if (item->invariants != NULL) free(item->invariants);
   if (item->lock_state.pre_lock_snapshot != NULL) free(item->lock_state.pre_lock_snapshot);
-  if (item->value != NULL) free(item->value);
+  // OT types need special cleanup — destroy functions handle ot_data
+  if (item->value != NULL) {
+    switch (item->type) {
+      case DATA_TYPE_OT_ORDERED_SET:
+        crabs_ot_ordered_set_destroy((crabs_ot_ordered_set_t*)item->value);
+        item->ot_data = NULL; // Destroyed by set destroy
+        break;
+      case DATA_TYPE_OT_DOCUMENT:
+        crabs_ot_document_destroy((crabs_ot_document_t*)item->value);
+        item->ot_data = NULL;
+        break;
+      case DATA_TYPE_OT_TREE:
+        crabs_ot_tree_destroy((crabs_ot_tree_t*)item->value);
+        item->ot_data = NULL;
+        break;
+      default:
+        free(item->value);
+        break;
+    }
+  }
+  if (item->ot_data != NULL) {
+    crabs_ot_data_item_destroy((crabs_ot_data_item_t*)item->ot_data);
+  }
   free(item);
 }
 

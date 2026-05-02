@@ -27,6 +27,12 @@ typedef enum {
   DATA_TYPE_RESOURCE    = 0x07,  // PN-Counter + lock
   DATA_TYPE_ONE_SHOT_SET  = 0x08,  // Add-only set (v1.4 §2)
   DATA_TYPE_ONE_SHOT_FLAG = 0x09,  // Monotonic boolean flag (v1.4 §2)
+  // OT/CRDT Hybrid Types (v1.5 §3)
+  DATA_TYPE_OT_ORDERED_SET = 0x10,
+  DATA_TYPE_OT_DOCUMENT    = 0x11,
+  DATA_TYPE_OT_TABLE       = 0x12,
+  DATA_TYPE_OT_TREE        = 0x13,
+  DATA_TYPE_OT_ORDERED_MAP = 0x14,
   DATA_TYPE_CUSTOM      = 0xFF   // User-defined
 } data_type_e;
 
@@ -115,6 +121,9 @@ typedef struct data_item_t {
 
   // Lock state (only for RESOURCE type)
   lock_state_t     lock_state;
+
+  // OT data (only for OT types 0x10-0x1F)
+  void*            ot_data;  // crabs_ot_data_item_t* when type is OT
 
   // Pointer-based linking
   struct data_item_t* next;
