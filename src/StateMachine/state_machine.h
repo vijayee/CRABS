@@ -11,6 +11,7 @@
 #include "../CRABS/data_model.h"
 #include "../Trigger/trigger.h"
 #include "../Crypto/sig_scheme.h"
+#include "../HLC/hlc.h"
 
 // ============================================================
 // Lock Claim (§7.2)
@@ -61,6 +62,9 @@ typedef struct {
   uint32_t           co_signer_count;
   // v1.4: Dedup specification
   dedup_spec_t       dedup;
+  // v1.6 Amd6: Ordering system support
+  crabs_ordering_system_e ordering_system;  // LAMPORT (default) or HLC
+  crabs_hlc_t        hlc;                   // HLC timestamp (used when ordering_system == HLC)
 } operation_t;
 
 // ============================================================
@@ -129,6 +133,12 @@ crabs_error_e  state_machine_op_refresh_key(state_t* state, operation_t* op,
 operation_t*   operation_create(const char* type);
 void           operation_destroy(operation_t* op);
 bool           operation_is_builtin(const char* type);
+
+// Cross-system operation ordering (v1.6 Amd6 §10.2)
+// Compares two operations by their ordering system (Lamport or HLC).
+// Returns: -1 if a < b, 0 if equal, 1 if a > b
+// Rule: Lamport operations always sort before HLC operations.
+int            crabs_operation_compare(const operation_t* a, const operation_t* b);
 
 // Misc
 void           state_machine_generate_lock_token(uint8_t token[CRABS_LOCK_TOKEN_SIZE]);

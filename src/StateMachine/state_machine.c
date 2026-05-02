@@ -148,6 +148,38 @@ void operation_destroy(operation_t* op) {
 }
 
 // ============================================================
+// Cross-System Operation Ordering (v1.6 Amd6 §10.2)
+// ============================================================
+
+int crabs_operation_compare(const operation_t* a, const operation_t* b) {
+  if (a == NULL && b == NULL) return 0;
+  if (a == NULL) return -1;
+  if (b == NULL) return 1;
+
+  // Cross-system ordering: Lamport operations sort before HLC operations
+  if (a->ordering_system == CRABS_ORDERING_LAMPORT &&
+      b->ordering_system == CRABS_ORDERING_HLC) {
+    return -1;  // Lamport before HLC
+  }
+  if (a->ordering_system == CRABS_ORDERING_HLC &&
+      b->ordering_system == CRABS_ORDERING_LAMPORT) {
+    return 1;  // HLC after Lamport
+  }
+
+  // Same ordering system: use system-specific ordering
+  if (a->ordering_system == CRABS_ORDERING_HLC) {
+    // HLC ordering: compare by (physical_seconds, physical_nanos,
+    // logical_counter, node_id)
+    return crabs_hlc_compare(&a->hlc, &b->hlc);
+  }
+
+  // Lamport ordering: compare by (lamport_time, node_id)
+  if (a->lamport_time < b->lamport_time) return -1;
+  if (a->lamport_time > b->lamport_time) return 1;
+  return strcmp(a->node_id, b->node_id);
+}
+
+// ============================================================
 // Lock Token Generation
 // ============================================================
 void state_machine_generate_lock_token(uint8_t token[CRABS_LOCK_TOKEN_SIZE]) {

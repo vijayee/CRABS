@@ -9,6 +9,7 @@
 #include <stdbool.h>
 #include "crabs.h"
 #include "../Crypto/sig_scheme.h"
+#include "../HLC/hlc.h"
 
 // Forward declarations
 typedef struct trigger_t trigger_t;
@@ -266,6 +267,9 @@ typedef struct {
   uint64_t lamport_time;
   char     node_id[CRABS_MAX_USER_ID];
   uint8_t  state_hash[CRABS_HASH_SIZE];
+  // v1.6 Amd6: Ordering system support
+  crabs_ordering_system_e ordering_system;  // LAMPORT (default) or HLC
+  crabs_hlc_t        hlc;                   // HLC timestamp (used when ordering_system == HLC)
 } log_entry_t;
 
 // ============================================================
@@ -293,6 +297,8 @@ typedef struct state_t {
   uint32_t       op_type_def_count;
   // v1.5.2 §4: Compaction config (crabs_tombstone_config_t*, if set auto-compaction runs after OT ops)
   void* compaction_config;
+  // v1.6 Amd6: Ordering configuration (crabs_ordering_config_t*, if set uses HLC ordering)
+  void* ordering_config;
 } state_t;
 
 // ============================================================
@@ -315,6 +321,11 @@ void         state_destroy(state_t* state);
 // Set compaction config on state (enables auto-compaction after OT ops)
 // Pass NULL to disable. config is NOT owned by state (caller must keep alive).
 void         state_set_compaction_config(state_t* state, void* config);
+
+// Set ordering config on state (v1.6 Amd6 §6.3)
+// Pass NULL to use default Lamport ordering.
+void         state_set_ordering_config(state_t* state, crabs_ordering_config_t* config);
+crabs_ordering_config_t* state_get_ordering_config(state_t* state);
 
 // Initialize node ECDSA keypair for envelope signing (§11)
 crabs_error_e state_set_node_key(state_t* state,

@@ -809,3 +809,192 @@ TEST(HLCReceive, MultipleReceives) {
   // which equals last, so we go to the "same time" branch with max counter
   EXPECT_EQ(state.last.physical_seconds, 36001u);
 }
+
+// ============================================================
+// Cross-System Operation Ordering Tests (§10.2)
+// ============================================================
+
+extern "C" {
+#include "StateMachine/state_machine.h"
+}
+
+// §12.7: Cross-System Ordering — Lamport before HLC
+TEST(HLCOrdering, LamportBeforeHLC) {
+  operation_t a, b;
+  memset(&a, 0, sizeof(a));
+  memset(&b, 0, sizeof(b));
+
+  // Operation A: Lamport (lamport_time=42, node="alice")
+  a.ordering_system = CRABS_ORDERING_LAMPORT;
+  a.lamport_time = 42;
+  strncpy(a.node_id, "alice", CRABS_MAX_USER_ID - 1);
+
+  // Operation B: HLC (36000, 500, 0, "bob")
+  b.ordering_system = CRABS_ORDERING_HLC;
+  b.hlc = {36000, 500000000, 0, "bob"};
+
+  EXPECT_LT(crabs_operation_compare(&a, &b), 0);  // A < B
+  EXPECT_GT(crabs_operation_compare(&b, &a), 0);  // B > A
+}
+
+// Lamport operations compared by lamport_time
+TEST(HLCOrdering, LamportOrderingByTime) {
+  operation_t a, b;
+  memset(&a, 0, sizeof(a));
+  memset(&b, 0, sizeof(b));
+
+  a.ordering_system = CRABS_ORDERING_LAMPORT;
+  a.lamport_time = 10;
+  strncpy(a.node_id, "alice", CRABS_MAX_USER_ID - 1);
+
+  b.ordering_system = CRABS_ORDERING_LAMPORT;
+  b.lamport_time = 20;
+  strncpy(b.node_id, "bob", CRABS_MAX_USER_ID - 1);
+
+  EXPECT_LT(crabs_operation_compare(&a, &b), 0);  // 10 < 20
+  EXPECT_GT(crabs_operation_compare(&b, &a), 0);  // 20 > 10
+}
+
+// Lamport operations with same time compared by node_id
+TEST(HLCOrdering, LamportOrderingByNodeId) {
+  operation_t a, b;
+  memset(&a, 0, sizeof(a));
+  memset(&b, 0, sizeof(b));
+
+  a.ordering_system = CRABS_ORDERING_LAMPORT;
+  a.lamport_time = 42;
+  strncpy(a.node_id, "alice", CRABS_MAX_USER_ID - 1);
+
+  b.ordering_system = CRABS_ORDERING_LAMPORT;
+  b.lamport_time = 42;
+  strncpy(b.node_id, "bob", CRABS_MAX_USER_ID - 1);
+
+  EXPECT_LT(crabs_operation_compare(&a, &b), 0);  // alice < bob
+}
+
+// HLC operations compared by HLC fields
+TEST(HLCOrdering, HLCOrderingByTime) {
+  operation_t a, b;
+  memset(&a, 0, sizeof(a));
+  memset(&b, 0, sizeof(b));
+
+  a.ordering_system = CRABS_ORDERING_HLC;
+  a.hlc = {36000, 0, 0, "alice"};
+  strncpy(a.node_id, "alice", CRABS_MAX_USER_ID - 1);
+
+  b.ordering_system = CRABS_ORDERING_HLC;
+  b.hlc = {36001, 0, 0, "bob"};
+  strncpy(b.node_id, "bob", CRABS_MAX_USER_ID - 1);
+
+  EXPECT_LT(crabs_operation_compare(&a, &b), 0);
+  EXPECT_GT(crabs_operation_compare(&b, &a), 0);
+}
+
+// HLC operations with same physical time compared by counter
+TEST(HLCOrdering, HLCOrderingByCounter) {
+  operation_t a, b;
+  memset(&a, 0, sizeof(a));
+  memset(&b, 0, sizeof(b));
+
+  a.ordering_system = CRABS_ORDERING_HLC;
+  a.hlc = {36000, 500000000, 3, "alice"};
+  strncpy(a.node_id, "alice", CRABS_MAX_USER_ID - 1);
+
+  b.ordering_system = CRABS_ORDERING_HLC;
+  b.hlc = {36000, 500000000, 7, "alice"};
+  strncpy(b.node_id, "alice", CRABS_MAX_USER_ID - 1);
+
+  EXPECT_LT(crabs_operation_compare(&a, &b), 0);  // 3 < 7
+}
+
+// Equal operations
+TEST(HLCOrdering, EqualOperations) {
+  operation_t a, b;
+  memset(&a, 0, sizeof(a));
+  memset(&b, 0, sizeof(b));
+
+  a.ordering_system = CRABS_ORDERING_LAMPORT;
+  a.lamport_time = 42;
+  strncpy(a.node_id, "alice", CRABS_MAX_USER_ID - 1);
+
+  b.ordering_system = CRABS_ORDERING_LAMPORT;
+  b.lamport_time = 42;
+  strncpy(b.node_id, "alice", CRABS_MAX_USER_ID - 1);
+
+  EXPECT_EQ(crabs_operation_compare(&a, &b), 0);
+}
+
+// Null pointer handling
+TEST(HLCOrdering, NullPointers) {
+  operation_t a;
+  memset(&a, 0, sizeof(a));
+  a.ordering_system = CRABS_ORDERING_LAMPORT;
+  a.lamport_time = 42;
+  strncpy(a.node_id, "alice", CRABS_MAX_USER_ID - 1);
+
+  EXPECT_EQ(crabs_operation_compare(NULL, NULL), 0);
+  EXPECT_LT(crabs_operation_compare(NULL, &a), 0);
+  EXPECT_GT(crabs_operation_compare(&a, NULL), 0);
+}
+
+// Default ordering_system is LAMPORT (backward compat)
+TEST(HLCOrdering, DefaultOrderingIsLamport) {
+  operation_t op;
+  memset(&op, 0, sizeof(op));
+
+  // After memset, ordering_system should be 0 = CRABS_ORDERING_LAMPORT
+  EXPECT_EQ(op.ordering_system, CRABS_ORDERING_LAMPORT);
+}
+
+// ============================================================
+// Ordering Config Integration Tests (§6.3)
+// ============================================================
+
+TEST(HLCOrdering, StateSetOrderingConfig) {
+  state_t* state = state_create();
+
+  // Default is NULL (Lamport)
+  crabs_ordering_config_t* config = state_get_ordering_config(state);
+  EXPECT_EQ(config, nullptr);
+
+  // Set HLC config
+  crabs_ordering_config_t hlc_config;
+  crabs_ordering_config_init_hlc(&hlc_config, HLC_STRATEGY_BOUNDED);
+  state_set_ordering_config(state, &hlc_config);
+
+  config = state_get_ordering_config(state);
+  EXPECT_NE(config, nullptr);
+  EXPECT_EQ(config->ordering_system, CRABS_ORDERING_HLC);
+
+  state_destroy(state);
+}
+
+TEST(HLCOrdering, StateSetNullConfig) {
+  state_t* state = state_create();
+
+  // Set NULL config (revert to default Lamport)
+  state_set_ordering_config(state, NULL);
+
+  crabs_ordering_config_t* config = state_get_ordering_config(state);
+  EXPECT_EQ(config, nullptr);
+
+  state_destroy(state);
+}
+
+TEST(HLCOrdering, LogEntryHasOrderingFields) {
+  log_entry_t entry;
+  memset(&entry, 0, sizeof(entry));
+
+  // After memset, ordering_system should be 0 = LAMPORT
+  EXPECT_EQ(entry.ordering_system, CRABS_ORDERING_LAMPORT);
+
+  // Set HLC fields
+  entry.ordering_system = CRABS_ORDERING_HLC;
+  entry.hlc = {36000, 500000000, 42, "alice"};
+
+  EXPECT_EQ(entry.ordering_system, CRABS_ORDERING_HLC);
+  EXPECT_EQ(entry.hlc.physical_seconds, 36000u);
+  EXPECT_EQ(entry.hlc.physical_nanos, 500000000u);
+  EXPECT_EQ(entry.hlc.logical_counter, 42u);
+  EXPECT_STREQ(entry.hlc.node_id, "alice");
+}

@@ -137,6 +137,16 @@ void state_set_compaction_config(state_t* state, void* config) {
   state->compaction_config = config;
 }
 
+void state_set_ordering_config(state_t* state, crabs_ordering_config_t* config) {
+  if (state == NULL) return;
+  state->ordering_config = config;
+}
+
+crabs_ordering_config_t* state_get_ordering_config(state_t* state) {
+  if (state == NULL) return NULL;
+  return (crabs_ordering_config_t*)state->ordering_config;
+}
+
 // ============================================================
 // State query helpers
 // ============================================================
