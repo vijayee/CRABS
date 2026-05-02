@@ -19,7 +19,8 @@ TEST(OTTypes, OpTypeEnumValues) {
   EXPECT_EQ(CRABS_OT_OP_UPDATE, 0x03);
   EXPECT_EQ(CRABS_OT_OP_MOVE,   0x04);
   EXPECT_EQ(CRABS_OT_OP_SWAP,   0x05);
-  EXPECT_EQ(CRABS_OT_OP_TYPE_COUNT, 5);
+  EXPECT_EQ(CRABS_OT_OP_COMPACT, 0x06);
+  EXPECT_EQ(CRABS_OT_OP_TYPE_COUNT, 6);
 }
 
 TEST(OTTypes, OpTypeName) {
@@ -28,6 +29,7 @@ TEST(OTTypes, OpTypeName) {
   EXPECT_STREQ(crabs_ot_op_type_name(CRABS_OT_OP_UPDATE), "UPDATE");
   EXPECT_STREQ(crabs_ot_op_type_name(CRABS_OT_OP_MOVE),   "MOVE");
   EXPECT_STREQ(crabs_ot_op_type_name(CRABS_OT_OP_SWAP),   "SWAP");
+  EXPECT_STREQ(crabs_ot_op_type_name(CRABS_OT_OP_COMPACT), "COMPACT");
   EXPECT_STREQ(crabs_ot_op_type_name((crabs_ot_op_type_e)99), "UNKNOWN");
 }
 

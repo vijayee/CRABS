@@ -20,14 +20,15 @@
 // ============================================================
 
 typedef enum {
-  CRABS_OT_OP_INSERT = 0x01,
-  CRABS_OT_OP_DELETE = 0x02,
-  CRABS_OT_OP_UPDATE = 0x03,
-  CRABS_OT_OP_MOVE   = 0x04,
-  CRABS_OT_OP_SWAP   = 0x05,
+  CRABS_OT_OP_INSERT  = 0x01,
+  CRABS_OT_OP_DELETE  = 0x02,
+  CRABS_OT_OP_UPDATE  = 0x03,
+  CRABS_OT_OP_MOVE    = 0x04,
+  CRABS_OT_OP_SWAP    = 0x05,
+  CRABS_OT_OP_COMPACT = 0x06,  // v1.6 §3: Tombstone compaction operation
 } crabs_ot_op_type_e;
 
-#define CRABS_OT_OP_TYPE_COUNT 5
+#define CRABS_OT_OP_TYPE_COUNT 6
 
 // ============================================================
 // OT Operation ID (v1.5 §3.2)

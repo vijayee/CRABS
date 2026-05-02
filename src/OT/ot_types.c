@@ -82,12 +82,13 @@ void crabs_ot_operation_add_dep(crabs_ot_operation_t* op,
 
 const char* crabs_ot_op_type_name(crabs_ot_op_type_e type) {
   switch (type) {
-    case CRABS_OT_OP_INSERT: return "INSERT";
-    case CRABS_OT_OP_DELETE: return "DELETE";
-    case CRABS_OT_OP_UPDATE: return "UPDATE";
-    case CRABS_OT_OP_MOVE:   return "MOVE";
-    case CRABS_OT_OP_SWAP:   return "SWAP";
-    default:                 return "UNKNOWN";
+    case CRABS_OT_OP_INSERT:  return "INSERT";
+    case CRABS_OT_OP_DELETE:  return "DELETE";
+    case CRABS_OT_OP_UPDATE:  return "UPDATE";
+    case CRABS_OT_OP_MOVE:    return "MOVE";
+    case CRABS_OT_OP_SWAP:    return "SWAP";
+    case CRABS_OT_OP_COMPACT: return "COMPACT";
+    default:                  return "UNKNOWN";
   }
 }
 

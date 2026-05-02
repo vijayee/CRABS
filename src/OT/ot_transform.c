@@ -6,6 +6,7 @@
 //
 
 #include "ot_transform.h"
+#include "../Compaction/compact_op.h"
 #include <string.h>
 
 // ============================================================
@@ -329,6 +330,33 @@ void crabs_transform_matrix_init(crabs_ot_data_item_t* item) {
                                     crabs_transform_swap_move);
   crabs_ot_data_item_set_transform(item, CRABS_OT_OP_SWAP, CRABS_OT_OP_SWAP,
                                     crabs_transform_swap_swap);
+
+  // Row COMPACT (5): vs INSERT, DELETE, UPDATE, MOVE, SWAP, COMPACT
+  // COMPACT absorbs all preceding ops (they're part of the compacted state)
+  crabs_ot_data_item_set_transform(item, CRABS_OT_OP_COMPACT, CRABS_OT_OP_INSERT,
+                                    crabs_transform_compact_insert);
+  crabs_ot_data_item_set_transform(item, CRABS_OT_OP_COMPACT, CRABS_OT_OP_DELETE,
+                                    crabs_transform_compact_delete);
+  crabs_ot_data_item_set_transform(item, CRABS_OT_OP_COMPACT, CRABS_OT_OP_UPDATE,
+                                    crabs_transform_compact_update);
+  crabs_ot_data_item_set_transform(item, CRABS_OT_OP_COMPACT, CRABS_OT_OP_MOVE,
+                                    crabs_transform_compact_move);
+  crabs_ot_data_item_set_transform(item, CRABS_OT_OP_COMPACT, CRABS_OT_OP_SWAP,
+                                    crabs_transform_compact_swap);
+  crabs_ot_data_item_set_transform(item, CRABS_OT_OP_COMPACT, CRABS_OT_OP_COMPACT,
+                                    crabs_transform_compact_compact);
+
+  // Column COMPACT: preceding ops vs COMPACT are absorbed (become no-ops)
+  crabs_ot_data_item_set_transform(item, CRABS_OT_OP_INSERT, CRABS_OT_OP_COMPACT,
+                                    crabs_transform_insert_compact);
+  crabs_ot_data_item_set_transform(item, CRABS_OT_OP_DELETE, CRABS_OT_OP_COMPACT,
+                                    crabs_transform_delete_compact);
+  crabs_ot_data_item_set_transform(item, CRABS_OT_OP_UPDATE, CRABS_OT_OP_COMPACT,
+                                    crabs_transform_update_compact);
+  crabs_ot_data_item_set_transform(item, CRABS_OT_OP_MOVE, CRABS_OT_OP_COMPACT,
+                                    crabs_transform_move_compact);
+  crabs_ot_data_item_set_transform(item, CRABS_OT_OP_SWAP, CRABS_OT_OP_COMPACT,
+                                    crabs_transform_swap_compact);
 }
 
 // ============================================================
@@ -337,11 +365,12 @@ void crabs_transform_matrix_init(crabs_ot_data_item_t* item) {
 
 static const char* _transform_descriptions[CRABS_OT_TRANSFORM_MATRIX_SIZE]
                                            [CRABS_OT_TRANSFORM_MATRIX_SIZE] = {
-  {"T1: INS vs INS", "T3: INS vs DEL", "INS vs UPD", "INS vs MOV", "INS vs SWP"},
-  {"T2: DEL vs INS", "T4: DEL vs DEL", "DEL vs UPD", "DEL vs MOV", "DEL vs SWP"},
-  {"UPD vs INS",     "UPD vs DEL",     "UPD vs UPD", "UPD vs MOV", "UPD vs SWP"},
-  {"MOV vs INS",     "MOV vs DEL",     "MOV vs UPD", "T5: MOV vs MOV", "MOV vs SWP"},
-  {"T6: SWP vs INS", "T7: SWP vs DEL", "SWP vs UPD", "SWP vs MOV", "SWP vs SWP"},
+  {"T1: INS vs INS", "T3: INS vs DEL", "INS vs UPD", "INS vs MOV", "INS vs SWP", "INS vs CMP"},
+  {"T2: DEL vs INS", "T4: DEL vs DEL", "DEL vs UPD", "DEL vs MOV", "DEL vs SWP", "DEL vs CMP"},
+  {"UPD vs INS",     "UPD vs DEL",     "UPD vs UPD", "UPD vs MOV", "UPD vs SWP", "UPD vs CMP"},
+  {"MOV vs INS",     "MOV vs DEL",     "MOV vs UPD", "T5: MOV vs MOV", "MOV vs SWP", "MOV vs CMP"},
+  {"T6: SWP vs INS", "T7: SWP vs DEL", "SWP vs UPD", "SWP vs MOV", "SWP vs SWP", "SWP vs CMP"},
+  {"CMP vs INS",     "CMP vs DEL",     "CMP vs UPD", "CMP vs MOV", "CMP vs SWP", "CMP vs CMP"},
 };
 
 static crabs_transform_entry_t _entry_result;
