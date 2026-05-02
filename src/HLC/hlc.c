@@ -114,7 +114,7 @@ int crabs_hlc_format(const crabs_hlc_t* hlc, char* buf, size_t buf_len) {
 
   time_t sec = (time_t)hlc->physical_seconds;
   struct tm tm;
-  gmtime_r(&sec, &tm);
+  if (gmtime_r(&sec, &tm) == NULL) return -1;
 
   int written = snprintf(buf, buf_len,
     "%04d-%02d-%02dT%02d:%02d:%02d.%09lu#%lu@%s",
@@ -307,6 +307,7 @@ crabs_hlc_receive_result_e crabs_hlc_receive(crabs_hlc_state_t* state,
       // In a real deployment, this would collect confirmations from other nodes
       // For now, accept but increment quorum_failures to indicate
       // the limitation
+      state->quorum_failures += 1;
       break;
 
     case HLC_STRATEGY_STRICT:
@@ -360,4 +361,97 @@ crabs_hlc_receive_result_e crabs_hlc_receive(crabs_hlc_state_t* state,
   // else: max is behind last, keep last as-is (shouldn't happen normally)
 
   return CRABS_HLC_ACCEPTED;
+}
+
+// ============================================================
+// HLC Serialization (v1.6 Amd6 §9)
+// ============================================================
+
+size_t crabs_hlc_serialize(const crabs_hlc_t* hlc, uint8_t* buf, size_t buf_len) {
+  if (hlc == NULL || buf == NULL) return 0;
+
+  // Calculate node_id length (without null terminator)
+  size_t node_id_len = strlen(hlc->node_id);
+  size_t total_len = 8 + 8 + 8 + 2 + node_id_len;  // 26 + node_id
+
+  if (buf_len < total_len) return 0;
+
+  // Validate nanos
+  if (hlc->physical_nanos >= 1000000000ULL) return 0;
+
+  size_t offset = 0;
+
+  // physical_seconds (8 bytes, big-endian)
+  for (int i = 7; i >= 0; i--) {
+    buf[offset++] = (uint8_t)(hlc->physical_seconds >> (i * 8));
+  }
+
+  // physical_nanos (8 bytes, big-endian)
+  for (int i = 7; i >= 0; i--) {
+    buf[offset++] = (uint8_t)(hlc->physical_nanos >> (i * 8));
+  }
+
+  // logical_counter (8 bytes, big-endian)
+  for (int i = 7; i >= 0; i--) {
+    buf[offset++] = (uint8_t)(hlc->logical_counter >> (i * 8));
+  }
+
+  // node_id_length (2 bytes, big-endian)
+  buf[offset++] = (uint8_t)(node_id_len >> 8);
+  buf[offset++] = (uint8_t)(node_id_len & 0xFF);
+
+  // node_id (variable length)
+  memcpy(buf + offset, hlc->node_id, node_id_len);
+  offset += node_id_len;
+
+  return offset;
+}
+
+size_t crabs_hlc_deserialize(crabs_hlc_t* hlc, const uint8_t* data, size_t data_len) {
+  if (hlc == NULL || data == NULL) return 0;
+
+  // Minimum: 8 + 8 + 8 + 2 = 26 bytes (with empty node_id)
+  if (data_len < 26) return 0;
+
+  memset(hlc, 0, sizeof(crabs_hlc_t));
+
+  size_t offset = 0;
+
+  // physical_seconds (8 bytes, big-endian)
+  hlc->physical_seconds = 0;
+  for (int i = 0; i < 8; i++) {
+    hlc->physical_seconds = (hlc->physical_seconds << 8) | data[offset++];
+  }
+
+  // physical_nanos (8 bytes, big-endian)
+  hlc->physical_nanos = 0;
+  for (int i = 0; i < 8; i++) {
+    hlc->physical_nanos = (hlc->physical_nanos << 8) | data[offset++];
+  }
+
+  // logical_counter (8 bytes, big-endian)
+  hlc->logical_counter = 0;
+  for (int i = 0; i < 8; i++) {
+    hlc->logical_counter = (hlc->logical_counter << 8) | data[offset++];
+  }
+
+  // Validate nanos
+  if (hlc->physical_nanos >= 1000000000ULL) return 0;
+
+  // node_id_length (2 bytes, big-endian)
+  uint16_t node_id_len = ((uint16_t)data[offset] << 8) | data[offset + 1];
+  offset += 2;
+
+  // Validate node_id_length
+  if (node_id_len >= CRABS_HLC_NODE_ID_SIZE) return 0;
+
+  // Check remaining data
+  if (data_len < offset + node_id_len) return 0;
+
+  // node_id
+  memcpy(hlc->node_id, data + offset, node_id_len);
+  hlc->node_id[node_id_len] = '\0';
+  offset += node_id_len;
+
+  return offset;
 }

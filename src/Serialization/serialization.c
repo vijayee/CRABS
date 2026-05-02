@@ -959,6 +959,14 @@ static void _serialize_log_entry(write_buf_t* buf, const log_entry_t* entry) {
   _write_uint64_le(buf, entry->lamport_time);
   _write_string16(buf, entry->node_id);
   _write_bytes(buf, entry->state_hash, CRABS_HASH_SIZE);
+  // v1.6 Amd6: ordering fields
+  _write_uint8(buf, (uint8_t)entry->ordering_system);
+  if (entry->ordering_system == CRABS_ORDERING_HLC) {
+    _write_uint64_le(buf, entry->hlc.physical_seconds);
+    _write_uint64_le(buf, entry->hlc.physical_nanos);
+    _write_uint64_le(buf, entry->hlc.logical_counter);
+    _write_string16(buf, entry->hlc.node_id);
+  }
 }
 
 static bool _deserialize_log_entry(read_buf_t* buf, log_entry_t* entry) {
@@ -969,6 +977,18 @@ static bool _deserialize_log_entry(read_buf_t* buf, log_entry_t* entry) {
   if (!_read_uint64_le(buf, &entry->lamport_time)) return false;
   if (!_read_string16(buf, entry->node_id, CRABS_MAX_USER_ID)) return false;
   if (!_read_bytes(buf, entry->state_hash, CRABS_HASH_SIZE)) return false;
+  // v1.6 Amd6: ordering fields (backward compatible — defaults to LAMPORT if absent)
+  entry->ordering_system = CRABS_ORDERING_LAMPORT;
+  memset(&entry->hlc, 0, sizeof(crabs_hlc_t));
+  if (buf->offset < buf->len) {
+    if (!_read_uint8(buf, (uint8_t*)&entry->ordering_system)) return false;
+    if (entry->ordering_system == CRABS_ORDERING_HLC) {
+      if (!_read_uint64_le(buf, &entry->hlc.physical_seconds)) return false;
+      if (!_read_uint64_le(buf, &entry->hlc.physical_nanos)) return false;
+      if (!_read_uint64_le(buf, &entry->hlc.logical_counter)) return false;
+      if (!_read_string16(buf, entry->hlc.node_id, CRABS_HLC_NODE_ID_SIZE)) return false;
+    }
+  }
   return true;
 }
 
@@ -1712,6 +1732,19 @@ serialized_buffer_t* crabs_serialize_for_signing(const operation_t* op) {
     // Note: rejection_message and state_mutation are NOT included in canonical form
     // They are part of the operation payload, not the signature domain
   }
+
+  // 16. op.ordering_system (v1.6 Amd6 §6.2: uint8 discriminator)
+  _write_uint8(buf, (uint8_t)op->ordering_system);
+
+  // 17. Ordering fields (v1.6 Amd6 §6.2: conditional on ordering_system)
+  if (op->ordering_system == CRABS_ORDERING_HLC) {
+    // HLC: physical_seconds, physical_nanos, logical_counter, node_id
+    _write_uint64_le(buf, op->hlc.physical_seconds);
+    _write_uint64_le(buf, op->hlc.physical_nanos);
+    _write_uint64_le(buf, op->hlc.logical_counter);
+    _write_string16(buf, op->hlc.node_id);
+  }
+  // Lamport: lamport_time is already included at position 11
 
   // Create output
   serialized_buffer_t* result = serialized_buffer_create(buf->offset);

@@ -218,4 +218,26 @@ crabs_hlc_t crabs_hlc_next(crabs_hlc_state_t* state);
 crabs_hlc_receive_result_e crabs_hlc_receive(crabs_hlc_state_t* state,
                                                const crabs_hlc_t* received);
 
+// ============================================================
+// HLC Serialization (v1.6 Amd6 §9)
+// ============================================================
+
+// HLC serialized format:
+//   physical_seconds: uint64 (8 bytes)
+//   physical_nanos:   uint64 (8 bytes)
+//   logical_counter:  uint64 (8 bytes)
+//   node_id_length:   uint16 (2 bytes)
+//   node_id:          byte[node_id_length]
+// Total: 26 bytes + node_id
+
+// Serialize an HLC timestamp to a byte buffer.
+// Returns number of bytes written, or 0 on error.
+// buf must be at least 26 + strlen(node_id) bytes.
+size_t crabs_hlc_serialize(const crabs_hlc_t* hlc, uint8_t* buf, size_t buf_len);
+
+// Deserialize an HLC timestamp from a byte buffer.
+// Returns number of bytes consumed, or 0 on error.
+// Validates that nanos < 1,000,000,000 and node_id_length <= CRABS_HLC_NODE_ID_SIZE.
+size_t crabs_hlc_deserialize(crabs_hlc_t* hlc, const uint8_t* data, size_t data_len);
+
 #endif // CRABS_HLC_H

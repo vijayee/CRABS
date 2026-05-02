@@ -10,6 +10,8 @@
 
 extern "C" {
 #include "HLC/hlc.h"
+#include "Serialization/serialization.h"
+#include "StateMachine/state_machine.h"
 }
 
 // ============================================================
@@ -997,4 +999,152 @@ TEST(HLCOrdering, LogEntryHasOrderingFields) {
   EXPECT_EQ(entry.hlc.physical_nanos, 500000000u);
   EXPECT_EQ(entry.hlc.logical_counter, 42u);
   EXPECT_STREQ(entry.hlc.node_id, "alice");
+}
+
+// ============================================================
+// HLC Serialization Tests (§9)
+// ============================================================
+
+TEST(HLCSerialization, SerializeDeserialize) {
+  crabs_hlc_t original = {36000, 500123456, 42, "alice"};
+  uint8_t buf[128];
+
+  size_t written = crabs_hlc_serialize(&original, buf, sizeof(buf));
+  EXPECT_GT(written, 0u);
+
+  // Expected: 8 + 8 + 8 + 2 + 5 = 31 bytes
+  EXPECT_EQ(written, 31u);
+
+  crabs_hlc_t decoded;
+  memset(&decoded, 0, sizeof(decoded));
+  size_t consumed = crabs_hlc_deserialize(&decoded, buf, written);
+  EXPECT_EQ(consumed, written);
+
+  EXPECT_EQ(decoded.physical_seconds, 36000u);
+  EXPECT_EQ(decoded.physical_nanos, 500123456u);
+  EXPECT_EQ(decoded.logical_counter, 42u);
+  EXPECT_STREQ(decoded.node_id, "alice");
+}
+
+TEST(HLCSerialization, SerializeEmptyNodeId) {
+  crabs_hlc_t original = {36000, 0, 0, ""};
+  uint8_t buf[64];
+
+  size_t written = crabs_hlc_serialize(&original, buf, sizeof(buf));
+  EXPECT_EQ(written, 26u);  // 26 + 0 bytes for empty node_id
+
+  crabs_hlc_t decoded;
+  size_t consumed = crabs_hlc_deserialize(&decoded, buf, written);
+  EXPECT_EQ(consumed, 26u);
+  EXPECT_STREQ(decoded.node_id, "");
+}
+
+TEST(HLCSerialization, SerializeBufferTooSmall) {
+  crabs_hlc_t original = {36000, 0, 0, "alice"};
+  uint8_t buf[10];  // Too small
+
+  size_t written = crabs_hlc_serialize(&original, buf, sizeof(buf));
+  EXPECT_EQ(written, 0u);
+}
+
+TEST(HLCSerialization, DeserializeBufferTooShort) {
+  crabs_hlc_t decoded;
+  uint8_t data[10];  // Too short
+  memset(data, 0, sizeof(data));
+
+  size_t consumed = crabs_hlc_deserialize(&decoded, data, sizeof(data));
+  EXPECT_EQ(consumed, 0u);
+}
+
+TEST(HLCSerialization, DeserializeInvalidNanos) {
+  // Create serialized data with invalid nanos >= 1B
+  uint8_t buf[32];
+  memset(buf, 0, sizeof(buf));
+
+  // physical_seconds = 36000
+  // physical_nanos = 1000000000 (invalid)
+  uint64_t invalid_nanos = 1000000000ULL;
+  for (int i = 7; i >= 0; i--) {
+    buf[8 + (7 - i)] = (uint8_t)(invalid_nanos >> (i * 8));
+  }
+
+  crabs_hlc_t decoded;
+  size_t consumed = crabs_hlc_deserialize(&decoded, buf, sizeof(buf));
+  EXPECT_EQ(consumed, 0u);  // Should reject invalid nanos
+}
+
+TEST(HLCSerialization, NullPointers) {
+  crabs_hlc_t hlc = {36000, 0, 0, "alice"};
+  uint8_t buf[64];
+
+  EXPECT_EQ(crabs_hlc_serialize(NULL, buf, sizeof(buf)), 0u);
+  EXPECT_EQ(crabs_hlc_serialize(&hlc, NULL, sizeof(buf)), 0u);
+
+  EXPECT_EQ(crabs_hlc_deserialize(NULL, buf, sizeof(buf)), 0u);
+  EXPECT_EQ(crabs_hlc_deserialize(&hlc, NULL, sizeof(buf)), 0u);
+}
+
+TEST(HLCSerialization, LongNodeId) {
+  char long_id[63];
+  memset(long_id, 'X', 62);
+  long_id[62] = '\0';
+
+  crabs_hlc_t original = {36000, 500000000, 10, ""};
+  strncpy(original.node_id, long_id, CRABS_HLC_NODE_ID_SIZE - 1);
+
+  uint8_t buf[128];
+  size_t written = crabs_hlc_serialize(&original, buf, sizeof(buf));
+  EXPECT_GT(written, 0u);
+
+  crabs_hlc_t decoded;
+  size_t consumed = crabs_hlc_deserialize(&decoded, buf, written);
+  EXPECT_EQ(consumed, written);
+  EXPECT_STREQ(decoded.node_id, long_id);
+}
+
+TEST(HLCSerialization, CanonicalSigningIncludesOrderingSystem) {
+  // Create a Lamport operation and verify serialization includes ordering_system
+  operation_t op;
+  memset(&op, 0, sizeof(op));
+  strncpy(op.type, "__lock__", CRABS_MAX_OP_NAME - 1);
+  op.ordering_system = CRABS_ORDERING_LAMPORT;
+  op.lamport_time = 42;
+  strncpy(op.node_id, "alice", CRABS_MAX_USER_ID - 1);
+
+  serialized_buffer_t* sig_data = crabs_serialize_for_signing(&op);
+  EXPECT_NE(sig_data, nullptr);
+  EXPECT_GT(sig_data->len, 0u);
+
+  serialized_buffer_destroy(sig_data);
+}
+
+TEST(HLCSerialization, CanonicalSigningHLCOperation) {
+  // Create an HLC operation and verify serialization includes HLC fields
+  operation_t op;
+  memset(&op, 0, sizeof(op));
+  strncpy(op.type, "__lock__", CRABS_MAX_OP_NAME - 1);
+  op.ordering_system = CRABS_ORDERING_HLC;
+  op.hlc = {36000, 500000000, 42, "alice"};
+  strncpy(op.node_id, "alice", CRABS_MAX_USER_ID - 1);
+
+  serialized_buffer_t* sig_data = crabs_serialize_for_signing(&op);
+  EXPECT_NE(sig_data, nullptr);
+  EXPECT_GT(sig_data->len, 0u);
+
+  // HLC operation should serialize more bytes than Lamport
+  // (due to extra HLC fields)
+  operation_t lamport_op;
+  memset(&lamport_op, 0, sizeof(lamport_op));
+  strncpy(lamport_op.type, "__lock__", CRABS_MAX_OP_NAME - 1);
+  lamport_op.ordering_system = CRABS_ORDERING_LAMPORT;
+  lamport_op.lamport_time = 42;
+  strncpy(lamport_op.node_id, "alice", CRABS_MAX_USER_ID - 1);
+
+  serialized_buffer_t* lamport_data = crabs_serialize_for_signing(&lamport_op);
+  EXPECT_NE(lamport_data, nullptr);
+  // HLC has 3 extra uint64 fields (24 bytes) plus length-prefixed node_id
+  EXPECT_GT(sig_data->len, lamport_data->len);
+
+  serialized_buffer_destroy(sig_data);
+  serialized_buffer_destroy(lamport_data);
 }
