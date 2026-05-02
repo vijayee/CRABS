@@ -6,6 +6,7 @@
 //
 
 #include "compaction.h"
+#include "compact_op.h"
 #include <stdio.h>
 #include <string.h>
 
@@ -146,8 +147,15 @@ bool crabs_needs_compaction(const crabs_tombstone_config_t* config,
   if (config == NULL || registry == NULL || item == NULL) return false;
   if (config->strategy == CRABS_COMPACT_NONE) return false;
 
+  // Try CRDT vtable first
   uint64_t tombstones = crabs_tombstone_count(registry, item);
   uint64_t visible = crabs_visible_size(registry, item);
+
+  // For OT types with no vtable, use OT-specific counting
+  if (tombstones == 0 && visible == 0 && item->ot_data != NULL) {
+    tombstones = crabs_ot_tombstone_count(item->type, item->value);
+    visible = crabs_ot_visible_count(item->type, item->value);
+  }
 
   // Emergency threshold: always compact regardless of ratio
   if (config->emergency_tombstone_count > 0 &&

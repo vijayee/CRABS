@@ -103,6 +103,7 @@ crabs_ot_document_t* crabs_extract_visible_document(
       }
       visible->tail = new_span;
       visible->span_count++;
+      visible->visible_char_count += new_span->text_size;
     }
     span = span->next;
   }
@@ -146,6 +147,70 @@ void* crabs_extract_visible(data_type_e type, const void* value) {
         (const crabs_ot_tree_t*)value);
     default:
       return NULL;
+  }
+}
+
+// ============================================================
+// COMPACT Operation (v1.6 §3)
+// ============================================================
+
+// ============================================================
+// OT Type Tombstone Counting (v1.5.2 §4)
+// ============================================================
+
+uint64_t crabs_ot_tombstone_count(data_type_e type, const void* value) {
+  if (value == NULL) return 0;
+
+  switch (type) {
+    case DATA_TYPE_OT_ORDERED_SET: {
+      const crabs_ot_ordered_set_t* set = (const crabs_ot_ordered_set_t*)value;
+      return (uint64_t)(set->count - set->visible_count);
+    }
+    case DATA_TYPE_OT_DOCUMENT: {
+      const crabs_ot_document_t* doc = (const crabs_ot_document_t*)value;
+      // Count spans marked deleted
+      uint64_t deleted = 0;
+      const crabs_span_t* span = doc->head;
+      while (span != NULL) {
+        if (span->deleted) deleted++;
+        span = span->next;
+      }
+      return deleted;
+    }
+    case DATA_TYPE_OT_TREE: {
+      const crabs_ot_tree_t* tree = (const crabs_ot_tree_t*)value;
+      return (uint64_t)(tree->node_count - tree->visible_count);
+    }
+    default:
+      return 0;
+  }
+}
+
+uint64_t crabs_ot_visible_count(data_type_e type, const void* value) {
+  if (value == NULL) return 0;
+
+  switch (type) {
+    case DATA_TYPE_OT_ORDERED_SET: {
+      const crabs_ot_ordered_set_t* set = (const crabs_ot_ordered_set_t*)value;
+      return (uint64_t)set->visible_count;
+    }
+    case DATA_TYPE_OT_DOCUMENT: {
+      const crabs_ot_document_t* doc = (const crabs_ot_document_t*)value;
+      // Count spans not deleted
+      uint64_t visible = 0;
+      const crabs_span_t* span = doc->head;
+      while (span != NULL) {
+        if (!span->deleted) visible++;
+        span = span->next;
+      }
+      return visible;
+    }
+    case DATA_TYPE_OT_TREE: {
+      const crabs_ot_tree_t* tree = (const crabs_ot_tree_t*)value;
+      return (uint64_t)tree->visible_count;
+    }
+    default:
+      return 0;
   }
 }
 

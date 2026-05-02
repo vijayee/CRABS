@@ -33,6 +33,18 @@ void crabs_compact_id_init(crabs_ot_op_id_t* id, const char* node_id,
 void* crabs_extract_visible(data_type_e type, const void* value);
 
 // ============================================================
+// OT Type Tombstone Counting (v1.5.2 §4)
+// ============================================================
+
+// Count tombstones (deleted entries) in an OT data item.
+// Returns 0 for non-OT types or null values.
+uint64_t crabs_ot_tombstone_count(data_type_e type, const void* value);
+
+// Count visible (non-deleted) entries in an OT data item.
+// Returns 0 for non-OT types or null values.
+uint64_t crabs_ot_visible_count(data_type_e type, const void* value);
+
+// ============================================================
 // COMPACT Operation (v1.6 §3)
 // ============================================================
 
