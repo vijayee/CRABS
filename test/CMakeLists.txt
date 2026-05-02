@@ -36,6 +36,7 @@ if (BUILD_TESTING)
         test_one_shot.cpp
         test_dedup.cpp
         test_cli.cpp
+        test_position_map.cpp
     )
 
     add_dependencies(testcrabs crabs)
