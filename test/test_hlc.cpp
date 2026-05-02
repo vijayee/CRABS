@@ -321,3 +321,260 @@ TEST(HLCCore, DefaultConstants) {
   EXPECT_EQ(CRABS_HLC_DEFAULT_QUORUM_TIMEOUT_MS, 1000u);
   EXPECT_EQ(CRABS_HLC_DEFAULT_TRUSTED_RESYNC_MS, 30000u);
 }
+
+// ============================================================
+// Mock Time Source for Deterministic Testing
+// ============================================================
+
+static crabs_physical_time_t g_mock_time = {0, 0, false};
+
+static crabs_physical_time_t mock_get_time(void* ctx) {
+  (void)ctx;
+  return g_mock_time;
+}
+
+static bool mock_is_available(void* ctx) {
+  (void)ctx;
+  return g_mock_time.valid;
+}
+
+static crabs_time_source_ops_t g_mock_ops = {
+  mock_get_time,
+  mock_is_available,
+  NULL
+};
+
+// Helper: create state with mock time source
+static crabs_hlc_state_t make_mock_state(const char* node_id,
+                                          uint64_t sec, uint64_t nanos) {
+  g_mock_time.seconds = sec;
+  g_mock_time.nanos = nanos;
+  g_mock_time.valid = true;
+
+  crabs_hlc_state_t state;
+  crabs_hlc_state_init(&state, node_id);
+  state.time_source_ops = &g_mock_ops;
+  return state;
+}
+
+// ============================================================
+// HLC Generation Tests (§4.1, §12.1-12.3)
+// ============================================================
+
+TEST(HLCGeneration, NullState) {
+  crabs_hlc_t hlc = crabs_hlc_next(NULL);
+  EXPECT_EQ(hlc.physical_seconds, 0u);
+  EXPECT_EQ(hlc.physical_nanos, 0u);
+  EXPECT_EQ(hlc.logical_counter, 0u);
+  EXPECT_STREQ(hlc.node_id, "");
+}
+
+// §12.1: Basic HLC Generation
+TEST(HLCGeneration, InitialTimestamp) {
+  crabs_hlc_state_t state = make_mock_state("alice", 36000, 500000000);
+
+  crabs_hlc_t hlc = crabs_hlc_next(&state);
+
+  EXPECT_EQ(hlc.physical_seconds, 36000u);
+  EXPECT_EQ(hlc.physical_nanos, 500000000u);
+  EXPECT_EQ(hlc.logical_counter, 0u);
+  EXPECT_STREQ(hlc.node_id, "alice");
+
+  // State should be updated
+  EXPECT_EQ(state.last.physical_seconds, 36000u);
+  EXPECT_EQ(state.last.physical_nanos, 500000000u);
+  EXPECT_EQ(state.last.logical_counter, 0u);
+}
+
+// §12.2: Same-Nanosecond Events
+TEST(HLCGeneration, SameNanosecondEvents) {
+  crabs_hlc_state_t state = make_mock_state("alice", 36000, 500000000);
+
+  crabs_hlc_t hlc1 = crabs_hlc_next(&state);
+  EXPECT_EQ(hlc1.physical_seconds, 36000u);
+  EXPECT_EQ(hlc1.physical_nanos, 500000000u);
+  EXPECT_EQ(hlc1.logical_counter, 0u);
+
+  // Time doesn't change — same nanosecond
+  g_mock_time.seconds = 36000;
+  g_mock_time.nanos = 500000000;
+
+  crabs_hlc_t hlc2 = crabs_hlc_next(&state);
+  EXPECT_EQ(hlc2.physical_seconds, 36000u);
+  EXPECT_EQ(hlc2.physical_nanos, 500000000u);
+  EXPECT_EQ(hlc2.logical_counter, 1u);
+
+  // Still same nanosecond
+  crabs_hlc_t hlc3 = crabs_hlc_next(&state);
+  EXPECT_EQ(hlc3.physical_seconds, 36000u);
+  EXPECT_EQ(hlc3.physical_nanos, 500000000u);
+  EXPECT_EQ(hlc3.logical_counter, 2u);
+}
+
+// §12.2: Events are properly ordered
+TEST(HLCGeneration, SameNanosecondOrdering) {
+  crabs_hlc_state_t state = make_mock_state("alice", 36000, 500000000);
+
+  crabs_hlc_t hlc1 = crabs_hlc_next(&state);
+  g_mock_time.seconds = 36000;
+  g_mock_time.nanos = 500000000;
+  crabs_hlc_t hlc2 = crabs_hlc_next(&state);
+  crabs_hlc_t hlc3 = crabs_hlc_next(&state);
+
+  EXPECT_LT(crabs_hlc_compare(&hlc1, &hlc2), 0);
+  EXPECT_LT(crabs_hlc_compare(&hlc2, &hlc3), 0);
+}
+
+// §12.3: Clock Regression
+TEST(HLCGeneration, ClockRegression) {
+  // Set up initial state with a known timestamp
+  crabs_hlc_state_t state = make_mock_state("alice", 36000, 500000000);
+  crabs_hlc_next(&state);  // Establish baseline: (36000, 500000000, 0)
+
+  // Now physical clock regresses (jumps backward 600ms)
+  g_mock_time.seconds = 35999;
+  g_mock_time.nanos = 900000000;
+
+  uint64_t regressions_before = state.clock_regressions_detected;
+  crabs_hlc_t hlc = crabs_hlc_next(&state);
+
+  // Should use last known physical time + increment counter
+  EXPECT_EQ(hlc.physical_seconds, 36000u);
+  EXPECT_EQ(hlc.physical_nanos, 500000000u);
+  EXPECT_EQ(hlc.logical_counter, 1u);
+  EXPECT_EQ(state.clock_regressions_detected, regressions_before + 1);
+}
+
+// Clock regression with same-second but lower nanos
+TEST(HLCGeneration, ClockRegressionNanos) {
+  crabs_hlc_state_t state = make_mock_state("alice", 36000, 500000000);
+  crabs_hlc_next(&state);
+
+  // Clock regresses within the same second
+  g_mock_time.seconds = 36000;
+  g_mock_time.nanos = 400000000;  // 100ms before last timestamp
+
+  uint64_t regressions_before = state.clock_regressions_detected;
+  crabs_hlc_t hlc = crabs_hlc_next(&state);
+
+  EXPECT_EQ(hlc.physical_seconds, 36000u);
+  EXPECT_EQ(hlc.physical_nanos, 500000000u);
+  EXPECT_EQ(hlc.logical_counter, 1u);
+  EXPECT_EQ(state.clock_regressions_detected, regressions_before + 1);
+}
+
+// Time source unavailable
+TEST(HLCGeneration, TimeSourceUnavailable) {
+  crabs_hlc_state_t state = make_mock_state("alice", 36000, 500000000);
+  crabs_hlc_next(&state);
+
+  // Time source becomes unavailable
+  g_mock_time.valid = false;
+
+  crabs_hlc_t hlc = crabs_hlc_next(&state);
+
+  // Should use last known time + increment counter
+  EXPECT_EQ(hlc.physical_seconds, 36000u);
+  EXPECT_EQ(hlc.physical_nanos, 500000000u);
+  EXPECT_EQ(hlc.logical_counter, 1u);
+}
+
+// Normal time advance resets counter
+TEST(HLCGeneration, NormalAdvanceResetsCounter) {
+  crabs_hlc_state_t state = make_mock_state("alice", 36000, 500000000);
+
+  // Generate same-nanosecond events to build up counter
+  crabs_hlc_next(&state);  // counter=0
+  crabs_hlc_next(&state);  // counter=1
+  crabs_hlc_next(&state);  // counter=2
+
+  // Time advances
+  g_mock_time.seconds = 36001;
+  g_mock_time.nanos = 0;
+  g_mock_time.valid = true;
+
+  crabs_hlc_t hlc = crabs_hlc_next(&state);
+  EXPECT_EQ(hlc.physical_seconds, 36001u);
+  EXPECT_EQ(hlc.physical_nanos, 0u);
+  EXPECT_EQ(hlc.logical_counter, 0u);  // Reset!
+}
+
+// Monotonicity guarantee
+TEST(HLCGeneration, Monotonicity) {
+  crabs_hlc_state_t state = make_mock_state("alice", 36000, 0);
+  crabs_hlc_t prev = crabs_hlc_next(&state);
+
+  // Generate 100 events with varying time behavior
+  for (int i = 0; i < 100; i++) {
+    // Alternate between time advance, same time, and regression
+    if (i % 3 == 0) {
+      g_mock_time.seconds = 36000 + (i / 3) + 1;
+      g_mock_time.nanos = 0;
+      g_mock_time.valid = true;
+    } else if (i % 3 == 1) {
+      // Same nanosecond (no time change)
+    } else {
+      // Regression
+      g_mock_time.seconds = 35999;
+      g_mock_time.nanos = 0;
+      g_mock_time.valid = true;
+    }
+
+    crabs_hlc_t curr = crabs_hlc_next(&state);
+    EXPECT_LT(crabs_hlc_compare(&prev, &curr), 0)
+      << "Monotonicity violated at iteration " << i;
+    prev = curr;
+  }
+}
+
+// Node ID preserved in generated timestamps
+TEST(HLCGeneration, NodeIdPreserved) {
+  crabs_hlc_state_t state = make_mock_state("testnode", 36000, 0);
+  crabs_hlc_t hlc = crabs_hlc_next(&state);
+  EXPECT_STREQ(hlc.node_id, "testnode");
+}
+
+// ============================================================
+// Physical Time Source Tests (§7)
+// ============================================================
+
+TEST(HLCGeneration, SystemTimeSource) {
+  crabs_physical_time_t t = crabs_hlc_get_system_time(NULL);
+  // System clock should return valid time (epoch > 1700000000 for 2023+)
+  EXPECT_TRUE(t.valid);
+  EXPECT_GT(t.seconds, 1700000000u);
+}
+
+TEST(HLCGeneration, MockTimeSource) {
+  g_mock_time.seconds = 36000;
+  g_mock_time.nanos = 500000000;
+  g_mock_time.valid = true;
+
+  crabs_hlc_state_t state;
+  crabs_hlc_state_init(&state, "test");
+  state.time_source_ops = &g_mock_ops;
+
+  crabs_physical_time_t t = crabs_hlc_get_physical_time(&state);
+  EXPECT_TRUE(t.valid);
+  EXPECT_EQ(t.seconds, 36000u);
+  EXPECT_EQ(t.nanos, 500000000u);
+}
+
+TEST(HLCGeneration, MockTimeSourceUnavailable) {
+  g_mock_time.valid = false;
+
+  crabs_hlc_state_t state;
+  crabs_hlc_state_init(&state, "test");
+  state.time_source_ops = &g_mock_ops;
+
+  crabs_physical_time_t t = crabs_hlc_get_physical_time(&state);
+  EXPECT_FALSE(t.valid);
+}
+
+TEST(HLCGeneration, DefaultTimeSourceFallsBackToSystemClock) {
+  crabs_hlc_state_t state;
+  crabs_hlc_state_init(&state, "test");
+  // No mock time source — should use system clock
+  crabs_physical_time_t t = crabs_hlc_get_physical_time(&state);
+  EXPECT_TRUE(t.valid);
+}
