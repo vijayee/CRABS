@@ -39,6 +39,7 @@ if (BUILD_TESTING)
         test_position_map.cpp
         test_ot_types.cpp
         test_ot_transform.cpp
+        test_ot_ordered_set.cpp
     )
 
     add_dependencies(testcrabs crabs)
