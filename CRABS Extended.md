@@ -30,7 +30,7 @@ Raph Levien's work on the synthesis of OT and CRDTs  demonstrates that the trans
 
 ### 1.2 Our Approach
 
-We present **CRABS** (Cryptographic Role-based Attribute-gated Blockchain-like State machines), a protocol that unifies these threads into a single framework. The key insight is:
+We present **CRABS** (Cryptographic Attribute-Based State machines), a protocol that unifies these threads into a single framework. The key insight is:
 
 > **Attributes are not keys. Attributes are state.**
 
