@@ -1286,3 +1286,188 @@ TEST(HLCLockIntegration, StateMachineLockExpiredHLCMode) {
 
   state_destroy(state);
 }
+
+// ============================================================
+// HLC Test Vectors (v1.6 Amd6 §12)
+// ============================================================
+
+TEST(HLCTestVectors, TV12_1_BasicHLCGeneration) {
+  // §12.1: Initial timestamp from physical time
+  crabs_hlc_state_t state;
+  crabs_hlc_state_init(&state, "alice");
+
+  // Mock physical time: epoch=36000, nanos=500000000
+  g_mock_time = {36000, 500000000, true};
+  g_mock_ops = {mock_get_time, mock_is_available, NULL};
+  state.time_source_ops = &g_mock_ops;
+
+  crabs_hlc_t result = crabs_hlc_next(&state);
+
+  EXPECT_EQ(result.physical_seconds, 36000u);
+  EXPECT_EQ(result.physical_nanos, 500000000u);
+  EXPECT_EQ(result.logical_counter, 0u);
+  EXPECT_STREQ(result.node_id, "alice");
+}
+
+TEST(HLCTestVectors, TV12_2_SameNanosecondEvents) {
+  // §12.2: Same-nanosecond events increment logical counter
+  crabs_hlc_state_t state;
+  crabs_hlc_state_init(&state, "alice");
+
+  // Mock time stays constant at (36000, 500000000)
+  g_mock_time = {36000, 500000000, true};
+  g_mock_ops = {mock_get_time, mock_is_available, NULL};
+  state.time_source_ops = &g_mock_ops;
+
+  crabs_hlc_t event1 = crabs_hlc_next(&state);
+  EXPECT_EQ(event1.physical_seconds, 36000u);
+  EXPECT_EQ(event1.physical_nanos, 500000000u);
+  EXPECT_EQ(event1.logical_counter, 0u);
+
+  crabs_hlc_t event2 = crabs_hlc_next(&state);
+  EXPECT_EQ(event2.physical_seconds, 36000u);
+  EXPECT_EQ(event2.physical_nanos, 500000000u);
+  EXPECT_EQ(event2.logical_counter, 1u);
+
+  crabs_hlc_t event3 = crabs_hlc_next(&state);
+  EXPECT_EQ(event3.physical_seconds, 36000u);
+  EXPECT_EQ(event3.physical_nanos, 500000000u);
+  EXPECT_EQ(event3.logical_counter, 2u);
+
+  // Verify ordering: 0 < 1 < 2
+  EXPECT_LT(crabs_hlc_compare(&event1, &event2), 0);
+  EXPECT_LT(crabs_hlc_compare(&event2, &event3), 0);
+}
+
+TEST(HLCTestVectors, TV12_3_ClockRegression) {
+  // §12.3: Clock regression — counter increments on last known time
+  crabs_hlc_state_t state;
+  crabs_hlc_state_init(&state, "alice");
+
+  // Set up: first advance to (36000, 500000000, 5)
+  g_mock_time = {36000, 500000000, true};
+  g_mock_ops = {mock_get_time, mock_is_available, NULL};
+  state.time_source_ops = &g_mock_ops;
+
+  // Generate events until counter reaches 5
+  for (int i = 0; i <= 5; i++) {
+    crabs_hlc_next(&state);
+  }
+  EXPECT_EQ(state.last.logical_counter, 5u);
+
+  // Now clock regresses: physical time jumps BACK 600ms
+  g_mock_time = {35999, 900000000, true};
+
+  uint64_t regressions_before = state.clock_regressions_detected;
+  crabs_hlc_t result = crabs_hlc_next(&state);
+
+  EXPECT_EQ(result.physical_seconds, 36000u);
+  EXPECT_EQ(result.physical_nanos, 500000000u);
+  EXPECT_EQ(result.logical_counter, 6u);
+  EXPECT_STREQ(result.node_id, "alice");
+  EXPECT_EQ(state.clock_regressions_detected, regressions_before + 1);
+}
+
+TEST(HLCTestVectors, TV12_4_BoundedStrategyAccept) {
+  // §12.4: BOUNDED strategy — timestamp within skew window
+  crabs_hlc_state_t state;
+  crabs_hlc_state_init_strategy(&state, "alice", HLC_STRATEGY_BOUNDED);
+  state.max_skew_ms = 5000;
+
+  // Mock local time = (36000, 0)
+  g_mock_time = {36000, 0, true};
+  g_mock_ops = {mock_get_time, mock_is_available, NULL};
+  state.time_source_ops = &g_mock_ops;
+
+  // Generate initial timestamp
+  crabs_hlc_next(&state);
+
+  // Received from Node B: (36002, 0, 0, "bob") — 2 seconds ahead
+  crabs_hlc_t received = {36002, 0, 0, "bob"};
+
+  crabs_hlc_receive_result_e result = crabs_hlc_receive(&state, &received);
+
+  EXPECT_EQ(result, CRABS_HLC_ACCEPTED);
+  // After max rule, state should have advanced to received time
+  EXPECT_EQ(state.last.physical_seconds, 36002u);
+}
+
+TEST(HLCTestVectors, TV12_5_BoundedStrategyReject) {
+  // §12.5: BOUNDED strategy — timestamp too far ahead
+  crabs_hlc_state_t state;
+  crabs_hlc_state_init_strategy(&state, "alice", HLC_STRATEGY_BOUNDED);
+  state.max_skew_ms = 5000;
+
+  // Mock local time = (36000, 0)
+  g_mock_time = {36000, 0, true};
+  g_mock_ops = {mock_get_time, mock_is_available, NULL};
+  state.time_source_ops = &g_mock_ops;
+
+  crabs_hlc_next(&state);
+  crabs_hlc_t saved_last = state.last;
+
+  // Received from Node M: (99999, 0, 0, "malicious") — far in future
+  crabs_hlc_t received = {99999, 0, 0, "malicious"};
+
+  uint64_t rejections_before = state.time_travel_attempts_rejected;
+  crabs_hlc_receive_result_e result = crabs_hlc_receive(&state, &received);
+
+  EXPECT_EQ(result, CRABS_HLC_REJECTED_SKEW);
+  EXPECT_EQ(state.time_travel_attempts_rejected, rejections_before + 1);
+  // State should be unchanged
+  EXPECT_EQ(state.last.physical_seconds, saved_last.physical_seconds);
+  EXPECT_EQ(state.last.physical_nanos, saved_last.physical_nanos);
+  EXPECT_EQ(state.last.logical_counter, saved_last.logical_counter);
+}
+
+TEST(HLCTestVectors, TV12_6_StrictStrategy) {
+  // §12.6: STRICT strategy — accepted but state unchanged
+  crabs_hlc_state_t state;
+  crabs_hlc_state_init_strategy(&state, "alice", HLC_STRATEGY_STRICT);
+
+  // Set state.last = (36000, 500, 3, "alice")
+  g_mock_time = {36000, 500, true};
+  g_mock_ops = {mock_get_time, mock_is_available, NULL};
+  state.time_source_ops = &g_mock_ops;
+  crabs_hlc_next(&state);
+  // Generate more events to get counter to 3
+  for (int i = 0; i < 3; i++) {
+    crabs_hlc_next(&state);
+  }
+
+  crabs_hlc_t saved_last = state.last;
+
+  // Received from Node B: (99999, 0, 0, "bob")
+  crabs_hlc_t received = {99999, 0, 0, "bob"};
+
+  crabs_hlc_receive_result_e result = crabs_hlc_receive(&state, &received);
+
+  EXPECT_EQ(result, CRABS_HLC_ACCEPTED_STRICT);
+  // State must be UNCHANGED
+  EXPECT_EQ(state.last.physical_seconds, saved_last.physical_seconds);
+  EXPECT_EQ(state.last.physical_nanos, saved_last.physical_nanos);
+  EXPECT_EQ(state.last.logical_counter, saved_last.logical_counter);
+  EXPECT_STREQ(state.last.node_id, saved_last.node_id);
+}
+
+TEST(HLCTestVectors, TV12_7_CrossSystemOrdering) {
+  // §12.7: Lamport operations sort before HLC operations
+  operation_t op_a, op_b;
+  memset(&op_a, 0, sizeof(op_a));
+  memset(&op_b, 0, sizeof(op_b));
+
+  // Operation A: Lamport (lamport_time=42, node="alice")
+  op_a.ordering_system = CRABS_ORDERING_LAMPORT;
+  op_a.lamport_time = 42;
+  strncpy(op_a.node_id, "alice", CRABS_MAX_USER_ID - 1);
+
+  // Operation B: HLC (36000, 500, 0, "bob")
+  op_b.ordering_system = CRABS_ORDERING_HLC;
+  op_b.hlc = {36000, 500, 0, "bob"};
+  strncpy(op_b.node_id, "bob", CRABS_MAX_USER_ID - 1);
+
+  // A is LAMPORT, B is HLC → A < B
+  EXPECT_LT(crabs_operation_compare(&op_a, &op_b), 0);
+  // B is HLC, A is LAMPORT → B > A
+  EXPECT_GT(crabs_operation_compare(&op_b, &op_a), 0);
+}
