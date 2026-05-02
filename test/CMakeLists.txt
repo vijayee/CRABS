@@ -45,6 +45,7 @@ if (BUILD_TESTING)
         test_ot_execution.cpp
         test_ot_serialization.cpp
         test_compaction.cpp
+        test_vector_clock.cpp
     )
 
     add_dependencies(testcrabs crabs)
