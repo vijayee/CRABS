@@ -37,6 +37,7 @@ if (BUILD_TESTING)
         test_dedup.cpp
         test_cli.cpp
         test_position_map.cpp
+        test_ot_types.cpp
     )
 
     add_dependencies(testcrabs crabs)
