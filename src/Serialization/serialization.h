@@ -18,7 +18,7 @@
 // Magic bytes and format version (§13.1)
 // ============================================================
 #define CRABS_SERIAL_MAGIC      0x42415243  // "CRAB" in little-endian
-#define CRABS_SERIAL_VERSION    4           // v4: adds OT data item serialization
+#define CRABS_SERIAL_VERSION    5           // v5: adds last_compaction_time to DataItem
 
 // ============================================================
 // Serialized buffer

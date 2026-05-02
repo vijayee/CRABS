@@ -49,6 +49,7 @@ if (BUILD_TESTING)
         test_compact_op.cpp
         test_crdt_compaction.cpp
         test_compaction_engine.cpp
+        test_compaction_integration.cpp
     )
 
     add_dependencies(testcrabs crabs)

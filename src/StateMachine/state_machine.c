@@ -11,6 +11,8 @@
 #include "../Serialization/serialization.h"
 #include "../Dedup/dedup.h"
 #include "../OT/ot_execution.h"
+#include "../Compaction/compaction_engine.h"
+#include "../Compaction/crdt_compaction.h"
 #include "../Util/allocator.h"
 #include <string.h>
 #include <stdlib.h>
@@ -81,6 +83,12 @@ static const transition_t TRANSITIONS[] = {
   {PROTOCOL_MODIFIED, CRABS_OP_CHECK_DEDUP,       PROTOCOL_MODIFIED},
   {PROTOCOL_VERIFIED, CRABS_OP_CHECK_DEDUP,       PROTOCOL_VERIFIED},
   {PROTOCOL_ERROR,    CRABS_OP_CHECK_DEDUP,       PROTOCOL_ERROR},
+  // Compaction operation (v1.5.2 §4.3): valid in any state, no state change
+  {PROTOCOL_IDLE,     CRABS_OP_COMPACT,            PROTOCOL_IDLE},
+  {PROTOCOL_LOCKED,   CRABS_OP_COMPACT,            PROTOCOL_LOCKED},
+  {PROTOCOL_MODIFIED, CRABS_OP_COMPACT,            PROTOCOL_MODIFIED},
+  {PROTOCOL_VERIFIED, CRABS_OP_COMPACT,            PROTOCOL_VERIFIED},
+  {PROTOCOL_ERROR,    CRABS_OP_COMPACT,            PROTOCOL_ERROR},
 };
 
 bool state_machine_is_valid_transition(protocol_state_e current, const char* op_type) {
@@ -118,7 +126,8 @@ bool operation_is_builtin(const char* type) {
           strcmp(type, CRABS_OP_ACTIVATE_KEY) == 0 ||
           strcmp(type, CRABS_OP_ROTATE_KEY) == 0 ||
           strcmp(type, CRABS_OP_DEFINE_OPERATION) == 0 ||
-          strcmp(type, CRABS_OP_CHECK_DEDUP) == 0);
+          strcmp(type, CRABS_OP_CHECK_DEDUP) == 0 ||
+          strcmp(type, CRABS_OP_COMPACT) == 0);
 }
 
 operation_t* operation_create(const char* type) {
@@ -442,6 +451,9 @@ crabs_error_e state_machine_execute(state_t* state, operation_t* op) {
   } else if (strcmp(op->type, CRABS_OP_EXECUTE_OT) == 0) {
     // OT operation: extract, transform, and apply (v1.5 §8)
     result = crabs_execute_ot_operation(state, op);
+  } else if (strcmp(op->type, CRABS_OP_COMPACT) == 0) {
+    // Compaction operation (v1.5.2 §4.3)
+    result = state_machine_op_compact(state, op);
   } else {
     result = CRABS_ERR_INVALID_PARAM;
   }
@@ -1018,6 +1030,23 @@ crabs_error_e state_machine_op_refresh_key(state_t* state, operation_t* op,
   }
 
   return CRABS_SUCCESS;
+}
+
+// ============================================================
+// Compaction Built-in Operation (v1.5.2 §4.3)
+// ============================================================
+
+crabs_error_e state_machine_op_compact(state_t* state, operation_t* op) {
+  if (state == NULL || op == NULL) return CRABS_ERR_INVALID_PARAM;
+
+  crabs_compaction_engine_t engine;
+  crabs_compaction_engine_init(&engine, NULL);
+  crabs_register_crdt_vtables(&engine.registry);
+
+  crabs_error_e err = crabs_op_compact(&engine, state);
+  crabs_compaction_engine_destroy(&engine);
+
+  return err;
 }
 
 // ============================================================

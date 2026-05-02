@@ -123,4 +123,7 @@ typedef enum {
 // OT Operations (v1.5 §8)
 #define CRABS_OP_EXECUTE_OT        "__execute_ot__"
 
+// Compaction Operation (v1.5.2 §4.3)
+#define CRABS_OP_COMPACT           "__compact__"
+
 #endif // CRABS_CRABS_H

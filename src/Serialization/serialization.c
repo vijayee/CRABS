@@ -654,9 +654,12 @@ static void _serialize_data_item(write_buf_t* buf, const data_item_t* item) {
     _write_uint64_le(buf, (uint64_t)item->invariants[i].param);
     _write_string16(buf, item->invariants[i].error_message);
   }
+
+  // last_compaction_time (v5: v1.5.2 §7)
+  _write_uint64_le(buf, item->last_compaction_time);
 }
 
-static bool _deserialize_data_item(read_buf_t* buf, data_item_t* item) {
+static bool _deserialize_data_item(read_buf_t* buf, data_item_t* item, uint32_t version) {
   // name
   if (!_read_string16(buf, item->name, CRABS_MAX_USER_ID)) return false;
 
@@ -817,6 +820,16 @@ static bool _deserialize_data_item(read_buf_t* buf, data_item_t* item) {
   // Initialize lock_state
   memset(&item->lock_state, 0, sizeof(lock_state_t));
   item->next = NULL;
+
+  // last_compaction_time (v5+: v1.5.2 §7)
+  // Backward compat: older versions default to 0
+  if (version >= 5) {
+    uint64_t lct;
+    if (!_read_uint64_le(buf, &lct)) return false;
+    item->last_compaction_time = lct;
+  } else {
+    item->last_compaction_time = 0;
+  }
 
   return true;
 }
@@ -1083,7 +1096,7 @@ state_t* crabs_deserialize_state(const uint8_t* data, size_t len) {
   data_item_t* tail = NULL;
   for (uint32_t i = 0; i < item_count; i++) {
     data_item_t* item = get_clear_memory(sizeof(data_item_t));
-    if (!_deserialize_data_item(&buf, item)) {
+    if (!_deserialize_data_item(&buf, item, version)) {
       data_item_destroy(item);
       goto fail;
     }

@@ -5,6 +5,8 @@
 #include "cli.h"
 #include "../Util/allocator.h"
 #include "../Serialization/serialization.h"
+#include "../Compaction/compaction_engine.h"
+#include "../Compaction/crdt_compaction.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -763,6 +765,32 @@ cli_result_e cli_cmd_op_check_dedup(cli_node_t* node, const char* op_type_name,
 }
 
 // ============================================================
+// Compaction Command (v1.5.2 §4.3)
+// ============================================================
+
+cli_result_e cli_cmd_compact(cli_node_t* node) {
+  if (node == NULL || !node->initialized) return CLI_ERR_NOT_INIT;
+
+  crabs_compaction_engine_t engine;
+  crabs_compaction_engine_init(&engine, NULL);
+  crabs_register_crdt_vtables(&engine.registry);
+
+  crabs_error_e err = crabs_op_compact(&engine, node->state);
+
+  if (err == CRABS_SUCCESS) {
+    printf("Compaction completed. Items compacted: %llu, Skipped: %llu, Unsafe: %llu\n",
+           (unsigned long long)engine.compaction_count,
+           (unsigned long long)engine.skipped_count,
+           (unsigned long long)engine.unsafe_count);
+    crabs_compaction_engine_destroy(&engine);
+    return CLI_OK;
+  }
+  printf("Compaction error: %s\n", cli_error_string(err));
+  crabs_compaction_engine_destroy(&engine);
+  return CLI_ERR_EXEC;
+}
+
+// ============================================================
 // Command Dispatch
 // ============================================================
 
@@ -800,6 +828,7 @@ static void _print_op_usage(void) {
   printf("  op submit <type> [payload_hex] [signer_id]           Submit an operation\n");
   printf("  op define <op_type> <dedup_type> [tracker|flag|condition]  Define operation type with dedup\n");
   printf("  op check-dedup <op_type> [signer_id]                 Check dedup for operation type\n");
+  printf("  compact                       Run compaction on all items\n");
 }
 
 void cli_print_usage(const char* prog) {
@@ -815,6 +844,7 @@ void cli_print_usage(const char* prog) {
   _print_policy_usage();
   _print_key_usage();
   _print_op_usage();
+  printf("  compact                 Run tombstone compaction on all items\n");
   printf("\n  help                     Show this help message\n");
 }
 
@@ -1038,6 +1068,10 @@ cli_result_e cli_dispatch(cli_node_t* node, int argc, char** argv) {
     printf("Unknown op subcommand: %s\n", sub);
     _print_op_usage();
     return CLI_ERR_ARGS;
+  }
+
+  if (strcmp(cmd, "compact") == 0) {
+    return cli_cmd_compact(node);
   }
 
   // Unreachable if all commands are handled above

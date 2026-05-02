@@ -103,6 +103,11 @@ cli_result_e cli_cmd_op_check_dedup(cli_node_t* node, const char* op_type_name,
                                       const char* signer_id);
 
 // ============================================================
+// Compaction Command (v1.5.2 §4.3)
+// ============================================================
+cli_result_e cli_cmd_compact(cli_node_t* node);
+
+// ============================================================
 // Command Dispatch
 // ============================================================
 cli_result_e cli_dispatch(cli_node_t* node, int argc, char** argv);
