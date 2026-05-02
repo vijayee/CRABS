@@ -40,6 +40,8 @@ if (BUILD_TESTING)
         test_ot_types.cpp
         test_ot_transform.cpp
         test_ot_ordered_set.cpp
+        test_ot_document.cpp
+        test_ot_tree.cpp
     )
 
     add_dependencies(testcrabs crabs)

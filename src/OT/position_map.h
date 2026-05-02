@@ -29,6 +29,7 @@ typedef struct crabs_bst_node {
 // ============================================================
 crabs_bst_node_t* crabs_bst_create(uint64_t value);
 void              crabs_bst_destroy(crabs_bst_node_t* root);
+crabs_bst_node_t* crabs_bst_copy(const crabs_bst_node_t* root);
 
 // ============================================================
 // BST Operations

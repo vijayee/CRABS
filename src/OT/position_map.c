@@ -101,6 +101,18 @@ void crabs_bst_destroy(crabs_bst_node_t* root) {
   free(root);
 }
 
+crabs_bst_node_t* crabs_bst_copy(const crabs_bst_node_t* root) {
+  if (root == NULL) return NULL;
+  crabs_bst_node_t* copy = get_clear_memory(sizeof(crabs_bst_node_t));
+  copy->value = root->value;
+  copy->size = root->size;
+  copy->height = root->height;
+  copy->deleted = root->deleted;
+  copy->left = crabs_bst_copy(root->left);
+  copy->right = crabs_bst_copy(root->right);
+  return copy;
+}
+
 // ============================================================
 // BST Operations
 // ============================================================
