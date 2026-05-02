@@ -4,6 +4,10 @@
 
 #include "serialization.h"
 #include "../Util/allocator.h"
+#include "../OT/ot_ordered_set.h"
+#include "../OT/ot_document.h"
+#include "../OT/ot_tree.h"
+#include "../OT/ot_transform.h"
 #include <string.h>
 #include <openssl/sha.h>
 
@@ -194,6 +198,392 @@ void serialized_buffer_destroy(serialized_buffer_t* buf) {
 }
 
 // ============================================================
+// OT Operation Serialization (v1.5 §9)
+// ============================================================
+
+static void _serialize_ot_op_id(write_buf_t* buf, const crabs_ot_op_id_t* id) {
+  _write_bytes(buf, (const uint8_t*)id->node_id, CRABS_MAX_USER_ID);
+  _write_uint64_le(buf, id->sequence_num);
+  _write_uint64_le(buf, id->timestamp);
+}
+
+static bool _deserialize_ot_op_id(read_buf_t* buf, crabs_ot_op_id_t* id) {
+  if (!_read_bytes(buf, (uint8_t*)id->node_id, CRABS_MAX_USER_ID)) return false;
+  id->node_id[CRABS_MAX_USER_ID - 1] = '\0';
+  if (!_read_uint64_le(buf, &id->sequence_num)) return false;
+  if (!_read_uint64_le(buf, &id->timestamp)) return false;
+  return true;
+}
+
+static void _serialize_ot_op(write_buf_t* buf, const crabs_ot_operation_t* op) {
+  _serialize_ot_op_id(buf, &op->id);
+  _write_uint32_le(buf, (uint32_t)op->op_type);
+  _write_uint64_le(buf, op->visible_pos);
+  _write_uint64_le(buf, op->visible_pos_2);
+  _write_uint64_le(buf, op->priority);
+  _write_bytes32(buf, op->payload, op->payload_size);
+  uint32_t dep_write_count = op->dep_count < CRABS_OT_MAX_DEPS ? op->dep_count : CRABS_OT_MAX_DEPS;
+  _write_uint32_le(buf, dep_write_count);
+  for (uint32_t i = 0; i < dep_write_count; i++) {
+    _serialize_ot_op_id(buf, &op->deps[i]);
+  }
+  _write_uint32_le(buf, op->transform_fn_id);
+}
+
+static bool _deserialize_ot_op(read_buf_t* buf, crabs_ot_operation_t* op) {
+  crabs_ot_operation_init(op);
+  if (!_deserialize_ot_op_id(buf, &op->id)) return false;
+  uint32_t op_type;
+  if (!_read_uint32_le(buf, &op_type)) return false;
+  op->op_type = (crabs_ot_op_type_e)op_type;
+  if (!_read_uint64_le(buf, &op->visible_pos)) return false;
+  if (!_read_uint64_le(buf, &op->visible_pos_2)) return false;
+  if (!_read_uint64_le(buf, &op->priority)) return false;
+
+  uint8_t* payload = NULL;
+  uint32_t payload_size = 0;
+  if (!_read_bytes32(buf, &payload, &payload_size)) return false;
+  op->payload = payload;
+  op->payload_size = payload_size;
+
+  if (!_read_uint32_le(buf, &op->dep_count)) return false;
+  if (op->dep_count > CRABS_OT_MAX_DEPS) {
+    op->dep_count = CRABS_OT_MAX_DEPS;
+  }
+  for (uint32_t i = 0; i < op->dep_count; i++) {
+    if (!_deserialize_ot_op_id(buf, &op->deps[i])) return false;
+  }
+  if (!_read_uint32_le(buf, &op->transform_fn_id)) return false;
+  return true;
+}
+
+// ============================================================
+// BST Position Map Serialization
+// ============================================================
+
+// BST serialization uses level-order traversal with explicit NULL markers
+// Format: node_count(4) [value(8) deleted(1) has_left(1) has_right(1)]...
+
+static void _serialize_bst_node(write_buf_t* buf, const crabs_bst_node_t* node) {
+  if (node == NULL) return;
+  _write_uint64_le(buf, node->value);
+  _write_uint8(buf, node->deleted ? 1 : 0);
+  _write_uint8(buf, (node->left != NULL) ? 1 : 0);
+  _write_uint8(buf, (node->right != NULL) ? 1 : 0);
+}
+
+static uint32_t _count_bst_nodes(const crabs_bst_node_t* root) {
+  if (root == NULL) return 0;
+  return 1 + _count_bst_nodes(root->left) + _count_bst_nodes(root->right);
+}
+
+static void _serialize_bst_recursive(write_buf_t* buf, const crabs_bst_node_t* root) {
+  if (root == NULL) return;
+  _serialize_bst_node(buf, root);
+  _serialize_bst_recursive(buf, root->left);
+  _serialize_bst_recursive(buf, root->right);
+}
+
+static crabs_bst_node_t* _deserialize_bst_recursive(read_buf_t* buf) {
+  uint64_t value;
+  if (!_read_uint64_le(buf, &value)) return NULL;
+  uint8_t deleted;
+  if (!_read_uint8(buf, &deleted)) return NULL;
+  uint8_t has_left;
+  if (!_read_uint8(buf, &has_left)) return NULL;
+  uint8_t has_right;
+  if (!_read_uint8(buf, &has_right)) return NULL;
+
+  crabs_bst_node_t* node = crabs_bst_create(value);
+  if (node == NULL) return NULL;
+  node->deleted = (deleted != 0);
+
+  if (has_left) {
+    node->left = _deserialize_bst_recursive(buf);
+    if (node->left == NULL) {
+      crabs_bst_destroy(node);
+      return NULL;
+    }
+  }
+  if (has_right) {
+    node->right = _deserialize_bst_recursive(buf);
+    if (node->right == NULL) {
+      crabs_bst_destroy(node);
+      return NULL;
+    }
+  }
+
+  // Recompute size and height from children
+  uint32_t left_size = (node->left != NULL) ? crabs_bst_size(node->left) : 0;
+  uint32_t right_size = (node->right != NULL) ? crabs_bst_size(node->right) : 0;
+  node->size = 1 + left_size + right_size;
+  uint32_t left_h = (node->left != NULL) ? node->left->height : 0;
+  uint32_t right_h = (node->right != NULL) ? node->right->height : 0;
+  node->height = 1 + (left_h > right_h ? left_h : right_h);
+
+  return node;
+}
+
+// ============================================================
+// OT Data Item Serialization
+// ============================================================
+
+static void _serialize_ot_type_state(write_buf_t* buf, const data_item_t* item) {
+  switch (item->type) {
+    case DATA_TYPE_OT_ORDERED_SET: {
+      crabs_ot_ordered_set_t* set = (crabs_ot_ordered_set_t*)item->value;
+      // Serialize elements as linked list
+      uint32_t count = (set != NULL) ? set->count : 0;
+      _write_uint32_le(buf, count);
+      crabs_ordered_element_t* elem = (set != NULL) ? set->head : NULL;
+      while (elem != NULL) {
+        _serialize_ot_op_id(buf, &elem->id);
+        _write_bytes32(buf, elem->value, elem->value_size);
+        _write_uint8(buf, elem->deleted ? 1 : 0);
+        elem = elem->next;
+      }
+      break;
+    }
+    case DATA_TYPE_OT_DOCUMENT: {
+      crabs_ot_document_t* doc = (crabs_ot_document_t*)item->value;
+      // Serialize spans as linked list
+      uint32_t span_count = (doc != NULL) ? doc->span_count : 0;
+      _write_uint32_le(buf, span_count);
+      crabs_span_t* span = (doc != NULL) ? doc->head : NULL;
+      while (span != NULL) {
+        _serialize_ot_op_id(buf, &span->id);
+        _write_bytes32(buf, span->text, span->text_size);
+        uint32_t style_write_count = span->style_count < CRABS_SPAN_MAX_STYLES ?
+                                      span->style_count : CRABS_SPAN_MAX_STYLES;
+        _write_uint32_le(buf, style_write_count);
+        for (uint32_t s = 0; s < style_write_count; s++) {
+          _write_string16(buf, span->styles[s].name);
+          _write_string16(buf, span->styles[s].value);
+        }
+        _write_uint8(buf, span->deleted ? 1 : 0);
+        span = span->next;
+      }
+      break;
+    }
+    case DATA_TYPE_OT_TREE: {
+      crabs_ot_tree_t* tree = (crabs_ot_tree_t*)item->value;
+      // Serialize tree nodes from pool
+      uint32_t node_count = (tree != NULL) ? tree->node_count : 0;
+      _write_uint32_le(buf, node_count);
+      crabs_tree_node_t* node = (tree != NULL) ? tree->node_pool : NULL;
+      while (node != NULL) {
+        _write_string16(buf, node->id);
+        _write_string16(buf, node->parent_id);
+        _write_bytes32(buf, node->value, node->value_size);
+        _write_uint8(buf, node->deleted ? 1 : 0);
+        // Serialize the child position map
+        uint32_t bst_count = _count_bst_nodes(node->child_position_map);
+        _write_uint32_le(buf, bst_count);
+        _serialize_bst_recursive(buf, node->child_position_map);
+        node = node->pool_next;
+      }
+      // Root node id
+      _write_string16(buf, (tree != NULL && tree->root != NULL) ? tree->root->id : "");
+      break;
+    }
+    default:
+      // No type-specific state for unimplemented OT types
+      break;
+  }
+}
+
+static bool _deserialize_ot_type_state(read_buf_t* buf, data_item_t* item) {
+  switch (item->type) {
+    case DATA_TYPE_OT_ORDERED_SET: {
+      crabs_ot_ordered_set_t* set = (crabs_ot_ordered_set_t*)item->value;
+      if (set == NULL) return false;
+
+      uint32_t count;
+      if (!_read_uint32_le(buf, &count)) return false;
+
+      crabs_ordered_element_t* tail = NULL;
+      for (uint32_t i = 0; i < count; i++) {
+        crabs_ot_op_id_t id;
+        if (!_deserialize_ot_op_id(buf, &id)) return false;
+
+        uint8_t* value = NULL;
+        uint32_t value_size = 0;
+        if (!_read_bytes32(buf, &value, &value_size)) return false;
+
+        uint8_t deleted;
+        if (!_read_uint8(buf, &deleted)) { free(value); return false; }
+
+        crabs_ordered_element_t* elem = crabs_ordered_element_create(&id, value, value_size);
+        if (value != NULL) free(value);
+        if (elem == NULL) return false;
+
+        elem->deleted = (deleted != 0);
+
+        if (set->head == NULL) {
+          set->head = elem;
+          tail = elem;
+        } else {
+          tail->next = elem;
+          elem->prev = tail;
+          tail = elem;
+        }
+        set->count++;
+        if (!elem->deleted) set->visible_count++;
+      }
+      set->tail = tail;
+      break;
+    }
+    case DATA_TYPE_OT_DOCUMENT: {
+      crabs_ot_document_t* doc = (crabs_ot_document_t*)item->value;
+      if (doc == NULL) return false;
+
+      uint32_t span_count;
+      if (!_read_uint32_le(buf, &span_count)) return false;
+
+      crabs_span_t* tail = NULL;
+      for (uint32_t i = 0; i < span_count; i++) {
+        crabs_ot_op_id_t id;
+        if (!_deserialize_ot_op_id(buf, &id)) return false;
+
+        uint8_t* text = NULL;
+        uint32_t text_size = 0;
+        if (!_read_bytes32(buf, &text, &text_size)) return false;
+
+        crabs_span_t* span = crabs_span_create(&id, text, text_size);
+        if (text != NULL) free(text);
+        if (span == NULL) return false;
+
+        uint32_t style_count;
+        if (!_read_uint32_le(buf, &style_count)) return false;
+        span->style_count = (style_count < CRABS_SPAN_MAX_STYLES) ? style_count : CRABS_SPAN_MAX_STYLES;
+        for (uint32_t s = 0; s < span->style_count; s++) {
+          if (!_read_string16(buf, span->styles[s].name, CRABS_STYLE_NAME_MAX)) return false;
+          if (!_read_string16(buf, span->styles[s].value, CRABS_STYLE_VALUE_MAX)) return false;
+        }
+
+        uint8_t deleted;
+        if (!_read_uint8(buf, &deleted)) return false;
+        span->deleted = (deleted != 0);
+
+        if (doc->head == NULL) {
+          doc->head = span;
+          tail = span;
+        } else {
+          tail->next = span;
+          span->prev = tail;
+          tail = span;
+        }
+        doc->span_count++;
+        if (!span->deleted) doc->visible_char_count += span->text_size;
+      }
+      doc->tail = tail;
+      break;
+    }
+    case DATA_TYPE_OT_TREE: {
+      crabs_ot_tree_t* tree = (crabs_ot_tree_t*)item->value;
+      if (tree == NULL) return false;
+
+      uint32_t node_count;
+      if (!_read_uint32_le(buf, &node_count)) return false;
+
+      crabs_tree_node_t* first_node = NULL;
+      crabs_tree_node_t* prev_node = NULL;
+
+      for (uint32_t i = 0; i < node_count; i++) {
+        char id[CRABS_TREE_NODE_ID_MAX] = {0};
+        char parent_id[CRABS_TREE_NODE_ID_MAX] = {0};
+        if (!_read_string16(buf, id, CRABS_TREE_NODE_ID_MAX)) return false;
+        if (!_read_string16(buf, parent_id, CRABS_TREE_NODE_ID_MAX)) return false;
+
+        uint8_t* value = NULL;
+        uint32_t value_size = 0;
+        if (!_read_bytes32(buf, &value, &value_size)) return false;
+
+        uint8_t deleted;
+        if (!_read_uint8(buf, &deleted)) { free(value); return false; }
+
+        crabs_tree_node_t* node = crabs_tree_node_create(id, parent_id[0] ? parent_id : NULL,
+                                                           value, value_size);
+        if (value != NULL) free(value);
+        if (node == NULL) return false;
+        node->deleted = (deleted != 0);
+
+        // Deserialize child position map
+        uint32_t bst_count;
+        if (!_read_uint32_le(buf, &bst_count)) return false;
+        if (bst_count > 0) {
+          node->child_position_map = _deserialize_bst_recursive(buf);
+          if (node->child_position_map == NULL) return false;
+        }
+
+        // Build pool linkage
+        if (first_node == NULL) {
+          first_node = node;
+        }
+        if (prev_node != NULL) {
+          prev_node->pool_next = node;
+        }
+        prev_node = node;
+        tree->node_count++;
+        if (!node->deleted) tree->visible_count++;
+        // Assign pool incrementally so early returns don't leak nodes
+        tree->node_pool = first_node;
+      }
+
+      // Read root node id and link up tree structure
+      char root_id[CRABS_TREE_NODE_ID_MAX] = {0};
+      if (!_read_string16(buf, root_id, CRABS_TREE_NODE_ID_MAX)) return false;
+
+      // Rebuild parent/child links
+      if (root_id[0] != '\0') {
+        // Find root and rebuild tree structure
+        crabs_tree_node_t* node = tree->node_pool;
+        while (node != NULL) {
+          if (strcmp(node->id, root_id) == 0) {
+            tree->root = node;
+            // Root has no parent
+            break;
+          }
+          node = node->pool_next;
+        }
+
+        // Link parent-child relationships
+        node = tree->node_pool;
+        while (node != NULL) {
+          if (node != tree->root && node->parent_id[0] != '\0') {
+            // Find parent
+            crabs_tree_node_t* parent = tree->node_pool;
+            while (parent != NULL) {
+              if (strcmp(parent->id, node->parent_id) == 0) {
+                node->parent = parent;
+                // Add to parent's children (as last child)
+                if (parent->first_child == NULL) {
+                  parent->first_child = node;
+                } else {
+                  crabs_tree_node_t* sibling = parent->first_child;
+                  while (sibling->next_sibling != NULL) {
+                    sibling = sibling->next_sibling;
+                  }
+                  sibling->next_sibling = node;
+                  node->prev_sibling = sibling;
+                }
+                break;
+              }
+              parent = parent->pool_next;
+            }
+          }
+          node = node->pool_next;
+        }
+      }
+      break;
+    }
+    default:
+      break;
+  }
+  return true;
+}
+
+// ============================================================
 // Data item serialization (§13.2)
 // ============================================================
 static void _serialize_data_item(write_buf_t* buf, const data_item_t* item) {
@@ -210,11 +600,7 @@ static void _serialize_data_item(write_buf_t* buf, const data_item_t* item) {
   _write_uint8(buf, (uint8_t)item->protocol_state);
 
   // value: For simple types, serialize the value as bytes
-  // We'll store a serialized representation of the CRDT value
-  // For now, we serialize value_length + value bytes
-  // The value pointer points to type-specific data; for counters it's int64_t,
-  // for registers it's lww_register_t*, etc.
-  // We serialize value as raw bytes; the type_id tells the deserializer how to interpret
+  // For OT types, serialize the full OT data item (op_log, position_map, etc.)
   if (item->value != NULL) {
     if (item->type == DATA_TYPE_COUNTER || item->type == DATA_TYPE_PN_COUNTER ||
         item->type == DATA_TYPE_RESOURCE) {
@@ -233,6 +619,24 @@ static void _serialize_data_item(write_buf_t* buf, const data_item_t* item) {
         val_bytes[i] = (uint8_t)((val >> (i * 8)) & 0xFF);
       }
       _write_bytes32(buf, val_bytes, sizeof(int64_t));
+    } else if (item->type >= DATA_TYPE_OT_ORDERED_SET && item->type <= DATA_TYPE_OT_ORDERED_MAP) {
+      // OT type: serialize the ot_data (op_log + position_map + priority_counters)
+      // followed by type-specific state (elements, spans, tree nodes)
+      if (item->ot_data != NULL) {
+        serialized_buffer_t* ot_buf = crabs_serialize_ot_data(
+          (crabs_ot_data_item_t*)item->ot_data);
+        if (ot_buf != NULL) {
+          _write_bytes32(buf, ot_buf->data, (uint32_t)ot_buf->len);
+          serialized_buffer_destroy(ot_buf);
+        } else {
+          _write_bytes32(buf, NULL, 0);
+        }
+      } else {
+        _write_bytes32(buf, NULL, 0);
+      }
+
+      // Type-specific state
+      _serialize_ot_type_state(buf, item);
     } else {
       // Generic: just write 0 length for unsupported types
       _write_bytes32(buf, NULL, 0);
@@ -285,6 +689,7 @@ static bool _deserialize_data_item(read_buf_t* buf, data_item_t* item) {
         *val |= ((int64_t)val_data[i]) << (i * 8);
       }
       item->value = val;
+      free(val_data);
     } else if (item->type == DATA_TYPE_REGISTER) {
       int64_t* val = get_memory(sizeof(int64_t));
       *val = 0;
@@ -292,14 +697,61 @@ static bool _deserialize_data_item(read_buf_t* buf, data_item_t* item) {
         *val |= ((int64_t)val_data[i]) << (i * 8);
       }
       item->value = val;
+      free(val_data);
+    } else if (item->type >= DATA_TYPE_OT_ORDERED_SET && item->type <= DATA_TYPE_OT_ORDERED_MAP) {
+      // OT type: deserialize ot_data
+      crabs_ot_data_item_t* ot_data = crabs_deserialize_ot_data(val_data, val_len, item->type);
+      free(val_data);
+      if (ot_data == NULL) return false;
+      item->ot_data = ot_data;
+
+      // Create the type-specific value and link ot_data
+      switch (item->type) {
+        case DATA_TYPE_OT_ORDERED_SET: {
+          crabs_ot_ordered_set_t* set = crabs_ot_ordered_set_create();
+          if (set == NULL) return false;
+          // Replace the set's ot_data with the deserialized one
+          if (set->ot_data != NULL) crabs_ot_data_item_destroy(set->ot_data);
+          set->ot_data = ot_data;
+          item->value = set;
+          item->ot_data = ot_data;
+          break;
+        }
+        case DATA_TYPE_OT_DOCUMENT: {
+          crabs_ot_document_t* doc = crabs_ot_document_create();
+          if (doc == NULL) return false;
+          if (doc->ot_data != NULL) crabs_ot_data_item_destroy(doc->ot_data);
+          doc->ot_data = ot_data;
+          item->value = doc;
+          item->ot_data = ot_data;
+          break;
+        }
+        case DATA_TYPE_OT_TREE: {
+          crabs_ot_tree_t* tree = crabs_ot_tree_create();
+          if (tree == NULL) return false;
+          if (tree->ot_data != NULL) crabs_ot_data_item_destroy(tree->ot_data);
+          tree->ot_data = ot_data;
+          item->value = tree;
+          item->ot_data = ot_data;
+          break;
+        }
+        default:
+          item->value = NULL;
+          break;
+      }
     } else {
       // Store as raw bytes for unknown types
       item->value = get_memory(val_len);
       memcpy(item->value, val_data, val_len);
+      free(val_data);
     }
-    free(val_data);
   } else {
     item->value = NULL;
+  }
+
+  // For OT types, deserialize type-specific state (elements, spans, tree nodes)
+  if (item->type >= DATA_TYPE_OT_ORDERED_SET && item->type <= DATA_TYPE_OT_ORDERED_MAP) {
+    if (!_deserialize_ot_type_state(buf, item)) return false;
   }
 
   // invariant_count
@@ -962,6 +1414,216 @@ operation_t* crabs_deserialize_operation(const uint8_t* data, size_t len) {
 
 fail:
   operation_destroy(op);
+  return NULL;
+}
+
+// ============================================================
+// ============================================================
+// Public OT Serialization Functions
+// ============================================================
+
+serialized_buffer_t* crabs_serialize_ot_op(const crabs_ot_operation_t* op) {
+  if (op == NULL) return NULL;
+  write_buf_t* buf = _write_buf_create(256);
+  _serialize_ot_op(buf, op);
+
+  serialized_buffer_t* result = serialized_buffer_create(buf->offset);
+  memcpy(result->data, buf->data, buf->offset);
+  result->len = buf->offset;
+  free(buf->data);
+  free(buf);
+  return result;
+}
+
+crabs_ot_operation_t* crabs_deserialize_ot_op(const uint8_t* data, size_t len) {
+  if (data == NULL || len == 0) return NULL;
+  read_buf_t buf;
+  buf.data = data;
+  buf.len = len;
+  buf.offset = 0;
+
+  crabs_ot_operation_t* op = crabs_ot_operation_create();
+  if (op == NULL) return NULL;
+  if (!_deserialize_ot_op(&buf, op)) {
+    crabs_ot_operation_destroy(op);
+    return NULL;
+  }
+  return op;
+}
+
+serialized_buffer_t* crabs_serialize_ot_op_log(const crabs_ot_operation_t* ops, uint32_t count) {
+  if (ops == NULL || count == 0) return NULL;
+  write_buf_t* buf = _write_buf_create(64 + count * 256);
+
+  _write_uint32_le(buf, count);
+  for (uint32_t i = 0; i < count; i++) {
+    _serialize_ot_op(buf, &ops[i]);
+  }
+
+  serialized_buffer_t* result = serialized_buffer_create(buf->offset);
+  memcpy(result->data, buf->data, buf->offset);
+  result->len = buf->offset;
+  free(buf->data);
+  free(buf);
+  return result;
+}
+
+uint32_t crabs_deserialize_ot_op_log(const uint8_t* data, size_t len,
+                                      crabs_ot_operation_t** ops_out) {
+  if (data == NULL || len < 4 || ops_out == NULL) return 0;
+
+  read_buf_t buf;
+  buf.data = data;
+  buf.len = len;
+  buf.offset = 0;
+
+  uint32_t count;
+  if (!_read_uint32_le(&buf, &count)) return 0;
+  if (count == 0 || count > 1024) return 0;
+
+  crabs_ot_operation_t* ops = get_clear_memory(sizeof(crabs_ot_operation_t) * count);
+  if (ops == NULL) return 0;
+
+  for (uint32_t i = 0; i < count; i++) {
+    crabs_ot_operation_init(&ops[i]);
+    if (!_deserialize_ot_op(&buf, &ops[i])) {
+      // Free already-parsed ops
+      for (uint32_t j = 0; j < i; j++) {
+        if (ops[j].payload != NULL) free(ops[j].payload);
+      }
+      free(ops);
+      *ops_out = NULL;
+      return 0;
+    }
+  }
+
+  *ops_out = ops;
+  return count;
+}
+
+serialized_buffer_t* crabs_serialize_bst(const crabs_bst_node_t* root) {
+  write_buf_t* buf = _write_buf_create(128);
+
+  uint32_t node_count = _count_bst_nodes(root);
+  _write_uint32_le(buf, node_count);
+  _serialize_bst_recursive(buf, root);
+
+  serialized_buffer_t* result = serialized_buffer_create(buf->offset);
+  memcpy(result->data, buf->data, buf->offset);
+  result->len = buf->offset;
+  free(buf->data);
+  free(buf);
+  return result;
+}
+
+crabs_bst_node_t* crabs_deserialize_bst(const uint8_t* data, size_t len) {
+  if (data == NULL || len < 4) return NULL;
+
+  read_buf_t buf;
+  buf.data = data;
+  buf.len = len;
+  buf.offset = 0;
+
+  uint32_t node_count;
+  if (!_read_uint32_le(&buf, &node_count)) return NULL;
+  if (node_count == 0) return NULL;
+
+  return _deserialize_bst_recursive(&buf);
+}
+
+serialized_buffer_t* crabs_serialize_ot_data(const crabs_ot_data_item_t* item) {
+  if (item == NULL) return NULL;
+
+  write_buf_t* buf = _write_buf_create(512);
+
+  // ot_type_id
+  _write_uint32_le(buf, item->ot_type_id);
+
+  // op_log
+  _write_uint32_le(buf, item->op_log_count);
+  for (uint32_t i = 0; i < item->op_log_count; i++) {
+    _serialize_ot_op(buf, &item->op_log[i]);
+  }
+
+  // position_map (BST)
+  uint32_t bst_count = _count_bst_nodes(item->position_map);
+  _write_uint32_le(buf, bst_count);
+  _serialize_bst_recursive(buf, item->position_map);
+
+  // priority_counters
+  _write_uint32_le(buf, item->priority_counter_count);
+  for (uint32_t i = 0; i < item->priority_counter_count; i++) {
+    _write_uint64_le(buf, item->priority_counters[i]);
+  }
+
+  serialized_buffer_t* result = serialized_buffer_create(buf->offset);
+  memcpy(result->data, buf->data, buf->offset);
+  result->len = buf->offset;
+  free(buf->data);
+  free(buf);
+  return result;
+}
+
+crabs_ot_data_item_t* crabs_deserialize_ot_data(const uint8_t* data, size_t len,
+                                                  uint32_t ot_type_id) {
+  if (data == NULL || len == 0) return NULL;
+
+  read_buf_t buf;
+  buf.data = data;
+  buf.len = len;
+  buf.offset = 0;
+
+  crabs_ot_data_item_t* item = crabs_ot_data_item_create(ot_type_id);
+  if (item == NULL) return NULL;
+
+  // ot_type_id
+  uint32_t type_id;
+  if (!_read_uint32_le(&buf, &type_id)) goto fail;
+
+  // op_log
+  uint32_t op_count;
+  if (!_read_uint32_le(&buf, &op_count)) goto fail;
+  if (op_count > 0) {
+    item->op_log = get_clear_memory(sizeof(crabs_ot_operation_t) * op_count);
+    if (item->op_log == NULL) goto fail;
+    item->op_log_capacity = op_count;
+    for (uint32_t i = 0; i < op_count; i++) {
+      crabs_ot_operation_init(&item->op_log[i]);
+      if (!_deserialize_ot_op(&buf, &item->op_log[i])) {
+        item->op_log_count = i; // Free payloads of already-parsed ops
+        goto fail;
+      }
+    }
+    item->op_log_count = op_count;
+  }
+
+  // position_map (BST)
+  uint32_t bst_count;
+  if (!_read_uint32_le(&buf, &bst_count)) goto fail;
+  if (bst_count > 0) {
+    item->position_map = _deserialize_bst_recursive(&buf);
+    if (item->position_map == NULL) goto fail;
+  }
+
+  // priority_counters
+  uint32_t pc_count;
+  if (!_read_uint32_le(&buf, &pc_count)) goto fail;
+  if (pc_count > 0) {
+    item->priority_counters = get_clear_memory(sizeof(uint64_t) * pc_count);
+    if (item->priority_counters == NULL) goto fail;
+    item->priority_counter_count = pc_count;
+    for (uint32_t i = 0; i < pc_count; i++) {
+      if (!_read_uint64_le(&buf, &item->priority_counters[i])) goto fail;
+    }
+  }
+
+  // Initialize transform matrix for this type
+  crabs_transform_matrix_init(item);
+
+  return item;
+
+fail:
+  crabs_ot_data_item_destroy(item);
   return NULL;
 }
 

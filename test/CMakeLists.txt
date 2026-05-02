@@ -43,6 +43,7 @@ if (BUILD_TESTING)
         test_ot_document.cpp
         test_ot_tree.cpp
         test_ot_execution.cpp
+        test_ot_serialization.cpp
     )
 
     add_dependencies(testcrabs crabs)
