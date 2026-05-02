@@ -70,4 +70,30 @@ crabs_error_e crabs_register_two_p_set_vtable(crabs_compaction_registry_t* regis
 // Register all built-in CRDT compaction vtables
 crabs_error_e crabs_register_crdt_vtables(crabs_compaction_registry_t* registry);
 
+// ============================================================
+// G-Counter Compaction VTable (v1.5.2 §3.3 — counter variant)
+// ============================================================
+
+uint64_t crabs_g_counter_count_tombstones(const void* item);
+uint64_t crabs_g_counter_count_visible(const void* item);
+void* crabs_g_counter_extract_visible(const void* item);
+void* crabs_g_counter_rebuild_from_visible(const void* visible);
+bool crabs_g_counter_compaction_safe(const void* item, const state_t* state);
+double crabs_g_counter_estimated_savings(const void* item);
+void crabs_g_counter_describe_tombstones(const void* item, char* buf, uint32_t buf_size);
+crabs_error_e crabs_register_g_counter_vtable(crabs_compaction_registry_t* registry);
+
+// ============================================================
+// PN-Counter (RGA) Compaction VTable (v1.5.2 §3.3)
+// ============================================================
+
+uint64_t crabs_pn_counter_count_tombstones(const void* item);
+uint64_t crabs_pn_counter_count_visible(const void* item);
+void* crabs_pn_counter_extract_visible(const void* item);
+void* crabs_pn_counter_rebuild_from_visible(const void* visible);
+bool crabs_pn_counter_compaction_safe(const void* item, const state_t* state);
+double crabs_pn_counter_estimated_savings(const void* item);
+void crabs_pn_counter_describe_tombstones(const void* item, char* buf, uint32_t buf_size);
+crabs_error_e crabs_register_pn_counter_vtable(crabs_compaction_registry_t* registry);
+
 #endif // CRABS_CRDT_COMPACTION_H
