@@ -1,6 +1,11 @@
 # CRABS: Cryptographic Attribute-Based State Machines
 
 ### *A Protocol for Self-Sovereign Attribute-Based Authorization with Convergent State*
+**Victor J. Morrow**
+
+*Prometheus*
+
+*victor.j.morrow@gmail.com*
 
 ---
 
