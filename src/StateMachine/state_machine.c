@@ -224,12 +224,14 @@ bool state_machine_lock_expired(state_t* state, const lock_state_t* lock, uint64
 
   crabs_ordering_config_t* config = state_get_ordering_config(state);
   if (config != NULL && config->ordering_system == CRABS_ORDERING_HLC) {
-    // HLC-based expiry: use crabs_hlc_lock_expired
-    crabs_hlc_state_t hlc_state;
-    crabs_hlc_state_init(&hlc_state, "");
-    return crabs_hlc_lock_expired(&hlc_state, &lock->lock_acquired_at,
-                                   state->config.max_lock_duration_ms +
-                                   (uint64_t)lock->lock_extensions * state->config.max_lock_duration_ms);
+    // HLC-based expiry: compare physical time against acquired_at + duration
+    crabs_physical_time_t now = crabs_hlc_get_system_time(NULL);
+    if (!now.valid) return now_ms >= lock->lock_expiry;
+    uint64_t total_duration_ms = state->config.max_lock_duration_ms +
+      (uint64_t)lock->lock_extensions * state->config.max_lock_duration_ms;
+    crabs_hlc_t expiry = crabs_hlc_add_duration(lock->lock_acquired_at, total_duration_ms);
+    return (now.seconds > expiry.physical_seconds) ||
+           (now.seconds == expiry.physical_seconds && now.nanos > expiry.physical_nanos);
   }
 
   // Fallback: wall-clock millisecond comparison
@@ -246,6 +248,7 @@ uint32_t state_machine_prune_expired(state_t* state, uint64_t now_ms) {
       if (state_machine_lock_expired(state, &item->lock_state, now_ms)) {
         item->protocol_state = PROTOCOL_IDLE;
         item->lock_state.lock_token_valid = false;
+        OPENSSL_cleanse(item->lock_state.lock_token, CRABS_LOCK_TOKEN_SIZE);
         memset(item->lock_state.lock_owner, 0, CRABS_MAX_USER_ID);
         if (item->lock_state.pre_lock_snapshot != NULL) {
           free(item->lock_state.pre_lock_snapshot);
@@ -273,12 +276,13 @@ static bool is_duplicate_op(state_t* state, const uint8_t uuid[CRABS_UUID_SIZE])
 }
 
 static void record_processed_op(state_t* state, const uint8_t uuid[CRABS_UUID_SIZE]) {
-  state->processed_op_count++;
-  state->processed_ops = realloc(state->processed_ops,
-    state->processed_op_count * CRABS_UUID_SIZE);
-  if (state->processed_ops != NULL) {
-    memcpy(state->processed_ops[state->processed_op_count - 1], uuid, CRABS_UUID_SIZE);
-  }
+  uint64_t new_count = state->processed_op_count + 1;
+  uint8_t(*new_ops)[CRABS_UUID_SIZE] = realloc(state->processed_ops,
+    new_count * CRABS_UUID_SIZE);
+  if (new_ops == NULL) return;
+  state->processed_ops = new_ops;
+  state->processed_op_count = new_count;
+  memcpy(state->processed_ops[state->processed_op_count - 1], uuid, CRABS_UUID_SIZE);
 }
 
 // ============================================================
@@ -288,9 +292,11 @@ static void append_log(state_t* state, const uint8_t uuid[CRABS_UUID_SIZE],
                        const char* type, const char* signer_id,
                        uint64_t lamport_time, const char* node_id,
                        const uint8_t state_hash[CRABS_HASH_SIZE]) {
-  state->log_count++;
-  state->log = realloc(state->log, state->log_count * sizeof(log_entry_t));
-  if (state->log == NULL) return;
+  uint64_t new_count = state->log_count + 1;
+  log_entry_t* new_log = realloc(state->log, new_count * sizeof(log_entry_t));
+  if (new_log == NULL) return;
+  state->log = new_log;
+  state->log_count = new_count;
   log_entry_t* entry = &state->log[state->log_count - 1];
   entry->version = state->version;
   memcpy(entry->uuid, uuid, CRABS_UUID_SIZE);
@@ -372,10 +378,8 @@ crabs_error_e state_machine_execute(state_t* state, operation_t* op) {
       return CRABS_ERR_SERIALIZATION_ERROR;
     }
 
-    // Use a temporary master key for policy-only verification
-    // In production, this would be provided by the key management system
-    abe_master_key_t* mk = crypto_abe_setup();
-    if (mk == NULL) {
+    // Use the persistent ABE master key from state
+    if (state->abe_mk == NULL) {
       serialized_buffer_destroy(ser);
       return CRABS_ERR_CRYPTOGRAPHIC_ERROR;
     }
@@ -384,19 +388,18 @@ crabs_error_e state_machine_execute(state_t* state, operation_t* op) {
     if (op->sig_scheme != SCHEME_UNSPECIFIED || op->key_id[0] != '\0') {
       // v1.3: Scheme-aware verification
       vr = crypto_verify_operation_auth_v2(
-          mk, pp.abe_policy, state->attr_machine,
+          state->abe_mk, pp.abe_policy, state->attr_machine,
           ser->data, ser->len,
           op->signature, CRABS_SIG_SIZE,
           op->signer_id, op->key_id, op->sig_scheme, mode);
     } else {
       // Legacy ECDSA verification
       vr = crypto_verify_operation_auth(
-          mk, pp.abe_policy, state->attr_machine,
+          state->abe_mk, pp.abe_policy, state->attr_machine,
           ser->data, ser->len,
           op->signature, op->signer_id, mode);
     }
 
-    crypto_abe_master_key_destroy(mk);
     serialized_buffer_destroy(ser);
 
     if (!vr.authorized) {
@@ -526,8 +529,7 @@ crabs_error_e state_machine_execute(state_t* state, operation_t* op) {
     state_machine_auto_compact(state);
   }
 
-  // Step 9: Transition protocol states (handled by built-in ops)
-  // Step 10: Log operation
+  // Step 9: Transition protocol states and log operation
   uint8_t state_hash[CRABS_HASH_SIZE];
   memset(state_hash, 0, CRABS_HASH_SIZE);
   append_log(state, op->uuid, op->type, op->signer_id,
@@ -697,6 +699,7 @@ crabs_error_e state_machine_op_unlock(state_t* state, operation_t* op) {
 }
 
 crabs_error_e state_machine_op_force_unlock(state_t* state, operation_t* op) {
+  if (!state->config.allow_force_unlock) return CRABS_ERR_FORCE_UNLOCK_DISABLED;
   uint64_t now_ms = (uint64_t)time(NULL) * 1000;
   for (uint32_t i = 0; i < op->resource_count; i++) {
     data_item_t* item = state_find_item(state, op->resources[i]);

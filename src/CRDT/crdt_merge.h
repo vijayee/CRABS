@@ -110,4 +110,7 @@ void* crdt_merge_value(data_type_e type, crdt_type_e crdt_type,
                        void* value_a, void* value_b,
                        const char* node_id_a, const char* node_id_b);
 
+// Free a CRDT value using its type-specific destroy function
+void crdt_value_destroy(crdt_type_e crdt_type, void* value);
+
 #endif // CRABS_CRDT_MERGE_H

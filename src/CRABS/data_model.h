@@ -300,6 +300,8 @@ typedef struct state_t {
   void* compaction_config;
   // v1.6 Amd6: Ordering configuration (crabs_ordering_config_t*, if set uses HLC ordering)
   void* ordering_config;
+  // ABE master key — generated once at state creation, used for all ABE operations
+  void* abe_mk;
 } state_t;
 
 // ============================================================

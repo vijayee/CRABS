@@ -88,6 +88,7 @@ state_t* state_create(void) {
   state->config.max_lock_extensions = CRABS_MAX_LOCK_EXTENDS;
   state->config.allow_force_unlock = true;
   state->config.bootstrap_admin[0] = '\0';
+  state->abe_mk = crypto_abe_setup();
   return state;
 }
 
@@ -98,6 +99,9 @@ void state_destroy(state_t* state) {
   }
   if (state->last_refresh_envelope != NULL) {
     crypto_key_envelope_destroy(state->last_refresh_envelope);
+  }
+  if (state->abe_mk != NULL) {
+    crypto_abe_master_key_destroy(state->abe_mk);
   }
   data_item_t* item = state->items;
   while (item != NULL) {

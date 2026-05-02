@@ -26,9 +26,20 @@ typedef enum {
   CRABS_OT_OP_MOVE    = 0x04,
   CRABS_OT_OP_SWAP    = 0x05,
   CRABS_OT_OP_COMPACT = 0x06,  // v1.6 §3: Tombstone compaction operation
+  // Document type-specific operations
+  CRABS_OT_OP_INSERT_TEXT  = 0x11,
+  CRABS_OT_OP_DELETE_RANGE = 0x12,
+  CRABS_OT_OP_STYLE        = 0x13,
+  CRABS_OT_OP_MERGE_SPANS  = 0x14,
+  CRABS_OT_OP_SPLIT_SPAN   = 0x15,
+  // Tree type-specific operations
+  CRABS_OT_OP_INSERT_NODE  = 0x21,
+  CRABS_OT_OP_DELETE_NODE  = 0x22,
+  CRABS_OT_OP_REPARENT     = 0x23,
+  CRABS_OT_OP_REORDER      = 0x24,
 } crabs_ot_op_type_e;
 
-#define CRABS_OT_OP_TYPE_COUNT 6
+#define CRABS_OT_OP_TYPE_COUNT 15
 
 // ============================================================
 // OT Operation ID (v1.5 §3.2)

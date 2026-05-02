@@ -1011,6 +1011,21 @@ bool condition_evaluate(const condition_node_t* node, const state_t* state) {
 
 // Recursively filter CONTAINS nodes from a parsed AST.
 // Returns a new AST with only non-CONTAINS nodes, or NULL if all filtered.
+// Walk the AST and evaluate each CONTAINS node individually.
+// Sets *all_pass to false if any CONTAINS node evaluates to false.
+static void _evaluate_contains_nodes(const condition_node_t* node,
+                                      const state_t* state, bool* all_pass) {
+  if (node == NULL) return;
+  if (node->type == NODE_CONTAINS) {
+    if (!condition_evaluate(node, state)) {
+      *all_pass = false;
+    }
+    return;
+  }
+  _evaluate_contains_nodes(node->left, state, all_pass);
+  _evaluate_contains_nodes(node->right, state, all_pass);
+}
+
 static condition_node_t* _filter_contains_nodes(condition_node_t* node) {
   if (node == NULL) return NULL;
 
@@ -1174,28 +1189,18 @@ policy_preprocess_result_t preprocess_policy(const char* policy, const state_t* 
   }
 
   // Step 3: Evaluate all CONTAINS nodes against state
-  // We walk the AST and check CONTAINS nodes.
-  // If any CONTAINS node evaluates to false, resolved_ok = false.
-  // We then strip CONTAINS nodes from the AST for ABE consumption.
+  // Walk the AST and evaluate each CONTAINS node individually.
+  // CONTAINS nodes verify that an element exists in the state's CRDT sets.
+  // ABE comparison nodes are evaluated separately by the ABE engine.
   bool all_contains_pass = true;
 
   // Walk and evaluate CONTAINS nodes
-  // We use a helper to check all CONTAINS nodes in the tree
   condition_node_t* filtered = _filter_contains_nodes(ast);
 
-  // Evaluate the original AST to check CONTAINS satisfaction
-  // For CONTAINS-only policies where all nodes are CONTAINS,
-  // evaluating the full AST tells us if the policy passes
-  if (!condition_evaluate(ast, state)) {
-    // Check if this is because a CONTAINS condition failed
-    // vs a comparison condition. We need finer-grained checking.
-    // Walk the AST and evaluate only CONTAINS nodes
-    // Simple approach: re-evaluate just the CONTAINS portions
-    // by creating a temp AST with only CONTAINS nodes
-    // For now: if overall evaluation fails, check if policy
-    // has CONTAINS components that failed
-    all_contains_pass = false;
-  }
+  // Evaluate CONTAINS nodes independently from ABE nodes.
+  // This ensures mixed CONTAINS + ABE policies aren't incorrectly rejected
+  // when only the ABE comparison (not the CONTAINS check) fails.
+  _evaluate_contains_nodes(ast, state, &all_contains_pass);
 
   // Step 4: Build the ABE policy string from the filtered AST
   if (filtered != NULL) {

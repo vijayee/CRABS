@@ -200,7 +200,7 @@ TEST(CompactionEngine, CompactItemORSetWithTombstones) {
   EXPECT_EQ(result, CRABS_COMPACTION_OK);
   EXPECT_EQ(engine.compaction_count, 1u);
 
-  or_set_destroy(set);
+  // Old value is now freed by crabs_compact_item
   item->value = nullptr;
   data_item_destroy(item);
   state_destroy(state);
@@ -231,7 +231,7 @@ TEST(CompactionEngine, CompactItem2PSet) {
   EXPECT_EQ(result, CRABS_COMPACTION_OK);
   EXPECT_EQ(engine.compaction_count, 1u);
 
-  two_p_set_destroy(set);
+  // Old value is now freed by crabs_compact_item
   item->value = nullptr;
   data_item_destroy(item);
   state_destroy(state);
@@ -333,7 +333,7 @@ TEST(CompactionEngine, StatisticsAfterCompact) {
   crabs_compact_item(&engine, state, item, 1000);
   EXPECT_EQ(crabs_engine_compaction_count(&engine), 1u);
 
-  or_set_destroy(set);
+  // Old value is now freed by crabs_compact_item
   item->value = nullptr;
   data_item_destroy(item);
   state_destroy(state);
@@ -368,7 +368,10 @@ TEST(CompactionEngine, UnsafeCompactionStrongSafety) {
   crabs_compaction_result_e result = crabs_compact_item(&engine, state, item, 1000);
   EXPECT_TRUE(result == CRABS_COMPACTION_OK || result == CRABS_COMPACTION_UNSAFE);
 
-  or_set_destroy(set);
+  // Old value only freed on OK
+  if (result != CRABS_COMPACTION_OK) {
+    or_set_destroy(set);
+  }
   item->value = nullptr;
   data_item_destroy(item);
   state_destroy(state);
@@ -442,7 +445,7 @@ TEST(CompactionEngine, LastCompactionTime) {
   crabs_compact_item(&engine, state, item, 5000);
   EXPECT_EQ(item->last_compaction_time, 5000u);
 
-  or_set_destroy(set);
+  // Old value is now freed by crabs_compact_item
   item->value = nullptr;
   data_item_destroy(item);
   state_destroy(state);

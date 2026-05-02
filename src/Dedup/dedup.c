@@ -175,8 +175,8 @@ crabs_error_e dedup_apply_mutation(state_t* state, const operation_t* op) {
         }
 
         case MUTATION_CUSTOM:
-          // Application-defined callback - not implemented in core
-          return CRABS_SUCCESS;
+          // Application-defined callback - requires external mutation handler
+          return CRABS_ERR_INTERNAL;
 
         default:
           return CRABS_ERR_INVALID_PARAM;

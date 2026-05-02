@@ -49,7 +49,7 @@ TEST(CompactOp, IdInitNull) {
 
 TEST(CompactOp, OpTypeValue) {
   EXPECT_EQ(CRABS_OT_OP_COMPACT, 0x06);
-  EXPECT_EQ(CRABS_OT_OP_TYPE_COUNT, 6);
+  EXPECT_EQ(CRABS_OT_OP_TYPE_COUNT, 15);
 }
 
 // ============================================================

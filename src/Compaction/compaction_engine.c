@@ -7,6 +7,7 @@
 
 #include "compaction_engine.h"
 #include "compact_op.h"
+#include "../CRDT/crdt_merge.h"
 #include <string.h>
 #include <time.h>
 
@@ -169,10 +170,7 @@ crabs_compaction_result_e crabs_compact_item(
     void* visible = vtable->extract_visible(item->value);
     if (visible == NULL) return CRABS_COMPACTION_ERROR;
 
-    // Use the visible value directly as the compacted result.
-    // extract_visible already creates a clean copy with no tombstones.
-    // The original item->value is replaced; callers should ensure
-    // the old value is freed if needed (or add a destroy_value vtable fn).
+    crdt_value_destroy(item->crdt_type, item->value);
     item->value = visible;
   }
 

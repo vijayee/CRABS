@@ -88,7 +88,16 @@ const char* crabs_ot_op_type_name(crabs_ot_op_type_e type) {
     case CRABS_OT_OP_MOVE:    return "MOVE";
     case CRABS_OT_OP_SWAP:    return "SWAP";
     case CRABS_OT_OP_COMPACT: return "COMPACT";
-    default:                  return "UNKNOWN";
+    case CRABS_OT_OP_INSERT_TEXT:  return "INSERT_TEXT";
+    case CRABS_OT_OP_DELETE_RANGE: return "DELETE_RANGE";
+    case CRABS_OT_OP_STYLE:        return "STYLE";
+    case CRABS_OT_OP_MERGE_SPANS:  return "MERGE_SPANS";
+    case CRABS_OT_OP_SPLIT_SPAN:   return "SPLIT_SPAN";
+    case CRABS_OT_OP_INSERT_NODE:  return "INSERT_NODE";
+    case CRABS_OT_OP_DELETE_NODE:  return "DELETE_NODE";
+    case CRABS_OT_OP_REPARENT:     return "REPARENT";
+    case CRABS_OT_OP_REORDER:      return "REORDER";
+    default:                       return "UNKNOWN";
   }
 }
 

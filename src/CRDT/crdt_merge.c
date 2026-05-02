@@ -495,10 +495,7 @@ crabs_error_e crdt_merge_state(state_t* dst, const state_t* src) {
                                               dst_item->value, src_item->value,
                                               dst_item->name, src_item->name);
       if (merged_value != NULL) {
-        // Free old value and replace
-        if (dst_item->value != NULL) {
-          // Type-specific free handled by caller or merge
-        }
+        crdt_value_destroy(dst_item->crdt_type, dst_item->value);
         dst_item->value = merged_value;
       }
     }
@@ -615,5 +612,35 @@ void* crdt_merge_value(data_type_e type, crdt_type_e crdt_type,
     case CRDT_CUSTOM:
     default:
       return NULL;
+  }
+}
+
+void crdt_value_destroy(crdt_type_e crdt_type, void* value) {
+  if (value == NULL) return;
+  switch (crdt_type) {
+    case CRDT_G_COUNTER:
+      g_counter_destroy((g_counter_t*)value);
+      break;
+    case CRDT_PN_COUNTER:
+      pn_counter_destroy((pn_counter_t*)value);
+      break;
+    case CRDT_OR_SET:
+      or_set_destroy((or_set_t*)value);
+      break;
+    case CRDT_2P_SET:
+      two_p_set_destroy((two_p_set_t*)value);
+      break;
+    case CRDT_LWW_REG:
+      lww_register_destroy((lww_register_t*)value);
+      break;
+    case CRDT_ONE_SHOT_SET:
+      one_shot_set_destroy((one_shot_set_t*)value);
+      break;
+    case CRDT_ONE_SHOT_FLAG:
+      one_shot_flag_destroy((one_shot_flag_t*)value);
+      break;
+    default:
+      free(value);
+      break;
   }
 }
