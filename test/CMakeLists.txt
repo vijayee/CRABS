@@ -48,6 +48,7 @@ if (BUILD_TESTING)
         test_vector_clock.cpp
         test_compact_op.cpp
         test_crdt_compaction.cpp
+        test_compaction_engine.cpp
     )
 
     add_dependencies(testcrabs crabs)

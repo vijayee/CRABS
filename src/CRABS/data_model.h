@@ -125,6 +125,9 @@ typedef struct data_item_t {
   // OT data (only for OT types 0x10-0x1F)
   void*            ot_data;  // crabs_ot_data_item_t* when type is OT
 
+  // Compaction tracking (v1.5.2 §4)
+  uint64_t         last_compaction_time;  // Timestamp of last successful compaction
+
   // Pointer-based linking
   struct data_item_t* next;
 } data_item_t;
