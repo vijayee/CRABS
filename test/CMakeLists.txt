@@ -52,6 +52,7 @@ if (BUILD_TESTING)
         test_compaction_integration.cpp
         test_compaction_periodic.cpp
         test_compaction_vectors.cpp
+        test_hlc.cpp
     )
 
     add_dependencies(testcrabs crabs)
