@@ -5,6 +5,8 @@
 
 *Prometheus*
 
+*https://github.com/vijayee*
+
 *victor.j.morrow@gmail.com*
 
 ---
@@ -193,45 +195,40 @@ Type	CRDT Strategy	Lock Required?	Example
 Resources (items with inherent scarcity) follow a strict protocol state machine:
 
 ```
-                    ┌─────────────────────────────────────┐
-                    │         RESOURCE PROTOCOL             │
-                    │                                      │
-                    │         __lock__ (atomic)             │
-                    │    ┌─────────────────────┐           │
-                    │    ▼                     │           │
-                    │ ┌───────┐   __rollback__  │           │
-                    │ │ IDLE  │◄────────────────┼───┐       │
-                    │ └───┬───┘                │   │       │
-                    │     │                    │   │       │
-                    │     │ __lock__           │   │       │
-                    │     ▼                    │   │       │
-                    │ ┌────────┐              │   │       │
-                    │ │ LOCKED │              │   │       │
-                    │ └───┬────┘              │   │       │
-                    │     │                   │   │       │
-                    │     │ user operation    │   │       │
-                    │     ▼                   │   │       │
-                    │ ┌──────────┐            │   │       │
-                    │ │ MODIFIED │────────────┘   │       │
-                    │ └───┬──────┘                │       │
-                    │     │                       │       │
-                    │     │ __verify__            │       │
-                    │     ▼                       │       │
-                    │ ┌──────────┐                │       │
-                    │ │ VERIFIED │                │       │
-                    │ └───┬──────┘                │       │
-                    │     │                       │       │
-                    │     │ __unlock__            │       │
-                    │     └──────────►────────────┘       │
-                    │                                      │
-                    │  Built-in primitives:                 │
-                    │    __lock__     — acquire exclusive   │
-                    │    __extend__   — extend lock expiry  │
-                    │    __verify__   — check invariants    │
-                    │    __rollback__ — revert to snapshot  │
-                    │    __unlock__   — release             │
-                    │    __force_unlock__ — release expired │
-                    └─────────────────────────────────────┘
+              ┌───────────────────────────┐
+              │     RESOURCE PROTOCOL       │
+              │                             │
+              │    ┌──────────────┐        │
+              │    ▼              │        │
+              │ ┌───────┐    __rollback__ │
+              │ │ IDLE  │◄────────────┐   │
+              │ └───┬───┘             │   │
+              │     │ __lock__         │   │
+              │     ▼                  │   │
+              │ ┌────────┐            │   │
+              │ │ LOCKED │            │   │
+              │ └───┬────┘            │   │
+              │     │ user operation  │   │
+              │     ▼                 │   │
+              │ ┌──────────┐          │   │
+              │ │ MODIFIED │──────────┘   │
+              │ └───┬──────┘              │
+              │     │ __verify__          │
+              │     ▼                      │
+              │ ┌──────────┐              │
+              │ │ VERIFIED │              │
+              │ └───┬──────┘              │
+              │     │ __unlock__          │
+              │     └────────►────────────┘
+              │                             │
+              │  Built-in primitives:       │
+              │   __lock__   — acquire      │
+              │   __extend__ — extend lock  │
+              │   __verify__ — invariants   │
+              │   __rollback__ — snapshot   │
+              │   __unlock__ — release      │
+              │   __force_unlock__ — expired │
+              └───────────────────────────┘
 ```
 
 ### 3.5 The Operation
