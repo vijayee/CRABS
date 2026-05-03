@@ -250,14 +250,14 @@ Every OT/CRDT type defines a transform matrix specifying how each operation type
 
 \begin{figure}[t]
 \centering
-\begin{tikzpicture}[scale=0.9, transform shape,
-    cell/.style={draw, text width=1.45cm, minimum height=0.55cm, align=center, font=\tiny\sffamily},
-    header/.style={draw, fill=blue!15, text width=1.45cm, minimum height=0.6cm, align=center, font=\tiny\bfseries\sffamily},
-    rowheader/.style={draw, fill=blue!15, text width=1.45cm, minimum height=0.55cm, align=center, font=\tiny\bfseries\sffamily},
+\begin{tikzpicture}[
+    gridcell/.style={draw, text width=1.5cm, text height=0.45cm, text depth=0.35cm, align=center, font=\tiny\sffamily, inner sep=0pt, outer sep=0pt},
+    header/.style={gridcell, fill=blue!15, font=\tiny\bfseries\sffamily},
+    rowheader/.style={gridcell, fill=blue!15, font=\tiny\bfseries\sffamily},
+    cell/.style={gridcell},
 ]
-\matrix[matrix of nodes, column sep=-0.4pt, row sep=-0.4pt,
-    nodes={inner sep=1pt, outer sep=0pt}] {
-    |[header]| & |[header, fill=orange!15]| INSERT(j) & |[header, fill=orange!15]| DELETE(j) & |[header, fill=orange!15]| MOVE(j$\to$k) & |[header, fill=orange!15]| SWAP(j,k) \\
+\matrix[matrix of nodes, column sep=-0.4pt, row sep=-0.4pt] {
+    |[header]| {} & |[header, fill=orange!15]| INSERT(j) & |[header, fill=orange!15]| DELETE(j) & |[header, fill=orange!15]| MOVE(j$\to$k) & |[header, fill=orange!15]| SWAP(j,k) \\
     |[rowheader]| INSERT(i) & |[cell, fill=green!8]| priority compare & |[cell, fill=green!8]| shift\_left if $i > j$ & |[cell, fill=green!8]| shift\_left if $i > j$ & |[cell, fill=green!8]| shift\_left if $i > \min(j,k)$ \\
     |[rowheader]| DELETE(i) & |[cell, fill=yellow!8]| shift\_right if $i \ge j$ & |[cell, fill=yellow!8]| no\_conflict & |[cell, fill=yellow!8]| adjust & |[cell, fill=yellow!8]| adjust \\
     |[rowheader]| MOVE(i$\to$l) & |[cell, fill=red!8]| shift\_right if $i \ge j$ & |[cell, fill=red!8]| shift\_left if $i > j$ & |[cell, fill=red!8]| composite & |[cell, fill=red!8]| composite \\
