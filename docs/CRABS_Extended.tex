@@ -1,40 +1,37 @@
-\documentclass[11pt,a4paper]{article}
+\documentclass[sigconf,nonacm]{acmart}
 
 % --- Packages ---
 \usepackage[utf8]{inputenc}
 \usepackage[T1]{fontenc}
-\usepackage[margin=1in]{geometry}
-\usepackage{amsmath,amssymb,amsthm}
+\usepackage{amsmath,amssymb}
 \usepackage{hyperref}
 \usepackage{xcolor}
 \usepackage{graphicx}
 \usepackage{enumitem}
 \usepackage{booktabs}
 \usepackage{tabularx}
-\usepackage{fancyhdr}
-\usepackage{cite}
 \usepackage{float}
-\usepackage{caption}
 \usepackage{listings}
 \usepackage{tikz}
-\usetikzlibrary{arrows.meta, positioning, shapes, fit, backgrounds, matrix}
+\usetikzlibrary{arrows.meta, positioning, shapes, fit, backgrounds, calc, matrix}
+
+% --- ACM Template Settings ---
+\settopmatter{printacmref=false}
+\setcopyright{none}
+\renewcommand\footnotetextcopyrightpermission[1]{}
 
 % --- Metadata ---
-\title{\textbf{CRABS: Cryptographic Attribute-Based State Machines (Extended)}\\[4pt]
-\large \textit{A Unified Protocol for Self-Sovereign Authorization with OT/CRDT Hybrid Convergence}}
-\author{Victor J. Morrow\\[4pt]
-\textit{Prometheus}\\[4pt]
-\texttt{victor.j.morrow@gmail.com}}
-\date{}
+\title{CRABS: Cryptographic Attribute-Based State Machines (Extended)}
+\subtitle{A Unified Protocol for Self-Sovereign Authorization with OT/CRDT Hybrid Convergence}
+
+\author{Victor J. Morrow}
+\affiliation{%
+  \institution{Prometheus}
+}
+\email{victor.j.morrow@gmail.com}
+\authornote{\url{https://github.com/vijayee}}
 
 % --- Styling ---
-\pagestyle{fancy}
-\fancyhf{}
-\fancyhead[L]{\small CRABS: Cryptographic Attribute-Based State Machines (Extended)}
-\fancyhead[R]{\small Victor J. Morrow}
-\fancyfoot[C]{\thepage}
-\renewcommand{\headrulewidth}{0.4pt}
-
 \definecolor{codebg}{rgb}{0.95,0.95,0.95}
 \lstset{
   basicstyle=\ttfamily\small,
@@ -47,30 +44,22 @@
   showstringspaces=false
 }
 
-% --- Commands ---
 \newcommand{\crab}{\textsc{CRABS}}
 \newcommand{\abe}{\textsc{ABE}}
 \newcommand{\crdt}{\textsc{CRDT}}
-\newcommand{\ot}{\textsc{OT}}
 \newcommand{\ecdsa}{\textsc{ECDSA}}
 \newcommand{\msk}{\textsc{MSK}}
 \newcommand{\mpk}{\textsc{MPK}}
 
 \begin{document}
 
-\maketitle
-
-\begin{center}
-\rule{0.5\textwidth}{0.4pt}
-\end{center}
-
 \begin{abstract}
-\noindent We present \textbf{CRABS}, a protocol that unifies Attribute-Based Encryption (ABE), Conflict-free Replicated Data Types (CRDTs), and Operational Transformation (OT) into a single framework for decentralized, self-sovereign authorization. CRABS treats \textbf{attributes as state}---the set of all users and their attributes is the state of a protocol-governed machine, eliminating the central authority problem inherent in traditional ABE. We extend the protocol with \textbf{OT/CRDT hybrid types} that combine the expressiveness of operational transformation with the convergence guarantees of CRDTs, enabling move, swap, reorder, and intent-preserving merge operations on ordered data structures. We introduce \textbf{threshold triggers}---state-conditional attribute issuance that bridges dynamic state changes with ABE decryption capabilities. The protocol supports \textbf{cryptographic agility} through a pluggable signature scheme interface, \textbf{idempotent operations} through declarative dedup specifications, and \textbf{tombstone management} through a unified compaction framework. We describe the protocol's architecture, algorithms, security properties, and limitations, and discuss applications to decentralized organizations, collaborative content platforms, and self-sovereign identity systems.
+We present \crab{} (Cryptographic Attribute-Based State machines), a protocol that unifies Attribute-Based Encryption (ABE), Conflict-free Replicated Data Types (CRDTs), and Operational Transformation (OT) into a single framework for decentralized, self-sovereign authorization. \crab{} treats \textbf{attributes as state}---the set of all users and their attributes is the state of a protocol-governed machine, eliminating the central authority problem inherent in traditional ABE. We extend the protocol with \textbf{OT/CRDT hybrid types} that combine the expressiveness of operational transformation with the convergence guarantees of CRDTs, enabling move, swap, reorder, and intent-preserving merge operations on ordered data structures. We introduce \textbf{threshold triggers}---state-conditional attribute issuance that bridges dynamic state changes with ABE decryption capabilities. The protocol supports \textbf{cryptographic agility} through a pluggable signature scheme interface, \textbf{idempotent operations} through declarative dedup specifications, and \textbf{tombstone management} through a unified compaction framework. We describe the protocol's architecture, algorithms, security properties, and limitations, and discuss applications to decentralized organizations, collaborative content platforms, and self-sovereign identity systems.
 \end{abstract}
 
-% ======================================================================
+\maketitle
+
 \section{Introduction}
-% ======================================================================
 
 \subsection{Motivation}
 
@@ -80,21 +69,21 @@ However, ABE suffers from a fundamental operational limitation: \textbf{only a c
 
 Concurrently, Conflict-free Replicated Data Types (CRDTs)~\cite{shapiro2011crdt} have emerged as a foundation for decentralized state convergence. CRDTs allow multiple replicas to be updated independently and merged without conflicts, making them ideal for peer-to-peer systems. However, basic CRDTs have \textbf{limited expressiveness}---they support counters, sets, and registers, but cannot represent ordered structures with move, swap, or reorder operations. Operational Transformation (OT)~\cite{ellis1989ot} provides intent-preserving transformations for collaborative editing, but traditionally requires a central sequencer.
 
-Raph Levien's work on the synthesis of OT and CRDTs~\cite{levien2016synthesis} demonstrates that the transform function---not the sequencer---is the heart of the system. By carrying a transform function with each operation and maintaining a causal context, data structures can be both \textbf{convergent} (CRDT property) and \textbf{expressive} (OT property).
+Raph Levien's work on the synthesis of OT and CRDTs~\cite{levien2016otcrdt} demonstrates that the transform function---not the sequencer---is the heart of the system. By carrying a transform function with each operation and maintaining a causal context, data structures can be both \textbf{convergent} (CRDT property) and \textbf{expressive} (OT property).
 
 \subsection{Our Approach}
 
-We present \textbf{CRABS} (Cryptographic Attribute-Based State machines), a protocol that unifies these threads into a single framework. The key insight is:
+We present \textbf{\crab{}} (Cryptographic Attribute-Based State machines), a protocol that unifies these threads into a single framework. The key insight is:
 
 \begin{quote}
 \textbf{Attributes are not keys. Attributes are state.}
 \end{quote}
 
-In CRABS, the set of all users and their attributes is the state of a \textbf{protocol state machine}---the Attribute Machine. Changing an attribute (granting a role, verifying an identity, self-asserting a phone number) is a \textbf{state transition} governed by the same protocol rules as any other operation. ABE keys issued to users are \textbf{derived from the current state} and become invalid when the state changes.
+In \crab{}, the set of all users and their attributes is the state of a \textbf{protocol state machine}---the Attribute Machine. Changing an attribute (granting a role, verifying an identity, self-asserting a phone number) is a \textbf{state transition} governed by the same protocol rules as any other operation. ABE keys issued to users are \textbf{derived from the current state} and become invalid when the state changes.
 
 We extend this foundation with:
 
-\begin{enumerate}[leftmargin=*,label={\arabic*.}]
+\begin{enumerate}
     \item \textbf{OT/CRDT Hybrid Types}: Data types that combine the expressiveness of operational transformation with the convergence guarantees of CRDTs, supporting insert, delete, move, swap, and intent-preserving merge on ordered structures.
     \item \textbf{Threshold Triggers}: State-conditional attribute issuance---when a state condition becomes true (e.g., \texttt{video.flags >= 10}), the protocol automatically issues temporary attributes to specified roles, enabling state-conditional decryption.
     \item \textbf{Cryptographic Agility}: A pluggable signature scheme interface supporting ECDSA, Ed25519, BLS, Dilithium, and future schemes through a unified VTable abstraction.
@@ -106,8 +95,8 @@ We extend this foundation with:
 
 This paper makes the following contributions:
 
-\begin{enumerate}[leftmargin=*,label={\arabic*.}]
-    \item \textbf{The CRABS protocol}---A unified architecture combining ABE, CRDTs, OT, and protocol state machines for self-sovereign attribute management.
+\begin{enumerate}
+    \item \textbf{The \crab{} protocol}---A unified architecture combining ABE, CRDTs, OT, and protocol state machines for self-sovereign attribute management.
     \item \textbf{The Attribute Machine}---A state machine whose state \textit{is} the attribute universe, eliminating the central authority problem.
     \item \textbf{OT/CRDT Hybrid Types}---A family of data types that combine OT expressiveness with CRDT convergence, with a formal transform matrix and position map implementation.
     \item \textbf{Threshold Triggers}---A mechanism for state-conditional attribute issuance, bridging dynamic state changes with ABE decryption.
@@ -115,50 +104,46 @@ This paper makes the following contributions:
     \item \textbf{Unified Compaction Framework}---A tombstone management system applicable to all CRDT types, with safety guarantees based on vector clock synchronization.
 \end{enumerate}
 
-% ======================================================================
 \section{Related Work}
-% ======================================================================
 
 \subsection{Attribute-Based Encryption}
 
-ABE was introduced by Sahai and Waters~\cite{sahai2005fuzzy} as ``Fuzzy Identity-Based Encryption.'' Goyal et al.~\cite{goyal2006abe} formalized Key-Policy ABE (KP-ABE), and Bethencourt, Sahai, and Waters~\cite{bethencourt2007cpabe} introduced Ciphertext-Policy ABE (CP-ABE), the variant used in CRABS. Multi-authority ABE~\cite{chase2007multi} and decentralized ABE~\cite{lewko2011decentralizing} distribute trust across multiple authorities but still require each authority to manage its own attribute domain. CRABS is, to our knowledge, the first system to treat attributes as protocol-governed state rather than static cryptographic material.
+ABE was introduced by Sahai and Waters~\cite{sahai2005fuzzy} as ``Fuzzy Identity-Based Encryption.'' Goyal et al.~\cite{goyal2006abe} formalized Key-Policy ABE (KP-ABE), and Bethencourt, Sahai, and Waters~\cite{bethencourt2007cpabe} introduced Ciphertext-Policy ABE (CP-ABE), the variant used in \crab{}. Multi-authority ABE~\cite{chase2007multi} and decentralized ABE~\cite{lewko2011decentralizing} distribute trust across multiple authorities but still require each authority to manage its own attribute domain. \crab{} is, to our knowledge, the first system to treat attributes as protocol-governed state rather than static cryptographic material.
 
 \subsection{Operational Transformation and CRDTs}
 
-Operational Transformation (OT) was pioneered by Ellis and Gibbs~\cite{ellis1989ot} for collaborative text editing. The Jupiter system~\cite{nichols1995jupiter} introduced a central server for operation ordering. Raph Levien's work~\cite{levien2016synthesis} demonstrated that OT and CRDTs can be synthesized: operations carry transform functions that adjust them against concurrent operations, achieving convergence without a central sequencer.
+Operational Transformation (OT) was pioneered by Ellis and Gibbs~\cite{ellis1989ot} for collaborative text editing. The Jupiter system~\cite{nichols1995jupiter} introduced a central server for operation ordering. Raph Levien's work~\cite{levien2016otcrdt} demonstrated that OT and CRDTs can be synthesized: operations carry transform functions that adjust them against concurrent operations, achieving convergence without a central sequencer.
 
-CRDTs were formalized by Shapiro et al.~\cite{shapiro2011crdt}. Types include G-Counters (grow-only counters), PN-Counters, OR-Sets (observed-remove sets), LWW-Registers (last-writer-wins registers), and RGA (Replicated Growable Arrays)~\cite{levien2016rga}. CRABS extends these with OT/CRDT hybrids that support move, swap, reorder, and intent-preserving merge.
+CRDTs were formalized by Shapiro et al.~\cite{shapiro2011crdt}. Types include G-Counters (grow-only counters), PN-Counters, OR-Sets (observed-remove sets), LWW-Registers (last-writer-wins registers), and RGA (Replicated Growable Arrays)~\cite{levien2016rga}. \crab{} extends these with OT/CRDT hybrids that support move, swap, reorder, and intent-preserving merge.
 
 \subsection{Protocol State Machines and Session Types}
 
-Protocol state machines, also known as typestate~\cite{deline2004typestate} or session types~\cite{honda1998session}, specify valid sequences of operations on a resource. CRABS extends typestate to a decentralized, CRDT-based setting where multiple participants can observe and verify protocol compliance. The resource locking protocol in CRABS is a direct application of typestate to resource scarcity.
+Protocol state machines, also known as typestate~\cite{deline2004typestate} or session types~\cite{honda1998session}, specify valid sequences of operations on a resource. \crab{} extends typestate to a decentralized, CRDT-based setting where multiple participants can observe and verify protocol compliance. The resource locking protocol in \crab{} is a direct application of typestate to resource scarcity.
 
 \subsection{Self-Sovereign Identity}
 
-Self-Sovereign Identity (SSI)~\cite{allen2016ssi} is a paradigm where individuals control their own digital identities without relying on central authorities. Verifiable Credentials (VCs) and Decentralized Identifiers (DIDs) are key building blocks. CRABS's Attribute Machine provides a cryptographic foundation for SSI, where attributes are self-asserted or verified by peers, and all changes are recorded in an auditable transition log.
+Self-Sovereign Identity (SSI)~\cite{allen2016ssi} is a paradigm where individuals control their own digital identities without relying on central authorities. Verifiable Credentials (VCs) and Decentralized Identifiers (DIDs) are key building blocks. \crab{}'s Attribute Machine provides a cryptographic foundation for SSI, where attributes are self-asserted or verified by peers, and all changes are recorded in an auditable transition log.
 
 \subsection{Capability-Based Security}
 
-Capability systems~\cite{dennis1966capability} grant access based on possession of a capability token rather than identity. CRABS's capability vault---where ABE-encrypted ECDSA signing keys serve as capabilities---applies this principle to the attribute-based setting.
+Capability systems~\cite{dennis1966capability} grant access based on possession of a capability token rather than identity. \crab{}'s capability vault---where ABE-encrypted ECDSA signing keys serve as capabilities---applies this principle to the attribute-based setting.
 
-% ======================================================================
-\section{The CRABS Protocol}
-% ======================================================================
+\section{The \crab{} Protocol}
 
 \subsection{Architecture Overview}
 
-CRABS consists of three layers, shown in Figure~\ref{fig:architecture}.
+\crab{} consists of three layers, as shown in Figure~\ref{fig:architecture}.
 
-\begin{figure}[H]
+\begin{figure}[t]
 \centering
 \begin{tikzpicture}[
-    box/.style={draw, rectangle, minimum width=14cm, minimum height=1.2cm, align=center, font=\small},
+    box/.style={draw, rectangle, text width=0.85\columnwidth, minimum height=1.4cm, align=center, font=\small\bfseries, rounded corners=2pt},
 ]
-    \node[box, fill=blue!8] (l3) {\textbf{Layer 3: Application State Machines}\\(Treasury, Documents, Voting, etc.)\\Each is a CRABS state machine with its own policies};
-    \node[box, fill=green!8, above=0.1cm of l3] (l2) {\textbf{Layer 2: The Attribute Machine}\\State = all users + their attributes\\Operations = grant\_role, revoke, self\_assert, verify\\Policies = who can change what};
-    \node[box, fill=yellow!8, above=0.1cm of l2] (l1) {\textbf{Layer 1: Cryptographic Primitives}\\ABE (CP-ABE via openabe-c) + Pluggable Signatures + SHA-256\\CRDT/OT merge rules + Protocol state machines};
+    \node[box, fill=blue!15, draw=blue!40] (l1) {\textbf{Layer 1: Cryptographic Primitives}\\{\normalfont\small ABE (CP-ABE via openabe-c) + Pluggable Signatures + SHA-256}\\\rule{0pt}{0pt}\\[-2pt]{\normalfont\small CRDT/OT merge rules + Protocol state machines}};
+    \node[box, fill=green!15, draw=green!40, above=0.15cm of l1] (l2) {\textbf{Layer 2: The Attribute Machine}\\{\normalfont\small State = all users + their attributes}\\\rule{0pt}{0pt}\\[-2pt]{\normalfont\small Operations = grant\_role, revoke, self\_assert, verify}\\\rule{0pt}{0pt}\\[-2pt]{\normalfont\small Policies = who can change what}};
+    \node[box, fill=yellow!15, draw=yellow!60, above=0.15cm of l2] (l3) {\textbf{Layer 3: Application State Machines}\\{\normalfont\small (Treasury, Documents, Voting, etc.)}\\\rule{0pt}{0pt}\\[-2pt]{\normalfont\small Each is a CRABS state machine with its own policies}};
 \end{tikzpicture}
-\caption{The three-layer CRABS architecture.}
+\caption{The three-layer \crab{} architecture. The Attribute Machine is the foundation; application machines reference its state for authorization decisions.}
 \label{fig:architecture}
 \end{figure}
 
@@ -166,9 +151,9 @@ The Attribute Machine is the foundation. Application machines reference its stat
 
 \subsection{Data Model}
 
-The state of a CRABS machine is a \textbf{bag of typed data items}:
+The state of a \crab{} machine is a \textbf{bag of typed data items}:
 
-\begin{lstlisting}
+\begin{lstlisting}[language=C]
 State = {
     version: uint64,
     items: {
@@ -190,9 +175,9 @@ Each data item has a type, a CRDT merge strategy, a protocol state (for resource
 
 \subsection{The Attribute Machine}
 
-The Attribute Machine is a CRABS state machine whose state \textit{is} the set of all users and their attributes:
+The Attribute Machine is a \crab{} state machine whose state \textit{is} the set of all users and their attributes:
 
-\begin{lstlisting}
+\begin{lstlisting}[language=C]
 AttributeMachine State = {
     users: {
         "alice": {
@@ -218,13 +203,13 @@ AttributeMachine State = {
 }
 \end{lstlisting}
 
-\textbf{Key insight:} The Attribute Machine follows the \textit{same protocol} as any other CRABS machine. There is no privileged ``authority''---only protocol rules.
+\textbf{Key insight:} The Attribute Machine follows the \textit{same protocol} as any other \crab{} machine. There is no privileged ``authority''---only protocol rules.
 
 \subsection{Key Derivation and Versioning}
 
 ABE keys are derived from the current state of the Attribute Machine:
 
-\begin{lstlisting}
+\begin{lstlisting}[language=C]
 KeyEnvelope = {
     user_id: "alice",
     state_version: 42,
@@ -235,9 +220,7 @@ KeyEnvelope = {
 
 When attributes change, the state version increments, and users request key refreshes. Old keys are automatically invalidated by version mismatch.
 
-% ======================================================================
 \section{OT/CRDT Hybrid Types}
-% ======================================================================
 
 \subsection{Motivation}
 
@@ -249,53 +232,55 @@ OT/CRDT hybrid types extend CRDTs with the expressiveness of operational transfo
 
 Every OT/CRDT hybrid type maintains two coordinate spaces:
 
-\begin{lstlisting}
-Internal coordinates:
-    The full structure, including deleted elements.
-Visible coordinates:
-    What users see and reference in operations.
+\begin{lstlisting}[language=C]
+Internal coordinates: The full structure, including deleted elements.
+Visible coordinates: What users see and reference in operations.
 \end{lstlisting}
 
 The mapping between spaces is maintained by a \textbf{position map}---a balanced BST that tracks all deleted and inserted positions:
 
-\begin{lstlisting}
+\begin{lstlisting}[language=C]
 xi(map, internal_pos) -> visible_pos       // Internal -> visible
 xi_inv(map, visible_pos) -> internal_pos   // Visible -> internal
 \end{lstlisting}
 
 \subsection{The Transform Matrix}
 
-Every OT/CRDT type defines a transform matrix specifying how each operation type transforms against every other:
+Every OT/CRDT type defines a transform matrix specifying how each operation type transforms against every other, as shown in Figure~\ref{fig:transform}.
 
-\vspace{6pt}
-\begin{table}[H]
+\begin{figure}[t]
 \centering
-\renewcommand{\arraystretch}{1.3}
-\begin{tabular}{l|llll}
-\multicolumn{1}{c}{} & \textbf{INSERT($j$)} & \textbf{DELETE($j$)} & \textbf{MOVE($j \to k$)} & \textbf{SWAP($j,k$)} \\
-\midrule
-\textbf{INSERT($i$)}       & priority compare & shift\_left if $i>j$  & shift\_left if $i>j$     & shift\_left if $i>\min(j,k)$ \\
-\textbf{DELETE($i$)}       & shift\_right if $i\geq j$ & no\_conflict  & adjust     & adjust \\
-\textbf{MOVE($i\to l$)}    & shift\_right if $i\geq j$ & shift\_left if $i>j$ & composite  & composite \\
-\textbf{SWAP($i_1,i_2$)}   & shift\_right if $i_1\geq j$ & shift\_left if $i_1>j$ & composite  & composite \\
-\end{tabular}
-\caption{Transform matrix for OT/CRDT hybrid types. Rows are incoming operations, columns are existing operations. Cells describe how the incoming operation is transformed.}
-\label{tab:transform}
-\end{table}
+\begin{tikzpicture}[scale=0.9, transform shape,
+    cell/.style={draw, text width=1.45cm, minimum height=0.55cm, align=center, font=\tiny\sffamily},
+    header/.style={draw, fill=blue!15, text width=1.45cm, minimum height=0.6cm, align=center, font=\tiny\bfseries\sffamily},
+    rowheader/.style={draw, fill=blue!15, text width=1.45cm, minimum height=0.55cm, align=center, font=\tiny\bfseries\sffamily},
+]
+\matrix[matrix of nodes, column sep=-0.4pt, row sep=-0.4pt,
+    nodes={inner sep=1pt, outer sep=0pt}] {
+    |[header]| & |[header, fill=orange!15]| INSERT(j) & |[header, fill=orange!15]| DELETE(j) & |[header, fill=orange!15]| MOVE(j$\to$k) & |[header, fill=orange!15]| SWAP(j,k) \\
+    |[rowheader]| INSERT(i) & |[cell, fill=green!8]| priority compare & |[cell, fill=green!8]| shift\_left if $i > j$ & |[cell, fill=green!8]| shift\_left if $i > j$ & |[cell, fill=green!8]| shift\_left if $i > \min(j,k)$ \\
+    |[rowheader]| DELETE(i) & |[cell, fill=yellow!8]| shift\_right if $i \ge j$ & |[cell, fill=yellow!8]| no\_conflict & |[cell, fill=yellow!8]| adjust & |[cell, fill=yellow!8]| adjust \\
+    |[rowheader]| MOVE(i$\to$l) & |[cell, fill=red!8]| shift\_right if $i \ge j$ & |[cell, fill=red!8]| shift\_left if $i > j$ & |[cell, fill=red!8]| composite & |[cell, fill=red!8]| composite \\
+    |[rowheader]| SWAP(i1,i2) & |[cell, fill=purple!8]| shift\_right if $i1 \ge j$ & |[cell, fill=purple!8]| shift\_left if $i1 > j$ & |[cell, fill=purple!8]| composite & |[cell, fill=purple!8]| composite \\
+};
+\end{tikzpicture}
+\caption{The transform matrix for OT/CRDT hybrid types. Rows = incoming operation, columns = existing operation. Each cell shows how the incoming operation transforms against the existing one. Green = insert row, yellow = delete, red = move, purple = swap.}
+\label{fig:transform}
+\end{figure}
 
 \subsection{Priority-Based Deterministic Ordering}
 
 Concurrent inserts at the same position are ordered deterministically by priority:
 
-\[
-\text{priority} = (\text{node\_timestamp} \ll 48) \mid (\text{node\_id\_hash} \mathbin{\&} \text{0xFFFF})
-\]
+\begin{lstlisting}[language=C]
+priority = (node_timestamp << 48) | (node_id_hash & 0xFFFF)
+\end{lstlisting}
 
 Higher priority inserts before lower priority at the same position. Priority is unique across all nodes (node\_id ensures uniqueness).
 
 \subsection{The Merge Algorithm}
 
-\begin{lstlisting}
+\begin{lstlisting}[language=C]
 Algorithm: OT_CRDT_MERGE
 
 Input:
@@ -319,19 +304,19 @@ Input:
 \subsection{Defined Types}
 
 \vspace{4pt}
-\begin{tabularx}{\textwidth}{l>{\hsize=0.5\hsize}X>{\hsize=1.5\hsize}ll}
+{\footnotesize
+\begin{tabularx}{\columnwidth}{p{0.8cm}p{2cm}Xp{2cm}}
 \toprule
-\textbf{Type ID} & \textbf{Name} & \textbf{Operations} & \textbf{Use Case} \\
+\textbf{Type} & \textbf{Name} & \textbf{Operations} & \textbf{Use Case} \\
 \midrule
 \texttt{0x10} & \texttt{OT\_ORDERED\_SET} & insert, delete, move, swap & Playlists, ranked lists \\
 \texttt{0x11} & \texttt{OT\_DOCUMENT} & insert\_text, delete\_range, move, merge, split, style & Collaborative editing \\
 \texttt{0x13} & \texttt{OT\_TREE} & insert\_node, delete\_node, reparent, reorder & File systems, org charts \\
 \bottomrule
 \end{tabularx}
+}
 
-% ======================================================================
 \section{Threshold Triggers}
-% ======================================================================
 
 \subsection{Motivation}
 
@@ -339,7 +324,7 @@ In standard ABE, attributes are static---they are issued at key generation time 
 
 \subsection{Trigger Definition}
 
-\begin{lstlisting}
+\begin{lstlisting}[language=C]
 ThresholdTrigger = {
     trigger_id: string,
     condition: string,           // e.g., "video_abc.flags >= 10"
@@ -352,8 +337,7 @@ ThresholdTrigger = {
 }
 
 TriggerEffect = {
-    type: ISSUE_ATTRIBUTE | CREATE_TRIGGER
-          | DELETE_TRIGGER | CHANGE_POLICY,
+    type: ISSUE_ATTRIBUTE | CREATE_TRIGGER | DELETE_TRIGGER | CHANGE_POLICY,
     issue_attribute: string,     // e.g., "flag_threshold_met:video_abc"
     target_role: string,         // e.g., "moderator"
     duration_ms: uint64          // How long the attribute is valid
@@ -362,7 +346,7 @@ TriggerEffect = {
 
 \subsection{The Condition Language}
 
-\begin{lstlisting}
+\begin{lstlisting}[language=C]
 <condition> ::= <or_expr>
 <or_expr>   ::= <and_expr> ("OR" <and_expr>)*
 <and_expr>  ::= <comparison> ("AND" <comparison>)*
@@ -376,9 +360,9 @@ TriggerEffect = {
 
 Triggers are evaluated \textbf{after every state transition}:
 
-\begin{lstlisting}
+\vspace{4pt}
+\begin{lstlisting}[language=C]
 Algorithm: PROCESS_TRIGGERS
-
 1. PRUNE_EXPIRED_TEMPORARY_ATTRIBUTES(attribute_machine)
 2. for each trigger in state.triggers:
 3.     if not trigger.enabled: continue
@@ -398,61 +382,58 @@ Algorithm: PROCESS_TRIGGERS
 
 Multiple thresholds enable progressive disclosure of increasingly sensitive data:
 
-\vspace{4pt}
-\begin{tabularx}{\textwidth}{l>{\hsize=1.2\hsize}X>{\hsize=0.8\hsize}X}
-\toprule
-\textbf{Trigger} & \textbf{Effect} & \textbf{Decrypt Capability} \\
-\midrule
-Trigger 1: flags $\geq$ 10 & Issue ``flag\_threshold\_10'' to moderator & Uploader's username \\
-Trigger 2: flags $\geq$ 50 & Issue ``flag\_threshold\_50'' to moderator & Uploader's email \\
-Trigger 3: flags $\geq$ 100 & Issue ``flag\_threshold\_100'' to admin & Uploader's phone \\
-\bottomrule
-\end{tabularx}
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}[
+    level/.style={draw, rectangle, rounded corners, text width=0.8\columnwidth, minimum height=0.9cm, align=center, font=\small},
+    arrow/.style={->, >=Stealth, thick, font=\footnotesize},
+]
+    \node[level, fill=green!8, draw=green!40] (l1) {Trigger 1: flags $\ge$ 10 \quad $\to$ \quad issue ``flag\_threshold\_10'' to moderator\\$\to$ can decrypt uploader's \textbf{username}};
+    \node[level, fill=yellow!8, draw=yellow!50, above=0.3cm of l1] (l2) {Trigger 2: flags $\ge$ 50 \quad $\to$ \quad issue ``flag\_threshold\_50'' to moderator\\$\to$ can decrypt uploader's \textbf{email}};
+    \node[level, fill=red!8, draw=red!40, above=0.3cm of l2] (l3) {Trigger 3: flags $\ge$ 100 \quad $\to$ \quad issue ``flag\_threshold\_100'' to admin\\$\to$ can decrypt uploader's \textbf{phone}};
 
-\noindent Each level of contact information is encrypted under a different policy, and the attributes are only issued when the corresponding threshold is met.
+    \draw[arrow, draw=green!60] (l1) -- (l2);
+    \draw[arrow, draw=red!60] (l2) -- (l3);
+\end{tikzpicture}
+\caption{Progressive disclosure via cascading threshold triggers. Each level reveals more sensitive information, encrypted under a different policy requiring the corresponding trigger attribute.}
+\label{fig:progressive}
+\end{figure}
 
-% ======================================================================
 \section{Cryptographic Agility}
-% ======================================================================
 
 \subsection{Motivation}
 
-The base CRABS protocol specifies ECDSA with secp256k1 as the sole signature scheme. This creates a hard dependency on a single cryptographic primitive, which is undesirable for post-quantum migration, performance diversity, and regulatory compliance.
+The base \crab{} protocol specifies ECDSA with secp256k1 as the sole signature scheme. This creates a hard dependency on a single cryptographic primitive, which is undesirable for post-quantum migration, performance diversity, and regulatory compliance.
 
 \subsection{The VTable Interface}
 
 Every signature scheme implements a common interface:
 
-\begin{lstlisting}
+\begin{lstlisting}[language=C]
 SignatureVTable = {
     scheme_id: uint8,
     name: string,
     properties: SchemeProperties,
-    generate_keypair:
-        function(pk, pk_len, sk, sk_len) -> int,
-    sign:
-        function(sk, sk_len, msg, msg_len, sig, sig_len) -> int,
-    verify:
-        function(pk, pk_len, msg, msg_len, sig, sig_len) -> int,
-    verify_batch:
-        function(...) -> int,     // Optional
-    aggregate_signatures:
-        function(...) -> int      // Optional
+    generate_keypair: function(pk, pk_len, sk, sk_len) -> int,
+    sign: function(sk, sk_len, msg, msg_len, sig, sig_len) -> int,
+    verify: function(pk, pk_len, msg, msg_len, sig, sig_len) -> int,
+    verify_batch: function(...) -> int,     // Optional
+    aggregate_signatures: function(...) -> int  // Optional
 }
 \end{lstlisting}
 
 \subsection{Supported Schemes}
 
 \vspace{4pt}
-\begin{tabularx}{\textwidth}{lccccr}
+\begin{tabularx}{\columnwidth}{llllcc}
 \toprule
-\textbf{Scheme} & \textbf{ID} & \textbf{Key Size} & \textbf{Sig Size} & \textbf{PQ} & \textbf{Batch} \\
+\textbf{Scheme} & \textbf{ID} & \textbf{Key} & \textbf{Sig} & \textbf{PQ} & \textbf{Batch} \\
 \midrule
-ECDSA secp256k1 & \texttt{0x01} & 33 B & 64 B & No & No \\
-Ed25519 & \texttt{0x03} & 32 B & 64 B & No & Yes \\
-BLS BLS12-381 & \texttt{0x05} & 48 B & 96 B & No & Yes \\
-Dilithium 3 & \texttt{0x09} & 1952 B & 3293 B & Yes & No \\
-Falcon 512 & \texttt{0x0B} & 897 B & 666 B & Yes & No \\
+ECDSA secp256k1 & 0x01 & 33 B & 64 B & No & No \\
+Ed25519 & 0x03 & 32 B & 64 B & No & Yes \\
+BLS BLS12-381 & 0x05 & 48 B & 96 B & No & Yes \\
+Dilithium 3 & 0x09 & 1952 B & 3293 B & Yes & No \\
+Falcon 512 & 0x0B & 897 B & 666 B & Yes & No \\
 \bottomrule
 \end{tabularx}
 
@@ -460,22 +441,13 @@ Falcon 512 & \texttt{0x0B} & 897 B & 666 B & Yes & No \\
 
 Users can register multiple keys for different schemes:
 
-\begin{lstlisting}
+\begin{lstlisting}[language=C]
 User = {
     ...,
     keys: {
-        "ecdsa_main": {
-            scheme: ECDSA_SECP256K1,
-            public_key: ..., is_active: true
-        },
-        "ed25519_mobile": {
-            scheme: ED25519,
-            public_key: ..., is_active: true
-        },
-        "dilithium_hsm": {
-            scheme: DILITHIUM_3,
-            public_key: ..., is_active: true
-        }
+        "ecdsa_main": {scheme: ECDSA_SECP256K1, public_key: ..., is_active: true},
+        "ed25519_mobile": {scheme: ED25519, public_key: ..., is_active: true},
+        "dilithium_hsm": {scheme: DILITHIUM_3, public_key: ..., is_active: true}
     },
     default_key_id: "ecdsa_main"
 }
@@ -485,17 +457,14 @@ User = {
 
 Policies can reference signature schemes:
 
-\begin{lstlisting}
+\begin{lstlisting}[language=C]
 "role:admin AND sig_scheme:ed25519"
-"role:admin AND (sig_scheme:ecdsa_secp256k1
-                 OR sig_scheme:dilithium_3)"
+"role:admin AND (sig_scheme:ecdsa_secp256k1 OR sig_scheme:dilithium_3)"
 \end{lstlisting}
 
 This enables graceful migration between schemes during transition periods.
 
-% ======================================================================
 \section{Idempotent Operations}
-% ======================================================================
 
 \subsection{Motivation}
 
@@ -503,7 +472,7 @@ Byte-level idempotency (UUID deduplication) prevents the same operation bytes fr
 
 \subsection{DedupSpec}
 
-\begin{lstlisting}
+\begin{lstlisting}[language=C]
 DedupSpec = {
     type: PER_USER | GLOBAL | CUSTOM,
     tracker_path: string,       // For PER_USER: ONE_SHOT_SET path
@@ -523,20 +492,20 @@ DedupSpec = {
 \subsection{Patterns}
 
 \vspace{4pt}
-\begin{tabularx}{\textwidth}{ll>{\hsize=0.8\hsize}X>{\hsize=1.2\hsize}X}
+{\footnotesize
+\begin{tabularx}{\columnwidth}{llXX}
 \toprule
-\textbf{Pattern} & \textbf{Dedup Type} & \textbf{Tracker} & \textbf{Example} \\
+\textbf{Pattern} & \textbf{Dedup} & \textbf{Tracker} & \textbf{Example} \\
 \midrule
-One vote per user & \texttt{PER\_USER} & \texttt{ONE\_SHOT\_SET} & \texttt{proposal\_42.voters} \\
-Execute once & \texttt{GLOBAL} & \texttt{ONE\_SHOT\_FLAG} & \texttt{proposal\_42.executed} \\
-First-past-the-post & \texttt{GLOBAL} & \texttt{ONE\_SHOT\_FLAG} & \texttt{username\_claims.alice123} \\
-Single-use token & \texttt{GLOBAL} & \texttt{ONE\_SHOT\_FLAG} & \texttt{codes.SUMMER2024} \\
+One vote per user & PER\_USER & ONE\_SHOT\_SET & \path{proposal_42.voters} \\
+Execute once & GLOBAL & ONE\_SHOT\_FLAG & \path{proposal_42.executed} \\
+First-past-the-post & GLOBAL & ONE\_SHOT\_FLAG & \path{username_claims.alice123} \\
+Single-use token & GLOBAL & ONE\_SHOT\_FLAG & \path{codes.SUMMER2024} \\
 \bottomrule
 \end{tabularx}
+}
 
-% ======================================================================
 \section{Tombstone Management}
-% ======================================================================
 
 \subsection{The Tombstone Problem}
 
@@ -548,7 +517,7 @@ Without management, tombstones grow linearly with edit count, not document size.
 
 Every tombstone-bearing type implements a compaction vtable:
 
-\begin{lstlisting}
+\begin{lstlisting}[language=C]
 CompactionVTable = {
     extract_visible: function(item) -> visible_value,
     rebuild_from_visible: function(visible) -> fresh_item,
@@ -560,7 +529,7 @@ CompactionVTable = {
 
 \subsection{Compaction Algorithm}
 
-\begin{lstlisting}
+\begin{lstlisting}[language=C]
 Algorithm: COMPACT_ITEM
 
 1. vtable = GET_COMPACTION_VTABLE(item.type)
@@ -575,11 +544,10 @@ Algorithm: COMPACT_ITEM
 
 Compaction is safe only when all peers have observed all operations prior to the compaction point. This is determined by vector clock comparison:
 
-\begin{lstlisting}
+\begin{lstlisting}[language=C]
 for each peer in state.peers:
     for each node in state.nodes:
-        if peer.vector_clock[node]
-           < state.max_sequence[node]:
+        if peer.vector_clock[node] < state.max_sequence[node]:
             return NOT_SAFE
 return SAFE
 \end{lstlisting}
@@ -587,7 +555,7 @@ return SAFE
 \subsection{Types Covered}
 
 \vspace{4pt}
-\begin{tabularx}{\textwidth}{l>{\hsize=0.9\hsize}X>{\hsize=1.1\hsize}X}
+\begin{tabularx}{\columnwidth}{l>{\hsize=0.9\hsize}X>{\hsize=1.1\hsize}X}
 \toprule
 \textbf{Type} & \textbf{Tombstone Source} & \textbf{Compaction Effect} \\
 \midrule
@@ -598,15 +566,13 @@ OT types & Position map nodes & Coordinate space reset \\
 \bottomrule
 \end{tabularx}
 
-% ======================================================================
 \section{Security Analysis}
-% ======================================================================
 
 \subsection{Threat Model}
 
 We assume the following adversary capabilities:
 
-\begin{itemize}[leftmargin=*]
+\begin{itemize}
     \item \textbf{Network adversary:} Can observe, delay, reorder, and drop messages
     \item \textbf{Byzantine nodes:} Up to $f$ nodes may behave arbitrarily
     \item \textbf{Compromised users:} Can attempt to use stale keys, forge signatures, or collude
@@ -617,7 +583,7 @@ We do not defend against compromise of the MSK (though threshold MSK schemes are
 \subsection{Security Properties}
 
 \vspace{4pt}
-\begin{tabularx}{\textwidth}{l>{\hsize=0.9\hsize}X>{\hsize=1.1\hsize}X}
+\begin{tabularx}{\columnwidth}{l>{\hsize=0.9\hsize}X>{\hsize=1.1\hsize}X}
 \toprule
 \textbf{Property} & \textbf{Mechanism} & \textbf{Guarantee} \\
 \midrule
@@ -636,7 +602,7 @@ Intent preservation & Transform functions & Concurrent edits preserve user inten
 \subsection{Threat Mitigations}
 
 \vspace{4pt}
-\begin{tabularx}{\textwidth}{>{\hsize=0.7\hsize}X>{\hsize=1.3\hsize}X}
+\begin{tabularx}{\columnwidth}{l>{\hsize=0.8\hsize}X}
 \toprule
 \textbf{Threat} & \textbf{Mitigation} \\
 \midrule
@@ -649,19 +615,16 @@ Compaction safety & Vector clock synchronization check \\
 \bottomrule
 \end{tabularx}
 
-% ======================================================================
 \section{Use Cases}
-% ======================================================================
 
 \subsection{Decentralized Autonomous Organizations (DAOs)}
 
-CRABS provides a natural foundation for DAOs where membership is defined by attributes rather than token holdings. The Attribute Machine governs roles, and application machines govern treasury, voting, and proposals. Threshold triggers enable automatic escalation, and OT/CRDT types enable collaborative document editing for proposals.
+\crab{} provides a natural foundation for DAOs where membership is defined by attributes rather than token holdings. The Attribute Machine governs roles, and application machines govern treasury, voting, and proposals. Threshold triggers enable automatic escalation, and OT/CRDT types enable collaborative document editing for proposals.
 
 \subsection{Collaborative Content Platform}
 
 A YouTube-like platform where:
-
-\begin{itemize}[leftmargin=*]
+\begin{itemize}
     \item Video metadata is stored in OT\_DOCUMENT items (collaborative descriptions)
     \item View counts use G-Counters (tamper-proof)
     \item Flags use PN-Counters with threshold triggers for automatic moderation
@@ -677,20 +640,18 @@ The Attribute Machine enables a fully self-sovereign identity system where users
 
 Each shipment is a resource with a protocol state machine governing custody transfers. Different organizations (customs, carriers, warehouses) have different roles, and the protocol ensures that custody transfers are atomic and auditable.
 
-% ======================================================================
 \section{Limitations and Future Work}
-% ======================================================================
 
 \subsection{Limitations}
 
 \vspace{4pt}
-\begin{tabularx}{\textwidth}{>{\hsize=0.7\hsize}X>{\hsize=0.8\hsize}X>{\hsize=0.5\hsize}X}
+\begin{tabularx}{\columnwidth}{l>{\hsize=0.8\hsize}X>{\hsize=1.2\hsize}X}
 \toprule
 \textbf{Limitation} & \textbf{Impact} & \textbf{Mitigation} \\
 \midrule
 MSK single point of compromise & Attacker can forge any attribute & Threshold MSK (future work) \\
 No post-quantum ABE & Pairings vulnerable to Shor's algorithm & Lattice-based ABE (future work) \\
-OT transform complexity & $O(N^2)$ merge for concurrent ops & Log pruning, compaction \\
+OT transform complexity & O($N^2$) merge for concurrent ops & Log pruning, compaction \\
 Tombstone growth & Linear with edit count & Unified compaction framework \\
 No global consensus & Temporary divergence possible & CRDT merge guarantees eventual convergence \\
 \bottomrule
@@ -700,7 +661,7 @@ No global consensus & Temporary divergence possible & CRDT merge guarantees even
 
 \textbf{Threshold MSK:} Distributing the MSK across $n$ nodes, requiring $k$ to sign, would eliminate the single point of compromise.
 
-\textbf{Post-Quantum CRABS:} Porting to lattice-based ABE would provide post-quantum security. The protocol architecture is agnostic to the underlying cryptographic primitives.
+\textbf{Post-Quantum \crab{}:} Porting to lattice-based ABE would provide post-quantum security. The protocol architecture is agnostic to the underlying cryptographic primitives.
 
 \textbf{Hierarchical Attribute Machines:} Organizations with multiple departments could have cross-machine trust relationships.
 
@@ -710,15 +671,13 @@ No global consensus & Temporary divergence possible & CRDT merge guarantees even
 
 \textbf{OT/CRDT Type Generator:} A code generation framework for deriving transform matrices from type definitions.
 
-% ======================================================================
 \section{Conclusion}
-% ======================================================================
 
-CRABS addresses the fundamental limitation of Attribute-Based Encryption---the central authority problem---by treating attributes as dynamic, protocol-governed state rather than static cryptographic material. The Attribute Machine, a CRABS state machine whose state \textit{is} the attribute universe, eliminates the need for a trusted authority while preserving ABE's cryptographic guarantees.
+\crab{} addresses the fundamental limitation of Attribute-Based Encryption---the central authority problem---by treating attributes as dynamic, protocol-governed state rather than static cryptographic material. The Attribute Machine, a \crab{} state machine whose state \textit{is} the attribute universe, eliminates the need for a trusted authority while preserving ABE's cryptographic guarantees.
 
-By extending this foundation with OT/CRDT hybrid types, threshold triggers, cryptographic agility, and unified tombstone management, CRABS provides a comprehensive framework for decentralized authorization that is:
+By extending this foundation with OT/CRDT hybrid types, threshold triggers, cryptographic agility, and unified tombstone management, \crab{} provides a comprehensive framework for decentralized authorization that is:
 
-\begin{itemize}[leftmargin=*]
+\begin{itemize}
     \item \textbf{Self-sovereign}---Users control their own attributes within policy constraints
     \item \textbf{Expressive}---OT/CRDT types support move, swap, reorder, and intent-preserving merge
     \item \textbf{Convergent}---CRDT merge ensures eventual consistency without consensus
@@ -729,7 +688,6 @@ By extending this foundation with OT/CRDT hybrid types, threshold triggers, cryp
 
 The protocol is implementable today with existing libraries (openabe-c for ABE, OpenSSL for ECDSA, libsodium for Ed25519, liboqs for post-quantum schemes) and is suitable for applications ranging from DAOs and collaborative content platforms to supply chain management and self-sovereign identity.
 
-% ======================================================================
 \begin{thebibliography}{99}
 
 \bibitem{sahai2005fuzzy}
@@ -747,7 +705,7 @@ M.~Shapiro, N.~Pregui\c{c}a, C.~Baquero, and M.~Zawirski, ``Conflict-Free Replic
 \bibitem{ellis1989ot}
 C.~Ellis and S.~Gibbs, ``Concurrency Control in Groupware Systems,'' \textit{SIGMOD}, 1989.
 
-\bibitem{levien2016synthesis}
+\bibitem{levien2016otcrdt}
 R.~Levien, ``Operational Transformation and CRDT Synthesis,'' 2016. \url{https://github.com/google/ot-crdt-papers}
 
 \bibitem{chase2007multi}
@@ -769,17 +727,15 @@ R.~DeLine and M.~F\"{a}hndrich, ``Typestates for Objects,'' \textit{ECOOP}, 2004
 K.~Honda, V.~Vasconcelos, and M.~Kubo, ``Language Primitives and Type Discipline for Structured Communication-Based Programming,'' \textit{ESOP}, 1998.
 
 \bibitem{allen2016ssi}
-C.~Allen, ``The Path to Self-Sovereign Identity,'' 2016. \url{http://www.lifewithalacrity.com/2016/04/the-path-to-self-sovereign-identity.html}
+C.~Allen, ``The Path to Self-Sovereign Identity,'' 2016.
 
 \bibitem{dennis1966capability}
 J.~Dennis and E.~Van Horn, ``Programming Semantics for Multiprogrammed Computations,'' \textit{CACM}, 1966.
 
 \end{thebibliography}
 
-% ======================================================================
 \vspace{12pt}
 \begin{center}
-\rule{0.3\textwidth}{0.4pt}\\[4pt]
 \textit{\crab{}: Hard shell. Sharp pincers. No backdoors.}
 \end{center}
 

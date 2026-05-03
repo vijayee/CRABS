@@ -1,40 +1,37 @@
-\documentclass[11pt,a4paper]{article}
+\documentclass[sigconf,nonacm]{acmart}
 
 % --- Packages ---
 \usepackage[utf8]{inputenc}
 \usepackage[T1]{fontenc}
-\usepackage[margin=1in]{geometry}
-\usepackage{amsmath,amssymb,amsthm}
+\usepackage{amsmath,amssymb}
 \usepackage{hyperref}
 \usepackage{xcolor}
 \usepackage{graphicx}
 \usepackage{enumitem}
 \usepackage{booktabs}
 \usepackage{tabularx}
-\usepackage{fancyhdr}
-\usepackage{cite}
 \usepackage{float}
-\usepackage{caption}
 \usepackage{listings}
 \usepackage{tikz}
-\usetikzlibrary{arrows.meta, positioning, shapes, fit, backgrounds}
+\usetikzlibrary{arrows.meta, positioning, shapes, fit, backgrounds, calc}
+
+% --- ACM Template Settings ---
+\settopmatter{printacmref=false}
+\setcopyright{none}
+\renewcommand\footnotetextcopyrightpermission[1]{}
 
 % --- Metadata ---
-\title{\textbf{CRABS: Cryptographic Attribute-Based State Machines}\\[4pt]
-\large \textit{A Protocol for Self-Sovereign Attribute-Based Authorization with Convergent State}}
-\author{Victor J. Morrow\\[4pt]
-\textit{Prometheus}\\[4pt]
-\texttt{victor.j.morrow@gmail.com}}
-\date{}
+\title{CRABS: Cryptographic Attribute-Based State Machines}
+\subtitle{A Protocol for Self-Sovereign Attribute-Based Authorization with Convergent State}
+
+\author{Victor J. Morrow}
+\affiliation{%
+  \institution{Prometheus}
+}
+\email{victor.j.morrow@gmail.com}
+\authornote{\url{https://github.com/vijayee}}
 
 % --- Styling ---
-\pagestyle{fancy}
-\fancyhf{}
-\fancyhead[L]{\small CRABS: Cryptographic Attribute-Based State Machines}
-\fancyhead[R]{\small Victor J. Morrow}
-\fancyfoot[C]{\thepage}
-\renewcommand{\headrulewidth}{0.4pt}
-
 \definecolor{codebg}{rgb}{0.95,0.95,0.95}
 \lstset{
   basicstyle=\ttfamily\small,
@@ -47,7 +44,6 @@
   showstringspaces=false
 }
 
-% --- Commands ---
 \newcommand{\crab}{\textsc{CRABS}}
 \newcommand{\abe}{\textsc{ABE}}
 \newcommand{\crdt}{\textsc{CRDT}}
@@ -57,19 +53,13 @@
 
 \begin{document}
 
-\maketitle
-
-\begin{center}
-\rule{0.5\textwidth}{0.4pt}
-\end{center}
-
 \begin{abstract}
-\noindent Attribute-Based Encryption (ABE) provides fine-grained access control by associating decryption keys with sets of attributes. However, ABE suffers from a fundamental limitation: only a central authority with the master secret key can issue or modify attributes. This creates a single point of trust, hinders self-sovereign identity, and makes dynamic attribute management impractical. We present \crab{}, a protocol that unifies ABE with Conflict-free Replicated Data Types (CRDTs) and protocol state machines. In \crab{}, \textit{attributes themselves are the state of a state machine}, and changing an attribute is a protocol-governed transition. This eliminates the central authority problem while preserving ABE's cryptographic guarantees. We describe the protocol's architecture, algorithms, security properties, and limitations, and discuss applications to decentralized organizations, resource-constrained environments, and self-sovereign identity systems.
+Attribute-Based Encryption (ABE) provides fine-grained access control by associating decryption keys with sets of attributes. However, ABE suffers from a fundamental limitation: only a central authority with the master secret key can issue or modify attributes. This creates a single point of trust, hinders self-sovereign identity, and makes dynamic attribute management impractical. We present \crab{}, a protocol that unifies ABE with Conflict-free Replicated Data Types (CRDTs) and protocol state machines. In \crab{}, \textit{attributes themselves are the state of a state machine}, and changing an attribute is a protocol-governed transition. This eliminates the central authority problem while preserving ABE's cryptographic guarantees. We describe the protocol's architecture, algorithms, security properties, and limitations, and discuss applications to decentralized organizations, resource-constrained environments, and self-sovereign identity systems.
 \end{abstract}
 
-% ======================================================================
+\maketitle
+
 \section{Introduction}
-% ======================================================================
 
 \subsection{The Problem}
 
@@ -83,7 +73,7 @@ Despite its power, ABE has a critical operational limitation:
 
 This creates several problems:
 
-\begin{enumerate}[leftmargin=*,label={\arabic*.}]
+\begin{enumerate}
     \item \textbf{Centralized trust}---The authority is a single point of compromise. A malicious or compromised authority can issue arbitrary attributes to any user.
     \item \textbf{Static attribute sets}---Attributes are typically issued at key generation time and are difficult to change. A user who changes departments, gets married, or is promoted must obtain an entirely new key from the authority.
     \item \textbf{No audit trail}---Attribute changes are not recorded. There is no cryptographic proof of when or why an attribute was granted or revoked.
@@ -102,8 +92,7 @@ We observe that these problems arise from treating attributes as \textit{static 
 In \crab{}, the set of all users and their attributes is the state of a \textbf{protocol state machine}---the Attribute Machine. Changing an attribute (granting a role, verifying an identity, self-asserting a phone number) is a \textbf{state transition} governed by the same protocol rules as any other operation. The ABE keys issued to users are \textit{derived from the current state} and become invalid when the state changes.
 
 This approach:
-
-\begin{itemize}[leftmargin=*]
+\begin{itemize}
     \item Eliminates the central authority---the \textit{protocol} is the authority
     \item Provides a full audit trail of every attribute change
     \item Allows users to self-assert attributes within policy constraints
@@ -115,7 +104,7 @@ This approach:
 
 This paper makes the following contributions:
 
-\begin{enumerate}[leftmargin=*,label={\arabic*.}]
+\begin{enumerate}
     \item \textbf{The \crab{} protocol}---A unified architecture combining ABE, CRDTs, and protocol state machines for self-sovereign attribute management.
     \item \textbf{The Attribute Machine}---A state machine whose state \textit{is} the attribute universe, governed by the same protocol as application-level machines.
     \item \textbf{Atomic multi-resource locking}---A composable locking primitive for operations on scarce resources, with timeout-based liveness guarantees.
@@ -123,9 +112,7 @@ This paper makes the following contributions:
     \item \textbf{Dual privacy modes}---Support for both auditable (Mode A) and privacy-preserving (Mode B) operation signatures.
 \end{enumerate}
 
-% ======================================================================
 \section{Related Work}
-% ======================================================================
 
 \subsection{Attribute-Based Encryption}
 
@@ -161,25 +148,22 @@ Self-Sovereign Identity (SSI)~\cite{allen2016ssi} is a paradigm where individual
 
 \textbf{Relevance:} \crab{}'s Attribute Machine provides a cryptographic foundation for SSI, where attributes are self-asserted or verified by peers, and all changes are recorded in an auditable transition log.
 
-% ======================================================================
 \section{The \crab{} Protocol}
-% ======================================================================
 
 \subsection{Architecture Overview}
 
 \crab{} consists of three layers, as shown in Figure~\ref{fig:architecture}.
 
-\begin{figure}[H]
+\begin{figure}[t]
 \centering
 \begin{tikzpicture}[
-    box/.style={draw, rectangle, minimum width=14cm, minimum height=1.2cm, align=center, font=\small},
-    label/.style={font=\small\bfseries, anchor=north west}
+    box/.style={draw, rectangle, text width=0.85\columnwidth, minimum height=1.4cm, align=center, font=\small\bfseries, rounded corners=2pt},
 ]
-    \node[box, fill=blue!8] (l3) {\textbf{Layer 3: Application State Machines}\\(Treasury, Documents, Voting, etc.)\\Each is a CRABS state machine with its own policies};
-    \node[box, fill=green!8, above=0.1cm of l3] (l2) {\textbf{Layer 2: The Attribute Machine}\\State = all users + their attributes\\Operations = grant\_role, revoke, self\_assert, verify\\Policies = who can change what};
-    \node[box, fill=yellow!8, above=0.1cm of l2] (l1) {\textbf{Layer 1: Cryptographic Primitives}\\ABE (CP-ABE via openabe-c) + ECDSA (via OpenSSL) + SHA-256\\CRDT merge rules + Protocol state machines};
+    \node[box, fill=blue!15, draw=blue!40] (l1) {\textbf{Layer 1: Cryptographic Primitives}\\{\normalfont\small ABE (CP-ABE via openabe-c) + ECDSA (via OpenSSL) + SHA-256}\\\rule{0pt}{0pt}\\[-2pt]{\normalfont\small CRDT merge rules + Protocol state machines}};
+    \node[box, fill=green!15, draw=green!40, above=0.15cm of l1] (l2) {\textbf{Layer 2: The Attribute Machine}\\{\normalfont\small State = all users + their attributes}\\\rule{0pt}{0pt}\\[-2pt]{\normalfont\small Operations = grant\_role, revoke, self\_assert, verify}\\\rule{0pt}{0pt}\\[-2pt]{\normalfont\small Policies = who can change what}};
+    \node[box, fill=yellow!15, draw=yellow!60, above=0.15cm of l2] (l3) {\textbf{Layer 3: Application State Machines}\\{\normalfont\small (Treasury, Documents, Voting, etc.)}\\\rule{0pt}{0pt}\\[-2pt]{\normalfont\small Each is a CRABS state machine with its own policies}};
 \end{tikzpicture}
-\caption{The three-layer \crab{} architecture.}
+\caption{The three-layer \crab{} architecture. The Attribute Machine is the foundation; application machines reference its state for authorization decisions.}
 \label{fig:architecture}
 \end{figure}
 
@@ -189,7 +173,7 @@ The Attribute Machine is the foundation. Application machines reference its stat
 
 The state of a \crab{} machine is a \textbf{bag of typed data items}:
 
-\begin{lstlisting}
+\begin{lstlisting}[language=C]
 State = {
     items: {
         "treasury": {
@@ -234,7 +218,7 @@ State = {
 \crab{} defines a small set of built-in data types, each with a CRDT merge strategy:
 
 \vspace{4pt}
-\begin{tabularx}{\textwidth}{lXcc}
+\begin{tabularx}{\columnwidth}{lXcc}
 \toprule
 \textbf{Type} & \textbf{CRDT Strategy} & \textbf{Lock?} & \textbf{Example} \\
 \midrule
@@ -253,33 +237,29 @@ State = {
 
 Resources (items with inherent scarcity) follow a strict protocol state machine, depicted in Figure~\ref{fig:protocol}.
 
-\begin{figure}[H]
+\begin{figure}[t]
 \centering
-\begin{tikzpicture}[
-    state/.style={draw, rectangle, rounded corners, minimum width=2.2cm, minimum height=0.8cm, align=center, font=\small},
-    edge/.style={->, >=Stealth, thick, font=\footnotesize}
+\begin{tikzpicture}[scale=0.65, transform shape,
+    state/.style={draw, rectangle, rounded corners, minimum width=1.6cm, minimum height=0.6cm, align=center, font=\scriptsize\bfseries},
+    edge/.style={->, >=Stealth, thick, font=\tiny},
 ]
-    \node[state, fill=blue!10] (idle) {IDLE};
-    \node[state, fill=orange!10, right=2.5cm of idle] (locked) {LOCKED};
-    \node[state, fill=red!10, right=2.5cm of locked] (modified) {MODIFIED};
-    \node[state, fill=green!10, below=2cm of modified] (verified) {VERIFIED};
+    \node[state, fill=blue!12, draw=blue!50] (idle) {IDLE};
+    \node[state, fill=orange!12, draw=orange!60, right=1.4cm of idle] (locked) {LOCKED};
+    \node[state, fill=red!12, draw=red!50, right=1.4cm of locked] (modified) {MODIFIED};
+    \node[state, fill=green!12, draw=green!50, below=1.6cm of modified] (verified) {VERIFIED};
 
     \draw[edge] (idle) -- node[above] {\_\_lock\_\_} (locked);
-    \draw[edge] (locked) -- node[above] {user operation} (modified);
+    \draw[edge] (locked) -- node[above] {op} (modified);
     \draw[edge] (modified) -- node[right] {\_\_verify\_\_} (verified);
 
-    \draw[edge, bend left=40] (modified) to node[below] {\_\_rollback\_\_} (idle);
-    \draw[edge, bend right=40] (verified) to node[left] {\_\_unlock\_\_} (idle);
+    \draw[edge, bend left=45, draw=red!60] (modified) to node[below, pos=0.3] {\_\_rollback\_\_} (idle);
+    \draw[edge, bend right=45, draw=green!50] (verified) to node[left] {\_\_unlock\_\_} (idle);
 
-    % Legend
-    \node[font=\small, below=0.8cm of idle, align=left, anchor=north] (legend) {
-        \textbf{Built-in primitives:}\\
-        \_\_lock\_\_ --- acquire exclusive \quad \_\_extend\_\_ --- extend lock expiry\\
-        \_\_verify\_\_ --- check invariants \quad \_\_rollback\_\_ --- revert to snapshot\\
-        \_\_unlock\_\_ --- release \quad \_\_force\_unlock\_\_ --- release expired
+    \node[font=\tiny, below=0.4cm of idle, align=left, anchor=north, text width=0.9\columnwidth] {
+        \textbf{Built-in:} \_\_lock\_\_ (acquire), \_\_extend\_\_ (renew), \_\_verify\_\_ (check), \_\_rollback\_\_ (revert), \_\_unlock\_\_ (release), \_\_force\_unlock\_\_ (expired)
     };
 \end{tikzpicture}
-\caption{The resource protocol state machine. Resources transition through IDLE $\to$ LOCKED $\to$ MODIFIED $\to$ VERIFIED $\to$ IDLE.}
+\caption{The resource protocol state machine. Resources transition through IDLE $\to$ LOCKED $\to$ MODIFIED $\to$ VERIFIED $\to$ IDLE. Red edge = rollback path, green edge = unlock path.}
 \label{fig:protocol}
 \end{figure}
 
@@ -287,7 +267,7 @@ Resources (items with inherent scarcity) follow a strict protocol state machine,
 
 Operations are the atomic unit of state change. They are completely generic---the state machine does not interpret operation semantics, only protocol correctness.
 
-\begin{lstlisting}
+\begin{lstlisting}[language=C]
 Operation = {
     type: "transfer",                    // Arbitrary string
     payload: {amount: 10, to: "bob"},    // Application-defined
@@ -314,7 +294,7 @@ Operation = {
 
 The Attribute Machine is a \crab{} state machine whose state is the set of all users and their attributes:
 
-\begin{lstlisting}
+\begin{lstlisting}[language=C]
 AttributeMachine State = {
     users: {
         "alice": {
@@ -346,7 +326,7 @@ AttributeMachine State = {
 
 ABE keys are derived from the current state of the Attribute Machine:
 
-\begin{lstlisting}
+\begin{lstlisting}[language=C]
 KeyEnvelope = {
     user_id: "alice",
     state_version: 42,                    // Which state version this is for
@@ -357,7 +337,7 @@ KeyEnvelope = {
 
 Verification during any operation:
 
-\begin{lstlisting}
+\begin{lstlisting}[language=C]
 function verify_key_is_current(state, key):
     if key.state_version != state.version:
         return REJECT("Key is stale. Current version: {state.version}")
@@ -371,7 +351,7 @@ function verify_key_is_current(state, key):
 
 When attributes change, users request a key refresh:
 
-\begin{lstlisting}
+\begin{lstlisting}[language=C]
 Operation: __refresh_abe_key__
 Resources: [attribute_machine]
 Policy: "role:member"
@@ -379,13 +359,11 @@ Effect: State machine derives new key from current attributes
         Old key is invalidated (version mismatch)
 \end{lstlisting}
 
-% ======================================================================
 \section{Algorithms}
-% ======================================================================
 
 \subsection{Atomic Lock Acquisition}
 
-\begin{lstlisting}
+\begin{lstlisting}[language=C]
 function atomic_acquire_locks(state, resources, lock_tokens, requester):
     acquired = []
 
@@ -423,14 +401,14 @@ rollback:
 \end{lstlisting}
 
 \textbf{Virtues:}
-\begin{itemize}[leftmargin=*]
+\begin{itemize}
     \item Atomic---no partial lock state is ever visible
     \item Deadlock-free---all-or-nothing semantics
     \item Policy-gated---only authorized users can lock
 \end{itemize}
 
 \textbf{Limitations:}
-\begin{itemize}[leftmargin=*]
+\begin{itemize}
     \item Requires all resources to be known in advance
     \item Contention increases with number of resources per operation
     \item No priority ordering---first-come-first-served
@@ -438,7 +416,7 @@ rollback:
 
 \subsection{Force Unlock (Timeout)}
 
-\begin{lstlisting}
+\begin{lstlisting}[language=C]
 function force_unlock(state, resource, requester):
     res = state.items[resource]
 
@@ -470,14 +448,14 @@ function force_unlock(state, resource, requester):
 \end{lstlisting}
 
 \textbf{Virtues:}
-\begin{itemize}[leftmargin=*]
+\begin{itemize}
     \item Guarantees liveness---no resource can be locked indefinitely
     \item Anyone can trigger---no single point of failure
     \item Rollback ensures consistency
 \end{itemize}
 
 \textbf{Limitations:}
-\begin{itemize}[leftmargin=*]
+\begin{itemize}
     \item Rollback discards any unverified changes (by design)
     \item Requires synchronized clocks (or generous timeout margins)
     \item Malicious nodes could force-unlock immediately after expiry
@@ -485,7 +463,7 @@ function force_unlock(state, resource, requester):
 
 \subsection{Operation Execution}
 
-\begin{lstlisting}
+\begin{lstlisting}[language=C]
 function execute_operation(state, op):
     // Step 1: Prune expired locks
     prune_expired_locks(state)
@@ -530,21 +508,21 @@ function execute_operation(state, op):
 \end{lstlisting}
 
 \textbf{Virtues:}
-\begin{itemize}[leftmargin=*]
+\begin{itemize}
     \item All security checks happen before execution
     \item Protocol state transitions are atomic with execution
     \item Full audit trail
 \end{itemize}
 
 \textbf{Limitations:}
-\begin{itemize}[leftmargin=*]
+\begin{itemize}
     \item Sequential within a single node (though CRDT merge allows parallel across nodes)
     \item Handler is application-defined---cannot verify its correctness cryptographically
 \end{itemize}
 
 \subsection{CRDT Merge}
 
-\begin{lstlisting}
+\begin{lstlisting}[language=C]
 function crdt_merge(state_a, state_b):
     merged = copy(state_a)
 
@@ -587,14 +565,14 @@ function crdt_merge(state_a, state_b):
 \end{lstlisting}
 
 \textbf{Virtues:}
-\begin{itemize}[leftmargin=*]
+\begin{itemize}
     \item Eventual consistency without consensus
     \item Deterministic---all nodes converge to the same state
     \item Handles concurrent operations gracefully
 \end{itemize}
 
 \textbf{Limitations:}
-\begin{itemize}[leftmargin=*]
+\begin{itemize}
     \item CRDTs have limited expressiveness (no arbitrary computation)
     \item Tombstones in OR-Sets grow unboundedly (can be garbage-collected with coordination)
     \item Last-writer-wins registers lose concurrent updates
@@ -602,7 +580,7 @@ function crdt_merge(state_a, state_b):
 
 \subsection{Key Refresh}
 
-\begin{lstlisting}
+\begin{lstlisting}[language=C]
 function refresh_abe_key(state, msk, mpk, user_id, requester):
     user = state.users[user_id]
 
@@ -635,28 +613,26 @@ function refresh_abe_key(state, msk, mpk, user_id, requester):
 \end{lstlisting}
 
 \textbf{Virtues:}
-\begin{itemize}[leftmargin=*]
+\begin{itemize}
     \item Keys are always derived from current state
     \item Old keys are automatically invalidated (version mismatch)
     \item No need to re-encrypt existing data---only new operations check key freshness
 \end{itemize}
 
 \textbf{Limitations:}
-\begin{itemize}[leftmargin=*]
+\begin{itemize}
     \item Requires users to proactively refresh keys after attribute changes
     \item Brief window where old key could be used if state version check is delayed
     \item Key refresh is an online operation (requires communication with a node)
 \end{itemize}
 
-% ======================================================================
 \section{Security Analysis}
-% ======================================================================
 
 \subsection{Threat Model}
 
 We assume the following adversary capabilities:
 
-\begin{itemize}[leftmargin=*]
+\begin{itemize}
     \item \textbf{Network adversary:} Can observe, delay, reorder, and drop messages
     \item \textbf{Byzantine nodes:} Up to $f$ nodes may behave arbitrarily (but not collude with the ABE authority, which is the protocol itself)
     \item \textbf{Compromised users:} Can attempt to use stale keys, forge signatures, or collude
@@ -664,7 +640,7 @@ We assume the following adversary capabilities:
 
 We do \textbf{not} defend against:
 
-\begin{itemize}[leftmargin=*]
+\begin{itemize}
     \item Compromise of the MSK (though the MSK can be rotated via protocol transition)
     \item Quantum attacks on bilinear pairings (post-quantum variants are future work)
     \item Sybil attacks on node identity (requires external PKI or proof-of-work)
@@ -673,7 +649,7 @@ We do \textbf{not} defend against:
 \subsection{Security Properties}
 
 \vspace{4pt}
-\begin{tabularx}{\textwidth}{l>{\hsize=0.9\hsize}X>{\hsize=1.1\hsize}X}
+\begin{tabularx}{\columnwidth}{l>{\hsize=0.9\hsize}X>{\hsize=1.1\hsize}X}
 \toprule
 \textbf{Property} & \textbf{Mechanism} & \textbf{Guarantee} \\
 \midrule
@@ -693,7 +669,7 @@ Auditability (Mode A) & Signer identity included & Every operation is attributab
 
 If a user's ECDSA signing key is compromised:
 
-\begin{enumerate}[leftmargin=*,label={\arabic*.}]
+\begin{enumerate}
     \item The user reports the compromise via a signed operation
     \item An admin revokes the user's key via a state transition
     \item The user is issued a new key pair
@@ -703,22 +679,20 @@ If a user's ECDSA signing key is compromised:
 
 If the MSK is compromised:
 
-\begin{enumerate}[leftmargin=*,label={\arabic*.}]
+\begin{enumerate}
     \item The MSK is rotated via a protocol transition (requires threshold of admins)
     \item All users refresh their ABE keys
     \item Old ciphertexts remain secure (the old MSK is discarded, not exposed)
     \item New ciphertexts use the new MPK
 \end{enumerate}
 
-% ======================================================================
 \section{Use Cases}
-% ======================================================================
 
 \subsection{Decentralized Autonomous Organizations (DAOs)}
 
 \crab{} provides a natural foundation for DAOs where membership is defined by attributes rather than token holdings:
 
-\begin{lstlisting}
+\begin{lstlisting}[language=C]
 DAO State = {
     treasury: RESOURCE(PN_COUNTER, {ETH: 1000}),
     members: SET(OR_SET, {alice, bob, carol}),
@@ -735,7 +709,7 @@ DAO State = {
 \end{lstlisting}
 
 \textbf{Advantages over token-based DAOs:}
-\begin{itemize}[leftmargin=*]
+\begin{itemize}
     \item Plutocracy is avoided---one member, one vote
     \item Roles enable fine-grained permissions
     \item No gas costs for voting
@@ -746,7 +720,7 @@ DAO State = {
 
 A document review workflow with dynamic policy updates:
 
-\begin{lstlisting}
+\begin{lstlisting}[language=C]
 Document State = {
     content: DOCUMENT(RGA, "..."),
     status: REGISTER(LWW, "draft"),
@@ -769,7 +743,7 @@ Document State = {
 
 The Attribute Machine enables a fully self-sovereign identity system:
 
-\begin{lstlisting}
+\begin{lstlisting}[language=C]
 AttributeMachine State = {
     users: {
         "alice": {
@@ -798,7 +772,7 @@ Users control their own attributes while relying on verifiers for high-assurance
 
 Each shipment is a resource with a protocol:
 
-\begin{lstlisting}
+\begin{lstlisting}[language=C]
 Shipment Protocol:
   IDLE -> __lock__ -> LOCKED -> inspect -> MODIFIED
       -> __verify__ -> VERIFIED -> __unlock__ -> IDLE
@@ -814,14 +788,12 @@ Policies:
 
 Different organizations (customs, carriers, warehouses) have different roles, and the protocol ensures that custody transfers are atomic and auditable.
 
-% ======================================================================
 \section{Limitations}
-% ======================================================================
 
 \subsection{Cryptographic Limitations}
 
 \vspace{4pt}
-\begin{tabularx}{\textwidth}{l>{\hsize=0.8\hsize}X>{\hsize=1.2\hsize}X}
+\begin{tabularx}{\columnwidth}{l>{\hsize=0.8\hsize}X>{\hsize=1.2\hsize}X}
 \toprule
 \textbf{Limitation} & \textbf{Impact} & \textbf{Mitigation} \\
 \midrule
@@ -835,7 +807,7 @@ No post-quantum security & Bilinear pairings vulnerable to Shor's algorithm & La
 \subsection{Protocol Limitations}
 
 \vspace{4pt}
-\begin{tabularx}{\textwidth}{l>{\hsize=0.8\hsize}X>{\hsize=1.2\hsize}X}
+\begin{tabularx}{\columnwidth}{l>{\hsize=0.8\hsize}X>{\hsize=1.2\hsize}X}
 \toprule
 \textbf{Limitation} & \textbf{Impact} & \textbf{Mitigation} \\
 \midrule
@@ -850,7 +822,7 @@ Online key refresh & Users must contact a node after attribute change & Can be b
 \subsection{Expressiveness Limitations}
 
 \vspace{4pt}
-\begin{tabularx}{\textwidth}{l>{\hsize=0.8\hsize}X>{\hsize=1.2\hsize}X}
+\begin{tabularx}{\columnwidth}{l>{\hsize=0.8\hsize}X>{\hsize=1.2\hsize}X}
 \toprule
 \textbf{Limitation} & \textbf{Impact} & \textbf{Mitigation} \\
 \midrule
@@ -860,9 +832,7 @@ No automatic execution & Transitions require user action & Can be combined with 
 \bottomrule
 \end{tabularx}
 
-% ======================================================================
 \section{Future Work}
-% ======================================================================
 
 \subsection{Threshold MSK}
 
@@ -896,15 +866,13 @@ A bridge between \crab{} and existing ABE deployments would allow gradual migrat
 
 Force-unlock is a public good---anyone can do it, but no one is incentivized to. A small reward (taken from the lock holder's stake) for force-unlocking expired locks would ensure liveness in practice.
 
-% ======================================================================
 \section{Conclusion}
-% ======================================================================
 
 \crab{} addresses the fundamental limitation of Attribute-Based Encryption---the central authority problem---by treating attributes as dynamic, protocol-governed state rather than static cryptographic material. The Attribute Machine, a \crab{} state machine whose state \textit{is} the attribute universe, eliminates the need for a trusted authority while preserving ABE's cryptographic guarantees.
 
 By combining ABE with CRDTs, protocol state machines, and atomic multi-resource locking, \crab{} provides a unified framework for decentralized authorization that is:
 
-\begin{itemize}[leftmargin=*]
+\begin{itemize}
     \item \textbf{Self-sovereign}---Users control their own attributes within policy constraints
     \item \textbf{Auditable}---Every attribute change is a logged, signed transition
     \item \textbf{Convergent}---CRDT merge ensures eventual consistency without consensus
@@ -914,7 +882,6 @@ By combining ABE with CRDTs, protocol state machines, and atomic multi-resource 
 
 The protocol is implementable today with existing libraries (openabe-c for ABE, OpenSSL for ECDSA, custom CRDT merge logic) and is suitable for applications ranging from DAOs and document review to supply chain management and self-sovereign identity.
 
-% ======================================================================
 \begin{thebibliography}{99}
 
 \bibitem{sahai2005fuzzy}
@@ -958,10 +925,8 @@ C.~Allen, ``The Path to Self-Sovereign Identity,'' 2016. \url{http://www.lifewit
 
 \end{thebibliography}
 
-% ======================================================================
 \vspace{12pt}
 \begin{center}
-\rule{0.3\textwidth}{0.4pt}\\[4pt]
 \textit{\crab{}: Hard shell. Sharp pincers. No backdoors.}
 \end{center}
 
