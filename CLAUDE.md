@@ -1,4 +1,4 @@
-# WaveDB Project
+
 
 Always read and follow the coding conventions in [STYLE_GUIDE.md](./docs/STYLE_GUIDE.md) when writing or modifying C code in this project.
 Use the de-wonk skill when completing an implementation
