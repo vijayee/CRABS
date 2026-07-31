@@ -15,10 +15,35 @@
 
 bool crabs_causally_before(const crabs_ot_op_id_t* a, const crabs_ot_op_id_t* b) {
   if (a == NULL || b == NULL) return false;
+  // Same node: the per-node sequence number is a sound happens-before order.
   if (strncmp(a->node_id, b->node_id, CRABS_MAX_USER_ID) == 0) {
     return a->sequence_num < b->sequence_num;
   }
-  return a->timestamp < b->timestamp;
+  // Cross-node: an ID alone carries no causal information. The prior code
+  // compared wall-clock timestamps, which is unsound (clocks skew and an
+  // attacker can forge timestamps to reorder history). Cross-node causality
+  // is decided by the dependency set (deps[]) — see crabs_op_depends_on.
+  return false;
+}
+
+// True if `op` declares a causal dependency on `predecessor` (i.e. predecessor
+// happens-before op). This is the sound, dependency-based replacement for the
+// wall-clock comparison that previously decided cross-node causality.
+bool crabs_op_depends_on(const crabs_ot_operation_t* op,
+                          const crabs_ot_op_id_t* predecessor) {
+  if (op == NULL || predecessor == NULL) return false;
+  for (uint32_t i = 0; i < op->dep_count && i < CRABS_OT_MAX_DEPS; i++) {
+    if (strncmp(op->deps[i].node_id, predecessor->node_id, CRABS_MAX_USER_ID) == 0 &&
+        op->deps[i].sequence_num == predecessor->sequence_num) {
+      return true;
+    }
+  }
+  // Same-node lower sequence is also happens-before.
+  if (op->id.node_id[0] != '\0' &&
+      strncmp(op->id.node_id, predecessor->node_id, CRABS_MAX_USER_ID) == 0) {
+    return op->id.sequence_num > predecessor->sequence_num;
+  }
+  return false;
 }
 
 // ============================================================

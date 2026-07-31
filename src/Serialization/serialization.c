@@ -11,6 +11,13 @@
 #include <string.h>
 #include <openssl/sha.h>
 
+// Upper bounds on attacker-controlled counts read from the wire. Without
+// these, a tiny crafted blob declaring log_count = 2^32 would force a
+// multi-GB allocation (and the allocator aborts on OOM → DoS, audit M-2).
+#define CRABS_DESER_MAX_ITEMS   100000
+#define CRABS_DESER_MAX_POLICIES 10000
+#define CRABS_DESER_MAX_LOG     1000000
+
 // ============================================================
 // Write buffer helper
 // ============================================================
@@ -406,6 +413,7 @@ static bool _deserialize_ot_type_state(read_buf_t* buf, data_item_t* item) {
 
       uint32_t count;
       if (!_read_uint32_le(buf, &count)) return false;
+      if (count > CRABS_DESER_MAX_LOG) return false;
 
       crabs_ordered_element_t* tail = NULL;
       for (uint32_t i = 0; i < count; i++) {
@@ -445,6 +453,7 @@ static bool _deserialize_ot_type_state(read_buf_t* buf, data_item_t* item) {
 
       uint32_t span_count;
       if (!_read_uint32_le(buf, &span_count)) return false;
+      if (span_count > CRABS_DESER_MAX_LOG) return false;
 
       crabs_span_t* tail = NULL;
       for (uint32_t i = 0; i < span_count; i++) {
@@ -491,6 +500,7 @@ static bool _deserialize_ot_type_state(read_buf_t* buf, data_item_t* item) {
 
       uint32_t node_count;
       if (!_read_uint32_le(buf, &node_count)) return false;
+      if (node_count > CRABS_DESER_MAX_LOG) return false;
 
       crabs_tree_node_t* first_node = NULL;
       crabs_tree_node_t* prev_node = NULL;
@@ -590,6 +600,137 @@ static bool _deserialize_ot_type_state(read_buf_t* buf, data_item_t* item) {
 }
 
 // ============================================================
+// CRDT value serialization (audit M-5): sets/flags previously lost their
+// contents on round-trip (the serializer wrote a 0-length value). These
+// helpers serialize or_set / two_p_set / one_shot_set / one_shot_flag into
+// a length-prefixed blob that the deserializer reconstructs.
+// ============================================================
+#include "../CRDT/crdt_merge.h"
+#include "../CRDT/one_shot.h"
+
+static void _serialize_crdt_value(write_buf_t* buf, data_type_e type, const void* value) {
+  if (value == NULL) { _write_bytes32(buf, NULL, 0); return; }
+  write_buf_t* cb = _write_buf_create(64);
+  switch (type) {
+    case DATA_TYPE_SET: {
+      const or_set_t* s = (const or_set_t*)value;
+      _write_uint32_le(cb, s->element_count);
+      for (uint32_t i = 0; i < s->element_count; i++) {
+        _write_string16(cb, s->elements[i].element);
+        _write_string16(cb, s->elements[i].tag);
+      }
+      _write_uint32_le(cb, s->tombstone_count);
+      for (uint32_t i = 0; i < s->tombstone_count; i++) {
+        _write_string16(cb, s->tombstones[i].element);
+        _write_string16(cb, s->tombstones[i].tag);
+      }
+      break;
+    }
+    case DATA_TYPE_2P_SET: {
+      const two_p_set_t* s = (const two_p_set_t*)value;
+      _write_uint32_le(cb, s->add_count);
+      for (uint32_t i = 0; i < s->add_count; i++) _write_string16(cb, s->add_set[i]);
+      _write_uint32_le(cb, s->remove_count);
+      for (uint32_t i = 0; i < s->remove_count; i++) _write_string16(cb, s->remove_set[i]);
+      break;
+    }
+    case DATA_TYPE_ONE_SHOT_SET: {
+      const one_shot_set_t* s = (const one_shot_set_t*)value;
+      _write_uint32_le(cb, s->element_count);
+      for (uint32_t i = 0; i < s->element_count; i++) _write_string16(cb, s->elements[i]);
+      break;
+    }
+    case DATA_TYPE_ONE_SHOT_FLAG: {
+      const one_shot_flag_t* f = (const one_shot_flag_t*)value;
+      _write_bool8(cb, f->value);
+      _write_string16(cb, f->set_by);
+      _write_uint64_le(cb, f->set_at);
+      break;
+    }
+    default:
+      break;
+  }
+  _write_bytes32(buf, cb->data, (uint32_t)cb->offset);
+  free(cb->data); free(cb);
+}
+
+static void* _deserialize_crdt_value(const uint8_t* data, uint32_t len, data_type_e type) {
+  if (data == NULL || len == 0) return NULL;
+  read_buf_t rb;
+  rb.data = data; rb.len = len; rb.offset = 0;
+  switch (type) {
+    case DATA_TYPE_SET: {
+      or_set_t* s = or_set_create();
+      if (!s) return NULL;
+      uint32_t ec;
+      if (!_read_uint32_le(&rb, &ec)) { or_set_destroy(s); return NULL; }
+      for (uint32_t i = 0; i < ec; i++) {
+        char elem[CRABS_MAX_USER_ID]; char tag[CRABS_MAX_USER_ID];
+        if (!_read_string16(&rb, elem, sizeof(elem)) || !_read_string16(&rb, tag, sizeof(tag))) { or_set_destroy(s); return NULL; }
+        or_set_add(s, elem, tag);
+      }
+      uint32_t tc;
+      if (!_read_uint32_le(&rb, &tc)) { or_set_destroy(s); return NULL; }
+      for (uint32_t i = 0; i < tc; i++) {
+        char elem[CRABS_MAX_USER_ID]; char tag[CRABS_MAX_USER_ID];
+        if (!_read_string16(&rb, elem, sizeof(elem)) || !_read_string16(&rb, tag, sizeof(tag))) { or_set_destroy(s); return NULL; }
+        // Reconstruct tombstone directly (or_set_remove would consume by element only)
+        uint32_t idx = s->tombstone_count;
+        s->tombstones = realloc(s->tombstones, (idx + 1) * sizeof(or_set_entry_t));
+        if (!s->tombstones) { or_set_destroy(s); return NULL; }
+        s->tombstones[idx].element = strdup(elem);
+        s->tombstones[idx].tag = strdup(tag);
+        s->tombstone_count = idx + 1;
+      }
+      return s;
+    }
+    case DATA_TYPE_2P_SET: {
+      two_p_set_t* s = two_p_set_create();
+      if (!s) return NULL;
+      uint32_t ac;
+      if (!_read_uint32_le(&rb, &ac)) { two_p_set_destroy(s); return NULL; }
+      for (uint32_t i = 0; i < ac; i++) {
+        char e[CRABS_MAX_USER_ID];
+        if (!_read_string16(&rb, e, sizeof(e))) { two_p_set_destroy(s); return NULL; }
+        two_p_set_add(s, e);
+      }
+      uint32_t rc2;
+      if (!_read_uint32_le(&rb, &rc2)) { two_p_set_destroy(s); return NULL; }
+      for (uint32_t i = 0; i < rc2; i++) {
+        char e[CRABS_MAX_USER_ID];
+        if (!_read_string16(&rb, e, sizeof(e))) { two_p_set_destroy(s); return NULL; }
+        two_p_set_remove(s, e);
+      }
+      return s;
+    }
+    case DATA_TYPE_ONE_SHOT_SET: {
+      one_shot_set_t* s = one_shot_set_create();
+      if (!s) return NULL;
+      uint32_t ec;
+      if (!_read_uint32_le(&rb, &ec)) { one_shot_set_destroy(s); return NULL; }
+      for (uint32_t i = 0; i < ec; i++) {
+        char e[CRABS_MAX_USER_ID];
+        if (!_read_string16(&rb, e, sizeof(e))) { one_shot_set_destroy(s); return NULL; }
+        one_shot_set_add(s, e);
+      }
+      return s;
+    }
+    case DATA_TYPE_ONE_SHOT_FLAG: {
+      one_shot_flag_t* f = one_shot_flag_create();
+      if (!f) return NULL;
+      uint8_t v; char setby[CRABS_MAX_USER_ID]; uint64_t at;
+      if (!_read_uint8(&rb, &v) || !_read_string16(&rb, setby, sizeof(setby)) || !_read_uint64_le(&rb, &at)) {
+        one_shot_flag_destroy(f); return NULL;
+      }
+      if (v) one_shot_flag_set(f, setby, at);
+      return f;
+    }
+    default:
+      return NULL;
+  }
+}
+
+// ============================================================
 // Data item serialization (§13.2)
 // ============================================================
 static void _serialize_data_item(write_buf_t* buf, const data_item_t* item) {
@@ -643,6 +784,10 @@ static void _serialize_data_item(write_buf_t* buf, const data_item_t* item) {
 
       // Type-specific state
       _serialize_ot_type_state(buf, item);
+    } else if (item->type == DATA_TYPE_SET || item->type == DATA_TYPE_2P_SET ||
+               item->type == DATA_TYPE_ONE_SHOT_SET || item->type == DATA_TYPE_ONE_SHOT_FLAG) {
+      // CRDT sets/flags: serialize their full contents (audit M-5).
+      _serialize_crdt_value(buf, item->type, item->value);
     } else {
       // Generic: just write 0 length for unsupported types
       _write_bytes32(buf, NULL, 0);
@@ -748,6 +893,12 @@ static bool _deserialize_data_item(read_buf_t* buf, data_item_t* item, uint32_t 
           item->value = NULL;
           break;
       }
+    } else if (item->type == DATA_TYPE_SET || item->type == DATA_TYPE_2P_SET ||
+               item->type == DATA_TYPE_ONE_SHOT_SET || item->type == DATA_TYPE_ONE_SHOT_FLAG) {
+      // CRDT sets/flags: reconstruct the struct (audit M-5).
+      void* v = _deserialize_crdt_value(val_data, val_len, item->type);
+      free(val_data);
+      item->value = v;
     } else {
       // Store as raw bytes for unknown types
       item->value = get_memory(val_len);
@@ -1114,14 +1265,17 @@ state_t* crabs_deserialize_state(const uint8_t* data, size_t len) {
   // item_count
   uint32_t item_count;
   if (!_read_uint32_le(&buf, &item_count)) goto fail;
+  if (item_count > CRABS_DESER_MAX_ITEMS) goto fail;
 
   // policy_count
   uint32_t policy_count;
   if (!_read_uint32_le(&buf, &policy_count)) goto fail;
+  if (policy_count > CRABS_DESER_MAX_POLICIES) goto fail;
 
   // log_count
   uint32_t log_count;
   if (!_read_uint32_le(&buf, &log_count)) goto fail;
+  if (log_count > CRABS_DESER_MAX_LOG) goto fail;
 
   // items
   data_item_t* tail = NULL;
@@ -1631,6 +1785,7 @@ crabs_ot_data_item_t* crabs_deserialize_ot_data(const uint8_t* data, size_t len,
   // op_log
   uint32_t op_count;
   if (!_read_uint32_le(&buf, &op_count)) goto fail;
+  if (op_count > CRABS_OT_OP_LOG_MAX) goto fail;
   if (op_count > 0) {
     free(item->op_log);
     item->op_log = get_clear_memory(sizeof(crabs_ot_operation_t) * op_count);

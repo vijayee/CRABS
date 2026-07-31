@@ -593,3 +593,29 @@ TEST_F(TestCLI, DispatchOpCheckDedup) {
                          (char*)"vote", (char*)"alice"};
   EXPECT_EQ(cli_dispatch(node, 5, check_argv), CLI_OK);
 }
+// Regression for audit M-17: the CLI must sign operations with the signer's
+// own custodied key, not the node key. A user without a CLI-custodied key
+// cannot submit a valid op (it is left unsigned and rejected); a user whose
+// key the CLI holds can.
+TEST_F(TestCLI, OpSubmitSignsWithCustodiedKey) {
+  cli_node_init(node, "admin");
+  cli_cmd_item_add(node, "res1", "resource");
+  state_add_policy(&node->attr_machine->base_state, CRABS_OP_LOCK, "");
+
+  // Register alice with a CLI-custodied keypair.
+  ecdsa_keypair_t* alice_key = crypto_ecdsa_generate();
+  ASSERT_NE(alice_key, nullptr);
+  char pk_hex[67];
+  cli_bytes_to_hex(alice_key->public_key, 33, pk_hex);
+  ASSERT_EQ(cli_cmd_user_register(node, "alice", pk_hex), CLI_OK);
+  // Grant alice role:admin so she satisfies the (empty) policy is fine, but
+  // for a role:admin policy she needs the attribute; use empty policy instead.
+  ASSERT_EQ(cli_node_add_user_key(node, "alice", alice_key), CLI_OK);
+
+  // Alice can submit because the CLI holds her key.
+  EXPECT_EQ(cli_cmd_op_submit(node, CRABS_OP_LOCK, nullptr, "alice"), CLI_OK);
+
+  // A user with no custodied key cannot submit (unsigned op is rejected).
+  cli_cmd_user_register(node, "bob", pk_hex);
+  EXPECT_NE(cli_cmd_op_submit(node, CRABS_OP_LOCK, nullptr, "bob"), CLI_OK);
+}

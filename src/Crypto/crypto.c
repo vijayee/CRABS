@@ -40,33 +40,24 @@ static void _ensure_oabe_init(void) {
 // Internal struct definitions for the opaque ABE types.
 //
 // The master key holds a real Waters '09 CP-ABE authority context (for
-// attribute-bound keygen) plus a vault_key derived from the master secret
-// via HKDF. The capability vault is encrypted with AES-256-GCM under a
-// per-ciphertext key = HKDF(vault_key, salt). This closes audit C-1: the
-// prior scheme derived the vault key from PUBLIC material (HMAC(MPK, policy)),
-// so anyone with the public params could decrypt the vault. The vault_key
-// is secret (derived from the master secret) and embedded in each user key
-// so key-holders can decrypt vault entries whose policy their attributes
-// satisfy.
-//
-// NOTE: the bundled openabe-c CP-ABE encrypt/decrypt is KEM-only (the
-// reference example 04_cpabe_encrypt.c returns empty plaintext). Full
-// attribute-based data encryption (ABE-KEM + DEM with user-key decryption)
-// is a tracked follow-up once the DEM is implemented; until then the vault
-// uses MSK-derived AES-256-GCM, which is confidential against anyone without
-// the master secret.
+// attribute-bound keygen). The capability vault is encrypted with real
+// CP-ABE (ABE-KEM + DEM): the encapsulated GT element is hashed to a
+// symmetric key and the payload is AES-256-GCM encrypted, so only a user key
+// whose attributes satisfy the access policy can recover the symmetric key
+// and decrypt. This closes audit C-1: the prior scheme derived the vault
+// key from PUBLIC material (HMAC(MPK, policy)), so anyone with the public
+// params could decrypt the vault. (The DEM was added to openabe-c itself
+// — see oabe_context.c.)
 struct abe_master_key_t {
   OABE_ContextCP*   ctx;             // authority context (params + msk + keystore)
   OABE_ByteString*  public_params;   // serialized MPK
   OABE_ByteString*  master_secret;   // serialized MSK
-  uint8_t           vault_key[32];   // HKDF(master_secret, "CRABS-VAULT-v1")
 };
 
 struct abe_user_key_t {
   char              attrs[CRABS_MAX_POLICY_EXPR];  // original attribute string (for identity)
-  OABE_ByteString*  key_bytes;       // serialized ABE user key
+  OABE_ByteString*  key_bytes;       // serialized CP-ABE user key
   OABE_ByteString*  public_params;   // copy of MPK public params (for decrypt)
-  uint8_t           vault_key[32];   // copy of master vault_key (bearer credential)
 };
 
 struct abe_ciphertext_t {
@@ -87,117 +78,6 @@ static void _crabs_attrs_to_oabe(const char* attrs, char* out, size_t out_len) {
     out[i++] = c;
   }
   out[i] = '\0';
-}
-
-// HKDF-extract style: PRK = HMAC-SHA256(salt, ikm). Used to derive the vault
-// key from the master secret, and per-ciphertext AES keys from the vault key
-// + a random salt.
-static void _hkdf_sha256(const uint8_t* salt, size_t salt_len,
-                           const uint8_t* ikm, size_t ikm_len,
-                           uint8_t out[32]) {
-  unsigned int out_len = 32;
-  HMAC(EVP_sha256(), salt, (int)salt_len, ikm, ikm_len, out, &out_len);
-}
-
-// AES-256-GCM encrypt into a freshly allocated ByteString.
-// Layout: salt(32) + nonce(12) + tag(16) + aes_ciphertext.
-static OABE_ByteString* _abe_aes_gcm_encrypt(const uint8_t vault_key[32],
-                                               const uint8_t* msg, size_t msg_len) {
-  uint8_t salt[32];
-  uint8_t nonce[12];
-  if (crypto_random_bytes(salt, sizeof(salt)) != CRABS_SUCCESS) return NULL;
-  if (crypto_random_bytes(nonce, sizeof(nonce)) != CRABS_SUCCESS) return NULL;
-
-  uint8_t key[32];
-  _hkdf_sha256(salt, 32, vault_key, 32, key);
-
-  EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
-  if (!ctx) { OPENSSL_cleanse(key, 32); return NULL; }
-  if (EVP_EncryptInit_ex(ctx, EVP_aes_256_gcm(), NULL, NULL, NULL) != 1 ||
-      EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_IVLEN, 12, NULL) != 1 ||
-      EVP_EncryptInit_ex(ctx, NULL, NULL, key, nonce) != 1) {
-    EVP_CIPHER_CTX_free(ctx); OPENSSL_cleanse(key, 32); return NULL;
-  }
-  OPENSSL_cleanse(key, 32);
-
-  uint8_t* ct = get_clear_memory(msg_len + 32);
-  if (!ct) { EVP_CIPHER_CTX_free(ctx); return NULL; }
-  int out_len = 0;
-  if (EVP_EncryptUpdate(ctx, ct, &out_len, msg, (int)msg_len) != 1) {
-    OPENSSL_cleanse(ct, msg_len + 32); free(ct); EVP_CIPHER_CTX_free(ctx);
-    return NULL;
-  }
-  int final_len = 0;
-  if (EVP_EncryptFinal_ex(ctx, ct + out_len, &final_len) != 1) {
-    OPENSSL_cleanse(ct, msg_len + 32); free(ct); EVP_CIPHER_CTX_free(ctx);
-    return NULL;
-  }
-  uint8_t tag[16];
-  if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_GET_TAG, 16, tag) != 1) {
-    OPENSSL_cleanse(ct, msg_len + 32); free(ct); EVP_CIPHER_CTX_free(ctx);
-    return NULL;
-  }
-  EVP_CIPHER_CTX_free(ctx);
-
-  size_t ct_total = (size_t)out_len + (size_t)final_len;
-  size_t total = 32 + 12 + 16 + ct_total;
-  uint8_t* blob = get_clear_memory(total);
-  if (!blob) { OPENSSL_cleanse(ct, msg_len + 32); free(ct); return NULL; }
-  memcpy(blob, salt, 32);
-  memcpy(blob + 32, nonce, 12);
-  memcpy(blob + 44, tag, 16);
-  memcpy(blob + 60, ct, ct_total);
-  OPENSSL_cleanse(ct, msg_len + 32);
-  free(ct);
-
-  OABE_ByteString* bs = oabe_bytestring_new_from_data(blob, total);
-  OPENSSL_cleanse(blob, total);
-  free(blob);
-  return bs;
-}
-
-static crabs_error_e _abe_aes_gcm_decrypt(const uint8_t vault_key[32],
-                                            const OABE_ByteString* ct_bytes,
-                                            uint8_t** out, size_t* out_len) {
-  const uint8_t* blob = oabe_bytestring_get_const_ptr(ct_bytes);
-  size_t blob_len = oabe_bytestring_get_size(ct_bytes);
-  if (blob_len < 60) return CRABS_ERR_CRYPTOGRAPHIC_ERROR;
-  const uint8_t* salt = blob;
-  const uint8_t* nonce = blob + 32;
-  const uint8_t* tag = blob + 44;
-  const uint8_t* aes_ct = blob + 60;
-  size_t aes_ct_len = blob_len - 60;
-
-  uint8_t key[32];
-  _hkdf_sha256(salt, 32, vault_key, 32, key);
-
-  EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
-  if (!ctx) { OPENSSL_cleanse(key, 32); return CRABS_ERR_CRYPTOGRAPHIC_ERROR; }
-  if (EVP_DecryptInit_ex(ctx, EVP_aes_256_gcm(), NULL, NULL, NULL) != 1 ||
-      EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_IVLEN, 12, NULL) != 1 ||
-      EVP_DecryptInit_ex(ctx, NULL, NULL, key, nonce) != 1 ||
-      EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_TAG, 16, (void*)tag) != 1) {
-    EVP_CIPHER_CTX_free(ctx); OPENSSL_cleanse(key, 32);
-    return CRABS_ERR_CRYPTOGRAPHIC_ERROR;
-  }
-  OPENSSL_cleanse(key, 32);
-
-  uint8_t* plain = get_clear_memory(aes_ct_len + 32);
-  if (!plain) { EVP_CIPHER_CTX_free(ctx); return CRABS_ERR_OOM; }
-  int dec_len = 0;
-  if (EVP_DecryptUpdate(ctx, plain, &dec_len, aes_ct, (int)aes_ct_len) != 1) {
-    OPENSSL_cleanse(plain, aes_ct_len + 32); free(plain);
-    EVP_CIPHER_CTX_free(ctx); return CRABS_ERR_CRYPTOGRAPHIC_ERROR;
-  }
-  int final_len = 0;
-  if (EVP_DecryptFinal_ex(ctx, plain + dec_len, &final_len) != 1) {
-    OPENSSL_cleanse(plain, aes_ct_len + 32); free(plain);
-    EVP_CIPHER_CTX_free(ctx); return CRABS_ERR_UNAUTHORIZED;
-  }
-  EVP_CIPHER_CTX_free(ctx);
-  *out = plain;
-  *out_len = (size_t)(dec_len + final_len);
-  return CRABS_SUCCESS;
 }
 
 // ============================================================
@@ -674,15 +554,6 @@ abe_master_key_t* crypto_abe_setup(void) {
     free(mk);
     return NULL;
   }
-  // Derive the vault key from the (secret) master secret via HKDF. The vault
-  // key is secret and is embedded in each user key; the prior scheme derived
-  // the vault key from the PUBLIC master public key, which let anyone with
-  // the public params decrypt the vault (audit C-1).
-  static const uint8_t vault_salt[] = "CRABS-VAULT-v1";
-  _hkdf_sha256(vault_salt, sizeof(vault_salt) - 1,
-               oabe_bytestring_get_const_ptr(mk->master_secret),
-               oabe_bytestring_get_size(mk->master_secret),
-               mk->vault_key);
   return mk;
 }
 
@@ -705,7 +576,6 @@ abe_user_key_t* crypto_abe_keygen(const abe_master_key_t* mk, const char* attrs)
 
   abe_user_key_t* sk = get_clear_memory(sizeof(abe_user_key_t));
   if (!sk) return NULL;
-  memcpy(sk->vault_key, mk->vault_key, sizeof(sk->vault_key));
 
   strncpy(sk->attrs, attrs, CRABS_MAX_POLICY_EXPR - 1);
   sk->attrs[CRABS_MAX_POLICY_EXPR - 1] = '\0';
@@ -768,9 +638,6 @@ abe_user_key_t* crypto_abe_user_key_deserialize(const abe_master_key_t* mk,
   _ensure_oabe_init();
   abe_user_key_t* sk = get_clear_memory(sizeof(abe_user_key_t));
   if (!sk) return NULL;
-  // A reconstructed user key inherits the master vault_key so it can decrypt
-  // vault entries (the vault key is secret, derived from the master secret).
-  memcpy(sk->vault_key, mk->vault_key, sizeof(sk->vault_key));
   sk->key_bytes = oabe_bytestring_new_from_data(buf, len);
   if (!sk->key_bytes) { free(sk); return NULL; }
   sk->public_params = oabe_bytestring_new_from_data(
@@ -791,7 +658,7 @@ abe_user_key_t* crypto_abe_user_key_deserialize(const abe_master_key_t* mk,
 abe_ciphertext_t* crypto_abe_encrypt(const abe_master_key_t* mk,
                                        const uint8_t* msg, size_t msg_len,
                                        const char* policy) {
-  if (!mk || !msg || !policy) return NULL;
+  if (!mk || !msg || !policy || !mk->public_params) return NULL;
   _ensure_oabe_init();
 
   abe_ciphertext_t* ct = get_clear_memory(sizeof(abe_ciphertext_t));
@@ -799,13 +666,20 @@ abe_ciphertext_t* crypto_abe_encrypt(const abe_master_key_t* mk,
   strncpy(ct->policy, policy, CRABS_MAX_POLICY_EXPR - 1);
   ct->policy[CRABS_MAX_POLICY_EXPR - 1] = '\0';
 
-  // AES-256-GCM under a per-ciphertext key derived from the (secret) vault
-  // key. ct_bytes = salt(32) + nonce(12) + tag(16) + aes_ct.
-  ct->ct_bytes = _abe_aes_gcm_encrypt(mk->vault_key, msg, msg_len);
-  if (!ct->ct_bytes) {
-    free(ct);
-    return NULL;
+  // Real CP-ABE: build an encryptor context with only the public params and
+  // encrypt under the access policy. The OpenABE context performs the
+  // ABE-KEM and the DEM (hashes the encapsulated GT element to a symmetric
+  // key and AES-256-GCM encrypts the plaintext), so the resulting ciphertext
+  // is only recoverable by a user key whose attributes satisfy the policy.
+  OABE_ContextCP* enc_ctx = oabe_context_cp_new();
+  if (!enc_ctx) { free(ct); return NULL; }
+  if (oabe_context_cp_set_public_params(enc_ctx, mk->public_params) != OABE_SUCCESS) {
+    oabe_context_cp_free(enc_ctx); free(ct); return NULL;
   }
+  if (oabe_context_cp_encrypt(enc_ctx, policy, msg, msg_len, &ct->ct_bytes) != OABE_SUCCESS) {
+    oabe_context_cp_free(enc_ctx); free(ct); return NULL;
+  }
+  oabe_context_cp_free(enc_ctx);
   return ct;
 }
 
@@ -817,22 +691,40 @@ void crypto_abe_ciphertext_destroy(abe_ciphertext_t* ct) {
 }
 
 // ============================================================
-// ABE Decrypt — AES-256-GCM with the (secret) vault key carried by the
-// user key, gated by attribute policy evaluation.
+// ABE Decrypt — real CP-ABE user-key decryption (ABE-KEM + DEM).
 // ============================================================
 
 crabs_error_e crypto_abe_decrypt(const abe_user_key_t* sk, const abe_ciphertext_t* ct,
                          uint8_t** out, size_t* out_len) {
   if (!sk || !ct || !out || !out_len) return CRABS_ERR_INVALID_PARAM;
-  if (!ct->ct_bytes) return CRABS_ERR_INVALID_PARAM;
+  if (!sk->key_bytes || !sk->public_params || !ct->ct_bytes) {
+    return CRABS_ERR_INVALID_PARAM;
+  }
+  _ensure_oabe_init();
 
-  // Gate by attribute policy (string-based check). Only users whose
-  // attributes satisfy the ciphertext's policy may decrypt the vault entry.
-  if (!crypto_abe_eval_policy(ct->policy, sk->attrs)) {
-    return CRABS_ERR_UNAUTHORIZED;
+  OABE_ContextCP* dec_ctx = oabe_context_cp_new();
+  if (!dec_ctx) return CRABS_ERR_CRYPTOGRAPHIC_ERROR;
+  if (oabe_context_cp_set_public_params(dec_ctx, sk->public_params) != OABE_SUCCESS) {
+    oabe_context_cp_free(dec_ctx); return CRABS_ERR_CRYPTOGRAPHIC_ERROR;
+  }
+  if (oabe_context_cp_import_key(dec_ctx, "dec_key", sk->key_bytes) != OABE_SUCCESS) {
+    oabe_context_cp_free(dec_ctx); return CRABS_ERR_CRYPTOGRAPHIC_ERROR;
   }
 
-  return _abe_aes_gcm_decrypt(sk->vault_key, ct->ct_bytes, out, out_len);
+  size_t cap = oabe_bytestring_get_size(ct->ct_bytes) + 64;
+  uint8_t* plain = get_clear_memory(cap);
+  if (!plain) { oabe_context_cp_free(dec_ctx); return CRABS_ERR_OOM; }
+  size_t plain_len = cap;
+  OABE_ERROR orc = oabe_context_cp_decrypt(dec_ctx, "dec_key", ct->ct_bytes,
+                                             plain, &plain_len);
+  oabe_context_cp_free(dec_ctx);
+  if (orc != OABE_SUCCESS) {
+    OPENSSL_cleanse(plain, cap); free(plain);
+    return CRABS_ERR_UNAUTHORIZED; // attributes don't satisfy the policy, or tampering
+  }
+  *out = plain;
+  *out_len = plain_len;
+  return CRABS_SUCCESS;
 }
 
 // ============================================================
@@ -944,6 +836,15 @@ verify_result_t crypto_verify_operation_auth(
       return result;
     }
 
+    // Verify the signature BEFORE the attribute policy check (audit L-7):
+    // checking the policy first returned distinct error codes for "user lacks
+    // attributes" vs "bad signature", a small information leak. Now the only
+    // signal on failure is a single UNAUTHORIZED.
+    if (!crypto_ecdsa_verify(user->public_key, serialized_op, op_len, signature)) {
+      result.error = CRABS_ERR_UNAUTHORIZED;
+      return result;
+    }
+
     if (has_attr_policy) {
       char attr_string[CRABS_MAX_POLICY_EXPR];
       _build_attr_string(user, attr_string, sizeof(attr_string));
@@ -951,11 +852,6 @@ verify_result_t crypto_verify_operation_auth(
         result.error = CRABS_ERR_UNAUTHORIZED;
         return result;
       }
-    }
-
-    if (!crypto_ecdsa_verify(user->public_key, serialized_op, op_len, signature)) {
-      result.error = CRABS_ERR_CRYPTOGRAPHIC_ERROR;
-      return result;
     }
 
     result.authorized = true;
@@ -1108,6 +1004,17 @@ verify_result_t crypto_verify_operation_auth_v2(
       return result;
     }
 
+    // Verify the signature BEFORE the attribute policy check (audit L-7):
+    // collapse the "bad signature" vs "lacks attributes" distinction into a
+    // single UNAUTHORIZED so a caller cannot distinguish them.
+    crabs_error_e sig_rc = _verify_user_signature(user, key_id, sig_scheme,
+                                                    serialized_op, op_len,
+                                                    signature, signature_len);
+    if (sig_rc != CRABS_SUCCESS) {
+      result.error = CRABS_ERR_UNAUTHORIZED;
+      return result;
+    }
+
     if (has_attr_policy) {
       char attr_string[CRABS_MAX_POLICY_EXPR];
       _build_attr_string(user, attr_string, sizeof(attr_string));
@@ -1115,14 +1022,6 @@ verify_result_t crypto_verify_operation_auth_v2(
         result.error = CRABS_ERR_UNAUTHORIZED;
         return result;
       }
-    }
-
-    crabs_error_e sig_rc = _verify_user_signature(user, key_id, sig_scheme,
-                                                    serialized_op, op_len,
-                                                    signature, signature_len);
-    if (sig_rc != CRABS_SUCCESS) {
-      result.error = sig_rc;
-      return result;
     }
 
     result.authorized = true;

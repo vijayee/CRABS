@@ -91,7 +91,7 @@ TEST(TestSchemeVerify, LegacyECDSAWrongSigFails) {
       sig, CRABS_SIG_SIZE,
       "admin", nullptr, SCHEME_UNSPECIFIED, VERIFY_MODE_A);
   EXPECT_FALSE(vr.authorized);
-  EXPECT_EQ(vr.error, CRABS_ERR_CRYPTOGRAPHIC_ERROR);
+  EXPECT_EQ(vr.error, CRABS_ERR_UNAUTHORIZED);
 
   crypto_ecdsa_keypair_destroy(kp);
   crypto_abe_master_key_destroy(mk);
@@ -164,7 +164,7 @@ TEST(TestSchemeVerify, VTableVerifyWrongMessageFails) {
       sig, sig_len,
       "admin", "vt-key", ECDSA_SECP256K1, VERIFY_MODE_A);
   EXPECT_FALSE(vr.authorized);
-  EXPECT_EQ(vr.error, CRABS_ERR_CRYPTOGRAPHIC_ERROR);
+  EXPECT_EQ(vr.error, CRABS_ERR_UNAUTHORIZED);
 
   crypto_abe_master_key_destroy(mk);
   attribute_machine_destroy(am);
@@ -185,7 +185,7 @@ TEST(TestSchemeVerify, VTableVerifyUnknownKeyIdFails) {
       sig, CRABS_SIG_SIZE,
       "admin", "nonexistent-key", ECDSA_SECP256K1, VERIFY_MODE_A);
   EXPECT_FALSE(vr.authorized);
-  EXPECT_EQ(vr.error, CRABS_ERR_RESOURCE_NOT_FOUND);
+  EXPECT_EQ(vr.error, CRABS_ERR_UNAUTHORIZED);
 
   crypto_abe_master_key_destroy(mk);
   attribute_machine_destroy(am);
@@ -261,7 +261,7 @@ TEST(TestSchemeVerify, SchemeMismatchFails) {
       sig, sig_len,
       "admin", "ecdsa-key", ED25519, VERIFY_MODE_A);
   EXPECT_FALSE(vr.authorized);
-  EXPECT_EQ(vr.error, CRABS_ERR_CRYPTOGRAPHIC_ERROR);
+  EXPECT_EQ(vr.error, CRABS_ERR_UNAUTHORIZED);
 
   crypto_abe_master_key_destroy(mk);
   attribute_machine_destroy(am);

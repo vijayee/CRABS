@@ -9,6 +9,7 @@ extern "C" {
 #include "../src/Crypto/sig_scheme.h"
 #include "../src/Crypto/crypto.h"
 #include "../src/Attribute/attribute_machine.h"
+#include "../src/CRDT/crdt_merge.h"
 #include <openssl/sha.h>
 }
 
@@ -1068,4 +1069,35 @@ TEST(TestSerialization, SigningCoversDedupMutationAndPayloadFormat) {
 
   operation_destroy(op);
   crypto_ecdsa_keypair_destroy(kp);
+}
+
+// Regression for audit M-5: OR-set / 2P-set / one-shot set/flag contents must
+// survive a serialize/deserialize round-trip (previously the serializer wrote
+// a 0-length value and the set came back empty).
+TEST(TestSerialization, RoundTripPreservesORSet) {
+  state_t* state = state_create();
+  data_item_t* item = data_item_create("s1", DATA_TYPE_SET, CRDT_OR_SET);
+  or_set_t* set = or_set_create();
+  or_set_add(set, "apple", "n1:1");
+  or_set_add(set, "banana", "n1:2");
+  or_set_remove(set, "apple");
+  item->value = set;
+  state_add_item(state, item);
+
+  serialized_buffer_t* buf = crabs_serialize_state(state);
+  ASSERT_NE(buf, nullptr);
+  state_t* restored = crabs_deserialize_state(buf->data, buf->len);
+  ASSERT_NE(restored, nullptr);
+
+  data_item_t* r = state_find_item(restored, "s1");
+  ASSERT_NE(r, nullptr);
+  ASSERT_NE(r->value, nullptr);
+  or_set_t* rs = (or_set_t*)r->value;
+  EXPECT_FALSE(or_set_contains(rs, "apple"));  // removed
+  EXPECT_TRUE(or_set_contains(rs, "banana")); // survived
+  EXPECT_GT(rs->element_count, 0u);
+
+  serialized_buffer_destroy(buf);
+  state_destroy(restored);
+  state_destroy(state);
 }

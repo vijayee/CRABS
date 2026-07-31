@@ -22,7 +22,9 @@
 #include "../OT/ot_ordered_set.h"
 #include "../OT/ot_document.h"
 #include "../OT/ot_tree.h"
+#include "../Util/allocator.h"
 #include <string.h>
+#include <stdlib.h>
 
 // ============================================================
 // Compaction ID Generation (v1.6 §3)
@@ -117,18 +119,64 @@ crabs_ot_tree_t* crabs_extract_visible_tree(
 
   crabs_ot_tree_t* visible = crabs_ot_tree_create();
   if (visible == NULL) return NULL;
+  if (tree->root == NULL) return visible;
 
-  // Walk the node pool linked list
-  crabs_tree_node_t* node = tree->node_pool;
-  while (node != NULL) {
+  // Iterative pre-order DFS so parents are inserted before their children
+  // (the prior pool walk visited children first because the pool is
+  // prepend-ordered, so the parent lookup failed and live nodes were
+  // silently dropped). Sibling order is preserved by inserting each child at
+  // the current end of its parent's visible children.
+  crabs_tree_node_t** stack = (crabs_tree_node_t**)get_clear_memory(sizeof(crabs_tree_node_t*) * 16);
+  if (stack == NULL) { crabs_ot_tree_destroy(visible); return NULL; }
+  uint32_t cap = 16, top = 0;
+  stack[top++] = tree->root;
+
+  while (top > 0) {
+    crabs_tree_node_t* node = stack[--top];
+    if (node == NULL) continue;
+    const char* parent_id_arg = node->parent_id[0] ? node->parent_id : NULL;
     if (!node->deleted) {
-      crabs_ot_tree_insert_node(visible, node->parent_id,
-        0, node->id,
-        node->value, node->value_size);
+      // Count current visible children of the parent so we append in order.
+      uint32_t pos = 0;
+      if (parent_id_arg != NULL) {
+        crabs_tree_node_t* vp = crabs_ot_tree_find(visible, parent_id_arg);
+        if (vp != NULL) {
+          for (crabs_tree_node_t* c = vp->first_child; c != NULL; c = c->next_sibling) pos++;
+        }
+      }
+      crabs_ot_tree_insert_node(visible, parent_id_arg, pos,
+                                 node->id, node->value, node->value_size);
     }
-    node = node->pool_next;
+    // Push children in reverse so they are visited (popped) in original order.
+    // Only descend into visible nodes: a deleted node's subtree is also
+    // marked deleted by _mark_subtree_deleted, so there is nothing to recover.
+    if (!node->deleted) {
+      crabs_tree_node_t* c = node->first_child;
+      // Collect children into a temp list to reverse.
+      crabs_tree_node_t** tmp = NULL;
+      uint32_t n = 0, tcap = 0;
+      while (c != NULL) {
+        if (n == tcap) {
+          tcap = tcap ? tcap * 2 : 8;
+          crabs_tree_node_t** nt = (crabs_tree_node_t**)realloc(tmp, sizeof(crabs_tree_node_t*) * tcap);
+          if (nt == NULL) { free(tmp); break; }
+          tmp = nt;
+        }
+        tmp[n++] = c;
+        c = c->next_sibling;
+      }
+      if (top + n > cap) {
+        uint32_t newcap = cap;
+        while (newcap < top + n) newcap *= 2;
+        crabs_tree_node_t** ns = (crabs_tree_node_t**)realloc(stack, sizeof(crabs_tree_node_t*) * newcap);
+        if (ns == NULL) { free(tmp); break; }
+        stack = ns; cap = newcap;
+      }
+      for (uint32_t i = 0; i < n; i++) stack[top++] = tmp[n - 1 - i];
+      free(tmp);
+    }
   }
-
+  free(stack);
   return visible;
 }
 

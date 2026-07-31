@@ -633,13 +633,19 @@ crabs_error_e state_machine_op_lock(state_t* state, operation_t* op, lock_respon
   uint64_t now_ms = (uint64_t)time(NULL) * 1000;
   uint64_t expiry = now_ms + state->config.max_lock_duration_ms;
 
-  // v1.6 Amd6 §8: Set HLC acquired_at if using HLC ordering
+  // v1.6 Amd6 §8: Set HLC acquired_at if using HLC ordering. Reuse the
+  // persistent per-node HLC state on the state so the logical counter
+  // advances and clock-regression protection holds across lock acquisitions
+  // (audit M-10: previously each lock built a fresh HLC state, resetting the
+  // counter).
   crabs_hlc_t acquired_at = {0, 0, 0, {'\0'}};
   crabs_ordering_config_t* config = state_get_ordering_config(state);
   if (config != NULL && config->ordering_system == CRABS_ORDERING_HLC) {
-    crabs_hlc_state_t hlc_state;
-    crabs_hlc_state_init(&hlc_state, op->node_id);
-    acquired_at = crabs_hlc_next(&hlc_state);
+    if (!state->hlc_state_initialized) {
+      crabs_hlc_state_init(&state->hlc_state, op->node_id);
+      state->hlc_state_initialized = true;
+    }
+    acquired_at = crabs_hlc_next(&state->hlc_state);
   }
 
   response->success = true;

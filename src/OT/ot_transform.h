@@ -19,6 +19,12 @@
 
 bool crabs_causally_before(const crabs_ot_op_id_t* a, const crabs_ot_op_id_t* b);
 
+// True if `op` declares a causal dependency on `predecessor` (predecessor
+// happens-before op). Sound cross-node causality via the dependency set,
+// replacing the prior wall-clock comparison.
+bool crabs_op_depends_on(const crabs_ot_operation_t* op,
+                          const crabs_ot_op_id_t* predecessor);
+
 // ============================================================
 // Transform Entry (v1.5 §4)
 // ============================================================

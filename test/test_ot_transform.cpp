@@ -35,10 +35,12 @@ TEST(OTTransform, CausallyBeforeSameNode) {
 }
 
 TEST(OTTransform, CausallyBeforeDiffNode) {
+  // Cross-node IDs alone carry no causal information (wall-clock comparison
+  // is unsound). Causality across nodes is decided by the dependency set.
   crabs_ot_op_id_t a, b;
   crabs_ot_op_id_init(&a, "node1", 5, 1000);
   crabs_ot_op_id_init(&b, "node2", 1, 2000);
-  EXPECT_TRUE(crabs_causally_before(&a, &b));
+  EXPECT_FALSE(crabs_causally_before(&a, &b));
   EXPECT_FALSE(crabs_causally_before(&b, &a));
 }
 

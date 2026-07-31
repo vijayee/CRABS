@@ -268,9 +268,12 @@ crabs_error_e crabs_transform_ot_op(crabs_ot_operation_t* op,
     // Skip if same operation (dedup)
     if (crabs_ot_op_id_equal(&op->id, &log_op->id)) continue;
 
-    // Check causal ordering: only transform against concurrent ops
-    // (not causally before the incoming op)
+    // Check causal ordering: only transform against concurrent ops. A log op
+    // that the incoming op causally depends on (or that precedes it on the
+    // same node) is already accounted for and must be skipped. This uses the
+    // dependency set (sound) rather than the prior wall-clock comparison.
     if (crabs_causally_before(&log_op->id, &op->id)) continue;
+    if (crabs_op_depends_on(op, &log_op->id)) continue;
 
     // Look up the transform function for this op type pair
     crabs_ot_transform_fn transform_fn = crabs_ot_data_item_get_transform(
@@ -504,22 +507,50 @@ void crabs_prune_ot_log(crabs_ot_data_item_t* item, uint32_t max_size) {
   uint32_t keep_count = max_size + 100;
   if (keep_count >= item->op_log_count) return;
 
-  // Remove oldest operations, preserving those with causal dependencies
+  // Candidates to prune are the oldest ops (indices 0..to_remove-1). But an
+  // op may only be pruned if NO retained op declares a causal dependency on
+  // it — otherwise a future transform against a retained op could need the
+  // pruned op's context and diverge (audit M-9: the prior code shifted the
+  // oldest ops out blindly, dropping causally-relevant history).
   uint32_t to_remove = item->op_log_count - keep_count;
   if (to_remove == 0) return;
 
-  // Free payloads of removed entries before overwriting them
+  // For each candidate, check whether any retained op depends on it.
+  uint8_t* prune = (uint8_t*)get_clear_memory(to_remove);
+  if (prune == NULL) return; // refuse to prune if we can't track it safely
   for (uint32_t i = 0; i < to_remove; i++) {
-    if (item->op_log[i].payload != NULL) {
-      free(item->op_log[i].payload);
-      item->op_log[i].payload = NULL;
+    const crabs_ot_op_id_t* cid = &item->op_log[i].id;
+    bool needed = false;
+    for (uint32_t j = to_remove; j < item->op_log_count && !needed; j++) {
+      const crabs_ot_operation_t* k = &item->op_log[j];
+      for (uint32_t d = 0; d < k->dep_count && d < CRABS_OT_MAX_DEPS; d++) {
+        if (strncmp(k->deps[d].node_id, cid->node_id, CRABS_MAX_USER_ID) == 0 &&
+            k->deps[d].sequence_num == cid->sequence_num) {
+          needed = true;
+          break;
+        }
+      }
     }
+    prune[i] = needed ? 0 : 1; // 1 = prune
   }
 
-  // Shift remaining ops to the beginning of the log
-  memmove(item->op_log, item->op_log + to_remove,
-          sizeof(crabs_ot_operation_t) * keep_count);
-  item->op_log_count = keep_count;
+  // Compact in place: free pruned payloads, move retained ops to the front.
+  uint32_t write = 0;
+  for (uint32_t i = 0; i < item->op_log_count; i++) {
+    if (i < to_remove && prune[i]) {
+      if (item->op_log[i].payload != NULL) {
+        free(item->op_log[i].payload);
+        item->op_log[i].payload = NULL;
+      }
+      continue; // drop
+    }
+    if (write != i) {
+      item->op_log[write] = item->op_log[i];
+    }
+    write++;
+  }
+  item->op_log_count = write;
+  free(prune);
 }
 
 // ============================================================

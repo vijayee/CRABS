@@ -8,6 +8,8 @@
 #include "../OT/ot_ordered_set.h"
 #include "../OT/ot_document.h"
 #include "../OT/ot_tree.h"
+#include "../CRDT/crdt_merge.h"
+#include "../CRDT/one_shot.h"
 #include "../Util/allocator.h"
 #include <openssl/crypto.h>
 #include <string.h>
@@ -59,6 +61,18 @@ void data_item_destroy(data_item_t* item) {
       case DATA_TYPE_OT_TREE:
         crabs_ot_tree_destroy((crabs_ot_tree_t*)item->value);
         item->ot_data = NULL;
+        break;
+      case DATA_TYPE_SET:
+        or_set_destroy((or_set_t*)item->value);
+        break;
+      case DATA_TYPE_2P_SET:
+        two_p_set_destroy((two_p_set_t*)item->value);
+        break;
+      case DATA_TYPE_ONE_SHOT_SET:
+        one_shot_set_destroy((one_shot_set_t*)item->value);
+        break;
+      case DATA_TYPE_ONE_SHOT_FLAG:
+        one_shot_flag_destroy((one_shot_flag_t*)item->value);
         break;
       default:
         free(item->value);

@@ -626,3 +626,22 @@ TEST_F(TestAttributeMachine, TestDestroyNull) {
   // Should not crash
   attribute_machine_destroy(NULL);
 }
+// Regression for audit C-5: a user must not be able to self-assert a
+// privileged attribute (role:admin, admin, member, etc.) — those require an
+// admin grant.
+TEST_F(TestAttributeMachine, TestSelfAssertRejectsPrivileged) {
+  uint8_t user_pk[33];
+  memset(user_pk, 0xCC, 33);
+  ASSERT_EQ(attribute_machine_register_user(am, "alice", user_pk, "dept:eng"), CRABS_SUCCESS);
+
+  EXPECT_EQ(attribute_machine_self_assert(am, "role", "admin", "alice"),
+            CRABS_ERR_UNAUTHORIZED);
+  EXPECT_EQ(attribute_machine_self_assert(am, "admin", "true", "alice"),
+            CRABS_ERR_UNAUTHORIZED);
+  EXPECT_EQ(attribute_machine_self_assert(am, "member", "true", "alice"),
+            CRABS_ERR_UNAUTHORIZED);
+
+  // A non-privileged self-assert still works.
+  EXPECT_EQ(attribute_machine_self_assert(am, "email", "alice@example.com", "alice"),
+            CRABS_SUCCESS);
+}

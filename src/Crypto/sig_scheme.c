@@ -6,6 +6,7 @@
 #include "crypto.h"
 #include "../Util/allocator.h"
 #include <string.h>
+#include <pthread.h>
 
 // ============================================================
 // Global Registry
@@ -13,6 +14,10 @@
 static signature_vtable_t* _registry[CRABS_MAX_REGISTERED_SCHEMES];
 static uint32_t _registry_count = 0;
 static bool _registry_initialized = false;
+// Guards register/get/cleanup so the registry can be used from multiple
+// threads (audit L-3). Init-time registration and steady-state lookups are
+// the common case; cleanup is expected only at shutdown.
+static pthread_mutex_t _registry_lock = PTHREAD_MUTEX_INITIALIZER;
 
 // ============================================================
 // Registry API
@@ -23,26 +28,38 @@ crabs_error_e crypto_sig_scheme_register(const signature_vtable_t* vtable) {
   if (vtable->sign == NULL) return CRABS_ERR_INVALID_PARAM;
   if (vtable->verify == NULL) return CRABS_ERR_INVALID_PARAM;
 
+  pthread_mutex_lock(&_registry_lock);
   if (crypto_sig_scheme_get(vtable->scheme_id) != NULL) {
+    pthread_mutex_unlock(&_registry_lock);
     return CRABS_ERR_SCHEME_ALREADY_REGISTERED;
   }
 
   if (_registry_count >= CRABS_MAX_REGISTERED_SCHEMES) {
+    pthread_mutex_unlock(&_registry_lock);
     return CRABS_ERR_OOM;
   }
 
   signature_vtable_t* entry = get_clear_memory(sizeof(signature_vtable_t));
+  if (entry == NULL) {
+    pthread_mutex_unlock(&_registry_lock);
+    return CRABS_ERR_OOM;
+  }
   memcpy(entry, vtable, sizeof(signature_vtable_t));
   _registry[_registry_count++] = entry;
+  pthread_mutex_unlock(&_registry_lock);
   return CRABS_SUCCESS;
 }
 
 const signature_vtable_t* crypto_sig_scheme_get(signature_scheme_e scheme_id) {
+  pthread_mutex_lock(&_registry_lock);
   for (uint32_t i = 0; i < _registry_count; i++) {
     if (_registry[i] != NULL && _registry[i]->scheme_id == scheme_id) {
-      return _registry[i];
+      const signature_vtable_t* r = _registry[i];
+      pthread_mutex_unlock(&_registry_lock);
+      return r;
     }
   }
+  pthread_mutex_unlock(&_registry_lock);
   return NULL;
 }
 
@@ -156,12 +173,15 @@ static signature_vtable_t _ecdsa_secp256k1_vtable = {
 // Initialization
 // ============================================================
 void crypto_sig_scheme_init(void) {
-  if (_registry_initialized) return;
+  pthread_mutex_lock(&_registry_lock);
+  if (_registry_initialized) { pthread_mutex_unlock(&_registry_lock); return; }
   _registry_initialized = true;
+  pthread_mutex_unlock(&_registry_lock);
   crypto_sig_scheme_register(&_ecdsa_secp256k1_vtable);
 }
 
 void crypto_sig_scheme_cleanup(void) {
+  pthread_mutex_lock(&_registry_lock);
   for (uint32_t i = 0; i < _registry_count; i++) {
     if (_registry[i] != NULL) {
       free(_registry[i]);
@@ -170,4 +190,5 @@ void crypto_sig_scheme_cleanup(void) {
   }
   _registry_count = 0;
   _registry_initialized = false;
+  pthread_mutex_unlock(&_registry_lock);
 }

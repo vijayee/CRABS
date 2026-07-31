@@ -302,6 +302,12 @@ typedef struct state_t {
   void* ordering_config;
   // ABE master key — generated once at state creation, used for all ABE operations
   void* abe_mk;
+  // v1.6 Amd6: persistent per-node HLC state (audit M-10). Reused across lock
+  // acquisitions so the logical counter advances and clock-regression
+  // protection holds across calls (previously each lock built a fresh HLC
+  // state, resetting the counter and losing monotonicity).
+  crabs_hlc_state_t hlc_state;
+  bool             hlc_state_initialized;
 } state_t;
 
 // ============================================================

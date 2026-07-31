@@ -14,17 +14,6 @@
 #include "../Crypto/crypto.h"
 
 // ============================================================
-// CLI Node Context
-// ============================================================
-typedef struct {
-  state_t*             state;
-  attribute_machine_t*  attr_machine;
-  abe_master_key_t*    abe_mk;
-  ecdsa_keypair_t*     node_key;
-  bool                 initialized;
-} cli_node_t;
-
-// ============================================================
 // CLI Result Codes
 // ============================================================
 typedef enum {
@@ -35,6 +24,36 @@ typedef enum {
   CLI_ERR_IO        = 4,
   CLI_ERR_NOT_FOUND = 5
 } cli_result_e;
+
+// ============================================================
+// CLI Node Context
+// ============================================================
+#define CRABS_CLI_KEYRING_MAX 32
+
+typedef struct {
+  char             user_id[CRABS_MAX_USER_ID];
+  ecdsa_keypair_t* key;
+} cli_user_key_t;
+
+typedef struct {
+  state_t*             state;
+  attribute_machine_t*  attr_machine;
+  abe_master_key_t*    abe_mk;
+  ecdsa_keypair_t*     node_key;
+  // Per-user ECDSA key custody (audit M-17): operations are signed with the
+  // key matching op->signer_id, not the node key. The bootstrap admin's key
+  // is node_key; other users' keys are added via cli_node_add_user_key.
+  cli_user_key_t       keyring[CRABS_CLI_KEYRING_MAX];
+  uint32_t             keyring_count;
+  bool                 initialized;
+} cli_node_t;
+
+// Add (or replace) a per-user signing key the CLI can use to sign operations
+// on that user's behalf. The CLI takes ownership of `key`.
+cli_result_e cli_node_add_user_key(cli_node_t* node, const char* user_id,
+                                     ecdsa_keypair_t* key);
+// Look up a user's custodied signing key (NULL if none).
+ecdsa_keypair_t* cli_node_get_user_key(cli_node_t* node, const char* user_id);
 
 // ============================================================
 // Node Lifecycle

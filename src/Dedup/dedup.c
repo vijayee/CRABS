@@ -29,6 +29,12 @@ data_item_t* dedup_resolve_path(state_t* state, const char* path) {
 // ============================================================
 // Dedup Guard Check (§5.2)
 // ============================================================
+// NOTE (audit L-9): the guard check (dedup_check_guard) and the mutation
+// (dedup_apply_mutation) are two separate steps performed in sequence by
+// state_machine_execute. This is a benign TOCTOU as long as execution stays
+// single-threaded per state — which it is today. If state_machine_execute
+// ever becomes concurrent, the guard/mutation pair must be made atomic
+// (e.g. a per-state lock around steps 5 and 8).
 
 crabs_error_e dedup_check_guard(const state_t* state, const operation_t* op) {
   if (state == NULL || op == NULL) return CRABS_ERR_INVALID_PARAM;

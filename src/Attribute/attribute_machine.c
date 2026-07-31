@@ -10,6 +10,7 @@
 #include "../CRDT/crdt_merge.h"
 #include <openssl/crypto.h>
 #include <string.h>
+#include <strings.h>
 #include <stdlib.h>
 #include <stdio.h>
 
@@ -287,6 +288,21 @@ crabs_error_e attribute_machine_self_assert(attribute_machine_t* am, const char*
     return CRABS_ERR_INVALID_PARAM;
   }
 
+  // Self-assertion is for non-privileged, user-owned attributes only. A user
+  // must not be able to grant themselves authorization-bearing attributes
+  // (role:admin, admin, member, owner, etc.) — those require an admin
+  // grant via attribute_machine_grant_role. Without this restriction a user
+  // could self-assert role:admin and satisfy any role policy (audit C-5).
+  if (attribute == NULL || attribute[0] == '\0') return CRABS_ERR_INVALID_PARAM;
+  static const char* _privileged[] = {
+    "role", "admin", "member", "owner", "root", "superuser", "manager", NULL
+  };
+  for (int i = 0; _privileged[i] != NULL; i++) {
+    if (strcasecmp(attribute, _privileged[i]) == 0) {
+      return CRABS_ERR_UNAUTHORIZED;
+    }
+  }
+
   user_t* user = attribute_machine_find_user(am, signer_id);
   if (user == NULL) return CRABS_ERR_USER_NOT_FOUND;
 
@@ -295,6 +311,10 @@ crabs_error_e attribute_machine_self_assert(attribute_machine_t* am, const char*
   // Check if attribute already exists (§8.4.3)
   for (uint32_t i = 0; i < user->attribute_count; i++) {
     if (_attribute_matches_name(&user->attributes[i], attribute)) {
+      // An existing verified attribute may not be overwritten by a self-assert.
+      if (user->attributes[i].verified_by[0] != '\0') {
+        return CRABS_ERR_UNAUTHORIZED;
+      }
       char formatted[CRABS_MAX_POLICY_EXPR];
       snprintf(formatted, sizeof(formatted), "%s:%s", attribute, value);
       strncpy(user->attributes[i].value, formatted, CRABS_MAX_POLICY_EXPR - 1);

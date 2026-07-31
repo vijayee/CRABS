@@ -113,6 +113,13 @@ void cli_node_destroy(cli_node_t* node) {
     state_destroy(node->state);
   }
   if (node->abe_mk != NULL) crypto_abe_master_key_destroy(node->abe_mk);
+  // Free per-user custodied keys, skipping the admin key (node_key), which
+  // is freed separately below (the admin keyring entry aliases node_key).
+  for (uint32_t i = 0; i < node->keyring_count; i++) {
+    if (node->keyring[i].key != NULL && node->keyring[i].key != node->node_key) {
+      crypto_ecdsa_keypair_destroy(node->keyring[i].key);
+    }
+  }
   if (node->node_key != NULL) crypto_ecdsa_keypair_destroy(node->node_key);
   free(node);
 }
@@ -143,7 +150,41 @@ cli_result_e cli_node_init(cli_node_t* node, const char* admin_id) {
   if (err != CRABS_SUCCESS) return CLI_ERR_EXEC;
 
   node->initialized = true;
+  // Custody the bootstrap admin's signing key under their user id so the CLI
+  // signs admin operations with the admin's key (audit M-17).
+  cli_node_add_user_key(node, admin_id, node->node_key);
   return CLI_OK;
+}
+
+// Per-user key custody (audit M-17).
+cli_result_e cli_node_add_user_key(cli_node_t* node, const char* user_id,
+                                     ecdsa_keypair_t* key) {
+  if (node == NULL || user_id == NULL || key == NULL) return CLI_ERR_ARGS;
+  for (uint32_t i = 0; i < node->keyring_count; i++) {
+    if (strcmp(node->keyring[i].user_id, user_id) == 0) {
+      if (node->keyring[i].key != NULL && node->keyring[i].key != key) {
+        crypto_ecdsa_keypair_destroy(node->keyring[i].key);
+      }
+      node->keyring[i].key = key;
+      return CLI_OK;
+    }
+  }
+  if (node->keyring_count >= CRABS_CLI_KEYRING_MAX) return CLI_ERR_EXEC;
+  strncpy(node->keyring[node->keyring_count].user_id, user_id, CRABS_MAX_USER_ID - 1);
+  node->keyring[node->keyring_count].user_id[CRABS_MAX_USER_ID - 1] = '\0';
+  node->keyring[node->keyring_count].key = key;
+  node->keyring_count++;
+  return CLI_OK;
+}
+
+ecdsa_keypair_t* cli_node_get_user_key(cli_node_t* node, const char* user_id) {
+  if (node == NULL || user_id == NULL) return NULL;
+  for (uint32_t i = 0; i < node->keyring_count; i++) {
+    if (strcmp(node->keyring[i].user_id, user_id) == 0) {
+      return node->keyring[i].key;
+    }
+  }
+  return NULL;
 }
 
 cli_result_e cli_node_load(cli_node_t* node, const char* path) {
@@ -631,18 +672,25 @@ cli_result_e cli_cmd_op_submit(cli_node_t* node, const char* type,
     }
   }
 
-  // Sign the operation if we have a signer and node key
+  // Sign the operation with the signer's own custodied key (audit M-17:
+  // previously every op was signed with the node key regardless of signer_id,
+  // so the CLI could not actually act as a non-admin user and would forge
+  // admin signatures for anyone). If the CLI holds no key for the signer, the
+  // op is left unsigned and execution will reject it (fail-closed).
   if (op->signer_id[0] != '\0' && node->attr_machine->base_state.node_key_valid) {
     user_t* user = attribute_machine_find_user(node->attr_machine, op->signer_id);
     if (user != NULL) {
-      // signer_key_version is part of the signed canonical form, so it must
-      // be set BEFORE serializing for signing.
-      op->signer_key_version = user->key_version;
-      serialized_buffer_t* sig_data = crabs_serialize_for_signing(op);
-      if (sig_data != NULL) {
-        crypto_ecdsa_sign(node->node_key->private_key,
-                          sig_data->data, sig_data->len, op->signature);
-        serialized_buffer_destroy(sig_data);
+      ecdsa_keypair_t* signer_key = cli_node_get_user_key(node, op->signer_id);
+      if (signer_key != NULL) {
+        // signer_key_version is part of the signed canonical form, so it must
+        // be set BEFORE serializing for signing.
+        op->signer_key_version = user->key_version;
+        serialized_buffer_t* sig_data = crabs_serialize_for_signing(op);
+        if (sig_data != NULL) {
+          crypto_ecdsa_sign(signer_key->private_key,
+                            sig_data->data, sig_data->len, op->signature);
+          serialized_buffer_destroy(sig_data);
+        }
       }
     }
   }

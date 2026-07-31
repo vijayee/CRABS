@@ -247,7 +247,7 @@ TEST(TestAbe, TestPolicyAnd) {
   ASSERT_NE(mk, nullptr);
 
   // OpenABE policy grammar: lowercase "and"/"or" with parentheses.
-  const char* policy = "AND admin editor";
+  const char* policy = "admin and editor";
   const uint8_t msg[] = "AND policy test";
   size_t msg_len = sizeof(msg);
 
@@ -282,7 +282,7 @@ TEST(TestAbe, TestPolicyOr) {
   abe_master_key_t* mk = crypto_abe_setup();
   ASSERT_NE(mk, nullptr);
 
-  const char* policy = "OR admin manager";
+  const char* policy = "admin or manager";
   const uint8_t msg[] = "OR policy test";
   size_t msg_len = sizeof(msg);
 
