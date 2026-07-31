@@ -238,14 +238,37 @@ crabs_tree_node_t* crabs_ot_tree_insert_node(
   return node;
 }
 
-// Helper: recursively mark subtree as deleted
+// Helper: mark a subtree as deleted using an explicit worklist (iterative)
+// to avoid unbounded recursion on a deep or attacker-shaped tree.
 static void _mark_subtree_deleted(crabs_ot_tree_t* tree, crabs_tree_node_t* node) {
   if (node == NULL || node->deleted) return;
-  node->deleted = true;
-  tree->visible_count--;
-  for (crabs_tree_node_t* c = node->first_child; c != NULL; c = c->next_sibling) {
-    _mark_subtree_deleted(tree, c);
+  crabs_tree_node_t** stack = NULL;
+  uint32_t cap = 0;
+  uint32_t top = 0;
+
+  // Push the root of the subtree.
+  stack = (crabs_tree_node_t**)realloc(stack, sizeof(crabs_tree_node_t*) * 16);
+  if (stack == NULL) return;
+  cap = 16;
+  stack[top++] = node;
+
+  while (top > 0) {
+    crabs_tree_node_t* n = stack[--top];
+    if (n == NULL || n->deleted) continue;
+    n->deleted = true;
+    tree->visible_count--;
+    for (crabs_tree_node_t* c = n->first_child; c != NULL; c = c->next_sibling) {
+      if (top == cap) {
+        uint32_t new_cap = cap * 2;
+        crabs_tree_node_t** ns = (crabs_tree_node_t**)realloc(stack, sizeof(crabs_tree_node_t*) * new_cap);
+        if (ns == NULL) { free(stack); return; }
+        stack = ns;
+        cap = new_cap;
+      }
+      stack[top++] = c;
+    }
   }
+  free(stack);
 }
 
 crabs_tree_node_t* crabs_ot_tree_delete_node(
@@ -289,6 +312,20 @@ crabs_tree_node_t* crabs_ot_tree_reparent(
   crabs_tree_node_t* new_parent = NULL;
   if (new_parent_id != NULL && new_parent_id[0] != '\0') {
     new_parent = crabs_ot_tree_find(tree, new_parent_id);
+  }
+
+  // Reject cycles: new_parent must not be `node` itself or one of its
+  // descendants. Allowing self/descendant parenting creates a cycle that
+  // makes every sibling-walking or subtree routine spin forever or overflow
+  // the stack.
+  if (new_parent != NULL) {
+    if (new_parent == node) return NULL;
+    // Walk ancestors of new_parent; if we reach `node`, it's a descendant.
+    crabs_tree_node_t* p = new_parent->parent;
+    while (p != NULL) {
+      if (p == node) return NULL;
+      p = p->parent;
+    }
   }
 
   // Unlink from current parent

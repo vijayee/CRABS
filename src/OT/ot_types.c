@@ -51,6 +51,14 @@ void crabs_ot_operation_destroy(crabs_ot_operation_t* op) {
   free(op);
 }
 
+void crabs_ot_operation_clear(crabs_ot_operation_t* op) {
+  if (op == NULL) return;
+  if (op->payload != NULL) {
+    free(op->payload);
+  }
+  memset(op, 0, sizeof(crabs_ot_operation_t));
+}
+
 void crabs_ot_operation_init(crabs_ot_operation_t* op) {
   if (op == NULL) return;
   memset(op, 0, sizeof(crabs_ot_operation_t));
@@ -133,8 +141,15 @@ void crabs_ot_data_item_destroy(crabs_ot_data_item_t* item) {
 crabs_ot_operation_t* crabs_ot_data_item_append_op(crabs_ot_data_item_t* item) {
   if (item == NULL) return NULL;
   if (item->op_log_count >= item->op_log_capacity) {
-    uint32_t new_cap = item->op_log_capacity * 2;
+    if (item->op_log_capacity == 0) return NULL;
+    uint64_t new_cap64 = (uint64_t)item->op_log_capacity * 2;
+    if (new_cap64 > CRABS_OT_OP_LOG_MAX) {
+      new_cap64 = CRABS_OT_OP_LOG_MAX;
+    }
+    uint32_t new_cap = (uint32_t)new_cap64;
+    if (new_cap <= item->op_log_capacity) return NULL; // cap reached
     crabs_ot_operation_t* new_log = get_clear_memory(sizeof(crabs_ot_operation_t) * new_cap);
+    if (new_log == NULL) return NULL;
     memcpy(new_log, item->op_log, sizeof(crabs_ot_operation_t) * item->op_log_count);
     free(item->op_log);
     item->op_log = new_log;

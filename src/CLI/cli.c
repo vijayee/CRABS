@@ -635,11 +635,13 @@ cli_result_e cli_cmd_op_submit(cli_node_t* node, const char* type,
   if (op->signer_id[0] != '\0' && node->attr_machine->base_state.node_key_valid) {
     user_t* user = attribute_machine_find_user(node->attr_machine, op->signer_id);
     if (user != NULL) {
+      // signer_key_version is part of the signed canonical form, so it must
+      // be set BEFORE serializing for signing.
+      op->signer_key_version = user->key_version;
       serialized_buffer_t* sig_data = crabs_serialize_for_signing(op);
       if (sig_data != NULL) {
         crypto_ecdsa_sign(node->node_key->private_key,
                           sig_data->data, sig_data->len, op->signature);
-        op->signer_key_version = user->key_version;
         serialized_buffer_destroy(sig_data);
       }
     }

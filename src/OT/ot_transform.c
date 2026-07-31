@@ -382,7 +382,17 @@ crabs_transform_entry_t* crabs_transform_matrix_get_entry(
   if (type2 < 1 || type2 > CRABS_OT_OP_TYPE_COUNT) return NULL;
   _entry_result.fn = item->transform_matrix[type1 - 1][type2 - 1];
   memset(_entry_result.description, 0, CRABS_TRANSFORM_DESC_MAX);
-  const char* desc = _transform_descriptions[type1 - 1][type2 - 1];
-  strncpy(_entry_result.description, desc, CRABS_TRANSFORM_DESC_MAX - 1);
+  // _transform_descriptions only initializes the first 6 rows/cols; the
+  // remaining entries are NULL. Guard against strncpy(NULL) crashing.
+  const char* desc = NULL;
+  if ((uint32_t)type1 - 1 < CRABS_OT_TRANSFORM_MATRIX_SIZE &&
+      (uint32_t)type2 - 1 < CRABS_OT_TRANSFORM_MATRIX_SIZE) {
+    desc = _transform_descriptions[type1 - 1][type2 - 1];
+  }
+  if (desc != NULL) {
+    strncpy(_entry_result.description, desc, CRABS_TRANSFORM_DESC_MAX - 1);
+  } else {
+    strncpy(_entry_result.description, "(none)", CRABS_TRANSFORM_DESC_MAX - 1);
+  }
   return &_entry_result;
 }

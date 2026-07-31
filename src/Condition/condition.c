@@ -844,8 +844,14 @@ int64_t condition_resolve_path(const state_t* state, const char* path) {
     case CRDT_PN_COUNTER:
       return pn_counter_value((const pn_counter_t*)item->value);
     default:
-      // For other types, try interpreting as raw int64_t
-      return *(int64_t*)item->value;
+      // Only counter/register types store an int64_t value; casting any
+      // other CRDT's struct pointer to int64_t* is a type-confusion that
+      // can read out of bounds (e.g. a deserialized raw-byte value shorter
+      // than 8 bytes). Return 0 for non-numeric types instead of guessing.
+      if (item->crdt_type == CRDT_LWW_REG || item->type == DATA_TYPE_REGISTER) {
+        return *(int64_t*)item->value;
+      }
+      return 0;
   }
 }
 
@@ -1008,6 +1014,23 @@ bool condition_evaluate(const condition_node_t* node, const state_t* state) {
 // ============================================================
 // Policy Pre-processing (Amendment 2 §5)
 // ============================================================
+
+// Detect a CONTAINS node reachable through an OR ancestor. The two-phase
+// policy evaluator (CONTAINS via state, everything else via ABE) cannot
+// soundly evaluate OR-of-CONTAINS — fail closed in that case.
+static bool _contains_under_or(const condition_node_t* node, bool under_or) {
+  if (node == NULL) return false;
+  if (node->type == NODE_CONTAINS && under_or) return true;
+  if (node->type == NODE_OR) {
+    return _contains_under_or(node->left, true) ||
+           _contains_under_or(node->right, true);
+  }
+  if (node->type == NODE_AND) {
+    return _contains_under_or(node->left, under_or) ||
+           _contains_under_or(node->right, under_or);
+  }
+  return false;
+}
 
 // Recursively filter CONTAINS nodes from a parsed AST.
 // Returns a new AST with only non-CONTAINS nodes, or NULL if all filtered.
@@ -1192,6 +1215,16 @@ policy_preprocess_result_t preprocess_policy(const char* policy, const state_t* 
   // Walk the AST and evaluate each CONTAINS node individually.
   // CONTAINS nodes verify that an element exists in the state's CRDT sets.
   // ABE comparison nodes are evaluated separately by the ABE engine.
+  //
+  // The two-phase evaluator can only soundly evaluate CONTAINS under AND (or
+  // at the top). A CONTAINS under an OR makes the ABE/CONTAINS split
+  // ambiguous — fail closed.
+  if (_contains_under_or(ast, false)) {
+    condition_node_destroy(ast);
+    result.resolved_ok = false;
+    return result;
+  }
+
   bool all_contains_pass = true;
 
   // Walk and evaluate CONTAINS nodes

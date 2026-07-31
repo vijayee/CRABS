@@ -78,9 +78,15 @@ void g_counter_destroy(g_counter_t* counter) {
 
 crabs_error_e g_counter_increment(g_counter_t* counter, const char* node_id, int64_t delta) {
   if (counter == NULL || node_id == NULL) return CRABS_ERR_INVALID_PARAM;
+  // A G-Counter only grows; a negative delta is convergently lost on merge
+  // (merge takes per-node max). Reject negative deltas — use a PN-Counter
+  // for decrementing counters.
+  if (delta < 0) return CRABS_ERR_INVALID_PARAM;
 
   g_counter_entry_t* entry = _g_counter_find_entry(counter, node_id);
   if (entry != NULL) {
+    // Checked addition to avoid silent int64 overflow with attacker-chosen deltas.
+    if (entry->count > INT64_MAX - delta) return CRABS_ERR_INVALID_PARAM;
     entry->count += delta;
     return CRABS_SUCCESS;
   }
@@ -502,17 +508,41 @@ crabs_error_e crdt_merge_state(state_t* dst, const state_t* src) {
     src_item = src_item->next;
   }
 
-  // Merge logs (sorted by lamport_time then node_id)
+  // Merge logs (sorted by lamport_time then node_id). Idempotency is a core
+  // CRDT requirement: merging the same src twice must not duplicate entries.
+  // Dedup by uuid before appending.
   if (src->log_count > 0) {
-    uint64_t total_count = dst->log_count + src->log_count;
-    log_entry_t* merged_log = realloc(dst->log, total_count * sizeof(log_entry_t));
-    if (merged_log == NULL && total_count > 0) return CRABS_ERR_OOM;
-    dst->log = merged_log;
-    // Append src log entries
-    memcpy(&dst->log[dst->log_count], src->log, src->log_count * sizeof(log_entry_t));
-    dst->log_count = total_count;
-    // Sort merged log
-    qsort(dst->log, dst->log_count, sizeof(log_entry_t), _compare_log_entries);
+    // Count how many src entries are NOT already present in dst (by uuid).
+    uint64_t add_count = 0;
+    for (uint64_t i = 0; i < src->log_count; i++) {
+      bool found = false;
+      for (uint64_t j = 0; j < dst->log_count; j++) {
+        if (memcmp(dst->log[j].uuid, src->log[i].uuid, CRABS_UUID_SIZE) == 0) {
+          found = true;
+          break;
+        }
+      }
+      if (!found) add_count++;
+    }
+    if (add_count > 0) {
+      uint64_t total_count = dst->log_count + add_count;
+      log_entry_t* merged_log = realloc(dst->log, total_count * sizeof(log_entry_t));
+      if (merged_log == NULL) return CRABS_ERR_OOM;
+      dst->log = merged_log;
+      for (uint64_t i = 0; i < src->log_count; i++) {
+        bool found = false;
+        for (uint64_t j = 0; j < dst->log_count; j++) {
+          if (memcmp(dst->log[j].uuid, src->log[i].uuid, CRABS_UUID_SIZE) == 0) {
+            found = true;
+            break;
+          }
+        }
+        if (!found) {
+          dst->log[dst->log_count++] = src->log[i];
+        }
+      }
+      qsort(dst->log, dst->log_count, sizeof(log_entry_t), _compare_log_entries);
+    }
   }
 
   // Merge processed_ops (union)

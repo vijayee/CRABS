@@ -86,6 +86,9 @@ typedef crabs_ot_operation_t* (*crabs_ot_transform_fn)(
 // ============================================================
 
 #define CRABS_OT_OP_LOG_INITIAL 16
+// Hard cap on the op-log capacity to avoid a huge allocation from untrusted
+// config (e.g. a malicious __change_config__ setting max_op_log_size to 1e9).
+#define CRABS_OT_OP_LOG_MAX 1048576
 
 typedef struct {
   uint32_t              ot_type_id;
@@ -114,6 +117,11 @@ bool crabs_ot_op_id_equal(const crabs_ot_op_id_t* a, const crabs_ot_op_id_t* b);
 crabs_ot_operation_t* crabs_ot_operation_create(void);
 void crabs_ot_operation_destroy(crabs_ot_operation_t* op);
 void crabs_ot_operation_init(crabs_ot_operation_t* op);
+// Free only an op's owned payload and zero the slot, WITHOUT freeing the op
+// struct itself. Use this for ops that live inside an array allocation (e.g.
+// ot_data->op_log[]) — calling crabs_ot_operation_destroy on such entries
+// would free an interior pointer (heap corruption).
+void crabs_ot_operation_clear(crabs_ot_operation_t* op);
 bool crabs_ot_operation_set_payload(crabs_ot_operation_t* op,
                                     const uint8_t* data, uint32_t size);
 void crabs_ot_operation_add_dep(crabs_ot_operation_t* op,

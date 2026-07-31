@@ -23,12 +23,11 @@
 // ============================================================
 // Document Operation Types (extends crabs_ot_op_type_e)
 // ============================================================
-
-#define CRABS_OT_OP_INSERT_TEXT  0x10
-#define CRABS_OT_OP_DELETE_RANGE 0x11
-#define CRABS_OT_OP_STYLE        0x12
-#define CRABS_OT_OP_MERGE_SPANS  0x13
-#define CRABS_OT_OP_SPLIT_SPAN   0x14
+// These identifiers are enum constants in ot_types.h (CRABS_OT_OP_INSERT_TEXT
+// etc.). Do NOT redefine them here as macros — a prior #define version used
+// different numeric values than the enum, which made the wire format and the
+// dispatch disagree (an op built with the enum value 0x11 for INSERT_TEXT
+// matched the macro DELETE_RANGE 0x11 and deleted text instead of inserting).
 
 // ============================================================
 // Style (v1.5 §6.1)

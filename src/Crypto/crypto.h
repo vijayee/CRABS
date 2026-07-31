@@ -47,41 +47,53 @@ crabs_error_e crypto_sha256(const uint8_t* data, size_t len,
 crabs_error_e crypto_random_bytes(uint8_t* buf, size_t len);
 
 // ============================================================
-// ABE Interface (§10.1) — Simulated CP-ABE with AES-256-GCM
+// ABE Interface (§10.1) — CP-ABE via OpenABE (Waters '09)
 // ============================================================
-// ABE_MASTER_KEY_SIZE: 32 bytes (MSK + MPK each)
-#define ABE_MASTER_KEY_SIZE  32
-#define ABE_NONCE_SIZE       12   // AES-GCM nonce
-#define ABE_TAG_SIZE         16   // AES-GCM auth tag
+// The master key, user keys, and ciphertexts are opaque; their internal
+// representation (OpenABE contexts and serialized byte strings) is private to
+// crypto.c. This replaces the prior "simulated" ABE whose decryption key was
+// derivable from public material (audit C-1).
 
-typedef struct {
-  uint8_t msk[ABE_MASTER_KEY_SIZE];  // Master Secret Key
-  uint8_t mpk[ABE_MASTER_KEY_SIZE];  // Master Public Key (SHA-256 of MSK)
-} abe_master_key_t;
+typedef struct abe_master_key_t abe_master_key_t;
+typedef struct abe_user_key_t   abe_user_key_t;
+typedef struct abe_ciphertext_t abe_ciphertext_t;
 
-typedef struct {
-  uint8_t  key[ABE_MASTER_KEY_SIZE];          // MPK copy (for simulated ABE key derivation)
-  char     attrs[CRABS_MAX_POLICY_EXPR];      // Comma-separated attribute string
-  uint32_t attr_count;                        // Number of parsed attributes
-} abe_user_key_t;
-
-typedef struct {
-  char     policy[CRABS_MAX_POLICY_EXPR];     // Access policy expression
-  uint8_t  nonce[ABE_NONCE_SIZE];             // AES-GCM nonce
-  uint8_t  tag[ABE_TAG_SIZE];                 // AES-GCM auth tag
-  uint8_t* ciphertext;                         // Encrypted data
-  size_t   ct_len;                            // Length of ciphertext
-} abe_ciphertext_t;
-
+// Generate a CP-ABE authority: public parameters (MPK) + master secret key.
 abe_master_key_t*  crypto_abe_setup(void);
 void               crypto_abe_master_key_destroy(abe_master_key_t* mk);
+
+// Derive a CP-ABE user secret key for the given pipe- or comma-separated
+// attribute list. The key can decrypt ciphertexts whose policy is satisfied
+// by the attributes.
 abe_user_key_t*    crypto_abe_keygen(const abe_master_key_t* mk, const char* attrs);
 void               crypto_abe_user_key_destroy(abe_user_key_t* sk);
-abe_ciphertext_t*  crypto_abe_encrypt(const abe_master_key_t* mk, const uint8_t* msg, size_t msg_len, const char* policy);
-void               crypto_abe_ciphertext_destroy(abe_ciphertext_t* ct);
-crabs_error_e      crypto_abe_decrypt(const abe_user_key_t* sk, const abe_ciphertext_t* ct, uint8_t** out, size_t* out_len);
 
-// Policy evaluation (AND/OR/attribute matching)
+// Encrypt msg under the given access policy (ABE boolean expression, e.g.
+// "admin and member"). Returns NULL on failure.
+abe_ciphertext_t*  crypto_abe_encrypt(const abe_master_key_t* mk,
+                                        const uint8_t* msg, size_t msg_len,
+                                        const char* policy);
+void               crypto_abe_ciphertext_destroy(abe_ciphertext_t* ct);
+
+// Decrypt with a user key. Succeeds only if the key's attributes satisfy the
+// ciphertext's policy. Caller frees *out.
+crabs_error_e      crypto_abe_decrypt(const abe_user_key_t* sk,
+                                        const abe_ciphertext_t* ct,
+                                        uint8_t** out, size_t* out_len);
+
+// Serialize a user key for storage/transmission (e.g. into a key envelope).
+// Returns the byte length written into out_buf, or 0 on overflow/error.
+size_t crypto_abe_user_key_serialize(const abe_user_key_t* sk,
+                                       uint8_t* out_buf, size_t buf_len);
+// Deserialize a user key from bytes (the master key provides the public params
+// needed to reconstruct a decrypt-capable context). Returns NULL on failure.
+abe_user_key_t* crypto_abe_user_key_deserialize(const abe_master_key_t* mk,
+                                                   const uint8_t* buf, size_t len);
+
+// Policy evaluation (AND/OR/attribute matching) — a lightweight string-based
+// check used by the authorization path; NOT a confidentiality mechanism.
+// Real attribute enforcement for the capability vault is provided by
+// crypto_abe_encrypt/decrypt above.
 bool crypto_abe_eval_policy(const char* policy, const char* attrs);
 
 // ============================================================
@@ -135,28 +147,53 @@ verify_result_t crypto_verify_operation_auth_v2(
     verify_mode_e mode);
 
 // ============================================================
+// Co-Signature Verification (v1.3 §4.2)
+// ============================================================
+// Verify a single co-signature against the serialized canonical form of the
+// operation. Resolves the co-signer's key via the attribute machine keyring
+// (key_id/sig_scheme) or the bootstrap public key (legacy). Returns
+// CRABS_SUCCESS only if the signature is valid and the co-signer is an
+// active user.
+crabs_error_e crypto_verify_co_signature(
+    const attribute_machine_t* attr_machine,
+    const char* signer_id,
+    const char* key_id,
+    signature_scheme_e sig_scheme,
+    const uint8_t* serialized_op, size_t op_len,
+    const uint8_t* signature, uint32_t signature_len);
+
+// ============================================================
 // Key Envelope (§11.2)
 // ============================================================
-#define KEY_ENVELOPE_FORMAT_V1  0x01
+#define KEY_ENVELOPE_FORMAT_V1  0x02  // v2: variable-length ABE user key
+
+// Maximum serialized size of a key envelope (used for transport buffers).
+// format_version(1) + user_id(64) + state_version(8) + attributes_hash(32)
+// + issued_at(8) + expires_at(8) + sk_abe_len(4) + sk_abe(<=1024) + signature(64)
+#define CRABS_KEY_ENVELOPE_MAX_SIZE 1200
 
 typedef struct key_envelope_t {
-  uint8_t  format_version;                       // 0x01
+  uint8_t  format_version;                       // 0x02
   char     user_id[CRABS_MAX_USER_ID];           // User identifier
   uint64_t state_version;                        // State version when issued
   uint8_t  attributes_hash[CRABS_HASH_SIZE];     // SHA-256 of attribute string
   uint64_t issued_at;                            // Unix timestamp ms
   uint64_t expires_at;                           // Expiry (0 = no expiry)
-  uint8_t  sk_abe[ABE_MASTER_KEY_SIZE];          // ABE secret key
-  uint8_t  signature[CRABS_SIG_SIZE];            // Node ECDSA signature
+  // Variable-length serialized ABE user key (crypto_abe_user_key_serialize).
+  uint8_t* sk_abe;
+  uint32_t sk_abe_len;
+  uint8_t  signature[CRABS_SIG_SIZE];            // Node ECDSA signature over the canonical form
 } key_envelope_t;
 
-// Create a key envelope: generates ABE key, signs with node key
+// Create a key envelope: generates a real CP-ABE user key for the user's
+// attributes, embeds its serialized form, and signs the canonical envelope
+// with the node's ECDSA private key. The user's attribute string and its
+// SHA-256 hash are computed internally.
 key_envelope_t* crypto_key_envelope_create(
     const abe_master_key_t* mk,
     const uint8_t node_private_key[32],
-    const char* user_id,
+    const user_t* user,
     uint64_t state_version,
-    const uint8_t attributes_hash[CRABS_HASH_SIZE],
     uint64_t issued_at,
     uint64_t expires_at);
 
@@ -164,6 +201,16 @@ key_envelope_t* crypto_key_envelope_create(
 bool crypto_key_envelope_verify(
     const uint8_t node_public_key[33],
     const key_envelope_t* envelope);
+
+// Serialize an envelope into a flat byte buffer (format_version + user_id +
+// state_version + attributes_hash + issued_at + expires_at + sk_abe_len +
+// sk_abe + signature). Returns bytes written, or 0 on overflow/error.
+size_t crypto_key_envelope_serialize(const key_envelope_t* env,
+                                       uint8_t* buf, size_t buf_len);
+// Deserialize an envelope from bytes. Returns NULL on failure. The master key
+// is needed to attach public params to the reconstructed ABE user key.
+key_envelope_t* crypto_key_envelope_deserialize(const abe_master_key_t* mk,
+                                                   const uint8_t* buf, size_t len);
 
 // Secure cleanup
 void crypto_key_envelope_destroy(key_envelope_t* envelope);

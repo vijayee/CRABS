@@ -67,10 +67,34 @@ data_item_t* crabs_register_ot_type(state_t* state,
   // Apply config to the ot_data
   if (item->ot_data != NULL) {
     crabs_ot_data_item_t* ot_data = (crabs_ot_data_item_t*)item->ot_data;
+    uint32_t desired_cap;
     if (config != NULL && config->max_op_log_size > 0) {
-      ot_data->op_log_capacity = config->max_op_log_size;
+      desired_cap = config->max_op_log_size;
     } else {
-      ot_data->op_log_capacity = CRABS_OT_MAX_OP_LOG_DEFAULT;
+      desired_cap = CRABS_OT_MAX_OP_LOG_DEFAULT;
+    }
+    // Cap to a sane maximum to avoid a huge allocation from untrusted config.
+    if (desired_cap > CRABS_OT_OP_LOG_MAX) {
+      desired_cap = CRABS_OT_OP_LOG_MAX;
+    }
+    // The op_log was allocated with the initial capacity by
+    // crabs_ot_data_item_create. Setting op_log_capacity above the actual
+    // allocation would let append_op write past the end of the buffer
+    // (heap overflow), so realloc to the desired capacity first.
+    if (desired_cap > ot_data->op_log_capacity) {
+      crabs_ot_operation_t* new_log = realloc(
+          ot_data->op_log,
+          sizeof(crabs_ot_operation_t) * desired_cap);
+      if (new_log == NULL) {
+        data_item_destroy(item);
+        return NULL;
+      }
+      memset(new_log + ot_data->op_log_capacity, 0,
+             sizeof(crabs_ot_operation_t) * (desired_cap - ot_data->op_log_capacity));
+      ot_data->op_log = new_log;
+      ot_data->op_log_capacity = desired_cap;
+    } else {
+      ot_data->op_log_capacity = desired_cap;
     }
   }
 
@@ -164,6 +188,14 @@ uint32_t crabs_extract_ot_ops(const uint8_t* payload, uint32_t payload_size,
       }
       crabs_ot_operation_set_payload(&ops[i], payload + offset, ops[i].payload_size);
       offset += ops[i].payload_size;
+    } else if (ops[i].payload_size > CRABS_OT_MAX_PAYLOAD) {
+      // Oversized payload: skip its bytes so the stream stays aligned for
+      // subsequent ops, but reject this op (don't store the payload).
+      if (offset + ops[i].payload_size > payload_size) {
+        if (ops[i].payload != NULL) { free(ops[i].payload); ops[i].payload = NULL; }
+        break;
+      }
+      offset += ops[i].payload_size;
     }
 
     if (offset + 4 > payload_size) {
@@ -175,6 +207,24 @@ uint32_t crabs_extract_ot_ops(const uint8_t* payload, uint32_t payload_size,
     if (ops[i].dep_count > CRABS_OT_MAX_DEPS) {
       ops[i].dep_count = CRABS_OT_MAX_DEPS;
     }
+
+    // Consume dep_count op-ids from the wire. Previously the parser read
+    // dep_count but immediately moved to the next op, desynchronizing every
+    // following op when any op had causal dependencies (and deps[] was
+    // silently dropped).
+    for (uint32_t d = 0; d < ops[i].dep_count; d++) {
+      if (offset + CRABS_MAX_USER_ID + 8 + 8 > payload_size) {
+        ops[i].dep_count = d; // truncated
+        goto done_op;
+      }
+      memcpy(ops[i].deps[d].node_id, payload + offset, CRABS_MAX_USER_ID);
+      offset += CRABS_MAX_USER_ID;
+      memcpy(&ops[i].deps[d].sequence_num, payload + offset, 8);
+      offset += 8;
+      memcpy(&ops[i].deps[d].timestamp, payload + offset, 8);
+      offset += 8;
+    }
+done_op:;
 
     parsed++;
   }
@@ -308,8 +358,8 @@ crabs_error_e crabs_apply_ot_op(data_item_t* item, crabs_ot_operation_t* op) {
           }
           char parent_id[64] = {0};
           char node_id[64] = {0};
-          memcpy(parent_id, op->payload, 64);
-          memcpy(node_id, op->payload + 64, 64);
+          memcpy(parent_id, op->payload, 63);
+          memcpy(node_id, op->payload + 64, 63);
           crabs_ot_tree_insert_node(tree,
             parent_id[0] ? parent_id : NULL,
             op->visible_pos, node_id,
@@ -321,7 +371,7 @@ crabs_error_e crabs_apply_ot_op(data_item_t* item, crabs_ot_operation_t* op) {
             return CRABS_ERR_INVALID_PARAM;
           }
           char node_id[64] = {0};
-          memcpy(node_id, op->payload, 64);
+          memcpy(node_id, op->payload, 63);
           crabs_ot_tree_delete_node(tree, node_id);
           break;
         }
@@ -332,8 +382,8 @@ crabs_error_e crabs_apply_ot_op(data_item_t* item, crabs_ot_operation_t* op) {
           }
           char node_id[64] = {0};
           char new_parent_id[64] = {0};
-          memcpy(node_id, op->payload, 64);
-          memcpy(new_parent_id, op->payload + 64, 64);
+          memcpy(node_id, op->payload, 63);
+          memcpy(new_parent_id, op->payload + 64, 63);
           crabs_ot_tree_reparent(tree, node_id,
             new_parent_id[0] ? new_parent_id : "",
             op->visible_pos);
@@ -344,7 +394,7 @@ crabs_error_e crabs_apply_ot_op(data_item_t* item, crabs_ot_operation_t* op) {
             return CRABS_ERR_INVALID_PARAM;
           }
           char node_id[64] = {0};
-          memcpy(node_id, op->payload, 64);
+          memcpy(node_id, op->payload, 63);
           crabs_ot_tree_reorder(tree, node_id, op->visible_pos);
           break;
         }

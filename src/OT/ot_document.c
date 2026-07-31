@@ -278,14 +278,13 @@ crabs_span_t* crabs_ot_document_delete_range(
         if (first_deleted == NULL) first_deleted = span;
       }
       remaining -= to_delete;
-      // After a partial delete, we're done (the remaining range is
-      // covered by the splits, or we've exhausted the range)
-      if (keep_before > 0 || keep_after > 0) {
-        // We split the span, so we've handled all remaining deletion
-        // in this span. Continue if there's more to delete in later spans.
-      }
     }
-    char_pos = pos + (len - remaining);
+    // Keep deleting from the original `pos`: after each deletion the chars
+    // that followed shift left into position `pos`, so the next char to
+    // delete is again at `pos`. Advancing char_pos by the deleted count
+    // (the previous `pos + (len - remaining)`) skipped characters and
+    // deleted the wrong ones across span boundaries.
+    char_pos = pos;
   }
 
   return first_deleted;

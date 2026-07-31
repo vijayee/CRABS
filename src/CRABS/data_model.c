@@ -174,13 +174,29 @@ crabs_error_e state_add_item(state_t* state, data_item_t* item) {
 
 crabs_error_e state_add_policy(state_t* state, const char* operation, const char* expression) {
   if (state == NULL || operation == NULL || expression == NULL) return CRABS_ERR_INVALID_PARAM;
-  uint32_t idx = state->policy_count;
-  state->policy_count++;
-  policy_t* new_policies = realloc(state->policies, state->policy_count * sizeof(policy_t));
+  // Update-in-place if a policy for this operation already exists, so the
+  // first-registered policy (returned by state_find_policy) reflects the
+  // latest expression. Otherwise append a new entry.
+  for (uint32_t i = 0; i < state->policy_count; i++) {
+    if (strcmp(state->policies[i].operation, operation) == 0) {
+      strncpy(state->policies[i].expression, expression, CRABS_MAX_POLICY_EXPR - 1);
+      state->policies[i].expression[CRABS_MAX_POLICY_EXPR - 1] = '\0';
+      return CRABS_SUCCESS;
+    }
+  }
+  uint32_t new_count = state->policy_count + 1;
+  policy_t* new_policies = realloc(state->policies, new_count * sizeof(policy_t));
   if (new_policies == NULL) return CRABS_ERR_OOM;
   state->policies = new_policies;
+  // Zero-init the new slot so allowed_scheme_count / min_key_version are
+  // not left as garbage (realloc does not zero-fill the grown region).
+  memset(&state->policies[state->policy_count], 0, sizeof(policy_t));
+  uint32_t idx = state->policy_count;
+  state->policy_count = new_count;
   strncpy(state->policies[idx].operation, operation, CRABS_MAX_OP_NAME - 1);
+  state->policies[idx].operation[CRABS_MAX_OP_NAME - 1] = '\0';
   strncpy(state->policies[idx].expression, expression, CRABS_MAX_POLICY_EXPR - 1);
+  state->policies[idx].expression[CRABS_MAX_POLICY_EXPR - 1] = '\0';
   return CRABS_SUCCESS;
 }
 
@@ -221,11 +237,13 @@ crabs_error_e state_register_op_type_def(state_t* state, const char* op_type, co
   // Check capacity
   if (state->op_type_def_count >= CRABS_MAX_OP_TYPE_DEFS) return CRABS_ERR_OOM;
 
-  uint32_t idx = state->op_type_def_count;
-  state->op_type_def_count++;
-  op_type_def_t* new_defs = realloc(state->op_type_defs, state->op_type_def_count * sizeof(op_type_def_t));
+  uint32_t new_count = state->op_type_def_count + 1;
+  op_type_def_t* new_defs = realloc(state->op_type_defs, new_count * sizeof(op_type_def_t));
   if (new_defs == NULL) return CRABS_ERR_OOM;
   state->op_type_defs = new_defs;
+  uint32_t idx = state->op_type_def_count;
+  state->op_type_def_count = new_count;
+  memset(&state->op_type_defs[idx], 0, sizeof(op_type_def_t));
 
   strncpy(state->op_type_defs[idx].op_type, op_type, CRABS_MAX_OP_NAME - 1);
   state->op_type_defs[idx].op_type[CRABS_MAX_OP_NAME - 1] = '\0';

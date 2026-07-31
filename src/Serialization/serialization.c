@@ -284,7 +284,13 @@ static void _serialize_bst_recursive(write_buf_t* buf, const crabs_bst_node_t* r
   _serialize_bst_recursive(buf, root->right);
 }
 
-static crabs_bst_node_t* _deserialize_bst_recursive(read_buf_t* buf) {
+// Maximum BST depth accepted during deserialization. A degenerate left-linked
+// tree of depth ~100k+ would otherwise overflow the stack; reject deeper
+// trees. 256 levels comfortably holds any balanced tree of >2^256 nodes.
+#define CRABS_BST_MAX_DESERIALIZE_DEPTH 256
+
+static crabs_bst_node_t* _deserialize_bst_recursive(read_buf_t* buf, uint32_t depth) {
+  if (depth > CRABS_BST_MAX_DESERIALIZE_DEPTH) return NULL;
   uint64_t value;
   if (!_read_uint64_le(buf, &value)) return NULL;
   uint8_t deleted;
@@ -299,14 +305,14 @@ static crabs_bst_node_t* _deserialize_bst_recursive(read_buf_t* buf) {
   node->deleted = (deleted != 0);
 
   if (has_left) {
-    node->left = _deserialize_bst_recursive(buf);
+    node->left = _deserialize_bst_recursive(buf, depth + 1);
     if (node->left == NULL) {
       crabs_bst_destroy(node);
       return NULL;
     }
   }
   if (has_right) {
-    node->right = _deserialize_bst_recursive(buf);
+    node->right = _deserialize_bst_recursive(buf, depth + 1);
     if (node->right == NULL) {
       crabs_bst_destroy(node);
       return NULL;
@@ -512,7 +518,7 @@ static bool _deserialize_ot_type_state(read_buf_t* buf, data_item_t* item) {
         uint32_t bst_count;
         if (!_read_uint32_le(buf, &bst_count)) return false;
         if (bst_count > 0) {
-          node->child_position_map = _deserialize_bst_recursive(buf);
+          node->child_position_map = _deserialize_bst_recursive(buf, 0);
           if (node->child_position_map == NULL) return false;
         }
 
@@ -1049,7 +1055,12 @@ serialized_buffer_t* crabs_serialize_state(const state_t* state) {
     _serialize_log_entry(buf, &state->log[i]);
   }
 
-  // Checksum: SHA-256 of all preceding bytes
+  // Checksum: SHA-256 of all preceding bytes.
+  // NOTE: this is an INTEGRITY/CORRUPTION check, NOT authentication. An
+  // attacker who can modify the blob can recompute this hash. Loading state
+  // blobs from untrusted sources requires an external signature (e.g. by the
+  // node key) over the whole blob — the load API does not currently accept a
+  // key, so adding HMAC would require an API change (audit M-1 follow-up).
   uint8_t hash[CRABS_HASH_SIZE];
   SHA256(buf->data, buf->offset, hash);
   _write_bytes(buf, hash, CRABS_HASH_SIZE);
@@ -1319,6 +1330,9 @@ operation_t* crabs_deserialize_operation(const uint8_t* data, size_t len) {
   uint32_t rs_count;
   if (!_read_uint32_le(&buf, &rs_count)) goto fail;
   if (rs_count > CRABS_MAX_RESOURCES) goto fail;
+  // The executor indexes op->required_state[i] for i < resource_count, so the
+  // counts must match to avoid an out-of-bounds read on a malformed op.
+  if (rs_count != resource_count) goto fail;
   if (rs_count > 0) {
     op->required_state = get_clear_memory(rs_count * sizeof(protocol_state_e));
     for (uint32_t i = 0; i < rs_count; i++) {
@@ -1332,6 +1346,7 @@ operation_t* crabs_deserialize_operation(const uint8_t* data, size_t len) {
   uint32_t ns_count;
   if (!_read_uint32_le(&buf, &ns_count)) goto fail;
   if (ns_count > CRABS_MAX_RESOURCES) goto fail;
+  if (ns_count != resource_count) goto fail;
   if (ns_count > 0) {
     op->next_state = get_clear_memory(ns_count * sizeof(protocol_state_e));
     for (uint32_t i = 0; i < ns_count; i++) {
@@ -1561,7 +1576,7 @@ crabs_bst_node_t* crabs_deserialize_bst(const uint8_t* data, size_t len) {
   if (!_read_uint32_le(&buf, &node_count)) return NULL;
   if (node_count == 0) return NULL;
 
-  return _deserialize_bst_recursive(&buf);
+  return _deserialize_bst_recursive(&buf, 0);
 }
 
 serialized_buffer_t* crabs_serialize_ot_data(const crabs_ot_data_item_t* item) {
@@ -1635,7 +1650,7 @@ crabs_ot_data_item_t* crabs_deserialize_ot_data(const uint8_t* data, size_t len,
   uint32_t bst_count;
   if (!_read_uint32_le(&buf, &bst_count)) goto fail;
   if (bst_count > 0) {
-    item->position_map = _deserialize_bst_recursive(&buf);
+    item->position_map = _deserialize_bst_recursive(&buf, 0);
     if (item->position_map == NULL) goto fail;
   }
 
@@ -1669,75 +1684,97 @@ serialized_buffer_t* crabs_serialize_for_signing(const operation_t* op) {
 
   write_buf_t* buf = _write_buf_create(1024);
 
+  // 0. Domain-separation tag + canonical-form version. This MUST change
+  // whenever the signed field set changes, so that signatures from one
+  // version do not verify against another.
+  _write_uint8(buf, 0x43); // 'C'
+  _write_uint8(buf, 0x52); // 'R'
+  _write_uint8(buf, 0x41); // 'A'
+  _write_uint8(buf, 0x42); // 'B'
+  _write_uint8(buf, 0x02); // signing-format version 2 (full dedup + payload_format + domain tag)
+
   // 1. op.type (length-prefixed string)
   _write_string16(buf, op->type);
 
   // 2. op.uuid (16 bytes raw)
   _write_bytes(buf, op->uuid, CRABS_UUID_SIZE);
 
-  // 3. op.payload (length-prefixed bytes)
+  // 3. op.payload_format (uint8) — included so the format byte cannot be
+  // flipped after signing without invalidating the signature.
+  _write_uint8(buf, op->payload_format);
+
+  // 4. op.payload (length-prefixed bytes)
   _write_bytes32(buf, op->payload, op->payload_size);
 
-  // 4. op.resources (length-prefixed array of length-prefixed strings)
+  // 5. op.resources (length-prefixed array of length-prefixed strings)
   _write_uint32_le(buf, op->resource_count);
   for (uint32_t i = 0; i < op->resource_count; i++) {
     _write_string16(buf, op->resources[i]);
   }
 
-  // 5. op.required_state (array of uint8)
+  // 6. op.required_state (array of uint8)
   _write_uint32_le(buf, op->resource_count);
   for (uint32_t i = 0; i < op->resource_count; i++) {
     _write_uint8(buf, (uint8_t)op->required_state[i]);
   }
 
-  // 6. op.next_state (array of uint8)
+  // 7. op.next_state (array of uint8)
   _write_uint32_le(buf, op->resource_count);
   for (uint32_t i = 0; i < op->resource_count; i++) {
     _write_uint8(buf, (uint8_t)op->next_state[i]);
   }
 
-  // 7. op.lock_claims (for each: resource length-prefixed string, then 32 bytes lock_token)
+  // 8. op.lock_claims (for each: resource length-prefixed string, then 32 bytes lock_token)
   _write_uint32_le(buf, op->lock_claim_count);
   for (uint32_t i = 0; i < op->lock_claim_count; i++) {
     _write_string16(buf, op->lock_claims[i].resource);
     _write_bytes(buf, op->lock_claims[i].lock_token, CRABS_LOCK_TOKEN_SIZE);
   }
 
-  // 8. op.policy (length-prefixed string)
+  // 9. op.policy (length-prefixed string)
   _write_string16(buf, op->policy);
 
-  // 9. op.signer_id (length-prefixed string)
+  // 10. op.signer_id (length-prefixed string)
   _write_string16(buf, op->signer_id);
 
-  // 10. op.signer_key_version (uint64)
+  // 11. op.signer_key_version (uint64)
   _write_uint64_le(buf, op->signer_key_version);
 
-  // 11. op.lamport_time (uint64)
+  // 12. op.lamport_time (uint64)
   _write_uint64_le(buf, op->lamport_time);
 
-  // 12. op.node_id (length-prefixed string)
+  // 13. op.node_id (length-prefixed string)
   _write_string16(buf, op->node_id);
 
-  // 13. op.sig_scheme (uint8)
+  // 14. op.sig_scheme (uint8)
   _write_uint8(buf, (uint8_t)op->sig_scheme);
 
-  // 14. op.key_id (length-prefixed string)
+  // 15. op.key_id (length-prefixed string)
   _write_string16(buf, op->key_id);
 
-  // 15. op.dedup (v1.4: included in canonical form per §7.5)
+  // 16. op.dedup (v1.4 — full spec included in canonical form per §7.5).
+  // The state_mutation and rejection_message MUST be signed, otherwise a
+  // relay could tamper with the mutation (e.g., change a counter delta)
+  // without invalidating the signature.
   _write_uint8(buf, (uint8_t)op->dedup.type);
-  if (op->dedup.type != DEDUP_NONE) {
-    _write_string16(buf, op->dedup.tracker_path);
-    _write_string16(buf, op->dedup.flag_path);
-    _write_string16(buf, op->dedup.condition);
-    // Note: rejection_message and state_mutation are NOT included in canonical form
-    // They are part of the operation payload, not the signature domain
-  }
+  _write_string16(buf, op->dedup.tracker_path);
+  _write_string16(buf, op->dedup.flag_path);
+  _write_string16(buf, op->dedup.condition);
+  _write_string16(buf, op->dedup.rejection_message);
+  // state_mutation
+  _write_uint8(buf, (uint8_t)op->dedup.update.type);
+  _write_string16(buf, op->dedup.update.set_path);
+  _write_string16(buf, op->dedup.update.element_value);
+  _write_string16(buf, op->dedup.update.flag_path);
+  _write_string16(buf, op->dedup.update.counter_path);
+  _write_int64_le(buf, op->dedup.update.delta);
+  _write_string16(buf, op->dedup.update.target_path);
+  _write_string16(buf, op->dedup.update.value);
 
-  // 16. op.ordering_system (v1.6 Amd6 §6.2: uint8 discriminator)
+  // 17. op.ordering_system (v1.6 Amd6 §6.2: uint8 discriminator)
   _write_uint8(buf, (uint8_t)op->ordering_system);
 
-  // 17. Ordering fields (v1.6 Amd6 §6.2: conditional on ordering_system)
+  // 18. Ordering fields (v1.6 Amd6 §6.2: conditional on ordering_system)
   if (op->ordering_system == CRABS_ORDERING_HLC) {
     // HLC: physical_seconds, physical_nanos, logical_counter, node_id
     _write_uint64_le(buf, op->hlc.physical_seconds);
@@ -1745,7 +1782,7 @@ serialized_buffer_t* crabs_serialize_for_signing(const operation_t* op) {
     _write_uint64_le(buf, op->hlc.logical_counter);
     _write_string16(buf, op->hlc.node_id);
   }
-  // Lamport: lamport_time is already included at position 11
+  // Lamport: lamport_time is already included at position 12
 
   // Create output
   serialized_buffer_t* result = serialized_buffer_create(buf->offset);

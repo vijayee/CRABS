@@ -92,6 +92,8 @@ static void unlock(void) {
 
 
 const char* log_level_string(int level) {
+  static const int n = (int)(sizeof(level_strings) / sizeof(level_strings[0]));
+  if (level < 0 || level >= n) return "?";
   return level_strings[level];
 }
 

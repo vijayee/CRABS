@@ -185,12 +185,40 @@ int64_t crabs_hlc_diff_ms(const crabs_hlc_t* hlc,
                            uint64_t ref_seconds, uint64_t ref_nanos) {
   if (hlc == NULL) return 0;
 
-  // Convert both to milliseconds (with nanosecond precision loss acceptable)
-  int64_t hlc_ms = (int64_t)(hlc->physical_seconds * 1000ULL) +
-                   (int64_t)(hlc->physical_nanos / 1000000ULL);
-  int64_t ref_ms = (int64_t)(ref_seconds * 1000ULL) +
-                   (int64_t)(ref_nanos / 1000000ULL);
+  // Convert each side to milliseconds with saturating arithmetic. The
+  // naive `seconds * 1000` wraps modulo 2^64 for attacker-chosen seconds
+  // (>= ~2^54), which can make an aeons-future timestamp appear within
+  // max_skew of local time and bypass the BOUNDED strategy.
+  const uint64_t MAX_SEC_BEFORE_OVERFLOW = (uint64_t)INT64_MAX / 1000ULL;
+  int64_t hlc_ms;
+  if (hlc->physical_seconds > MAX_SEC_BEFORE_OVERFLOW) {
+    hlc_ms = INT64_MAX;
+  } else {
+    uint64_t sec_ms = hlc->physical_seconds * 1000ULL;
+    uint64_t ns_ms = hlc->physical_nanos / 1000000ULL;
+    if (sec_ms > (uint64_t)INT64_MAX - ns_ms) {
+      hlc_ms = INT64_MAX;
+    } else {
+      hlc_ms = (int64_t)(sec_ms + ns_ms);
+    }
+  }
+  int64_t ref_ms;
+  if (ref_seconds > MAX_SEC_BEFORE_OVERFLOW) {
+    ref_ms = INT64_MAX;
+  } else {
+    uint64_t sec_ms = ref_seconds * 1000ULL;
+    uint64_t ns_ms = ref_nanos / 1000000ULL;
+    if (sec_ms > (uint64_t)INT64_MAX - ns_ms) {
+      ref_ms = INT64_MAX;
+    } else {
+      ref_ms = (int64_t)(sec_ms + ns_ms);
+    }
+  }
 
+  // Saturating subtraction.
+  if (hlc_ms == INT64_MAX && ref_ms != INT64_MAX) return INT64_MAX;
+  if (ref_ms == INT64_MAX && hlc_ms != INT64_MAX) return INT64_MIN;
+  if (hlc_ms == INT64_MAX && ref_ms == INT64_MAX) return 0;
   return hlc_ms - ref_ms;
 }
 
@@ -334,22 +362,22 @@ crabs_hlc_receive_result_e crabs_hlc_receive(crabs_hlc_state_t* state,
     }
 
     case HLC_STRATEGY_QUORUM:
-      // Quorum requires network confirmation — stub implementation
-      // In a real deployment, this would collect confirmations from other nodes
-      // For now, accept but increment quorum_failures to indicate
-      // the limitation
+      // Quorum requires network confirmation from other nodes, which is not
+      // implemented. Fail closed: reject rather than accept blindly (the
+      // prior stub accepted every timestamp, providing no time-travel
+      // protection while implying it did).
       state->quorum_failures += 1;
-      break;
+      return CRABS_HLC_REJECTED_SKEW;
 
     case HLC_STRATEGY_STRICT:
       // Accept message for ordering but never update local clock
       return CRABS_HLC_ACCEPTED_STRICT;
 
     case HLC_STRATEGY_TRUSTED:
-      // Trusted requires verification — stub implementation
-      // In a real deployment, this would verify the timestamp source
-      // For now, accept as if verified
-      break;
+      // Trusted requires an authenticated/verified time source, which is
+      // not implemented. Fail closed: reject rather than accept blindly.
+      state->time_travel_attempts_rejected += 1;
+      return CRABS_HLC_REJECTED_SKEW;
   }
 
   // Step 2: Check strict mode

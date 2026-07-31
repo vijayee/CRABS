@@ -102,6 +102,15 @@ attribute_machine_t* attribute_machine_create(const char* admin_id, const uint8_
   am->user_count = 0;
   am->current_time_ms = 0;
 
+  // Every machine needs an ABE master key for attribute-based verification
+  // (signature verification consults the attribute machine; the ABE master
+  // key is required for real CP-ABE attribute checks).
+  am->base_state.abe_mk = crypto_abe_setup();
+  if (am->base_state.abe_mk == NULL) {
+    free(am);
+    return NULL;
+  }
+
   // Create bootstrap admin user (§8.3 Genesis)
   user_t* admin = get_clear_memory(sizeof(user_t));
   if (admin == NULL) {

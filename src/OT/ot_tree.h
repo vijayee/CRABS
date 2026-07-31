@@ -24,11 +24,10 @@
 // ============================================================
 // Tree Operation Types (extends crabs_ot_op_type_e)
 // ============================================================
-
-#define CRABS_OT_OP_INSERT_NODE 0x13
-#define CRABS_OT_OP_DELETE_NODE 0x14
-#define CRABS_OT_OP_REPARENT    0x15
-#define CRABS_OT_OP_REORDER     0x16
+// These identifiers are enum constants in ot_types.h (CRABS_OT_OP_INSERT_NODE
+// etc.). Do NOT redefine them here as macros — a prior #define version used
+// different numeric values than the enum, which made the wire format and the
+// dispatch disagree.
 
 // ============================================================
 // Tree Node (v1.5 §7.1)

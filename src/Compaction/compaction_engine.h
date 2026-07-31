@@ -56,6 +56,11 @@ typedef struct {
   crabs_compaction_registry_t  registry;
   crabs_type_overrides_t       type_overrides;
   crabs_vector_clock_t         local_vc;
+  // Peer vector clock: tombstone collection is only safe once the relevant
+  // peers have acknowledged the tombstones. If NULL, compaction proceeds
+  // only in single-replica deployments (local_vc has <= 1 entry). Set via
+  // crabs_compaction_engine_set_peer_vc before running compaction.
+  crabs_vector_clock_t*        peer_vc;
   uint64_t                     last_run_time_ms;
   uint64_t                     compaction_count;
   uint64_t                     skipped_count;
@@ -68,6 +73,12 @@ typedef struct {
 // Initialize compaction engine with global config
 void crabs_compaction_engine_init(crabs_compaction_engine_t* engine,
                                    const crabs_tombstone_config_t* config);
+
+// Set the peer vector clock used for STRONG/QUORUM compaction safety checks.
+// The engine does NOT own the vc; the caller must keep it alive. Pass NULL
+// to clear (compaction then proceeds only in single-replica mode).
+void crabs_compaction_engine_set_peer_vc(crabs_compaction_engine_t* engine,
+                                           crabs_vector_clock_t* peer_vc);
 
 // Destroy compaction engine (does not free registry items)
 void crabs_compaction_engine_destroy(crabs_compaction_engine_t* engine);

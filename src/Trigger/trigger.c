@@ -149,8 +149,11 @@ uint32_t trigger_process_all(state_t* state, trigger_t* triggers, uint32_t trigg
     // Skip if disabled
     if (!trigger->enabled) continue;
 
-    // Skip if in cooldown
+    // Skip if in cooldown. Guard against clock regression: if now_ms <
+    // last_triggered_at (NTP step), the unsigned subtraction would wrap to a
+    // huge value and bypass the cooldown.
     if (trigger->cooldown_ms > 0 && trigger->last_triggered_at > 0) {
+      if (now_ms < trigger->last_triggered_at) continue; // clock stepped back
       if (now_ms - trigger->last_triggered_at < trigger->cooldown_ms) continue;
     }
 
@@ -231,8 +234,9 @@ crabs_error_e state_machine_op_create_trigger(state_t* state, operation_t* op) {
 
   // Make a mutable copy of the payload
   char buf[4096];
-  strncpy(buf, payload, sizeof(buf) - 1);
-  buf[sizeof(buf) - 1] = '\0';
+  { size_t _c = op->payload_size < sizeof(buf) - 1 ? op->payload_size : (uint32_t)(sizeof(buf) - 1);
+    memcpy(buf, op->payload, _c);
+    buf[_c] = '\0'; }
 
   char* saveptr = NULL;
   char* token = strtok_r(buf, ";", &saveptr);
@@ -334,8 +338,9 @@ crabs_error_e state_machine_op_delete_trigger(state_t* state, operation_t* op) {
   // Payload: trigger_id=<id>
   char trigger_id[CRABS_MAX_USER_ID] = {0};
   char buf[512];
-  strncpy(buf, (char*)op->payload, sizeof(buf) - 1);
-  buf[sizeof(buf) - 1] = '\0';
+  { size_t _c = op->payload_size < sizeof(buf) - 1 ? op->payload_size : (uint32_t)(sizeof(buf) - 1);
+    memcpy(buf, op->payload, _c);
+    buf[_c] = '\0'; }
 
   char* eq = strchr(buf, '=');
   if (eq == NULL) return CRABS_ERR_INVALID_PARAM;
@@ -368,8 +373,9 @@ crabs_error_e state_machine_op_disable_trigger(state_t* state, operation_t* op) 
   // Payload: trigger_id=<id>
   char trigger_id[CRABS_MAX_USER_ID] = {0};
   char buf[512];
-  strncpy(buf, (char*)op->payload, sizeof(buf) - 1);
-  buf[sizeof(buf) - 1] = '\0';
+  { size_t _c = op->payload_size < sizeof(buf) - 1 ? op->payload_size : (uint32_t)(sizeof(buf) - 1);
+    memcpy(buf, op->payload, _c);
+    buf[_c] = '\0'; }
 
   char* eq = strchr(buf, '=');
   if (eq == NULL) return CRABS_ERR_INVALID_PARAM;
@@ -391,8 +397,9 @@ crabs_error_e state_machine_op_enable_trigger(state_t* state, operation_t* op) {
   // Payload: trigger_id=<id>
   char trigger_id[CRABS_MAX_USER_ID] = {0};
   char buf[512];
-  strncpy(buf, (char*)op->payload, sizeof(buf) - 1);
-  buf[sizeof(buf) - 1] = '\0';
+  { size_t _c = op->payload_size < sizeof(buf) - 1 ? op->payload_size : (uint32_t)(sizeof(buf) - 1);
+    memcpy(buf, op->payload, _c);
+    buf[_c] = '\0'; }
 
   char* eq = strchr(buf, '=');
   if (eq == NULL) return CRABS_ERR_INVALID_PARAM;

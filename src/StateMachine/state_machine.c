@@ -18,6 +18,8 @@
 #include <stdlib.h>
 #include <time.h>
 #include <openssl/rand.h>
+#include <openssl/crypto.h>
+#include <openssl/evp.h>
 
 // ============================================================
 // Transition Table (§6.3)
@@ -183,12 +185,12 @@ int crabs_operation_compare(const operation_t* a, const operation_t* b) {
 // Lock Token Generation
 // ============================================================
 void state_machine_generate_lock_token(uint8_t token[CRABS_LOCK_TOKEN_SIZE]) {
+  // Lock tokens are bearer credentials — they MUST come from a CSPRNG.
+  // A failure here is a fatal error; we must never fall back to rand(),
+  // which is unseeded and predictable. The caller treats an all-zero token
+  // as "generation failed" and must abort the lock acquisition.
   if (RAND_bytes(token, CRABS_LOCK_TOKEN_SIZE) != 1) {
-    // Fallback: if RAND_bytes fails, fill with random as last resort
-    // but this should be treated as a serious error in production
-    for (int i = 0; i < CRABS_LOCK_TOKEN_SIZE; i++) {
-      token[i] = (uint8_t)(rand() & 0xFF);
-    }
+    memset(token, 0, CRABS_LOCK_TOKEN_SIZE);
   }
 }
 
@@ -288,10 +290,37 @@ static void record_processed_op(state_t* state, const uint8_t uuid[CRABS_UUID_SI
 // ============================================================
 // Log helper
 // ============================================================
+// Compute a tamper-evident hash-chain entry: state_hash = SHA256(prev_hash ||
+// version || uuid || type || signer_id || lamport_time || node_id). The
+// previous entry's state_hash (or an all-zero seed for the first entry) is
+// mixed in so that altering or removing any historical entry breaks the
+// chain (audit M-8: previously state_hash was always zero).
+static void _compute_log_chain_hash(state_t* state, log_entry_t* entry) {
+  uint8_t prev[CRABS_HASH_SIZE];
+  memset(prev, 0, CRABS_HASH_SIZE);
+  if (state->log_count > 1) {
+    memcpy(prev, state->log[state->log_count - 2].state_hash, CRABS_HASH_SIZE);
+  }
+  EVP_MD_CTX* ctx = EVP_MD_CTX_new();
+  if (!ctx) { memset(entry->state_hash, 0, CRABS_HASH_SIZE); return; }
+  EVP_DigestInit_ex(ctx, EVP_sha256(), NULL);
+  EVP_DigestUpdate(ctx, prev, CRABS_HASH_SIZE);
+  EVP_DigestUpdate(ctx, &entry->version, sizeof(entry->version));
+  EVP_DigestUpdate(ctx, entry->uuid, CRABS_UUID_SIZE);
+  EVP_DigestUpdate(ctx, entry->type, strnlen(entry->type, CRABS_MAX_OP_NAME));
+  EVP_DigestUpdate(ctx, entry->signer_id, strnlen(entry->signer_id, CRABS_MAX_USER_ID));
+  EVP_DigestUpdate(ctx, &entry->lamport_time, sizeof(entry->lamport_time));
+  EVP_DigestUpdate(ctx, entry->node_id, strnlen(entry->node_id, CRABS_MAX_USER_ID));
+  unsigned int hlen = 0;
+  EVP_DigestFinal_ex(ctx, entry->state_hash, &hlen);
+  EVP_MD_CTX_free(ctx);
+}
+
 static void append_log(state_t* state, const uint8_t uuid[CRABS_UUID_SIZE],
                        const char* type, const char* signer_id,
                        uint64_t lamport_time, const char* node_id,
                        const uint8_t state_hash[CRABS_HASH_SIZE]) {
+  (void)state_hash; // the chain hash is computed below; the caller's value is ignored
   uint64_t new_count = state->log_count + 1;
   log_entry_t* new_log = realloc(state->log, new_count * sizeof(log_entry_t));
   if (new_log == NULL) return;
@@ -300,11 +329,14 @@ static void append_log(state_t* state, const uint8_t uuid[CRABS_UUID_SIZE],
   log_entry_t* entry = &state->log[state->log_count - 1];
   entry->version = state->version;
   memcpy(entry->uuid, uuid, CRABS_UUID_SIZE);
-  strncpy(entry->type, type, CRABS_MAX_OP_NAME - 1);
-  strncpy(entry->signer_id, signer_id, CRABS_MAX_USER_ID - 1);
+  entry->type[0] = '\0';
+  strncat(entry->type, type, CRABS_MAX_OP_NAME - 1);
+  entry->signer_id[0] = '\0';
+  strncat(entry->signer_id, signer_id, CRABS_MAX_USER_ID - 1);
   entry->lamport_time = lamport_time;
-  strncpy(entry->node_id, node_id, CRABS_MAX_USER_ID - 1);
-  memcpy(entry->state_hash, state_hash, CRABS_HASH_SIZE);
+  entry->node_id[0] = '\0';
+  strncat(entry->node_id, node_id, CRABS_MAX_USER_ID - 1);
+  _compute_log_chain_hash(state, entry);
 }
 
 // ============================================================
@@ -338,8 +370,8 @@ crabs_error_e state_machine_execute(state_t* state, operation_t* op) {
     if (item->protocol_state == PROTOCOL_LOCKED ||
         item->protocol_state == PROTOCOL_MODIFIED) {
       if (!item->lock_state.lock_token_valid ||
-          memcmp(item->lock_state.lock_token, op->lock_claims[i].lock_token,
-                 CRABS_LOCK_TOKEN_SIZE) != 0) {
+          CRYPTO_memcmp(item->lock_state.lock_token, op->lock_claims[i].lock_token,
+                        CRABS_LOCK_TOKEN_SIZE) != 0) {
         return CRABS_ERR_LOCK_TOKEN_MISMATCH;
       }
       if (strlen(op->signer_id) > 0 &&
@@ -357,54 +389,54 @@ crabs_error_e state_machine_execute(state_t* state, operation_t* op) {
     }
   }
 
-  // Step 5b: ABE-gated policy verification (§10.3)
-  const char* policy = state_find_policy(state, op->type);
-  if (policy == NULL && op->resource_count > 0) {
+  // Step 5b: ABE-gated policy verification (§10.3) — fail closed.
+  // Every operation requires a registered policy and a valid signature.
+  if (state->attr_machine == NULL) {
     return CRABS_ERR_UNAUTHORIZED;
   }
-  if (policy != NULL && strlen(policy) > 0 && state->attr_machine != NULL) {
-    // Resolve CONTAINS operators in the policy
-    policy_preprocess_result_t pp = preprocess_policy(policy, state, op->signer_id);
-    if (!pp.resolved_ok) {
-      return CRABS_ERR_UNAUTHORIZED;
-    }
+  const char* policy = state_find_policy(state, op->type);
+  if (policy == NULL) {
+    // No policy registered for this operation type — reject.
+    return CRABS_ERR_UNAUTHORIZED;
+  }
 
-    // Determine verification mode from the operation
-    verify_mode_e mode = (op->signer_id[0] != '\0') ? VERIFY_MODE_A : VERIFY_MODE_B;
+  // Resolve CONTAINS operators and {user_id} placeholders in the policy.
+  policy_preprocess_result_t pp = preprocess_policy(policy, state, op->signer_id);
+  if (!pp.resolved_ok) {
+    return CRABS_ERR_UNAUTHORIZED;
+  }
 
-    // Serialize operation for signature verification
-    serialized_buffer_t* ser = crabs_serialize_for_signing(op);
-    if (ser == NULL) {
-      return CRABS_ERR_SERIALIZATION_ERROR;
-    }
+  verify_mode_e mode = (op->signer_id[0] != '\0') ? VERIFY_MODE_A : VERIFY_MODE_B;
 
-    // Use the persistent ABE master key from state
-    if (state->abe_mk == NULL) {
-      serialized_buffer_destroy(ser);
-      return CRABS_ERR_CRYPTOGRAPHIC_ERROR;
-    }
-
-    verify_result_t vr;
-    if (op->sig_scheme != SCHEME_UNSPECIFIED || op->key_id[0] != '\0') {
-      // v1.3: Scheme-aware verification
-      vr = crypto_verify_operation_auth_v2(
-          state->abe_mk, pp.abe_policy, state->attr_machine,
-          ser->data, ser->len,
-          op->signature, CRABS_SIG_SIZE,
-          op->signer_id, op->key_id, op->sig_scheme, mode);
-    } else {
-      // Legacy ECDSA verification
-      vr = crypto_verify_operation_auth(
-          state->abe_mk, pp.abe_policy, state->attr_machine,
-          ser->data, ser->len,
-          op->signature, op->signer_id, mode);
-    }
-
+  serialized_buffer_t* ser = crabs_serialize_for_signing(op);
+  if (ser == NULL) {
+    return CRABS_ERR_SERIALIZATION_ERROR;
+  }
+  if (state->abe_mk == NULL) {
     serialized_buffer_destroy(ser);
+    return CRABS_ERR_CRYPTOGRAPHIC_ERROR;
+  }
 
-    if (!vr.authorized) {
-      return vr.error;
-    }
+  verify_result_t vr;
+  if (op->sig_scheme != SCHEME_UNSPECIFIED || op->key_id[0] != '\0') {
+    // v1.3: Scheme-aware verification
+    vr = crypto_verify_operation_auth_v2(
+        state->abe_mk, pp.abe_policy, state->attr_machine,
+        ser->data, ser->len,
+        op->signature, CRABS_SIG_SIZE,
+        op->signer_id, op->key_id, op->sig_scheme, mode);
+  } else {
+    // Legacy ECDSA verification
+    vr = crypto_verify_operation_auth(
+        state->abe_mk, pp.abe_policy, state->attr_machine,
+        ser->data, ser->len,
+        op->signature, op->signer_id, mode);
+  }
+
+  serialized_buffer_destroy(ser);
+
+  if (!vr.authorized) {
+    return vr.error;
   }
 
   // Step 6: Key version verification (§10.4)
@@ -444,16 +476,48 @@ crabs_error_e state_machine_execute(state_t* state, operation_t* op) {
     }
   }
 
-  // Step 6c: Co-signature threshold enforcement (v1.3 §4.2)
-  if (state->config.sig_config.co_sign_threshold > 0 && op->co_signer_count < state->config.sig_config.co_sign_threshold) {
-    // Check if this operation type requires co-signatures
-    // Only enforce if threshold is set and operation has fewer co-signers
-    if (op->co_signer_count > 0 || op->sig_scheme != SCHEME_UNSPECIFIED) {
-      // If co-signers are present or scheme is specified, enforce threshold
-      if (op->co_signer_count < state->config.sig_config.co_sign_threshold) {
+  // Step 6c: Co-signature verification and threshold enforcement (v1.3 §4.2).
+  // Every co-signature is cryptographically verified against the canonical
+  // signed form; co-signers must be distinct from each other and from the
+  // primary signer. When a threshold is configured, it is enforced
+  // unconditionally (no fail-open bypass).
+  if (op->co_signer_count > 0) {
+    serialized_buffer_t* co_ser = crabs_serialize_for_signing(op);
+    if (co_ser == NULL) return CRABS_ERR_SERIALIZATION_ERROR;
+
+    for (uint32_t i = 0; i < op->co_signer_count; i++) {
+      const co_signature_t* cs = &op->co_signers[i];
+      if (cs->signer_id[0] == '\0') {
+        serialized_buffer_destroy(co_ser);
+        return CRABS_ERR_INVALID_PARAM;
+      }
+      // Distinctness: no co-signer may duplicate another or the primary signer.
+      if (strcmp(cs->signer_id, op->signer_id) == 0) {
+        serialized_buffer_destroy(co_ser);
+        return CRABS_ERR_DUPLICATE_OPERATION;
+      }
+      for (uint32_t j = 0; j < i; j++) {
+        if (strcmp(cs->signer_id, op->co_signers[j].signer_id) == 0) {
+          serialized_buffer_destroy(co_ser);
+          return CRABS_ERR_DUPLICATE_OPERATION;
+        }
+      }
+      crabs_error_e cs_rc = crypto_verify_co_signature(
+          state->attr_machine,
+          cs->signer_id, cs->key_id, cs->sig_scheme,
+          co_ser->data, co_ser->len,
+          cs->signature, cs->signature_len);
+      if (cs_rc != CRABS_SUCCESS) {
+        serialized_buffer_destroy(co_ser);
         return CRABS_ERR_UNAUTHORIZED;
       }
     }
+    serialized_buffer_destroy(co_ser);
+  }
+
+  if (state->config.sig_config.co_sign_threshold > 0 &&
+      op->co_signer_count < state->config.sig_config.co_sign_threshold) {
+    return CRABS_ERR_UNAUTHORIZED;
   }
 
   // Step 7: Execute operation handler
@@ -588,6 +652,12 @@ crabs_error_e state_machine_op_lock(state_t* state, operation_t* op, lock_respon
     if (item == NULL) return CRABS_ERR_RESOURCE_NOT_FOUND;
 
     state_machine_generate_lock_token(response->lock_tokens[i]);
+    // If CSPRNG generation failed, the token is all-zeros. Lock tokens are
+    // bearer credentials — never store a predictable token.
+    static const uint8_t zero_token[CRABS_LOCK_TOKEN_SIZE] = {0};
+    if (memcmp(response->lock_tokens[i], zero_token, CRABS_LOCK_TOKEN_SIZE) == 0) {
+      return CRABS_ERR_CRYPTOGRAPHIC_ERROR;
+    }
     memcpy(item->lock_state.lock_token, response->lock_tokens[i], CRABS_LOCK_TOKEN_SIZE);
     item->lock_state.lock_token_valid = true;
     strncpy(item->lock_state.lock_owner, op->signer_id, CRABS_MAX_USER_ID - 1);
@@ -726,7 +796,15 @@ crabs_error_e state_machine_op_change_config(state_t* state, operation_t* op) {
   if (op->payload == NULL || op->payload_size == 0) {
     return CRABS_ERR_INVALID_PARAM;
   }
-  char* payload_str = (char*)op->payload;
+  // op->payload is a byte array with explicit payload_size and no NUL
+  // termination guarantee. Copy into a bounded buffer and NUL-terminate
+  // before any string operations to avoid an out-of-bounds read.
+  char payload_buf[1024];
+  uint32_t copy_len = op->payload_size < sizeof(payload_buf) - 1
+                        ? op->payload_size : (uint32_t)sizeof(payload_buf) - 1;
+  memcpy(payload_buf, op->payload, copy_len);
+  payload_buf[copy_len] = '\0';
+  char* payload_str = payload_buf;
   if (strstr(payload_str, "max_lock_duration_ms") != NULL) {
     char* eq = strchr(payload_str, '=');
     if (eq != NULL) state->config.max_lock_duration_ms = (uint64_t)atoll(eq + 1);
@@ -1070,17 +1148,16 @@ crabs_error_e state_machine_op_refresh_key(state_t* state, operation_t* op,
   crabs_error_e rc = crypto_compute_attributes_hash(user, attr_hash);
   if (rc != CRABS_SUCCESS) return rc;
 
-  // Generate ABE master key for envelope creation
-  abe_master_key_t* mk = crypto_abe_setup();
-  if (mk == NULL) return CRABS_ERR_CRYPTOGRAPHIC_ERROR;
+  // Use the persistent ABE master key bound to this state (M-6: previously
+  // a throwaway master key was generated per refresh, producing envelopes
+  // whose ABE key was unrelated to the node's domain).
+  if (state->abe_mk == NULL) return CRABS_ERR_CRYPTOGRAPHIC_ERROR;
 
   // Create key envelope
   uint64_t now_ms = (uint64_t)time(NULL) * 1000;
   key_envelope_t* envelope = crypto_key_envelope_create(
-      mk, state->node_private_key, op->signer_id,
-      state->version, attr_hash, now_ms, 0);
-
-  crypto_abe_master_key_destroy(mk);
+      (abe_master_key_t*)state->abe_mk, state->node_private_key, user,
+      state->version, now_ms, 0);
 
   if (envelope == NULL) return CRABS_ERR_CRYPTOGRAPHIC_ERROR;
 
@@ -1093,14 +1170,11 @@ crabs_error_e state_machine_op_refresh_key(state_t* state, operation_t* op,
   }
   state->last_refresh_envelope = envelope;
 
-  // Copy envelope to response (flat serialization)
+  // Serialize the envelope into the response buffer (flat transport form).
   if (response != NULL) {
-    size_t copy_size = sizeof(key_envelope_t);
-    if (copy_size > sizeof(response->envelope_data)) {
-      copy_size = sizeof(response->envelope_data);
-    }
-    memcpy(response->envelope_data, envelope, copy_size);
-    response->envelope_data_len = (uint32_t)copy_size;
+    size_t n = crypto_key_envelope_serialize(envelope,
+        response->envelope_data, sizeof(response->envelope_data));
+    response->envelope_data_len = (uint32_t)n;
   }
 
   return CRABS_SUCCESS;

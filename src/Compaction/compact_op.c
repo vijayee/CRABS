@@ -249,9 +249,11 @@ crabs_error_e crabs_compact_ot_item(
   if (item->ot_data != NULL) {
     crabs_ot_data_item_t* ot_data = (crabs_ot_data_item_t*)item->ot_data;
 
-    // Destroy all ops in the log
+    // Clear all ops in the log. Use crabs_ot_operation_clear (NOT destroy),
+    // because the ops live inside the op_log array allocation — freeing an
+    // interior pointer would corrupt the heap.
     for (uint32_t i = 0; i < ot_data->op_log_count; i++) {
-      crabs_ot_operation_destroy(&ot_data->op_log[i]);
+      crabs_ot_operation_clear(&ot_data->op_log[i]);
     }
     ot_data->op_log_count = 0;
 

@@ -36,12 +36,19 @@ void crabs_compaction_engine_init(crabs_compaction_engine_t* engine,
 
   crabs_compaction_registry_init(&engine->registry);
   crabs_vector_clock_init(&engine->local_vc);
+  engine->peer_vc = NULL;
   engine->last_run_time_ms = 0;
   engine->compaction_count = 0;
   engine->skipped_count = 0;
   engine->unsafe_count = 0;
   engine->rate_window_start_ms = 0;
   engine->rate_window_count = 0;
+}
+
+void crabs_compaction_engine_set_peer_vc(crabs_compaction_engine_t* engine,
+                                           crabs_vector_clock_t* peer_vc) {
+  if (engine == NULL) return;
+  engine->peer_vc = peer_vc;
 }
 
 void crabs_compaction_engine_destroy(crabs_compaction_engine_t* engine) {
@@ -141,9 +148,12 @@ crabs_compaction_result_e crabs_compact_item(
     return CRABS_COMPACTION_UNSUPPORTED;
   }
 
-  // Step 2: Check compaction safety
+  // Step 2: Check compaction safety using the peer VC (if set). Previously
+  // the engine passed its own local_vc as BOTH local and peer, which made
+  // STRONG/QUORUM safety checks always pass — tombstones were collected
+  // without peer acknowledgment, causing replica divergence.
   if (!crabs_check_compaction_safety(config, state, item,
-                                      &engine->local_vc, &engine->local_vc)) {
+                                      &engine->local_vc, engine->peer_vc)) {
     engine->unsafe_count++;
     return CRABS_COMPACTION_UNSAFE;
   }
@@ -160,7 +170,7 @@ crabs_compaction_result_e crabs_compact_item(
   if (item->ot_data != NULL) {
     // OT type: use the existing crabs_compact_ot_item
     err = crabs_compact_ot_item(state, item, config, &engine->registry,
-                                &engine->local_vc, &engine->local_vc);
+                                &engine->local_vc, engine->peer_vc);
   } else {
     // CRDT type: use vtable dispatch
     const crabs_compaction_vtable_t* vtable =
