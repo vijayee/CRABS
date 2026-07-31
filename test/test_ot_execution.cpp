@@ -10,6 +10,7 @@ extern "C" {
 #include "../src/OT/ot_execution.h"
 #include "../src/OT/ot_ordered_set.h"
 #include "../src/OT/ot_tree.h"
+#include "../src/OT/ot_document.h"
 #include "../src/StateMachine/state_machine.h"
 }
 
@@ -298,4 +299,34 @@ TEST(OTExecution, PruneLog) {
 
 TEST(OTExecution, PruneNullItem) {
   crabs_prune_ot_log(nullptr, 100);
+}
+// Regression for audit C-8: the document op-type constants were #defined in
+// ot_document.h with different values than the enum in ot_types.h, so an op
+// built with the enum value for INSERT_TEXT (0x11) was dispatched as
+// DELETE_RANGE (macro 0x11) and deleted text instead of inserting. After the
+// fix, INSERT_TEXT inserts.
+TEST(OTExecution, ApplyDocumentInsertTextDispatchMatchesEnum) {
+  state_t* state = state_create();
+  data_item_t* item = crabs_register_ot_type(state, "doc",
+    DATA_TYPE_OT_DOCUMENT, nullptr);
+  ASSERT_NE(item, nullptr);
+
+  crabs_ot_operation_t op;
+  crabs_ot_operation_init(&op);
+  op.op_type = CRABS_OT_OP_INSERT_TEXT; // enum value 0x11
+  op.visible_pos = 0;
+  crabs_ot_op_id_init(&op.id, "n1", 1, 100);
+  uint8_t text[] = {'A', 'B'};
+  crabs_ot_operation_set_payload(&op, text, 2);
+
+  crabs_error_e err = crabs_apply_ot_op(item, &op);
+  EXPECT_EQ(err, CRABS_SUCCESS);
+
+  crabs_ot_document_t* doc = (crabs_ot_document_t*)item->value;
+  ASSERT_NE(doc, nullptr);
+  // Before the fix this would have been 0 (dispatched as DELETE_RANGE).
+  EXPECT_EQ(crabs_ot_document_char_count(doc), 2u);
+
+  if (op.payload) { free(op.payload); op.payload = nullptr; }
+  state_destroy(state);
 }

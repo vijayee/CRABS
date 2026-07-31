@@ -13,6 +13,9 @@ extern "C" {
 #include "../src/Compaction/compaction_engine.h"
 #include "../src/Compaction/crdt_compaction.h"
 #include "../src/Serialization/serialization.h"
+#include "../src/Attribute/attribute_machine.h"
+#include "../src/Crypto/crypto.h"
+#include "test_helpers.h"
 }
 
 // ============================================================
@@ -48,7 +51,9 @@ TEST(CompactionIntegration, TransitionValidForCompact) {
 // ============================================================
 
 TEST(CompactionIntegration, StateMachineCompactDispatch) {
-  state_t* state = state_create();
+  crabs_test_env_t env;
+  crabs_test_env_init(&env);
+  state_t* state = env.state;
 
   // Create an OR-Set with tombstones
   or_set_t* set = or_set_create();
@@ -61,6 +66,8 @@ TEST(CompactionIntegration, StateMachineCompactDispatch) {
   state_add_item(state, item);
 
   operation_t* op = operation_create(CRABS_OP_COMPACT);
+  strncpy(op->signer_id, "admin", CRABS_MAX_USER_ID - 1);
+  crabs_test_sign_op(&env, op);
   crabs_error_e err = state_machine_execute(state, op);
   EXPECT_EQ(err, CRABS_SUCCESS);
 
@@ -69,7 +76,7 @@ TEST(CompactionIntegration, StateMachineCompactDispatch) {
   // Clean up — the compaction may have replaced item->value
   or_set_destroy((or_set_t*)item->value);
   item->value = nullptr;
-  state_destroy(state);
+  crabs_test_env_destroy(&env);
 }
 
 TEST(CompactionIntegration, StateMachineCompactNullParams) {

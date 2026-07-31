@@ -16,6 +16,7 @@ extern "C" {
 #include "../src/Serialization/serialization.h"
 #include "../src/Condition/condition.h"
 #include "../src/Trigger/trigger.h"
+#include "test_helpers.h"
 }
 
 // ============================================================
@@ -33,9 +34,17 @@ protected:
 // ============================================================
 
 TEST_F(TestIntegration, LockModifyVerifyUnlock) {
-  // Create state with a resource item
-  state_t* state = state_create();
-  ASSERT_NE(state, nullptr);
+  // Use the shared test env: real admin keypair, attribute machine, policies.
+  crabs_test_env_t env;
+  crabs_test_env_init(&env);
+  state_t* state = env.state;
+
+  // Register alice with a real keypair and role:admin so she can sign.
+  ecdsa_keypair_t* alice_key = crypto_ecdsa_generate();
+  ASSERT_NE(alice_key, nullptr);
+  ASSERT_EQ(attribute_machine_register_user(state->attr_machine, "alice",
+                                               alice_key->public_key,
+                                               "role:admin"), CRABS_SUCCESS);
 
   data_item_t* res = data_item_create("resource1", DATA_TYPE_RESOURCE, CRDT_PN_COUNTER);
   ASSERT_NE(res, nullptr);
@@ -43,13 +52,6 @@ TEST_F(TestIntegration, LockModifyVerifyUnlock) {
   *val = 100;
   res->value = val;
   state_add_item(state, res);
-
-  // Add policies
-  state_add_policy(state, CRABS_OP_LOCK, "role:admin");
-  state_add_policy(state, CRABS_OP_EXTEND, "role:admin");
-  state_add_policy(state, CRABS_OP_VERIFY, "role:admin");
-  state_add_policy(state, CRABS_OP_ROLLBACK, "role:admin");
-  state_add_policy(state, CRABS_OP_UNLOCK, "role:admin");
 
   uint8_t uuid1[CRABS_UUID_SIZE];
   memset(uuid1, 0x01, CRABS_UUID_SIZE);
@@ -65,6 +67,7 @@ TEST_F(TestIntegration, LockModifyVerifyUnlock) {
   lock_op->next_state = (protocol_state_e*)malloc(sizeof(protocol_state_e));
   lock_op->next_state[0] = PROTOCOL_LOCKED;
   strncpy(lock_op->signer_id, "alice", CRABS_MAX_USER_ID - 1);
+  crabs_test_sign_op_with(alice_key, lock_op);
 
   crabs_error_e result = state_machine_execute(state, lock_op);
   EXPECT_EQ(result, CRABS_SUCCESS);
@@ -99,6 +102,7 @@ TEST_F(TestIntegration, LockModifyVerifyUnlock) {
   memcpy(verify_op->lock_claims[0].lock_token, item->lock_state.lock_token, CRABS_LOCK_TOKEN_SIZE);
   verify_op->lock_claim_count = 1;
   strncpy(verify_op->signer_id, "alice", CRABS_MAX_USER_ID - 1);
+  crabs_test_sign_op_with(alice_key, verify_op);
 
   result = state_machine_execute(state, verify_op);
   EXPECT_EQ(result, CRABS_SUCCESS);
@@ -122,6 +126,7 @@ TEST_F(TestIntegration, LockModifyVerifyUnlock) {
   memcpy(unlock_op->lock_claims[0].lock_token, item->lock_state.lock_token, CRABS_LOCK_TOKEN_SIZE);
   unlock_op->lock_claim_count = 1;
   strncpy(unlock_op->signer_id, "alice", CRABS_MAX_USER_ID - 1);
+  crabs_test_sign_op_with(alice_key, unlock_op);
 
   result = state_machine_execute(state, unlock_op);
   EXPECT_EQ(result, CRABS_SUCCESS);
@@ -134,7 +139,8 @@ TEST_F(TestIntegration, LockModifyVerifyUnlock) {
   EXPECT_EQ(item->protocol_state, PROTOCOL_IDLE);
   EXPECT_FALSE(item->lock_state.lock_token_valid);
 
-  state_destroy(state);
+  crypto_ecdsa_keypair_destroy(alice_key);
+  crabs_test_env_destroy(&env);
 }
 
 // ============================================================

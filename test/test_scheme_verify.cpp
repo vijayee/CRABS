@@ -10,6 +10,7 @@ extern "C" {
 #include "../src/StateMachine/state_machine.h"
 #include "../src/CRABS/crabs.h"
 #include "../src/CRABS/data_model.h"
+#include "../src/Serialization/serialization.h"
 #include "../src/Util/allocator.h"
 }
 
@@ -342,6 +343,10 @@ TEST(TestSchemeVerify, StateMachineDispatchesV2ForSchemeOps) {
   memset(admin_pk + 1, 0xAA, 32);
   attribute_machine_t* am = attribute_machine_create("admin", admin_pk);
   state->attr_machine = am;
+  // Fail-closed authorization requires an ABE master key on the state and a
+  // registered policy for register_key.
+  state->abe_mk = crypto_abe_setup();
+  state_add_policy(state, CRABS_OP_REGISTER_KEY, "");
 
   // Generate key and register it
   const signature_vtable_t* vt = crypto_sig_scheme_get(ECDSA_SECP256K1);
@@ -371,6 +376,12 @@ TEST(TestSchemeVerify, StateMachineDispatchesV2ForSchemeOps) {
   op->sig_scheme = ECDSA_SECP256K1;
   strncpy(op->key_id, "sm-key", CRABS_MAX_KEY_ID - 1);
 
+  // Sign with the sm-key secret key so v2 verification (key_id=sm-key) passes.
+  serialized_buffer_t* ser = crabs_serialize_for_signing(op);
+  ASSERT_NE(ser, nullptr);
+  crypto_ecdsa_sign(sk, ser->data, ser->len, op->signature);
+  serialized_buffer_destroy(ser);
+
   crabs_error_e rc = state_machine_execute(state, op);
   // This should succeed (key already registered, duplicate returns error,
   // but the test verifies that the v2 path is invoked without crash)
@@ -382,6 +393,7 @@ TEST(TestSchemeVerify, StateMachineDispatchesV2ForSchemeOps) {
 
   // Cleanup
   attribute_machine_destroy(state->attr_machine);
+  if (state->abe_mk) crypto_abe_master_key_destroy((abe_master_key_t*)state->abe_mk);
   data_item_t* item = state->items;
   while (item != NULL) {
     data_item_t* next = item->next;

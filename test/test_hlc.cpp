@@ -764,28 +764,28 @@ TEST(HLCReceive, StatisticsTracking) {
   EXPECT_EQ(state.time_travel_attempts_rejected, 2u);
 }
 
-// QUORUM strategy (stub) — accepts
-TEST(HLCReceive, QuorumStubAccepts) {
+// QUORUM strategy (not implemented) — fails closed (rejects) rather than
+// accepting blindly. The audit (H-12) found the prior stub accepted every
+// timestamp, providing no time-travel protection.
+TEST(HLCReceive, QuorumStubRejects) {
   crabs_hlc_state_t state = make_mock_state("alice", 36000, 0);
   state.receive_strategy = HLC_STRATEGY_QUORUM;
 
   crabs_hlc_t received = {36001, 0, 0, "bob"};
   crabs_hlc_receive_result_e result = crabs_hlc_receive(&state, &received);
 
-  // Stub accepts (no network infrastructure to collect confirmations)
-  EXPECT_EQ(result, CRABS_HLC_ACCEPTED);
+  EXPECT_EQ(result, CRABS_HLC_REJECTED_SKEW);
 }
 
-// TRUSTED strategy (stub) — accepts
-TEST(HLCReceive, TrustedStubAccepts) {
+// TRUSTED strategy (not implemented) — fails closed (rejects).
+TEST(HLCReceive, TrustedStubRejects) {
   crabs_hlc_state_t state = make_mock_state("alice", 36000, 0);
   state.receive_strategy = HLC_STRATEGY_TRUSTED;
 
   crabs_hlc_t received = {36001, 0, 0, "bob"};
   crabs_hlc_receive_result_e result = crabs_hlc_receive(&state, &received);
 
-  // Stub accepts (no verification infrastructure)
-  EXPECT_EQ(result, CRABS_HLC_ACCEPTED);
+  EXPECT_EQ(result, CRABS_HLC_REJECTED_SKEW);
 }
 
 // Multiple receives in sequence

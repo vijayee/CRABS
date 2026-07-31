@@ -139,24 +139,6 @@ TEST(TestCrypto, TestAbeNullParams) {
 TEST(TestAbe, TestSetup) {
   abe_master_key_t* mk = crypto_abe_setup();
   ASSERT_NE(mk, nullptr);
-
-  // MSK should not be all zeros
-  bool msk_nonzero = false;
-  for (int i = 0; i < ABE_MASTER_KEY_SIZE; i++) {
-    if (mk->msk[i] != 0) { msk_nonzero = true; break; }
-  }
-  EXPECT_TRUE(msk_nonzero);
-
-  // MPK should not be all zeros
-  bool mpk_nonzero = false;
-  for (int i = 0; i < ABE_MASTER_KEY_SIZE; i++) {
-    if (mk->mpk[i] != 0) { mpk_nonzero = true; break; }
-  }
-  EXPECT_TRUE(mpk_nonzero);
-
-  // MSK and MPK should differ (MSK is random, MPK is SHA-256 of MSK)
-  EXPECT_NE(memcmp(mk->msk, mk->mpk, ABE_MASTER_KEY_SIZE), 0);
-
   crypto_abe_master_key_destroy(mk);
 }
 
@@ -164,36 +146,31 @@ TEST(TestAbe, TestKeygen) {
   abe_master_key_t* mk = crypto_abe_setup();
   ASSERT_NE(mk, nullptr);
 
-  const char* attrs = "admin,editor,auditor";
-  abe_user_key_t* sk = crypto_abe_keygen(mk, attrs);
+  abe_user_key_t* sk = crypto_abe_keygen(mk, "admin,editor,auditor");
   ASSERT_NE(sk, nullptr);
 
-  // Attributes should be stored
-  EXPECT_STREQ(sk->attrs, attrs);
-  EXPECT_EQ(sk->attr_count, 3u);
-
-  // Key should not be all zeros (contains MPK)
-  bool key_nonzero = false;
-  for (int i = 0; i < ABE_MASTER_KEY_SIZE; i++) {
-    if (sk->key[i] != 0) { key_nonzero = true; break; }
-  }
-  EXPECT_TRUE(key_nonzero);
-
-  // Same master key should produce same user key (stores MPK)
-  abe_user_key_t* sk2 = crypto_abe_keygen(mk, "admin,viewer");
-  ASSERT_NE(sk2, nullptr);
-  EXPECT_EQ(memcmp(sk->key, sk2->key, ABE_MASTER_KEY_SIZE), 0);
-
-  // Different master key should produce different user key
+  // A key from a different master must not decrypt this master's ciphertext
+  // (the key is bound to the master's public params). Verify via a round-trip.
   abe_master_key_t* mk2 = crypto_abe_setup();
   ASSERT_NE(mk2, nullptr);
-  abe_user_key_t* sk3 = crypto_abe_keygen(mk2, attrs);
-  ASSERT_NE(sk3, nullptr);
-  EXPECT_NE(memcmp(sk->key, sk3->key, ABE_MASTER_KEY_SIZE), 0);
+  abe_user_key_t* sk2 = crypto_abe_keygen(mk2, "admin");
+  ASSERT_NE(sk2, nullptr);
+
+  const uint8_t msg[] = "probe";
+  abe_ciphertext_t* ct = crypto_abe_encrypt(mk, msg, sizeof(msg), "admin");
+  ASSERT_NE(ct, nullptr);
+  uint8_t* out = nullptr;
+  size_t out_len = 0;
+  // sk (from mk) can decrypt mk's ciphertext.
+  EXPECT_EQ(crypto_abe_decrypt(sk, ct, &out, &out_len), CRABS_SUCCESS);
+  if (out) { free(out); out = nullptr; }
+  // sk2 (from mk2) cannot decrypt mk's ciphertext (different domain).
+  EXPECT_NE(crypto_abe_decrypt(sk2, ct, &out, &out_len), CRABS_SUCCESS);
+  if (out) { free(out); out = nullptr; }
 
   crypto_abe_user_key_destroy(sk);
   crypto_abe_user_key_destroy(sk2);
-  crypto_abe_user_key_destroy(sk3);
+  crypto_abe_ciphertext_destroy(ct);
   crypto_abe_master_key_destroy(mk);
   crypto_abe_master_key_destroy(mk2);
 }
@@ -221,9 +198,6 @@ TEST(TestAbe, TestEncryptDecrypt) {
   // Encrypt
   abe_ciphertext_t* ct = crypto_abe_encrypt(mk, msg, msg_len, policy);
   ASSERT_NE(ct, nullptr);
-  EXPECT_STREQ(ct->policy, policy);
-  EXPECT_GT(ct->ct_len, 0u);
-  EXPECT_NE(ct->ciphertext, nullptr);
 
   // Decrypt with matching attributes
   abe_user_key_t* sk = crypto_abe_keygen(mk, "admin,editor");
@@ -272,6 +246,7 @@ TEST(TestAbe, TestPolicyAnd) {
   abe_master_key_t* mk = crypto_abe_setup();
   ASSERT_NE(mk, nullptr);
 
+  // OpenABE policy grammar: lowercase "and"/"or" with parentheses.
   const char* policy = "AND admin editor";
   const uint8_t msg[] = "AND policy test";
   size_t msg_len = sizeof(msg);
@@ -641,24 +616,20 @@ TEST_F(KeyEnvelopeTest, CreateAndVerify) {
   user_t* alice = attribute_machine_find_user(am, "alice");
   ASSERT_NE(alice, nullptr);
 
-  // Compute attributes hash
-  uint8_t attr_hash[CRABS_HASH_SIZE];
-  crabs_error_e rc = crypto_compute_attributes_hash(alice, attr_hash);
-  EXPECT_EQ(rc, CRABS_SUCCESS);
-
   // Create envelope
   uint64_t now_ms = 1000000;
   key_envelope_t* env = crypto_key_envelope_create(
-      mk, node_key->private_key, "alice", 42, attr_hash, now_ms, 0);
+      mk, node_key->private_key, alice, 42, now_ms, 0);
   ASSERT_NE(env, nullptr);
 
   // Check envelope fields
   EXPECT_EQ(env->format_version, KEY_ENVELOPE_FORMAT_V1);
   EXPECT_STREQ(env->user_id, "alice");
   EXPECT_EQ(env->state_version, 42u);
-  EXPECT_EQ(memcmp(env->attributes_hash, attr_hash, CRABS_HASH_SIZE), 0);
   EXPECT_EQ(env->issued_at, now_ms);
   EXPECT_EQ(env->expires_at, 0u);
+  EXPECT_GT(env->sk_abe_len, 0u);
+  EXPECT_NE(env->sk_abe, nullptr);
 
   // Verify with node's public key
   bool valid = crypto_key_envelope_verify(node_key->public_key, env);
@@ -678,11 +649,8 @@ TEST_F(KeyEnvelopeTest, CreateWithExpiry) {
   user_t* alice = attribute_machine_find_user(am, "alice");
   ASSERT_NE(alice, nullptr);
 
-  uint8_t attr_hash[CRABS_HASH_SIZE];
-  crypto_compute_attributes_hash(alice, attr_hash);
-
   key_envelope_t* env = crypto_key_envelope_create(
-      mk, node_key->private_key, "alice", 10, attr_hash, 1000, 5000);
+      mk, node_key->private_key, alice, 10, 1000, 5000);
   ASSERT_NE(env, nullptr);
 
   EXPECT_EQ(env->expires_at, 5000u);
@@ -692,12 +660,12 @@ TEST_F(KeyEnvelopeTest, CreateWithExpiry) {
 }
 
 TEST_F(KeyEnvelopeTest, NullParams) {
-  uint8_t dummy_hash[CRABS_HASH_SIZE] = {0};
+  user_t* alice = attribute_machine_find_user(am, "alice");
+  ASSERT_NE(alice, nullptr);
 
-  EXPECT_EQ(crypto_key_envelope_create(nullptr, node_key->private_key, "alice", 1, dummy_hash, 0, 0), nullptr);
-  EXPECT_EQ(crypto_key_envelope_create(mk, nullptr, "alice", 1, dummy_hash, 0, 0), nullptr);
-  EXPECT_EQ(crypto_key_envelope_create(mk, node_key->private_key, nullptr, 1, dummy_hash, 0, 0), nullptr);
-  EXPECT_EQ(crypto_key_envelope_create(mk, node_key->private_key, "alice", 1, nullptr, 0, 0), nullptr);
+  EXPECT_EQ(crypto_key_envelope_create(nullptr, node_key->private_key, alice, 1, 0, 0), nullptr);
+  EXPECT_EQ(crypto_key_envelope_create(mk, nullptr, alice, 1, 0, 0), nullptr);
+  EXPECT_EQ(crypto_key_envelope_create(mk, node_key->private_key, nullptr, 1, 0, 0), nullptr);
 }
 
 TEST_F(KeyEnvelopeTest, VerifyNullParams) {
@@ -709,11 +677,8 @@ TEST_F(KeyEnvelopeTest, VerifyWrongFormatVersion) {
   user_t* alice = attribute_machine_find_user(am, "alice");
   ASSERT_NE(alice, nullptr);
 
-  uint8_t attr_hash[CRABS_HASH_SIZE];
-  crypto_compute_attributes_hash(alice, attr_hash);
-
   key_envelope_t* env = crypto_key_envelope_create(
-      mk, node_key->private_key, "alice", 1, attr_hash, 0, 0);
+      mk, node_key->private_key, alice, 1, 0, 0);
   ASSERT_NE(env, nullptr);
 
   // Tamper with format version

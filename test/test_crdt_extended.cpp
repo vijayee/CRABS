@@ -24,11 +24,12 @@ TEST(TestCRDTExtended, GCounterZeroDelta) {
 
 TEST(TestCRDTExtended, GCounterNegativeDelta) {
   g_counter_t* c = g_counter_create();
-  // G-counter doesn't validate sign; negative deltas are added as-is
+  // A G-Counter only grows; a negative delta is convergently lost on merge
+  // (merge takes per-node max). Reject negative deltas — use a PN-Counter
+  // for decrementing counters.
   crabs_error_e err = g_counter_increment(c, "nodeA", -5);
-  EXPECT_EQ(err, CRABS_SUCCESS);
-  // Implementation adds the value without sign check
-  EXPECT_EQ(g_counter_value(c), -5);
+  EXPECT_EQ(err, CRABS_ERR_INVALID_PARAM);
+  EXPECT_EQ(g_counter_value(c), 0);
   g_counter_destroy(c);
 }
 

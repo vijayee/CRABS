@@ -442,7 +442,8 @@ TEST_F(TestStateMachine, TestKeyVersionVerification_StaleKey) {
 }
 
 TEST_F(TestStateMachine, TestKeyVersionVerification_NoAttrMachine) {
-  // Without attr_machine, key version check should be skipped
+  // Fail-closed: without attr_machine, authorization cannot be verified,
+  // so execution must be rejected.
   state->attr_machine = NULL;
 
   operation_t* op = operation_create(CRABS_OP_LOCK);
@@ -457,8 +458,7 @@ TEST_F(TestStateMachine, TestKeyVersionVerification_NoAttrMachine) {
   strncpy(op->signer_id, "alice", CRABS_MAX_USER_ID - 1);
   op->signer_key_version = 99;  // Would be stale if attr_machine existed
 
-  // Without attr_machine, step 5 ABE verification is skipped entirely
-  EXPECT_EQ(state_machine_execute(state, op), CRABS_SUCCESS);
+  EXPECT_EQ(state_machine_execute(state, op), CRABS_ERR_UNAUTHORIZED);
   operation_destroy(op);
 
   // Restore attr_machine for TearDown
@@ -515,6 +515,9 @@ TEST_F(TestStateMachine, TestRefreshKeyNoNodeKey) {
   // Create a state without node key
   state_t* no_key_state = state_create();
   no_key_state->attr_machine = am;
+  // Register the refresh-key policy so execution reaches the node-key check
+  // (fail-closed authorization requires a registered policy).
+  state_add_policy(no_key_state, CRABS_OP_REFRESH_KEY, "role:admin");
 
   operation_t* op = operation_create(CRABS_OP_REFRESH_KEY);
   memcpy(op->uuid, test_uuid, CRABS_UUID_SIZE);
@@ -528,4 +531,42 @@ TEST_F(TestStateMachine, TestRefreshKeyNoNodeKey) {
   operation_destroy(op);
   no_key_state->attr_machine = NULL;
   state_destroy(no_key_state);
+}
+// Regression for audit M-8: the audit log must carry a tamper-evident hash
+// chain, not all-zero state_hash values.
+TEST_F(TestStateMachine, AuditLogHashChainIsNonZeroAndChained) {
+  operation_t* op1 = make_lock_op();
+  for (int i = 0; i < CRABS_UUID_SIZE; i++) op1->uuid[i] = (uint8_t)(i + 1);
+  sign_operation(op1);
+  ASSERT_EQ(state_machine_execute(state, op1), CRABS_SUCCESS);
+  operation_destroy(op1);
+
+  ASSERT_GT(state->log_count, 0u);
+  // First entry's state_hash must be non-zero (previously it was always zero).
+  bool nonzero = false;
+  for (int i = 0; i < CRABS_HASH_SIZE; i++) {
+    if (state->log[state->log_count - 1].state_hash[i] != 0) { nonzero = true; break; }
+  }
+  EXPECT_TRUE(nonzero);
+
+  // A second op (extend, valid on a locked resource) produces a different
+  // chain hash — it mixes in the prior entry's hash.
+  uint8_t first[CRABS_HASH_SIZE];
+  memcpy(first, state->log[state->log_count - 1].state_hash, CRABS_HASH_SIZE);
+
+  operation_t* op2 = operation_create(CRABS_OP_EXTEND);
+  for (int i = 0; i < CRABS_UUID_SIZE; i++) op2->uuid[i] = (uint8_t)(i + 2);
+  op2->resources = (char(*)[CRABS_MAX_USER_ID])malloc(sizeof(char[CRABS_MAX_USER_ID]));
+  strncpy(op2->resources[0], "test_resource", CRABS_MAX_USER_ID - 1);
+  op2->resource_count = 1;
+  op2->required_state = (protocol_state_e*)malloc(sizeof(protocol_state_e));
+  op2->required_state[0] = PROTOCOL_LOCKED;
+  op2->next_state = (protocol_state_e*)malloc(sizeof(protocol_state_e));
+  op2->next_state[0] = PROTOCOL_LOCKED;
+  strncpy(op2->signer_id, "alice", CRABS_MAX_USER_ID - 1);
+  sign_operation(op2);
+  ASSERT_EQ(state_machine_execute(state, op2), CRABS_SUCCESS);
+  operation_destroy(op2);
+
+  EXPECT_NE(memcmp(first, state->log[state->log_count - 1].state_hash, CRABS_HASH_SIZE), 0);
 }

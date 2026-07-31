@@ -11,42 +11,37 @@ extern "C" {
 #include "../src/CRABS/crabs.h"
 #include "../src/CRABS/data_model.h"
 #include "../src/Util/allocator.h"
+#include "test_helpers.h"
 }
 
 // ============================================================
-// Helper: Create a state with an attribute machine
+// Helper: Create a state with an attribute machine backed by a real
+// ECDSA admin keypair, with policies registered for all built-in ops.
 // ============================================================
 
-static state_t* create_test_state_with_attr() {
-  state_t* state = (state_t*)get_clear_memory(sizeof(state_t));
-  state->version = 1;
-  state->config.max_lock_duration_ms = CRABS_DEFAULT_LOCK_MS;
-  state->config.max_lock_extensions = CRABS_MAX_LOCK_EXTENDS;
-  state->config.allow_force_unlock = true;
+static crabs_test_env_t g_env;
+static bool g_env_initialized = false;
 
-  uint8_t admin_pk[33] = {0x02};
-  memset(admin_pk + 1, 0xAA, 32);
-  attribute_machine_t* am = attribute_machine_create("admin", admin_pk);
-  state->attr_machine = am;
-  return state;
+static state_t* create_test_state_with_attr() {
+  crabs_test_env_init(&g_env);
+  g_env_initialized = true;
+  return g_env.state;
+}
+
+static ecdsa_keypair_t* test_admin_key() {
+  return g_env.admin_key;
 }
 
 static void destroy_test_state(state_t* state) {
-  if (state == NULL) return;
-  attribute_machine_destroy(state->attr_machine);
-  data_item_t* item = state->items;
-  while (item != NULL) {
-    data_item_t* next = item->next;
-    data_item_destroy(item);
-    item = next;
+  (void)state;
+  if (g_env_initialized) {
+    crabs_test_env_destroy(&g_env);
+    g_env_initialized = false;
   }
-  if (state->policies != NULL) free(state->policies);
-  if (state->log != NULL) free(state->log);
-  if (state->processed_ops != NULL) free(state->processed_ops);
-  if (state->last_refresh_envelope != NULL) {
-    crypto_key_envelope_destroy((key_envelope_t*)state->last_refresh_envelope);
-  }
-  free(state);
+}
+
+static void sign_as_admin(operation_t* op) {
+  crabs_test_sign_op_with(test_admin_key(), op);
 }
 
 static void fill_uuid(uint8_t* uuid) {
@@ -87,6 +82,7 @@ TEST(TestKeyOps, RegisterKeyBasic) {
   op->payload = payload;
   op->payload_size = (uint32_t)payload_size;
 
+  sign_as_admin(op);
   crabs_error_e rc = state_machine_execute(state, op);
   EXPECT_EQ(rc, CRABS_SUCCESS);
 
@@ -125,6 +121,7 @@ TEST(TestKeyOps, RegisterKeyRejectsUnknownUser) {
   fill_uuid(op->uuid);
   strncpy(op->signer_id, "nonexistent", CRABS_MAX_USER_ID - 1);
 
+  sign_as_admin(op);
   crabs_error_e rc = state_machine_execute(state, op);
   EXPECT_EQ(rc, CRABS_ERR_USER_NOT_FOUND);
 
@@ -142,6 +139,7 @@ TEST(TestKeyOps, RegisterKeyRejectsSuspendedUser) {
   fill_uuid(op->uuid);
   strncpy(op->signer_id, "admin", CRABS_MAX_USER_ID - 1);
 
+  sign_as_admin(op);
   crabs_error_e rc = state_machine_execute(state, op);
   EXPECT_EQ(rc, CRABS_ERR_USER_SUSPENDED);
 
@@ -156,6 +154,7 @@ TEST(TestKeyOps, RegisterKeyRejectsNullPayload) {
   fill_uuid(op->uuid);
   strncpy(op->signer_id, "admin", CRABS_MAX_USER_ID - 1);
 
+  sign_as_admin(op);
   crabs_error_e rc = state_machine_execute(state, op);
   EXPECT_EQ(rc, CRABS_ERR_INVALID_PARAM);
 
@@ -188,6 +187,7 @@ TEST(TestKeyOps, RevokeKeyBasic) {
   op->payload = payload;
   op->payload_size = (uint32_t)payload_size;
 
+  sign_as_admin(op);
   crabs_error_e rc = state_machine_execute(state, op);
   EXPECT_EQ(rc, CRABS_SUCCESS);
 
@@ -214,6 +214,7 @@ TEST(TestKeyOps, RevokeKeyRejectsUnknownKeyId) {
   op->payload = payload;
   op->payload_size = (uint32_t)payload_size;
 
+  sign_as_admin(op);
   crabs_error_e rc = state_machine_execute(state, op);
   EXPECT_EQ(rc, CRABS_ERR_RESOURCE_NOT_FOUND);
 
@@ -250,6 +251,7 @@ TEST(TestKeyOps, SetDefaultKeyBasic) {
   op->payload = payload;
   op->payload_size = (uint32_t)payload_size;
 
+  sign_as_admin(op);
   crabs_error_e rc = state_machine_execute(state, op);
   EXPECT_EQ(rc, CRABS_SUCCESS);
   EXPECT_STREQ(admin->default_key_id, "key2");
@@ -281,6 +283,7 @@ TEST(TestKeyOps, SetDefaultKeyRejectsInactiveKey) {
   op->payload = payload;
   op->payload_size = (uint32_t)payload_size;
 
+  sign_as_admin(op);
   crabs_error_e rc = state_machine_execute(state, op);
   EXPECT_EQ(rc, CRABS_ERR_KEY_NOT_ACTIVE);
 
@@ -418,6 +421,7 @@ TEST(TestKeyOps, RegisterKeyWithLabel) {
   op->payload = payload;
   op->payload_size = (uint32_t)payload_size;
 
+  sign_as_admin(op);
   crabs_error_e rc = state_machine_execute(state, op);
   EXPECT_EQ(rc, CRABS_SUCCESS);
 
@@ -437,10 +441,11 @@ TEST(TestKeyOps, RegisterKeyWithLabel) {
 TEST(TestKeyOps, RegisterKeyOnNonAdminUser) {
   state_t* state = create_test_state_with_attr();
 
-  // Register a regular user
-  uint8_t user_pk[33] = {0x02};
-  memset(user_pk + 1, 0xDD, 32);
-  attribute_machine_register_user(state->attr_machine, "alice", user_pk, "role:user");
+  // Register a regular user with a real ECDSA keypair so she can sign.
+  ecdsa_keypair_t* alice_key = crypto_ecdsa_generate();
+  ASSERT_NE(alice_key, nullptr);
+  attribute_machine_register_user(state->attr_machine, "alice",
+                                    alice_key->public_key, "role:user");
 
   // Alice registers her own key
   const char* config = "key_id=alice-ecdsa;scheme=1;public_key_len=33";
@@ -457,6 +462,7 @@ TEST(TestKeyOps, RegisterKeyOnNonAdminUser) {
   op->payload = payload;
   op->payload_size = (uint32_t)payload_size;
 
+  crabs_test_sign_op_with(alice_key, op);
   crabs_error_e rc = state_machine_execute(state, op);
   EXPECT_EQ(rc, CRABS_SUCCESS);
 
@@ -466,6 +472,7 @@ TEST(TestKeyOps, RegisterKeyOnNonAdminUser) {
   EXPECT_STREQ(alice->default_key_id, "alice-ecdsa");
 
   operation_destroy(op);
+  crypto_ecdsa_keypair_destroy(alice_key);
   destroy_test_state(state);
 }
 
@@ -514,6 +521,7 @@ TEST(TestKeyOps, RegisterKeyRejectsUnspecifiedScheme) {
   op->payload = payload;
   op->payload_size = (uint32_t)payload_size;
 
+  sign_as_admin(op);
   crabs_error_e rc = state_machine_execute(state, op);
   EXPECT_EQ(rc, CRABS_ERR_INVALID_PARAM);
 
@@ -547,6 +555,7 @@ TEST(TestKeyOps, RevokeLastKeySuspendsUserViaStateMachine) {
   op->payload = payload;
   op->payload_size = (uint32_t)payload_size;
 
+  sign_as_admin(op);
   crabs_error_e rc = state_machine_execute(state, op);
   EXPECT_EQ(rc, CRABS_SUCCESS);
   EXPECT_EQ(admin->status, USER_SUSPENDED);
@@ -579,6 +588,7 @@ TEST(TestKeyOps, RegisterKeyRejectsDuplicateKeyId) {
   op1->payload = payload1;
   op1->payload_size = (uint32_t)payload_size;
 
+  sign_as_admin(op1);
   crabs_error_e rc = state_machine_execute(state, op1);
   EXPECT_EQ(rc, CRABS_SUCCESS);
   operation_destroy(op1);
@@ -596,6 +606,7 @@ TEST(TestKeyOps, RegisterKeyRejectsDuplicateKeyId) {
   op2->payload = payload2;
   op2->payload_size = (uint32_t)payload_size;
 
+  sign_as_admin(op2);
   rc = state_machine_execute(state, op2);
   EXPECT_EQ(rc, CRABS_ERR_DUPLICATE_OPERATION);
   operation_destroy(op2);

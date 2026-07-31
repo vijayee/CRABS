@@ -13,7 +13,9 @@ if (BUILD_TESTING)
 
     add_executable(testcrabs
         test_main.cpp
+        test_helpers.c
         test_state_machine.cpp
+        test_co_sign.cpp
         test_crdt.cpp
         test_crypto.cpp
         test_serialization.cpp

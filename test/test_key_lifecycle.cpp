@@ -11,6 +11,7 @@ extern "C" {
 #include "../src/CRABS/crabs.h"
 #include "../src/CRABS/data_model.h"
 #include "../src/Util/allocator.h"
+#include "test_helpers.h"
 }
 
 // ============================================================
@@ -524,36 +525,30 @@ TEST(TestKeyLifecycle, ChangeConfigVaultFields) {
 // State machine operations for key lifecycle
 // ============================================================
 
-static state_t* create_state_with_am_for_lifecycle() {
-  state_t* state = (state_t*)get_clear_memory(sizeof(state_t));
-  state->version = 1;
-  state->config.max_lock_duration_ms = CRABS_DEFAULT_LOCK_MS;
-  state->config.max_lock_extensions = CRABS_MAX_LOCK_EXTENDS;
-  state->config.allow_force_unlock = true;
-  state->config.sig_config.key_rotation_enabled = true;
+static crabs_test_env_t g_env;
+static bool g_env_initialized = false;
 
-  uint8_t admin_pk[33] = {0x02};
-  memset(admin_pk + 1, 0xAA, 32);
-  attribute_machine_t* am = attribute_machine_create("admin", admin_pk);
-  state->attr_machine = am;
-  return state;
+static state_t* create_state_with_am_for_lifecycle() {
+  crabs_test_env_init(&g_env);
+  g_env_initialized = true;
+  g_env.state->config.sig_config.key_rotation_enabled = true;
+  return g_env.state;
+}
+
+static ecdsa_keypair_t* lifecycle_admin_key() {
+  return g_env.admin_key;
 }
 
 static void destroy_lifecycle_state(state_t* state) {
-  if (state == NULL) return;
-  attribute_machine_destroy(state->attr_machine);
-  data_item_t* item = state->items;
-  while (item != NULL) {
-    data_item_t* next = item->next;
-    data_item_destroy(item);
-    item = next;
+  (void)state;
+  if (g_env_initialized) {
+    crabs_test_env_destroy(&g_env);
+    g_env_initialized = false;
   }
-  if (state->policies) free(state->policies);
-  if (state->log) free(state->log);
-  if (state->processed_ops) free(state->processed_ops);
-  if (state->last_refresh_envelope)
-    crypto_key_envelope_destroy((key_envelope_t*)state->last_refresh_envelope);
-  free(state);
+}
+
+static void sign_lifecycle_op(operation_t* op) {
+  crabs_test_sign_op_with(lifecycle_admin_key(), op);
 }
 
 TEST(TestKeyLifecycle, StateMachineSuspendKey) {
@@ -575,7 +570,7 @@ TEST(TestKeyLifecycle, StateMachineSuspendKey) {
   strncpy(reg_op->signer_id, "admin", CRABS_MAX_USER_ID - 1);
   reg_op->payload = payload;
   reg_op->payload_size = (uint32_t)payload_size;
-  reg_op->sig_scheme = ECDSA_SECP256K1;
+  sign_lifecycle_op(reg_op);
   ASSERT_EQ(state_machine_execute(state, reg_op), CRABS_SUCCESS);
   operation_destroy(reg_op);
 
@@ -587,6 +582,7 @@ TEST(TestKeyLifecycle, StateMachineSuspendKey) {
   sus_op->payload = (uint8_t*)strdup(suspend_payload);
   sus_op->payload_size = (uint32_t)strlen(suspend_payload) + 1;
 
+  sign_lifecycle_op(sus_op);
   crabs_error_e rc = state_machine_execute(state, sus_op);
   EXPECT_EQ(rc, CRABS_SUCCESS);
   EXPECT_EQ(user_key_find(admin, "suskey")->status, KEY_SUSPENDED);
@@ -615,7 +611,7 @@ TEST(TestKeyLifecycle, StateMachineActivateKey) {
   strncpy(reg_op->signer_id, "admin", CRABS_MAX_USER_ID - 1);
   reg_op->payload = payload;
   reg_op->payload_size = (uint32_t)payload_size;
-  reg_op->sig_scheme = ECDSA_SECP256K1;
+  sign_lifecycle_op(reg_op);
   ASSERT_EQ(state_machine_execute(state, reg_op), CRABS_SUCCESS);
   operation_destroy(reg_op);
 
@@ -626,6 +622,7 @@ TEST(TestKeyLifecycle, StateMachineActivateKey) {
   strncpy(sus_op->signer_id, "admin", CRABS_MAX_USER_ID - 1);
   sus_op->payload = (uint8_t*)strdup(suspend_payload);
   sus_op->payload_size = (uint32_t)strlen(suspend_payload) + 1;
+  sign_lifecycle_op(sus_op);
   ASSERT_EQ(state_machine_execute(state, sus_op), CRABS_SUCCESS);
   operation_destroy(sus_op);
 
@@ -637,6 +634,7 @@ TEST(TestKeyLifecycle, StateMachineActivateKey) {
   act_op->payload = (uint8_t*)strdup(activate_payload);
   act_op->payload_size = (uint32_t)strlen(activate_payload) + 1;
 
+  sign_lifecycle_op(act_op);
   crabs_error_e rc = state_machine_execute(state, act_op);
   EXPECT_EQ(rc, CRABS_SUCCESS);
   EXPECT_EQ(user_key_find(admin, "actkey")->status, KEY_ACTIVE);
@@ -660,6 +658,7 @@ TEST(TestKeyLifecycle, StateMachineRotateKeyRequiresRotationEnabled) {
   rot_op->payload = (uint8_t*)strdup(rot_payload);
   rot_op->payload_size = (uint32_t)strlen(rot_payload) + 1;
 
+  sign_lifecycle_op(rot_op);
   crabs_error_e rc = state_machine_execute(state, rot_op);
   EXPECT_EQ(rc, CRABS_ERR_PROTOCOL_VIOLATION);
 

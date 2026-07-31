@@ -7,6 +7,7 @@ extern "C" {
 #include "../src/CRABS/data_model.h"
 #include "../src/StateMachine/state_machine.h"
 #include "../src/Crypto/sig_scheme.h"
+#include "../src/Crypto/crypto.h"
 #include "../src/Attribute/attribute_machine.h"
 #include <openssl/sha.h>
 }
@@ -276,15 +277,23 @@ TEST(TestSerialization, TestCanonicalEncodingFieldOrder) {
   serialized_buffer_t* buf = crabs_serialize_for_signing(op);
   ASSERT_NE(buf, nullptr);
 
-  // Verify the first field is the type string (length-prefixed)
-  // The lock op name is "__lock__" which is 8 chars
-  // uint16 length prefix = 8, then "__lock__"
-  uint16_t type_len = buf->data[0] | (buf->data[1] << 8);
+  // The canonical form begins with a 5-byte domain tag: "CRAB" + version.
+  ASSERT_GE(buf->len, 5);
+  EXPECT_EQ(buf->data[0], 0x43);
+  EXPECT_EQ(buf->data[1], 0x52);
+  EXPECT_EQ(buf->data[2], 0x41);
+  EXPECT_EQ(buf->data[3], 0x42);
+  EXPECT_EQ(buf->data[4], 0x02); // signing-format version
+
+  // After the domain tag, the first field is the type string (length-prefixed).
+  // "__lock__" is 8 chars → uint16 length prefix = 8, then the bytes.
+  size_t base = 5;
+  uint16_t type_len = buf->data[base] | (buf->data[base + 1] << 8);
   EXPECT_EQ(type_len, 8);
-  EXPECT_EQ(memcmp(buf->data + 2, "__lock__", 8), 0);
+  EXPECT_EQ(memcmp(buf->data + base + 2, "__lock__", 8), 0);
 
   // After type, the next 16 bytes should be the UUID
-  size_t offset = 2 + type_len;
+  size_t offset = base + 2 + type_len;
   EXPECT_EQ(memcmp(buf->data + offset, op->uuid, CRABS_UUID_SIZE), 0);
 
   serialized_buffer_destroy(buf);
@@ -1016,4 +1025,47 @@ TEST(OperationV3, DedupInCanonicalSigning) {
 
   serialized_buffer_destroy(canon);
   operation_destroy(op);
+}
+// Regression: the canonical signing form MUST cover the dedup state_mutation
+// (audit C-6) and payload_format (C-7). Tampering with either field after
+// signing must invalidate the signature.
+TEST(TestSerialization, SigningCoversDedupMutationAndPayloadFormat) {
+  ecdsa_keypair_t* kp = crypto_ecdsa_generate();
+  ASSERT_NE(kp, nullptr);
+
+  operation_t* op = operation_create("vote");
+  for (int i = 0; i < CRABS_UUID_SIZE; i++) op->uuid[i] = (uint8_t)(i + 1);
+  op->payload = (uint8_t*)strdup("yes");
+  op->payload_size = 3;
+  op->payload_format = 1; // JSON
+  op->dedup.type = DEDUP_CUSTOM;
+  strncpy(op->dedup.condition, "voted == false", CRABS_MAX_POLICY_EXPR - 1);
+  op->dedup.update.type = MUTATION_COUNTER_INCREMENT;
+  strncpy(op->dedup.update.counter_path, "tally", CRABS_MAX_DEDUP_PATH - 1);
+  op->dedup.update.delta = 1;
+
+  serialized_buffer_t* s1 = crabs_serialize_for_signing(op);
+  ASSERT_NE(s1, nullptr);
+  uint8_t sig[CRABS_SIG_SIZE];
+  ASSERT_EQ(crypto_ecdsa_sign(kp->private_key, s1->data, s1->len, sig), CRABS_SUCCESS);
+  EXPECT_TRUE(crypto_ecdsa_verify(kp->public_key, s1->data, s1->len, sig));
+  serialized_buffer_destroy(s1);
+
+  // Tamper with the dedup delta (1 -> 999999). The signature must no longer verify.
+  op->dedup.update.delta = 999999;
+  serialized_buffer_t* s2 = crabs_serialize_for_signing(op);
+  ASSERT_NE(s2, nullptr);
+  EXPECT_FALSE(crypto_ecdsa_verify(kp->public_key, s2->data, s2->len, sig));
+  serialized_buffer_destroy(s2);
+
+  // Tamper with payload_format (1 -> 2). Must also invalidate.
+  op->dedup.update.delta = 1; // restore
+  op->payload_format = 2;
+  serialized_buffer_t* s3 = crabs_serialize_for_signing(op);
+  ASSERT_NE(s3, nullptr);
+  EXPECT_FALSE(crypto_ecdsa_verify(kp->public_key, s3->data, s3->len, sig));
+  serialized_buffer_destroy(s3);
+
+  operation_destroy(op);
+  crypto_ecdsa_keypair_destroy(kp);
 }

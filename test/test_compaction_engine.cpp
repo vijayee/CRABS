@@ -457,3 +457,40 @@ TEST(CompactionEngine, LastCompactionTime) {
   state_destroy(state);
   crabs_compaction_engine_destroy(&engine);
 }
+// Regression for audit C-11: compaction safety must not pass a self vector
+// clock as the peer. In a multi-replica deployment (local_vc has > 1 entry)
+// with no peer VC provided, compaction must be rejected as unsafe (fail
+// closed) — otherwise tombstones are collected without peer acknowledgment
+// and removed elements resurrect on merge.
+TEST(CompactionEngine, MultiReplicaCompactionWithoutPeerVcIsUnsafe) {
+  crabs_compaction_engine_t engine;
+  crabs_tombstone_config_t config;
+  crabs_tombstone_config_init(&config);
+  config.strategy = CRABS_COMPACT_SIZE_BASED;
+  config.max_tombstone_ratio = 0.3;
+  crabs_compaction_engine_init(&engine, &config);
+  crabs_register_crdt_vtables(&engine.registry);
+
+  // Simulate a multi-replica local VC (two nodes).
+  crabs_vector_clock_set(&engine.local_vc, "n1", 5);
+  crabs_vector_clock_set(&engine.local_vc, "n2", 3);
+  // No peer VC set — compaction must be unsafe.
+  crabs_compaction_engine_set_peer_vc(&engine, nullptr);
+
+  state_t* state = state_create();
+  or_set_t* set = or_set_create();
+  or_set_add(set, "a", "n1:1");
+  or_set_add(set, "b", "n1:2");
+  or_set_remove(set, "a");
+  data_item_t* item = data_item_create("test_set", DATA_TYPE_SET, CRDT_OR_SET);
+  item->value = set;
+
+  crabs_compaction_result_e result = crabs_compact_item(&engine, state, item, 1000);
+  EXPECT_EQ(result, CRABS_COMPACTION_UNSAFE);
+
+  or_set_destroy(set);
+  item->value = nullptr;
+  data_item_destroy(item);
+  state_destroy(state);
+  crabs_compaction_engine_destroy(&engine);
+}

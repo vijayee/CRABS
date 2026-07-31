@@ -10,6 +10,7 @@ extern "C" {
 #include "../src/Attribute/attribute_machine.h"
 #include "../src/Crypto/crypto.h"
 #include "../src/Serialization/serialization.h"
+#include "test_helpers.h"
 }
 
 // ============================================================
@@ -236,12 +237,13 @@ TEST(TestDataModel, StateAddPolicySameOpTwice) {
   state_t* state = state_create();
   EXPECT_EQ(state_add_policy(state, CRABS_OP_LOCK, "role:admin"), CRABS_SUCCESS);
   EXPECT_EQ(state_add_policy(state, CRABS_OP_LOCK, "role:editor"), CRABS_SUCCESS);
-  // Both entries should exist (implementation appends, does not deduplicate)
-  EXPECT_EQ(state->policy_count, (uint32_t)2);
-  // find_policy returns first match
+  // Re-adding a policy for the same operation updates it in place (a second
+  // entry would be a shadow never returned by state_find_policy, and would
+  // grow the table without bound).
+  EXPECT_EQ(state->policy_count, (uint32_t)1);
   const char* p = state_find_policy(state, CRABS_OP_LOCK);
   ASSERT_NE(p, nullptr);
-  EXPECT_STREQ(p, "role:admin");
+  EXPECT_STREQ(p, "role:editor");
   state_destroy(state);
 }
 
@@ -634,7 +636,17 @@ TEST(TestDataModel, OperationIsBuiltinAll) {
 // ============================================================
 
 TEST(TestDataModel, InvariantViolationRejected) {
-  state_t* state = state_create();
+  crabs_test_env_t env;
+  crabs_test_env_init(&env);
+  state_t* state = env.state;
+
+  // Register alice with a real keypair so she can sign.
+  ecdsa_keypair_t* alice_key = crypto_ecdsa_generate();
+  ASSERT_NE(alice_key, nullptr);
+  ASSERT_EQ(attribute_machine_register_user(state->attr_machine, "alice",
+                                               alice_key->public_key,
+                                               "role:admin"), CRABS_SUCCESS);
+
   // Use a COUNTER type so invariant_check actually evaluates the value
   data_item_t* counter = data_item_create("c1", DATA_TYPE_COUNTER, CRDT_G_COUNTER);
   int64_t* val = (int64_t*)malloc(sizeof(int64_t));
@@ -649,8 +661,6 @@ TEST(TestDataModel, InvariantViolationRejected) {
   counter->invariant_count = 1;
 
   state_add_item(state, counter);
-  // Use empty policy to skip ABE check but pass the policy != NULL guard
-  state_add_policy(state, CRABS_OP_VERIFY, "");
 
   // Counter items don't need locking, just set to MODIFIED directly
   counter->protocol_state = PROTOCOL_MODIFIED;
@@ -667,6 +677,7 @@ TEST(TestDataModel, InvariantViolationRejected) {
   verify_op->next_state = (protocol_state_e*)malloc(sizeof(protocol_state_e));
   verify_op->next_state[0] = PROTOCOL_VERIFIED;
   strncpy(verify_op->signer_id, "alice", CRABS_MAX_USER_ID - 1);
+  crabs_test_sign_op_with(alice_key, verify_op);
 
   // Value 0 is not > 0, so verify should fail with INVARIANT_VIOLATED
   crabs_error_e rc = state_machine_execute(state, verify_op);
@@ -674,7 +685,8 @@ TEST(TestDataModel, InvariantViolationRejected) {
   operation_destroy(verify_op);
 
   free((void*)counter->invariants[0].error_message);
-  state_destroy(state);
+  crypto_ecdsa_keypair_destroy(alice_key);
+  crabs_test_env_destroy(&env);
 }
 
 // ============================================================
