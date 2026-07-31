@@ -62,5 +62,8 @@ if (BUILD_TESTING)
     target_link_libraries(testcrabs PRIVATE GTest::gmock)
 
     include(GoogleTest)
-    gtest_discover_tests(testcrabs)
+    # The test suite now uses real CP-ABE (Waters'09 pairing operations)
+    # which makes each crypto_abe_setup call take ~2-5 seconds. Set a
+    # generous timeout so the slow ABE tests aren't killed by ctest.
+    gtest_discover_tests(testcrabs PROPERTIES TIMEOUT 300)
 endif()
