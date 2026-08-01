@@ -515,6 +515,15 @@ static bool _deserialize_ot_type_state(read_buf_t* buf, data_item_t* item) {
         if (!_read_string16(buf, id, CRABS_TREE_NODE_ID_MAX)) return false;
         if (!_read_string16(buf, parent_id, CRABS_TREE_NODE_ID_MAX)) return false;
 
+        // Audit M-D: reject malformed trees. A self-parent (parent_id == id)
+        // creates an immediate cycle, and a duplicate id would make the
+        // later parent lookup ambiguous. Both can hang or overflow recursive
+        // walkers downstream.
+        if (parent_id[0] != '\0' && strcmp(parent_id, id) == 0) return false;
+        for (crabs_tree_node_t* scan = first_node; scan != NULL; scan = scan->pool_next) {
+          if (strcmp(scan->id, id) == 0) return false;
+        }
+
         uint8_t* value = NULL;
         uint32_t value_size = 0;
         if (!_read_bytes32(buf, &value, &value_size)) return false;
@@ -593,6 +602,27 @@ static bool _deserialize_ot_type_state(read_buf_t* buf, data_item_t* item) {
             }
           }
           node = node->pool_next;
+        }
+      }
+
+      // Audit M-D: detect cycles and disconnected nodes from the parent links
+      // (e.g. A→B and B→A from a crafted blob). Walk each non-root node's
+      // parent chain bounded by node_count+1; it must reach root, else the
+      // blob is cyclic or disconnected and downstream recursive walkers would
+      // hang or overflow the stack.
+      if (tree->root != NULL) {
+        crabs_tree_node_t* n = tree->node_pool;
+        while (n != NULL) {
+          if (n != tree->root) {
+            uint32_t steps = 0;
+            crabs_tree_node_t* p = n->parent;
+            while (p != NULL && p != tree->root && steps <= node_count) {
+              p = p->parent;
+              steps++;
+            }
+            if (p != tree->root) return false; // cyclic or disconnected
+          }
+          n = n->pool_next;
         }
       }
       break;

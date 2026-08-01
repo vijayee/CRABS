@@ -170,7 +170,12 @@ crabs_error_e crypto_verify_co_signature(
 // Maximum serialized size of a key envelope (used for transport buffers).
 // format_version(1) + user_id(64) + state_version(8) + attributes_hash(32)
 // + issued_at(8) + expires_at(8) + sk_abe_len(4) + sk_abe(<=1024) + signature(64)
-#define CRABS_KEY_ENVELOPE_MAX_SIZE 1200
+// Audit M-I: real Waters'09 CP-ABE user keys with several attributes
+// exceed the prior 1200-byte ceiling, so crypto_key_envelope_serialize
+// returned 0 and the refresh op reported SUCCESS with envelope_data_len=0
+// (an unusable, empty envelope). 8 KiB comfortably fits a key at the 4096-byte
+// keygen cap plus the envelope header and signature.
+#define CRABS_KEY_ENVELOPE_MAX_SIZE 8192
 
 typedef struct key_envelope_t {
   uint8_t  format_version;                       // 0x02

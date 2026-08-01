@@ -59,19 +59,54 @@ uint32_t one_shot_set_count(const one_shot_set_t* set) {
   return set->element_count;
 }
 
+// Comparator for qsort over C strings (strcmp wrapper).
+static int _cmp_str(const void* x, const void* y) {
+  const char* const* a = (const char* const*)x;
+  const char* const* b = (const char* const*)y;
+  return strcmp(*a, *b);
+}
+
 one_shot_set_t* one_shot_set_merge(const one_shot_set_t* a, const one_shot_set_t* b) {
   if (a == NULL && b == NULL) return NULL;
 
   one_shot_set_t* result = one_shot_set_create();
 
+  // Audit M-F: when the union exceeds CRABS_ONE_SHOT_SET_MAX, the prior code
+  // added a's elements then b's (dropping the overflow silently), so the
+  // surviving subset depended on argument order — merge(A,B) != merge(B,A).
+  // Collect the union, sort lexicographically, and keep the first MAX. The
+  // sort is a total order, so both replicas converge on the same subset.
   const one_shot_set_t* sources[2] = {a, b};
+  uint32_t total = 0;
+  for (int s = 0; s < 2; s++) {
+    if (sources[s] != NULL) total += sources[s]->element_count;
+  }
+
+  char** union_elems = NULL;
+  if (total > 0) {
+    union_elems = (char**)get_clear_memory(sizeof(char*) * total);
+    if (union_elems == NULL) return result; // OOM — return empty set
+  }
+  uint32_t ucount = 0;
   for (int s = 0; s < 2; s++) {
     if (sources[s] == NULL) continue;
     for (uint32_t i = 0; i < sources[s]->element_count; i++) {
-      one_shot_set_add(result, sources[s]->elements[i]);
+      const char* e = sources[s]->elements[i];
+      bool dup = false;
+      for (uint32_t j = 0; j < ucount; j++) {
+        if (strcmp(union_elems[j], e) == 0) { dup = true; break; }
+      }
+      if (!dup) union_elems[ucount++] = (char*)e;
     }
   }
+  qsort(union_elems, ucount, sizeof(char*), _cmp_str);
 
+  uint32_t keep = (ucount < CRABS_ONE_SHOT_SET_MAX) ? ucount : CRABS_ONE_SHOT_SET_MAX;
+  for (uint32_t i = 0; i < keep; i++) {
+    one_shot_set_add(result, union_elems[i]);
+  }
+
+  if (union_elems != NULL) free(union_elems);
   return result;
 }
 
