@@ -298,6 +298,11 @@ typedef struct state_t {
   uint32_t       op_type_def_count;
   // v1.5.2 §4: Compaction config (crabs_tombstone_config_t*, if set auto-compaction runs after OT ops)
   void* compaction_config;
+  // Audit F-3: optional compaction engine (crabs_compaction_engine_t*). When
+  // set, the execute path records each ingested OT op into the engine's local
+  // vector clock so the STRONG/QUORUM compaction safety check can be armed.
+  // The state does NOT own the engine.
+  void* compaction_engine;
   // v1.6 Amd6: Ordering configuration (crabs_ordering_config_t*, if set uses HLC ordering)
   void* ordering_config;
   // ABE master key — generated once at state creation, used for all ABE operations
@@ -330,6 +335,9 @@ void         state_destroy(state_t* state);
 // Set compaction config on state (enables auto-compaction after OT ops)
 // Pass NULL to disable. config is NOT owned by state (caller must keep alive).
 void         state_set_compaction_config(state_t* state, void* config);
+// Audit F-3: set the compaction engine used to record ingested ops into the
+// local vector clock. The state does not own the engine.
+void         state_set_compaction_engine(state_t* state, void* engine);
 
 // Set ordering config on state (v1.6 Amd6 §6.3)
 // Pass NULL to use default Lamport ordering.

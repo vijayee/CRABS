@@ -305,6 +305,23 @@ crabs_error_e crabs_compact_ot_item(
     }
     ot_data->op_log_count = 0;
 
+    // Audit F-3: emit a COMPACT op marker into the op log so peers
+    // transforming against this item know a compaction occurred at this
+    // point. Without it, peers never see a COMPACT op and concurrent ops
+    // are transformed against a log that no longer reflects the compacted
+    // state (the delete_compact/insert_compact transforms never fire). The
+    // marker carries a synthetic id — it is not causally ordered against
+    // user ops, only marks the compaction boundary.
+    if (ot_data->op_log_capacity > 0) {
+      crabs_ot_operation_t* marker = crabs_ot_data_item_append_op(ot_data);
+      if (marker != NULL) {
+        marker->op_type = CRABS_OT_OP_COMPACT;
+        strncpy(marker->id.node_id, "__compact__", CRABS_MAX_USER_ID - 1);
+        marker->id.node_id[CRABS_MAX_USER_ID - 1] = '\0';
+        marker->id.sequence_num = 0;
+      }
+    }
+
     // Reset position map (destroy and null out)
     if (ot_data->position_map != NULL) {
       crabs_bst_destroy(ot_data->position_map);
@@ -422,32 +439,27 @@ crabs_ot_operation_t* crabs_transform_compact_compact(
 crabs_ot_operation_t* crabs_transform_insert_compact(
   crabs_ot_operation_t* op1, crabs_ot_operation_t* op2) {
   (void)op2;
-  if (op1 != NULL) {
-    op1->visible_pos = 0;
-    op1->payload_size = 0;
-  }
+  // Audit F-3 / C-11: do NOT zero visible_pos/payload_size. A concurrent
+  // insert (one not causally before the COMPACT) must still apply against the
+  // compacted state; zeroing it would silently delete the insert. The
+  // COMPACT marker is informational; compaction safety is enforced by the
+  // fail-closed peer-VC check, not by destroying concurrent ops.
   return op1;
 }
 
 crabs_ot_operation_t* crabs_transform_delete_compact(
   crabs_ot_operation_t* op1, crabs_ot_operation_t* op2) {
   (void)op2;
-  // Audit F-3: setting visible_pos = 0 but leaving the op live made the
-  // delete remove visible element 0 instead of no-op'ing. Mark it as a
-  // no-op so crabs_apply_ot_op skips it.
-  if (op1 != NULL) {
-    op1->op_type = 0;
-  }
+  // Audit F-3 / C-11: leave the delete intact. Silently no-op'ing it (the
+  // prior op_type = 0) would drop a concurrent delete. Let it apply against
+  // the compacted state; the apply path bounds-checks the position.
   return op1;
 }
 
 crabs_ot_operation_t* crabs_transform_move_compact(
   crabs_ot_operation_t* op1, crabs_ot_operation_t* op2) {
   (void)op2;
-  if (op1 != NULL) {
-    op1->visible_pos = 0;
-    op1->visible_pos_2 = 0;
-  }
+  // Audit F-3 / C-11: leave the move intact (do not zero positions).
   return op1;
 }
 

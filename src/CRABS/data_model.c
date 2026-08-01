@@ -155,6 +155,11 @@ void state_set_compaction_config(state_t* state, void* config) {
   state->compaction_config = config;
 }
 
+void state_set_compaction_engine(state_t* state, void* engine) {
+  if (state == NULL) return;
+  state->compaction_engine = engine;
+}
+
 void state_set_ordering_config(state_t* state, crabs_ordering_config_t* config) {
   if (state == NULL) return;
   state->ordering_config = config;
