@@ -300,6 +300,44 @@ HLC, compaction, and ABE suites) pass. The slow CP-ABE-keygen suites
   `crypto_abe_eval_policy` read garbage) and one MEDIUM (OT append OOM left
   a log entry with `payload=NULL` but non-zero `payload_size`).
 
+### Fixed in the second pass (2026-08-01)
+
+| ID | Summary of fix |
+|----|----------------|
+| M-A | `state_machine_op_change_config` now parses each key via `_config_value_after` (finds the `=` immediately after the matched key, requiring a boundary before it), so `"max_lock_extensions=0;max_lock_duration_ms=60000"` no longer sets the duration to 0 (which made every lock instantly force-unlockable). |
+| M-B | `max_lock_duration_ms` is clamped to a 24h ceiling and `max_lock_extensions` to 1024, so the lock-expiry `extensions * duration` multiply cannot wrap uint64 into a small value (which made active locks read as expired). |
+| M-C | `attribute_machine_register_user` rejects signer_ids outside `[A-Za-z0-9_-]`, so the `{user_id}` policy placeholder cannot inject policy structure (quotes, parens, operators). |
+| M-D | OT tree deserialization now rejects duplicate node ids, self-parenting, and parent-link cycles/disconnections (bounded ancestor walk per node). |
+| M-J | `crabs_ot_tree_reparent`'s ancestor walk is bounded by node_count (no hang on a merge-created cycle), and `_rebuild_links` detaches any node whose parent chain cycles (deterministic per pool order). |
+| M-K | The 64-op transform-depth cap now counts only ops that were actually transformed and no longer fails the operation — a flooded log no longer permanently wedges the item. |
+| M-F | `one_shot_set_merge` collects the union, sorts lexicographically, and keeps the first MAX, so the surviving subset at the 256-element cap no longer depends on argument order (commutative). |
+| M-I | The refresh-key transport buffer is sized to 8 KiB (was 1024) and `CRABS_KEY_ENVELOPE_MAX_SIZE` to 8192 (was 1200) so real CP-ABE keys fit; `state_machine_op_refresh_key` now fails the op on serialize overflow instead of returning SUCCESS with `envelope_data_len = 0`. |
+| F-4 full | `crabs_ot_data_item_get_transform` now maps concrete document/tree op types (0x11-0x24) onto their base transform semantics (INSERT/DELETE/UPDATE/MOVE/SWAP) before matrix lookup, so concurrent document/tree ops are transformed against each other instead of applied untransformed. Regression test `OTTypes.ConcreteOpsResolveToBaseTransform`. |
+
+### Still deferred
+
+- **F-3 full:** compaction coordination — emit a signed COMPACT op, populate
+  `local_vc`/`peer_vc` from op ingest. Multi-replica compaction is fail-closed
+  until then; single-replica uses `CRABS_SAFETY_FORCE`.
+- **M-J commutativity:** `_rebuild_links` cycle-break is deterministic per pool
+  order; full commutativity across `merge(A,B)` vs `merge(B,A)` (id-sorted
+  cycle-break) is a deeper CRDT-tree follow-up.
+- **H-A, H-B:** key envelopes still ship `sk_abe` in cleartext (the ABE vault
+  crypto is real but unused internally); `crypto_revoke_and_rotate` still
+  generates the user's new ECDSA private key on the node.
+- **L-\*:** the LOW items (error-code oracles, `processed_ops` unbounded
+  growth, `localtime` thread-safety, CLI key-import path, op-log wire
+  endianness) are documented limitations.
+
+### Test posture (second pass)
+
+- 414 tests pass across 22 suites (state machine, co-sign, protocol ops,
+  trigger, serialization, CLI, verify-auth, attribute machine, dedup, CRDT,
+  HLC, compaction, ABE, OT types/transform/ordered-set/document/tree/
+  execution).
+- The slow CP-ABE-keygen suites (`TestPolicyConfig`, `KeyEnvelopeTest`) are
+  not run in CI due to ~300s per-test pairing cost.
+
 ---
 
 *Round 2 — same crab, sharper pincers needed.*
