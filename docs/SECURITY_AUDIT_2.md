@@ -381,4 +381,30 @@ The remaining deferred findings have been addressed.
 
 ---
 
+## 11. Fourth Remediation Pass (2026-08-01)
+
+The final documented limitations have been addressed.
+
+### Fixed in the fourth pass
+
+| ID | Summary of fix |
+|----|----------------|
+| L-a | `state_machine_execute` now authorizes (step 3) BEFORE the protocol-state, lock-claim, and dedup-guard checks. An unauthenticated caller gets a single `CRABS_ERR_UNAUTHORIZED` and cannot learn resource existence, lock state, or dedup-tracker membership from distinct error codes. Authenticated callers still receive specific protocol errors. |
+| L-k | `crabs_extract_ot_ops` now reads the OT op-log wire format with explicit little-endian helpers (`_rd_u32_le`/`_rd_u64_le`) instead of host-endian `memcpy`, so cross-architecture peers deserialize the same way. Oversized `dep_count` is rejected (not clamped) to keep the parse aligned. |
+| F-3 coordination | `state_t` gained an optional `compaction_engine` pointer (`state_set_compaction_engine`). `crabs_execute_ot_operation` records each ingested OT op's `(node_id, sequence_num)` into the engine's `local_vc` via `crabs_compaction_engine_record_op`, so the STRONG/QUORUM safety check is auto-armed from the execute path. `crabs_compact_ot_item` now emits a `CRABS_OT_OP_COMPACT` marker into the op log so peers transforming against the item see the compaction boundary. The COMPACT transforms (`insert_compact`/`delete_compact`/`move_compact`) are no-ops (return the op unchanged) so concurrent ops are not silently destroyed (C-11). |
+
+### Remaining limitation
+
+- **Slow ABE suites** (`TestPolicyConfig`, full `KeyEnvelopeTest`) take ~300s
+  per test due to real CP-ABE pairing and are not run in the fast CI pass;
+  the ECIES round-trip regression is run.
+
+### Test posture (fourth pass)
+
+- 449 tests pass across 27 suites. The CLI test that previously reported
+  `protocol_violation` for an unauthenticated lock now reports `unauthorized`
+  (the L-a reorder working as intended).
+
+---
+
 *Round 2 — same crab, sharper pincers needed.*
