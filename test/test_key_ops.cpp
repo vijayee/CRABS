@@ -617,3 +617,91 @@ TEST(TestKeyOps, RegisterKeyRejectsDuplicateKeyId) {
 
   destroy_test_state(state);
 }
+
+// ============================================================
+// Round 4 audit regression: R4-2 — a REVOKED user must be rejected by the
+// key-management handlers. Previously they checked == USER_SUSPENDED, so a
+// revoked user could still register/revoke/set-default/suspend/activate/
+// rotate keys. Now they whitelist USER_ACTIVE.
+//
+// Through the signed-operation path, the revoked user is first rejected by
+// the authorization step (crypto_verify_operation_auth whitelists
+// USER_ACTIVE per the H-C fix), which returns CRABS_ERR_USER_NOT_FOUND for
+// REVOKED users. The handler-level != USER_ACTIVE check is defense-in-depth
+// for the direct API path (tested in test_attribute_machine.cpp).
+// ============================================================
+TEST(TestKeyOps, RegisterKeyRejectsRevokedUser) {
+  state_t* state = create_test_state_with_attr();
+
+  // Revoke admin
+  attribute_machine_revoke_user(state->attr_machine, "admin");
+
+  operation_t* op = operation_create(CRABS_OP_REGISTER_KEY);
+  fill_uuid(op->uuid);
+  strncpy(op->signer_id, "admin", CRABS_MAX_USER_ID - 1);
+
+  sign_as_admin(op);
+  crabs_error_e rc = state_machine_execute(state, op);
+  // Auth step rejects REVOKED with USER_NOT_FOUND (H-C whitelist).
+  EXPECT_EQ(rc, CRABS_ERR_USER_NOT_FOUND);
+
+  operation_destroy(op);
+  destroy_test_state(state);
+}
+
+TEST(TestKeyOps, RevokeKeyRejectsRevokedUser) {
+  state_t* state = create_test_state_with_attr();
+
+  // First register a key (admin is still active)
+  user_t* admin = attribute_machine_find_user(state->attr_machine, "admin");
+  uint8_t pk[33];
+  _gen_pk_ops(pk);
+  ASSERT_EQ(user_key_register(admin, "mykey", ECDSA_SECP256K1, pk, 33, "test"), CRABS_SUCCESS);
+
+  // Revoke admin
+  attribute_machine_revoke_user(state->attr_machine, "admin");
+
+  // Now try to revoke the key — must be rejected by auth step
+  const char* config = "key_id=mykey";
+  size_t payload_size = strlen(config) + 1;
+  uint8_t* payload = (uint8_t*)calloc(payload_size, 1);
+  memcpy(payload, config, payload_size);
+
+  operation_t* op = operation_create(CRABS_OP_REVOKE_KEY);
+  fill_uuid(op->uuid);
+  strncpy(op->signer_id, "admin", CRABS_MAX_USER_ID - 1);
+  op->payload = payload;
+  op->payload_size = (uint32_t)payload_size;
+
+  sign_as_admin(op);
+  crabs_error_e rc = state_machine_execute(state, op);
+  EXPECT_EQ(rc, CRABS_ERR_USER_NOT_FOUND);
+
+  operation_destroy(op);
+  destroy_test_state(state);
+}
+
+TEST(TestKeyOps, SetDefaultKeyRejectsRevokedUser) {
+  state_t* state = create_test_state_with_attr();
+
+  // Revoke admin
+  attribute_machine_revoke_user(state->attr_machine, "admin");
+
+  const char* config = "key_id=somekey";
+  size_t payload_size = strlen(config) + 1;
+  uint8_t* payload = (uint8_t*)calloc(payload_size, 1);
+  memcpy(payload, config, payload_size);
+
+  operation_t* op = operation_create(CRABS_OP_SET_DEFAULT_KEY);
+  fill_uuid(op->uuid);
+  strncpy(op->signer_id, "admin", CRABS_MAX_USER_ID - 1);
+  op->payload = payload;
+  op->payload_size = (uint32_t)payload_size;
+
+  sign_as_admin(op);
+  crabs_error_e rc = state_machine_execute(state, op);
+  EXPECT_EQ(rc, CRABS_ERR_USER_NOT_FOUND);
+
+  operation_destroy(op);
+  destroy_test_state(state);
+}

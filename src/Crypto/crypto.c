@@ -853,10 +853,17 @@ static void _build_attr_string(const user_t* user, char* buf, size_t buf_len) {
     pos += tok_len;
   }
 
-  // Append temporary attribute values (full "name:value" tokens).
+  // Append temporary attribute tokens. Audit R4-1: use temp->name which holds
+  // the full "name:value" token (e.g. "clearance:secret"), NOT temp->value
+  // which holds only the value part ("secret"). The prior code emitted bare
+  // values, so a temporary "clearance:secret" appeared as just "secret" in the
+  // attribute string — failing to match "clearance:secret" policies while
+  // colliding with bare "secret" policies from unrelated namespaces. Using
+  // temp->name makes temporary attributes consistent with the F-1 fix for
+  // permanent attributes (full name:value tokens everywhere).
   temp_attr_list_t* temp = user->temp_attrs;
   while (temp != NULL) {
-    const char* token = temp->value;
+    const char* token = temp->name;
     size_t tok_len = strlen(token);
     if (tok_len > 0) {
       size_t need = (pos > 0 ? 1 : 0) + tok_len + 1;

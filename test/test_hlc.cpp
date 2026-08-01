@@ -1471,3 +1471,34 @@ TEST(HLCTestVectors, TV12_7_CrossSystemOrdering) {
   // B is HLC, A is LAMPORT → B > A
   EXPECT_GT(crabs_operation_compare(&op_b, &op_a), 0);
 }
+
+// Regression for audit R4-8: a received HLC timestamp with a logical counter
+// at or above UINT64_MAX/2 must be rejected. Without this, a malicious node
+// sending logical_counter = UINT64_MAX forces the local counter to saturate
+// at UINT64_MAX permanently — breaking the total-order guarantee (all
+// subsequent events at the same physical time share the same timestamp).
+//
+// Uses NAIVE strategy so the BOUNDED skew check doesn't interfere — we're
+// testing the logical-counter rejection, not the time-skew rejection.
+TEST(HLCTestVectors, TV12_8_RejectExtremeLogicalCounter) {
+  crabs_hlc_state_t state;
+  crabs_hlc_state_init_strategy(&state, "alice", HLC_STRATEGY_NAIVE);
+
+  crabs_hlc_t received = {1000, 0, UINT64_MAX, "bob"};
+  crabs_hlc_receive_result_e result = crabs_hlc_receive(&state, &received);
+  EXPECT_EQ(result, CRABS_HLC_REJECTED_SKEW);
+
+  // UINT64_MAX/2 is also rejected (the threshold is >= UINT64_MAX/2).
+  received.logical_counter = UINT64_MAX / 2;
+  result = crabs_hlc_receive(&state, &received);
+  EXPECT_EQ(result, CRABS_HLC_REJECTED_SKEW);
+
+  // A normal counter just below the threshold is accepted.
+  received.logical_counter = UINT64_MAX / 2 - 1;
+  result = crabs_hlc_receive(&state, &received);
+  EXPECT_EQ(result, CRABS_HLC_ACCEPTED);
+
+  // The local counter must NOT have been pushed to UINT64_MAX by the rejected
+  // receives.
+  EXPECT_LT(state.last.logical_counter, UINT64_MAX / 2);
+}

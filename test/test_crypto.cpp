@@ -654,6 +654,49 @@ TEST_F(VerifyAuthTest, RevokedUserRejected) {
   crypto_ecdsa_keypair_destroy(keypair);
 }
 
+// Regression for audit R4-1: temporary attributes must use the full
+// "name:value" token in the attribute string (not just the value part).
+// Before the fix, _build_attr_string read temp->value ("secret") instead of
+// temp->name ("clearance:secret"), so a temporary "clearance:secret" attribute
+// could not satisfy a "clearance:secret" policy but could satisfy a bare
+// "secret" policy — a namespace collision. Now it matches the namespaced
+// policy and does not match the bare-value policy.
+TEST_F(VerifyAuthTest, TempAttributeUsesFullNameColonToken) {
+  ecdsa_keypair_t* keypair = crypto_ecdsa_generate();
+  ASSERT_NE(keypair, nullptr);
+  ASSERT_EQ(attribute_machine_register_user(am, "alice", keypair->public_key,
+                                              "role:member"), CRABS_SUCCESS);
+
+  // Issue a temporary attribute clearance:secret to alice (who has role:member).
+  // The role parameter matches the attribute NAME ("role"), not the full
+  // "role:member" token.
+  attribute_machine_set_time(am, 1000);
+  ASSERT_EQ(attribute_machine_issue_temporary(am, "clearance", "secret",
+                                                 "role", 60000),
+            CRABS_SUCCESS);
+
+  const uint8_t op_data[] = {0x01, 0x02, 0x03};
+  uint8_t signature[CRABS_SIG_SIZE];
+  ASSERT_EQ(crypto_sign_operation(keypair->private_key, op_data, sizeof(op_data),
+                                    signature), CRABS_SUCCESS);
+
+  // The namespaced policy "clearance:secret" MUST be satisfied (the temp
+  // attribute token is now "clearance:secret", not just "secret").
+  verify_result_t vr = crypto_verify_operation_auth(
+      mk, "clearance:secret", am, op_data, sizeof(op_data),
+      signature, "alice", VERIFY_MODE_A);
+  EXPECT_TRUE(vr.authorized);
+
+  // A bare "secret" policy must NOT be satisfied — the token is
+  // "clearance:secret", not "secret", so there is no namespace collision.
+  vr = crypto_verify_operation_auth(
+      mk, "secret", am, op_data, sizeof(op_data),
+      signature, "alice", VERIFY_MODE_A);
+  EXPECT_FALSE(vr.authorized);
+
+  crypto_ecdsa_keypair_destroy(keypair);
+}
+
 // ============================================================
 // Key Envelope Tests (§11.2)
 // ============================================================

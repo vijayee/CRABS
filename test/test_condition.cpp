@@ -677,3 +677,35 @@ TEST_F(TestCondition, TestPreprocessPolicyContainsNot) {
   auto result = preprocess_policy("course_enrolled NOT CONTAINS carol", state, "alice");
   EXPECT_TRUE(result.resolved_ok);
 }
+
+// Regression for audit R4-7: deeply nested parenthesized expressions must
+// be rejected by the recursion depth limit rather than risking stack overflow.
+// The 256-byte input cap allows ~85 levels of bare parens, but the explicit
+// CRABS_CONDITION_MAX_DEPTH (64) cap blocks pathological inputs and protects
+// against future increases in the input length cap.
+TEST_F(TestCondition, TestDeepNestingRejected) {
+  // Build a string of 80 nested parens: (((((...x...)))))
+  // 80 > CRABS_CONDITION_MAX_DEPTH (64), so this must be rejected.
+  std::string deep;
+  for (int i = 0; i < 80; i++) deep += "(";
+  deep += "x >= 1";
+  for (int i = 0; i < 80; i++) deep += ")";
+
+  condition_node_t* node = condition_parse(deep.c_str());
+  EXPECT_EQ(node, nullptr);  // rejected by depth limit
+
+  // A shallow expression still parses fine.
+  std::string shallow = "(x >= 1)";
+  condition_node_t* ok = condition_parse(shallow.c_str());
+  EXPECT_NE(ok, nullptr);
+  condition_node_destroy(ok);
+
+  // Moderate nesting (32 levels) is accepted.
+  std::string moderate;
+  for (int i = 0; i < 32; i++) moderate += "(";
+  moderate += "x >= 1";
+  for (int i = 0; i < 32; i++) moderate += ")";
+  condition_node_t* mod = condition_parse(moderate.c_str());
+  EXPECT_NE(mod, nullptr);
+  condition_node_destroy(mod);
+}

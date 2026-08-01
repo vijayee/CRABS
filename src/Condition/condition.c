@@ -53,7 +53,19 @@ typedef struct {
   size_t      length;
   token_t     current;
   bool        has_error;
+  // Audit R4-7: track recursion depth so a future increase in
+  // CRABS_MAX_POLICY_EXPR (or a path that bypasses the cap) cannot turn the
+  // recursive-descent parser into a stack-overflow DoS. Each parenthesized
+  // sub-expression adds one level via _parse_comparison -> _parse_or_expr.
+  uint32_t   depth;
 } parser_ctx_t;
+
+// Audit R4-7: maximum nesting depth for the condition parser. 64 levels
+// comfortably exceeds any legitimate policy expression (the 256-byte input
+// cap allows ~85 levels of bare parens `(((...)))`), while blocking
+// pathological inputs that could overflow the stack if the input cap is
+// ever raised.
+#define CRABS_CONDITION_MAX_DEPTH 64
 
 // ============================================================
 // Keyword lookup
@@ -231,6 +243,7 @@ static void _parser_init(parser_ctx_t* ctx, const char* input) {
   ctx->pos = 0;
   ctx->length = strlen(input);
   ctx->has_error = false;
+  ctx->depth = 0;
   ctx->current = _lexer_next(ctx);
 }
 
@@ -694,7 +707,18 @@ static condition_node_t* _parse_and_expr(parser_ctx_t* ctx) {
 // Parser: OR expressions
 // ============================================================
 static condition_node_t* _parse_or_expr(parser_ctx_t* ctx) {
+  // Audit R4-7: bound recursion depth. Each parenthesized sub-expression
+  // re-enters _parse_or_expr via _parse_comparison, so this check caps the
+  // total nesting depth. Without it, a future increase in
+  // CRABS_MAX_POLICY_EXPR could allow a deeply nested input to overflow
+  // the stack.
+  if (ctx->depth >= CRABS_CONDITION_MAX_DEPTH) {
+    ctx->has_error = true;
+    return NULL;
+  }
+  ctx->depth++;
   condition_node_t* left = _parse_and_expr(ctx);
+  ctx->depth--;
   if (left == NULL) return NULL;
 
   while (_parser_peek(ctx).type == TOK_OR && !ctx->has_error) {

@@ -987,7 +987,10 @@ crabs_error_e state_machine_op_register_key(state_t* state, operation_t* op) {
 
   user_t* user = attribute_machine_find_user(state->attr_machine, op->signer_id);
   if (user == NULL) return CRABS_ERR_USER_NOT_FOUND;
-  if (user->status == USER_SUSPENDED) return CRABS_ERR_USER_SUSPENDED;
+  // Audit R4-2: whitelist USER_ACTIVE. The prior == USER_SUSPENDED check let a
+  // REVOKED user register keys (REVOKED != SUSPENDED). Only ACTIVE users may
+  // manage keys.
+  if (user->status != USER_ACTIVE) return CRABS_ERR_USER_SUSPENDED;
 
   // Payload format: key_id=<id>;scheme=<num>;public_key_len=<len>;label=<label>
   // public_key bytes follow in payload after the null-terminated config string
@@ -1052,7 +1055,8 @@ crabs_error_e state_machine_op_revoke_key(state_t* state, operation_t* op) {
 
   user_t* user = attribute_machine_find_user(state->attr_machine, op->signer_id);
   if (user == NULL) return CRABS_ERR_USER_NOT_FOUND;
-  if (user->status == USER_SUSPENDED) return CRABS_ERR_USER_SUSPENDED;
+  // Audit R4-2: whitelist USER_ACTIVE (rejects SUSPENDED and REVOKED).
+  if (user->status != USER_ACTIVE) return CRABS_ERR_USER_SUSPENDED;
 
   // Payload format: key_id=<id>
   if (op->payload == NULL || op->payload_size == 0) return CRABS_ERR_INVALID_PARAM;
@@ -1088,7 +1092,8 @@ crabs_error_e state_machine_op_set_default_key(state_t* state, operation_t* op) 
 
   user_t* user = attribute_machine_find_user(state->attr_machine, op->signer_id);
   if (user == NULL) return CRABS_ERR_USER_NOT_FOUND;
-  if (user->status == USER_SUSPENDED) return CRABS_ERR_USER_SUSPENDED;
+  // Audit R4-2: whitelist USER_ACTIVE (rejects SUSPENDED and REVOKED).
+  if (user->status != USER_ACTIVE) return CRABS_ERR_USER_SUSPENDED;
 
   // Payload format: key_id=<id>
   if (op->payload == NULL || op->payload_size == 0) return CRABS_ERR_INVALID_PARAM;
@@ -1128,7 +1133,8 @@ crabs_error_e state_machine_op_suspend_key(state_t* state, operation_t* op) {
 
   user_t* user = attribute_machine_find_user(state->attr_machine, op->signer_id);
   if (user == NULL) return CRABS_ERR_USER_NOT_FOUND;
-  if (user->status == USER_SUSPENDED) return CRABS_ERR_USER_SUSPENDED;
+  // Audit R4-2: whitelist USER_ACTIVE (rejects SUSPENDED and REVOKED).
+  if (user->status != USER_ACTIVE) return CRABS_ERR_USER_SUSPENDED;
 
   if (op->payload == NULL || op->payload_size == 0) return CRABS_ERR_INVALID_PARAM;
 
@@ -1162,7 +1168,8 @@ crabs_error_e state_machine_op_activate_key(state_t* state, operation_t* op) {
 
   user_t* user = attribute_machine_find_user(state->attr_machine, op->signer_id);
   if (user == NULL) return CRABS_ERR_USER_NOT_FOUND;
-  if (user->status == USER_SUSPENDED) return CRABS_ERR_USER_SUSPENDED;
+  // Audit R4-2: whitelist USER_ACTIVE (rejects SUSPENDED and REVOKED).
+  if (user->status != USER_ACTIVE) return CRABS_ERR_USER_SUSPENDED;
 
   if (op->payload == NULL || op->payload_size == 0) return CRABS_ERR_INVALID_PARAM;
 
@@ -1196,7 +1203,8 @@ crabs_error_e state_machine_op_rotate_key(state_t* state, operation_t* op) {
 
   user_t* user = attribute_machine_find_user(state->attr_machine, op->signer_id);
   if (user == NULL) return CRABS_ERR_USER_NOT_FOUND;
-  if (user->status == USER_SUSPENDED) return CRABS_ERR_USER_SUSPENDED;
+  // Audit R4-2: whitelist USER_ACTIVE (rejects SUSPENDED and REVOKED).
+  if (user->status != USER_ACTIVE) return CRABS_ERR_USER_SUSPENDED;
 
   if (!state->config.sig_config.key_rotation_enabled) return CRABS_ERR_PROTOCOL_VIOLATION;
 

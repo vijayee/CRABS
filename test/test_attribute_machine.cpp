@@ -728,3 +728,118 @@ TEST_F(TestAttributeMachine, TestSelfAssertValueCollisionStoredNamespaced) {
   }
   EXPECT_TRUE(found);
 }
+
+// ============================================================
+// Round 4 audit regression tests
+// ============================================================
+
+// R4-2: a REVOKED user must be rejected by the direct API paths that
+// previously only checked == USER_SUSPENDED. The H-C fix whitelisted
+// USER_ACTIVE in the main authorization path but not in these direct APIs.
+TEST_F(TestAttributeMachine, TestRevokedUserRejectedByDirectAPIs) {
+  uint8_t user_pk[33];
+  _gen_pk(user_pk);
+  ASSERT_EQ(attribute_machine_register_user(am, "alice", user_pk, "dept:eng"), CRABS_SUCCESS);
+
+  // Revoke alice
+  ASSERT_EQ(attribute_machine_revoke_user(am, "alice"), CRABS_SUCCESS);
+  user_t* alice = attribute_machine_find_user(am, "alice");
+  ASSERT_NE(alice, nullptr);
+  EXPECT_EQ(alice->status, USER_REVOKED);
+
+  // grant_role must reject a revoked target (previously let REVOKED through).
+  EXPECT_EQ(attribute_machine_grant_role(am, "alice", "dept", "mgmt", "admin"),
+            CRABS_ERR_USER_SUSPENDED);
+
+  // self_assert must reject a revoked signer.
+  EXPECT_EQ(attribute_machine_self_assert(am, "email", "a@b.com", "alice"),
+            CRABS_ERR_USER_SUSPENDED);
+
+  // verify_identity must reject a revoked target.
+  EXPECT_EQ(attribute_machine_verify_identity(am, "alice", "dept", "eng", "admin"),
+            CRABS_ERR_USER_SUSPENDED);
+}
+
+// R4-3: "verifier" and "issuer" must be in the privileged-attribute blocklist.
+// A trigger with issue_attribute="verifier" must not mint a temp attribute.
+TEST_F(TestAttributeMachine, TestPrivilegedAttrNamesIncludeVerifierIssuer) {
+  uint8_t user_pk[33];
+  _gen_pk(user_pk);
+  ASSERT_EQ(attribute_machine_register_user(am, "alice", user_pk, "role:staff"), CRABS_SUCCESS);
+
+  // self_assert of "verifier" must be rejected.
+  EXPECT_EQ(attribute_machine_self_assert(am, "verifier", "admin", "alice"),
+            CRABS_ERR_UNAUTHORIZED);
+
+  // self_assert of "issuer" must be rejected.
+  EXPECT_EQ(attribute_machine_self_assert(am, "issuer", "admin", "alice"),
+            CRABS_ERR_UNAUTHORIZED);
+
+  // issue_temporary with attribute="verifier" must be rejected.
+  attribute_machine_set_time(am, 1000);
+  EXPECT_EQ(attribute_machine_issue_temporary(am, "verifier", "admin", "role:staff", 60000),
+            CRABS_ERR_UNAUTHORIZED);
+  EXPECT_EQ(attribute_machine_issue_temporary(am, "issuer", "admin", "role:staff", 60000),
+            CRABS_ERR_UNAUTHORIZED);
+}
+
+// R4-5: attribute names outside [A-Za-z0-9_-] must be rejected so Unicode
+// homoglyphs cannot bypass the case-insensitive privileged-name blocklist.
+TEST_F(TestAttributeMachine, TestAttrNameCharsetValidation) {
+  uint8_t user_pk[33];
+  _gen_pk(user_pk);
+  ASSERT_EQ(attribute_machine_register_user(am, "alice", user_pk, "dept:eng"), CRABS_SUCCESS);
+
+  // Non-ASCII / special chars in attribute name → rejected.
+  EXPECT_EQ(attribute_machine_self_assert(am, "role admin", "true", "alice"),
+            CRABS_ERR_INVALID_PARAM);
+  EXPECT_EQ(attribute_machine_self_assert(am, "role;admin", "true", "alice"),
+            CRABS_ERR_INVALID_PARAM);
+  EXPECT_EQ(attribute_machine_self_assert(am, "role(admin)", "true", "alice"),
+            CRABS_ERR_INVALID_PARAM);
+
+  // issue_temporary with bad charset → rejected.
+  attribute_machine_set_time(am, 1000);
+  EXPECT_EQ(attribute_machine_issue_temporary(am, "bad name", "val", "role:staff", 60000),
+            CRABS_ERR_INVALID_PARAM);
+
+  // Valid charset still works.
+  EXPECT_EQ(attribute_machine_self_assert(am, "clearance_level", "secret", "alice"),
+            CRABS_SUCCESS);
+}
+
+// De-wonk: a comma in an attribute value would inject a separate token into
+// the attribute string (which is comma-separated). self_assert("clearance",
+// "secret,admin") would produce token "clearance:secret,admin", and the
+// attribute string would contain "admin" as a separate token — satisfying a
+// bare "admin" policy. Reject values containing commas or spaces.
+TEST_F(TestAttributeMachine, TestAttrValueCommaInjectionRejected) {
+  uint8_t user_pk[33];
+  _gen_pk(user_pk);
+  ASSERT_EQ(attribute_machine_register_user(am, "alice", user_pk, "dept:eng"), CRABS_SUCCESS);
+
+  // Comma in value → rejected (would inject "admin" as a separate token).
+  EXPECT_EQ(attribute_machine_self_assert(am, "clearance", "secret,admin", "alice"),
+            CRABS_ERR_INVALID_PARAM);
+
+  // Space in value → rejected (would break policy token parsing).
+  EXPECT_EQ(attribute_machine_self_assert(am, "clearance", "secret admin", "alice"),
+            CRABS_ERR_INVALID_PARAM);
+
+  // issue_temporary with comma in value → rejected.
+  attribute_machine_set_time(am, 1000);
+  EXPECT_EQ(attribute_machine_issue_temporary(am, "clearance", "secret,admin", "role", 60000),
+            CRABS_ERR_INVALID_PARAM);
+
+  // grant_role with comma in value → rejected.
+  EXPECT_EQ(attribute_machine_grant_role(am, "alice", "dept", "secret,admin", "admin"),
+            CRABS_ERR_INVALID_PARAM);
+
+  // verify_identity with comma in value → rejected.
+  EXPECT_EQ(attribute_machine_verify_identity(am, "alice", "dept", "eng,admin", "admin"),
+            CRABS_ERR_INVALID_PARAM);
+
+  // Normal value (no comma/space) still works.
+  EXPECT_EQ(attribute_machine_self_assert(am, "clearance", "secret", "alice"),
+            CRABS_SUCCESS);
+}

@@ -354,6 +354,21 @@ crabs_hlc_receive_result_e crabs_hlc_receive(crabs_hlc_state_t* state,
     return CRABS_HLC_REJECTED_SKEW;
   }
 
+  // Audit R4-8: reject received timestamps with a logical counter at or above
+  // UINT64_MAX/2. Once the local counter saturates at UINT64_MAX
+  // (_hlc_saturate_inc caps at UINT64_MAX), all subsequent events at the same
+  // physical time share the same timestamp — breaking HLC's total-order
+  // guarantee. A malicious node sending logical_counter = UINT64_MAX forces
+  // the local counter to UINT64_MAX permanently (the receive path takes max
+  // of received and local counters, then saturating-increments). Rejecting
+  // implausibly large counters on receive prevents this denial-of-convergence.
+  // UINT64_MAX/2 is ~9.2e18 — no legitimate HLC reaches this in normal
+  // operation (it would require 2^63 events at the same nanosecond).
+  if (received->logical_counter >= (UINT64_MAX / 2)) {
+    state->time_travel_attempts_rejected += 1;
+    return CRABS_HLC_REJECTED_SKEW;
+  }
+
   // Step 1: Validate based on strategy
   switch (state->receive_strategy) {
     case HLC_STRATEGY_NAIVE:

@@ -79,6 +79,21 @@ static uint32_t _parse_attributes(const char* attrs, attribute_value_t* out, uin
     // Trim leading spaces
     while (*token == ' ') token++;
 
+    // De-wonk: reject tokens containing commas. The attribute string is
+    // comma-separated, so a comma in a token (e.g. "role:admin,secret")
+    // would inject "secret" as a separate token — letting a user registered
+    // with "role:admin,secret|dept:eng" satisfy a bare "secret" policy. Skip
+    // the malformed token rather than storing it. This is defense in depth
+    // alongside the _is_safe_attr_value check in the mutation APIs.
+    bool has_comma = false;
+    for (const char* p = token; *p != '\0'; p++) {
+      if (*p == ',') { has_comma = true; break; }
+    }
+    if (has_comma) {
+      token = strtok_r(NULL, "|", &saveptr);
+      continue;
+    }
+
     strncpy(out[count].value, token, CRABS_MAX_POLICY_EXPR - 1);
     out[count].value[CRABS_MAX_POLICY_EXPR - 1] = '\0';
     out[count].verified_by[0] = '\0';
@@ -124,15 +139,20 @@ static bool _attribute_matches_name(const attribute_value_t* attr, const char* n
   return strcmp(attr_name, name) == 0;
 }
 
-// Audit N-1: the set of privileged attribute names that must never be mintable
-// via self-assertion OR via trigger-issued temporary attributes. A trigger
-// creator with __create_trigger__ authority could otherwise set
+// Audit N-1 / R4-3: the set of privileged attribute names that must never be
+// mintable via self-assertion OR via trigger-issued temporary attributes. A
+// trigger creator with __create_trigger__ authority could otherwise set
 // issue_attribute="role" and attribute_value="admin", and when the trigger
 // fires the target user receives a temporary "role:admin" attribute that
 // satisfies role:admin policies and produces a real CP-ABE key with attribute
 // role_admin (the F-1 blocklist in self_assert did not cover this path).
+// Audit R4-3: "verifier" and "issuer" were specified in the N-1 recommendation
+// but were missing from the blocklist. A trigger could mint "verifier:admin"
+// which, while not matching "role:admin" directly, could satisfy policies
+// written against the verifier namespace. Add them now.
 static const char* _PRIVILEGED_ATTR_NAMES[] = {
-  "role", "admin", "member", "owner", "root", "superuser", "manager", NULL
+  "role", "admin", "member", "owner", "root", "superuser", "manager",
+  "verifier", "issuer", NULL
 };
 
 static bool _is_privileged_attr_name(const char* name) {
@@ -141,6 +161,45 @@ static bool _is_privileged_attr_name(const char* name) {
     if (strcasecmp(name, _PRIVILEGED_ATTR_NAMES[i]) == 0) return true;
   }
   return false;
+}
+
+// Audit R4-5: attribute names arrive from attacker-controlled operation
+// payloads (trigger effect issue_attribute, self_assert attribute argument).
+// The privileged-name blocklist uses strcasecmp, so it blocks "Role"/"ADMIN"
+// etc., but it does NOT defend against Unicode homoglyph attacks (e.g. a
+// Cyrillic 'а' in "аdmin"). The user_id charset check (_is_safe_user_id)
+// rejects non-ASCII, but attribute names were never validated against the
+// same charset. Reject attribute names containing characters outside
+// [A-Za-z0-9_-] so homoglyphs and other non-portable characters cannot enter
+// the attribute namespace.
+static bool _is_safe_attr_name(const char* name) {
+  if (name == NULL || name[0] == '\0') return false;
+  for (const char* p = name; *p != '\0'; p++) {
+    char c = *p;
+    bool ok = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+              (c >= '0' && c <= '9') || c == '_' || c == '-';
+    if (!ok) return false;
+  }
+  return true;
+}
+
+// De-wonk: reject attribute values containing comma or space. The attribute
+// string is comma-separated and the policy tokenizer splits on commas and
+// spaces, so a value like "secret,admin" would inject "admin" as a separate
+// token into the attribute string — letting a user who self-asserts
+// clearance:secret,admin satisfy a bare "admin" policy. This is a
+// pre-existing injection vector, not introduced by the Round 4 changes, but
+// found during the de-wonk pass over the attribute namespace safety work.
+// Empty values are allowed — the CLI uses grant_role("role:admin", "") where
+// the full token is in the role parameter and the value is intentionally
+// empty.
+static bool _is_safe_attr_value(const char* value) {
+  if (value == NULL) return false;
+  for (const char* p = value; *p != '\0'; p++) {
+    char c = *p;
+    if (c == ',' || c == ' ') return false;
+  }
+  return true;
 }
 
 // ============================================================
@@ -319,10 +378,17 @@ crabs_error_e attribute_machine_grant_role(attribute_machine_t* am, const char* 
     return CRABS_ERR_INVALID_PARAM;
   }
 
+  // De-wonk: reject values containing comma/space to prevent attribute-string
+  // token injection (see _is_safe_attr_value).
+  if (!_is_safe_attr_value(value)) return CRABS_ERR_INVALID_PARAM;
+
   user_t* user = attribute_machine_find_user(am, target_user);
   if (user == NULL) return CRABS_ERR_USER_NOT_FOUND;
 
-  if (user->status == USER_SUSPENDED) return CRABS_ERR_USER_SUSPENDED;
+  // Audit R4-2: whitelist USER_ACTIVE. The prior == USER_SUSPENDED check let
+  // a REVOKED user through (REVOKED != SUSPENDED), so a revoked user could
+  // still grant roles to other users. Only ACTIVE users may mutate roles.
+  if (user->status != USER_ACTIVE) return CRABS_ERR_USER_SUSPENDED;
 
   // Check if role already exists — update it (§8.4.2)
   for (uint32_t i = 0; i < user->attribute_count; i++) {
@@ -368,6 +434,18 @@ crabs_error_e attribute_machine_self_assert(attribute_machine_t* am, const char*
   // grant via attribute_machine_grant_role. Without this restriction a user
   // could self-assert role:admin and satisfy any role policy (audit C-5).
   if (attribute == NULL || attribute[0] == '\0') return CRABS_ERR_INVALID_PARAM;
+  // Audit R4-5: reject attribute names outside the safe charset so Unicode
+  // homoglyphs and other non-portable characters cannot bypass the
+  // privileged-name blocklist (which uses strcasecmp and would not catch
+  // a Cyrillic 'а' in "аdmin").
+  if (!_is_safe_attr_name(attribute)) {
+    return CRABS_ERR_INVALID_PARAM;
+  }
+  // De-wonk: reject values containing comma/space to prevent attribute-string
+  // token injection (see _is_safe_attr_value).
+  if (!_is_safe_attr_value(value)) {
+    return CRABS_ERR_INVALID_PARAM;
+  }
   if (_is_privileged_attr_name(attribute)) {
     return CRABS_ERR_UNAUTHORIZED;
   }
@@ -375,7 +453,8 @@ crabs_error_e attribute_machine_self_assert(attribute_machine_t* am, const char*
   user_t* user = attribute_machine_find_user(am, signer_id);
   if (user == NULL) return CRABS_ERR_USER_NOT_FOUND;
 
-  if (user->status == USER_SUSPENDED) return CRABS_ERR_USER_SUSPENDED;
+  // Audit R4-2: whitelist USER_ACTIVE (rejects SUSPENDED and REVOKED).
+  if (user->status != USER_ACTIVE) return CRABS_ERR_USER_SUSPENDED;
 
   // Check if attribute already exists (§8.4.3)
   for (uint32_t i = 0; i < user->attribute_count; i++) {
@@ -421,10 +500,15 @@ crabs_error_e attribute_machine_verify_identity(attribute_machine_t* am, const c
     return CRABS_ERR_INVALID_PARAM;
   }
 
+  // De-wonk: reject values containing comma/space to prevent attribute-string
+  // token injection (see _is_safe_attr_value).
+  if (!_is_safe_attr_value(value)) return CRABS_ERR_INVALID_PARAM;
+
   user_t* user = attribute_machine_find_user(am, target_user);
   if (user == NULL) return CRABS_ERR_USER_NOT_FOUND;
 
-  if (user->status == USER_SUSPENDED) return CRABS_ERR_USER_SUSPENDED;
+  // Audit R4-2: whitelist USER_ACTIVE (rejects SUSPENDED and REVOKED).
+  if (user->status != USER_ACTIVE) return CRABS_ERR_USER_SUSPENDED;
 
   // Check if attribute already exists — set verified_by (§8.4.4)
   for (uint32_t i = 0; i < user->attribute_count; i++) {
@@ -467,6 +551,15 @@ crabs_error_e attribute_machine_revoke_role(attribute_machine_t* am, const char*
 
   user_t* user = attribute_machine_find_user(am, target_user);
   if (user == NULL) return CRABS_ERR_USER_NOT_FOUND;
+
+  // Audit R4-4: intentionally no USER_ACTIVE status check here. Revoking a
+  // role from a SUSPENDED or REVOKED user is a valid administrative action
+  // (stripping remaining privileges from a bad actor). The other
+  // attribute_machine mutations (grant_role, self_assert, verify_identity)
+  // restrict to ACTIVE targets because adding/modifying attributes on a
+  // revoked user is pointless at best and confusing at worst. Role
+  // revocation is the one mutation that must work regardless of target
+  // status — otherwise an admin cannot fully decommission a revoked user.
 
   // Find and remove the role attribute (§8.4.5)
   bool found = false;
@@ -583,6 +676,16 @@ crabs_error_e attribute_machine_issue_temporary(attribute_machine_t* am, const c
   // blocked self-assertion of privileged names but not trigger-issued temp
   // attributes. Reject privileged names here so the blocklist covers both
   // paths.
+  // Audit R4-5: also reject attribute names outside the safe charset so
+  // Unicode homoglyphs cannot bypass the case-insensitive blocklist.
+  if (!_is_safe_attr_name(attribute)) {
+    return CRABS_ERR_INVALID_PARAM;
+  }
+  // De-wonk: reject values containing comma/space to prevent attribute-string
+  // token injection (see _is_safe_attr_value).
+  if (!_is_safe_attr_value(value)) {
+    return CRABS_ERR_INVALID_PARAM;
+  }
   if (_is_privileged_attr_name(attribute)) {
     return CRABS_ERR_UNAUTHORIZED;
   }
