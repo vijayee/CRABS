@@ -11,6 +11,7 @@
 #include "ot_tree.h"
 #include "../CRABS/data_model.h"
 #include "../StateMachine/state_machine.h"
+#include "../Compaction/compaction_engine.h"
 #include "../Util/allocator.h"
 #include <stdlib.h>
 #include <string.h>
@@ -112,6 +113,19 @@ data_item_t* crabs_register_ot_type(state_t* state,
 // OT Operation Extraction (v1.5 §8.2 step 6)
 // ============================================================
 
+// Audit L-k: explicit little-endian readers so the OT op-log wire format is
+// cross-architecture safe (the prior memcpy reads were host-endian, which
+// desyncs big-endian peers). The format is defined as little-endian.
+static uint32_t _rd_u32_le(const uint8_t* p) {
+  return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
+         ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+static uint64_t _rd_u64_le(const uint8_t* p) {
+  return (uint64_t)p[0] | ((uint64_t)p[1] << 8) | ((uint64_t)p[2] << 16) |
+         ((uint64_t)p[3] << 24) | ((uint64_t)p[4] << 32) | ((uint64_t)p[5] << 40) |
+         ((uint64_t)p[6] << 48) | ((uint64_t)p[7] << 56);
+}
+
 // Payload format for OT operations:
 // [4 bytes: count] [count * crabs_ot_operation_t binary layout]
 // Each op: [op_type(4) + id.node_id(64) + id.sequence_num(8) + id.timestamp(8)
@@ -125,9 +139,8 @@ uint32_t crabs_extract_ot_ops(const uint8_t* payload, uint32_t payload_size,
     return 0;
   }
 
-  // Read op count from first 4 bytes
-  uint32_t count = 0;
-  memcpy(&count, payload, 4);
+  // Read op count from first 4 bytes (little-endian).
+  uint32_t count = _rd_u32_le(payload);
 
   if (count == 0 || count > 1024) {
     *ops_out = NULL;
@@ -146,7 +159,7 @@ uint32_t crabs_extract_ot_ops(const uint8_t* payload, uint32_t payload_size,
     crabs_ot_operation_init(&ops[i]);
 
     if (offset + 4 > payload_size) break;
-    memcpy(&ops[i].op_type, payload + offset, 4);
+    ops[i].op_type = _rd_u32_le(payload + offset);
     offset += 4;
 
     if (offset + CRABS_MAX_USER_ID > payload_size) break;
@@ -154,23 +167,23 @@ uint32_t crabs_extract_ot_ops(const uint8_t* payload, uint32_t payload_size,
     offset += CRABS_MAX_USER_ID;
 
     if (offset + 8 > payload_size) break;
-    memcpy(&ops[i].id.sequence_num, payload + offset, 8);
+    ops[i].id.sequence_num = _rd_u64_le(payload + offset);
     offset += 8;
 
     if (offset + 8 > payload_size) break;
-    memcpy(&ops[i].id.timestamp, payload + offset, 8);
+    ops[i].id.timestamp = _rd_u64_le(payload + offset);
     offset += 8;
 
     if (offset + 8 > payload_size) break;
-    memcpy(&ops[i].visible_pos, payload + offset, 8);
+    ops[i].visible_pos = _rd_u64_le(payload + offset);
     offset += 8;
 
     if (offset + 8 > payload_size) break;
-    memcpy(&ops[i].visible_pos_2, payload + offset, 8);
+    ops[i].visible_pos_2 = _rd_u64_le(payload + offset);
     offset += 8;
 
     if (offset + 8 > payload_size) break;
-    memcpy(&ops[i].priority, payload + offset, 8);
+    ops[i].priority = _rd_u64_le(payload + offset);
     offset += 8;
 
     if (offset + 4 > payload_size) {
@@ -178,7 +191,7 @@ uint32_t crabs_extract_ot_ops(const uint8_t* payload, uint32_t payload_size,
       if (ops[i].payload != NULL) { free(ops[i].payload); ops[i].payload = NULL; }
       break;
     }
-    memcpy(&ops[i].payload_size, payload + offset, 4);
+    ops[i].payload_size = _rd_u32_le(payload + offset);
     offset += 4;
 
     if (ops[i].payload_size > 0 && ops[i].payload_size <= CRABS_OT_MAX_PAYLOAD) {
@@ -202,16 +215,17 @@ uint32_t crabs_extract_ot_ops(const uint8_t* payload, uint32_t payload_size,
       if (ops[i].payload != NULL) { free(ops[i].payload); ops[i].payload = NULL; }
       break;
     }
-    memcpy(&ops[i].dep_count, payload + offset, 4);
+    ops[i].dep_count = _rd_u32_le(payload + offset);
     offset += 4;
+    // Audit M-E/L-k: reject (do not clamp) oversized dep_count — clamping
+    // desynchronizes the parse (the wire carries dep_count deps but we'd
+    // consume only MAX). Stop parsing on a malformed op.
     if (ops[i].dep_count > CRABS_OT_MAX_DEPS) {
-      ops[i].dep_count = CRABS_OT_MAX_DEPS;
+      ops[i].dep_count = 0;
+      break;
     }
 
-    // Consume dep_count op-ids from the wire. Previously the parser read
-    // dep_count but immediately moved to the next op, desynchronizing every
-    // following op when any op had causal dependencies (and deps[] was
-    // silently dropped).
+    // Consume dep_count op-ids from the wire (little-endian).
     for (uint32_t d = 0; d < ops[i].dep_count; d++) {
       if (offset + CRABS_MAX_USER_ID + 8 + 8 > payload_size) {
         ops[i].dep_count = d; // truncated
@@ -219,9 +233,9 @@ uint32_t crabs_extract_ot_ops(const uint8_t* payload, uint32_t payload_size,
       }
       memcpy(ops[i].deps[d].node_id, payload + offset, CRABS_MAX_USER_ID);
       offset += CRABS_MAX_USER_ID;
-      memcpy(&ops[i].deps[d].sequence_num, payload + offset, 8);
+      ops[i].deps[d].sequence_num = _rd_u64_le(payload + offset);
       offset += 8;
-      memcpy(&ops[i].deps[d].timestamp, payload + offset, 8);
+      ops[i].deps[d].timestamp = _rd_u64_le(payload + offset);
       offset += 8;
     }
 done_op:;
@@ -465,6 +479,16 @@ crabs_error_e crabs_execute_ot_operation(state_t* state, operation_t* op) {
 
     // Step 7: Transform and apply each OT operation
     for (uint32_t i = 0; i < ot_op_count; i++) {
+      // Audit F-3: record this ingested OT op in the compaction engine's
+      // local vector clock (if an engine is wired on the state) so the
+      // STRONG/QUORUM compaction safety check can compare local progress
+      // against a peer VC.
+      if (state->compaction_engine != NULL) {
+        crabs_compaction_engine_record_op(
+            (crabs_compaction_engine_t*)state->compaction_engine,
+            ot_ops[i].id.node_id, ot_ops[i].id.sequence_num);
+      }
+
       // Transform against concurrent operations in the op log
       crabs_error_e transform_err = crabs_transform_ot_op(
         &ot_ops[i], ot_data, op->node_id, CRABS_OT_MAX_TRANSFORM_DEPTH);
