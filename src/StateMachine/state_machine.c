@@ -845,6 +845,34 @@ crabs_error_e state_machine_op_force_unlock(state_t* state, operation_t* op) {
   return CRABS_SUCCESS;
 }
 
+// Audit M-A: find the value portion after "key=" in the config payload. The
+// prior code paired each strstr(KEY) with strchr(payload, '=') which found the
+// FIRST '=' in the whole payload, so "max_lock_extensions=0;max_lock_duration_ms=60000"
+// parsed the duration from "0;..." → 0, making every lock instantly expire
+// (force-unlock hijack). This helper finds the '=' immediately after the
+// matched key and requires the key to start at the buffer or after a ';'
+// separator, so "x_max_lock_duration_ms=" cannot match "max_lock_duration_ms=".
+static char* _config_value_after(char* payload, const char* key) {
+  if (payload == NULL || key == NULL) return NULL;
+  size_t klen = strlen(key);
+  char* p = payload;
+  while ((p = strstr(p, key)) != NULL) {
+    bool at_boundary = (p == payload) || (p[-1] == ';') || (p[-1] == ' ');
+    if (at_boundary && p[klen] == '=') {
+      return p + klen + 1;
+    }
+    p += klen;
+  }
+  return NULL;
+}
+
+// Upper bound on max_lock_duration_ms. Audit M-B: the lock-expiry computation
+// `max_lock_duration_ms + extensions * max_lock_duration_ms` wraps uint64 for
+// attacker-set huge values, which can make an active lock read as expired
+// (force-unlock hijack). Clamping here keeps the arithmetic in range; the
+// default is 5s and a 24h ceiling is generous.
+#define CRABS_MAX_LOCK_DURATION_MS_CAP 86400000ULL
+
 crabs_error_e state_machine_op_change_config(state_t* state, operation_t* op) {
   if (op->payload == NULL || op->payload_size == 0) {
     return CRABS_ERR_INVALID_PARAM;
@@ -858,57 +886,59 @@ crabs_error_e state_machine_op_change_config(state_t* state, operation_t* op) {
   memcpy(payload_buf, op->payload, copy_len);
   payload_buf[copy_len] = '\0';
   char* payload_str = payload_buf;
-  if (strstr(payload_str, "max_lock_duration_ms") != NULL) {
-    char* eq = strchr(payload_str, '=');
-    if (eq != NULL) state->config.max_lock_duration_ms = (uint64_t)atoll(eq + 1);
+
+  char* v;
+  if ((v = _config_value_after(payload_str, "max_lock_duration_ms")) != NULL) {
+    uint64_t val = (uint64_t)atoll(v);
+    // Audit M-B: clamp to a sane ceiling so the expiry arithmetic cannot wrap.
+    if (val > CRABS_MAX_LOCK_DURATION_MS_CAP) val = CRABS_MAX_LOCK_DURATION_MS_CAP;
+    state->config.max_lock_duration_ms = val;
   }
-  if (strstr(payload_str, "max_lock_extensions") != NULL) {
-    char* eq = strchr(payload_str, '=');
-    if (eq != NULL) state->config.max_lock_extensions = (uint32_t)atol(eq + 1);
+  if ((v = _config_value_after(payload_str, "max_lock_extensions")) != NULL) {
+    uint32_t val = (uint32_t)atol(v);
+    // Audit M-B: with max_lock_duration_ms capped at 24h, extensions up to
+    // ~2^43 still cannot overflow the `extensions * duration` multiply.
+    // 1024 is far above any legitimate use and keeps the arithmetic safe.
+    if (val > 1024) val = 1024;
+    state->config.max_lock_extensions = val;
   }
-  if (strstr(payload_str, "allow_force_unlock") != NULL) {
-    char* eq = strchr(payload_str, '=');
-    if (eq != NULL) state->config.allow_force_unlock = (strcmp(eq + 1, "true") == 0);
+  if ((v = _config_value_after(payload_str, "allow_force_unlock")) != NULL) {
+    state->config.allow_force_unlock = (strcmp(v, "true") == 0);
   }
-  if (strstr(payload_str, "default_scheme") != NULL) {
-    char* eq = strchr(payload_str, '=');
-    if (eq != NULL) state->config.sig_config.default_scheme = (signature_scheme_e)atoi(eq + 1);
+  if ((v = _config_value_after(payload_str, "default_scheme")) != NULL) {
+    state->config.sig_config.default_scheme = (signature_scheme_e)atoi(v);
   }
-  if (strstr(payload_str, "max_keys_per_user") != NULL) {
-    char* eq = strchr(payload_str, '=');
-    if (eq != NULL) state->config.sig_config.max_keys_per_user = (uint32_t)atol(eq + 1);
+  if ((v = _config_value_after(payload_str, "max_keys_per_user")) != NULL) {
+    uint32_t val = (uint32_t)atol(v);
+    if (val == 0) val = 1; // must allow at least one key
+    if (val > 64) val = 64;
+    state->config.sig_config.max_keys_per_user = val;
   }
-  if (strstr(payload_str, "key_rotation_enabled") != NULL) {
-    char* eq = strchr(payload_str, '=');
-    if (eq != NULL) state->config.sig_config.key_rotation_enabled = (strcmp(eq + 1, "true") == 0);
+  if ((v = _config_value_after(payload_str, "key_rotation_enabled")) != NULL) {
+    state->config.sig_config.key_rotation_enabled = (strcmp(v, "true") == 0);
   }
-  if (strstr(payload_str, "co_sign_threshold") != NULL) {
-    char* eq = strchr(payload_str, '=');
-    if (eq != NULL) state->config.sig_config.co_sign_threshold = (uint32_t)atol(eq + 1);
+  if ((v = _config_value_after(payload_str, "co_sign_threshold")) != NULL) {
+    uint32_t val = (uint32_t)atol(v);
+    if (val > 32) val = 32;
+    state->config.sig_config.co_sign_threshold = val;
   }
-  if (strstr(payload_str, "key_expiry_enabled") != NULL) {
-    char* eq = strchr(payload_str, '=');
-    if (eq != NULL) state->config.sig_config.key_expiry_enabled = (strcmp(eq + 1, "true") == 0);
+  if ((v = _config_value_after(payload_str, "key_expiry_enabled")) != NULL) {
+    state->config.sig_config.key_expiry_enabled = (strcmp(v, "true") == 0);
   }
-  if (strstr(payload_str, "default_key_ttl_ms") != NULL) {
-    char* eq = strchr(payload_str, '=');
-    if (eq != NULL) state->config.sig_config.default_key_ttl_ms = (uint64_t)atoll(eq + 1);
+  if ((v = _config_value_after(payload_str, "default_key_ttl_ms")) != NULL) {
+    state->config.sig_config.default_key_ttl_ms = (uint64_t)atoll(v);
   }
-  if (strstr(payload_str, "max_key_age_ms") != NULL) {
-    char* eq = strchr(payload_str, '=');
-    if (eq != NULL) state->config.sig_config.max_key_age_ms = (uint64_t)atoll(eq + 1);
+  if ((v = _config_value_after(payload_str, "max_key_age_ms")) != NULL) {
+    state->config.sig_config.max_key_age_ms = (uint64_t)atoll(v);
   }
-  if (strstr(payload_str, "vault_provider") != NULL) {
-    char* eq = strchr(payload_str, '=');
-    if (eq != NULL) state->config.vault_config.provider = (vault_provider_e)atoi(eq + 1);
+  if ((v = _config_value_after(payload_str, "vault_provider")) != NULL) {
+    state->config.vault_config.provider = (vault_provider_e)atoi(v);
   }
-  if (strstr(payload_str, "vault_signing_delegated") != NULL) {
-    char* eq = strchr(payload_str, '=');
-    if (eq != NULL) state->config.vault_config.signing_delegated = (strcmp(eq + 1, "true") == 0);
+  if ((v = _config_value_after(payload_str, "vault_signing_delegated")) != NULL) {
+    state->config.vault_config.signing_delegated = (strcmp(v, "true") == 0);
   }
-  if (strstr(payload_str, "vault_rotation_delegated") != NULL) {
-    char* eq = strchr(payload_str, '=');
-    if (eq != NULL) state->config.vault_config.rotation_delegated = (strcmp(eq + 1, "true") == 0);
+  if ((v = _config_value_after(payload_str, "vault_rotation_delegated")) != NULL) {
+    state->config.vault_config.rotation_delegated = (strcmp(v, "true") == 0);
   }
   return CRABS_SUCCESS;
 }
@@ -1233,6 +1263,15 @@ crabs_error_e state_machine_op_refresh_key(state_t* state, operation_t* op,
   if (response != NULL) {
     size_t n = crypto_key_envelope_serialize(envelope,
         response->envelope_data, sizeof(response->envelope_data));
+    // Audit M-I: fail the op if the envelope does not fit (previously the
+    // op returned SUCCESS with envelope_data_len = 0, delivering an
+    // unusable empty envelope).
+    if (n == 0) {
+      crypto_key_envelope_destroy(envelope);
+      state->last_refresh_envelope = NULL;
+      response->envelope_data_len = 0;
+      return CRABS_ERR_SERIALIZATION_ERROR;
+    }
     response->envelope_data_len = (uint32_t)n;
   }
 

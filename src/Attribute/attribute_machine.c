@@ -18,6 +18,23 @@
 // Internal helpers
 // ============================================================
 
+// Audit M-C: a signer_id is spliced raw into policy text via the {user_id}
+// placeholder (condition.c _resolve_user_id_placeholder) before parsing.
+// A signer_id containing '"', '(', ')', ',', or operator keywords could
+// alter the policy's structure (policy-structure injection). Restrict
+// signer_ids to a safe charset at registration so substitution cannot
+// break out of the intended context.
+static bool _is_safe_user_id(const char* id) {
+  if (id == NULL || id[0] == '\0') return false;
+  for (const char* p = id; *p != '\0'; p++) {
+    char c = *p;
+    bool ok = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+              (c >= '0' && c <= '9') || c == '_' || c == '-';
+    if (!ok) return false;
+  }
+  return true;
+}
+
 // Parse pipe-separated attribute string like "role:admin|dept:eng"
 // into attribute_value_t entries. Each entry's value field stores
 // "name:value" so the attribute name is recoverable.
@@ -212,6 +229,11 @@ crabs_error_e attribute_machine_register_user(attribute_machine_t* am, const cha
   // Verify user_id is unique (§8.4.1)
   if (attribute_machine_find_user(am, user_id) != NULL) {
     return CRABS_ERR_DUPLICATE_OPERATION;
+  }
+  // Audit M-C: reject signer_ids outside the safe charset so the {user_id}
+  // policy placeholder cannot inject policy structure.
+  if (!_is_safe_user_id(user_id)) {
+    return CRABS_ERR_INVALID_PARAM;
   }
 
   // Create user entry

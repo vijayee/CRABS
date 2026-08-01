@@ -123,7 +123,12 @@ uint32_t       state_machine_auto_compact(state_t* state);
 
 // Key refresh operation (§11.3)
 typedef struct {
-  uint8_t         envelope_data[1024];  // Serialized key envelope for transport
+  // Audit M-I: sized large enough for a real Waters'09 CP-ABE user key
+  // (up to ~4096 bytes) plus the envelope header and signature. The prior
+  // 1024-byte buffer overflowed in crypto_key_envelope_serialize, which
+  // returned 0 and left the op reporting SUCCESS with an unusable empty
+  // envelope. Must stay >= CRABS_KEY_ENVELOPE_MAX_SIZE (crypto.h).
+  uint8_t         envelope_data[8192];
   uint32_t        envelope_data_len;
 } refresh_key_response_t;
 
