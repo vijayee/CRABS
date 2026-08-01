@@ -413,9 +413,11 @@ TEST_F(VerifyAuthTest, ModeA_AuthorizedUser) {
   rc = crypto_sign_operation(keypair->private_key, op_data, sizeof(op_data), signature);
   EXPECT_EQ(rc, CRABS_SUCCESS);
 
-  // Mode A: Verify alice is authorized with policy "admin"
+  // Mode A: Verify alice is authorized with policy "role:admin" (F-1:
+  // policies and attributes are matched as whole "name:value" tokens, so a
+  // user with "role:admin" satisfies "role:admin" but not bare "admin").
   verify_result_t vr = crypto_verify_operation_auth(
-      mk, "admin", am, op_data, sizeof(op_data),
+      mk, "role:admin", am, op_data, sizeof(op_data),
       signature, "alice", VERIFY_MODE_A);
   EXPECT_TRUE(vr.authorized);
   EXPECT_EQ(vr.error, CRABS_SUCCESS);
@@ -437,9 +439,9 @@ TEST_F(VerifyAuthTest, ModeA_UnauthorizedUser) {
   rc = crypto_sign_operation(keypair->private_key, op_data, sizeof(op_data), signature);
   EXPECT_EQ(rc, CRABS_SUCCESS);
 
-  // Policy requires "admin" but alice only has "viewer"
+  // Policy requires "role:admin" but alice only has "role:viewer"
   verify_result_t vr = crypto_verify_operation_auth(
-      mk, "admin", am, op_data, sizeof(op_data),
+      mk, "role:admin", am, op_data, sizeof(op_data),
       signature, "alice", VERIFY_MODE_A);
   EXPECT_FALSE(vr.authorized);
   EXPECT_EQ(vr.error, CRABS_ERR_UNAUTHORIZED);
@@ -457,7 +459,7 @@ TEST_F(VerifyAuthTest, ModeA_UserNotFound) {
   EXPECT_EQ(rc, CRABS_SUCCESS);
 
   verify_result_t vr = crypto_verify_operation_auth(
-      mk, "admin", am, op_data, sizeof(op_data),
+      mk, "role:admin", am, op_data, sizeof(op_data),
       signature, "nonexistent", VERIFY_MODE_A);
   EXPECT_FALSE(vr.authorized);
   EXPECT_EQ(vr.error, CRABS_ERR_USER_NOT_FOUND);
@@ -483,9 +485,9 @@ TEST_F(VerifyAuthTest, ModeB_AuthorizedUser) {
   rc = crypto_sign_operation(keypair1->private_key, op_data, sizeof(op_data), signature);
   EXPECT_EQ(rc, CRABS_SUCCESS);
 
-  // Mode B: Find any user matching policy "admin" with valid signature
+  // Mode B: Find any user matching policy "role:admin" with valid signature
   verify_result_t vr = crypto_verify_operation_auth(
-      mk, "admin", am, op_data, sizeof(op_data),
+      mk, "role:admin", am, op_data, sizeof(op_data),
       signature, nullptr, VERIFY_MODE_B);
   EXPECT_TRUE(vr.authorized);
   EXPECT_EQ(vr.error, CRABS_SUCCESS);
@@ -507,9 +509,9 @@ TEST_F(VerifyAuthTest, ModeB_NoMatchingUser) {
   rc = crypto_sign_operation(keypair->private_key, op_data, sizeof(op_data), signature);
   EXPECT_EQ(rc, CRABS_SUCCESS);
 
-  // No user has "admin" attribute
+  // No user has "role:admin" attribute
   verify_result_t vr = crypto_verify_operation_auth(
-      mk, "admin", am, op_data, sizeof(op_data),
+      mk, "role:admin", am, op_data, sizeof(op_data),
       signature, nullptr, VERIFY_MODE_B);
   EXPECT_FALSE(vr.authorized);
   EXPECT_EQ(vr.error, CRABS_ERR_UNAUTHORIZED);
@@ -551,9 +553,9 @@ TEST_F(VerifyAuthTest, AndPolicy) {
   rc = crypto_sign_operation(keypair->private_key, op_data, sizeof(op_data), signature);
   EXPECT_EQ(rc, CRABS_SUCCESS);
 
-  // alice has both admin and engineering
+  // alice has both role:admin and department:engineering (F-1: whole-token match)
   verify_result_t vr = crypto_verify_operation_auth(
-      mk, "AND admin engineering", am, op_data, sizeof(op_data),
+      mk, "AND role:admin department:engineering", am, op_data, sizeof(op_data),
       signature, "alice", VERIFY_MODE_A);
   EXPECT_TRUE(vr.authorized);
   EXPECT_EQ(vr.error, CRABS_SUCCESS);
@@ -574,6 +576,79 @@ TEST_F(VerifyAuthTest, NullParams) {
       mk, nullptr, am, op_data, sizeof(op_data), sig, "alice", VERIFY_MODE_A);
   EXPECT_FALSE(vr.authorized);
   EXPECT_EQ(vr.error, CRABS_ERR_INVALID_PARAM);
+}
+
+// Regression for audit F-1: a user who self-asserts "clearance:admin" (a
+// non-privileged name with a privileged value) must NOT satisfy a "role:admin"
+// policy. Policies and attribute strings are matched as whole "name:value"
+// tokens, so "clearance:admin" != "role:admin". The prior code stripped the
+// name, producing token "admin", which matched a bare "admin" policy and was
+// minted a real CP-ABE key for attribute "admin".
+TEST_F(VerifyAuthTest, SelfAssertValueDoesNotAuthorize) {
+  ecdsa_keypair_t* keypair = crypto_ecdsa_generate();
+  ASSERT_NE(keypair, nullptr);
+
+  // alice is a regular member (no role:admin).
+  ASSERT_EQ(attribute_machine_register_user(am, "alice", keypair->public_key,
+                                              "role:member"), CRABS_SUCCESS);
+  // Self-assert a non-privileged attribute whose value is "admin".
+  ASSERT_EQ(attribute_machine_self_assert(am, "clearance", "admin", "alice"),
+            CRABS_SUCCESS);
+
+  const uint8_t op_data[] = {0x01, 0x02, 0x03};
+  uint8_t signature[CRABS_SIG_SIZE];
+  ASSERT_EQ(crypto_sign_operation(keypair->private_key, op_data, sizeof(op_data),
+                                    signature), CRABS_SUCCESS);
+
+  // Namespaced policy: "role:admin" must NOT match "clearance:admin".
+  verify_result_t vr = crypto_verify_operation_auth(
+      mk, "role:admin", am, op_data, sizeof(op_data),
+      signature, "alice", VERIFY_MODE_A);
+  EXPECT_FALSE(vr.authorized);
+  EXPECT_EQ(vr.error, CRABS_ERR_UNAUTHORIZED);
+
+  // And a bare "admin" policy must also NOT match (token is "clearance:admin",
+  // not "admin"). This is the defense-in-depth guarantee: even careless
+  // bare-value policies cannot be satisfied by self-asserted values.
+  vr = crypto_verify_operation_auth(
+      mk, "admin", am, op_data, sizeof(op_data),
+      signature, "alice", VERIFY_MODE_A);
+  EXPECT_FALSE(vr.authorized);
+  EXPECT_EQ(vr.error, CRABS_ERR_UNAUTHORIZED);
+
+  crypto_ecdsa_keypair_destroy(keypair);
+}
+
+// Regression for audit H-C: a REVOKED user must not authorize even with a
+// valid signature. All gates check status == USER_ACTIVE (whitelist), so
+// REVOKED is rejected. (Previously gates checked != SUSPENDED, and REVOKED
+// — which was never assigned — would have passed.)
+TEST_F(VerifyAuthTest, RevokedUserRejected) {
+  ecdsa_keypair_t* keypair = crypto_ecdsa_generate();
+  ASSERT_NE(keypair, nullptr);
+  ASSERT_EQ(attribute_machine_register_user(am, "alice", keypair->public_key,
+                                              "role:admin"), CRABS_SUCCESS);
+
+  ASSERT_EQ(attribute_machine_revoke_user(am, "alice"), CRABS_SUCCESS);
+
+  const uint8_t op_data[] = {0x01, 0x02, 0x03};
+  uint8_t signature[CRABS_SIG_SIZE];
+  ASSERT_EQ(crypto_sign_operation(keypair->private_key, op_data, sizeof(op_data),
+                                    signature), CRABS_SUCCESS);
+
+  verify_result_t vr = crypto_verify_operation_auth(
+      mk, "role:admin", am, op_data, sizeof(op_data),
+      signature, "alice", VERIFY_MODE_A);
+  EXPECT_FALSE(vr.authorized);
+  EXPECT_EQ(vr.error, CRABS_ERR_USER_NOT_FOUND); // revoked maps to NOT_FOUND
+
+  // Mode B must also reject a revoked user (no user satisfies the policy).
+  vr = crypto_verify_operation_auth(
+      mk, "role:admin", am, op_data, sizeof(op_data),
+      signature, nullptr, VERIFY_MODE_B);
+  EXPECT_FALSE(vr.authorized);
+
+  crypto_ecdsa_keypair_destroy(keypair);
 }
 
 // ============================================================

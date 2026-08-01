@@ -129,6 +129,17 @@ crabs_error_e attribute_machine_revoke_role(attribute_machine_t* am, const char*
                                               const char* role, const char* signer_id);
 crabs_error_e attribute_machine_suspend_user(attribute_machine_t* am, const char* user_id);
 
+// Audit H-C: revoke a user. Unlike suspend (recoverable), revocation is the
+// terminal state — a revoked user cannot authorize, refresh, or be reactivated
+// without re-registration. Sets user->status = USER_REVOKED.
+crabs_error_e attribute_machine_revoke_user(attribute_machine_t* am, const char* user_id);
+
+// Audit H-C: inject the platform wall clock (ms) used for temporary-attribute
+// expiry and key expiry. Without this, current_time_ms stays 0 and expired
+// temp attributes are never pruned (they grant authority indefinitely).
+// Platforms MUST call this before processing operations that depend on expiry.
+void attribute_machine_set_time(attribute_machine_t* am, uint64_t now_ms);
+
 // ============================================================
 // Query Functions
 // ============================================================

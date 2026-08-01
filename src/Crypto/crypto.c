@@ -753,37 +753,47 @@ static void _build_attr_string(const user_t* user, char* buf, size_t buf_len) {
     return;
   }
 
+  // Audit F-1: emit the full "name:value" token (do NOT strip the name).
+  // Policies are matched as whole tokens by crypto_abe_eval_policy, so a
+  // policy "role:admin" matches only an attribute "role:admin" — a user
+  // who self-asserts "clearance:admin" cannot satisfy "role:admin". The
+  // prior code stripped the name, making "role:admin" and "dept:admin"
+  // collide and letting self_assert("clearance","admin") satisfy "admin".
+  // Fail closed on overflow rather than truncating mid-token: a truncated
+  // "role:admi" token could alias a different legitimate token.
   size_t pos = 0;
-  for (uint32_t i = 0; i < user->attribute_count && pos < buf_len - 1; i++) {
-    if (pos > 0 && pos < buf_len - 1) {
-      buf[pos++] = ',';
+  for (uint32_t i = 0; i < user->attribute_count; i++) {
+    const char* token = user->attributes[i].value;
+    size_t tok_len = strlen(token);
+    if (tok_len == 0) continue;
+    size_t need = (pos > 0 ? 1 : 0) + tok_len + 1;
+    if (need > buf_len - pos) {
+      // Overflow — fail closed: produce an empty string so the caller's
+      // (typically uninitialized) buffer is NUL-terminated and policy
+      // evaluation rejects rather than reading garbage.
+      buf[0] = '\0';
+      return;
     }
-    // Extract the value portion after the colon from "type:value" format
-    const char* attr = user->attributes[i].value;
-    const char* colon = strchr(attr, ':');
-    const char* value = colon ? colon + 1 : attr;
-    size_t val_len = strlen(value);
-    if (pos + val_len >= buf_len - 1) {
-      val_len = buf_len - pos - 1;
-    }
-    memcpy(buf + pos, value, val_len);
-    pos += val_len;
+    if (pos > 0) buf[pos++] = ',';
+    memcpy(buf + pos, token, tok_len);
+    pos += tok_len;
   }
 
-  // Append temporary attribute values
+  // Append temporary attribute values (full "name:value" tokens).
   temp_attr_list_t* temp = user->temp_attrs;
-  while (temp != NULL && pos < buf_len - 1) {
-    if (pos > 0 && pos < buf_len - 1) {
-      buf[pos++] = ',';
+  while (temp != NULL) {
+    const char* token = temp->value;
+    size_t tok_len = strlen(token);
+    if (tok_len > 0) {
+      size_t need = (pos > 0 ? 1 : 0) + tok_len + 1;
+      if (need > buf_len - pos) {
+        buf[0] = '\0';
+        return;
+      }
+      if (pos > 0) buf[pos++] = ',';
+      memcpy(buf + pos, token, tok_len);
+      pos += tok_len;
     }
-    // Use the value portion of temp attrs
-    const char* value = temp->value;
-    size_t val_len = strlen(value);
-    if (pos + val_len >= buf_len - 1) {
-      val_len = buf_len - pos - 1;
-    }
-    memcpy(buf + pos, value, val_len);
-    pos += val_len;
     temp = temp->next;
   }
 
@@ -925,6 +935,7 @@ static crabs_error_e _verify_user_signature(
     const user_t* user,
     const char* key_id,
     signature_scheme_e sig_scheme,
+    uint64_t now_ms,
     const uint8_t* serialized_op, size_t op_len,
     const uint8_t* signature, uint32_t signature_len) {
   if (sig_scheme == SCHEME_UNSPECIFIED && (key_id == NULL || key_id[0] == '\0')) {
@@ -940,6 +951,13 @@ static crabs_error_e _verify_user_signature(
     user_key_t* key = user_key_find((user_t*)user, key_id);
     if (key == NULL) return CRABS_ERR_RESOURCE_NOT_FOUND;
     if (key->status != KEY_ACTIVE) return CRABS_ERR_UNAUTHORIZED;
+    // Audit H-C: enforce key expiry. A key with expires_at set and past is
+    // rejected (now_ms == 0 means the platform has not injected a clock yet;
+    // in that case we do not enforce time-based expiry, matching the prior
+    // behavior, but a future-dated expiry is still respected).
+    if (key->expires_at != 0 && now_ms != 0 && key->expires_at <= now_ms) {
+      return CRABS_ERR_UNAUTHORIZED;
+    }
     if (sig_scheme != SCHEME_UNSPECIFIED && key->scheme != sig_scheme) {
       return CRABS_ERR_CRYPTOGRAPHIC_ERROR;
     }
@@ -953,6 +971,9 @@ static crabs_error_e _verify_user_signature(
   if (sig_scheme != SCHEME_UNSPECIFIED) {
     user_key_t* key = user_key_find_active((user_t*)user, sig_scheme);
     if (key == NULL) return CRABS_ERR_RESOURCE_NOT_FOUND;
+    if (key->expires_at != 0 && now_ms != 0 && key->expires_at <= now_ms) {
+      return CRABS_ERR_UNAUTHORIZED;
+    }
     return _verify_sig_with_scheme(key->scheme,
                                     key->public_key, key->public_key_len,
                                     serialized_op, (uint32_t)op_len,
@@ -1008,6 +1029,7 @@ verify_result_t crypto_verify_operation_auth_v2(
     // collapse the "bad signature" vs "lacks attributes" distinction into a
     // single UNAUTHORIZED so a caller cannot distinguish them.
     crabs_error_e sig_rc = _verify_user_signature(user, key_id, sig_scheme,
+                                                    attr_machine->current_time_ms,
                                                     serialized_op, op_len,
                                                     signature, signature_len);
     if (sig_rc != CRABS_SUCCESS) {
@@ -1047,6 +1069,7 @@ verify_result_t crypto_verify_operation_auth_v2(
           crabs_error_e sig_rc;
           if (sig_scheme != SCHEME_UNSPECIFIED || (key_id != NULL && key_id[0] != '\0')) {
             sig_rc = _verify_user_signature(user, key_id, sig_scheme,
+                                             attr_machine->current_time_ms,
                                              serialized_op, op_len,
                                              signature, signature_len);
           } else {
@@ -1095,6 +1118,7 @@ crabs_error_e crypto_verify_co_signature(
                                               : CRABS_ERR_USER_NOT_FOUND;
   }
   return _verify_user_signature(user, key_id, sig_scheme,
+                                  attr_machine->current_time_ms,
                                   serialized_op, op_len,
                                   signature, signature_len);
 }

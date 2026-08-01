@@ -1199,14 +1199,14 @@ policy_preprocess_result_t preprocess_policy(const char* policy, const state_t* 
   // Step 2: Parse the policy into an AST
   condition_node_t* ast = condition_parse(work_buf);
   if (ast == NULL) {
-    // If we can't parse as a condition expression, treat as an attribute policy.
-    // Strip "type:" prefix (e.g., "role:admin" → "admin") for ABE evaluation.
-    const char* colon = strrchr(work_buf, ':');
-    if (colon != NULL && colon[1] != '\0') {
-      strncpy(result.abe_policy, colon + 1, CRABS_MAX_POLICY_EXPR - 1);
-    } else {
-      strncpy(result.abe_policy, work_buf, CRABS_MAX_POLICY_EXPR - 1);
-    }
+    // Not a condition expression — treat as a bare attribute policy. Keep the
+    // full "name:value" token: _build_attr_string emits "name:value" tokens and
+    // crypto_abe_eval_policy matches whole tokens, so "role:admin" matches
+    // "role:admin" exactly. Stripping the name prefix here (the old behavior)
+    // made "role:admin" and "dept:admin" collide and let a self-asserted
+    // "clearance:admin" satisfy a "role:admin" policy (audit F-1).
+    strncpy(result.abe_policy, work_buf, CRABS_MAX_POLICY_EXPR - 1);
+    result.abe_policy[CRABS_MAX_POLICY_EXPR - 1] = '\0';
     result.resolved_ok = true;
     return result;
   }

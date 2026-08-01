@@ -158,6 +158,66 @@ TEST_F(TestTrigger, TestProcessTriggersConditionTrue) {
   EXPECT_EQ(state->triggers[0].last_triggered_at, 1000u);
 }
 
+// Regression for audit H-E: a trigger firing CHANGE_POLICY must NOT weaken
+// authorization. (1) An empty policy_expression is rejected — it would
+// remove attribute gating for the target op. (2) A change targeting a
+// BUILTIN op (here __force_unlock__) is rejected — builtin policies must
+// be changed by a direct signed operation, not a trigger side effect, so a
+// holder of __create_trigger__ authority cannot escalate by weakening the
+// force-unlock or change-config policy.
+TEST_F(TestTrigger, TestChangePolicyRejectsEmptyAndBuiltinTargets) {
+  data_item_t* views = data_item_create("views", DATA_TYPE_COUNTER, CRDT_G_COUNTER);
+  g_counter_t* gc = g_counter_create();
+  g_counter_increment(gc, "nodeA", 100);
+  views->value = gc;
+  state_add_item(state, views);
+
+  // Case 1: empty policy_expression → rejected, trigger does not fire.
+  {
+    trigger_effect_t effect;
+    memset(&effect, 0, sizeof(effect));
+    effect.type = TRIGGER_EFFECT_CHANGE_POLICY;
+    strncpy(effect.policy_operation, "__read__", CRABS_MAX_OP_NAME - 1);
+    effect.policy_expression[0] = '\0'; // empty — would remove attribute gating
+    trigger_t* trigger = trigger_create("empty_policy", "Fires when views >= 50",
+      "views >= 50", &effect, 0, false, "admin");
+    ASSERT_NE(trigger, nullptr);
+    state->trigger_count = 1;
+    state->triggers = (trigger_t*)realloc(state->triggers, sizeof(trigger_t));
+    state->triggers[0] = *trigger;
+    free(trigger);
+    uint32_t fired = trigger_process_all(state, state->triggers, state->trigger_count, NULL, 1000);
+    EXPECT_EQ(fired, 0u); // did not fire (effect rejected)
+    // Clean up this trigger's AST before reusing the slot in case 2.
+    condition_node_destroy(state->triggers[0].condition_ast);
+    state->triggers[0].condition_ast = NULL;
+    state->trigger_count = 0;
+    free(state->triggers);
+    state->triggers = NULL;
+  }
+
+  // Case 2: builtin target (__force_unlock__) → rejected.
+  {
+    trigger_effect_t effect;
+    memset(&effect, 0, sizeof(effect));
+    effect.type = TRIGGER_EFFECT_CHANGE_POLICY;
+    strncpy(effect.policy_operation, "__force_unlock__", CRABS_MAX_OP_NAME - 1);
+    strncpy(effect.policy_expression, "role:member", CRABS_MAX_POLICY_EXPR - 1);
+    trigger_t* trigger = trigger_create("weaken_force_unlock", "Fires when views >= 50",
+      "views >= 50", &effect, 0, false, "admin");
+    ASSERT_NE(trigger, nullptr);
+    state->trigger_count = 1;
+    state->triggers = (trigger_t*)realloc(state->triggers, sizeof(trigger_t));
+    state->triggers[0] = *trigger;
+    free(trigger);
+    uint32_t fired = trigger_process_all(state, state->triggers, state->trigger_count, NULL, 1000);
+    EXPECT_EQ(fired, 0u); // rejected — builtin policy not changed
+    // The force-unlock policy is NOT added.
+    EXPECT_EQ(state_find_policy(state, "__force_unlock__"), nullptr);
+    // TearDown's state_destroy will free the remaining trigger's AST.
+  }
+}
+
 TEST_F(TestTrigger, TestProcessTriggersConditionFalse) {
   // Add a counter item "views" with value 10
   data_item_t* views = data_item_create("views", DATA_TYPE_COUNTER, CRDT_G_COUNTER);

@@ -129,6 +129,7 @@ bool operation_is_builtin(const char* type) {
           strcmp(type, CRABS_OP_ROTATE_KEY) == 0 ||
           strcmp(type, CRABS_OP_DEFINE_OPERATION) == 0 ||
           strcmp(type, CRABS_OP_CHECK_DEDUP) == 0 ||
+          strcmp(type, CRABS_OP_EXECUTE_OT) == 0 ||
           strcmp(type, CRABS_OP_COMPACT) == 0);
 }
 
@@ -349,6 +350,16 @@ crabs_error_e state_machine_execute(state_t* state, operation_t* op) {
   uint64_t now_ms = (uint64_t)time(NULL) * 1000;
   state_machine_prune_expired(state, now_ms);
 
+  // Audit H-C: inject the wall clock into the attribute machine and prune
+  // expired temporary attributes BEFORE authorization. Without this, an
+  // expired temporary attribute (issued via attribute_machine_issue_temporary)
+  // would continue to satisfy policies indefinitely — current_time_ms stays 0
+  // and prune_expired_temporary never removes anything.
+  if (state->attr_machine != NULL) {
+    attribute_machine_set_time(state->attr_machine, now_ms);
+    attribute_machine_prune_expired_temporary(state->attr_machine);
+  }
+
   // Step 2: Idempotency check
   if (is_duplicate_op(state, op->uuid)) {
     return CRABS_SUCCESS;
@@ -382,8 +393,16 @@ crabs_error_e state_machine_execute(state_t* state, operation_t* op) {
   }
 
   // Step 5: Dedup guard check (v1.4 §5.2)
-  if (op->dedup.type != DEDUP_NONE) {
-    crabs_error_e dedup_result = dedup_check_guard(state, op);
+  // Audit F-2: enforce the SERVER-REGISTERED dedup spec when one exists for
+  // this operation type, so a signer cannot bypass "vote once" by setting
+  // dedup.type = DEDUP_NONE (or a trivial custom condition) on the wire. The
+  // op-carried spec is only consulted when no spec is registered for the
+  // operation type (legacy/dynamic ops). The registered spec also wins for
+  // the mutation in step 8.
+  const dedup_spec_t* registered_dedup = state_find_op_type_def(state, op->type);
+  const dedup_spec_t* effective_dedup = registered_dedup ? registered_dedup : &op->dedup;
+  if (effective_dedup->type != DEDUP_NONE) {
+    crabs_error_e dedup_result = dedup_check_guard_spec(state, effective_dedup, op);
     if (dedup_result != CRABS_SUCCESS) {
       return dedup_result;
     }
@@ -573,14 +592,42 @@ crabs_error_e state_machine_execute(state_t* state, operation_t* op) {
     // Compaction operation (v1.5.2 §4.3)
     result = state_machine_op_compact(state, op);
   } else {
-    result = CRABS_ERR_INVALID_PARAM;
+    // Audit F-5: non-builtin (application-defined) operations have no C
+    // handler in this implementation. Their effect is the dedup state
+    // mutation (step 8) plus the protocol transition applied below.
+    // Previously the dispatch rejected them, which left the LOCKED→MODIFIED
+    // transition unreachable and made __verify__/__unlock__ impossible (the
+    // entire resource lifecycle could only end in force-unlock/rollback).
+    result = CRABS_SUCCESS;
   }
 
   if (result != CRABS_SUCCESS) return result;
 
+  // Step 7b: Apply protocol state transitions for non-builtin operations
+  // (§6.3 wildcard: LOCKED → MODIFIED). Builtin operations manage their own
+  // protocol state in their handlers (e.g. __lock__ sets LOCKED, __verify__
+  // sets VERIFIED or ERROR). This is the only path that reaches MODIFIED,
+  // without which __verify__ (which requires MODIFIED) can never succeed.
+  if (!operation_is_builtin(op->type)) {
+    for (uint32_t i = 0; i < op->resource_count; i++) {
+      data_item_t* item = state_find_item(state, op->resources[i]);
+      if (item == NULL) return CRABS_ERR_RESOURCE_NOT_FOUND;
+      if (item->type != DATA_TYPE_RESOURCE) continue; // only RESOURCE has protocol state
+      if (item->protocol_state == PROTOCOL_LOCKED) {
+        item->protocol_state = PROTOCOL_MODIFIED;
+      } else {
+        // A user operation may only be applied to a LOCKED resource (the
+        // wildcard transition). Other states require a builtin transition.
+        return CRABS_ERR_PROTOCOL_VIOLATION;
+      }
+    }
+  }
+
   // Step 8: Apply dedup state mutation (v1.4 §5.3)
-  if (op->dedup.type != DEDUP_NONE) {
-    crabs_error_e mut_result = dedup_apply_mutation(state, op);
+  // Audit F-2: apply the same effective spec used in step 5 (registered wins
+  // over op-carried), so the mutation matches the guard that was checked.
+  if (effective_dedup->type != DEDUP_NONE) {
+    crabs_error_e mut_result = dedup_apply_mutation_spec(state, effective_dedup, op);
     if (mut_result != CRABS_SUCCESS) {
       // Mutation failure doesn't roll back the operation,
       // but we log the error for diagnostics
@@ -1147,7 +1194,13 @@ crabs_error_e state_machine_op_refresh_key(state_t* state, operation_t* op,
   // Find the requesting user
   user_t* user = attribute_machine_find_user(state->attr_machine, op->signer_id);
   if (user == NULL) return CRABS_ERR_USER_NOT_FOUND;
-  if (user->status == USER_SUSPENDED) return CRABS_ERR_USER_SUSPENDED;
+  // Audit H-C: whitelist the status — only ACTIVE users may refresh. SUSPENDED
+  // and REVOKED are both rejected (previously only SUSPENDED was checked, so a
+  // revoked user could still obtain a fresh ABE key envelope).
+  if (user->status != USER_ACTIVE) {
+    return (user->status == USER_SUSPENDED) ? CRABS_ERR_USER_SUSPENDED
+                                              : CRABS_ERR_USER_NOT_FOUND;
+  }
 
   // Compute attributes hash for current attribute set
   uint8_t attr_hash[CRABS_HASH_SIZE];

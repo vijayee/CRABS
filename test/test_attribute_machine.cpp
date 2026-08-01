@@ -331,6 +331,57 @@ TEST_F(TestAttributeMachine, TestSuspendUserNotFound) {
   EXPECT_EQ(result, CRABS_ERR_USER_NOT_FOUND);
 }
 
+// Regression for audit H-C: attribute_machine_revoke_user sets USER_REVOKED.
+// Revocation is terminal — the enum value was previously declared but never
+// assigned, so there was no way to actually revoke a user.
+TEST_F(TestAttributeMachine, TestRevokeUser) {
+  uint8_t user_pk[33];
+  memset(user_pk, 0xCD, 33);
+  ASSERT_EQ(attribute_machine_register_user(am, "alice", user_pk, NULL), CRABS_SUCCESS);
+
+  user_t* alice = attribute_machine_find_user(am, "alice");
+  ASSERT_NE(alice, nullptr);
+  EXPECT_EQ(alice->status, USER_ACTIVE);
+
+  EXPECT_EQ(attribute_machine_revoke_user(am, "alice"), CRABS_SUCCESS);
+  alice = attribute_machine_find_user(am, "alice");
+  ASSERT_NE(alice, nullptr);
+  EXPECT_EQ(alice->status, USER_REVOKED);
+}
+
+TEST_F(TestAttributeMachine, TestRevokeUserNotFound) {
+  EXPECT_EQ(attribute_machine_revoke_user(am, "nonexistent"), CRABS_ERR_USER_NOT_FOUND);
+}
+
+// Regression for audit H-C: temp attributes with expires_at in the past are
+// pruned once the platform injects a wall clock via attribute_machine_set_time.
+// Without set_time, current_time_ms stays 0 and expired temp attrs are never
+// pruned (they would grant authority indefinitely).
+TEST_F(TestAttributeMachine, TestTempAttrExpiredAfterSetTime) {
+  uint8_t user_pk[33];
+  memset(user_pk, 0xCD, 33);
+  ASSERT_EQ(attribute_machine_register_user(am, "alice", user_pk, "role:member"), CRABS_SUCCESS);
+
+  // Issue a temp attribute with 5000ms duration at time 1000 → expires at 6000.
+  // issue_temporary grants to users whose attribute NAME matches `role`; alice
+  // has "role:member" so name "role" matches.
+  attribute_machine_set_time(am, 1000);
+  ASSERT_EQ(attribute_machine_issue_temporary(am, "clearance", "confidential", "role", 5000), CRABS_SUCCESS);
+
+  user_t* alice = attribute_machine_find_user(am, "alice");
+  ASSERT_NE(alice, nullptr);
+  EXPECT_EQ(alice->temp_attrs == NULL, false); // temp attr present
+
+  // Advance time past expiry and prune.
+  attribute_machine_set_time(am, 7000);
+  uint32_t pruned = attribute_machine_prune_expired_temporary(am);
+  EXPECT_GT(pruned, 0u);
+
+  alice = attribute_machine_find_user(am, "alice");
+  ASSERT_NE(alice, nullptr);
+  EXPECT_EQ(alice->temp_attrs, nullptr); // expired temp attr removed
+}
+
 TEST_F(TestAttributeMachine, TestFindUser) {
   uint8_t user_pk[33];
   memset(user_pk, 0xCD, 33);
@@ -644,4 +695,26 @@ TEST_F(TestAttributeMachine, TestSelfAssertRejectsPrivileged) {
   // A non-privileged self-assert still works.
   EXPECT_EQ(attribute_machine_self_assert(am, "email", "alice@example.com", "alice"),
             CRABS_SUCCESS);
+}
+
+// Regression for audit F-1: a self-asserted attribute whose name is not
+// privileged but whose value is a privileged word (e.g. clearance:admin) is
+// stored as the whole token "clearance:admin". The end-to-end authorization
+// regression (that this token does not satisfy "role:admin") lives in
+// test_crypto.cpp's VerifyAuthTest.SelfAssertValueDoesNotAuthorize.
+TEST_F(TestAttributeMachine, TestSelfAssertValueCollisionStoredNamespaced) {
+  uint8_t user_pk[33];
+  memset(user_pk, 0xCC, 33);
+  ASSERT_EQ(attribute_machine_register_user(am, "alice", user_pk, "dept:eng"), CRABS_SUCCESS);
+
+  ASSERT_EQ(attribute_machine_self_assert(am, "clearance", "admin", "alice"),
+            CRABS_SUCCESS);
+
+  user_t* alice = attribute_machine_find_user(am, "alice");
+  ASSERT_NE(alice, nullptr);
+  bool found = false;
+  for (uint32_t i = 0; i < alice->attribute_count; i++) {
+    if (strcmp(alice->attributes[i].value, "clearance:admin") == 0) found = true;
+  }
+  EXPECT_TRUE(found);
 }

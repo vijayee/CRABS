@@ -435,6 +435,27 @@ crabs_error_e attribute_machine_suspend_user(attribute_machine_t* am, const char
   return CRABS_SUCCESS;
 }
 
+// Audit H-C: revocation is terminal. A revoked user is rejected by every
+// authorization gate (all gates check status == USER_ACTIVE, a whitelist),
+// and may not refresh keys. Re-registration is required to restore access.
+crabs_error_e attribute_machine_revoke_user(attribute_machine_t* am, const char* user_id) {
+  if (am == NULL || user_id == NULL) return CRABS_ERR_INVALID_PARAM;
+
+  user_t* user = attribute_machine_find_user(am, user_id);
+  if (user == NULL) return CRABS_ERR_USER_NOT_FOUND;
+
+  user->status = USER_REVOKED;
+  user->key_version++;
+  am->base_state.version++;
+
+  return CRABS_SUCCESS;
+}
+
+void attribute_machine_set_time(attribute_machine_t* am, uint64_t now_ms) {
+  if (am == NULL) return;
+  am->current_time_ms = now_ms;
+}
+
 // ============================================================
 // Query Functions
 // ============================================================

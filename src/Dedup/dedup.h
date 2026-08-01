@@ -20,6 +20,15 @@
 // Returns CRABS_SUCCESS if the guard passes, or an appropriate error code.
 crabs_error_e dedup_check_guard(const state_t* state, const operation_t* op);
 
+// Audit F-2: check/apply an explicit dedup spec. The executor uses the
+// server-registered spec (state_find_op_type_def) when one exists, so a
+// signer cannot bypass "vote once" by setting dedup.type = DEDUP_NONE on
+// the wire. The op-carried spec is only consulted when no spec is
+// registered for the operation type.
+crabs_error_e dedup_check_guard_spec(const state_t* state,
+                                        const dedup_spec_t* spec,
+                                        const operation_t* op);
+
 // ============================================================
 // Dedup State Mutation (§5.3)
 // ============================================================
@@ -27,6 +36,10 @@ crabs_error_e dedup_check_guard(const state_t* state, const operation_t* op);
 // Apply the dedup state mutation after successful operation execution.
 // Returns CRABS_SUCCESS on success.
 crabs_error_e dedup_apply_mutation(state_t* state, const operation_t* op);
+
+crabs_error_e dedup_apply_mutation_spec(state_t* state,
+                                          const dedup_spec_t* spec,
+                                          const operation_t* op);
 
 // ============================================================
 // Desugaring helpers

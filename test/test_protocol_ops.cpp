@@ -295,7 +295,12 @@ TEST_F(TestProtocolOps, LockNonResourceTypeMismatch) {
 // Custom (Non-Builtin) Operation Rejection
 // ============================================================
 
-TEST_F(TestProtocolOps, CustomOperationRejected) {
+// Audit F-5: application-defined (non-builtin) operations are now accepted
+// rather than rejected. They have no C handler; their effect is the dedup
+// state mutation (if any) plus the protocol transition on their resources.
+// A custom op with no resources and a registered (empty) policy is a no-op
+// that succeeds and is recorded in the log.
+TEST_F(TestProtocolOps, CustomOperationAcceptedNoResources) {
   state_add_policy(state, "custom_transfer", "");
 
   operation_t* op = operation_create("custom_transfer");
@@ -305,7 +310,89 @@ TEST_F(TestProtocolOps, CustomOperationRejected) {
   sign_op(op);
 
   crabs_error_e rc = state_machine_execute(state, op);
-  EXPECT_EQ(rc, CRABS_ERR_INVALID_PARAM);
+  EXPECT_EQ(rc, CRABS_SUCCESS);
+  operation_destroy(op);
+}
+
+// Audit F-5: a custom op applied to a LOCKED resource transitions it to
+// MODIFIED (§6.3 wildcard). This is the only path that reaches MODIFIED,
+// making __verify__/__unlock__ reachable. The op must declare the resource
+// with required_state=LOCKED.
+TEST_F(TestProtocolOps, CustomOperationTransitionsLockedToModified) {
+  state_add_policy(state, "custom_transfer", "");
+
+  // Lock res1 first.
+  operation_t* lock = operation_create(CRABS_OP_LOCK);
+  memset(lock->uuid, 0x91, CRABS_UUID_SIZE);
+  lock->resources = (char(*)[CRABS_MAX_USER_ID])malloc(sizeof(char[CRABS_MAX_USER_ID]));
+  strncpy(lock->resources[0], "res1", CRABS_MAX_USER_ID - 1);
+  lock->resource_count = 1;
+  lock->required_state = (protocol_state_e*)malloc(sizeof(protocol_state_e));
+  lock->required_state[0] = PROTOCOL_IDLE;
+  lock->next_state = (protocol_state_e*)malloc(sizeof(protocol_state_e));
+  lock->next_state[0] = PROTOCOL_LOCKED;
+  strncpy(lock->signer_id, "alice", CRABS_MAX_USER_ID - 1);
+  sign_op(lock);
+  ASSERT_EQ(state_machine_execute(state, lock), CRABS_SUCCESS);
+  operation_destroy(lock);
+
+  data_item_t* res1 = state_find_item(state, "res1");
+  ASSERT_NE(res1, nullptr);
+  ASSERT_EQ(res1->protocol_state, PROTOCOL_LOCKED);
+
+  // Apply a custom op on the locked resource → MODIFIED.
+  operation_t* op = operation_create("custom_transfer");
+  memset(op->uuid, 0x92, CRABS_UUID_SIZE);
+  op->resources = (char(*)[CRABS_MAX_USER_ID])malloc(sizeof(char[CRABS_MAX_USER_ID]));
+  strncpy(op->resources[0], "res1", CRABS_MAX_USER_ID - 1);
+  op->resource_count = 1;
+  op->required_state = (protocol_state_e*)malloc(sizeof(protocol_state_e));
+  op->required_state[0] = PROTOCOL_LOCKED;
+  op->next_state = (protocol_state_e*)malloc(sizeof(protocol_state_e));
+  op->next_state[0] = PROTOCOL_MODIFIED;
+  strncpy(op->signer_id, "alice", CRABS_MAX_USER_ID - 1);
+  sign_op(op);
+
+  EXPECT_EQ(state_machine_execute(state, op), CRABS_SUCCESS);
+  EXPECT_EQ(res1->protocol_state, PROTOCOL_MODIFIED);
+  operation_destroy(op);
+
+  // Now __verify__ is reachable (requires MODIFIED).
+  operation_t* verify = operation_create(CRABS_OP_VERIFY);
+  memset(verify->uuid, 0x93, CRABS_UUID_SIZE);
+  verify->resources = (char(*)[CRABS_MAX_USER_ID])malloc(sizeof(char[CRABS_MAX_USER_ID]));
+  strncpy(verify->resources[0], "res1", CRABS_MAX_USER_ID - 1);
+  verify->resource_count = 1;
+  verify->required_state = (protocol_state_e*)malloc(sizeof(protocol_state_e));
+  verify->required_state[0] = PROTOCOL_MODIFIED;
+  verify->next_state = (protocol_state_e*)malloc(sizeof(protocol_state_e));
+  verify->next_state[0] = PROTOCOL_VERIFIED;
+  strncpy(verify->signer_id, "alice", CRABS_MAX_USER_ID - 1);
+  sign_op(verify);
+  EXPECT_EQ(state_machine_execute(state, verify), CRABS_SUCCESS);
+  EXPECT_EQ(res1->protocol_state, PROTOCOL_VERIFIED);
+  operation_destroy(verify);
+}
+
+// Audit F-5: a custom op on a non-LOCKED resource (e.g. IDLE) is rejected —
+// the wildcard transition only applies LOCKED→MODIFIED.
+TEST_F(TestProtocolOps, CustomOperationOnIdleResourceRejected) {
+  state_add_policy(state, "custom_transfer", "");
+
+  operation_t* op = operation_create("custom_transfer");
+  memset(op->uuid, 0x94, CRABS_UUID_SIZE);
+  op->resources = (char(*)[CRABS_MAX_USER_ID])malloc(sizeof(char[CRABS_MAX_USER_ID]));
+  strncpy(op->resources[0], "res1", CRABS_MAX_USER_ID - 1);
+  op->resource_count = 1;
+  op->required_state = (protocol_state_e*)malloc(sizeof(protocol_state_e));
+  op->required_state[0] = PROTOCOL_IDLE;  // not LOCKED
+  op->next_state = (protocol_state_e*)malloc(sizeof(protocol_state_e));
+  op->next_state[0] = PROTOCOL_MODIFIED;
+  strncpy(op->signer_id, "alice", CRABS_MAX_USER_ID - 1);
+  sign_op(op);
+
+  crabs_error_e rc = state_machine_execute(state, op);
+  EXPECT_EQ(rc, CRABS_ERR_PROTOCOL_VIOLATION);
   operation_destroy(op);
 }
 

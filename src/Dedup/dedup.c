@@ -36,16 +36,18 @@ data_item_t* dedup_resolve_path(state_t* state, const char* path) {
 // ever becomes concurrent, the guard/mutation pair must be made atomic
 // (e.g. a per-state lock around steps 5 and 8).
 
-crabs_error_e dedup_check_guard(const state_t* state, const operation_t* op) {
-  if (state == NULL || op == NULL) return CRABS_ERR_INVALID_PARAM;
+crabs_error_e dedup_check_guard_spec(const state_t* state,
+                                        const dedup_spec_t* spec,
+                                        const operation_t* op) {
+  if (state == NULL || op == NULL || spec == NULL) return CRABS_ERR_INVALID_PARAM;
 
-  switch (op->dedup.type) {
+  switch (spec->type) {
     case DEDUP_NONE:
       return CRABS_SUCCESS;
 
     case DEDUP_PER_USER: {
       // Find the tracker ONE_SHOT_SET
-      data_item_t* tracker = state_find_item((state_t*)state, op->dedup.tracker_path);
+      data_item_t* tracker = state_find_item((state_t*)state, spec->tracker_path);
       if (tracker == NULL) return CRABS_ERR_TRACKER_NOT_FOUND;
 
       // Verify it's a ONE_SHOT_SET
@@ -61,7 +63,7 @@ crabs_error_e dedup_check_guard(const state_t* state, const operation_t* op) {
 
     case DEDUP_GLOBAL: {
       // Find the flag ONE_SHOT_FLAG
-      data_item_t* flag_item = state_find_item((state_t*)state, op->dedup.flag_path);
+      data_item_t* flag_item = state_find_item((state_t*)state, spec->flag_path);
       if (flag_item == NULL) return CRABS_ERR_FLAG_NOT_FOUND;
 
       // Verify it's a ONE_SHOT_FLAG
@@ -77,8 +79,8 @@ crabs_error_e dedup_check_guard(const state_t* state, const operation_t* op) {
 
     case DEDUP_CUSTOM: {
       // Evaluate the condition expression against the current state
-      if (op->dedup.condition[0] == '\0') return CRABS_ERR_CONDITION_NOT_MET;
-      condition_node_t* ast = condition_parse(op->dedup.condition);
+      if (spec->condition[0] == '\0') return CRABS_ERR_CONDITION_NOT_MET;
+      condition_node_t* ast = condition_parse(spec->condition);
       if (ast == NULL) return CRABS_ERR_CONDITION_NOT_MET;
       bool result = condition_evaluate(ast, state);
       condition_node_destroy(ast);
@@ -90,20 +92,27 @@ crabs_error_e dedup_check_guard(const state_t* state, const operation_t* op) {
   }
 }
 
+crabs_error_e dedup_check_guard(const state_t* state, const operation_t* op) {
+  if (state == NULL || op == NULL) return CRABS_ERR_INVALID_PARAM;
+  return dedup_check_guard_spec(state, &op->dedup, op);
+}
+
 // ============================================================
 // Dedup State Mutation (§5.3)
 // ============================================================
 
-crabs_error_e dedup_apply_mutation(state_t* state, const operation_t* op) {
-  if (state == NULL || op == NULL) return CRABS_ERR_INVALID_PARAM;
+crabs_error_e dedup_apply_mutation_spec(state_t* state,
+                                          const dedup_spec_t* spec,
+                                          const operation_t* op) {
+  if (state == NULL || op == NULL || spec == NULL) return CRABS_ERR_INVALID_PARAM;
 
-  switch (op->dedup.type) {
+  switch (spec->type) {
     case DEDUP_NONE:
       return CRABS_SUCCESS;
 
     case DEDUP_PER_USER: {
       // Add signer to the tracker ONE_SHOT_SET
-      data_item_t* tracker = state_find_item(state, op->dedup.tracker_path);
+      data_item_t* tracker = state_find_item(state, spec->tracker_path);
       if (tracker == NULL) return CRABS_ERR_TRACKER_NOT_FOUND;
       if (tracker->type != DATA_TYPE_ONE_SHOT_SET) return CRABS_ERR_TRACKER_NOT_FOUND;
 
@@ -115,7 +124,7 @@ crabs_error_e dedup_apply_mutation(state_t* state, const operation_t* op) {
 
     case DEDUP_GLOBAL: {
       // Set the flag ONE_SHOT_FLAG
-      data_item_t* flag_item = state_find_item(state, op->dedup.flag_path);
+      data_item_t* flag_item = state_find_item(state, spec->flag_path);
       if (flag_item == NULL) return CRABS_ERR_FLAG_NOT_FOUND;
       if (flag_item->type != DATA_TYPE_ONE_SHOT_FLAG) return CRABS_ERR_FLAG_NOT_FOUND;
 
@@ -126,7 +135,7 @@ crabs_error_e dedup_apply_mutation(state_t* state, const operation_t* op) {
     }
 
     case DEDUP_CUSTOM: {
-      state_mutation_t* mut = (state_mutation_t*)&op->dedup.update;
+      state_mutation_t* mut = (state_mutation_t*)&spec->update;
       switch (mut->type) {
         case MUTATION_SET_ADD: {
           data_item_t* item = state_find_item(state, mut->set_path);
@@ -192,6 +201,11 @@ crabs_error_e dedup_apply_mutation(state_t* state, const operation_t* op) {
     default:
       return CRABS_ERR_INVALID_PARAM;
   }
+}
+
+crabs_error_e dedup_apply_mutation(state_t* state, const operation_t* op) {
+  if (state == NULL || op == NULL) return CRABS_ERR_INVALID_PARAM;
+  return dedup_apply_mutation_spec(state, &op->dedup, op);
 }
 
 // ============================================================

@@ -209,6 +209,45 @@ TEST_F(DedupGuardTest, GlobalFlagNotFound) {
   operation_destroy(op);
 }
 
+// Regression for audit F-2: when a dedup spec is REGISTERED for an operation
+// type, the server must enforce THAT spec regardless of what dedup the op
+// carries on the wire. A signer cannot bypass "vote once" by setting
+// dedup.type = DEDUP_NONE on their operation. The executor resolves the
+// effective spec via state_find_op_type_def and calls dedup_check_guard_spec
+// with it; this test exercises that exact path.
+TEST_F(DedupGuardTest, RegisteredSpecEnforcedEvenWhenOpCarriesNone) {
+  // Register a PER_USER dedup spec for the "vote" op type.
+  dedup_spec_t spec;
+  memset(&spec, 0, sizeof(spec));
+  spec.type = DEDUP_PER_USER;
+  strncpy(spec.tracker_path, "proposal_42_voters", CRABS_MAX_DEDUP_PATH - 1);
+  ASSERT_EQ(state_register_op_type_def(state, "vote", &spec), CRABS_SUCCESS);
+
+  // Alice has already voted.
+  data_item_t* voters = state_find_item(state, "proposal_42_voters");
+  ASSERT_EQ(one_shot_set_add((one_shot_set_t*)voters->value, "alice"), CRABS_SUCCESS);
+
+  // Attacker submits a "vote" op with dedup.type = DEDUP_NONE to bypass.
+  operation_t* op = operation_create("vote");
+  op->dedup.type = DEDUP_NONE;  // bypass attempt
+  strncpy(op->signer_id, "alice", CRABS_MAX_USER_ID - 1);
+
+  // The executor's resolution: registered wins over op-carried.
+  const dedup_spec_t* registered = state_find_op_type_def(state, "vote");
+  ASSERT_NE(registered, nullptr);
+  const dedup_spec_t* effective = registered;
+  EXPECT_EQ(effective->type, DEDUP_PER_USER);
+
+  // Guard with the EFFECTIVE (registered) spec must reject alice.
+  EXPECT_EQ(dedup_check_guard_spec(state, effective, op), CRABS_ERR_ALREADY_PERFORMED);
+
+  // Sanity: the op-carried spec alone (DEDUP_NONE) would have passed —
+  // confirming the bypass would work without the F-2 fix.
+  EXPECT_EQ(dedup_check_guard(state, op), CRABS_SUCCESS);
+
+  operation_destroy(op);
+}
+
 // ============================================================
 // Dedup state mutation tests
 // ============================================================

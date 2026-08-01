@@ -102,12 +102,30 @@ static crabs_error_e _execute_trigger_effect(state_t* state, trigger_t* trigger,
     }
 
     case TRIGGER_EFFECT_CHANGE_POLICY: {
-      if (trigger->effect.policy_operation[0] != '\0' && trigger->effect.policy_expression[0] != '\0') {
-        crabs_error_e err = state_add_policy(state,
-          trigger->effect.policy_operation,
-          trigger->effect.policy_expression);
-        if (err != CRABS_SUCCESS) return err;
+      // Audit H-E: a trigger firing CHANGE_POLICY can rewrite the
+      // authorization policy for any op — including weakening
+      // __force_unlock__ or __change_config__ to an empty policy that any
+      // signature satisfies, which would let a holder of any attribute
+      // reconfigure the machine. Two guards:
+      //   (1) Never allow an empty policy_expression via a trigger — it
+      //       removes attribute gating. Use a signed __change_config__-class
+      //       op to set an empty policy if that is ever intended.
+      //   (2) Never allow a trigger to change the policy of a BUILTIN op
+      //       type. Triggers may only set policies for application-defined
+      //       (non-builtin) op types; builtin policies must be changed by a
+      //       direct signed operation, not a side effect of condition
+      //       evaluation.
+      if (trigger->effect.policy_operation[0] == '\0') break;
+      if (trigger->effect.policy_expression[0] == '\0') {
+        return CRABS_ERR_INVALID_PARAM;
       }
+      if (operation_is_builtin(trigger->effect.policy_operation)) {
+        return CRABS_ERR_UNAUTHORIZED;
+      }
+      crabs_error_e err = state_add_policy(state,
+        trigger->effect.policy_operation,
+        trigger->effect.policy_expression);
+      if (err != CRABS_SUCCESS) return err;
       break;
     }
 
