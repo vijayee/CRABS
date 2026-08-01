@@ -28,8 +28,10 @@ void crabs_ot_op_id_init(crabs_ot_op_id_t* id, const char* node_id,
 
 bool crabs_ot_op_id_equal(const crabs_ot_op_id_t* a, const crabs_ot_op_id_t* b) {
   if (a == NULL || b == NULL) return a == b;
+  // Audit M-L: an op id is (node_id, sequence_num) — the timestamp is not part
+  // of the identity. Including it here meant a forged timestamp could make the
+  // same logical op appear distinct, bypassing dedup and double-applying.
   return a->sequence_num == b->sequence_num &&
-         a->timestamp == b->timestamp &&
          strncmp(a->node_id, b->node_id, CRABS_MAX_USER_ID) == 0;
 }
 

@@ -283,9 +283,14 @@ crabs_error_e crabs_transform_ot_op(crabs_ot_operation_t* op,
       // Apply forward transform: op' = T(op, log_op)
       crabs_ot_operation_t* transformed = transform_fn(op, log_op);
       if (transformed != NULL) {
-        // Copy transformed fields back to op
+        // Copy transformed fields back to op. Audit F-4: copy back op_type
+        // too — transform functions signal "no-op" by setting op_type = 0
+        // (e.g. delete_delete at the same position). Without copying it back,
+        // the delete was still applied at the same position, deleting
+        // whatever element shifted into it (wrong element deleted).
         op->visible_pos = transformed->visible_pos;
         op->visible_pos_2 = transformed->visible_pos_2;
+        op->op_type = transformed->op_type;
         // Free the returned operation (it's a heap copy)
         if (transformed != op) {
           crabs_ot_operation_destroy(transformed);
@@ -310,6 +315,14 @@ crabs_error_e crabs_transform_ot_op(crabs_ot_operation_t* op,
 crabs_error_e crabs_apply_ot_op(data_item_t* item, crabs_ot_operation_t* op) {
   if (item == NULL || op == NULL) return CRABS_ERR_INVALID_PARAM;
   if (!crabs_is_ot_type((uint32_t)item->type)) return CRABS_ERR_NOT_OT_TYPE;
+
+  // Audit F-4: a transform may mark the op as a no-op by setting op_type = 0
+  // (e.g. delete_delete at the same position, or move_move with the same
+  // source). Skip applying it entirely — applying a no-op'd delete would
+  // delete whatever element shifted into the position (wrong element).
+  if (op->op_type == 0) {
+    return CRABS_SUCCESS;
+  }
 
   switch (item->type) {
     case DATA_TYPE_OT_ORDERED_SET: {
@@ -472,18 +485,33 @@ crabs_error_e crabs_execute_ot_operation(state_t* state, operation_t* op) {
         return apply_err;
       }
 
-      // Append to op log
-      crabs_ot_data_item_append_op(ot_data);
+      // Append a fresh slot to the op log. Audit H-I: check the return — on
+      // failure (capacity cap reached or OOM) append_op does NOT increment
+      // op_log_count, and the prior code then overwrote the last existing
+      // log entry (leaking its payload and destroying causal history). Abort
+      // the whole operation instead.
+      crabs_ot_operation_t* log_entry = crabs_ot_data_item_append_op(ot_data);
+      if (log_entry == NULL) {
+        crabs_ot_ops_free(ot_ops, ot_op_count);
+        return CRABS_ERR_OOM;
+      }
       // Copy the transformed op into the log
-      if (ot_data->op_log != NULL && ot_data->op_log_count > 0) {
-        crabs_ot_operation_t* log_entry = &ot_data->op_log[ot_data->op_log_count - 1];
-        *log_entry = ot_ops[i];
-        // Payload was allocated for the log entry, need to copy
-        if (ot_ops[i].payload != NULL && ot_ops[i].payload_size > 0) {
-          log_entry->payload = get_memory(ot_ops[i].payload_size);
-          memcpy(log_entry->payload, ot_ops[i].payload, ot_ops[i].payload_size);
-          log_entry->payload_size = ot_ops[i].payload_size;
+      *log_entry = ot_ops[i];
+      // Payload was allocated for the log entry, need to copy
+      if (ot_ops[i].payload != NULL && ot_ops[i].payload_size > 0) {
+        log_entry->payload = get_memory(ot_ops[i].payload_size);
+        if (log_entry->payload == NULL) {
+          // Keep the log entry self-consistent (NULL payload, 0 size) so a
+          // later transform reading it doesn't dereference NULL.
+          log_entry->payload_size = 0;
+          crabs_ot_ops_free(ot_ops, ot_op_count);
+          return CRABS_ERR_OOM;
         }
+        memcpy(log_entry->payload, ot_ops[i].payload, ot_ops[i].payload_size);
+        log_entry->payload_size = ot_ops[i].payload_size;
+      } else {
+        log_entry->payload = NULL;
+        log_entry->payload_size = 0;
       }
 
       // Prune log if it exceeds max size

@@ -59,10 +59,25 @@ crabs_ot_operation_t* crabs_transform_insert_insert(
   if (op1->visible_pos > op2->visible_pos) {
     op1->visible_pos += 1;
   } else if (op1->visible_pos == op2->visible_pos) {
-    // Tie-break: lower priority (higher value) shifts right
-    if (op1->priority >= op2->priority) {
-      op1->visible_pos += 1;
+    // Audit F-4: tie-break must be a STRICT total order (antisymmetric) so
+    // both replicas agree on which op shifts. The prior `op1->priority >=
+    // op2->priority` rule shifted BOTH ops when priorities were equal (TP2
+    // violation → divergent documents). Now the op with the lexicographically
+    // larger (priority, node_id) shifts right; the other stays. Exactly one
+    // replica shifts, so both converge.
+    bool shift;
+    if (op1->priority != op2->priority) {
+      shift = (op1->priority > op2->priority);
+    } else {
+      int cmp = strncmp(op1->id.node_id, op2->id.node_id, CRABS_MAX_USER_ID);
+      shift = (cmp > 0);
+      // If node_id is also equal (same node, same priority), the per-node
+      // sequence number is the final tiebreaker — but same-node same-priority
+      // should not happen (sequence_num is unique per node). Default to no
+      // shift to avoid symmetric behavior.
+      if (cmp == 0) shift = false;
     }
+    if (shift) op1->visible_pos += 1;
   }
   return op1;
 }

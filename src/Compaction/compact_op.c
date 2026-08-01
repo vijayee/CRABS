@@ -432,8 +432,11 @@ crabs_ot_operation_t* crabs_transform_insert_compact(
 crabs_ot_operation_t* crabs_transform_delete_compact(
   crabs_ot_operation_t* op1, crabs_ot_operation_t* op2) {
   (void)op2;
+  // Audit F-3: setting visible_pos = 0 but leaving the op live made the
+  // delete remove visible element 0 instead of no-op'ing. Mark it as a
+  // no-op so crabs_apply_ot_op skips it.
   if (op1 != NULL) {
-    op1->visible_pos = 0;
+    op1->op_type = 0;
   }
   return op1;
 }

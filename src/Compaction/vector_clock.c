@@ -128,21 +128,21 @@ bool crabs_check_compaction_safety(const crabs_tombstone_config_t* config,
 
     case CRABS_SAFETY_STRONG:
       // All peers must have acknowledged — local VC must dominate peer VC.
-      // If no peer VC is available, compaction is only safe in a
-      // single-replica deployment (local_vc has at most one entry).
+      // Audit F-3: the prior fallback (`local_vc->count <= 1` when peer_vc is
+      // NULL) always passed because local_vc is never populated outside
+      // src/Compaction, so compaction proceeded without peer agreement and
+      // destroyed concurrent remote operations. Fail closed: multi-replica
+      // deployments MUST call crabs_compaction_engine_set_peer_vc; single-
+      // replica deployments should use CRABS_SAFETY_FORCE.
       if (local_vc == NULL) return false;
-      if (peer_vc == NULL) {
-        return local_vc->count <= 1;
-      }
+      if (peer_vc == NULL) return false;
       return crabs_vector_clock_dominates(local_vc, peer_vc);
 
     case CRABS_SAFETY_QUORUM: {
       // At least quorum_threshold peers must have acknowledged.
       if (local_vc == NULL) return false;
-      if (peer_vc == NULL) {
-        // No peer acknowledgments available: safe only in single-replica mode.
-        return local_vc->count <= 1;
-      }
+      // Audit F-3: fail closed without a peer VC (see STRONG above).
+      if (peer_vc == NULL) return false;
       if (peer_vc->count == 0) return true;  // No peers to wait for
 
       uint32_t acknowledged = 0;

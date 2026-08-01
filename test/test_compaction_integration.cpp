@@ -184,11 +184,17 @@ TEST(CompactionIntegration, CompactSetsLastCompactionTime) {
 
   EXPECT_EQ(item->last_compaction_time, 0u);
 
-  // Run compaction through state machine
+  // Run compaction through state machine. Audit F-3: compaction without a
+  // peer vector clock is now rejected for STRONG/QUORUM safety (the prior
+  // fallback always passed because local_vc was never populated, so
+  // compaction destroyed concurrent remote operations). This is a single-
+  // replica test, so use FORCE mode.
   crabs_compaction_engine_t engine;
   crabs_tombstone_config_t config;
   crabs_tombstone_config_init(&config);
   config.max_tombstone_ratio = 0.3;
+  config.safety_level = CRABS_SAFETY_FORCE;
+  config.allow_force = true;
   crabs_compaction_engine_init(&engine, &config);
   crabs_register_crdt_vtables(&engine.registry);
 
