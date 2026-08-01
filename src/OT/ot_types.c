@@ -180,11 +180,44 @@ void crabs_ot_data_item_set_transform(crabs_ot_data_item_t* item,
   item->transform_matrix[type1 - 1][type2 - 1] = fn;
 }
 
+// Audit F-4: map a concrete op type (document/tree) onto its base transform
+// semantics so the transform matrix — which is indexed by the base types
+// (INSERT/DELETE/UPDATE/MOVE/SWAP/COMPACT, 1..6) — can be consulted. Without
+// this, document/tree op types (0x11-0x24) all exceeded CRABS_OT_OP_TYPE_COUNT,
+// the lookup returned NULL, and concurrent ops were applied untransformed
+// (divergent documents). The mapping:
+//   INSERT_TEXT/INSERT_NODE -> INSERT, DELETE_RANGE/DELETE_NODE -> DELETE,
+//   STYLE/MERGE_SPANS/SPLIT_SPAN -> UPDATE, REPARENT -> MOVE,
+//   REORDER -> SWAP. Unknown types fall back to themselves (base lookup).
+static crabs_ot_op_type_e _base_op_type(crabs_ot_op_type_e t) {
+  switch (t) {
+    case CRABS_OT_OP_INSERT_TEXT:
+    case CRABS_OT_OP_INSERT_NODE:
+      return CRABS_OT_OP_INSERT;
+    case CRABS_OT_OP_DELETE_RANGE:
+    case CRABS_OT_OP_DELETE_NODE:
+      return CRABS_OT_OP_DELETE;
+    case CRABS_OT_OP_STYLE:
+    case CRABS_OT_OP_MERGE_SPANS:
+    case CRABS_OT_OP_SPLIT_SPAN:
+      return CRABS_OT_OP_UPDATE;
+    case CRABS_OT_OP_REPARENT:
+      return CRABS_OT_OP_MOVE;
+    case CRABS_OT_OP_REORDER:
+      return CRABS_OT_OP_SWAP;
+    default:
+      return t; // base types (1..6) and COMPACT pass through
+  }
+}
+
 crabs_ot_transform_fn crabs_ot_data_item_get_transform(const crabs_ot_data_item_t* item,
                                                         crabs_ot_op_type_e type1,
                                                         crabs_ot_op_type_e type2) {
   if (item == NULL) return NULL;
-  if (type1 < 1 || type1 > CRABS_OT_OP_TYPE_COUNT) return NULL;
-  if (type2 < 1 || type2 > CRABS_OT_OP_TYPE_COUNT) return NULL;
-  return item->transform_matrix[type1 - 1][type2 - 1];
+  // Map concrete op types onto base transform semantics before lookup.
+  crabs_ot_op_type_e b1 = _base_op_type(type1);
+  crabs_ot_op_type_e b2 = _base_op_type(type2);
+  if (b1 < 1 || b1 > CRABS_OT_OP_TYPE_COUNT) return NULL;
+  if (b2 < 1 || b2 > CRABS_OT_OP_TYPE_COUNT) return NULL;
+  return item->transform_matrix[b1 - 1][b2 - 1];
 }

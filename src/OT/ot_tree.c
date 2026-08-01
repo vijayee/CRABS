@@ -321,11 +321,16 @@ crabs_tree_node_t* crabs_ot_tree_reparent(
   if (new_parent != NULL) {
     if (new_parent == node) return NULL;
     // Walk ancestors of new_parent; if we reach `node`, it's a descendant.
+    // Audit M-J: bound the walk by node_count — a merge-created parent
+    // cycle (e.g. concurrent X→Y and Y→X) would otherwise spin forever.
+    uint32_t steps = 0;
     crabs_tree_node_t* p = new_parent->parent;
-    while (p != NULL) {
+    while (p != NULL && steps <= tree->node_count) {
       if (p == node) return NULL;
       p = p->parent;
+      steps++;
     }
+    if (p != NULL) return NULL; // cycle detected — refuse to reparent
   }
 
   // Unlink from current parent
@@ -492,6 +497,30 @@ static void _rebuild_links(crabs_ot_tree_t* tree) {
         while (last->next_sibling != NULL) last = last->next_sibling;
         last->next_sibling = n;
         n->prev_sibling = last;
+      }
+    }
+  }
+
+  // Audit M-J: concurrent reparents merged here can create parent cycles
+  // (e.g. dest has X→Y, src has Y→X). Break any cycle so downstream ancestor
+  // walks don't spin. Walk each node's parent chain bounded by node_count+1;
+  // if it doesn't reach a terminal (NULL/root) within the bound, clear that
+  // node's parent link (making it a root). This is deterministic for a given
+  // pool order; full commutativity across merge(A,B) vs merge(B,A) is a
+  // deeper CRDT-tree follow-up.
+  for (crabs_tree_node_t* n = tree->node_pool; n != NULL; n = n->pool_next) {
+    uint32_t steps = 0;
+    crabs_tree_node_t* p = n->parent;
+    while (p != NULL && p != n && steps <= tree->node_count) {
+      p = p->parent;
+      steps++;
+    }
+    if (p == n || (p != NULL && steps > tree->node_count)) {
+      // Cycle through or leading into n: detach n from its parent.
+      if (n->parent != NULL) {
+        _unlink_child(tree, n);
+        n->parent = NULL;
+        n->parent_id[0] = '\0';
       }
     }
   }

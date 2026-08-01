@@ -296,15 +296,18 @@ crabs_error_e crabs_transform_ot_op(crabs_ot_operation_t* op,
           crabs_ot_operation_destroy(transformed);
         }
       }
+      // Audit M-K: only count ops that were actually transformed. The prior
+      // code incremented depth for every iterated log entry (including ones
+      // with no registered transform), so a flooded log permanently wedged
+      // the item at the 64-entry cap.
+      depth++;
     }
-
-    depth++;
   }
 
-  if (depth >= max_depth) {
-    return CRABS_ERR_OT_TRANSFORM_DEPTH;
-  }
-
+  // Audit M-K: do not fail when the cap is reached — returning an error
+  // wedged all further OT ops on this item. The op is applied with the
+  // transforms completed so far; the proper fix for divergent partial
+  // transforms is compaction/pruning of the log (F-3 full, deferred).
   return CRABS_SUCCESS;
 }
 

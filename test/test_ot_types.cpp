@@ -7,6 +7,7 @@
 #include <gtest/gtest.h>
 extern "C" {
 #include "../src/OT/ot_types.h"
+#include "../src/OT/ot_transform.h"
 }
 
 // ============================================================
@@ -86,11 +87,16 @@ TEST(OTTypes, OpIdNotEqualSeqNum) {
   EXPECT_FALSE(crabs_ot_op_id_equal(&a, &b));
 }
 
-TEST(OTTypes, OpIdNotEqualTimestamp) {
+// Audit M-L: an op id is (node_id, sequence_num) — the timestamp is NOT part
+// of the identity. Including it (the old behavior) meant a forged timestamp
+// could make the same logical op appear distinct, bypassing dedup and
+// double-applying. Same node_id + sequence_num is now equal regardless of
+// timestamp.
+TEST(OTTypes, OpIdEqualIgnoresTimestamp) {
   crabs_ot_op_id_t a, b;
   crabs_ot_op_id_init(&a, "node1", 42, 1000);
   crabs_ot_op_id_init(&b, "node1", 42, 2000);
-  EXPECT_FALSE(crabs_ot_op_id_equal(&a, &b));
+  EXPECT_TRUE(crabs_ot_op_id_equal(&a, &b));
 }
 
 TEST(OTTypes, OpIdEqualNull) {
@@ -365,6 +371,46 @@ TEST(OTTypes, DataItemTransformDefaultNull) {
   crabs_ot_transform_fn fn = crabs_ot_data_item_get_transform(item,
     CRABS_OT_OP_INSERT, CRABS_OT_OP_DELETE);
   EXPECT_EQ(fn, nullptr);
+  crabs_ot_data_item_destroy(item);
+}
+
+// Regression for audit F-4: the transform matrix is indexed by the base op
+// types (INSERT/DELETE/UPDATE/MOVE/SWAP, 1..5), but the op types actually
+// executed are the concrete document/tree types (0x11-0x24). Previously
+// get_transform rejected any type > CRABS_OT_OP_TYPE_COUNT (15), so document/
+// tree ops always got NULL and were applied untransformed (divergent
+// documents). Now get_transform maps concrete types to their base semantics
+// before lookup, so a registered INSERT/INSERT transform is found for a
+// (INSERT_TEXT, INSERT_TEXT) pair.
+TEST(OTTypes, ConcreteOpsResolveToBaseTransform) {
+  crabs_ot_data_item_t* item = crabs_ot_data_item_create(1);
+
+  crabs_ot_data_item_set_transform(item, CRABS_OT_OP_INSERT, CRABS_OT_OP_INSERT,
+                                    crabs_transform_insert_insert);
+
+  // Direct base lookup still works.
+  crabs_ot_transform_fn base_fn = crabs_ot_data_item_get_transform(item,
+    CRABS_OT_OP_INSERT, CRABS_OT_OP_INSERT);
+  EXPECT_EQ(base_fn, crabs_transform_insert_insert);
+
+  // Concrete document ops resolve to the base INSERT/INSERT transform.
+  crabs_ot_transform_fn doc_fn = crabs_ot_data_item_get_transform(item,
+    CRABS_OT_OP_INSERT_TEXT, CRABS_OT_OP_INSERT_TEXT);
+  EXPECT_EQ(doc_fn, crabs_transform_insert_insert);
+
+  // Tree INSERT_NODE also resolves to INSERT.
+  crabs_ot_transform_fn tree_fn = crabs_ot_data_item_get_transform(item,
+    CRABS_OT_OP_INSERT_NODE, CRABS_OT_OP_INSERT_NODE);
+  EXPECT_EQ(tree_fn, crabs_transform_insert_insert);
+
+  // DELETE_RANGE resolves to DELETE; a registered DELETE/DELETE transform
+  // is found for the concrete pair.
+  crabs_ot_data_item_set_transform(item, CRABS_OT_OP_DELETE, CRABS_OT_OP_DELETE,
+                                    crabs_transform_delete_delete);
+  crabs_ot_transform_fn del_fn = crabs_ot_data_item_get_transform(item,
+    CRABS_OT_OP_DELETE_RANGE, CRABS_OT_OP_DELETE_RANGE);
+  EXPECT_EQ(del_fn, crabs_transform_delete_delete);
+
   crabs_ot_data_item_destroy(item);
 }
 
