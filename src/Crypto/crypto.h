@@ -21,6 +21,10 @@ typedef struct {
 ecdsa_keypair_t* crypto_ecdsa_generate(void);
 void             crypto_ecdsa_keypair_destroy(ecdsa_keypair_t* keypair);
 
+// Derive the compressed public key (33 bytes) from a 32-byte private key.
+crabs_error_e crypto_ecdsa_derive_public_key(const uint8_t private_key[32],
+                                                uint8_t public_key[33]);
+
 // ============================================================
 // ECDSA Signing (§10.2.1)
 // ============================================================
@@ -165,7 +169,10 @@ crabs_error_e crypto_verify_co_signature(
 // ============================================================
 // Key Envelope (§11.2)
 // ============================================================
-#define KEY_ENVELOPE_FORMAT_V1  0x02  // v2: variable-length ABE user key
+// Audit H-A: v3 wraps the ABE user key in ECIES (ECDH + AES-256-GCM) to the
+// recipient's registered public key, so the envelope is no longer shipped in
+// cleartext. v2 (cleartext sk_abe) is rejected by crypto_key_envelope_verify.
+#define KEY_ENVELOPE_FORMAT_V1  0x03
 
 // Maximum serialized size of a key envelope (used for transport buffers).
 // format_version(1) + user_id(64) + state_version(8) + attributes_hash(32)
@@ -217,6 +224,15 @@ size_t crypto_key_envelope_serialize(const key_envelope_t* env,
 key_envelope_t* crypto_key_envelope_deserialize(const abe_master_key_t* mk,
                                                    const uint8_t* buf, size_t len);
 
+// Audit H-A: decrypt the ECIES-wrapped ABE user key with the recipient's
+// private key. On success, writes the plaintext ABE key to `out` (caller
+// must OPENSSL_cleanse it after importing). Returns CRABS_ERR_UNAUTHORIZED on
+// tag mismatch (wrong recipient or tampering).
+crabs_error_e crypto_key_envelope_decrypt_sk(const key_envelope_t* env,
+                                                const uint8_t user_private_key[32],
+                                                uint8_t* out, size_t out_cap,
+                                                size_t* out_len);
+
 // Secure cleanup
 void crypto_key_envelope_destroy(key_envelope_t* envelope);
 
@@ -229,16 +245,21 @@ crabs_error_e crypto_compute_attributes_hash(
 // Key Compromise Recovery (§11.4)
 // ============================================================
 typedef struct {
-  ecdsa_keypair_t* new_ecdsa_key;    // New ECDSA keypair for the user
+  uint8_t new_public_key[33];   // Echoed: the user's new public key
   key_envelope_t*  new_envelope;     // New ABE key envelope
 } recovery_result_t;
 
-// Revoke compromised keys and rotate: suspend user, generate new keys
+// Audit H-B: node-blind key rotation. The node never generates or learns the
+// user's new ECDSA private key. The user generates their own keypair
+// out-of-band and submits the new public key; the node records it, suspends
+// the compromised key, and issues a new ABE envelope bound to the user's
+// current attributes. The envelope is returned for out-of-band delivery.
 recovery_result_t* crypto_revoke_and_rotate(
     const abe_master_key_t* mk,
     const uint8_t node_private_key[32],
     attribute_machine_t* attr_machine,
     const char* user_id,
+    const uint8_t new_public_key[33],
     uint64_t state_version,
     uint64_t issued_at);
 

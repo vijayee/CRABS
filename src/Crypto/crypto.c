@@ -276,6 +276,24 @@ ecdsa_keypair_t* crypto_ecdsa_generate(void) {
   return keypair;
 }
 
+// Derive the compressed public key (33 bytes) from a 32-byte private key.
+// Used by the CLI to restore node-key custody after loading a serialized
+// state (audit L-l): the operator persists the private key out-of-band and
+// re-custodies it via cli_node_load_key.
+crabs_error_e crypto_ecdsa_derive_public_key(const uint8_t private_key[32],
+                                                uint8_t public_key[33]) {
+  if (private_key == NULL || public_key == NULL) return CRABS_ERR_INVALID_PARAM;
+  EC_KEY* eckey = _eckey_from_private(private_key);
+  if (eckey == NULL) return CRABS_ERR_CRYPTOGRAPHIC_ERROR;
+  point_conversion_form_t form = POINT_CONVERSION_COMPRESSED;
+  size_t pub_len = EC_POINT_point2oct(
+    EC_KEY_get0_group(eckey),
+    EC_KEY_get0_public_key(eckey),
+    form, public_key, 33, NULL);
+  EC_KEY_free(eckey);
+  return (pub_len == 33) ? CRABS_SUCCESS : CRABS_ERR_CRYPTOGRAPHIC_ERROR;
+}
+
 // ============================================================
 // ECDSA Keypair Destroy
 // ============================================================
@@ -1170,6 +1188,114 @@ static uint8_t* _envelope_sign_data_alloc(const key_envelope_t* env, size_t* out
   return buf;
 }
 
+// ============================================================
+// Audit H-A: ECIES envelope transport encryption
+// The ABE user key (sk_abe) is encrypted to the recipient's registered
+// secp256k1 public key so the envelope is not shipped in cleartext. Layout
+// of the encrypted sk_abe blob: eph_pub(33) + iv(12) + ct(pt_len) + tag(16).
+// The symmetric key is SHA256(shared_secret || eph_pub || label) where
+// shared_secret = ECDH(eph_priv, recipient_pub). The recipient recovers it
+// with ECDH(user_priv, eph_pub).
+// ============================================================
+
+static int _ecdh_shared_secret(const uint8_t priv[32], const uint8_t pub[33],
+                                 uint8_t out[32]) {
+  EC_KEY* my_key = _eckey_from_private(priv);
+  if (!my_key) return -1;
+  EC_KEY* their_key = _eckey_from_public(pub);
+  if (!their_key) { EC_KEY_free(my_key); return -1; }
+  const EC_POINT* their_point = EC_KEY_get0_public_key(their_key);
+  int rc = ECDH_compute_key(out, 32, their_point, my_key, NULL);
+  EC_KEY_free(my_key);
+  EC_KEY_free(their_key);
+  return (rc == 32) ? 0 : -1;
+}
+
+static const char _ENVELOPE_ECIES_LABEL[] = "CRABS-ENVELOPE-ECIES-V1";
+
+static int _ecies_derive_key(const uint8_t shared[32], const uint8_t eph_pub[33],
+                                uint8_t aes_key[32]) {
+  EVP_MD_CTX* md = EVP_MD_CTX_new();
+  if (!md) return -1;
+  int ok = -1;
+  unsigned int hlen = 0;
+  if (EVP_DigestInit_ex(md, EVP_sha256(), NULL) == 1 &&
+      EVP_DigestUpdate(md, shared, 32) == 1 &&
+      EVP_DigestUpdate(md, eph_pub, 33) == 1 &&
+      EVP_DigestUpdate(md, _ENVELOPE_ECIES_LABEL, sizeof(_ENVELOPE_ECIES_LABEL) - 1) == 1 &&
+      EVP_DigestFinal_ex(md, aes_key, &hlen) == 1 && hlen == 32) {
+    ok = 0;
+  }
+  EVP_MD_CTX_free(md);
+  return ok;
+}
+
+static int _aes256_gcm_encrypt(const uint8_t key[32], const uint8_t iv[12],
+                                 const uint8_t* pt, size_t pt_len,
+                                 uint8_t* ct, uint8_t tag[16]) {
+  EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
+  if (!ctx) return -1;
+  int rc = -1, outl = 0, finall = 0;
+  if (EVP_EncryptInit_ex(ctx, EVP_aes_256_gcm(), NULL, NULL, NULL) != 1 ||
+      EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_IVLEN, 12, NULL) != 1 ||
+      EVP_EncryptInit_ex(ctx, NULL, NULL, key, iv) != 1) goto done;
+  if (EVP_EncryptUpdate(ctx, ct, &outl, pt, (int)pt_len) != 1) goto done;
+  if (EVP_EncryptFinal_ex(ctx, ct + outl, &finall) != 1) goto done;
+  if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_GET_TAG, 16, tag) != 1) goto done;
+  rc = 0;
+done:
+  EVP_CIPHER_CTX_free(ctx);
+  return rc;
+}
+
+static int _aes256_gcm_decrypt(const uint8_t key[32], const uint8_t iv[12],
+                                 const uint8_t* ct, size_t ct_len,
+                                 const uint8_t tag[16], uint8_t* pt) {
+  EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
+  if (!ctx) return -1;
+  int rc = -1, outl = 0, finall = 0;
+  if (EVP_DecryptInit_ex(ctx, EVP_aes_256_gcm(), NULL, NULL, NULL) != 1 ||
+      EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_IVLEN, 12, NULL) != 1 ||
+      EVP_DecryptInit_ex(ctx, NULL, NULL, key, iv) != 1) goto done;
+  if (EVP_DecryptUpdate(ctx, pt, &outl, ct, (int)ct_len) != 1) goto done;
+  if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_TAG, 16, (void*)tag) != 1) goto done;
+  if (EVP_DecryptFinal_ex(ctx, pt + outl, &finall) != 1) goto done; // fails on tag mismatch
+  rc = 0;
+done:
+  EVP_CIPHER_CTX_free(ctx);
+  return rc;
+}
+
+// ECIES encrypt: out = eph_pub(33) + iv(12) + ct(pt_len) + tag(16). Returns
+// total length, or 0 on failure.
+static size_t _ecies_encrypt_to_pub(const uint8_t recipient_pub[33],
+                                       const uint8_t* pt, size_t pt_len,
+                                       uint8_t* out, size_t out_cap) {
+  if (pt_len == 0) return 0;
+  size_t need = 33 + 12 + pt_len + 16;
+  if (out == NULL || out_cap < need) return 0;
+  ecdsa_keypair_t* eph = crypto_ecdsa_generate();
+  if (!eph) return 0;
+  uint8_t shared[32];
+  if (_ecdh_shared_secret(eph->private_key, recipient_pub, shared) != 0) {
+    crypto_ecdsa_keypair_destroy(eph); return 0;
+  }
+  memcpy(out, eph->public_key, 33);  // eph_pub
+  crypto_ecdsa_keypair_destroy(eph);
+  uint8_t* iv = out + 33;
+  if (RAND_bytes(iv, 12) != 1) { OPENSSL_cleanse(shared, 32); return 0; }
+  uint8_t aes_key[32];
+  if (_ecies_derive_key(shared, out, aes_key) != 0) {
+    OPENSSL_cleanse(shared, 32); return 0;
+  }
+  uint8_t* ct = out + 45;
+  uint8_t* tag = out + 45 + pt_len;
+  int enc_rc = _aes256_gcm_encrypt(aes_key, iv, pt, pt_len, ct, tag);
+  OPENSSL_cleanse(shared, 32);
+  OPENSSL_cleanse(aes_key, 32);
+  return (enc_rc == 0) ? need : 0;
+}
+
 key_envelope_t* crypto_key_envelope_create(
     const abe_master_key_t* mk,
     const uint8_t node_private_key[32],
@@ -1195,9 +1321,8 @@ key_envelope_t* crypto_key_envelope_create(
   env->issued_at = issued_at;
   env->expires_at = expires_at;
 
-  // Generate a real CP-ABE user key for the user's attributes and embed its
-  // serialized form. (M-6: previously the envelope embedded the public MPK as
-  // the "secret" key, so the delivered "secret" was public.)
+  // Generate a real CP-ABE user key for the user's attributes and serialize
+  // it to a temporary buffer.
   abe_user_key_t* abe_sk = crypto_abe_keygen(mk, attrs);
   if (!abe_sk) {
     free(env);
@@ -1209,14 +1334,36 @@ key_envelope_t* crypto_key_envelope_create(
     free(env);
     return NULL;
   }
-  env->sk_abe = get_clear_memory(sk_len);
-  if (!env->sk_abe) {
+  uint8_t* plain_sk = get_clear_memory(sk_len);
+  if (!plain_sk) {
     crypto_abe_user_key_destroy(abe_sk);
     free(env);
     return NULL;
   }
-  env->sk_abe_len = (uint32_t)crypto_abe_user_key_serialize(abe_sk, env->sk_abe, sk_len);
+  crypto_abe_user_key_serialize(abe_sk, plain_sk, sk_len);
   crypto_abe_user_key_destroy(abe_sk);
+
+  // Audit H-A: ECIES-encrypt the serialized ABE key to the user's registered
+  // public key so the envelope is not shipped in cleartext. The encrypted blob
+  // layout is eph_pub(33) + iv(12) + ct(sk_len) + tag(16).
+  size_t enc_cap = 33 + 12 + sk_len + 16;
+  env->sk_abe = get_clear_memory(enc_cap);
+  if (!env->sk_abe) {
+    OPENSSL_cleanse(plain_sk, sk_len); free(plain_sk);
+    free(env);
+    return NULL;
+  }
+  size_t enc_len = _ecies_encrypt_to_pub(user->public_key, plain_sk, sk_len,
+                                           env->sk_abe, enc_cap);
+  OPENSSL_cleanse(plain_sk, sk_len);
+  free(plain_sk);
+  if (enc_len == 0) {
+    OPENSSL_cleanse(env->sk_abe, enc_cap);
+    free(env->sk_abe);
+    free(env);
+    return NULL;
+  }
+  env->sk_abe_len = (uint32_t)enc_len;
 
   size_t sign_len = 0;
   uint8_t* sign_data = _envelope_sign_data_alloc(env, &sign_len);
@@ -1336,6 +1483,42 @@ key_envelope_t* crypto_key_envelope_deserialize(const abe_master_key_t* mk,
   return env;
 }
 
+// Audit H-A: decrypt the ECIES-encrypted sk_abe using the recipient's private
+// key. The blob layout is eph_pub(33) + iv(12) + ct(ct_len) + tag(16). Returns
+// the plaintext ABE key bytes in `out`; the caller must cleanse `out` after
+// importing the key.
+crabs_error_e crypto_key_envelope_decrypt_sk(const key_envelope_t* env,
+                                                const uint8_t user_private_key[32],
+                                                uint8_t* out, size_t out_cap,
+                                                size_t* out_len) {
+  if (!env || !user_private_key || !out || !out_len) return CRABS_ERR_INVALID_PARAM;
+  // Minimum: eph_pub(33) + iv(12) + tag(16) = 61 (no ciphertext)
+  if (env->sk_abe_len < 33 + 12 + 16) return CRABS_ERR_CRYPTOGRAPHIC_ERROR;
+  const uint8_t* eph_pub = env->sk_abe;
+  const uint8_t* iv = env->sk_abe + 33;
+  size_t ct_len = (size_t)env->sk_abe_len - 33 - 12 - 16;
+  const uint8_t* ct = env->sk_abe + 45;
+  const uint8_t* tag = env->sk_abe + 45 + ct_len;
+  if (out_cap < ct_len) return CRABS_ERR_CRYPTOGRAPHIC_ERROR;
+  uint8_t shared[32];
+  if (_ecdh_shared_secret(user_private_key, eph_pub, shared) != 0) {
+    return CRABS_ERR_CRYPTOGRAPHIC_ERROR;
+  }
+  uint8_t aes_key[32];
+  if (_ecies_derive_key(shared, eph_pub, aes_key) != 0) {
+    OPENSSL_cleanse(shared, 32); return CRABS_ERR_CRYPTOGRAPHIC_ERROR;
+  }
+  int dec_rc = _aes256_gcm_decrypt(aes_key, iv, ct, ct_len, tag, out);
+  OPENSSL_cleanse(shared, 32);
+  OPENSSL_cleanse(aes_key, 32);
+  if (dec_rc != 0) {
+    // Tag mismatch = wrong recipient or tampering.
+    return CRABS_ERR_UNAUTHORIZED;
+  }
+  *out_len = ct_len;
+  return CRABS_SUCCESS;
+}
+
 // ============================================================
 // Attributes Hash (§11.2)
 // ============================================================
@@ -1364,9 +1547,10 @@ recovery_result_t* crypto_revoke_and_rotate(
     const uint8_t node_private_key[32],
     attribute_machine_t* attr_machine,
     const char* user_id,
+    const uint8_t new_public_key[33],
     uint64_t state_version,
     uint64_t issued_at) {
-  if (!mk || !node_private_key || !attr_machine || !user_id) return NULL;
+  if (!mk || !node_private_key || !attr_machine || !user_id || !new_public_key) return NULL;
 
   // Step 1: Suspend compromised user (also increments key_version per §8.4)
   user_t* user = attribute_machine_find_user(attr_machine, user_id);
@@ -1374,30 +1558,23 @@ recovery_result_t* crypto_revoke_and_rotate(
 
   attribute_machine_suspend_user(attr_machine, user_id);
 
-  // Step 3: Generate new ECDSA keypair
-  ecdsa_keypair_t* new_key = crypto_ecdsa_generate();
-  if (!new_key) return NULL;
-
-  // Step 4: Update user's public key
-  memcpy(user->public_key, new_key->public_key, 33);
+  // Audit H-B: record the USER-SUPPLIED public key. The node never generates
+  // or sees the user's new private key, so a node compromise cannot
+  // impersonate rotated users.
+  memcpy(user->public_key, new_public_key, 33);
 
   // Step 5: Generate a new ABE key envelope for the user's current attributes.
   key_envelope_t* envelope = crypto_key_envelope_create(
       mk, node_private_key, user, state_version, issued_at, 0);
-  if (!envelope) {
-    crypto_ecdsa_keypair_destroy(new_key);
-    return NULL;
-  }
+  if (!envelope) return NULL;
 
-  // Step 6: Build result
+  // Step 6: Build result (envelope only; no private key on the node)
   recovery_result_t* result = get_clear_memory(sizeof(recovery_result_t));
   if (!result) {
-    crypto_ecdsa_keypair_destroy(new_key);
     crypto_key_envelope_destroy(envelope);
     return NULL;
   }
-
-  result->new_ecdsa_key = new_key;
+  memcpy(result->new_public_key, new_public_key, 33);
   result->new_envelope = envelope;
 
   return result;
@@ -1405,7 +1582,6 @@ recovery_result_t* crypto_revoke_and_rotate(
 
 void crypto_recovery_result_destroy(recovery_result_t* result) {
   if (result) {
-    if (result->new_ecdsa_key) crypto_ecdsa_keypair_destroy(result->new_ecdsa_key);
     if (result->new_envelope) crypto_key_envelope_destroy(result->new_envelope);
     free(result);
   }

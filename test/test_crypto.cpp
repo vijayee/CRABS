@@ -720,6 +720,44 @@ TEST_F(KeyEnvelopeTest, CreateAndVerify) {
   crypto_key_envelope_destroy(env);
 }
 
+// Regression for audit H-A: the ABE user key in the envelope is ECIES-encrypted
+// to the recipient's public key, so the envelope is not shipped in cleartext.
+// Decrypting with the recipient's private key recovers the ABE key; a wrong
+// private key is rejected (tag mismatch).
+TEST_F(KeyEnvelopeTest, EciesDecryptRoundTrip) {
+  user_t* alice = attribute_machine_find_user(am, "alice");
+  ASSERT_NE(alice, nullptr);
+
+  key_envelope_t* env = crypto_key_envelope_create(
+      mk, node_key->private_key, alice, 42, 1000, 0);
+  ASSERT_NE(env, nullptr);
+  ASSERT_GT(env->sk_abe_len, 33u + 12u + 16u);  // ECIES blob layout
+
+  // Decrypt with alice's private key → recovers the ABE key.
+  uint8_t plain[4096];
+  size_t plain_len = 0;
+  crabs_error_e rc = crypto_key_envelope_decrypt_sk(
+      env, alice_key->private_key, plain, sizeof(plain), &plain_len);
+  EXPECT_EQ(rc, CRABS_SUCCESS);
+  EXPECT_GT(plain_len, 0u);
+
+  // The recovered plaintext should round-trip into an ABE user key (deserialize).
+  abe_user_key_t* recovered = crypto_abe_user_key_deserialize(mk, plain, plain_len);
+  EXPECT_NE(recovered, nullptr);
+  if (recovered) crypto_abe_user_key_destroy(recovered);
+  memset(plain, 0, plain_len);
+
+  // A wrong private key must be rejected (tag mismatch → UNAUTHORIZED).
+  ecdsa_keypair_t* wrong_key = crypto_ecdsa_generate();
+  ASSERT_NE(wrong_key, nullptr);
+  rc = crypto_key_envelope_decrypt_sk(
+      env, wrong_key->private_key, plain, sizeof(plain), &plain_len);
+  EXPECT_EQ(rc, CRABS_ERR_UNAUTHORIZED);
+  crypto_ecdsa_keypair_destroy(wrong_key);
+
+  crypto_key_envelope_destroy(env);
+}
+
 TEST_F(KeyEnvelopeTest, CreateWithExpiry) {
   user_t* alice = attribute_machine_find_user(am, "alice");
   ASSERT_NE(alice, nullptr);
@@ -809,10 +847,15 @@ TEST_F(KeyEnvelopeTest, RevokeAndRotate) {
   ASSERT_NE(alice, nullptr);
   uint64_t orig_version = alice->key_version;
 
+  // Audit H-B: node-blind rotation — the caller supplies the user's new
+  // public key; the node records it and issues an envelope but never learns
+  // the private key.
+  ecdsa_keypair_t* user_new_key = crypto_ecdsa_generate();
+  ASSERT_NE(user_new_key, nullptr);
+
   recovery_result_t* result = crypto_revoke_and_rotate(
-      mk, node_key->private_key, am, "alice", 1, 1000);
+      mk, node_key->private_key, am, "alice", user_new_key->public_key, 1, 1000);
   ASSERT_NE(result, nullptr);
-  ASSERT_NE(result->new_ecdsa_key, nullptr);
   ASSERT_NE(result->new_envelope, nullptr);
 
   // User should be suspended
@@ -821,24 +864,31 @@ TEST_F(KeyEnvelopeTest, RevokeAndRotate) {
   // Key version should be incremented
   EXPECT_EQ(alice->key_version, orig_version + 1);
 
-  // Public key should be updated to new key
-  EXPECT_EQ(memcmp(alice->public_key, result->new_ecdsa_key->public_key, 33), 0);
+  // Public key should be updated to the user-supplied key
+  EXPECT_EQ(memcmp(alice->public_key, user_new_key->public_key, 33), 0);
+  EXPECT_EQ(memcmp(alice->public_key, result->new_public_key, 33), 0);
 
   // Envelope should be verifiable with node key
   EXPECT_TRUE(crypto_key_envelope_verify(node_key->public_key, result->new_envelope));
 
   crypto_recovery_result_destroy(result);
+  crypto_ecdsa_keypair_destroy(user_new_key);
 }
 
 TEST_F(KeyEnvelopeTest, RevokeAndRotateUserNotFound) {
+  ecdsa_keypair_t* user_new_key = crypto_ecdsa_generate();
   recovery_result_t* result = crypto_revoke_and_rotate(
-      mk, node_key->private_key, am, "nonexistent", 1, 1000);
+      mk, node_key->private_key, am, "nonexistent", user_new_key->public_key, 1, 1000);
   EXPECT_EQ(result, nullptr);
+  crypto_ecdsa_keypair_destroy(user_new_key);
 }
 
 TEST_F(KeyEnvelopeTest, RevokeAndRotateNullParams) {
-  EXPECT_EQ(crypto_revoke_and_rotate(nullptr, node_key->private_key, am, "alice", 1, 1000), nullptr);
-  EXPECT_EQ(crypto_revoke_and_rotate(mk, nullptr, am, "alice", 1, 1000), nullptr);
-  EXPECT_EQ(crypto_revoke_and_rotate(mk, node_key->private_key, nullptr, "alice", 1, 1000), nullptr);
-  EXPECT_EQ(crypto_revoke_and_rotate(mk, node_key->private_key, am, nullptr, 1, 1000), nullptr);
+  ecdsa_keypair_t* user_new_key = crypto_ecdsa_generate();
+  EXPECT_EQ(crypto_revoke_and_rotate(nullptr, node_key->private_key, am, "alice", user_new_key->public_key, 1, 1000), nullptr);
+  EXPECT_EQ(crypto_revoke_and_rotate(mk, nullptr, am, "alice", user_new_key->public_key, 1, 1000), nullptr);
+  EXPECT_EQ(crypto_revoke_and_rotate(mk, node_key->private_key, nullptr, "alice", user_new_key->public_key, 1, 1000), nullptr);
+  EXPECT_EQ(crypto_revoke_and_rotate(mk, node_key->private_key, am, nullptr, user_new_key->public_key, 1, 1000), nullptr);
+  EXPECT_EQ(crypto_revoke_and_rotate(mk, node_key->private_key, am, "alice", nullptr, 1, 1000), nullptr);
+  crypto_ecdsa_keypair_destroy(user_new_key);
 }
