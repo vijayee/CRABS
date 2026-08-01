@@ -370,51 +370,13 @@ crabs_error_e state_machine_execute(state_t* state, operation_t* op) {
     return CRABS_SUCCESS;
   }
 
-  // Step 3: Verify protocol state transitions
-  for (uint32_t i = 0; i < op->resource_count; i++) {
-    data_item_t* item = state_find_item(state, op->resources[i]);
-    if (item == NULL) return CRABS_ERR_RESOURCE_NOT_FOUND;
-    if (item->protocol_state != op->required_state[i]) {
-      return CRABS_ERR_PROTOCOL_VIOLATION;
-    }
-  }
-
-  // Step 4: Verify lock claims
-  for (uint32_t i = 0; i < op->lock_claim_count; i++) {
-    data_item_t* item = state_find_item(state, op->lock_claims[i].resource);
-    if (item == NULL) return CRABS_ERR_RESOURCE_NOT_FOUND;
-    if (item->protocol_state == PROTOCOL_LOCKED ||
-        item->protocol_state == PROTOCOL_MODIFIED) {
-      if (!item->lock_state.lock_token_valid ||
-          CRYPTO_memcmp(item->lock_state.lock_token, op->lock_claims[i].lock_token,
-                        CRABS_LOCK_TOKEN_SIZE) != 0) {
-        return CRABS_ERR_LOCK_TOKEN_MISMATCH;
-      }
-      if (strlen(op->signer_id) > 0 &&
-          strcmp(item->lock_state.lock_owner, op->signer_id) != 0) {
-        return CRABS_ERR_LOCK_OWNER_MISMATCH;
-      }
-    }
-  }
-
-  // Step 5: Dedup guard check (v1.4 §5.2)
-  // Audit F-2: enforce the SERVER-REGISTERED dedup spec when one exists for
-  // this operation type, so a signer cannot bypass "vote once" by setting
-  // dedup.type = DEDUP_NONE (or a trivial custom condition) on the wire. The
-  // op-carried spec is only consulted when no spec is registered for the
-  // operation type (legacy/dynamic ops). The registered spec also wins for
-  // the mutation in step 8.
-  const dedup_spec_t* registered_dedup = state_find_op_type_def(state, op->type);
-  const dedup_spec_t* effective_dedup = registered_dedup ? registered_dedup : &op->dedup;
-  if (effective_dedup->type != DEDUP_NONE) {
-    crabs_error_e dedup_result = dedup_check_guard_spec(state, effective_dedup, op);
-    if (dedup_result != CRABS_SUCCESS) {
-      return dedup_result;
-    }
-  }
-
-  // Step 5b: ABE-gated policy verification (§10.3) — fail closed.
-  // Every operation requires a registered policy and a valid signature.
+  // Step 3: Authorization (§10.3) — fail closed. Every operation requires a
+  // registered policy and a valid signature.
+  // Audit L-a: authorize BEFORE the protocol/lock/dedup checks (steps 4-6)
+  // so an unauthenticated caller cannot learn resource existence, lock
+  // state, or dedup-tracker membership from distinct error codes. An
+  // unauthenticated caller gets a single CRABS_ERR_UNAUTHORIZED; an
+  // authenticated caller still receives the specific protocol error below.
   if (state->attr_machine == NULL) {
     return CRABS_ERR_UNAUTHORIZED;
   }
@@ -461,6 +423,49 @@ crabs_error_e state_machine_execute(state_t* state, operation_t* op) {
 
   if (!vr.authorized) {
     return vr.error;
+  }
+
+  // Step 4: Verify protocol state transitions
+  for (uint32_t i = 0; i < op->resource_count; i++) {
+    data_item_t* item = state_find_item(state, op->resources[i]);
+    if (item == NULL) return CRABS_ERR_RESOURCE_NOT_FOUND;
+    if (item->protocol_state != op->required_state[i]) {
+      return CRABS_ERR_PROTOCOL_VIOLATION;
+    }
+  }
+
+  // Step 5: Verify lock claims
+  for (uint32_t i = 0; i < op->lock_claim_count; i++) {
+    data_item_t* item = state_find_item(state, op->lock_claims[i].resource);
+    if (item == NULL) return CRABS_ERR_RESOURCE_NOT_FOUND;
+    if (item->protocol_state == PROTOCOL_LOCKED ||
+        item->protocol_state == PROTOCOL_MODIFIED) {
+      if (!item->lock_state.lock_token_valid ||
+          CRYPTO_memcmp(item->lock_state.lock_token, op->lock_claims[i].lock_token,
+                        CRABS_LOCK_TOKEN_SIZE) != 0) {
+        return CRABS_ERR_LOCK_TOKEN_MISMATCH;
+      }
+      if (strlen(op->signer_id) > 0 &&
+          strcmp(item->lock_state.lock_owner, op->signer_id) != 0) {
+        return CRABS_ERR_LOCK_OWNER_MISMATCH;
+      }
+    }
+  }
+
+  // Step 6: Dedup guard check (v1.4 §5.2)
+  // Audit F-2: enforce the SERVER-REGISTERED dedup spec when one exists for
+  // this operation type, so a signer cannot bypass "vote once" by setting
+  // dedup.type = DEDUP_NONE (or a trivial custom condition) on the wire. The
+  // op-carried spec is only consulted when no spec is registered for the
+  // operation type (legacy/dynamic ops). The registered spec also wins for
+  // the mutation in step 8.
+  const dedup_spec_t* registered_dedup = state_find_op_type_def(state, op->type);
+  const dedup_spec_t* effective_dedup = registered_dedup ? registered_dedup : &op->dedup;
+  if (effective_dedup->type != DEDUP_NONE) {
+    crabs_error_e dedup_result = dedup_check_guard_spec(state, effective_dedup, op);
+    if (dedup_result != CRABS_SUCCESS) {
+      return dedup_result;
+    }
   }
 
   // Step 6: Key version verification (§10.4)
