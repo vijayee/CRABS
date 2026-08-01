@@ -254,9 +254,10 @@ static bool _deserialize_ot_op(read_buf_t* buf, crabs_ot_operation_t* op) {
   op->payload_size = payload_size;
 
   if (!_read_uint32_le(buf, &op->dep_count)) return false;
-  if (op->dep_count > CRABS_OT_MAX_DEPS) {
-    op->dep_count = CRABS_OT_MAX_DEPS;
-  }
+  // Audit M-E: reject (do not clamp) oversized dep_count. Clamping desynced
+  // the parse — the writer emitted `dep_count` deps but we'd only consume
+  // CRABS_OT_MAX_DEPS, leaving subsequent ops misaligned.
+  if (op->dep_count > CRABS_OT_MAX_DEPS) return false;
   for (uint32_t i = 0; i < op->dep_count; i++) {
     if (!_deserialize_ot_op_id(buf, &op->deps[i])) return false;
   }
@@ -470,7 +471,10 @@ static bool _deserialize_ot_type_state(read_buf_t* buf, data_item_t* item) {
 
         uint32_t style_count;
         if (!_read_uint32_le(buf, &style_count)) return false;
-        span->style_count = (style_count < CRABS_SPAN_MAX_STYLES) ? style_count : CRABS_SPAN_MAX_STYLES;
+        // Audit M-E: reject (do not clamp) oversized style_count. Clamping
+        // desynced the parse.
+        if (style_count > CRABS_SPAN_MAX_STYLES) return false;
+        span->style_count = style_count;
         for (uint32_t s = 0; s < span->style_count; s++) {
           if (!_read_string16(buf, span->styles[s].name, CRABS_STYLE_NAME_MAX)) return false;
           if (!_read_string16(buf, span->styles[s].value, CRABS_STYLE_VALUE_MAX)) return false;
@@ -1016,8 +1020,10 @@ static bool _deserialize_policy(read_buf_t* buf, policy_t* policy, uint32_t seri
     // v1.3: scheme constraints
     uint32_t scheme_count;
     if (!_read_uint32_le(buf, &scheme_count)) return false;
-    policy->allowed_scheme_count = scheme_count < CRABS_MAX_ALLOWED_SCHEMES ?
-                                   scheme_count : CRABS_MAX_ALLOWED_SCHEMES;
+    // Audit M-E: reject (do not clamp) oversized scheme_count. Clamping
+    // desynced the parse.
+    if (scheme_count > CRABS_MAX_ALLOWED_SCHEMES) return false;
+    policy->allowed_scheme_count = scheme_count;
     for (uint32_t i = 0; i < policy->allowed_scheme_count; i++) {
       uint8_t scheme;
       if (!_read_uint8(buf, &scheme)) return false;
@@ -1786,6 +1792,11 @@ crabs_ot_data_item_t* crabs_deserialize_ot_data(const uint8_t* data, size_t len,
   uint32_t op_count;
   if (!_read_uint32_le(&buf, &op_count)) goto fail;
   if (op_count > CRABS_OT_OP_LOG_MAX) goto fail;
+  // Audit H-G: bound the allocation to remaining buffer. Each op is at least
+  // a few bytes on the wire; if op_count exceeds the remaining buffer, the
+  // requested allocation (op_count * ~1.4KB) would be far larger than the
+  // input and the aborting allocator turns a few-byte packet into a DoS.
+  if (op_count > (buf.len - buf.offset)) goto fail;
   if (op_count > 0) {
     free(item->op_log);
     item->op_log = get_clear_memory(sizeof(crabs_ot_operation_t) * op_count);
@@ -1812,6 +1823,9 @@ crabs_ot_data_item_t* crabs_deserialize_ot_data(const uint8_t* data, size_t len,
   // priority_counters
   uint32_t pc_count;
   if (!_read_uint32_le(&buf, &pc_count)) goto fail;
+  // Audit H-G: bound the allocation to remaining buffer. 4 wire bytes could
+  // request ~34 GiB; the aborting allocator turns a tiny packet into a DoS.
+  if (pc_count > (buf.len - buf.offset) / sizeof(uint64_t)) goto fail;
   if (pc_count > 0) {
     item->priority_counters = get_clear_memory(sizeof(uint64_t) * pc_count);
     if (item->priority_counters == NULL) goto fail;

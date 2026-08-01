@@ -160,7 +160,22 @@ crabs_hlc_t crabs_hlc_add_duration(crabs_hlc_t hlc, uint64_t duration_ms) {
   uint64_t add_seconds = duration_ms / 1000ULL;
   uint64_t add_nanos = (duration_ms % 1000ULL) * 1000000ULL;
 
+  // Audit M-N: saturating add. Without this, a huge/attacker-chosen duration
+  // wraps physical_seconds to a small value, inverting lock-expiry comparisons
+  // (an active lock would read as expired, or vice versa).
+  if (hlc.physical_seconds > UINT64_MAX - add_seconds) {
+    hlc.physical_seconds = UINT64_MAX;
+    hlc.physical_nanos = 999999999ULL;
+    return hlc;
+  }
   hlc.physical_seconds += add_seconds;
+  // Cap the nano carry so normalize's +1 cannot overflow physical_seconds.
+  if (hlc.physical_nanos + add_nanos >= 1000000000ULL) {
+    if (hlc.physical_seconds == UINT64_MAX) {
+      hlc.physical_nanos = 999999999ULL;
+      return hlc;
+    }
+  }
   hlc.physical_nanos += add_nanos;
   crabs_hlc_normalize(&hlc);
   return hlc;
@@ -271,6 +286,13 @@ crabs_physical_time_t crabs_hlc_get_physical_time(crabs_hlc_state_t* state) {
 // HLC Generation (v1.6 Amd6 §4.1)
 // ============================================================
 
+// Audit M-N: saturating increment. The HLC logical counter must never wrap
+// to 0 — that would regress the clock and allow duplicate timestamps. Cap
+// at UINT64_MAX instead of +1 when already at the maximum.
+static uint64_t _hlc_saturate_inc(uint64_t v) {
+  return (v == UINT64_MAX) ? UINT64_MAX : v + 1;
+}
+
 crabs_hlc_t crabs_hlc_next(crabs_hlc_state_t* state) {
   crabs_hlc_t hlc = {0, 0, 0, {'\0'}};
 
@@ -287,7 +309,7 @@ crabs_hlc_t crabs_hlc_next(crabs_hlc_state_t* state) {
     // Fallback: use last known time + increment counter
     hlc.physical_seconds = state->last.physical_seconds;
     hlc.physical_nanos = state->last.physical_nanos;
-    hlc.logical_counter = state->last.logical_counter + 1;
+    hlc.logical_counter = _hlc_saturate_inc(state->last.logical_counter);
     state->last = hlc;
     return hlc;
   }
@@ -302,14 +324,14 @@ crabs_hlc_t crabs_hlc_next(crabs_hlc_state_t* state) {
     // Use last physical time + increment logical counter
     hlc.physical_seconds = state->last.physical_seconds;
     hlc.physical_nanos = state->last.physical_nanos;
-    hlc.logical_counter = state->last.logical_counter + 1;
+    hlc.logical_counter = _hlc_saturate_inc(state->last.logical_counter);
 
   } else if (now.seconds == state->last.physical_seconds &&
              now.nanos == state->last.physical_nanos) {
     // Same physical time as last event
     hlc.physical_seconds = now.seconds;
     hlc.physical_nanos = now.nanos;
-    hlc.logical_counter = state->last.logical_counter + 1;
+    hlc.logical_counter = _hlc_saturate_inc(state->last.logical_counter);
 
   } else {
     // Physical time advanced normally
@@ -415,7 +437,7 @@ crabs_hlc_receive_result_e crabs_hlc_receive(crabs_hlc_state_t* state,
     if (received->logical_counter > max_counter) {
       max_counter = received->logical_counter;
     }
-    state->last.logical_counter = max_counter + 1;
+    state->last.logical_counter = _hlc_saturate_inc(max_counter);
   }
   // else: max is behind last, keep last as-is (shouldn't happen normally)
 

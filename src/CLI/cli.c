@@ -162,7 +162,13 @@ cli_result_e cli_node_add_user_key(cli_node_t* node, const char* user_id,
   if (node == NULL || user_id == NULL || key == NULL) return CLI_ERR_ARGS;
   for (uint32_t i = 0; i < node->keyring_count; i++) {
     if (strcmp(node->keyring[i].user_id, user_id) == 0) {
-      if (node->keyring[i].key != NULL && node->keyring[i].key != key) {
+      // Audit H-F: never destroy an entry that aliases node->node_key — that
+      // leaves a dangling pointer dereferenced by cli_cmd_key_revoke and
+      // double-freed by cli_node_destroy. Only destroy a genuinely distinct
+      // previous key.
+      if (node->keyring[i].key != NULL &&
+          node->keyring[i].key != key &&
+          node->keyring[i].key != node->node_key) {
         crypto_ecdsa_keypair_destroy(node->keyring[i].key);
       }
       node->keyring[i].key = key;

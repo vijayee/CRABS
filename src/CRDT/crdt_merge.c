@@ -107,8 +107,18 @@ crabs_error_e g_counter_increment(g_counter_t* counter, const char* node_id, int
 int64_t g_counter_value(const g_counter_t* counter) {
   if (counter == NULL) return 0;
   int64_t total = 0;
+  // Audit M-G: saturating accumulation. Per-entry increments are checked,
+  // but the sum can overflow int64 with many entries / large counts; that is
+  // undefined behavior. Clamp to INT64_MAX instead of wrapping.
   for (uint32_t i = 0; i < counter->entry_count; i++) {
-    total += counter->entries[i].count;
+    int64_t c = counter->entries[i].count;
+    if (c >= 0) {
+      if (total > INT64_MAX - c) total = INT64_MAX;
+      else total += c;
+    } else {
+      if (total < INT64_MIN - c) total = INT64_MIN;
+      else total += c;
+    }
   }
   return total;
 }
@@ -242,6 +252,16 @@ void or_set_destroy(or_set_t* set) {
 
 crabs_error_e or_set_add(or_set_t* set, const char* element, const char* tag) {
   if (set == NULL || element == NULL || tag == NULL) return CRABS_ERR_INVALID_PARAM;
+
+  // Audit H-J: dedup by tag. An OR-Set add is uniquely identified by its tag;
+  // re-adding the same tag (e.g. merge(A, A) under gossip/replay) must be
+  // idempotent. Without this, element_count doubled on every self-merge,
+  // yielding unbounded memory growth and a remote memory-exhaustion DoS.
+  for (uint32_t i = 0; i < set->element_count; i++) {
+    if (strcmp(set->elements[i].tag, tag) == 0) return CRABS_SUCCESS;
+  }
+  // A tag that is already tombstoned should not be re-added either.
+  if (_or_set_tag_in_tombstones(set, tag)) return CRABS_SUCCESS;
 
   uint32_t new_count = set->element_count + 1;
   or_set_entry_t* new_elements = realloc(set->elements, new_count * sizeof(or_set_entry_t));
