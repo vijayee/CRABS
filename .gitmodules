@@ -1,0 +1,3 @@
+[submodule "deps/openabe-c"]
+	path = deps/openabe-c
+	url = https://github.com/vijayee/openabe-c.git

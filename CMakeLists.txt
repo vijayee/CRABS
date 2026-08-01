@@ -8,9 +8,9 @@ file(GLOB_RECURSE C_INC "src/*/*.h")
 
 include(CTest)
 
-# OpenABE (real CP-ABE) integration. The library and its RELIC dependency are
-# built at the path below; link statically and add GMP/pthread.
-set(OPENABE_ROOT /home/victor/Workspace/src/github.com/vijayee/openabe-to-c/openabe-c)
+# OpenABE (real CP-ABE) is a git submodule at deps/openabe-c.
+# Run `git submodule update --init --recursive` after cloning.
+set(OPENABE_ROOT ${CMAKE_SOURCE_DIR}/deps/openabe-c)
 set(OPENABE_INCLUDE ${OPENABE_ROOT}/include)
 set(OPENABE_LIB ${OPENABE_ROOT}/build)
 set(RELIC_LIB ${OPENABE_ROOT}/deps/relic/build/lib)
