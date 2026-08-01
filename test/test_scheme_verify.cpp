@@ -24,6 +24,15 @@ static attribute_machine_t* create_am_for_verify() {
   return attribute_machine_create("admin", admin_pk);
 }
 
+// Audit N-3: user_key_register now validates secp256k1 public keys, so tests
+// must use real generated keys (not 0xCC fill).
+static void _gen_pk_sv(uint8_t out[33]) {
+  ecdsa_keypair_t* kp = crypto_ecdsa_generate();
+  ASSERT_NE(kp, nullptr);
+  memcpy(out, kp->public_key, 33);
+  crypto_ecdsa_keypair_destroy(kp);
+}
+
 // ============================================================
 // _verify_sig_with_scheme (tested through v2 API)
 // ============================================================
@@ -56,9 +65,10 @@ TEST(TestSchemeVerify, LegacyECDSAViaV2) {
   // Empty policy auto-authorizes
   EXPECT_TRUE(vr.authorized);
 
-  // Now with actual policy (ABE policy uses stripped attribute values)
+  // Now with actual policy (audit F-1: policies match full "name:value" tokens,
+  // so "role:admin" not "admin")
   verify_result_t vr2 = crypto_verify_operation_auth_v2(
-      mk, "admin", am,
+      mk, "role:admin", am,
       msg, sizeof(msg),
       sig, CRABS_SIG_SIZE,
       "admin", nullptr, SCHEME_UNSPECIFIED, VERIFY_MODE_A);
@@ -125,9 +135,9 @@ TEST(TestSchemeVerify, VTableVerifyViaKeyId) {
   uint8_t sig[CRABS_SIG_SIZE]; uint32_t sig_len = sizeof(sig);
   ASSERT_EQ(vt->sign(sk, sk_len, msg, sizeof(msg), sig, &sig_len), CRABS_SUCCESS);
 
-  // Verify via v2 with key_id
+  // Verify via v2 with key_id (audit F-1: policy is "role:admin")
   verify_result_t vr = crypto_verify_operation_auth_v2(
-      mk, "admin", am,
+      mk, "role:admin", am,
       msg, sizeof(msg),
       sig, sig_len,
       "admin", "vtable-key", ECDSA_SECP256K1, VERIFY_MODE_A);
@@ -208,7 +218,7 @@ TEST(TestSchemeVerify, VTableVerifyInactiveKeyFails) {
   ASSERT_EQ(user_key_register(admin, "rev-key", ECDSA_SECP256K1, pk, 33, "primary"), CRABS_SUCCESS);
 
   // Register a second active key so revoking doesn't suspend
-  uint8_t pk2[33] = {0x03}; memset(pk2 + 1, 0xCC, 32);
+  uint8_t pk2[33]; _gen_pk_sv(pk2);
   ASSERT_EQ(user_key_register(admin, "other-key", ECDSA_SECP256K1, pk2, 33, "backup"), CRABS_SUCCESS);
 
   // Revoke the key
@@ -293,9 +303,9 @@ TEST(TestSchemeVerify, ModeBSchemeAwareVerification) {
   uint8_t sig[CRABS_SIG_SIZE]; uint32_t sig_len = sizeof(sig);
   ASSERT_EQ(vt->sign(sk, sk_len, msg, sizeof(msg), sig, &sig_len), CRABS_SUCCESS);
 
-  // Mode B with scheme and key_id
+  // Mode B with scheme and key_id (audit F-1: policy is "role:admin")
   verify_result_t vr = crypto_verify_operation_auth_v2(
-      mk, "admin", am,
+      mk, "role:admin", am,
       msg, sizeof(msg),
       sig, sig_len,
       nullptr, "modeb-key", ECDSA_SECP256K1, VERIFY_MODE_B);
@@ -365,8 +375,7 @@ TEST(TestSchemeVerify, StateMachineDispatchesV2ForSchemeOps) {
   size_t payload_size = config_len + 33;
   uint8_t* payload = (uint8_t*)calloc(payload_size, 1);
   memcpy(payload, config, config_len);
-  payload[config_len] = 0x03;
-  memset(payload + config_len + 1, 0xBB, 32);
+  { uint8_t _pk[33]; _gen_pk_sv(_pk); memcpy(payload + config_len, _pk, 33); }
 
   operation_t* op = operation_create(CRABS_OP_REGISTER_KEY);
   for (int i = 0; i < CRABS_UUID_SIZE; i++) op->uuid[i] = (uint8_t)i;
@@ -433,8 +442,9 @@ TEST(TestSchemeVerify, VerifyWithSchemeNoKeyId) {
   ASSERT_EQ(vt->sign(sk, sk_len, msg, sizeof(msg), sig, &sig_len), CRABS_SUCCESS);
 
   // Verify with scheme but no key_id — should find active key for that scheme
+  // (audit F-1: policy is "role:admin")
   verify_result_t vr = crypto_verify_operation_auth_v2(
-      mk, "admin", am,
+      mk, "role:admin", am,
       msg, sizeof(msg),
       sig, sig_len,
       "admin", "", ECDSA_SECP256K1, VERIFY_MODE_A);

@@ -7,7 +7,17 @@ extern "C" {
 #include "../src/Attribute/attribute_machine.h"
 #include "../src/StateMachine/state_machine.h"
 #include "../src/Crypto/sig_scheme.h"
+#include "../src/Crypto/crypto.h"
 #include "../src/CRABS/crabs.h"
+}
+
+// Audit N-3: user_key_register now validates secp256k1 public keys, so tests
+// must use real generated keys (not 0xBB/0xCC fill).
+static void _gen_pk_kr(uint8_t out[33]) {
+  ecdsa_keypair_t* kp = crypto_ecdsa_generate();
+  ASSERT_NE(kp, nullptr);
+  memcpy(out, kp->public_key, 33);
+  crypto_ecdsa_keypair_destroy(kp);
 }
 
 // ============================================================
@@ -51,8 +61,8 @@ TEST(TestKeyRing, FindReturnsKeyAfterRegister) {
   attribute_machine_t* am = create_test_am();
   user_t* admin = attribute_machine_find_user(am, "admin");
 
-  uint8_t pk[33] = {0x03};
-  memset(pk + 1, 0xBB, 32);
+  uint8_t pk[33];
+  _gen_pk_kr(pk);
   crabs_error_e rc = user_key_register(admin, "key1", ECDSA_SECP256K1, pk, 33, "primary");
   ASSERT_EQ(rc, CRABS_SUCCESS);
 
@@ -70,8 +80,8 @@ TEST(TestKeyRing, FindReturnsNullForUnknownKey) {
   attribute_machine_t* am = create_test_am();
   user_t* admin = attribute_machine_find_user(am, "admin");
 
-  uint8_t pk[33] = {0x03};
-  memset(pk + 1, 0xBB, 32);
+  uint8_t pk[33];
+  _gen_pk_kr(pk);
   ASSERT_EQ(user_key_register(admin, "key1", ECDSA_SECP256K1, pk, 33, "primary"), CRABS_SUCCESS);
 
   EXPECT_EQ(user_key_find(admin, "nonexistent"), nullptr);
@@ -100,8 +110,8 @@ TEST(TestKeyRing, FindActiveReturnsMatchingActiveKey) {
   attribute_machine_t* am = create_test_am();
   user_t* admin = attribute_machine_find_user(am, "admin");
 
-  uint8_t pk[33] = {0x03};
-  memset(pk + 1, 0xBB, 32);
+  uint8_t pk[33];
+  _gen_pk_kr(pk);
   ASSERT_EQ(user_key_register(admin, "ecdsa-key", ECDSA_SECP256K1, pk, 33, "primary"), CRABS_SUCCESS);
 
   user_key_t* found = user_key_find_active(admin, ECDSA_SECP256K1);
@@ -115,8 +125,8 @@ TEST(TestKeyRing, FindActiveSkipsInactiveKeys) {
   attribute_machine_t* am = create_test_am();
   user_t* admin = attribute_machine_find_user(am, "admin");
 
-  uint8_t pk[33] = {0x03};
-  memset(pk + 1, 0xBB, 32);
+  uint8_t pk[33];
+  _gen_pk_kr(pk);
   ASSERT_EQ(user_key_register(admin, "ecdsa-key", ECDSA_SECP256K1, pk, 33, "primary"), CRABS_SUCCESS);
 
   // Revoke the key (marks inactive)
@@ -132,8 +142,8 @@ TEST(TestKeyRing, FindActiveSkipsWrongScheme) {
   attribute_machine_t* am = create_test_am();
   user_t* admin = attribute_machine_find_user(am, "admin");
 
-  uint8_t pk[33] = {0x03};
-  memset(pk + 1, 0xBB, 32);
+  uint8_t pk[33];
+  _gen_pk_kr(pk);
   ASSERT_EQ(user_key_register(admin, "ecdsa-key", ECDSA_SECP256K1, pk, 33, "primary"), CRABS_SUCCESS);
 
   // Looking for ED25519 — no match
@@ -150,8 +160,8 @@ TEST(TestKeyRing, RegisterBasicKey) {
   attribute_machine_t* am = create_test_am();
   user_t* admin = attribute_machine_find_user(am, "admin");
 
-  uint8_t pk[33] = {0x03};
-  memset(pk + 1, 0xBB, 32);
+  uint8_t pk[33];
+  _gen_pk_kr(pk);
   crabs_error_e rc = user_key_register(admin, "key1", ECDSA_SECP256K1, pk, 33, "primary key");
   EXPECT_EQ(rc, CRABS_SUCCESS);
 
@@ -174,8 +184,8 @@ TEST(TestKeyRing, RegisterSetsDefaultOnFirstKey) {
   // Default key should be empty initially (user has legacy pk, no keyring keys)
   EXPECT_STREQ(admin->default_key_id, "");
 
-  uint8_t pk[33] = {0x03};
-  memset(pk + 1, 0xBB, 32);
+  uint8_t pk[33];
+  _gen_pk_kr(pk);
   ASSERT_EQ(user_key_register(admin, "key1", ECDSA_SECP256K1, pk, 33, "primary"), CRABS_SUCCESS);
 
   // First registered key should become default
@@ -188,10 +198,10 @@ TEST(TestKeyRing, RegisterDoesNotOverrideDefault) {
   attribute_machine_t* am = create_test_am();
   user_t* admin = attribute_machine_find_user(am, "admin");
 
-  uint8_t pk1[33] = {0x03};
-  memset(pk1 + 1, 0xBB, 32);
-  uint8_t pk2[33] = {0x02};
-  memset(pk2 + 1, 0xCC, 32);
+  uint8_t pk1[33];
+  _gen_pk_kr(pk1);
+  uint8_t pk2[33];
+  _gen_pk_kr(pk2);
 
   ASSERT_EQ(user_key_register(admin, "key1", ECDSA_SECP256K1, pk1, 33, "primary"), CRABS_SUCCESS);
   ASSERT_EQ(user_key_register(admin, "key2", ECDSA_SECP256K1, pk2, 33, "secondary"), CRABS_SUCCESS);
@@ -239,8 +249,8 @@ TEST(TestKeyRing, RegisterRejectsZeroLengthPublicKey) {
 TEST(TestKeyRing, RegisterRejectsUnspecifiedScheme) {
   attribute_machine_t* am = create_test_am();
   user_t* admin = attribute_machine_find_user(am, "admin");
-  uint8_t pk[33] = {0x03};
-  memset(pk + 1, 0xBB, 32);
+  uint8_t pk[33];
+  _gen_pk_kr(pk);
 
   EXPECT_EQ(user_key_register(admin, "key1", SCHEME_UNSPECIFIED, pk, 33, "label"),
             CRABS_ERR_INVALID_PARAM);
@@ -251,8 +261,8 @@ TEST(TestKeyRing, RegisterRejectsUnspecifiedScheme) {
 TEST(TestKeyRing, RegisterRejectsDuplicateKeyId) {
   attribute_machine_t* am = create_test_am();
   user_t* admin = attribute_machine_find_user(am, "admin");
-  uint8_t pk[33] = {0x03};
-  memset(pk + 1, 0xBB, 32);
+  uint8_t pk[33];
+  _gen_pk_kr(pk);
 
   ASSERT_EQ(user_key_register(admin, "key1", ECDSA_SECP256K1, pk, 33, "primary"), CRABS_SUCCESS);
   EXPECT_EQ(user_key_register(admin, "key1", ECDSA_SECP256K1, pk, 33, "duplicate"),
@@ -269,12 +279,13 @@ TEST(TestKeyRing, RegisterRejectsAtMaxKeys) {
   for (uint32_t i = 0; i < CRABS_MAX_KEYS_PER_USER; i++) {
     char key_id[CRABS_MAX_KEY_ID];
     snprintf(key_id, sizeof(key_id), "key%u", i);
-    uint8_t pk[33] = {0x03};
-    memset(pk + 1, (uint8_t)i, 32);
+    uint8_t pk[33];
+    _gen_pk_kr(pk);
     ASSERT_EQ(user_key_register(admin, key_id, ECDSA_SECP256K1, pk, 33, nullptr), CRABS_SUCCESS);
   }
 
-  // Next one should fail
+  // Next one should fail (max keys reached — the max-keys check fires before
+  // the N-3 key validation, so a dummy key is fine here)
   uint8_t pk[33] = {0x03};
   memset(pk + 1, 0xFF, 32);
   EXPECT_EQ(user_key_register(admin, "overflow", ECDSA_SECP256K1, pk, 33, nullptr),
@@ -287,8 +298,8 @@ TEST(TestKeyRing, RegisterWithNullLabel) {
   attribute_machine_t* am = create_test_am();
   user_t* admin = attribute_machine_find_user(am, "admin");
 
-  uint8_t pk[33] = {0x03};
-  memset(pk + 1, 0xBB, 32);
+  uint8_t pk[33];
+  _gen_pk_kr(pk);
   crabs_error_e rc = user_key_register(admin, "key1", ECDSA_SECP256K1, pk, 33, nullptr);
   EXPECT_EQ(rc, CRABS_SUCCESS);
 
@@ -303,10 +314,10 @@ TEST(TestKeyRing, RegisterMultipleKeys) {
   attribute_machine_t* am = create_test_am();
   user_t* admin = attribute_machine_find_user(am, "admin");
 
-  uint8_t pk1[33] = {0x03};
-  memset(pk1 + 1, 0xBB, 32);
+  uint8_t pk1[33];
+  _gen_pk_kr(pk1);
   uint8_t pk2[33] = {0x02};
-  memset(pk2 + 1, 0xCC, 32);
+  memset(pk2 + 1, 0xCC, 32);  // ED25519 — not validated by N-3 (non-secp256k1)
 
   ASSERT_EQ(user_key_register(admin, "ecdsa-key", ECDSA_SECP256K1, pk1, 33, "ecdsa primary"), CRABS_SUCCESS);
   ASSERT_EQ(user_key_register(admin, "ed25519-key", ED25519, pk2, 33, "ed25519 primary"), CRABS_SUCCESS);
@@ -341,8 +352,8 @@ TEST(TestKeyRing, RevokeMarksKeyInactive) {
   attribute_machine_t* am = create_test_am();
   user_t* admin = attribute_machine_find_user(am, "admin");
 
-  uint8_t pk[33] = {0x03};
-  memset(pk + 1, 0xBB, 32);
+  uint8_t pk[33];
+  _gen_pk_kr(pk);
   ASSERT_EQ(user_key_register(admin, "key1", ECDSA_SECP256K1, pk, 33, "primary"), CRABS_SUCCESS);
 
   crabs_error_e rc = user_key_revoke(admin, "key1");
@@ -360,8 +371,8 @@ TEST(TestKeyRing, RevokeIncrementsKeyVersion) {
   user_t* admin = attribute_machine_find_user(am, "admin");
   uint64_t version_before = admin->key_version;
 
-  uint8_t pk[33] = {0x03};
-  memset(pk + 1, 0xBB, 32);
+  uint8_t pk[33];
+  _gen_pk_kr(pk);
   ASSERT_EQ(user_key_register(admin, "key1", ECDSA_SECP256K1, pk, 33, "primary"), CRABS_SUCCESS);
 
   // Register doesn't change key_version (only revoke does per spec)
@@ -391,10 +402,10 @@ TEST(TestKeyRing, RevokeDefaultKeyTransitionsDefault) {
   attribute_machine_t* am = create_test_am();
   user_t* admin = attribute_machine_find_user(am, "admin");
 
-  uint8_t pk1[33] = {0x03};
-  memset(pk1 + 1, 0xBB, 32);
-  uint8_t pk2[33] = {0x02};
-  memset(pk2 + 1, 0xCC, 32);
+  uint8_t pk1[33];
+  _gen_pk_kr(pk1);
+  uint8_t pk2[33];
+  _gen_pk_kr(pk2);
 
   ASSERT_EQ(user_key_register(admin, "key1", ECDSA_SECP256K1, pk1, 33, "primary"), CRABS_SUCCESS);
   ASSERT_EQ(user_key_register(admin, "key2", ECDSA_SECP256K1, pk2, 33, "secondary"), CRABS_SUCCESS);
@@ -412,8 +423,8 @@ TEST(TestKeyRing, RevokeOnlyKeyClearsDefault) {
   attribute_machine_t* am = create_test_am();
   user_t* admin = attribute_machine_find_user(am, "admin");
 
-  uint8_t pk[33] = {0x03};
-  memset(pk + 1, 0xBB, 32);
+  uint8_t pk[33];
+  _gen_pk_kr(pk);
   ASSERT_EQ(user_key_register(admin, "key1", ECDSA_SECP256K1, pk, 33, "primary"), CRABS_SUCCESS);
   EXPECT_STREQ(admin->default_key_id, "key1");
 
@@ -430,8 +441,8 @@ TEST(TestKeyRing, RevokeAllKeysSuspendsUser) {
   user_t* admin = attribute_machine_find_user(am, "admin");
   EXPECT_EQ(admin->status, USER_ACTIVE);
 
-  uint8_t pk[33] = {0x03};
-  memset(pk + 1, 0xBB, 32);
+  uint8_t pk[33];
+  _gen_pk_kr(pk);
   ASSERT_EQ(user_key_register(admin, "key1", ECDSA_SECP256K1, pk, 33, "primary"), CRABS_SUCCESS);
 
   ASSERT_EQ(user_key_revoke(admin, "key1"), CRABS_SUCCESS);
@@ -450,10 +461,10 @@ TEST(TestKeyRing, SetDefaultChangesDefault) {
   attribute_machine_t* am = create_test_am();
   user_t* admin = attribute_machine_find_user(am, "admin");
 
-  uint8_t pk1[33] = {0x03};
-  memset(pk1 + 1, 0xBB, 32);
-  uint8_t pk2[33] = {0x02};
-  memset(pk2 + 1, 0xCC, 32);
+  uint8_t pk1[33];
+  _gen_pk_kr(pk1);
+  uint8_t pk2[33];
+  _gen_pk_kr(pk2);
 
   ASSERT_EQ(user_key_register(admin, "key1", ECDSA_SECP256K1, pk1, 33, "primary"), CRABS_SUCCESS);
   ASSERT_EQ(user_key_register(admin, "key2", ECDSA_SECP256K1, pk2, 33, "secondary"), CRABS_SUCCESS);
@@ -485,10 +496,10 @@ TEST(TestKeyRing, SetDefaultRejectsInactiveKey) {
   attribute_machine_t* am = create_test_am();
   user_t* admin = attribute_machine_find_user(am, "admin");
 
-  uint8_t pk1[33] = {0x03};
-  memset(pk1 + 1, 0xBB, 32);
-  uint8_t pk2[33] = {0x02};
-  memset(pk2 + 1, 0xCC, 32);
+  uint8_t pk1[33];
+  _gen_pk_kr(pk1);
+  uint8_t pk2[33];
+  _gen_pk_kr(pk2);
 
   ASSERT_EQ(user_key_register(admin, "key1", ECDSA_SECP256K1, pk1, 33, "primary"), CRABS_SUCCESS);
   ASSERT_EQ(user_key_register(admin, "key2", ECDSA_SECP256K1, pk2, 33, "secondary"), CRABS_SUCCESS);
@@ -510,10 +521,10 @@ TEST(TestKeyRing, DestroyAllClearsKeyring) {
   attribute_machine_t* am = create_test_am();
   user_t* admin = attribute_machine_find_user(am, "admin");
 
-  uint8_t pk1[33] = {0x03};
-  memset(pk1 + 1, 0xBB, 32);
-  uint8_t pk2[33] = {0x02};
-  memset(pk2 + 1, 0xCC, 32);
+  uint8_t pk1[33];
+  _gen_pk_kr(pk1);
+  uint8_t pk2[33];
+  _gen_pk_kr(pk2);
 
   ASSERT_EQ(user_key_register(admin, "key1", ECDSA_SECP256K1, pk1, 33, "primary"), CRABS_SUCCESS);
   ASSERT_EQ(user_key_register(admin, "key2", ECDSA_SECP256K1, pk2, 33, "secondary"), CRABS_SUCCESS);
@@ -579,8 +590,8 @@ TEST(TestKeyRing, DestroyMachineWithKeysNoLeak) {
   attribute_machine_t* am = create_test_am();
   user_t* admin = attribute_machine_find_user(am, "admin");
 
-  uint8_t pk[33] = {0x03};
-  memset(pk + 1, 0xBB, 32);
+  uint8_t pk[33];
+  _gen_pk_kr(pk);
   ASSERT_EQ(user_key_register(admin, "key1", ECDSA_SECP256K1, pk, 33, "primary"), CRABS_SUCCESS);
   ASSERT_EQ(user_key_register(admin, "key2", ED25519, pk, 33, "ed25519"), CRABS_SUCCESS);
 

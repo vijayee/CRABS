@@ -18,6 +18,15 @@
 #define CRABS_MAX_POLICY_EXPR   256  // Maximum policy expression length
 #define CRABS_MAX_RESOURCES     8    // Maximum resources per operation
 #define CRABS_MAX_ATTRIBUTES    64   // Maximum attributes per user
+// Audit N-10: the attribute string is built by concatenating every user
+// attribute "name:value" token with commas. The prior callers used a
+// CRABS_MAX_POLICY_EXPR (256) byte buffer, which overflows at ~8 attributes
+// and made _build_attr_string fail closed (empty string) — a user who gained
+// one more attribute would suddenly satisfy no policies. Size the buffer
+// for the maximum: up to CRABS_MAX_ATTRIBUTES tokens, each up to
+// CRABS_MAX_POLICY_EXPR bytes, plus a comma per token. This is a few KB and
+// safe on the stack.
+#define CRABS_ATTR_STRING_MAX   (CRABS_MAX_ATTRIBUTES * (CRABS_MAX_POLICY_EXPR + 1))
 #define CRABS_MAX_LOG_ENTRIES   0    // Unlimited (0 = no limit)
 // Audit L-b: cap the processed-op idempotency set so a long-running node does
 // not grow it without bound (memory-exhaustion DoS). Beyond the cap, new ops

@@ -156,7 +156,14 @@ TEST(CompactionEngine, CompactItemUnsupportedType) {
 
 TEST(CompactionEngine, CompactItemORSetNoTombstones) {
   crabs_compaction_engine_t engine;
-  crabs_compaction_engine_init(&engine, nullptr);
+  // Audit F-3: single-replica tests use FORCE mode (the default QUORUM safety
+  // level fails closed without a peer VC, which is correct for multi-replica
+  // but prevents single-replica compaction testing).
+  crabs_tombstone_config_t cfg;
+  crabs_tombstone_config_init(&cfg);
+  cfg.safety_level = CRABS_SAFETY_FORCE;
+  cfg.allow_force = true;
+  crabs_compaction_engine_init(&engine, &cfg);
   crabs_register_crdt_vtables(&engine.registry);
 
   state_t* state = state_create();
@@ -183,6 +190,8 @@ TEST(CompactionEngine, CompactItemORSetWithTombstones) {
   crabs_tombstone_config_init(&config);
   config.strategy = CRABS_COMPACT_SIZE_BASED;
   config.max_tombstone_ratio = 0.3;  // Low threshold to force compaction
+  config.safety_level = CRABS_SAFETY_FORCE;  // Single-replica test
+  config.allow_force = true;
   crabs_compaction_engine_init(&engine, &config);
   crabs_register_crdt_vtables(&engine.registry);
 
@@ -214,6 +223,8 @@ TEST(CompactionEngine, CompactItem2PSet) {
   crabs_tombstone_config_init(&config);
   config.strategy = CRABS_COMPACT_SIZE_BASED;
   config.max_tombstone_ratio = 0.3;
+  config.safety_level = CRABS_SAFETY_FORCE;  // Single-replica test
+  config.allow_force = true;
   crabs_compaction_engine_init(&engine, &config);
   crabs_register_crdt_vtables(&engine.registry);
 
@@ -319,6 +330,8 @@ TEST(CompactionEngine, StatisticsAfterCompact) {
   crabs_tombstone_config_init(&config);
   config.strategy = CRABS_COMPACT_SIZE_BASED;
   config.max_tombstone_ratio = 0.3;
+  config.safety_level = CRABS_SAFETY_FORCE;  // Single-replica test
+  config.allow_force = true;
   crabs_compaction_engine_init(&engine, &config);
   crabs_register_crdt_vtables(&engine.registry);
 
@@ -435,6 +448,8 @@ TEST(CompactionEngine, LastCompactionTime) {
   crabs_tombstone_config_t config;
   crabs_tombstone_config_init(&config);
   config.max_tombstone_ratio = 0.3;
+  config.safety_level = CRABS_SAFETY_FORCE;  // Single-replica test
+  config.allow_force = true;
   crabs_compaction_engine_init(&engine, &config);
   crabs_register_crdt_vtables(&engine.registry);
 

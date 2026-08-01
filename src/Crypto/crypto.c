@@ -52,6 +52,12 @@ struct abe_master_key_t {
   OABE_ContextCP*   ctx;             // authority context (params + msk + keystore)
   OABE_ByteString*  public_params;   // serialized MPK
   OABE_ByteString*  master_secret;   // serialized MSK
+  // Audit N-9: per-authority key-ID sequence. The prior global counter meant
+  // multiple abe_master_key_t instances (e.g. independent state machines with
+  // independent ABE domains) would generate colliding key IDs, and the
+  // oabe_context_delete_key call could remove the wrong key. Scoping the
+  // sequence to the authority keeps key IDs unique within an authority.
+  atomic_uint        key_seq;
 };
 
 struct abe_user_key_t {
@@ -294,6 +300,35 @@ crabs_error_e crypto_ecdsa_derive_public_key(const uint8_t private_key[32],
   return (pub_len == 33) ? CRABS_SUCCESS : CRABS_ERR_CRYPTOGRAPHIC_ERROR;
 }
 
+// Audit N-3: validate that a compressed secp256k1 public key decodes to a
+// point that is on the curve and is not the point at infinity. The ECIES
+// envelope encryption (_ecdh_shared_secret) performs ECDH with an unvalidated
+// recipient public key; a key that decodes to the point at infinity would
+// produce an all-zero shared secret (predictable AES key → envelope
+// confidentiality defeated). secp256k1 has cofactor 1 so small-subgroup
+// attacks do not apply, but the infinity check is still required. This is
+// called at user registration and key registration so invalid keys never
+// enter the attribute machine or the keyring.
+bool crypto_ecdsa_validate_public_key(const uint8_t public_key[33]) {
+  if (public_key == NULL) return false;
+  EC_KEY* eckey = _eckey_from_public(public_key);
+  if (eckey == NULL) return false;
+  const EC_GROUP* group = EC_KEY_get0_group(eckey);
+  const EC_POINT* point = EC_KEY_get0_public_key(eckey);
+  bool valid = false;
+  if (group != NULL && point != NULL) {
+    // Must not be the point at infinity (ECDH with infinity yields zero).
+    if (!EC_POINT_is_at_infinity(group, point)) {
+      // Must lie on the curve (o2i_ECPublicKey already checks group membership
+      // in most OpenSSL builds, but verify explicitly for defense in depth).
+      int on_curve = EC_POINT_is_on_curve(group, point, NULL);
+      valid = (on_curve == 1);
+    }
+  }
+  EC_KEY_free(eckey);
+  return valid;
+}
+
 // ============================================================
 // ECDSA Keypair Destroy
 // ============================================================
@@ -531,7 +566,16 @@ static bool _eval_policy_expr(const char** pp, const char* attrs) {
 
 bool crypto_abe_eval_policy(const char* policy, const char* attrs) {
   if (!policy || !attrs) return false;
-  if (strlen(policy) == 0) return true;
+  // Audit N-4: an empty policy means "no attribute requirement" — but this
+  // function evaluates the ABE attribute policy in isolation, and an empty
+  // policy should NOT be treated as satisfied (that made the function a
+  // silent free-pass for any future caller that calls it directly). The
+  // authorization path in crypto_verify_operation_auth handles the
+  // "no attribute requirement" case separately by checking has_attr_policy
+  // before calling this function; it still requires a valid signature. Here,
+  // an empty policy returns false so a bare attribute policy must always
+  // name at least one attribute to match.
+  if (strlen(policy) == 0) return false;
 
   const char* p = policy;
   bool result = _eval_policy_expr(&p, attrs);
@@ -577,7 +621,18 @@ abe_master_key_t* crypto_abe_setup(void) {
 
 void crypto_abe_master_key_destroy(abe_master_key_t* mk) {
   if (mk) {
-    if (mk->master_secret) oabe_bytestring_free(mk->master_secret);
+    // Audit N-17: cleanse the master secret before freeing it. The MSK is the
+    // root trust material — anyone who recovers it from freed heap memory can
+    // forge any attribute. oabe_bytestring_free does not zero the buffer, so
+    // OPENSSL_cleanse the data first. (Public params are non-secret.)
+    if (mk->master_secret) {
+      const uint8_t* ms_data = oabe_bytestring_get_const_ptr(mk->master_secret);
+      size_t ms_len = oabe_bytestring_get_size(mk->master_secret);
+      if (ms_data != NULL && ms_len > 0) {
+        OPENSSL_cleanse((void*)ms_data, ms_len);
+      }
+      oabe_bytestring_free(mk->master_secret);
+    }
     if (mk->public_params) oabe_bytestring_free(mk->public_params);
     if (mk->ctx) oabe_context_cp_free(mk->ctx);
     free(mk);
@@ -602,9 +657,10 @@ abe_user_key_t* crypto_abe_keygen(const abe_master_key_t* mk, const char* attrs)
   _crabs_attrs_to_oabe(attrs, oabe_attrs, sizeof(oabe_attrs));
 
   // Use the master key's unique key id per user key to avoid collisions.
-  static atomic_uint _keyseq = 0;
+  // Audit N-9: the sequence is per-authority (stored in abe_master_key_t) so
+  // multiple independent ABE domains do not generate colliding key IDs.
   char key_id[64];
-  unsigned seq = (unsigned)atomic_fetch_add(&_keyseq, 1);
+  unsigned seq = (unsigned)atomic_fetch_add(&((abe_master_key_t*)mk)->key_seq, 1);
   snprintf(key_id, sizeof(key_id), "u%u", seq);
 
   if (oabe_context_cp_keygen(mk->ctx, key_id, oabe_attrs) != OABE_SUCCESS) {
@@ -874,7 +930,7 @@ verify_result_t crypto_verify_operation_auth(
     }
 
     if (has_attr_policy) {
-      char attr_string[CRABS_MAX_POLICY_EXPR];
+      char attr_string[CRABS_ATTR_STRING_MAX];
       _build_attr_string(user, attr_string, sizeof(attr_string));
       if (!crypto_abe_eval_policy(abe_policy, attr_string)) {
         result.error = CRABS_ERR_UNAUTHORIZED;
@@ -904,7 +960,7 @@ verify_result_t crypto_verify_operation_auth(
             return result;
           }
         } else {
-          char attr_string[CRABS_MAX_POLICY_EXPR];
+          char attr_string[CRABS_ATTR_STRING_MAX];
           _build_attr_string(user, attr_string, sizeof(attr_string));
           if (crypto_abe_eval_policy(abe_policy, attr_string) &&
               crypto_ecdsa_verify(user->public_key, serialized_op, op_len, signature)) {
@@ -1056,7 +1112,7 @@ verify_result_t crypto_verify_operation_auth_v2(
     }
 
     if (has_attr_policy) {
-      char attr_string[CRABS_MAX_POLICY_EXPR];
+      char attr_string[CRABS_ATTR_STRING_MAX];
       _build_attr_string(user, attr_string, sizeof(attr_string));
       if (!crypto_abe_eval_policy(abe_policy, attr_string)) {
         result.error = CRABS_ERR_UNAUTHORIZED;
@@ -1079,7 +1135,7 @@ verify_result_t crypto_verify_operation_auth_v2(
       if (user->status == USER_ACTIVE) {
         bool attr_ok = true;
         if (has_attr_policy) {
-          char attr_string[CRABS_MAX_POLICY_EXPR];
+          char attr_string[CRABS_ATTR_STRING_MAX];
           _build_attr_string(user, attr_string, sizeof(attr_string));
           attr_ok = crypto_abe_eval_policy(abe_policy, attr_string);
         }
@@ -1306,7 +1362,7 @@ key_envelope_t* crypto_key_envelope_create(
   if (!mk || !node_private_key || !user) return NULL;
 
   // Build the attribute string and its hash.
-  char attrs[CRABS_MAX_POLICY_EXPR];
+  char attrs[CRABS_ATTR_STRING_MAX];
   _build_attr_string(user, attrs, sizeof(attrs));
   uint8_t attributes_hash[CRABS_HASH_SIZE];
   if (crypto_compute_attributes_hash(user, attributes_hash) != CRABS_SUCCESS) return NULL;
@@ -1454,6 +1510,16 @@ key_envelope_t* crypto_key_envelope_deserialize(const abe_master_key_t* mk,
   if (!env) return NULL;
   size_t pos = 0;
   env->format_version = buf[pos++];
+  // Audit N-14: reject unknown envelope versions at deserialize time. The
+  // prior code accepted any version byte and only rejected v2 cleartext
+  // envelopes in crypto_key_envelope_verify — but if the envelope was used
+  // without verification (e.g. for display/migration), a v0 or future-version
+  // envelope could be misinterpreted. Reject anything that is not the
+  // current format.
+  if (env->format_version != KEY_ENVELOPE_FORMAT_V1) {
+    free(env);
+    return NULL;
+  }
   memcpy(env->user_id, buf + pos, CRABS_MAX_USER_ID);
   pos += CRABS_MAX_USER_ID;
   for (int i = 0; i < 8; i++) env->state_version |= ((uint64_t)buf[pos + i]) << (i * 8);
@@ -1526,7 +1592,7 @@ crabs_error_e crypto_key_envelope_decrypt_sk(const key_envelope_t* env,
 crabs_error_e crypto_compute_attributes_hash(const user_t* user, uint8_t hash[CRABS_HASH_SIZE]) {
   if (!user || !hash) return CRABS_ERR_INVALID_PARAM;
 
-  char attr_string[CRABS_MAX_POLICY_EXPR];
+  char attr_string[CRABS_ATTR_STRING_MAX];
   _build_attr_string(user, attr_string, sizeof(attr_string));
 
   if (strlen(attr_string) == 0) {

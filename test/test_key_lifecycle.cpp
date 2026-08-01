@@ -24,6 +24,15 @@ static attribute_machine_t* create_am_lifecycle() {
   return attribute_machine_create("admin", admin_pk);
 }
 
+// Audit N-3: user_key_register now validates secp256k1 public keys, so tests
+// must use real generated keys (not 0xBB/0xCC fill).
+static void _gen_pk_lifecycle(uint8_t out[33]) {
+  ecdsa_keypair_t* kp = crypto_ecdsa_generate();
+  ASSERT_NE(kp, nullptr);
+  memcpy(out, kp->public_key, 33);
+  crypto_ecdsa_keypair_destroy(kp);
+}
+
 // ============================================================
 // key_status_e enum
 // ============================================================
@@ -51,8 +60,8 @@ TEST(TestKeyLifecycle, RegisteredKeyHasActiveStatus) {
   attribute_machine_t* am = create_am_lifecycle();
   user_t* admin = attribute_machine_find_user(am, "admin");
 
-  uint8_t pk[33] = {0x03};
-  memset(pk + 1, 0xBB, 32);
+  uint8_t pk[33];
+  _gen_pk_lifecycle(pk);
   ASSERT_EQ(user_key_register(admin, "k1", ECDSA_SECP256K1, pk, 33, "primary"), CRABS_SUCCESS);
 
   user_key_t* key = user_key_find(admin, "k1");
@@ -74,8 +83,8 @@ TEST(TestKeyLifecycle, SuspendActiveKey) {
   attribute_machine_t* am = create_am_lifecycle();
   user_t* admin = attribute_machine_find_user(am, "admin");
 
-  uint8_t pk[33] = {0x03};
-  memset(pk + 1, 0xBB, 32);
+  uint8_t pk[33];
+  _gen_pk_lifecycle(pk);
   ASSERT_EQ(user_key_register(admin, "k1", ECDSA_SECP256K1, pk, 33, "primary"), CRABS_SUCCESS);
 
   crabs_error_e rc = user_key_suspend(admin, "k1");
@@ -103,8 +112,8 @@ TEST(TestKeyLifecycle, SuspendRejectsNonActiveKey) {
   attribute_machine_t* am = create_am_lifecycle();
   user_t* admin = attribute_machine_find_user(am, "admin");
 
-  uint8_t pk[33] = {0x03};
-  memset(pk + 1, 0xBB, 32);
+  uint8_t pk[33];
+  _gen_pk_lifecycle(pk);
   ASSERT_EQ(user_key_register(admin, "k1", ECDSA_SECP256K1, pk, 33, "primary"), CRABS_SUCCESS);
   ASSERT_EQ(user_key_revoke(admin, "k1"), CRABS_SUCCESS);
 
@@ -118,10 +127,10 @@ TEST(TestKeyLifecycle, SuspendDefaultKeyTransitionsDefault) {
   attribute_machine_t* am = create_am_lifecycle();
   user_t* admin = attribute_machine_find_user(am, "admin");
 
-  uint8_t pk1[33] = {0x03};
-  memset(pk1 + 1, 0xBB, 32);
-  uint8_t pk2[33] = {0x02};
-  memset(pk2 + 1, 0xCC, 32);
+  uint8_t pk1[33];
+  _gen_pk_lifecycle(pk1);
+  uint8_t pk2[33];
+  _gen_pk_lifecycle(pk2);
 
   ASSERT_EQ(user_key_register(admin, "k1", ECDSA_SECP256K1, pk1, 33, "primary"), CRABS_SUCCESS);
   ASSERT_EQ(user_key_register(admin, "k2", ECDSA_SECP256K1, pk2, 33, "secondary"), CRABS_SUCCESS);
@@ -138,8 +147,8 @@ TEST(TestKeyLifecycle, SuspendKeyNotInFindActive) {
   attribute_machine_t* am = create_am_lifecycle();
   user_t* admin = attribute_machine_find_user(am, "admin");
 
-  uint8_t pk[33] = {0x03};
-  memset(pk + 1, 0xBB, 32);
+  uint8_t pk[33];
+  _gen_pk_lifecycle(pk);
   ASSERT_EQ(user_key_register(admin, "k1", ECDSA_SECP256K1, pk, 33, "primary"), CRABS_SUCCESS);
   ASSERT_EQ(user_key_suspend(admin, "k1"), CRABS_SUCCESS);
 
@@ -157,8 +166,8 @@ TEST(TestKeyLifecycle, ActivateSuspendedKey) {
   attribute_machine_t* am = create_am_lifecycle();
   user_t* admin = attribute_machine_find_user(am, "admin");
 
-  uint8_t pk[33] = {0x03};
-  memset(pk + 1, 0xBB, 32);
+  uint8_t pk[33];
+  _gen_pk_lifecycle(pk);
   ASSERT_EQ(user_key_register(admin, "k1", ECDSA_SECP256K1, pk, 33, "primary"), CRABS_SUCCESS);
   ASSERT_EQ(user_key_suspend(admin, "k1"), CRABS_SUCCESS);
 
@@ -173,8 +182,8 @@ TEST(TestKeyLifecycle, ActivateActiveKeyIsIdempotent) {
   attribute_machine_t* am = create_am_lifecycle();
   user_t* admin = attribute_machine_find_user(am, "admin");
 
-  uint8_t pk[33] = {0x03};
-  memset(pk + 1, 0xBB, 32);
+  uint8_t pk[33];
+  _gen_pk_lifecycle(pk);
   ASSERT_EQ(user_key_register(admin, "k1", ECDSA_SECP256K1, pk, 33, "primary"), CRABS_SUCCESS);
 
   // Activating an already active key should succeed (idempotent)
@@ -188,8 +197,8 @@ TEST(TestKeyLifecycle, ActivateRejectsRevokedKey) {
   attribute_machine_t* am = create_am_lifecycle();
   user_t* admin = attribute_machine_find_user(am, "admin");
 
-  uint8_t pk[33] = {0x03};
-  memset(pk + 1, 0xBB, 32);
+  uint8_t pk[33];
+  _gen_pk_lifecycle(pk);
   ASSERT_EQ(user_key_register(admin, "k1", ECDSA_SECP256K1, pk, 33, "primary"), CRABS_SUCCESS);
   ASSERT_EQ(user_key_revoke(admin, "k1"), CRABS_SUCCESS);
 
@@ -202,8 +211,8 @@ TEST(TestKeyLifecycle, ActivateRejectsExpiredKey) {
   attribute_machine_t* am = create_am_lifecycle();
   user_t* admin = attribute_machine_find_user(am, "admin");
 
-  uint8_t pk[33] = {0x03};
-  memset(pk + 1, 0xBB, 32);
+  uint8_t pk[33];
+  _gen_pk_lifecycle(pk);
   ASSERT_EQ(user_key_register(admin, "k1", ECDSA_SECP256K1, pk, 33, "primary"), CRABS_SUCCESS);
 
   // Manually set key to expired state
@@ -218,8 +227,8 @@ TEST(TestKeyLifecycle, ActivateReactivatesSuspendedUser) {
   attribute_machine_t* am = create_am_lifecycle();
   user_t* admin = attribute_machine_find_user(am, "admin");
 
-  uint8_t pk[33] = {0x03};
-  memset(pk + 1, 0xBB, 32);
+  uint8_t pk[33];
+  _gen_pk_lifecycle(pk);
   ASSERT_EQ(user_key_register(admin, "k1", ECDSA_SECP256K1, pk, 33, "primary"), CRABS_SUCCESS);
 
   // Revoke the only key, which suspends the user
@@ -237,8 +246,8 @@ TEST(TestKeyLifecycle, ActivateReactivatesSuspendedUser) {
   // then activate the suspended key
   am = create_am_lifecycle();
   admin = attribute_machine_find_user(am, "admin");
-  uint8_t pk1[33] = {0x03}; memset(pk1 + 1, 0xBB, 32);
-  uint8_t pk2[33] = {0x02}; memset(pk2 + 1, 0xCC, 32);
+  uint8_t pk1[33]; _gen_pk_lifecycle(pk1);
+  uint8_t pk2[33]; _gen_pk_lifecycle(pk2);
   ASSERT_EQ(user_key_register(admin, "k1", ECDSA_SECP256K1, pk1, 33, "primary"), CRABS_SUCCESS);
   ASSERT_EQ(user_key_register(admin, "k2", ECDSA_SECP256K1, pk2, 33, "secondary"), CRABS_SUCCESS);
 
@@ -263,10 +272,10 @@ TEST(TestKeyLifecycle, RotateKeyBasic) {
   attribute_machine_t* am = create_am_lifecycle();
   user_t* admin = attribute_machine_find_user(am, "admin");
 
-  uint8_t old_pk[33] = {0x03};
-  memset(old_pk + 1, 0xBB, 32);
-  uint8_t new_pk[33] = {0x02};
-  memset(new_pk + 1, 0xDD, 32);
+  uint8_t old_pk[33];
+  _gen_pk_lifecycle(old_pk);
+  uint8_t new_pk[33];
+  _gen_pk_lifecycle(new_pk);
 
   ASSERT_EQ(user_key_register(admin, "old-key", ECDSA_SECP256K1, old_pk, 33, "primary"), CRABS_SUCCESS);
 
@@ -293,8 +302,8 @@ TEST(TestKeyLifecycle, RotateKeyBasic) {
 TEST(TestKeyLifecycle, RotateRejectsNullParams) {
   attribute_machine_t* am = create_am_lifecycle();
   user_t* admin = attribute_machine_find_user(am, "admin");
-  uint8_t pk[33] = {0x03};
-  memset(pk + 1, 0xBB, 32);
+  uint8_t pk[33];
+  _gen_pk_lifecycle(pk);
 
   EXPECT_EQ(user_key_rotate(nullptr, "old", "new", ECDSA_SECP256K1, pk, 33, "l"), CRABS_ERR_INVALID_PARAM);
   EXPECT_EQ(user_key_rotate(admin, nullptr, "new", ECDSA_SECP256K1, pk, 33, "l"), CRABS_ERR_INVALID_PARAM);
@@ -309,8 +318,8 @@ TEST(TestKeyLifecycle, RotateRejectsNullParams) {
 TEST(TestKeyLifecycle, RotateRejectsUnknownOldKey) {
   attribute_machine_t* am = create_am_lifecycle();
   user_t* admin = attribute_machine_find_user(am, "admin");
-  uint8_t pk[33] = {0x03};
-  memset(pk + 1, 0xBB, 32);
+  uint8_t pk[33];
+  _gen_pk_lifecycle(pk);
 
   EXPECT_EQ(user_key_rotate(admin, "nonexistent", "new-key", ECDSA_SECP256K1, pk, 33, "l"), CRABS_ERR_RESOURCE_NOT_FOUND);
 
@@ -321,8 +330,8 @@ TEST(TestKeyLifecycle, RotateRejectsNonActiveOldKey) {
   attribute_machine_t* am = create_am_lifecycle();
   user_t* admin = attribute_machine_find_user(am, "admin");
 
-  uint8_t pk[33] = {0x03};
-  memset(pk + 1, 0xBB, 32);
+  uint8_t pk[33];
+  _gen_pk_lifecycle(pk);
   ASSERT_EQ(user_key_register(admin, "old-key", ECDSA_SECP256K1, pk, 33, "primary"), CRABS_SUCCESS);
   ASSERT_EQ(user_key_revoke(admin, "old-key"), CRABS_SUCCESS);
 
@@ -337,8 +346,8 @@ TEST(TestKeyLifecycle, RotateRejectsDuplicateNewKeyId) {
   attribute_machine_t* am = create_am_lifecycle();
   user_t* admin = attribute_machine_find_user(am, "admin");
 
-  uint8_t pk[33] = {0x03};
-  memset(pk + 1, 0xBB, 32);
+  uint8_t pk[33];
+  _gen_pk_lifecycle(pk);
   ASSERT_EQ(user_key_register(admin, "key1", ECDSA_SECP256K1, pk, 33, "primary"), CRABS_SUCCESS);
 
   // Try to rotate key1 to key1 (same id)
@@ -351,9 +360,9 @@ TEST(TestKeyLifecycle, RotateChainMultiple) {
   attribute_machine_t* am = create_am_lifecycle();
   user_t* admin = attribute_machine_find_user(am, "admin");
 
-  uint8_t pk1[33] = {0x03}; memset(pk1 + 1, 0x11, 32);
-  uint8_t pk2[33] = {0x02}; memset(pk2 + 1, 0x22, 32);
-  uint8_t pk3[33] = {0x03}; memset(pk3 + 1, 0x33, 32);
+  uint8_t pk1[33]; _gen_pk_lifecycle(pk1);
+  uint8_t pk2[33]; _gen_pk_lifecycle(pk2);
+  uint8_t pk3[33]; _gen_pk_lifecycle(pk3);
 
   ASSERT_EQ(user_key_register(admin, "v1", ECDSA_SECP256K1, pk1, 33, "v1"), CRABS_SUCCESS);
   ASSERT_EQ(user_key_rotate(admin, "v1", "v2", ECDSA_SECP256K1, pk2, 33, "v2"), CRABS_SUCCESS);
@@ -562,8 +571,7 @@ TEST(TestKeyLifecycle, StateMachineSuspendKey) {
   size_t payload_size = config_len + 33;
   uint8_t* payload = (uint8_t*)calloc(payload_size, 1);
   memcpy(payload, config, config_len);
-  payload[config_len] = 0x03;
-  memset(payload + config_len + 1, 0xBB, 32);
+  { uint8_t _pk[33]; _gen_pk_lifecycle(_pk); memcpy(payload + config_len, _pk, 33); }
 
   operation_t* reg_op = operation_create(CRABS_OP_REGISTER_KEY);
   memcpy(reg_op->uuid, "\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b\x0c\x0d\x0e\x0f\x10", 16);
@@ -603,8 +611,7 @@ TEST(TestKeyLifecycle, StateMachineActivateKey) {
   size_t payload_size = config_len + 33;
   uint8_t* payload = (uint8_t*)calloc(payload_size, 1);
   memcpy(payload, config, config_len);
-  payload[config_len] = 0x03;
-  memset(payload + config_len + 1, 0xBB, 32);
+  { uint8_t _pk[33]; _gen_pk_lifecycle(_pk); memcpy(payload + config_len, _pk, 33); }
 
   operation_t* reg_op = operation_create(CRABS_OP_REGISTER_KEY);
   memcpy(reg_op->uuid, "\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b\x0c\x0d\x0e\x0f\x10", 16);
@@ -675,8 +682,8 @@ TEST(TestKeyLifecycle, KeyExpiryFieldAccess) {
   attribute_machine_t* am = create_am_lifecycle();
   user_t* admin = attribute_machine_find_user(am, "admin");
 
-  uint8_t pk[33] = {0x03};
-  memset(pk + 1, 0xBB, 32);
+  uint8_t pk[33];
+  _gen_pk_lifecycle(pk);
   ASSERT_EQ(user_key_register(admin, "expkey", ECDSA_SECP256K1, pk, 33, "expirable"), CRABS_SUCCESS);
 
   user_key_t* key = user_key_find(admin, "expkey");

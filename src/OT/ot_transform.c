@@ -413,7 +413,13 @@ static const char* _transform_descriptions[CRABS_OT_TRANSFORM_MATRIX_SIZE]
   {"CMP vs INS",     "CMP vs DEL",     "CMP vs UPD", "CMP vs MOV", "CMP vs SWP", "CMP vs CMP"},
 };
 
-static crabs_transform_entry_t _entry_result;
+// Audit L-i: thread-local storage so concurrent lookups from different
+// threads do not race on the shared result struct. The prior static
+// _entry_result made the function non-reentrant; two threads calling
+// crabs_transform_matrix_get_entry simultaneously would overwrite each
+// other's description buffer. C11 _Thread_local gives each thread its own
+// instance without changing the API.
+static _Thread_local crabs_transform_entry_t _entry_result;
 
 crabs_transform_entry_t* crabs_transform_matrix_get_entry(
     crabs_ot_data_item_t* item, crabs_ot_op_type_e type1, crabs_ot_op_type_e type2) {

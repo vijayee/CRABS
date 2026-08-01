@@ -330,8 +330,11 @@ TEST(TestAbe, TestPolicyEvalSimple) {
   EXPECT_FALSE(crypto_abe_eval_policy("admin", "viewer,editor"));
   EXPECT_TRUE(crypto_abe_eval_policy("editor", "admin,editor,viewer"));
 
-  // Empty policy always passes
-  EXPECT_TRUE(crypto_abe_eval_policy("", "admin"));
+  // Audit N-4: an empty policy is NOT authorized by this function. The
+  // authorization path handles the "no attribute requirement" case separately
+  // (it still requires a valid signature); this function returns false for
+  // an empty policy so a bare call cannot be a silent free-pass.
+  EXPECT_FALSE(crypto_abe_eval_policy("", "admin"));
 }
 
 TEST(TestAbe, TestPolicyEvalAndOr) {

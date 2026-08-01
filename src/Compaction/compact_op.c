@@ -131,6 +131,11 @@ crabs_ot_tree_t* crabs_extract_visible_tree(
   uint32_t cap = 16, top = 0;
   stack[top++] = tree->root;
 
+  // Audit N-6: any allocation failure during traversal now fails loud (destroy
+  // the partial visible tree and return NULL) instead of silently dropping
+  // live nodes. Silent data loss is worse than a failed compaction: a
+  // compaction that returns NULL aborts the item compaction (caller handles
+  // CRABS_ERR_INTERNAL), but a partial tree would permanently lose nodes.
   while (top > 0) {
     crabs_tree_node_t* node = stack[--top];
     if (node == NULL) continue;
@@ -155,21 +160,33 @@ crabs_ot_tree_t* crabs_extract_visible_tree(
       // Collect children into a temp list to reverse.
       crabs_tree_node_t** tmp = NULL;
       uint32_t n = 0, tcap = 0;
+      bool oom = false;
       while (c != NULL) {
         if (n == tcap) {
           tcap = tcap ? tcap * 2 : 8;
           crabs_tree_node_t** nt = (crabs_tree_node_t**)realloc(tmp, sizeof(crabs_tree_node_t*) * tcap);
-          if (nt == NULL) { free(tmp); break; }
+          if (nt == NULL) { oom = true; break; }
           tmp = nt;
         }
         tmp[n++] = c;
         c = c->next_sibling;
       }
+      if (oom) {
+        free(tmp);
+        free(stack);
+        crabs_ot_tree_destroy(visible);
+        return NULL;
+      }
       if (top + n > cap) {
         uint32_t newcap = cap;
         while (newcap < top + n) newcap *= 2;
         crabs_tree_node_t** ns = (crabs_tree_node_t**)realloc(stack, sizeof(crabs_tree_node_t*) * newcap);
-        if (ns == NULL) { free(tmp); break; }
+        if (ns == NULL) {
+          free(tmp);
+          free(stack);
+          crabs_ot_tree_destroy(visible);
+          return NULL;
+        }
         stack = ns; cap = newcap;
       }
       for (uint32_t i = 0; i < n; i++) stack[top++] = tmp[n - 1 - i];
@@ -426,13 +443,26 @@ crabs_ot_operation_t* crabs_transform_compact_compact(
   crabs_ot_operation_t* op1, crabs_ot_operation_t* op2) {
   if (op1 == NULL || op2 == NULL) return op1;
 
-  // Last-writer-wins: earlier timestamp is absorbed
-  if (op1->id.timestamp < op2->id.timestamp) {
+  // Audit N-7: the prior tiebreak used op1->id.timestamp, an attacker-
+  // controlled field on the wire (the M-L fix removed timestamp from op
+  // identity but it remained here). Two malicious nodes could set timestamps
+  // to produce divergent COMPACT outcomes. Use a deterministic, attacker-
+  // independent total order on (node_id, sequence_num): the op with the
+  // lexicographically larger (node_id, sequence_num) is absorbed (becomes a
+  // no-op COMPACT marker at position 0); the other survives. This is the
+  // same total order used by the F-4 insert/insert tiebreak.
+  int cmp = strncmp(op1->id.node_id, op2->id.node_id, CRABS_MAX_USER_ID);
+  bool absorb;
+  if (cmp != 0) {
+    absorb = (cmp > 0);
+  } else {
+    // Same node: the later sequence number is absorbed (it came after).
+    absorb = (op1->id.sequence_num > op2->id.sequence_num);
+  }
+  if (absorb) {
     op1->op_type = CRABS_OT_OP_COMPACT;
     op1->visible_pos = 0;
-    return op1;
   }
-
   return op1;
 }
 
@@ -466,18 +496,14 @@ crabs_ot_operation_t* crabs_transform_move_compact(
 crabs_ot_operation_t* crabs_transform_update_compact(
   crabs_ot_operation_t* op1, crabs_ot_operation_t* op2) {
   (void)op2;
-  if (op1 != NULL) {
-    op1->payload_size = 0;
-  }
+  // Audit F-3 / C-11: leave the update intact (do not zero payload_size). A
+  // concurrent update must still apply against the compacted state.
   return op1;
 }
 
 crabs_ot_operation_t* crabs_transform_swap_compact(
   crabs_ot_operation_t* op1, crabs_ot_operation_t* op2) {
   (void)op2;
-  if (op1 != NULL) {
-    op1->visible_pos = 0;
-    op1->visible_pos_2 = 0;
-  }
+  // Audit F-3 / C-11: leave the swap intact (do not zero positions).
   return op1;
 }

@@ -1,6 +1,16 @@
 #include <gtest/gtest.h>
 extern "C" {
 #include "../src/Attribute/attribute_machine.h"
+#include "../src/Crypto/crypto.h"
+}
+
+// Audit N-3: the attribute machine now validates secp256k1 public keys at
+// registration, so tests must use real generated keys (not 0xAB/0xCD fill).
+static void _gen_pk(uint8_t out[33]) {
+  ecdsa_keypair_t* kp = crypto_ecdsa_generate();
+  ASSERT_NE(kp, nullptr);
+  memcpy(out, kp->public_key, 33);
+  crypto_ecdsa_keypair_destroy(kp);
 }
 
 class TestAttributeMachine : public ::testing::Test {
@@ -9,7 +19,7 @@ protected:
   uint8_t admin_pk[33];
 
   void SetUp() override {
-    memset(admin_pk, 0xAB, 33);
+    _gen_pk(admin_pk);
     am = attribute_machine_create("admin", admin_pk);
   }
 
@@ -48,7 +58,7 @@ TEST_F(TestAttributeMachine, TestGenesisNullParams) {
 
 TEST_F(TestAttributeMachine, TestRegisterUser) {
   uint8_t user_pk[33];
-  memset(user_pk, 0xCD, 33);
+  _gen_pk(user_pk);
 
   crabs_error_e result = attribute_machine_register_user(am, "alice", user_pk, "dept:eng|level:senior");
   EXPECT_EQ(result, CRABS_SUCCESS);
@@ -71,7 +81,7 @@ TEST_F(TestAttributeMachine, TestRegisterUser) {
 
 TEST_F(TestAttributeMachine, TestRegisterUserNullAttrs) {
   uint8_t user_pk[33];
-  memset(user_pk, 0xEE, 33);
+  _gen_pk(user_pk);
 
   crabs_error_e result = attribute_machine_register_user(am, "bob", user_pk, NULL);
   EXPECT_EQ(result, CRABS_SUCCESS);
@@ -83,7 +93,7 @@ TEST_F(TestAttributeMachine, TestRegisterUserNullAttrs) {
 
 TEST_F(TestAttributeMachine, TestRegisterDuplicateUser) {
   uint8_t user_pk[33];
-  memset(user_pk, 0xCD, 33);
+  _gen_pk(user_pk);
 
   crabs_error_e result = attribute_machine_register_user(am, "alice", user_pk, "dept:eng");
   EXPECT_EQ(result, CRABS_SUCCESS);
@@ -102,7 +112,7 @@ TEST_F(TestAttributeMachine, TestRegisterUserNullParams) {
 
 TEST_F(TestAttributeMachine, TestGrantRole) {
   uint8_t user_pk[33];
-  memset(user_pk, 0xCD, 33);
+  _gen_pk(user_pk);
   attribute_machine_register_user(am, "alice", user_pk, NULL);
 
   crabs_error_e result = attribute_machine_grant_role(am, "alice", "role", "editor", "admin");
@@ -120,7 +130,7 @@ TEST_F(TestAttributeMachine, TestGrantRole) {
 
 TEST_F(TestAttributeMachine, TestGrantRoleUpdatesExisting) {
   uint8_t user_pk[33];
-  memset(user_pk, 0xCD, 33);
+  _gen_pk(user_pk);
   attribute_machine_register_user(am, "alice", user_pk, NULL);
 
   attribute_machine_grant_role(am, "alice", "role", "viewer", "admin");
@@ -141,7 +151,7 @@ TEST_F(TestAttributeMachine, TestGrantRoleUserNotFound) {
 
 TEST_F(TestAttributeMachine, TestGrantRoleSuspendedUser) {
   uint8_t user_pk[33];
-  memset(user_pk, 0xCD, 33);
+  _gen_pk(user_pk);
   attribute_machine_register_user(am, "alice", user_pk, NULL);
 
   attribute_machine_suspend_user(am, "alice");
@@ -152,7 +162,7 @@ TEST_F(TestAttributeMachine, TestGrantRoleSuspendedUser) {
 
 TEST_F(TestAttributeMachine, TestRevokeRole) {
   uint8_t user_pk[33];
-  memset(user_pk, 0xCD, 33);
+  _gen_pk(user_pk);
   attribute_machine_register_user(am, "alice", user_pk, "role:editor");
 
   user_t* alice = attribute_machine_find_user(am, "alice");
@@ -171,7 +181,7 @@ TEST_F(TestAttributeMachine, TestRevokeRole) {
 
 TEST_F(TestAttributeMachine, TestRevokeRoleNotFound) {
   uint8_t user_pk[33];
-  memset(user_pk, 0xCD, 33);
+  _gen_pk(user_pk);
   attribute_machine_register_user(am, "alice", user_pk, NULL);
 
   crabs_error_e result = attribute_machine_revoke_role(am, "alice", "nonexistent_role", "admin");
@@ -185,7 +195,7 @@ TEST_F(TestAttributeMachine, TestRevokeRoleUserNotFound) {
 
 TEST_F(TestAttributeMachine, TestRevokeRoleShiftsAttributes) {
   uint8_t user_pk[33];
-  memset(user_pk, 0xCD, 33);
+  _gen_pk(user_pk);
   attribute_machine_register_user(am, "alice", user_pk, "role:editor|dept:eng|level:senior");
 
   user_t* alice = attribute_machine_find_user(am, "alice");
@@ -207,7 +217,7 @@ TEST_F(TestAttributeMachine, TestRevokeRoleShiftsAttributes) {
 
 TEST_F(TestAttributeMachine, TestSelfAssert) {
   uint8_t user_pk[33];
-  memset(user_pk, 0xCD, 33);
+  _gen_pk(user_pk);
   attribute_machine_register_user(am, "alice", user_pk, NULL);
 
   crabs_error_e result = attribute_machine_self_assert(am, "email", "alice@example.com", "alice");
@@ -226,7 +236,7 @@ TEST_F(TestAttributeMachine, TestSelfAssert) {
 
 TEST_F(TestAttributeMachine, TestSelfAssertUpdatesExisting) {
   uint8_t user_pk[33];
-  memset(user_pk, 0xCD, 33);
+  _gen_pk(user_pk);
   attribute_machine_register_user(am, "alice", user_pk, NULL);
 
   attribute_machine_self_assert(am, "email", "old@example.com", "alice");
@@ -248,7 +258,7 @@ TEST_F(TestAttributeMachine, TestSelfAssertUserNotFound) {
 
 TEST_F(TestAttributeMachine, TestSelfAssertSuspendedUser) {
   uint8_t user_pk[33];
-  memset(user_pk, 0xCD, 33);
+  _gen_pk(user_pk);
   attribute_machine_register_user(am, "alice", user_pk, NULL);
   attribute_machine_suspend_user(am, "alice");
 
@@ -258,7 +268,7 @@ TEST_F(TestAttributeMachine, TestSelfAssertSuspendedUser) {
 
 TEST_F(TestAttributeMachine, TestVerifyIdentity) {
   uint8_t user_pk[33];
-  memset(user_pk, 0xCD, 33);
+  _gen_pk(user_pk);
   attribute_machine_register_user(am, "alice", user_pk, NULL);
 
   // Admin verifies alice's identity
@@ -277,7 +287,7 @@ TEST_F(TestAttributeMachine, TestVerifyIdentity) {
 
 TEST_F(TestAttributeMachine, TestVerifyIdentityUpdatesExisting) {
   uint8_t user_pk[33];
-  memset(user_pk, 0xCD, 33);
+  _gen_pk(user_pk);
   attribute_machine_register_user(am, "alice", user_pk, NULL);
 
   // Alice self-asserts first
@@ -300,7 +310,7 @@ TEST_F(TestAttributeMachine, TestVerifyIdentityUserNotFound) {
 
 TEST_F(TestAttributeMachine, TestVerifyIdentitySuspendedUser) {
   uint8_t user_pk[33];
-  memset(user_pk, 0xCD, 33);
+  _gen_pk(user_pk);
   attribute_machine_register_user(am, "alice", user_pk, NULL);
   attribute_machine_suspend_user(am, "alice");
 
@@ -310,7 +320,7 @@ TEST_F(TestAttributeMachine, TestVerifyIdentitySuspendedUser) {
 
 TEST_F(TestAttributeMachine, TestSuspendUser) {
   uint8_t user_pk[33];
-  memset(user_pk, 0xCD, 33);
+  _gen_pk(user_pk);
   attribute_machine_register_user(am, "alice", user_pk, NULL);
 
   user_t* alice = attribute_machine_find_user(am, "alice");
@@ -336,7 +346,7 @@ TEST_F(TestAttributeMachine, TestSuspendUserNotFound) {
 // assigned, so there was no way to actually revoke a user.
 TEST_F(TestAttributeMachine, TestRevokeUser) {
   uint8_t user_pk[33];
-  memset(user_pk, 0xCD, 33);
+  _gen_pk(user_pk);
   ASSERT_EQ(attribute_machine_register_user(am, "alice", user_pk, NULL), CRABS_SUCCESS);
 
   user_t* alice = attribute_machine_find_user(am, "alice");
@@ -359,7 +369,7 @@ TEST_F(TestAttributeMachine, TestRevokeUserNotFound) {
 // pruned (they would grant authority indefinitely).
 TEST_F(TestAttributeMachine, TestTempAttrExpiredAfterSetTime) {
   uint8_t user_pk[33];
-  memset(user_pk, 0xCD, 33);
+  _gen_pk(user_pk);
   ASSERT_EQ(attribute_machine_register_user(am, "alice", user_pk, "role:member"), CRABS_SUCCESS);
 
   // Issue a temp attribute with 5000ms duration at time 1000 → expires at 6000.
@@ -384,7 +394,7 @@ TEST_F(TestAttributeMachine, TestTempAttrExpiredAfterSetTime) {
 
 TEST_F(TestAttributeMachine, TestFindUser) {
   uint8_t user_pk[33];
-  memset(user_pk, 0xCD, 33);
+  _gen_pk(user_pk);
   attribute_machine_register_user(am, "alice", user_pk, NULL);
 
   user_t* found = attribute_machine_find_user(am, "alice");
@@ -402,7 +412,7 @@ TEST_F(TestAttributeMachine, TestFindUserNullParams) {
 
 TEST_F(TestAttributeMachine, TestFindAttribute) {
   uint8_t user_pk[33];
-  memset(user_pk, 0xCD, 33);
+  _gen_pk(user_pk);
   attribute_machine_register_user(am, "alice", user_pk, "dept:eng|level:senior");
 
   user_t* alice = attribute_machine_find_user(am, "alice");
@@ -431,7 +441,7 @@ TEST_F(TestAttributeMachine, TestFindAttributeNullParams) {
 
 TEST_F(TestAttributeMachine, TestUserHasRole) {
   uint8_t user_pk[33];
-  memset(user_pk, 0xCD, 33);
+  _gen_pk(user_pk);
   attribute_machine_register_user(am, "alice", user_pk, "role:editor|dept:eng");
 
   user_t* alice = attribute_machine_find_user(am, "alice");
@@ -454,7 +464,7 @@ TEST_F(TestAttributeMachine, TestUserHasRoleNullParams) {
 
 TEST_F(TestAttributeMachine, TestIssueTemporaryAttribute) {
   uint8_t user_pk[33];
-  memset(user_pk, 0xCD, 33);
+  _gen_pk(user_pk);
   attribute_machine_register_user(am, "alice", user_pk, "dept:worker");
 
   am->current_time_ms = 1000;
@@ -477,7 +487,7 @@ TEST_F(TestAttributeMachine, TestIssueTemporaryAttribute) {
 
 TEST_F(TestAttributeMachine, TestIssueTemporarySkipsSuspendedUser) {
   uint8_t user_pk[33];
-  memset(user_pk, 0xCD, 33);
+  _gen_pk(user_pk);
   attribute_machine_register_user(am, "alice", user_pk, "dept:worker");
   attribute_machine_suspend_user(am, "alice");
 
@@ -494,7 +504,7 @@ TEST_F(TestAttributeMachine, TestIssueTemporarySkipsSuspendedUser) {
 
 TEST_F(TestAttributeMachine, TestIssueTemporaryNoMatchingUsers) {
   uint8_t user_pk[33];
-  memset(user_pk, 0xCD, 33);
+  _gen_pk(user_pk);
   attribute_machine_register_user(am, "alice", user_pk, "dept:eng");
 
   am->current_time_ms = 1000;
@@ -519,7 +529,7 @@ TEST_F(TestAttributeMachine, TestIssueTemporaryNullParams) {
 
 TEST_F(TestAttributeMachine, TestPruneExpiredTemporary) {
   uint8_t user_pk[33];
-  memset(user_pk, 0xCD, 33);
+  _gen_pk(user_pk);
   attribute_machine_register_user(am, "alice", user_pk, "dept:worker");
 
   am->current_time_ms = 1000;
@@ -544,7 +554,7 @@ TEST_F(TestAttributeMachine, TestPruneExpiredTemporary) {
 
 TEST_F(TestAttributeMachine, TestPruneExpiredTemporaryKeepsValid) {
   uint8_t user_pk[33];
-  memset(user_pk, 0xCD, 33);
+  _gen_pk(user_pk);
   attribute_machine_register_user(am, "alice", user_pk, "dept:worker");
 
   am->current_time_ms = 1000;
@@ -563,8 +573,8 @@ TEST_F(TestAttributeMachine, TestPruneExpiredTemporaryKeepsValid) {
 
 TEST_F(TestAttributeMachine, TestPruneExpiredTemporaryMultipleUsers) {
   uint8_t pk1[33], pk2[33];
-  memset(pk1, 0xCD, 33);
-  memset(pk2, 0xEF, 33);
+  _gen_pk(pk1);
+  _gen_pk(pk2);
   attribute_machine_register_user(am, "alice", pk1, "dept:worker");
   attribute_machine_register_user(am, "bob", pk2, "dept:worker");
 
@@ -599,7 +609,7 @@ TEST_F(TestAttributeMachine, TestPruneExpiredNullMachine) {
 
 TEST_F(TestAttributeMachine, TestPublicKeyStored) {
   uint8_t user_pk[33];
-  memset(user_pk, 0xCD, 33);
+  _gen_pk(user_pk);
   attribute_machine_register_user(am, "alice", user_pk, NULL);
 
   user_t* alice = attribute_machine_find_user(am, "alice");
@@ -615,7 +625,7 @@ TEST_F(TestAttributeMachine, TestAdminPublicKeyStored) {
 
 TEST_F(TestAttributeMachine, TestVersionIncrements) {
   uint8_t user_pk[33];
-  memset(user_pk, 0xCD, 33);
+  _gen_pk(user_pk);
 
   uint64_t initial_version = am->base_state.version;
 
@@ -640,7 +650,7 @@ TEST_F(TestAttributeMachine, TestVersionIncrements) {
 
 TEST_F(TestAttributeMachine, TestKeyVersionIncrements) {
   uint8_t user_pk[33];
-  memset(user_pk, 0xCD, 33);
+  _gen_pk(user_pk);
   attribute_machine_register_user(am, "alice", user_pk, NULL);
 
   user_t* alice = attribute_machine_find_user(am, "alice");
@@ -657,7 +667,7 @@ TEST_F(TestAttributeMachine, TestKeyVersionIncrements) {
 
 TEST_F(TestAttributeMachine, TestMaxAttributes) {
   uint8_t user_pk[33];
-  memset(user_pk, 0xCD, 33);
+  _gen_pk(user_pk);
   attribute_machine_register_user(am, "alice", user_pk, NULL);
 
   // Fill up to max attributes
@@ -682,7 +692,7 @@ TEST_F(TestAttributeMachine, TestDestroyNull) {
 // admin grant.
 TEST_F(TestAttributeMachine, TestSelfAssertRejectsPrivileged) {
   uint8_t user_pk[33];
-  memset(user_pk, 0xCC, 33);
+  _gen_pk(user_pk);
   ASSERT_EQ(attribute_machine_register_user(am, "alice", user_pk, "dept:eng"), CRABS_SUCCESS);
 
   EXPECT_EQ(attribute_machine_self_assert(am, "role", "admin", "alice"),
@@ -704,7 +714,7 @@ TEST_F(TestAttributeMachine, TestSelfAssertRejectsPrivileged) {
 // test_crypto.cpp's VerifyAuthTest.SelfAssertValueDoesNotAuthorize.
 TEST_F(TestAttributeMachine, TestSelfAssertValueCollisionStoredNamespaced) {
   uint8_t user_pk[33];
-  memset(user_pk, 0xCC, 33);
+  _gen_pk(user_pk);
   ASSERT_EQ(attribute_machine_register_user(am, "alice", user_pk, "dept:eng"), CRABS_SUCCESS);
 
   ASSERT_EQ(attribute_machine_self_assert(am, "clearance", "admin", "alice"),

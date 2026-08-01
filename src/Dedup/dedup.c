@@ -8,6 +8,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
+#include <stdint.h>
 
 // ============================================================
 // Path resolution
@@ -169,6 +170,17 @@ crabs_error_e dedup_apply_mutation_spec(state_t* state,
           if (item->type == DATA_TYPE_COUNTER || item->type == DATA_TYPE_PN_COUNTER ||
               item->type == DATA_TYPE_RESOURCE) {
             int64_t* val = (int64_t*)item->value;
+            // Audit N-15: checked addition. mut->delta is signed and covered by
+            // the operation signature (C-6 fix), but a large delta in a
+            // registered dedup spec could overflow the counter — undefined
+            // behavior. Reject on overflow instead of wrapping, matching
+            // g_counter_increment's checked-add discipline.
+            if (mut->delta > 0 && *val > INT64_MAX - mut->delta) {
+              return CRABS_ERR_INVALID_PARAM;
+            }
+            if (mut->delta < 0 && *val < INT64_MIN - mut->delta) {
+              return CRABS_ERR_INVALID_PARAM;
+            }
             *val += mut->delta;
             return CRABS_SUCCESS;
           }

@@ -202,16 +202,22 @@ TEST_F(TestIntegration, CRDTMergeBetweenReplicas) {
 // ============================================================
 
 TEST_F(TestIntegration, AttributeMachineLifecycle) {
-  // Create attribute machine with admin
+  // Create attribute machine with admin (audit N-3: real generated keys)
   uint8_t admin_pk[33];
-  memset(admin_pk, 0xAA, 33);
+  ecdsa_keypair_t* admin_kp = crypto_ecdsa_generate();
+  ASSERT_NE(admin_kp, nullptr);
+  memcpy(admin_pk, admin_kp->public_key, 33);
+  crypto_ecdsa_keypair_destroy(admin_kp);
   attribute_machine_t* am = attribute_machine_create("admin", admin_pk);
   ASSERT_NE(am, nullptr);
   EXPECT_EQ(am->user_count, 1u);
 
   // Register a user
   uint8_t user_pk[33];
-  memset(user_pk, 0xBB, 33);
+  ecdsa_keypair_t* kp = crypto_ecdsa_generate();
+  ASSERT_NE(kp, nullptr);
+  memcpy(user_pk, kp->public_key, 33);
+  crypto_ecdsa_keypair_destroy(kp);
   crabs_error_e result = attribute_machine_register_user(am, "alice", user_pk, "dept:eng");
   EXPECT_EQ(result, CRABS_SUCCESS);
 
@@ -498,8 +504,10 @@ TEST_F(TestIntegration, KeyVersionVerification) {
 
   // Set up attribute machine with alice registered with real key and role:admin
   uint8_t admin_pk[33];
-  memset(admin_pk, 0xAA, 33);
-  admin_pk[0] = 0x02;
+  ecdsa_keypair_t* admin_kp2 = crypto_ecdsa_generate();
+  ASSERT_NE(admin_kp2, nullptr);
+  memcpy(admin_pk, admin_kp2->public_key, 33);
+  crypto_ecdsa_keypair_destroy(admin_kp2);
   attribute_machine_t* am = attribute_machine_create("admin", admin_pk);
   ASSERT_NE(am, nullptr);
 

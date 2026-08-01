@@ -7,6 +7,7 @@ extern "C" {
 #include "../src/CRDT/crdt_merge.h"
 #include "../src/StateMachine/state_machine.h"
 #include "../src/Attribute/attribute_machine.h"
+#include "../src/Crypto/crypto.h"
 }
 
 // ============================================================
@@ -638,13 +639,19 @@ TEST_F(TestTrigger, TestDisableTriggerNotFound) {
 TEST_F(TestTrigger, TestIssueAttributeEffect) {
   // Create an attribute machine with a user who has role "viewer"
   uint8_t admin_pk[33];
-  memset(admin_pk, 0xAB, 33);
+  ecdsa_keypair_t* admin_kp = crypto_ecdsa_generate();
+  ASSERT_NE(admin_kp, nullptr);
+  memcpy(admin_pk, admin_kp->public_key, 33);
+  crypto_ecdsa_keypair_destroy(admin_kp);
   attribute_machine_t* am = attribute_machine_create("admin", admin_pk);
   ASSERT_NE(am, nullptr);
 
   // Register a user with viewer role
   uint8_t user_pk[33];
-  memset(user_pk, 0xCD, 33);
+  ecdsa_keypair_t* kp = crypto_ecdsa_generate();
+  ASSERT_NE(kp, nullptr);
+  memcpy(user_pk, kp->public_key, 33);
+  crypto_ecdsa_keypair_destroy(kp);
   attribute_machine_register_user(am, "alice", user_pk, "role:viewer");
 
   // Set current time for temp attr expiry

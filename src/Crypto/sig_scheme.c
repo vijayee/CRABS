@@ -29,9 +29,13 @@ crabs_error_e crypto_sig_scheme_register(const signature_vtable_t* vtable) {
   if (vtable->verify == NULL) return CRABS_ERR_INVALID_PARAM;
 
   pthread_mutex_lock(&_registry_lock);
-  if (crypto_sig_scheme_get(vtable->scheme_id) != NULL) {
-    pthread_mutex_unlock(&_registry_lock);
-    return CRABS_ERR_SCHEME_ALREADY_REGISTERED;
+  // Inline duplicate check (do NOT call crypto_sig_scheme_get here — it
+  // locks the same _registry_lock, which would deadlock).
+  for (uint32_t i = 0; i < _registry_count; i++) {
+    if (_registry[i] != NULL && _registry[i]->scheme_id == vtable->scheme_id) {
+      pthread_mutex_unlock(&_registry_lock);
+      return CRABS_ERR_SCHEME_ALREADY_REGISTERED;
+    }
   }
 
   if (_registry_count >= CRABS_MAX_REGISTERED_SCHEMES) {

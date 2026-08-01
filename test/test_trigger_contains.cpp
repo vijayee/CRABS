@@ -119,14 +119,19 @@ protected:
   uint8_t admin_pk[33];
 
   void SetUp() override {
-    memset(admin_pk, 0xAB, 33);
-    admin_pk[0] = 0x02;
+    // Audit N-3: use real generated secp256k1 keys.
+    ecdsa_keypair_t* admin_kp = crypto_ecdsa_generate();
+    ASSERT_NE(admin_kp, nullptr);
+    memcpy(admin_pk, admin_kp->public_key, 33);
+    crypto_ecdsa_keypair_destroy(admin_kp);
     am = attribute_machine_create("admin", admin_pk);
     ASSERT_NE(am, nullptr);
 
     uint8_t pk[33];
-    memset(pk, 0xCD, 33);
-    pk[0] = 0x02;
+    ecdsa_keypair_t* kp = crypto_ecdsa_generate();
+    ASSERT_NE(kp, nullptr);
+    memcpy(pk, kp->public_key, 33);
+    crypto_ecdsa_keypair_destroy(kp);
     attribute_machine_register_user(am, "alice", pk, "dept:eng");
 
     state = state_create();
@@ -283,8 +288,12 @@ TEST(TestContains, PolicyPreprocessNoContains) {
   state_t* s = state_create();
   policy_preprocess_result_t result = preprocess_policy("role:admin", s, "alice");
   EXPECT_TRUE(result.resolved_ok);
-  // preprocess_policy strips the type prefix, so "role:admin" → "admin"
-  EXPECT_STREQ(result.abe_policy, "admin");
+  // Audit F-1/N-4: preprocess_policy keeps the full "name:value" token (no
+  // longer strips the name prefix). _build_attr_string emits "name:value"
+  // tokens and crypto_abe_eval_policy matches whole tokens, so "role:admin"
+  // matches "role:admin" exactly. Stripping the name made "role:admin" and
+  // "dept:admin" collide.
+  EXPECT_STREQ(result.abe_policy, "role:admin");
   state_destroy(s);
 }
 

@@ -207,10 +207,13 @@ TEST(CompactOp, TransformInsertCompact) {
   crabs_ot_operation_init(&op2);
   op2.op_type = CRABS_OT_OP_COMPACT;
 
+  // Audit F-3: insert_compact is now a no-op (does not zero visible_pos or
+  // payload_size). A concurrent insert must still apply against the compacted
+  // state; zeroing it would silently delete the insert.
   crabs_ot_operation_t* result = crabs_transform_insert_compact(&op1, &op2);
   EXPECT_EQ(result, &op1);
-  EXPECT_EQ(result->visible_pos, 0u);  // Absorbed
-  EXPECT_EQ(result->payload_size, 0u);   // Payload cleared
+  EXPECT_EQ(result->visible_pos, 5u);    // Unchanged
+  EXPECT_EQ(result->payload_size, 4u);    // Unchanged
 }
 
 TEST(CompactOp, TransformDeleteCompact) {
@@ -223,9 +226,11 @@ TEST(CompactOp, TransformDeleteCompact) {
   crabs_ot_operation_init(&op2);
   op2.op_type = CRABS_OT_OP_COMPACT;
 
+  // Audit F-3: delete_compact is now a no-op. The delete must still apply
+  // against the compacted state; the apply path bounds-checks the position.
   crabs_ot_operation_t* result = crabs_transform_delete_compact(&op1, &op2);
   EXPECT_EQ(result, &op1);
-  EXPECT_EQ(result->visible_pos, 0u);
+  EXPECT_EQ(result->visible_pos, 5u);  // Unchanged
 }
 
 TEST(CompactOp, TransformMoveCompact) {
@@ -239,10 +244,11 @@ TEST(CompactOp, TransformMoveCompact) {
   crabs_ot_operation_init(&op2);
   op2.op_type = CRABS_OT_OP_COMPACT;
 
+  // Audit F-3: move_compact is now a no-op (positions unchanged).
   crabs_ot_operation_t* result = crabs_transform_move_compact(&op1, &op2);
   EXPECT_EQ(result, &op1);
-  EXPECT_EQ(result->visible_pos, 0u);
-  EXPECT_EQ(result->visible_pos_2, 0u);
+  EXPECT_EQ(result->visible_pos, 5u);    // Unchanged
+  EXPECT_EQ(result->visible_pos_2, 10u);  // Unchanged
 }
 
 TEST(CompactOp, TransformNullOps) {

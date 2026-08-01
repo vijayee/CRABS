@@ -571,7 +571,10 @@ void crabs_prune_ot_log(crabs_ot_data_item_t* item, uint32_t max_size) {
   if (to_remove == 0) return;
 
   // For each candidate, check whether any retained op depends on it.
-  uint8_t* prune = (uint8_t*)get_clear_memory(to_remove);
+  // Audit N-12: use calloc (returns NULL on OOM) instead of get_clear_memory
+  // (which aborts the process). The NULL check below then skips pruning
+  // safely; the prior call would abort the node on a large prune set.
+  uint8_t* prune = (uint8_t*)calloc(to_remove, 1);
   if (prune == NULL) return; // refuse to prune if we can't track it safely
   for (uint32_t i = 0; i < to_remove; i++) {
     const crabs_ot_op_id_t* cid = &item->op_log[i].id;

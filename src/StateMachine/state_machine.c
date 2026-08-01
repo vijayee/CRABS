@@ -313,10 +313,15 @@ static void _compute_log_chain_hash(state_t* state, log_entry_t* entry) {
   EVP_DigestUpdate(ctx, prev, CRABS_HASH_SIZE);
   EVP_DigestUpdate(ctx, &entry->version, sizeof(entry->version));
   EVP_DigestUpdate(ctx, entry->uuid, CRABS_UUID_SIZE);
-  EVP_DigestUpdate(ctx, entry->type, strnlen(entry->type, CRABS_MAX_OP_NAME));
-  EVP_DigestUpdate(ctx, entry->signer_id, strnlen(entry->signer_id, CRABS_MAX_USER_ID));
+  // Audit N-13: use strlen (not strnlen) since the fields are guaranteed
+  // NUL-terminated by the strncat calls in append_log above. strnlen would
+  // read up to the max buffer size even when the string is shorter, hashing
+  // whatever bytes follow the intended string — bounded and safe, but
+  // include only the intended bytes for a stable, well-defined chain hash.
+  EVP_DigestUpdate(ctx, entry->type, strlen(entry->type));
+  EVP_DigestUpdate(ctx, entry->signer_id, strlen(entry->signer_id));
   EVP_DigestUpdate(ctx, &entry->lamport_time, sizeof(entry->lamport_time));
-  EVP_DigestUpdate(ctx, entry->node_id, strnlen(entry->node_id, CRABS_MAX_USER_ID));
+  EVP_DigestUpdate(ctx, entry->node_id, strlen(entry->node_id));
   unsigned int hlen = 0;
   EVP_DigestFinal_ex(ctx, entry->state_hash, &hlen);
   EVP_MD_CTX_free(ctx);
@@ -719,6 +724,25 @@ crabs_error_e state_machine_op_lock(state_t* state, operation_t* op, lock_respon
     // bearer credentials — never store a predictable token.
     static const uint8_t zero_token[CRABS_LOCK_TOKEN_SIZE] = {0};
     if (memcmp(response->lock_tokens[i], zero_token, CRABS_LOCK_TOKEN_SIZE) == 0) {
+      // Audit N-8: roll back already-acquired locks before failing. The prior
+      // code returned the error here, leaving resources 0..i-1 in LOCKED with
+      // tokens the caller never received — only expiry/force-unlock could
+      // release them (a denial-of-service on those resources). Restore each
+      // already-locked item to IDLE, clear its token, and free its snapshot
+      // so the all-or-nothing semantics from §4.1 hold.
+      for (uint32_t j = 0; j < i; j++) {
+        data_item_t* locked = state_find_item(state, op->resources[j]);
+        if (locked == NULL) continue;
+        locked->protocol_state = PROTOCOL_IDLE;
+        locked->lock_state.lock_token_valid = false;
+        OPENSSL_cleanse(locked->lock_state.lock_token, CRABS_LOCK_TOKEN_SIZE);
+        memset(locked->lock_state.lock_owner, 0, CRABS_MAX_USER_ID);
+        if (locked->lock_state.pre_lock_snapshot != NULL) {
+          free(locked->lock_state.pre_lock_snapshot);
+          locked->lock_state.pre_lock_snapshot = NULL;
+        }
+        locked->lock_state.lock_extensions = 0;
+      }
       return CRABS_ERR_CRYPTOGRAPHIC_ERROR;
     }
     memcpy(item->lock_state.lock_token, response->lock_tokens[i], CRABS_LOCK_TOKEN_SIZE);
@@ -1294,6 +1318,18 @@ crabs_error_e state_machine_op_refresh_key(state_t* state, operation_t* op,
 
 crabs_error_e state_machine_op_compact(state_t* state, operation_t* op) {
   if (state == NULL || op == NULL) return CRABS_ERR_INVALID_PARAM;
+
+  // Audit N-20: use the state's persistent compaction engine if one is wired
+  // so the local_vc accumulated from the OT execute path (via
+  // crabs_compaction_engine_record_op) is preserved across __compact__
+  // invocations. The prior code created a fresh engine on the stack each
+  // time, so local_vc started empty and the STRONG/QUORUM safety check could
+  // never be armed. If no persistent engine is set, fall back to a fresh
+  // one (single-replica CRABS_SAFETY_FORCE mode).
+  if (state->compaction_engine != NULL) {
+    return crabs_op_compact_now((crabs_compaction_engine_t*)state->compaction_engine,
+                                state);
+  }
 
   crabs_compaction_engine_t engine;
   crabs_compaction_engine_init(&engine, NULL);

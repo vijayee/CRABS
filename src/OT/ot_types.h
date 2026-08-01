@@ -124,7 +124,10 @@ void crabs_ot_operation_init(crabs_ot_operation_t* op);
 void crabs_ot_operation_clear(crabs_ot_operation_t* op);
 bool crabs_ot_operation_set_payload(crabs_ot_operation_t* op,
                                     const uint8_t* data, uint32_t size);
-void crabs_ot_operation_add_dep(crabs_ot_operation_t* op,
+// Audit N-16: returns true if the dependency was added, false if the dep
+// array is full (CRABS_OT_MAX_DEPS). The caller must fail the operation on
+// false to avoid silently dropping causality.
+bool crabs_ot_operation_add_dep(crabs_ot_operation_t* op,
                                 const crabs_ot_op_id_t* dep);
 const char* crabs_ot_op_type_name(crabs_ot_op_type_e type);
 

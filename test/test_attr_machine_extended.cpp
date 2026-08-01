@@ -18,8 +18,12 @@ protected:
   uint8_t admin_pk[33];
 
   void SetUp() override {
-    memset(admin_pk, 0xAB, 33);
-    admin_pk[0] = 0x02;
+    // Audit N-3: use a real generated secp256k1 key (the attribute machine
+    // now validates public keys at registration).
+    ecdsa_keypair_t* kp = crypto_ecdsa_generate();
+    ASSERT_NE(kp, nullptr);
+    memcpy(admin_pk, kp->public_key, 33);
+    crypto_ecdsa_keypair_destroy(kp);
     am = attribute_machine_create("admin", admin_pk);
     ASSERT_NE(am, nullptr);
   }
@@ -30,8 +34,10 @@ protected:
 
   void register_user(const char* id) {
     uint8_t pk[33];
-    memset(pk, 0xCD, 33);
-    pk[0] = 0x02;
+    ecdsa_keypair_t* kp = crypto_ecdsa_generate();
+    ASSERT_NE(kp, nullptr);
+    memcpy(pk, kp->public_key, 33);
+    crypto_ecdsa_keypair_destroy(kp);
     crabs_error_e rc = attribute_machine_register_user(am, id, pk, "role:user");
     ASSERT_EQ(rc, CRABS_SUCCESS);
   }
@@ -238,10 +244,12 @@ TEST_F(TestAttrMachine, KeyRefreshViaStateMachine) {
 // ============================================================
 
 TEST_F(TestAttrMachine, CompromiseRecoveryScenario) {
-  // Register alice
+  // Register alice (audit N-3: real generated key)
   uint8_t compromised_pk[33];
-  memset(compromised_pk, 0xDD, 33);
-  compromised_pk[0] = 0x02;
+  ecdsa_keypair_t* kp = crypto_ecdsa_generate();
+  ASSERT_NE(kp, nullptr);
+  memcpy(compromised_pk, kp->public_key, 33);
+  crypto_ecdsa_keypair_destroy(kp);
   attribute_machine_register_user(am, "alice", compromised_pk, "role:admin");
 
   user_t* alice = attribute_machine_find_user(am, "alice");
@@ -275,8 +283,10 @@ TEST_F(TestAttrMachine, CompromiseRecoveryScenario) {
 TEST_F(TestAttrMachine, PolicyEnforcementNoRole) {
   // Register alice with role:user (not role:admin)
   uint8_t pk[33];
-  memset(pk, 0xCD, 33);
-  pk[0] = 0x02;
+  ecdsa_keypair_t* kp = crypto_ecdsa_generate();
+  ASSERT_NE(kp, nullptr);
+  memcpy(pk, kp->public_key, 33);
+  crypto_ecdsa_keypair_destroy(kp);
   attribute_machine_register_user(am, "alice", pk, "role:user");
 
   // Create state with policy requiring role:admin

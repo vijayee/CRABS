@@ -82,12 +82,19 @@ bool crabs_ot_operation_set_payload(crabs_ot_operation_t* op,
   return true;
 }
 
-void crabs_ot_operation_add_dep(crabs_ot_operation_t* op,
+// Audit N-16: return a bool so the caller can detect a dropped dependency
+// and fail the operation instead of silently losing causality. The prior
+// void return meant an op with more than CRABS_OT_MAX_DEPS dependencies
+// silently dropped the overflow, and crabs_op_depends_on would not find the
+// dropped deps — causing the transform to apply against ops that should have
+// been skipped (causality violation → potential divergence).
+bool crabs_ot_operation_add_dep(crabs_ot_operation_t* op,
                                 const crabs_ot_op_id_t* dep) {
-  if (op == NULL || dep == NULL) return;
-  if (op->dep_count >= CRABS_OT_MAX_DEPS) return;
+  if (op == NULL || dep == NULL) return false;
+  if (op->dep_count >= CRABS_OT_MAX_DEPS) return false; // full — caller must fail
   op->deps[op->dep_count] = *dep;
   op->dep_count++;
+  return true;
 }
 
 const char* crabs_ot_op_type_name(crabs_ot_op_type_e type) {
@@ -150,10 +157,18 @@ crabs_ot_operation_t* crabs_ot_data_item_append_op(crabs_ot_data_item_t* item) {
     }
     uint32_t new_cap = (uint32_t)new_cap64;
     if (new_cap <= item->op_log_capacity) return NULL; // cap reached
-    crabs_ot_operation_t* new_log = get_clear_memory(sizeof(crabs_ot_operation_t) * new_cap);
+    // Audit N-5: use realloc instead of get_clear_memory+memcpy+free. The
+    // prior path allocated a zeroed array, memcpy'd the old entries (which
+    // include payload pointers), then freed the old array — leaving the
+    // payload pointers briefly in freed heap memory. realloc preserves the
+    // entries in place and only zeroes the new tail, avoiding the temporary
+    // double-copy of payload pointers.
+    crabs_ot_operation_t* new_log = realloc(
+        item->op_log, sizeof(crabs_ot_operation_t) * new_cap);
     if (new_log == NULL) return NULL;
-    memcpy(new_log, item->op_log, sizeof(crabs_ot_operation_t) * item->op_log_count);
-    free(item->op_log);
+    // Zero the new slots only (realloc does not zero the grown region).
+    memset(new_log + item->op_log_capacity, 0,
+           sizeof(crabs_ot_operation_t) * (new_cap - item->op_log_capacity));
     item->op_log = new_log;
     item->op_log_capacity = new_cap;
   }
@@ -163,11 +178,31 @@ crabs_ot_operation_t* crabs_ot_data_item_append_op(crabs_ot_data_item_t* item) {
   return op;
 }
 
+// Audit N-11: produce a per-node priority so concurrent ops from different
+// nodes at the same insertion count get distinct priorities, reducing
+// reliance on the (priority, node_id) tie-break in insert_insert. The high
+// 32 bits are the global op count (preserving same-node insertion order);
+// the low 32 bits are a hash of the node_id (differentiating concurrent
+// nodes). The tie-break still handles the rare case of two ops from the
+// same node at the same count (should not happen — sequence_num is unique
+// per node).
+static uint32_t _node_id_hash(const char* node_id) {
+  if (node_id == NULL) return 0;
+  // FNV-1a 32-bit
+  uint32_t h = 0x811c9dc5u;
+  for (const char* p = node_id; *p != '\0'; p++) {
+    h ^= (uint8_t)*p;
+    h *= 0x01000193u;
+  }
+  return h;
+}
+
 uint64_t crabs_ot_data_item_next_priority(crabs_ot_data_item_t* item,
                                            const char* node_id) {
   if (item == NULL || node_id == NULL) return 0;
-  // Priority is the total op count + 1 (operations are ordered by insertion)
-  return (uint64_t)item->op_log_count + 1;
+  uint64_t count = (uint64_t)item->op_log_count + 1;
+  uint64_t hash = _node_id_hash(node_id);
+  return (count << 32) | (hash & 0xFFFFFFFFu);
 }
 
 void crabs_ot_data_item_set_transform(crabs_ot_data_item_t* item,

@@ -24,6 +24,28 @@
 // alter the policy's structure (policy-structure injection). Restrict
 // signer_ids to a safe charset at registration so substitution cannot
 // break out of the intended context.
+//
+// Audit N-2: the safe charset [A-Za-z0-9_-] already excludes delimiters, but
+// it still allows the condition-language keywords (AND, OR, NOT, BETWEEN, IN,
+// CONTAINS, CONTAINS_ANY, CONTAINS_ALL, true, false). A user who registers
+// with user_id = "AND" or "OR" can alter a policy template's structure when
+// {user_id} is substituted: e.g. policy "{user_id} IN (alice, bob)" with
+// signer_id "AND" becomes "AND IN (alice, bob)" — the parser sees the AND
+// keyword, not an identifier. Reject signer_ids that case-insensitively
+// match a policy keyword so the substituted text is always a bare identifier.
+static const char* _POLICY_KEYWORDS[] = {
+  "and", "or", "not", "between", "in", "contains",
+  "contains_any", "contains_all", "true", "false", NULL
+};
+
+static bool _is_policy_keyword(const char* id) {
+  if (id == NULL) return false;
+  for (int i = 0; _POLICY_KEYWORDS[i] != NULL; i++) {
+    if (strcasecmp(id, _POLICY_KEYWORDS[i]) == 0) return true;
+  }
+  return false;
+}
+
 static bool _is_safe_user_id(const char* id) {
   if (id == NULL || id[0] == '\0') return false;
   for (const char* p = id; *p != '\0'; p++) {
@@ -32,6 +54,9 @@ static bool _is_safe_user_id(const char* id) {
               (c >= '0' && c <= '9') || c == '_' || c == '-';
     if (!ok) return false;
   }
+  // Reject policy keywords so the {user_id} placeholder cannot inject
+  // operator tokens into the condition AST.
+  if (_is_policy_keyword(id)) return false;
   return true;
 }
 
@@ -97,6 +122,25 @@ static bool _attribute_matches_name(const attribute_value_t* attr, const char* n
   char attr_name[CRABS_MAX_POLICY_EXPR];
   _extract_name(attr->value, attr_name, sizeof(attr_name));
   return strcmp(attr_name, name) == 0;
+}
+
+// Audit N-1: the set of privileged attribute names that must never be mintable
+// via self-assertion OR via trigger-issued temporary attributes. A trigger
+// creator with __create_trigger__ authority could otherwise set
+// issue_attribute="role" and attribute_value="admin", and when the trigger
+// fires the target user receives a temporary "role:admin" attribute that
+// satisfies role:admin policies and produces a real CP-ABE key with attribute
+// role_admin (the F-1 blocklist in self_assert did not cover this path).
+static const char* _PRIVILEGED_ATTR_NAMES[] = {
+  "role", "admin", "member", "owner", "root", "superuser", "manager", NULL
+};
+
+static bool _is_privileged_attr_name(const char* name) {
+  if (name == NULL || name[0] == '\0') return false;
+  for (int i = 0; _PRIVILEGED_ATTR_NAMES[i] != NULL; i++) {
+    if (strcasecmp(name, _PRIVILEGED_ATTR_NAMES[i]) == 0) return true;
+  }
+  return false;
 }
 
 // ============================================================
@@ -235,6 +279,14 @@ crabs_error_e attribute_machine_register_user(attribute_machine_t* am, const cha
   if (!_is_safe_user_id(user_id)) {
     return CRABS_ERR_INVALID_PARAM;
   }
+  // Audit N-3: reject invalid public keys at registration. A key that does
+  // not decode to a point on secp256k1 (or decodes to the point at infinity)
+  // would make ECDH in the ECIES envelope encryption produce a predictable
+  // shared secret, defeating envelope confidentiality. Validate before the
+  // user is ever stored.
+  if (!crypto_ecdsa_validate_public_key(public_key)) {
+    return CRABS_ERR_INVALID_PARAM;
+  }
 
   // Create user entry
   user_t* user = get_clear_memory(sizeof(user_t));
@@ -316,13 +368,8 @@ crabs_error_e attribute_machine_self_assert(attribute_machine_t* am, const char*
   // grant via attribute_machine_grant_role. Without this restriction a user
   // could self-assert role:admin and satisfy any role policy (audit C-5).
   if (attribute == NULL || attribute[0] == '\0') return CRABS_ERR_INVALID_PARAM;
-  static const char* _privileged[] = {
-    "role", "admin", "member", "owner", "root", "superuser", "manager", NULL
-  };
-  for (int i = 0; _privileged[i] != NULL; i++) {
-    if (strcasecmp(attribute, _privileged[i]) == 0) {
-      return CRABS_ERR_UNAUTHORIZED;
-    }
+  if (_is_privileged_attr_name(attribute)) {
+    return CRABS_ERR_UNAUTHORIZED;
   }
 
   user_t* user = attribute_machine_find_user(am, signer_id);
@@ -528,6 +575,18 @@ crabs_error_e attribute_machine_issue_temporary(attribute_machine_t* am, const c
 
   if (duration_ms == 0) return CRABS_ERR_INVALID_PARAM;
 
+  // Audit N-1: a trigger creator can set the issue_attribute field at trigger
+  // creation time. If the privileged-name blocklist is not consulted here, a
+  // trigger with issue_attribute="role" and attribute_value="admin" mints a
+  // temporary "role:admin" attribute on fire — satisfying role:admin policies
+  // and producing a real CP-ABE key with attribute role_admin. The F-1 fix
+  // blocked self-assertion of privileged names but not trigger-issued temp
+  // attributes. Reject privileged names here so the blocklist covers both
+  // paths.
+  if (_is_privileged_attr_name(attribute)) {
+    return CRABS_ERR_UNAUTHORIZED;
+  }
+
   uint64_t now = am->current_time_ms;
   uint64_t expires = now + duration_ms;
 
@@ -646,6 +705,16 @@ crabs_error_e user_key_register(user_t* user, const char* key_id,
   }
   if (user->key_count >= CRABS_MAX_KEYS_PER_USER) {
     return CRABS_ERR_INVALID_PARAM;
+  }
+  // Audit N-3: validate secp256k1 compressed public keys (33 bytes) at
+  // registration so the ECIES envelope encryption never performs ECDH against
+  // an invalid recipient key. Other schemes (Ed25519, BLS, Dilithium, etc.)
+  // have their own key formats and are validated by their vtable on use.
+  if (public_key_len == 33 &&
+      (scheme == ECDSA_SECP256K1 || scheme == SCHNORR_SECP256K1)) {
+    if (!crypto_ecdsa_validate_public_key(public_key)) {
+      return CRABS_ERR_INVALID_PARAM;
+    }
   }
   // Check for duplicate key_id
   if (user_key_find(user, key_id) != NULL) {

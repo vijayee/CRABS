@@ -28,6 +28,15 @@ static state_t* create_test_state_with_attr() {
   return g_env.state;
 }
 
+// Audit N-3: user_key_register now validates secp256k1 public keys, so tests
+// must use real generated keys (not 0xBB/0xCC fill).
+static void _gen_pk_ops(uint8_t out[33]) {
+  ecdsa_keypair_t* kp = crypto_ecdsa_generate();
+  ASSERT_NE(kp, nullptr);
+  memcpy(out, kp->public_key, 33);
+  crypto_ecdsa_keypair_destroy(kp);
+}
+
 static ecdsa_keypair_t* test_admin_key() {
   return g_env.admin_key;
 }
@@ -72,9 +81,10 @@ TEST(TestKeyOps, RegisterKeyBasic) {
   uint8_t* payload = (uint8_t*)calloc(payload_size, 1);
   ASSERT_NE(payload, nullptr);
   memcpy(payload, config, config_len);
-  // Fill public key data after the config string
-  payload[config_len] = 0x03;  // compressed point prefix
-  memset(payload + config_len + 1, 0xBB, 32);
+  // Audit N-3: use a real generated secp256k1 public key (not 0xBB fill).
+  uint8_t _real_pk[33];
+  _gen_pk_ops(_real_pk);
+  memcpy(payload + config_len, _real_pk, 33);
 
   operation_t* op = operation_create(CRABS_OP_REGISTER_KEY);
   fill_uuid(op->uuid);
@@ -171,8 +181,8 @@ TEST(TestKeyOps, RevokeKeyBasic) {
 
   // First register a key
   user_t* admin = attribute_machine_find_user(state->attr_machine, "admin");
-  uint8_t pk[33] = {0x03};
-  memset(pk + 1, 0xBB, 32);
+  uint8_t pk[33];
+  _gen_pk_ops(pk);
   ASSERT_EQ(user_key_register(admin, "mykey", ECDSA_SECP256K1, pk, 33, "test"), CRABS_SUCCESS);
 
   // Now revoke via state machine
@@ -231,10 +241,10 @@ TEST(TestKeyOps, SetDefaultKeyBasic) {
 
   // Register two keys
   user_t* admin = attribute_machine_find_user(state->attr_machine, "admin");
-  uint8_t pk1[33] = {0x03};
-  memset(pk1 + 1, 0xBB, 32);
-  uint8_t pk2[33] = {0x02};
-  memset(pk2 + 1, 0xCC, 32);
+  uint8_t pk1[33];
+  _gen_pk_ops(pk1);
+  uint8_t pk2[33];
+  _gen_pk_ops(pk2);
   ASSERT_EQ(user_key_register(admin, "key1", ECDSA_SECP256K1, pk1, 33, "primary"), CRABS_SUCCESS);
   ASSERT_EQ(user_key_register(admin, "key2", ECDSA_SECP256K1, pk2, 33, "secondary"), CRABS_SUCCESS);
   EXPECT_STREQ(admin->default_key_id, "key1");
@@ -264,10 +274,10 @@ TEST(TestKeyOps, SetDefaultKeyRejectsInactiveKey) {
   state_t* state = create_test_state_with_attr();
 
   user_t* admin = attribute_machine_find_user(state->attr_machine, "admin");
-  uint8_t pk1[33] = {0x03};
-  memset(pk1 + 1, 0xBB, 32);
-  uint8_t pk2[33] = {0x02};
-  memset(pk2 + 1, 0xCC, 32);
+  uint8_t pk1[33];
+  _gen_pk_ops(pk1);
+  uint8_t pk2[33];
+  _gen_pk_ops(pk2);
   ASSERT_EQ(user_key_register(admin, "key1", ECDSA_SECP256K1, pk1, 33, "primary"), CRABS_SUCCESS);
   ASSERT_EQ(user_key_register(admin, "key2", ECDSA_SECP256K1, pk2, 33, "secondary"), CRABS_SUCCESS);
   ASSERT_EQ(user_key_revoke(admin, "key2"), CRABS_SUCCESS);
@@ -303,8 +313,7 @@ TEST(TestKeyOps, RegisterKeyDirectHandler) {
   size_t payload_size = config_len + 33;
   uint8_t* payload = (uint8_t*)calloc(payload_size, 1);
   memcpy(payload, config, config_len);
-  payload[config_len] = 0x03;
-  memset(payload + config_len + 1, 0xCC, 32);
+  { uint8_t _pk[33]; _gen_pk_ops(_pk); memcpy(payload + config_len, _pk, 33); }
 
   operation_t* op = operation_create(CRABS_OP_REGISTER_KEY);
   fill_uuid(op->uuid);
@@ -328,8 +337,8 @@ TEST(TestKeyOps, RevokeKeyDirectHandler) {
   state_t* state = create_test_state_with_attr();
 
   user_t* admin = attribute_machine_find_user(state->attr_machine, "admin");
-  uint8_t pk[33] = {0x03};
-  memset(pk + 1, 0xBB, 32);
+  uint8_t pk[33];
+  _gen_pk_ops(pk);
   ASSERT_EQ(user_key_register(admin, "revme", ECDSA_SECP256K1, pk, 33, "test"), CRABS_SUCCESS);
 
   const char* config = "key_id=revme";
@@ -355,10 +364,10 @@ TEST(TestKeyOps, SetDefaultKeyDirectHandler) {
   state_t* state = create_test_state_with_attr();
 
   user_t* admin = attribute_machine_find_user(state->attr_machine, "admin");
-  uint8_t pk1[33] = {0x03};
-  memset(pk1 + 1, 0xBB, 32);
-  uint8_t pk2[33] = {0x02};
-  memset(pk2 + 1, 0xCC, 32);
+  uint8_t pk1[33];
+  _gen_pk_ops(pk1);
+  uint8_t pk2[33];
+  _gen_pk_ops(pk2);
   ASSERT_EQ(user_key_register(admin, "k1", ECDSA_SECP256K1, pk1, 33, "a"), CRABS_SUCCESS);
   ASSERT_EQ(user_key_register(admin, "k2", ECDSA_SECP256K1, pk2, 33, "b"), CRABS_SUCCESS);
 
@@ -412,8 +421,7 @@ TEST(TestKeyOps, RegisterKeyWithLabel) {
   size_t payload_size = config_len + 33;
   uint8_t* payload = (uint8_t*)calloc(payload_size, 1);
   memcpy(payload, config, config_len);
-  payload[config_len] = 0x03;
-  memset(payload + config_len + 1, 0xDD, 32);
+  { uint8_t _pk[33]; _gen_pk_ops(_pk); memcpy(payload + config_len, _pk, 33); }
 
   operation_t* op = operation_create(CRABS_OP_REGISTER_KEY);
   fill_uuid(op->uuid);
@@ -453,8 +461,7 @@ TEST(TestKeyOps, RegisterKeyOnNonAdminUser) {
   size_t payload_size = config_len + 33;
   uint8_t* payload = (uint8_t*)calloc(payload_size, 1);
   memcpy(payload, config, config_len);
-  payload[config_len] = 0x03;
-  memset(payload + config_len + 1, 0xEE, 32);
+  { uint8_t _pk[33]; _gen_pk_ops(_pk); memcpy(payload + config_len, _pk, 33); }
 
   operation_t* op = operation_create(CRABS_OP_REGISTER_KEY);
   fill_uuid(op->uuid);
@@ -512,8 +519,7 @@ TEST(TestKeyOps, RegisterKeyRejectsUnspecifiedScheme) {
   size_t payload_size = config_len + 33;
   uint8_t* payload = (uint8_t*)calloc(payload_size, 1);
   memcpy(payload, config, config_len);
-  payload[config_len] = 0x03;
-  memset(payload + config_len + 1, 0xBB, 32);
+  { uint8_t _pk[33]; _gen_pk_ops(_pk); memcpy(payload + config_len, _pk, 33); }
 
   operation_t* op = operation_create(CRABS_OP_REGISTER_KEY);
   fill_uuid(op->uuid);
@@ -538,8 +544,8 @@ TEST(TestKeyOps, RevokeLastKeySuspendsUserViaStateMachine) {
 
   // Register a single key for admin
   user_t* admin = attribute_machine_find_user(state->attr_machine, "admin");
-  uint8_t pk[33] = {0x03};
-  memset(pk + 1, 0xBB, 32);
+  uint8_t pk[33];
+  _gen_pk_ops(pk);
   ASSERT_EQ(user_key_register(admin, "onlykey", ECDSA_SECP256K1, pk, 33, "primary"), CRABS_SUCCESS);
   EXPECT_EQ(admin->status, USER_ACTIVE);
 
@@ -579,8 +585,7 @@ TEST(TestKeyOps, RegisterKeyRejectsDuplicateKeyId) {
   // First registration
   uint8_t* payload1 = (uint8_t*)calloc(payload_size, 1);
   memcpy(payload1, config, config_len);
-  payload1[config_len] = 0x03;
-  memset(payload1 + config_len + 1, 0xBB, 32);
+  { uint8_t _pk[33]; _gen_pk_ops(_pk); memcpy(payload1 + config_len, _pk, 33); }
 
   operation_t* op1 = operation_create(CRABS_OP_REGISTER_KEY);
   fill_uuid(op1->uuid);
@@ -596,8 +601,7 @@ TEST(TestKeyOps, RegisterKeyRejectsDuplicateKeyId) {
   // Duplicate registration — use a different UUID to avoid idempotency check
   uint8_t* payload2 = (uint8_t*)calloc(payload_size, 1);
   memcpy(payload2, config, config_len);
-  payload2[config_len] = 0x03;
-  memset(payload2 + config_len + 1, 0xCC, 32);
+  { uint8_t _pk[33]; _gen_pk_ops(_pk); memcpy(payload2 + config_len, _pk, 33); }
 
   operation_t* op2 = operation_create(CRABS_OP_REGISTER_KEY);
   // Use a different UUID

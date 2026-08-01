@@ -25,6 +25,12 @@ void             crypto_ecdsa_keypair_destroy(ecdsa_keypair_t* keypair);
 crabs_error_e crypto_ecdsa_derive_public_key(const uint8_t private_key[32],
                                                 uint8_t public_key[33]);
 
+// Audit N-3: validate a compressed secp256k1 public key — decodes to a point
+// on the curve and is not the point at infinity. Called at user/key
+// registration so the ECIES envelope encryption never performs ECDH against
+// an invalid recipient key (which could yield a predictable shared secret).
+bool crypto_ecdsa_validate_public_key(const uint8_t public_key[33]);
+
 // ============================================================
 // ECDSA Signing (§10.2.1)
 // ============================================================
