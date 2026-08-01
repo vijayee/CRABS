@@ -340,4 +340,45 @@ HLC, compaction, and ABE suites) pass. The slow CP-ABE-keygen suites
 
 ---
 
+## 10. Third Remediation Pass (2026-08-01)
+
+The remaining deferred findings have been addressed.
+
+### Fixed in the third pass
+
+| ID | Summary of fix |
+|----|----------------|
+| H-A | Key envelopes now wrap the ABE user key in ECIES (ECDH on secp256k1 + AES-256-GCM) to the recipient's registered public key — the `sk_abe` blob is no longer shipped in cleartext. Envelope format version bumped to `0x03`; `crypto_key_envelope_verify` rejects v2 cleartext envelopes. New `crypto_key_envelope_decrypt_sk(env, user_priv, out, cap, &len)` lets the recipient recover the ABE key; a wrong private key is rejected (GCM tag mismatch → `CRABS_ERR_UNAUTHORIZED`). Regression test `KeyEnvelopeTest.EciesDecryptRoundTrip`. |
+| H-B | `crypto_revoke_and_rotate` is now node-blind: it takes the user's new public key (the user generates their own keypair out-of-band) and only records it + issues an envelope. The node never generates or learns the user's private key. CLI `key revoke <user> <new_pub_hex>` updated; `recovery_result_t` no longer carries a private key. |
+| F-3 (partial) | `crabs_ot_tree_merge` now propagates deletion to descendants (a deleted parent's live children are deleted), so compaction's `crabs_extract_visible_tree` no longer drops them silently. New `crabs_compaction_engine_record_op(engine, node_id, seq)` lets applications populate `local_vc` from op ingest so the STRONG/QUORUM safety check can be armed; multi-replica compaction remains fail-closed until an app wires it. |
+| M-J commutativity | `_rebuild_links` cycle-break now processes nodes in id-sorted order and detaches the max-id edge of each cycle, so `merge(A,B) == merge(B,A)` (the cycle-break no longer depends on pool order). |
+| L-b | `record_processed_op` caps the idempotency set at `CRABS_PROCESSED_OPS_MAX` (65536) — a long-running node no longer grows it without bound. |
+| L-l | New `cli_node_load_key(node, private_key_hex)` restores node-key custody after `cli_node_load` by importing the persisted private key and re-custodying it under the matching registered user. New `crypto_ecdsa_derive_public_key(priv, pub)` helper. |
+| L-8 | `log.c init_event` uses `localtime_r` into a thread-local buffer instead of the non-reentrant `localtime`. |
+
+### Remaining limitations (documented)
+
+- **F-3 coordination layer:** emitting a signed COMPACT op on the wire and
+  auto-populating `local_vc` from the execute path (rather than via the
+  application calling `crabs_compaction_engine_record_op`) is an architectural
+  follow-up. The safety mechanism is now available and fail-closed.
+- **L-a (error-code oracles):** the executor still returns distinct pre-auth
+  error codes (RESOURCE_NOT_FOUND vs PROTOCOL_VIOLATION vs LOCK_TOKEN_MISMATCH).
+  Collapsing these to a single UNAUTHORIZED before auth, or reordering auth
+  first, is a behavior change deferred to avoid breaking operator
+  diagnostics.
+- **L-k (op-log wire endianness):** `crabs_extract_ot_ops` uses host-endian
+  `memcpy` and has no in-repo producer; cross-architecture peer interop is
+  not exercised. Documented.
+- **Slow ABE suites:** `TestPolicyConfig` and `KeyEnvelopeTest` (full) take
+  ~300s per test due to real CP-ABE pairing and are not run in the fast CI
+  pass; the round-trip regression (`EciesDecryptRoundTrip`) is run.
+
+### Test posture (third pass)
+
+- 449 tests pass across 27 suites, including the new H-A ECIES round-trip,
+  H-B node-blind rotation, and the existing OT/CRDT/compaction/state suites.
+
+---
+
 *Round 2 — same crab, sharper pincers needed.*
