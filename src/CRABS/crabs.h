@@ -19,6 +19,12 @@
 #define CRABS_MAX_RESOURCES     8    // Maximum resources per operation
 #define CRABS_MAX_ATTRIBUTES    64   // Maximum attributes per user
 #define CRABS_MAX_LOG_ENTRIES   0    // Unlimited (0 = no limit)
+// Audit L-b: cap the processed-op idempotency set so a long-running node does
+// not grow it without bound (memory-exhaustion DoS). Beyond the cap, new ops
+// are not recorded; replay protection across sessions relies on Lamport
+// clocks and signatures, and within-session idempotency covers the recent
+// window of CRABS_PROCESSED_OPS_MAX entries.
+#define CRABS_PROCESSED_OPS_MAX 65536
 #define CRABS_DEFAULT_LOCK_MS   5000 // Default lock timeout (5 seconds)
 #define CRABS_MAX_LOCK_EXTENDS  3    // Maximum lock extensions
 #define CRABS_LOCK_TOKEN_SIZE   32   // Lock token byte length

@@ -308,14 +308,19 @@ TEST_F(TestCLI, KeyRevoke) {
   cli_bytes_to_hex(keypair->public_key, 33, pk_hex);
 
   cli_cmd_user_register(node, "alice", pk_hex);
-  EXPECT_EQ(cli_cmd_key_revoke(node, "alice"), CLI_OK);
+  // Audit H-B: node-blind rotation — supply the user's new public key.
+  ecdsa_keypair_t* new_keypair = crypto_ecdsa_generate();
+  char new_pk_hex[67];
+  cli_bytes_to_hex(new_keypair->public_key, 33, new_pk_hex);
+  EXPECT_EQ(cli_cmd_key_revoke(node, "alice", new_pk_hex), CLI_OK);
 
   crypto_ecdsa_keypair_destroy(keypair);
+  crypto_ecdsa_keypair_destroy(new_keypair);
 }
 
 TEST_F(TestCLI, KeyRevokeNullUserId) {
   cli_node_init(node, "admin");
-  EXPECT_EQ(cli_cmd_key_revoke(node, nullptr), CLI_ERR_ARGS);
+  EXPECT_EQ(cli_cmd_key_revoke(node, nullptr, nullptr), CLI_ERR_ARGS);
 }
 
 // ============================================================

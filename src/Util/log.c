@@ -132,8 +132,13 @@ int log_add_fp(FILE *fp, int level) {
 
 static void init_event(log_Event *ev, void *udata) {
   if (!ev->time) {
+    // Audit L-8: localtime returns a pointer to a shared static struct tm,
+    // which is not thread-safe. Use localtime_r into a per-event struct so
+    // concurrent loggers don't race on the shared buffer.
+    static __thread struct tm tm_buf;
     time_t t = time(NULL);
-    ev->time = localtime(&t);
+    localtime_r(&t, &tm_buf);
+    ev->time = &tm_buf;
   }
   ev->udata = udata;
 }

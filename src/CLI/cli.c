@@ -7,6 +7,7 @@
 #include "../Serialization/serialization.h"
 #include "../Compaction/compaction_engine.h"
 #include "../Compaction/crdt_compaction.h"
+#include <openssl/crypto.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -240,6 +241,45 @@ cli_result_e cli_node_load(cli_node_t* node, const char* path) {
                      node->node_key->public_key);
 
   node->initialized = true;
+  return CLI_OK;
+}
+
+// Audit L-l: restore node-key custody after cli_node_load. The operator
+// persists the node private key out-of-band and imports it here so the node
+// can sign for the bootstrap admin again. The derived public key must match a
+// registered user; that user's id is used as the custody alias (so the CLI
+// signs with the right key for that user).
+cli_result_e cli_node_load_key(cli_node_t* node, const char* private_key_hex) {
+  if (node == NULL || private_key_hex == NULL) return CLI_ERR_ARGS;
+  if (!node->initialized || node->attr_machine == NULL) return CLI_ERR_NOT_INIT;
+
+  uint8_t priv[32];
+  if (cli_hex_to_bytes(private_key_hex, priv, 32) != CLI_OK) return CLI_ERR_ARGS;
+
+  uint8_t pub[33];
+  if (crypto_ecdsa_derive_public_key(priv, pub) != CRABS_SUCCESS) return CLI_ERR_EXEC;
+
+  // Find the registered user whose public key matches the derived key.
+  const char* custody_id = NULL;
+  for (user_t* u = node->attr_machine->users; u != NULL; u = u->next) {
+    if (memcmp(u->public_key, pub, 33) == 0) {
+      custody_id = u->user_id;
+      break;
+    }
+  }
+  if (custody_id == NULL) return CLI_ERR_EXEC; // no matching user
+
+  // Replace the node key with the imported one.
+  if (node->node_key != NULL) crypto_ecdsa_keypair_destroy(node->node_key);
+  node->node_key = get_clear_memory(sizeof(ecdsa_keypair_t));
+  if (node->node_key == NULL) return CLI_ERR_EXEC;
+  memcpy(node->node_key->private_key, priv, 32);
+  memcpy(node->node_key->public_key, pub, 33);
+
+  state_set_node_key(&node->attr_machine->base_state, priv, pub);
+  // Custody the imported key under the matching user id.
+  cli_node_add_user_key(node, custody_id, node->node_key);
+  OPENSSL_cleanse(priv, 32);
   return CLI_OK;
 }
 
@@ -569,15 +609,25 @@ cli_result_e cli_cmd_key_refresh(cli_node_t* node, const char* user_id) {
   return CLI_OK;
 }
 
-cli_result_e cli_cmd_key_revoke(cli_node_t* node, const char* user_id) {
+cli_result_e cli_cmd_key_revoke(cli_node_t* node, const char* user_id,
+                                  const char* new_public_key_hex) {
   if (node == NULL || !node->initialized) return CLI_ERR_NOT_INIT;
-  if (user_id == NULL) return CLI_ERR_ARGS;
+  if (user_id == NULL || new_public_key_hex == NULL) return CLI_ERR_ARGS;
 
+  uint8_t new_pk[33];
+  if (cli_hex_to_bytes(new_public_key_hex, new_pk, 33) != CLI_OK) {
+    printf("Error: new public key must be 66 hex chars.\n");
+    return CLI_ERR_ARGS;
+  }
+
+  // Audit H-B: node-blind rotation. The node records the user's new public
+  // key and issues an envelope; it never generates or holds the private key.
   recovery_result_t* result = crypto_revoke_and_rotate(
       node->abe_mk,
       node->node_key->private_key,
       node->attr_machine,
       user_id,
+      new_pk,
       node->attr_machine->base_state.version,
       0);
 
@@ -587,12 +637,10 @@ cli_result_e cli_cmd_key_revoke(cli_node_t* node, const char* user_id) {
   }
 
   printf("Keys revoked and rotated for user '%s'.\n", user_id);
-
-  if (result->new_ecdsa_key != NULL) {
-    char pub_hex[67];
-    cli_bytes_to_hex(result->new_ecdsa_key->public_key, 33, pub_hex);
-    printf("  New public key: %s\n", pub_hex);
-  }
+  char pub_hex[67];
+  cli_bytes_to_hex(result->new_public_key, 33, pub_hex);
+  printf("  New public key recorded: %s\n", pub_hex);
+  printf("  (Private key is held by the user; the node does not know it.)\n");
 
   crypto_recovery_result_destroy(result);
   return CLI_OK;
@@ -1068,11 +1116,11 @@ cli_result_e cli_dispatch(cli_node_t* node, int argc, char** argv) {
       return cli_cmd_key_refresh(node, argv[3]);
     }
     if (strcmp(sub, "revoke") == 0) {
-      if (argc < 4) {
-        printf("Usage: key revoke <user_id>\n");
+      if (argc < 5) {
+        printf("Usage: key revoke <user_id> <new_public_key_hex>\n");
         return CLI_ERR_ARGS;
       }
-      return cli_cmd_key_revoke(node, argv[3]);
+      return cli_cmd_key_revoke(node, argv[3], argv[4]);
     }
     printf("Unknown key subcommand: %s\n", sub);
     _print_key_usage();

@@ -279,10 +279,15 @@ static bool is_duplicate_op(state_t* state, const uint8_t uuid[CRABS_UUID_SIZE])
 }
 
 static void record_processed_op(state_t* state, const uint8_t uuid[CRABS_UUID_SIZE]) {
+  // Audit L-b: cap growth so a long-running node does not exhaust memory.
+  // Beyond the cap the op is not recorded; replay protection across
+  // sessions relies on Lamport clocks and signatures, and within-session
+  // idempotency covers the recent window.
+  if (state->processed_op_count >= CRABS_PROCESSED_OPS_MAX) return;
   uint64_t new_count = state->processed_op_count + 1;
   uint8_t(*new_ops)[CRABS_UUID_SIZE] = realloc(state->processed_ops,
     new_count * CRABS_UUID_SIZE);
-  if (new_ops == NULL) return;
+  if (new_ops == NULL) return; // keep old array; op unrecorded (replay risk)
   state->processed_ops = new_ops;
   state->processed_op_count = new_count;
   memcpy(state->processed_ops[state->processed_op_count - 1], uuid, CRABS_UUID_SIZE);

@@ -62,6 +62,12 @@ cli_node_t* cli_node_create(void);
 void        cli_node_destroy(cli_node_t* node);
 cli_result_e cli_node_init(cli_node_t* node, const char* admin_id);
 cli_result_e cli_node_load(cli_node_t* node, const char* path);
+// Audit L-l: restore node-key custody after a load. cli_node_load generates a
+// fresh, unrelated node key, so the node cannot sign for the bootstrap admin
+// until the operator imports the persisted private key (64 hex chars). The
+// derived public key must match a registered user; that user's id is used as
+// the custody alias.
+cli_result_e cli_node_load_key(cli_node_t* node, const char* private_key_hex);
 cli_result_e cli_node_save(cli_node_t* node, const char* path);
 
 // ============================================================
@@ -102,7 +108,12 @@ cli_result_e cli_cmd_policy_add(cli_node_t* node, const char* operation,
 // ============================================================
 cli_result_e cli_cmd_key_generate(void);
 cli_result_e cli_cmd_key_refresh(cli_node_t* node, const char* user_id);
-cli_result_e cli_cmd_key_revoke(cli_node_t* node, const char* user_id);
+// Audit H-B: revoke + rotate is node-blind. The operator supplies the user's
+// new public key (66 hex chars, compressed secp256k1); the node records it
+// and issues a new ABE envelope. The user generates their own private key
+// out-of-band; the node never learns it.
+cli_result_e cli_cmd_key_revoke(cli_node_t* node, const char* user_id,
+                                  const char* new_public_key_hex);
 
 // ============================================================
 // Operation Submission
