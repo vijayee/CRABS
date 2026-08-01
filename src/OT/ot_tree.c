@@ -12,6 +12,14 @@
 #include <stdlib.h>
 #include <string.h>
 
+// Audit M-J: comparator for qsort over tree-node pointers by id. Used to
+// make the merge cycle-break commutative (process nodes in id order).
+static int _node_id_cmp(const void* x, const void* y) {
+  const crabs_tree_node_t* const* a = (const crabs_tree_node_t* const*)x;
+  const crabs_tree_node_t* const* b = (const crabs_tree_node_t* const*)y;
+  return strcmp((*a)->id, (*b)->id);
+}
+
 // ============================================================
 // Tree Node Lifecycle
 // ============================================================
@@ -502,26 +510,72 @@ static void _rebuild_links(crabs_ot_tree_t* tree) {
   }
 
   // Audit M-J: concurrent reparents merged here can create parent cycles
-  // (e.g. dest has X→Y, src has Y→X). Break any cycle so downstream ancestor
-  // walks don't spin. Walk each node's parent chain bounded by node_count+1;
-  // if it doesn't reach a terminal (NULL/root) within the bound, clear that
-  // node's parent link (making it a root). This is deterministic for a given
-  // pool order; full commutativity across merge(A,B) vs merge(B,A) is a
-  // deeper CRDT-tree follow-up.
-  for (crabs_tree_node_t* n = tree->node_pool; n != NULL; n = n->pool_next) {
-    uint32_t steps = 0;
-    crabs_tree_node_t* p = n->parent;
-    while (p != NULL && p != n && steps <= tree->node_count) {
-      p = p->parent;
-      steps++;
-    }
-    if (p == n || (p != NULL && steps > tree->node_count)) {
-      // Cycle through or leading into n: detach n from its parent.
-      if (n->parent != NULL) {
-        _unlink_child(tree, n);
-        n->parent = NULL;
-        n->parent_id[0] = '\0';
+  // (e.g. dest has X→Y, src has Y→X). Break every cycle so downstream ancestor
+  // walks don't spin. To be COMMUTATIVE across merge(A,B) vs merge(B,A),
+  // process nodes in id-sorted order and, for each cycle encountered,
+  // detach the edge from the cycle's lexicographically-largest-id node.
+  // Both replicas see the same node set and the same max-id, so they break
+  // the same edge and converge.
+  if (tree->node_count > 0) {
+    // Collect the pool into an array.
+    crabs_tree_node_t** arr = (crabs_tree_node_t**)get_clear_memory(
+        sizeof(crabs_tree_node_t*) * tree->node_count);
+    if (arr != NULL) {
+      uint32_t cnt = 0;
+      for (crabs_tree_node_t* n = tree->node_pool; n != NULL && cnt < tree->node_count; n = n->pool_next) {
+        arr[cnt++] = n;
       }
+      // Sort by id (strcmp). qsort is not stable, but the cycle-break only
+      // depends on the order being a deterministic total order, which strcmp
+      // provides (ids are unique — enforced at deserialize and at insert).
+      // Comparator uses a thread-safe-ish static; ids are unique so ties don't
+      // occur.
+      qsort(arr, cnt, sizeof(crabs_tree_node_t*), _node_id_cmp);
+
+      // Heap-allocated scratch chain for cycle detection, sized to the node
+      // count (de-wonk: a fixed 256-entry stack trail could miss cycles in
+      // larger trees).
+      crabs_tree_node_t** trail = (crabs_tree_node_t**)get_clear_memory(
+          sizeof(crabs_tree_node_t*) * (cnt > 0 ? cnt : 1));
+      if (trail != NULL) {
+        for (uint32_t i = 0; i < cnt; i++) {
+          crabs_tree_node_t* n = arr[i];
+          // Walk n's parent chain collecting into the trail; detect a repeat
+          // (cycle). Bounded by cnt+1.
+          uint32_t tlen = 0;
+          crabs_tree_node_t* p = n->parent;
+          bool cycle_found = false;
+          uint32_t cycle_start = 0;
+          while (p != NULL && tlen <= cnt) {
+            for (uint32_t j = 0; j < tlen; j++) {
+              if (trail[j] == p) {
+                cycle_found = true;
+                cycle_start = j;
+                break;
+              }
+            }
+            if (cycle_found) break;
+            trail[tlen++] = p;
+            p = p->parent;
+          }
+          if (cycle_found) {
+            // The cycle is trail[cycle_start .. tlen-1]. Find the max-id node
+            // in it and detach its parent edge (commutative: both replicas
+            // pick the same max-id).
+            crabs_tree_node_t* max_node = trail[cycle_start];
+            for (uint32_t j = cycle_start + 1; j < tlen; j++) {
+              if (strcmp(trail[j]->id, max_node->id) > 0) max_node = trail[j];
+            }
+            if (max_node->parent != NULL) {
+              _unlink_child(tree, max_node);
+              max_node->parent = NULL;
+              max_node->parent_id[0] = '\0';
+            }
+          }
+        }
+        free(trail);
+      }
+      free(arr);
     }
   }
 }
@@ -569,6 +623,23 @@ crabs_ot_tree_t* crabs_ot_tree_merge(
 
   // Rebuild parent/child links
   _rebuild_links(dest);
+
+  // Audit F-3: propagate deletion downward. When a node is marked deleted on
+  // merge, all of its descendants must also be deleted; otherwise compaction
+  // (crabs_extract_visible_tree) drops live children of a deleted parent
+  // (silent data loss). Iterate to a fixpoint: any node whose parent is
+  // deleted becomes deleted.
+  bool changed = true;
+  while (changed) {
+    changed = false;
+    for (crabs_tree_node_t* n = dest->node_pool; n != NULL; n = n->pool_next) {
+      if (!n->deleted && n->parent != NULL && n->parent->deleted) {
+        n->deleted = true;
+        if (dest->visible_count > 0) dest->visible_count--;
+        changed = true;
+      }
+    }
+  }
 
   return dest;
 }

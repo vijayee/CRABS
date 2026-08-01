@@ -80,6 +80,16 @@ void crabs_compaction_engine_init(crabs_compaction_engine_t* engine,
 void crabs_compaction_engine_set_peer_vc(crabs_compaction_engine_t* engine,
                                            crabs_vector_clock_t* peer_vc);
 
+// Audit F-3: record an ingested operation in the engine's local vector clock.
+// Applications MUST call this for every op they process so the STRONG/QUORUM
+// safety check (crabs_check_compaction_safety) can compare local progress
+// against the peer VC. Without it, local_vc stays empty and compaction is
+// fail-closed (refused). Records (node_id, sequence_num) as the high-water
+// mark for that node.
+void crabs_compaction_engine_record_op(crabs_compaction_engine_t* engine,
+                                         const char* node_id,
+                                         uint64_t sequence_num);
+
 // Destroy compaction engine (does not free registry items)
 void crabs_compaction_engine_destroy(crabs_compaction_engine_t* engine);
 

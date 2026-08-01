@@ -51,6 +51,19 @@ void crabs_compaction_engine_set_peer_vc(crabs_compaction_engine_t* engine,
   engine->peer_vc = peer_vc;
 }
 
+void crabs_compaction_engine_record_op(crabs_compaction_engine_t* engine,
+                                         const char* node_id,
+                                         uint64_t sequence_num) {
+  // Audit F-3: track the per-node high-water mark so the STRONG/QUORUM
+  // safety check can compare local progress against the peer VC. Take the
+  // max so out-of-order delivery still converges.
+  if (engine == NULL || node_id == NULL) return;
+  uint64_t cur = crabs_vector_clock_get(&engine->local_vc, node_id);
+  if (sequence_num > cur) {
+    crabs_vector_clock_set(&engine->local_vc, node_id, sequence_num);
+  }
+}
+
 void crabs_compaction_engine_destroy(crabs_compaction_engine_t* engine) {
   if (engine == NULL) return;
   // No heap allocations in the engine itself
