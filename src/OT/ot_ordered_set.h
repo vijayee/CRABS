@@ -18,8 +18,12 @@
 // ============================================================
 // Type ID
 // ============================================================
-
-#define DATA_TYPE_OT_ORDERED_SET 0x10
+// Audit R6-1: DATA_TYPE_OT_ORDERED_SET is defined as an enum constant in
+// data_model.h (value 0x10). Do NOT re-#define it here — the dual
+// definition required #undef hacks in compact_op.c and risked redefinition
+// conflicts if include order changed. The CRABS_OT_ORDERED_SET macro is
+// retained as the numeric type ID for crabs_ot_data_item_create() calls
+// in the .c file (it does not collide with any enum identifier).
 #define CRABS_OT_ORDERED_SET    0x10
 
 // ============================================================

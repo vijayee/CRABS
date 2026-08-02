@@ -384,13 +384,25 @@ crabs_hlc_receive_result_e crabs_hlc_receive(crabs_hlc_state_t* state,
 
       int64_t skew_ms = crabs_hlc_diff_ms(received, local.seconds, local.nanos);
 
-      if (skew_ms > (int64_t)state->max_skew_ms) {
+      // Audit R6-4: clamp max_skew_ms to INT64_MAX before casting to int64_t.
+      // The prior code did `(int64_t)state->max_skew_ms` directly — if
+      // max_skew_ms > INT64_MAX (e.g. set to UINT64_MAX via __change_config__),
+      // the cast wraps to a negative value, making `skew_ms > negative` always
+      // true and rejecting ALL timestamps (fail-closed but surprising). Clamping
+      // to INT64_MAX makes the behavior predictable: a huge max_skew_ms means
+      // "accept any skew up to INT64_MAX ms" (~292 million years), which is the
+      // intent of setting a very large value. skew_ms itself is already
+      // saturated to [-INT64_MAX, INT64_MAX] by crabs_hlc_diff_ms.
+      int64_t max_skew = (state->max_skew_ms > (uint64_t)INT64_MAX)
+                         ? INT64_MAX : (int64_t)state->max_skew_ms;
+
+      if (skew_ms > max_skew) {
         // Received timestamp too far in the future
         state->time_travel_attempts_rejected += 1;
         return CRABS_HLC_REJECTED_SKEW;
       }
 
-      if (skew_ms < -(int64_t)state->max_skew_ms) {
+      if (skew_ms < -max_skew) {
         // Received timestamp too far in the past
         state->time_travel_attempts_rejected += 1;
         return CRABS_HLC_REJECTED_SKEW;

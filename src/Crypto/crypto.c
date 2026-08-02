@@ -1337,6 +1337,14 @@ static size_t _ecies_encrypt_to_pub(const uint8_t recipient_pub[33],
   if (pt_len == 0) return 0;
   size_t need = 33 + 12 + pt_len + 16;
   if (out == NULL || out_cap < need) return 0;
+  // Audit R5-6: defense-in-depth. The N-3 fix validates recipient public keys
+  // at registration (attribute_machine_register_user / user_key_register), so
+  // invalid keys should never reach this function. Validate again here so a
+  // pre-existing database (populated before N-3) or any future code path that
+  // bypasses registration cannot trigger ECDH against an invalid key — which
+  // would produce a predictable shared secret and defeat envelope
+  // confidentiality. The cost is negligible (one EC_POINT_is_on_curve check).
+  if (!crypto_ecdsa_validate_public_key(recipient_pub)) return 0;
   ecdsa_keypair_t* eph = crypto_ecdsa_generate();
   if (!eph) return 0;
   uint8_t shared[32];

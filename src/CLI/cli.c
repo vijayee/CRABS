@@ -437,16 +437,37 @@ cli_result_e cli_cmd_user_grant(cli_node_t* node, const char* user_id,
   if (node == NULL || !node->initialized) return CLI_ERR_NOT_INIT;
   if (user_id == NULL || role == NULL) return CLI_ERR_ARGS;
 
+  // Audit R5-1: attribute_machine_grant_role validates the attribute NAME
+  // charset ([A-Za-z0-9_-]) and constructs the token as "name:value". The
+  // CLI historically accepted the full "role:admin" token as the role
+  // parameter with an empty value, which produced "role:admin:" (trailing
+  // colon) and is now rejected by the name charset check (colon not allowed).
+  // Split the role parameter on the first colon: if present, the part before
+  // is the name and the part after is the value (the value argument is
+  // ignored). If no colon, use role as the name and value as the value.
+  char name_buf[CRABS_MAX_POLICY_EXPR];
+  const char* name = role;
+  const char* val = value ? value : "";
+  const char* colon = strchr(role, ':');
+  if (colon != NULL) {
+    size_t name_len = (size_t)(colon - role);
+    if (name_len >= sizeof(name_buf)) name_len = sizeof(name_buf) - 1;
+    memcpy(name_buf, role, name_len);
+    name_buf[name_len] = '\0';
+    name = name_buf;
+    val = colon + 1;
+  }
+
   // Use admin as signer (first registered user)
   const char* signer_id = node->attr_machine->users ? node->attr_machine->users->user_id : user_id;
   crabs_error_e err = attribute_machine_grant_role(node->attr_machine, user_id,
-                                                     role, value ? value : "", signer_id);
+                                                     name, val, signer_id);
   if (err != CRABS_SUCCESS) {
     printf("Error: %s\n", cli_error_string(err));
     return CLI_ERR_EXEC;
   }
 
-  printf("Role '%s' granted to '%s'.\n", role, user_id);
+  printf("Role '%s:%s' granted to '%s'.\n", name, val, user_id);
   return CLI_OK;
 }
 

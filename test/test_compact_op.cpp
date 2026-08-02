@@ -6,17 +6,9 @@
 
 #include <gtest/gtest.h>
 extern "C" {
-// Undefine conflicting macros before including data_model.h
-#ifdef DATA_TYPE_OT_ORDERED_SET
-#undef DATA_TYPE_OT_ORDERED_SET
-#endif
-#ifdef DATA_TYPE_OT_DOCUMENT
-#undef DATA_TYPE_OT_DOCUMENT
-#endif
-#ifdef DATA_TYPE_OT_TREE
-#undef DATA_TYPE_OT_TREE
-#endif
-
+// Audit R6-1: the #undef hacks for DATA_TYPE_OT_* macros are no longer
+// needed — the dual #define/enum definitions have been resolved by removing
+// the #define macros from the OT headers.
 #include "../src/CRABS/data_model.h"
 #include "../src/Compaction/compact_op.h"
 #include "../src/Compaction/compaction.h"

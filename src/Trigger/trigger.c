@@ -343,8 +343,16 @@ crabs_error_e state_machine_op_create_trigger(state_t* state, operation_t* op) {
     return CRABS_ERR_OOM;
   }
   state->triggers = new_triggers;
+  // Audit R5-4: struct copy transfers ownership of condition_ast (and all
+  // other pointer fields) to the array entry. We use free() — NOT
+  // trigger_destroy() — because trigger_destroy would free condition_ast,
+  // leaving the array entry with a dangling pointer. The heap allocation
+  // itself (the trigger_t struct) is freed, but its heap-allocated members
+  // (condition_ast) remain valid via the copy. If trigger_destroy is ever
+  // changed to be used here, the condition_ast must be deep-copied for the
+  // array entry first.
   state->triggers[idx] = *new_trigger;
-  free(new_trigger);  // We copied the struct, free the heap allocation
+  free(new_trigger);
 
   return CRABS_SUCCESS;
 }

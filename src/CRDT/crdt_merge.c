@@ -191,6 +191,13 @@ crabs_error_e pn_counter_decrement(pn_counter_t* counter, const char* node_id, i
 
 int64_t pn_counter_value(const pn_counter_t* counter) {
   if (counter == NULL) return 0;
+  // Audit R6-3: both g_counter_value calls return values in [0, INT64_MAX]
+  // because g_counter_increment rejects negative deltas (a G-Counter only
+  // grows). The subtraction pos - neg is therefore in [-INT64_MAX, INT64_MAX],
+  // which fits in int64_t without overflow. This invariant (g_counter entries
+  // are always non-negative) is what makes the unchecked subtraction safe; if
+  // g_counter_increment ever accepts negative deltas, this subtraction would
+  // need saturating arithmetic to prevent overflow.
   return g_counter_value(&counter->pos) - g_counter_value(&counter->neg);
 }
 

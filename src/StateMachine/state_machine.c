@@ -1033,13 +1033,19 @@ crabs_error_e state_machine_op_register_key(state_t* state, operation_t* op) {
     token = strtok_r(NULL, ";", &saveptr);
   }
 
-  // Find the public key data after the config string's null terminator
-  // The config string ends at the first \0 in the payload
-  size_t config_strlen = strnlen((const char*)op->payload, op->payload_size);
-  if (config_strlen + 1 + pk_len > op->payload_size) {
+  // Find the public key data after the config string's null terminator.
+  // Audit R5-5: use memchr (matching rotate_key's pattern) rather than
+  // strnlen. strnlen returns payload_size when no NUL is present, which
+  // happens to be caught by the bounds check below, but memchr makes the
+  // "no NUL found" case explicit by returning NULL — easier to audit and
+  // consistent with the rotate_key handler.
+  char* config_end = (char*)memchr(op->payload, '\0', op->payload_size);
+  if (config_end == NULL) return CRABS_ERR_INVALID_PARAM;
+  size_t config_len = (size_t)(config_end - (char*)op->payload) + 1;
+  if (config_len + pk_len > op->payload_size) {
     return CRABS_ERR_INVALID_PARAM;
   }
-  pk_data = op->payload + config_strlen + 1;
+  pk_data = op->payload + config_len;
 
   if (key_id[0] == '\0' || pk_len == 0 || pk_data == NULL) {
     return CRABS_ERR_INVALID_PARAM;

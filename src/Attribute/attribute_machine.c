@@ -60,6 +60,13 @@ static bool _is_safe_user_id(const char* id) {
   return true;
 }
 
+// Audit R5-2 / R6-2: forward declarations so _parse_attributes can validate
+// attribute name and value parts against the safe charset. The full
+// definitions appear below (after _PRIVILEGED_ATTR_NAMES, which they do not
+// depend on).
+static bool _is_safe_attr_name(const char* name);
+static bool _is_safe_attr_value(const char* value);
+
 // Parse pipe-separated attribute string like "role:admin|dept:eng"
 // into attribute_value_t entries. Each entry's value field stores
 // "name:value" so the attribute name is recoverable.
@@ -84,7 +91,7 @@ static uint32_t _parse_attributes(const char* attrs, attribute_value_t* out, uin
     // would inject "secret" as a separate token — letting a user registered
     // with "role:admin,secret|dept:eng" satisfy a bare "secret" policy. Skip
     // the malformed token rather than storing it. This is defense in depth
-    // alongside the _is_safe_attr_value check in the mutation APIs.
+    // alongside the _is_safe_attr_value check below.
     bool has_comma = false;
     for (const char* p = token; *p != '\0'; p++) {
       if (*p == ',') { has_comma = true; break; }
@@ -92,6 +99,42 @@ static uint32_t _parse_attributes(const char* attrs, attribute_value_t* out, uin
     if (has_comma) {
       token = strtok_r(NULL, "|", &saveptr);
       continue;
+    }
+
+    // Audit R5-2: validate the attribute NAME part against the safe charset.
+    // Audit R6-2: validate the attribute VALUE part against the safe charset
+    // too (reject commas and spaces), matching the _is_safe_attr_value check
+    // in all mutation APIs (grant_role, self_assert, verify_identity,
+    // issue_temporary). Without this, a space in the value part (e.g.
+    // "role:admin secret") would pass through _parse_attributes even though
+    // the mutation APIs reject it — an inconsistency in defense-in-depth.
+    // Extract the name (before the colon) and value (after the colon) and
+    // reject the token if either fails validation.
+    {
+      char name_buf[CRABS_MAX_POLICY_EXPR];
+      char value_buf[CRABS_MAX_POLICY_EXPR];
+      const char* colon = strchr(token, ':');
+      size_t name_len = (colon != NULL) ? (size_t)(colon - token) : strlen(token);
+      if (name_len >= sizeof(name_buf)) name_len = sizeof(name_buf) - 1;
+      memcpy(name_buf, token, name_len);
+      name_buf[name_len] = '\0';
+      if (!_is_safe_attr_name(name_buf)) {
+        token = strtok_r(NULL, "|", &saveptr);
+        continue;
+      }
+      // Validate the value part (after the colon). An empty value is allowed
+      // (the mutation APIs allow it too — see _is_safe_attr_value comment).
+      if (colon != NULL) {
+        const char* value = colon + 1;
+        size_t value_len = strlen(value);
+        if (value_len >= sizeof(value_buf)) value_len = sizeof(value_buf) - 1;
+        memcpy(value_buf, value, value_len);
+        value_buf[value_len] = '\0';
+        if (!_is_safe_attr_value(value_buf)) {
+          token = strtok_r(NULL, "|", &saveptr);
+          continue;
+        }
+      }
     }
 
     strncpy(out[count].value, token, CRABS_MAX_POLICY_EXPR - 1);
@@ -190,9 +233,15 @@ static bool _is_safe_attr_name(const char* name) {
 // clearance:secret,admin satisfy a bare "admin" policy. This is a
 // pre-existing injection vector, not introduced by the Round 4 changes, but
 // found during the de-wonk pass over the attribute namespace safety work.
-// Empty values are allowed — the CLI uses grant_role("role:admin", "") where
-// the full token is in the role parameter and the value is intentionally
-// empty.
+//
+// Audit R5-3: empty values ARE allowed (the loop body never executes for an
+// empty string, so the function returns true). This is intentional: the CLI
+// uses grant_role("role:admin", "") where the full token is in the role
+// parameter and the value is intentionally empty, producing "role:". This
+// asymmetry with _is_safe_attr_name (which rejects empty names) is by design
+// — an attribute must have a name but may have an empty value. A "role:"
+// token with trailing colon is unlikely to match any real policy, but is
+// harmless.
 static bool _is_safe_attr_value(const char* value) {
   if (value == NULL) return false;
   for (const char* p = value; *p != '\0'; p++) {
@@ -378,6 +427,14 @@ crabs_error_e attribute_machine_grant_role(attribute_machine_t* am, const char* 
     return CRABS_ERR_INVALID_PARAM;
   }
 
+  // Audit R5-1: validate the attribute NAME charset. self_assert and
+  // issue_temporary call _is_safe_attr_name, but grant_role previously did not
+  // — a caller with grant authority could pass a role name like "role,admin"
+  // which produces the token "role,admin:value", and the comma splits into two
+  // tokens in the attribute string ("role" and "admin:value"), letting a bare
+  // "role" token satisfy unrelated policies. The value check alone does not
+  // defend against name-part injection.
+  if (!_is_safe_attr_name(role)) return CRABS_ERR_INVALID_PARAM;
   // De-wonk: reject values containing comma/space to prevent attribute-string
   // token injection (see _is_safe_attr_value).
   if (!_is_safe_attr_value(value)) return CRABS_ERR_INVALID_PARAM;
@@ -500,6 +557,12 @@ crabs_error_e attribute_machine_verify_identity(attribute_machine_t* am, const c
     return CRABS_ERR_INVALID_PARAM;
   }
 
+  // Audit R5-1: validate the attribute NAME charset, matching grant_role /
+  // self_assert / issue_temporary. Without this, a verifier could pass an
+  // attribute name like "email,admin" which produces the token
+  // "email,admin:value" — the comma splits into two tokens in the attribute
+  // string, letting a bare "email" token satisfy unrelated policies.
+  if (!_is_safe_attr_name(attribute)) return CRABS_ERR_INVALID_PARAM;
   // De-wonk: reject values containing comma/space to prevent attribute-string
   // token injection (see _is_safe_attr_value).
   if (!_is_safe_attr_value(value)) return CRABS_ERR_INVALID_PARAM;

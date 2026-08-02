@@ -843,3 +843,110 @@ TEST_F(TestAttributeMachine, TestAttrValueCommaInjectionRejected) {
   EXPECT_EQ(attribute_machine_self_assert(am, "clearance", "secret", "alice"),
             CRABS_SUCCESS);
 }
+
+// Audit R5-1: grant_role and verify_identity must validate the attribute NAME
+// charset (not just the value). self_assert and issue_temporary call
+// _is_safe_attr_name, but grant_role and verify_identity previously did not —
+// a caller with grant/verify authority could pass a role name like
+// "role,admin" which produces the token "role,admin:value", and the comma
+// splits into two tokens in the attribute string ("role" and "admin:value"),
+// letting a bare "role" token satisfy unrelated policies.
+TEST_F(TestAttributeMachine, TestGrantRoleRejectsBadAttrNameCharset) {
+  uint8_t user_pk[33];
+  _gen_pk(user_pk);
+  ASSERT_EQ(attribute_machine_register_user(am, "alice", user_pk, "dept:eng"), CRABS_SUCCESS);
+
+  // grant_role with comma in role NAME → rejected (would inject "admin" as a
+  // separate token via the name part).
+  EXPECT_EQ(attribute_machine_grant_role(am, "alice", "role,admin", "val", "admin"),
+            CRABS_ERR_INVALID_PARAM);
+
+  // grant_role with space in role NAME → rejected.
+  EXPECT_EQ(attribute_machine_grant_role(am, "alice", "role admin", "val", "admin"),
+            CRABS_ERR_INVALID_PARAM);
+
+  // grant_role with parenthesis in role NAME → rejected.
+  EXPECT_EQ(attribute_machine_grant_role(am, "alice", "role(admin)", "val", "admin"),
+            CRABS_ERR_INVALID_PARAM);
+
+  // grant_role with semicolon in role NAME → rejected.
+  EXPECT_EQ(attribute_machine_grant_role(am, "alice", "role;admin", "val", "admin"),
+            CRABS_ERR_INVALID_PARAM);
+
+  // Valid charset still works.
+  EXPECT_EQ(attribute_machine_grant_role(am, "alice", "clearance", "secret", "admin"),
+            CRABS_SUCCESS);
+}
+
+TEST_F(TestAttributeMachine, TestVerifyIdentityRejectsBadAttrNameCharset) {
+  uint8_t user_pk[33];
+  _gen_pk(user_pk);
+  ASSERT_EQ(attribute_machine_register_user(am, "alice", user_pk, "dept:eng"), CRABS_SUCCESS);
+
+  // verify_identity with comma in attribute NAME → rejected.
+  EXPECT_EQ(attribute_machine_verify_identity(am, "alice", "email,admin", "val", "admin"),
+            CRABS_ERR_INVALID_PARAM);
+
+  // verify_identity with space in attribute NAME → rejected.
+  EXPECT_EQ(attribute_machine_verify_identity(am, "alice", "email admin", "val", "admin"),
+            CRABS_ERR_INVALID_PARAM);
+
+  // verify_identity with parenthesis in attribute NAME → rejected.
+  EXPECT_EQ(attribute_machine_verify_identity(am, "alice", "email(admin)", "val", "admin"),
+            CRABS_ERR_INVALID_PARAM);
+
+  // Valid charset still works.
+  EXPECT_EQ(attribute_machine_verify_identity(am, "alice", "email", "alice@test.com", "admin"),
+            CRABS_SUCCESS);
+}
+
+// Audit R5-2: _parse_attributes (used by register_user for initial attributes)
+// must validate the name part of each "name:value" token against the safe
+// charset. Previously it only checked for commas in the whole token (de-wonk)
+// but did not validate the name part — a name like "role admin" (with a space)
+// would be stored without rejection.
+TEST_F(TestAttributeMachine, TestRegisterUserRejectsBadAttrNameInInitialAttrs) {
+  uint8_t user_pk[33];
+  _gen_pk(user_pk);
+
+  // Initial attrs with a space in the name part → the malformed token is
+  // skipped (not stored), so the user is registered with fewer attributes.
+  ASSERT_EQ(attribute_machine_register_user(am, "alice", user_pk, "bad name:value|dept:eng"),
+            CRABS_SUCCESS);
+  user_t* alice = attribute_machine_find_user(am, "alice");
+  ASSERT_NE(alice, nullptr);
+  // The "bad name:value" token is rejected; only "dept:eng" is stored.
+  EXPECT_EQ(alice->attribute_count, 1u);
+  EXPECT_STREQ(alice->attributes[0].value, "dept:eng");
+
+  // Initial attrs with a comma in the name part → rejected by the de-wonk
+  // comma check (the whole token contains a comma).
+  uint8_t user_pk2[33];
+  _gen_pk(user_pk2);
+  ASSERT_EQ(attribute_machine_register_user(am, "bob", user_pk2, "role,admin:value"),
+            CRABS_SUCCESS);
+  user_t* bob = attribute_machine_find_user(am, "bob");
+  ASSERT_NE(bob, nullptr);
+  // The comma-containing token is rejected; bob has no attributes.
+  EXPECT_EQ(bob->attribute_count, 0u);
+
+  // Initial attrs with parenthesis in the name part → rejected by charset.
+  uint8_t user_pk3[33];
+  _gen_pk(user_pk3);
+  ASSERT_EQ(attribute_machine_register_user(am, "carol", user_pk3, "name(attr):value|dept:eng"),
+            CRABS_SUCCESS);
+  user_t* carol = attribute_machine_find_user(am, "carol");
+  ASSERT_NE(carol, nullptr);
+  // The "name(attr):value" token is rejected; only "dept:eng" is stored.
+  EXPECT_EQ(carol->attribute_count, 1u);
+  EXPECT_STREQ(carol->attributes[0].value, "dept:eng");
+
+  // Valid charset in all name parts → all attributes stored.
+  uint8_t user_pk4[33];
+  _gen_pk(user_pk4);
+  ASSERT_EQ(attribute_machine_register_user(am, "dave", user_pk4, "role:staff|dept:eng|clearance:secret"),
+            CRABS_SUCCESS);
+  user_t* dave = attribute_machine_find_user(am, "dave");
+  ASSERT_NE(dave, nullptr);
+  EXPECT_EQ(dave->attribute_count, 3u);
+}

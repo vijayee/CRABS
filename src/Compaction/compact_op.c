@@ -7,17 +7,10 @@
 
 #include "compact_op.h"
 
-// Undefine OT type macros that conflict with data_type_e enum values
-// in data_model.h. These headers define the same constants as macros.
-#ifdef DATA_TYPE_OT_ORDERED_SET
-#undef DATA_TYPE_OT_ORDERED_SET
-#endif
-#ifdef DATA_TYPE_OT_DOCUMENT
-#undef DATA_TYPE_OT_DOCUMENT
-#endif
-#ifdef DATA_TYPE_OT_TREE
-#undef DATA_TYPE_OT_TREE
-#endif
+// Audit R6-1: the #undef hacks for DATA_TYPE_OT_* macros are no longer
+// needed — the dual #define/enum definitions have been resolved by removing
+// the #define macros from the OT headers. data_type_e in data_model.h is
+// now the single source of truth for these constants.
 
 #include "../OT/ot_ordered_set.h"
 #include "../OT/ot_document.h"

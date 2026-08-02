@@ -16,8 +16,10 @@
 // ============================================================
 // Type ID
 // ============================================================
-
-#define DATA_TYPE_OT_DOCUMENT 0x11
+// Audit R6-1: DATA_TYPE_OT_DOCUMENT is defined as an enum constant in
+// data_model.h (value 0x11). Do NOT re-#define it here — the dual
+// definition required #undef hacks in compact_op.c. The CRABS_OT_DOCUMENT
+// macro is retained as the numeric type ID for crabs_ot_data_item_create().
 #define CRABS_OT_DOCUMENT     0x11
 
 // ============================================================

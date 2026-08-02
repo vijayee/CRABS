@@ -17,8 +17,10 @@
 // ============================================================
 // Type ID
 // ============================================================
-
-#define DATA_TYPE_OT_TREE 0x13
+// Audit R6-1: DATA_TYPE_OT_TREE is defined as an enum constant in
+// data_model.h (value 0x13). Do NOT re-#define it here — the dual
+// definition required #undef hacks in compact_op.c. The CRABS_OT_TREE
+// macro is retained as the numeric type ID for crabs_ot_data_item_create().
 #define CRABS_OT_TREE     0x13
 
 // ============================================================
