@@ -3,9 +3,11 @@
 //
 
 #include "condition.h"
+#include "../Util/platform.h"
 #include "../Util/allocator.h"
 #include "../CRDT/crdt_merge.h"
 #include <string.h>
+#include <strings.h>
 #include <stdlib.h>
 #include <ctype.h>
 #include <stdio.h>
@@ -374,7 +376,7 @@ static bool _parse_value_list(parser_ctx_t* ctx, char*** values, uint32_t* count
     *values = NULL;
     return false;
   }
-  (*values)[0] = strdup(elem.path);
+  (*values)[0] = platform_strdup(elem.path);
   *count = 1;
 
   while (_parser_peek(ctx).type == TOK_COMMA) {
@@ -397,7 +399,7 @@ static bool _parse_value_list(parser_ctx_t* ctx, char*** values, uint32_t* count
       *count = 0;
       return false;
     }
-    (*values)[*count] = strdup(elem.path);
+    (*values)[*count] = platform_strdup(elem.path);
     (*count)++;
   }
 
@@ -536,7 +538,7 @@ static condition_node_t* _parse_comparison(parser_ctx_t* ctx) {
       node->contains_type = CONTAINS_SINGLE;
       node->negated = false;
       node->element_values = get_memory(sizeof(char*));
-      node->element_values[0] = strdup(primary.path);
+      node->element_values[0] = platform_strdup(primary.path);
       node->element_count = 1;
       return node;
     }
@@ -555,7 +557,7 @@ static condition_node_t* _parse_comparison(parser_ctx_t* ctx) {
     node->contains_type = CONTAINS_SINGLE;
     node->negated = false;
     node->element_values = get_memory(sizeof(char*));
-    node->element_values[0] = strdup(value.path);
+    node->element_values[0] = platform_strdup(value.path);
     node->element_count = 1;
     return node;
   }
@@ -615,7 +617,7 @@ static condition_node_t* _parse_comparison(parser_ctx_t* ctx) {
       node->contains_type = CONTAINS_SINGLE;
       node->negated = true;
       node->element_values = get_memory(sizeof(char*));
-      node->element_values[0] = strdup(value.path);
+      node->element_values[0] = platform_strdup(value.path);
       node->element_count = 1;
       return node;
     }
@@ -669,7 +671,7 @@ static condition_node_t* _parse_comparison(parser_ctx_t* ctx) {
       node->contains_type = CONTAINS_SINGLE;
       node->negated = true;
       node->element_values = get_memory(sizeof(char*));
-      node->element_values[0] = strdup(primary.path);
+      node->element_values[0] = platform_strdup(primary.path);
       node->element_count = 1;
       return node;
     }
@@ -802,7 +804,7 @@ condition_node_t* condition_node_create_contains(const char* set_path, contains_
   if (count > 0 && values != NULL) {
     node->element_values = get_memory(count * sizeof(char*));
     for (uint32_t i = 0; i < count; i++) {
-      node->element_values[i] = strdup(values[i]);
+      node->element_values[i] = platform_strdup(values[i]);
     }
   }
   return node;
@@ -1111,7 +1113,7 @@ static condition_node_t* _filter_contains_nodes(condition_node_t* node) {
   if (node->element_values != NULL && node->element_count > 0) {
     copy->element_values = get_memory(node->element_count * sizeof(char*));
     for (uint32_t i = 0; i < node->element_count; i++) {
-      copy->element_values[i] = strdup(node->element_values[i]);
+      copy->element_values[i] = platform_strdup(node->element_values[i]);
     }
     copy->element_count = node->element_count;
   }

@@ -3,6 +3,7 @@
 //
 
 #include "one_shot.h"
+#include "../Util/platform.h"
 #include "../Util/allocator.h"
 #include <string.h>
 #include <stdlib.h>
@@ -39,7 +40,7 @@ crabs_error_e one_shot_set_add(one_shot_set_t* set, const char* element) {
   char** new_elements = realloc(set->elements, new_count * sizeof(char*));
   if (new_elements == NULL) return CRABS_ERR_OOM;
   set->elements = new_elements;
-  char* dup = strdup(element);
+  char* dup = platform_strdup(element);
   if (dup == NULL) return CRABS_ERR_OOM;
   set->elements[set->element_count] = dup;
   set->element_count = new_count;

@@ -3,6 +3,7 @@
 //
 
 #include "attribute_machine.h"
+#include "../Util/platform.h"
 #include "../Trigger/trigger.h"
 #include "../Crypto/crypto.h"
 #include "../Condition/condition.h"
@@ -80,7 +81,7 @@ static uint32_t _parse_attributes(const char* attrs, attribute_value_t* out, uin
   buf[sizeof(buf) - 1] = '\0';
 
   char* saveptr = NULL;
-  char* token = strtok_r(buf, "|", &saveptr);
+  char* token = platform_strtok_r(buf, "|", &saveptr);
 
   while (token != NULL && count < max_count) {
     // Trim leading spaces
@@ -97,7 +98,7 @@ static uint32_t _parse_attributes(const char* attrs, attribute_value_t* out, uin
       if (*p == ',') { has_comma = true; break; }
     }
     if (has_comma) {
-      token = strtok_r(NULL, "|", &saveptr);
+      token = platform_strtok_r(NULL, "|", &saveptr);
       continue;
     }
 
@@ -119,7 +120,7 @@ static uint32_t _parse_attributes(const char* attrs, attribute_value_t* out, uin
       memcpy(name_buf, token, name_len);
       name_buf[name_len] = '\0';
       if (!_is_safe_attr_name(name_buf)) {
-        token = strtok_r(NULL, "|", &saveptr);
+        token = platform_strtok_r(NULL, "|", &saveptr);
         continue;
       }
       // Validate the value part (after the colon). An empty value is allowed
@@ -131,7 +132,7 @@ static uint32_t _parse_attributes(const char* attrs, attribute_value_t* out, uin
         memcpy(value_buf, value, value_len);
         value_buf[value_len] = '\0';
         if (!_is_safe_attr_value(value_buf)) {
-          token = strtok_r(NULL, "|", &saveptr);
+          token = platform_strtok_r(NULL, "|", &saveptr);
           continue;
         }
       }
@@ -144,7 +145,7 @@ static uint32_t _parse_attributes(const char* attrs, attribute_value_t* out, uin
     out[count].expires_at = 0;
     count++;
 
-    token = strtok_r(NULL, "|", &saveptr);
+    token = platform_strtok_r(NULL, "|", &saveptr);
   }
 
   return count;

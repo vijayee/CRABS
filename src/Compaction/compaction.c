@@ -233,8 +233,8 @@ void crabs_describe_tombstones(const crabs_compaction_registry_t* registry,
   if (vtable == NULL || vtable->describe_tombstones == NULL) {
     uint64_t tombstones = crabs_tombstone_count(registry, item);
     uint64_t visible = crabs_visible_size(registry, item);
-    snprintf(buf, buf_size, "tombstones=%lu visible=%lu",
-             (unsigned long)tombstones, (unsigned long)visible);
+    snprintf(buf, buf_size, "tombstones=%llu visible=%llu",
+             (unsigned long long)tombstones, (unsigned long long)visible);
     return;
   }
   vtable->describe_tombstones(item->value, buf, buf_size);

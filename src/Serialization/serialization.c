@@ -3,6 +3,7 @@
 //
 
 #include "serialization.h"
+#include "../Util/platform.h"
 #include "../Util/allocator.h"
 #include "../OT/ot_ordered_set.h"
 #include "../OT/ot_document.h"
@@ -712,8 +713,8 @@ static void* _deserialize_crdt_value(const uint8_t* data, uint32_t len, data_typ
         uint32_t idx = s->tombstone_count;
         s->tombstones = realloc(s->tombstones, (idx + 1) * sizeof(or_set_entry_t));
         if (!s->tombstones) { or_set_destroy(s); return NULL; }
-        s->tombstones[idx].element = strdup(elem);
-        s->tombstones[idx].tag = strdup(tag);
+        s->tombstones[idx].element = platform_strdup(elem);
+        s->tombstones[idx].tag = platform_strdup(tag);
         s->tombstone_count = idx + 1;
       }
       return s;

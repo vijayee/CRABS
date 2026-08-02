@@ -3,6 +3,7 @@
 //
 
 #include "state_machine.h"
+#include "../Util/platform.h"
 #include "../Trigger/trigger.h"
 #include "../Crypto/crypto.h"
 #include "../Crypto/sig_scheme.h"
@@ -1009,12 +1010,12 @@ crabs_error_e state_machine_op_register_key(state_t* state, operation_t* op) {
   buf[copy_len] = '\0';
 
   char* saveptr = NULL;
-  char* token = strtok_r(buf, ";", &saveptr);
+  char* token = platform_strtok_r(buf, ";", &saveptr);
 
   while (token != NULL) {
     while (*token == ' ') token++;
     char* eq = strchr(token, '=');
-    if (eq == NULL) { token = strtok_r(NULL, ";", &saveptr); continue; }
+    if (eq == NULL) { token = platform_strtok_r(NULL, ";", &saveptr); continue; }
 
     *eq = '\0';
     const char* key = token;
@@ -1030,7 +1031,7 @@ crabs_error_e state_machine_op_register_key(state_t* state, operation_t* op) {
       strncpy(label, val, CRABS_MAX_KEY_LABEL - 1);
     }
 
-    token = strtok_r(NULL, ";", &saveptr);
+    token = platform_strtok_r(NULL, ";", &saveptr);
   }
 
   // Find the public key data after the config string's null terminator.
@@ -1074,17 +1075,17 @@ crabs_error_e state_machine_op_revoke_key(state_t* state, operation_t* op) {
   buf[copy_len] = '\0';
 
   char* saveptr = NULL;
-  char* token = strtok_r(buf, ";", &saveptr);
+  char* token = platform_strtok_r(buf, ";", &saveptr);
   while (token != NULL) {
     while (*token == ' ') token++;
     char* eq = strchr(token, '=');
-    if (eq == NULL) { token = strtok_r(NULL, ";", &saveptr); continue; }
+    if (eq == NULL) { token = platform_strtok_r(NULL, ";", &saveptr); continue; }
 
     *eq = '\0';
     if (strcmp(token, "key_id") == 0) {
       strncpy(key_id, eq + 1, CRABS_MAX_KEY_ID - 1);
     }
-    token = strtok_r(NULL, ";", &saveptr);
+    token = platform_strtok_r(NULL, ";", &saveptr);
   }
 
   if (key_id[0] == '\0') return CRABS_ERR_INVALID_PARAM;
@@ -1111,17 +1112,17 @@ crabs_error_e state_machine_op_set_default_key(state_t* state, operation_t* op) 
   buf[copy_len] = '\0';
 
   char* saveptr = NULL;
-  char* token = strtok_r(buf, ";", &saveptr);
+  char* token = platform_strtok_r(buf, ";", &saveptr);
   while (token != NULL) {
     while (*token == ' ') token++;
     char* eq = strchr(token, '=');
-    if (eq == NULL) { token = strtok_r(NULL, ";", &saveptr); continue; }
+    if (eq == NULL) { token = platform_strtok_r(NULL, ";", &saveptr); continue; }
 
     *eq = '\0';
     if (strcmp(token, "key_id") == 0) {
       strncpy(key_id, eq + 1, CRABS_MAX_KEY_ID - 1);
     }
-    token = strtok_r(NULL, ";", &saveptr);
+    token = platform_strtok_r(NULL, ";", &saveptr);
   }
 
   if (key_id[0] == '\0') return CRABS_ERR_INVALID_PARAM;
@@ -1151,16 +1152,16 @@ crabs_error_e state_machine_op_suspend_key(state_t* state, operation_t* op) {
   buf[copy_len] = '\0';
 
   char* saveptr = NULL;
-  char* token = strtok_r(buf, ";", &saveptr);
+  char* token = platform_strtok_r(buf, ";", &saveptr);
   while (token != NULL) {
     while (*token == ' ') token++;
     char* eq = strchr(token, '=');
-    if (eq == NULL) { token = strtok_r(NULL, ";", &saveptr); continue; }
+    if (eq == NULL) { token = platform_strtok_r(NULL, ";", &saveptr); continue; }
     *eq = '\0';
     if (strcmp(token, "key_id") == 0) {
       strncpy(key_id, eq + 1, CRABS_MAX_KEY_ID - 1);
     }
-    token = strtok_r(NULL, ";", &saveptr);
+    token = platform_strtok_r(NULL, ";", &saveptr);
   }
 
   if (key_id[0] == '\0') return CRABS_ERR_INVALID_PARAM;
@@ -1186,16 +1187,16 @@ crabs_error_e state_machine_op_activate_key(state_t* state, operation_t* op) {
   buf[copy_len] = '\0';
 
   char* saveptr = NULL;
-  char* token = strtok_r(buf, ";", &saveptr);
+  char* token = platform_strtok_r(buf, ";", &saveptr);
   while (token != NULL) {
     while (*token == ' ') token++;
     char* eq = strchr(token, '=');
-    if (eq == NULL) { token = strtok_r(NULL, ";", &saveptr); continue; }
+    if (eq == NULL) { token = platform_strtok_r(NULL, ";", &saveptr); continue; }
     *eq = '\0';
     if (strcmp(token, "key_id") == 0) {
       strncpy(key_id, eq + 1, CRABS_MAX_KEY_ID - 1);
     }
-    token = strtok_r(NULL, ";", &saveptr);
+    token = platform_strtok_r(NULL, ";", &saveptr);
   }
 
   if (key_id[0] == '\0') return CRABS_ERR_INVALID_PARAM;
@@ -1227,11 +1228,11 @@ crabs_error_e state_machine_op_rotate_key(state_t* state, operation_t* op) {
   buf[copy_len] = '\0';
 
   char* saveptr = NULL;
-  char* token = strtok_r(buf, ";", &saveptr);
+  char* token = platform_strtok_r(buf, ";", &saveptr);
   while (token != NULL) {
     while (*token == ' ') token++;
     char* eq = strchr(token, '=');
-    if (eq == NULL) { token = strtok_r(NULL, ";", &saveptr); continue; }
+    if (eq == NULL) { token = platform_strtok_r(NULL, ";", &saveptr); continue; }
     *eq = '\0';
     if (strcmp(token, "old_key_id") == 0) {
       strncpy(old_key_id, eq + 1, CRABS_MAX_KEY_ID - 1);
@@ -1242,7 +1243,7 @@ crabs_error_e state_machine_op_rotate_key(state_t* state, operation_t* op) {
     } else if (strcmp(token, "public_key_len") == 0) {
       pk_len = (uint32_t)atoi(eq + 1);
     }
-    token = strtok_r(NULL, ";", &saveptr);
+    token = platform_strtok_r(NULL, ";", &saveptr);
   }
 
   if (old_key_id[0] == '\0' || new_key_id[0] == '\0' || pk_len == 0) {

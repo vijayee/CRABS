@@ -6,6 +6,7 @@
 //
 
 #include "hlc.h"
+#include "../Util/platform.h"
 #include <string.h>
 #include <stdio.h>
 #include <time.h>
@@ -114,14 +115,17 @@ int crabs_hlc_format(const crabs_hlc_t* hlc, char* buf, size_t buf_len) {
 
   time_t sec = (time_t)hlc->physical_seconds;
   struct tm tm;
-  if (gmtime_r(&sec, &tm) == NULL) return -1;
+  // Audit X-5: use platform_gmtime_r (gmtime_r on POSIX, gmtime_s on Windows)
+  if (platform_gmtime_r(&sec, &tm) == NULL) return -1;
 
+  // Audit X-3: use %llu with unsigned long long cast instead of %lu, which
+  // truncates uint64_t to 32 bits on 64-bit Windows (LLP64 model).
   int written = snprintf(buf, buf_len,
-    "%04d-%02d-%02dT%02d:%02d:%02d.%09lu#%lu@%s",
+    "%04d-%02d-%02dT%02d:%02d:%02d.%09llu#%llu@%s",
     tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
     tm.tm_hour, tm.tm_min, tm.tm_sec,
-    (unsigned long)hlc->physical_nanos,
-    (unsigned long)hlc->logical_counter,
+    (unsigned long long)hlc->physical_nanos,
+    (unsigned long long)hlc->logical_counter,
     hlc->node_id);
 
   if (written < 0 || (size_t)written >= buf_len) {
@@ -245,13 +249,14 @@ crabs_physical_time_t crabs_hlc_get_system_time(void* ctx) {
   (void)ctx;
   crabs_physical_time_t result = {0, 0, false};
 
-  struct timespec ts;
-  if (clock_gettime(CLOCK_REALTIME, &ts) != 0) {
-    return result;
-  }
+  // Audit X-2: use the platform abstraction so the time source works on
+  // Windows (GetSystemTimeAsFileTime) and POSIX (clock_gettime). The prior
+  // code called clock_gettime directly, which is POSIX-only.
+  platform_time_t pt = platform_get_time();
+  if (!pt.valid) return result;
 
-  result.seconds = (uint64_t)ts.tv_sec;
-  result.nanos = (uint64_t)ts.tv_nsec;
+  result.seconds = pt.seconds;
+  result.nanos = pt.nanos;
   result.valid = true;
   return result;
 }

@@ -312,7 +312,7 @@ cli_result_e cli_cmd_state_show(cli_node_t* node) {
   if (node == NULL || !node->initialized) return CLI_ERR_NOT_INIT;
   state_t* state = &node->attr_machine->base_state;
 
-  printf("State Version: %lu\n", state->version);
+  printf("State Version: %llu\n", (unsigned long long)state->version);
   uint32_t item_count = 0;
   data_item_t* item = state->items;
   while (item != NULL) {
@@ -321,7 +321,7 @@ cli_result_e cli_cmd_state_show(cli_node_t* node) {
   }
   printf("  Data Items: %u\n", item_count);
   printf("  Policies: %u\n", state->policy_count);
-  printf("  Log Entries: %lu\n", state->log_count);
+  printf("  Log Entries: %llu\n", (unsigned long long)state->log_count);
   printf("  Triggers: %u\n", state->trigger_count);
   printf("  Node Key: %s\n", state->node_key_valid ? "initialized" : "not set");
   printf("  Users: %u\n", node->attr_machine->user_count);
@@ -372,7 +372,7 @@ cli_result_e cli_cmd_state_config(cli_node_t* node) {
   machine_config_t* cfg = &node->attr_machine->base_state.config;
 
   printf("Machine Configuration:\n");
-  printf("  max_lock_duration_ms: %lu\n", cfg->max_lock_duration_ms);
+  printf("  max_lock_duration_ms: %llu\n", (unsigned long long)cfg->max_lock_duration_ms);
   printf("  max_lock_extensions:  %u\n", cfg->max_lock_extensions);
   printf("  allow_force_unlock:   %s\n", cfg->allow_force_unlock ? "true" : "false");
   printf("  bootstrap_admin:     %s\n", cfg->bootstrap_admin[0] ? cfg->bootstrap_admin : "(not set)");
@@ -624,7 +624,7 @@ cli_result_e cli_cmd_key_refresh(cli_node_t* node, const char* user_id) {
 
   user_t* user = attribute_machine_find_user(node->attr_machine, user_id);
   if (user != NULL) {
-    printf("  New key version: %lu\n", user->key_version);
+    printf("  New key version: %llu\n", (unsigned long long)user->key_version);
   }
 
   return CLI_OK;

@@ -3,6 +3,7 @@
 //
 
 #include "trigger.h"
+#include "../Util/platform.h"
 #include "../StateMachine/state_machine.h"
 #include "../Util/allocator.h"
 #include <string.h>
@@ -257,14 +258,14 @@ crabs_error_e state_machine_op_create_trigger(state_t* state, operation_t* op) {
     buf[_c] = '\0'; }
 
   char* saveptr = NULL;
-  char* token = strtok_r(buf, ";", &saveptr);
+  char* token = platform_strtok_r(buf, ";", &saveptr);
   while (token != NULL) {
     // Trim leading whitespace
     while (*token == ' ') token++;
 
     char* eq = strchr(token, '=');
     if (eq == NULL) {
-      token = strtok_r(NULL, ";", &saveptr);
+      token = platform_strtok_r(NULL, ";", &saveptr);
       continue;
     }
 
@@ -300,7 +301,7 @@ crabs_error_e state_machine_op_create_trigger(state_t* state, operation_t* op) {
       strncpy(policy_expression, value, CRABS_MAX_POLICY_EXPR - 1);
     }
 
-    token = strtok_r(NULL, ";", &saveptr);
+    token = platform_strtok_r(NULL, ";", &saveptr);
   }
 
   if (trigger_id[0] == '\0' || condition_expr[0] == '\0') {

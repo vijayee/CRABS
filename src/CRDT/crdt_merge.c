@@ -3,6 +3,7 @@
 //
 
 #include "crdt_merge.h"
+#include "../Util/platform.h"
 #include "one_shot.h"
 #include "../Util/allocator.h"
 #include <string.h>
@@ -275,8 +276,8 @@ crabs_error_e or_set_add(or_set_t* set, const char* element, const char* tag) {
   if (new_elements == NULL) return CRABS_ERR_OOM;
   set->elements = new_elements;
 
-  set->elements[set->element_count].element = strdup(element);
-  set->elements[set->element_count].tag = strdup(tag);
+  set->elements[set->element_count].element = platform_strdup(element);
+  set->elements[set->element_count].tag = platform_strdup(tag);
   set->element_count = new_count;
   return CRABS_SUCCESS;
 }
@@ -295,8 +296,8 @@ crabs_error_e or_set_remove(or_set_t* set, const char* element) {
       if (new_tombstones == NULL) return CRABS_ERR_OOM;
       set->tombstones = new_tombstones;
 
-      set->tombstones[set->tombstone_count].element = strdup(set->elements[i].element);
-      set->tombstones[set->tombstone_count].tag = strdup(set->elements[i].tag);
+      set->tombstones[set->tombstone_count].element = platform_strdup(set->elements[i].element);
+      set->tombstones[set->tombstone_count].tag = platform_strdup(set->elements[i].tag);
       set->tombstone_count = new_ts_count;
     }
   }
@@ -339,8 +340,8 @@ or_set_t* or_set_merge(const or_set_t* a, const or_set_t* b) {
         or_set_entry_t* new_ts = realloc(result->tombstones, new_count * sizeof(or_set_entry_t));
         if (new_ts == NULL) continue;
         result->tombstones = new_ts;
-        result->tombstones[result->tombstone_count].element = strdup(sources[s]->tombstones[i].element);
-        result->tombstones[result->tombstone_count].tag = strdup(sources[s]->tombstones[i].tag);
+        result->tombstones[result->tombstone_count].element = platform_strdup(sources[s]->tombstones[i].element);
+        result->tombstones[result->tombstone_count].tag = platform_strdup(sources[s]->tombstones[i].tag);
         result->tombstone_count = new_count;
       }
     }
@@ -387,7 +388,7 @@ crabs_error_e two_p_set_add(two_p_set_t* set, const char* element) {
   char** new_add_set = realloc(set->add_set, new_count * sizeof(char*));
   if (new_add_set == NULL) return CRABS_ERR_OOM;
   set->add_set = new_add_set;
-  set->add_set[set->add_count] = strdup(element);
+  set->add_set[set->add_count] = platform_strdup(element);
   set->add_count = new_count;
   return CRABS_SUCCESS;
 }
@@ -404,7 +405,7 @@ crabs_error_e two_p_set_remove(two_p_set_t* set, const char* element) {
   char** new_remove_set = realloc(set->remove_set, new_count * sizeof(char*));
   if (new_remove_set == NULL) return CRABS_ERR_OOM;
   set->remove_set = new_remove_set;
-  set->remove_set[set->remove_count] = strdup(element);
+  set->remove_set[set->remove_count] = platform_strdup(element);
   set->remove_count = new_count;
   return CRABS_SUCCESS;
 }

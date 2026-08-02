@@ -5,8 +5,8 @@
 #include "sig_scheme.h"
 #include "crypto.h"
 #include "../Util/allocator.h"
+#include "../Util/platform.h"
 #include <string.h>
-#include <pthread.h>
 
 // ============================================================
 // Global Registry
@@ -17,7 +17,32 @@ static bool _registry_initialized = false;
 // Guards register/get/cleanup so the registry can be used from multiple
 // threads (audit L-3). Init-time registration and steady-state lookups are
 // the common case; cleanup is expected only at shutdown.
-static pthread_mutex_t _registry_lock = PTHREAD_MUTEX_INITIALIZER;
+// Audit X-1: use the platform abstraction instead of pthread directly so
+// the registry compiles on Windows (CRITICAL_SECTION) and POSIX
+// (pthread_mutex_t).
+// De-wonk: on POSIX, use PTHREAD_MUTEX_INITIALIZER for static, race-free
+// initialization. On Windows, CRITICAL_SECTION cannot be statically
+// initialized, so use a lazy-init guard. The guard has a theoretical race
+// if two threads call _ensure_registry_lock simultaneously before the lock
+// is initialized; in practice, crypto_sig_scheme_init() is called at startup
+// before multi-threaded use, so the race does not arise. If Windows
+// multi-threaded use before init becomes a concern, switch to
+// InitOnceExecuteOnce.
+#ifdef _WIN32
+static platform_mutex_t _registry_lock;
+static bool _registry_lock_initialized = false;
+static void _ensure_registry_lock(void) {
+  if (_registry_lock_initialized) return;
+  platform_mutex_init(&_registry_lock);
+  _registry_lock_initialized = true;
+}
+#else
+// POSIX: static initialization eliminates the race entirely.
+static platform_mutex_t _registry_lock = PTHREAD_MUTEX_INITIALIZER;
+static void _ensure_registry_lock(void) {
+  // No-op: the mutex is statically initialized.
+}
+#endif
 
 // ============================================================
 // Registry API
@@ -28,42 +53,42 @@ crabs_error_e crypto_sig_scheme_register(const signature_vtable_t* vtable) {
   if (vtable->sign == NULL) return CRABS_ERR_INVALID_PARAM;
   if (vtable->verify == NULL) return CRABS_ERR_INVALID_PARAM;
 
-  pthread_mutex_lock(&_registry_lock);
+  _ensure_registry_lock(); platform_mutex_lock(&_registry_lock);
   // Inline duplicate check (do NOT call crypto_sig_scheme_get here — it
   // locks the same _registry_lock, which would deadlock).
   for (uint32_t i = 0; i < _registry_count; i++) {
     if (_registry[i] != NULL && _registry[i]->scheme_id == vtable->scheme_id) {
-      pthread_mutex_unlock(&_registry_lock);
+      platform_mutex_unlock(&_registry_lock);
       return CRABS_ERR_SCHEME_ALREADY_REGISTERED;
     }
   }
 
   if (_registry_count >= CRABS_MAX_REGISTERED_SCHEMES) {
-    pthread_mutex_unlock(&_registry_lock);
+    platform_mutex_unlock(&_registry_lock);
     return CRABS_ERR_OOM;
   }
 
   signature_vtable_t* entry = get_clear_memory(sizeof(signature_vtable_t));
   if (entry == NULL) {
-    pthread_mutex_unlock(&_registry_lock);
+    platform_mutex_unlock(&_registry_lock);
     return CRABS_ERR_OOM;
   }
   memcpy(entry, vtable, sizeof(signature_vtable_t));
   _registry[_registry_count++] = entry;
-  pthread_mutex_unlock(&_registry_lock);
+  platform_mutex_unlock(&_registry_lock);
   return CRABS_SUCCESS;
 }
 
 const signature_vtable_t* crypto_sig_scheme_get(signature_scheme_e scheme_id) {
-  pthread_mutex_lock(&_registry_lock);
+  _ensure_registry_lock(); platform_mutex_lock(&_registry_lock);
   for (uint32_t i = 0; i < _registry_count; i++) {
     if (_registry[i] != NULL && _registry[i]->scheme_id == scheme_id) {
       const signature_vtable_t* r = _registry[i];
-      pthread_mutex_unlock(&_registry_lock);
+      platform_mutex_unlock(&_registry_lock);
       return r;
     }
   }
-  pthread_mutex_unlock(&_registry_lock);
+  platform_mutex_unlock(&_registry_lock);
   return NULL;
 }
 
@@ -177,15 +202,15 @@ static signature_vtable_t _ecdsa_secp256k1_vtable = {
 // Initialization
 // ============================================================
 void crypto_sig_scheme_init(void) {
-  pthread_mutex_lock(&_registry_lock);
-  if (_registry_initialized) { pthread_mutex_unlock(&_registry_lock); return; }
+  _ensure_registry_lock(); platform_mutex_lock(&_registry_lock);
+  if (_registry_initialized) { platform_mutex_unlock(&_registry_lock); return; }
   _registry_initialized = true;
-  pthread_mutex_unlock(&_registry_lock);
+  platform_mutex_unlock(&_registry_lock);
   crypto_sig_scheme_register(&_ecdsa_secp256k1_vtable);
 }
 
 void crypto_sig_scheme_cleanup(void) {
-  pthread_mutex_lock(&_registry_lock);
+  _ensure_registry_lock(); platform_mutex_lock(&_registry_lock);
   for (uint32_t i = 0; i < _registry_count; i++) {
     if (_registry[i] != NULL) {
       free(_registry[i]);
@@ -194,5 +219,5 @@ void crypto_sig_scheme_cleanup(void) {
   }
   _registry_count = 0;
   _registry_initialized = false;
-  pthread_mutex_unlock(&_registry_lock);
+  platform_mutex_unlock(&_registry_lock);
 }
