@@ -1,0 +1,41 @@
+{
+  "name": "crabs-node",
+  "version": "0.1.0",
+  "description": "Node.js N-API bindings for the CRABS cryptographic attribute-based state machine library",
+  "main": "index.js",
+  "types": "index.d.ts",
+  "scripts": {
+    "install": "cmake-js compile",
+    "build": "cmake-js build",
+    "clean": "cmake-js clean",
+    "test": "node test/test.js"
+  },
+  "dependencies": {
+    "node-addon-api": "^7.1.0"
+  },
+  "devDependencies": {
+    "cmake-js": "^7.3.0"
+  },
+  "binary": {
+    "module_path": "./build/Release",
+    "module_name": "crabs_node"
+  },
+  "files": [
+    "src/",
+    "CMakeLists.txt",
+    "index.js",
+    "index.d.ts",
+    "README.md"
+  ],
+  "keywords": [
+    "crabs",
+    "abe",
+    "attribute-based-encryption",
+    "crdt",
+    "ot",
+    "cryptographic",
+    "authorization",
+    "self-sovereign"
+  ],
+  "license": "MIT"
+}

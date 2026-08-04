@@ -85,6 +85,12 @@ abe_ciphertext_t*  crypto_abe_encrypt(const abe_master_key_t* mk,
                                         const char* policy);
 void               crypto_abe_ciphertext_destroy(abe_ciphertext_t* ct);
 
+// Accessors for opaque ciphertext (used by language bindings that can't
+// access the internal struct). Get the policy string and the raw encrypted
+// data + its length.
+const char*        crypto_abe_ciphertext_get_policy(const abe_ciphertext_t* ct);
+const uint8_t*     crypto_abe_ciphertext_get_data(const abe_ciphertext_t* ct, size_t* len);
+
 // Decrypt with a user key. Succeeds only if the key's attributes satisfy the
 // ciphertext's policy. Caller frees *out.
 crabs_error_e      crypto_abe_decrypt(const abe_user_key_t* sk,

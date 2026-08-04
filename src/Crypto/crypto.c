@@ -764,6 +764,21 @@ void crypto_abe_ciphertext_destroy(abe_ciphertext_t* ct) {
   }
 }
 
+// Accessors for opaque ciphertext (used by language bindings).
+const char* crypto_abe_ciphertext_get_policy(const abe_ciphertext_t* ct) {
+  if (!ct) return NULL;
+  return ct->policy;
+}
+
+const uint8_t* crypto_abe_ciphertext_get_data(const abe_ciphertext_t* ct, size_t* len) {
+  if (!ct || !ct->ct_bytes) {
+    if (len) *len = 0;
+    return NULL;
+  }
+  if (len) *len = oabe_bytestring_get_size(ct->ct_bytes);
+  return (const uint8_t*)oabe_bytestring_get_const_ptr(ct->ct_bytes);
+}
+
 // ============================================================
 // ABE Decrypt — real CP-ABE user-key decryption (ABE-KEM + DEM).
 // ============================================================
