@@ -1,0 +1,278 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>CRABS Video Platform</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+           background: #0f0f0f; color: #e0e0e0; max-width: 900px; margin: 0 auto; padding: 20px; }
+    h1 { color: #ff4444; margin-bottom: 10px; }
+    .subtitle { color: #888; margin-bottom: 20px; font-size: 14px; }
+    .video-frame { background: #1a1a1a; border-radius: 8px; padding: 40px; text-align: center;
+                   margin-bottom: 20px; border: 1px solid #333; }
+    .video-frame .play { font-size: 48px; color: #555; }
+    .stats { display: flex; gap: 20px; margin-bottom: 20px; flex-wrap: wrap; }
+    .stat { background: #1a1a1a; padding: 12px 20px; border-radius: 8px; border: 1px solid #333;
+            text-align: center; min-width: 80px; }
+    .stat .num { font-size: 24px; font-weight: bold; }
+    .stat .label { font-size: 12px; color: #888; text-transform: uppercase; }
+    .actions { display: flex; gap: 10px; margin-bottom: 20px; flex-wrap: wrap; }
+    button { background: #2a2a2a; color: #e0e0e0; border: 1px solid #444; padding: 10px 20px;
+             border-radius: 6px; cursor: pointer; font-size: 14px; transition: all 0.2s; }
+    button:hover { background: #3a3a3a; border-color: #666; }
+    button:active { transform: scale(0.97); }
+    button.like { border-color: #4a4; }
+    button.like.active { background: #2a4a2a; border-color: #4a4; color: #4f4; }
+    button.dislike { border-color: #a44; }
+    button.dislike.active { background: #4a2a2a; border-color: #a44; color: #f88; }
+    button.subscribe.active { background: #2a2a4a; border-color: #44a; color: #88f; }
+    button.flag { border-color: #a44; }
+    button.contact { border-color: #da4; color: #ff4; }
+    .user-bar { display: flex; gap: 10px; align-items: center; margin-bottom: 20px;
+                background: #1a1a1a; padding: 12px; border-radius: 8px; border: 1px solid #333; }
+    .user-bar label { color: #888; font-size: 14px; }
+    select { background: #2a2a2a; color: #e0e0e0; border: 1px solid #444; padding: 6px 10px;
+             border-radius: 4px; font-size: 14px; }
+    .user-attrs { font-size: 12px; color: #888; }
+    .comments { background: #1a1a1a; border-radius: 8px; padding: 16px; border: 1px solid #333;
+                margin-bottom: 20px; }
+    .comment { padding: 10px; border-bottom: 1px solid #2a2a2a; }
+    .comment:last-child { border-bottom: none; }
+    .comment .user { font-weight: bold; color: #88f; }
+    .comment .text { margin: 4px 0; }
+    .comment .meta { font-size: 11px; color: #666; }
+    .comment .reply-btn { font-size: 12px; padding: 4px 10px; margin-top: 4px; }
+    .reply-form { margin: 8px 0 8px 20px; display: none; }
+    .reply-form input { width: 70%; background: #2a2a2a; color: #e0e0e0; border: 1px solid #444;
+                        padding: 6px 10px; border-radius: 4px; }
+    .comment-input { display: flex; gap: 10px; margin-top: 12px; }
+    .comment-input input { flex: 1; background: #2a2a2a; color: #e0e0e0; border: 1px solid #444;
+                           padding: 8px 12px; border-radius: 4px; }
+    .ratio-warning { color: #a44; font-size: 12px; margin-top: 8px; }
+    .contact-info { background: #2a2a1a; border: 1px solid #aa4; border-radius: 8px;
+                   padding: 16px; margin-bottom: 20px; display: none; }
+    .contact-info h3 { color: #ff4; margin-bottom: 8px; }
+    .contact-info pre { white-space: pre-wrap; font-size: 13px; color: #cc8; }
+    .trigger-status { padding: 8px 12px; border-radius: 4px; margin-bottom: 10px; font-size: 13px; }
+    .trigger-status.active { background: #2a2a1a; border: 1px solid #aa4; color: #ff4; }
+    .trigger-status.inactive { background: #1a1a1a; border: 1px solid #333; color: #888; }
+    .error { color: #f88; font-size: 13px; margin: 8px 0; }
+  </style>
+</head>
+<body>
+  <h1>🦀 CRABS Video Platform</h1>
+  <div class="subtitle">Attribute-based authorization · HLC ordering · Threshold-triggered decryption · CRDT state</div>
+
+  <div class="user-bar">
+    <label>Acting as:</label>
+    <select id="userSelect">
+      <option value="alice">alice (member)</option>
+      <option value="bob">bob (member)</option>
+      <option value="carol">carol (member)</option>
+      <option value="admin">admin (moderator)</option>
+    </select>
+    <span class="user-attrs" id="userAttrs"></span>
+  </div>
+
+  <div class="video-frame">
+    <div class="play">▶</div>
+    <div style="color:#666; margin-top:10px;">Sample Video</div>
+  </div>
+
+  <div class="stats">
+    <div class="stat"><div class="num" id="views">0</div><div class="label">Views</div></div>
+    <div class="stat"><div class="num" id="likes">0</div><div class="label">Likes</div></div>
+    <div class="stat"><div class="num" id="dislikes">0</div><div class="label">Dislikes</div></div>
+    <div class="stat"><div class="num" id="subscribers">0</div><div class="label">Subscribers</div></div>
+    <div class="stat"><div class="num" id="flags">0</div><div class="label">Flags</div></div>
+  </div>
+
+  <div class="trigger-status inactive" id="triggerStatus">
+    Flag threshold not reached. <span id="flagProgress">0/3</span> flags needed to decrypt contact info.
+  </div>
+
+  <div class="actions">
+    <button class="like" id="likeBtn" onclick="doAction('like')">👍 Like</button>
+    <button class="dislike" id="dislikeBtn" onclick="doAction('dislike')">👎 Dislike</button>
+    <button class="subscribe" id="subBtn" onclick="doAction('subscribe')">🔔 Subscribe</button>
+    <button class="flag" onclick="doAction('flag')">🚩 Flag</button>
+    <button class="contact" id="contactBtn" onclick="viewContact()" style="display:none">🔓 View Contact Info</button>
+    <button onclick="doView()">▶ View</button>
+  </div>
+
+  <div class="contact-info" id="contactInfo">
+    <h3>🔓 Decrypted Contact Information</h3>
+    <pre id="contactData"></pre>
+  </div>
+
+  <div class="comments">
+    <h3 style="margin-bottom:10px;">💬 Comments</h3>
+    <div id="commentList"></div>
+    <div class="comment-input">
+      <input type="text" id="commentText" placeholder="Write a comment..."
+             onkeypress="if(event.key==='Enter')doComment()">
+      <button onclick="doComment()">Post</button>
+    </div>
+    <div class="ratio-warning" id="ratioWarning"></div>
+  </div>
+
+  <div class="error" id="error"></div>
+
+  <script>
+    let currentUser = 'alice';
+
+    async function api(endpoint, data = {}) {
+      const res = await fetch('/api/' + endpoint, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ...data, userId: currentUser })
+      });
+      const json = await res.json();
+      if (!res.ok) throw new Error(json.error || 'Request failed');
+      return json;
+    }
+
+    async function doView() {
+      try { await api('view'); await refreshState(); } catch(e) { showError(e.message); }
+    }
+
+    async function doAction(action) {
+      try {
+        await api(action);
+        await refreshState();
+        document.getElementById('error').textContent = '';
+      } catch(e) { showError(e.message); }
+    }
+
+    async function doComment() {
+      const text = document.getElementById('commentText').value;
+      if (!text.trim()) return;
+      try {
+        await api('comment', { text });
+        document.getElementById('commentText').value = '';
+        await refreshState();
+        document.getElementById('error').textContent = '';
+      } catch(e) {
+        document.getElementById('ratioWarning').textContent = e.message;
+        setTimeout(() => document.getElementById('ratioWarning').textContent = '', 5000);
+      }
+    }
+
+    async function doReply(parentId) {
+      const input = document.getElementById('replyInput_' + parentId);
+      if (!input) return;
+      const text = input.value;
+      if (!text.trim()) return;
+      try {
+        await api('reply', { parentId, text });
+        await refreshState();
+      } catch(e) { showError(e.message); }
+    }
+
+    async function viewContact() {
+      try {
+        const data = await api('contact');
+        document.getElementById('contactData').textContent = JSON.stringify(data.contactInfo, null, 2);
+        document.getElementById('contactInfo').style.display = 'block';
+      } catch(e) { showError(e.message); }
+    }
+
+    function showError(msg) {
+      const el = document.getElementById('error');
+      el.textContent = msg;
+      setTimeout(() => el.textContent = '', 5000);
+    }
+
+    async function refreshState() {
+      const res = await fetch('/api/state');
+      const state = await res.json();
+
+      document.getElementById('views').textContent = state.views;
+      document.getElementById('likes').textContent = state.likes;
+      document.getElementById('dislikes').textContent = state.dislikes;
+      document.getElementById('subscribers').textContent =
+        state.users.filter(u => u.subscribed).length;
+      document.getElementById('flags').textContent = state.flagCount;
+
+      // Trigger status
+      const ts = document.getElementById('triggerStatus');
+      const fp = document.getElementById('flagProgress');
+      if (state.triggerActivated) {
+        ts.className = 'trigger-status active';
+        ts.innerHTML = '🔓 Flag threshold reached! Moderators can access contact info.';
+        fp.textContent = `${state.flagCount}/${state.flagThreshold}`;
+      } else {
+        ts.className = 'trigger-status inactive';
+        fp.textContent = `${state.flagCount}/${state.flagThreshold}`;
+      }
+
+      // Update user info
+      const userInfo = state.users.find(u => u.userId === currentUser);
+      if (userInfo) {
+        document.getElementById('userAttrs').textContent =
+          'Attributes: ' + (userInfo.attributes.join(', ') || 'none');
+        // Update like/dislike buttons
+        document.getElementById('likeBtn').classList.toggle('active', userInfo.vote === 1);
+        document.getElementById('dislikeBtn').classList.toggle('active', userInfo.vote === -1);
+        document.getElementById('subBtn').classList.toggle('active', userInfo.subscribed);
+        document.getElementById('subBtn').textContent = userInfo.subscribed ? '🔔 Subscribed' : '🔔 Subscribe';
+        // Show contact button for moderators (users with clearance:moderator)
+        const isMod = userInfo.attributes.some(a => a.includes('clearance:moderator'));
+        document.getElementById('contactBtn').style.display =
+          (isMod && state.triggerActivated) ? 'inline-block' : 'none';
+      }
+
+      // Load comments
+      const commentsRes = await fetch('/api/comments', { method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ userId: currentUser }) });
+      const commentsData = await commentsRes.json();
+      const list = document.getElementById('commentList');
+      list.innerHTML = '';
+      const topLevel = commentsData.comments.filter(c => c.parent === null);
+      const replies = commentsData.comments.filter(c => c.parent !== null);
+      for (const c of topLevel) {
+        list.innerHTML += formatComment(c);
+        for (const r of replies.filter(r => r.parent === c.id)) {
+          list.innerHTML += formatComment(r, true);
+        }
+      }
+    }
+
+    function formatComment(c, isReply = false) {
+      const style = isReply ? 'margin-left:30px;' : '';
+      return `
+        <div class="comment" style="${style}">
+          <span class="user">${c.user}</span>
+          <span class="meta"> · ${new Date(c.timestamp).toLocaleTimeString()}</span>
+          <div class="text">${escapeHtml(c.text)}</div>
+          ${!isReply ? `<button class="reply-btn" onclick="toggleReply(${c.id})">Reply</button>
+            <div class="reply-form" id="replyForm_${c.id}">
+              <input type="text" id="replyInput_${c.id}" placeholder="Reply..."
+                     onkeypress="if(event.key==='Enter')doReply(${c.id})">
+              <button onclick="doReply(${c.id})">Send</button>
+            </div>` : ''}
+        </div>`;
+    }
+
+    function toggleReply(id) {
+      const form = document.getElementById('replyForm_' + id);
+      form.style.display = form.style.display === 'block' ? 'none' : 'block';
+    }
+
+    function escapeHtml(s) {
+      return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+    }
+
+    document.getElementById('userSelect').addEventListener('change', e => {
+      currentUser = e.target.value;
+      refreshState();
+    });
+
+    refreshState();
+    setInterval(refreshState, 3000);  // auto-refresh every 3s
+  </script>
+</body>
+</html>

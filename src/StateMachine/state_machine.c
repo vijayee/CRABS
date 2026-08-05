@@ -667,9 +667,15 @@ crabs_error_e state_machine_execute(state_t* state, operation_t* op) {
   record_processed_op(state, op->uuid);
 
   // Step 9: Process triggers (Amendment 1, §5.2)
+  // Pass the attribute machine so trigger effects (e.g. ISSUE_ATTRIBUTE) can
+  // actually issue attributes. The prior code passed NULL here, which made
+  // _execute_trigger_effect silently skip ISSUE_ATTRIBUTE effects (the
+  // function checks `if (am == NULL) return CRABS_SUCCESS;`). This meant
+  // threshold triggers never issued attributes — a functional bug.
   if (state->triggers != NULL && state->trigger_count > 0) {
     uint64_t trigger_now_ms = (uint64_t)time(NULL) * 1000;
-    trigger_process_all(state, state->triggers, state->trigger_count, NULL, trigger_now_ms);
+    trigger_process_all(state, state->triggers, state->trigger_count,
+                        (attribute_machine_t*)state->attr_machine, trigger_now_ms);
   }
 
   return CRABS_SUCCESS;

@@ -38,6 +38,8 @@ export interface UserInfo {
   attributes: Array<{
     value: string;
     verifiedBy: string;
+    temporary: boolean;
+    expiresAt?: number;
   }>;
 }
 
@@ -99,6 +101,7 @@ export interface Node {
   getCounter(name: string): number | undefined;
   getPNCounter(name: string): number | undefined;
   getRegister(name: string): number | undefined;
+  setRegister(name: string, value: number, nodeId?: string): void;
   setContains(name: string, element: string): boolean;
 
   // Direct counter operations (for setup/testing)

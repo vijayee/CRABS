@@ -183,7 +183,9 @@ uint32_t trigger_process_all(state_t* state, trigger_t* triggers, uint32_t trigg
     if (trigger->one_shot && trigger->last_triggered_at > 0) continue;
 
     // Evaluate condition
-    if (trigger->condition_ast == NULL) continue;
+    if (trigger->condition_ast == NULL) {
+      continue;
+    }
 
     bool condition_result = condition_evaluate(trigger->condition_ast, state);
     if (!condition_result) continue;

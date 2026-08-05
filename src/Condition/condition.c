@@ -861,14 +861,23 @@ int64_t condition_resolve_path(const state_t* state, const char* path) {
   if (state == NULL || path == NULL) return 0;
 
   data_item_t* item = _find_item_by_path(state, path);
-  if (item == NULL) return 0;
-  if (item->value == NULL) return 0;
+  if (item == NULL) {
+    return 0;
+  }
+  if (item->value == NULL) {
+    return 0;
+  }
 
   switch (item->crdt_type) {
-    case CRDT_G_COUNTER:
-      return g_counter_value((const g_counter_t*)item->value);
-    case CRDT_PN_COUNTER:
-      return pn_counter_value((const pn_counter_t*)item->value);
+    case CRDT_G_COUNTER: {
+      const g_counter_t* gc = (const g_counter_t*)item->value;
+      int64_t v = g_counter_value(gc);
+      return v;
+    }
+    case CRDT_PN_COUNTER: {
+      int64_t v = pn_counter_value((const pn_counter_t*)item->value);
+      return v;
+    }
     default:
       // Only counter/register types store an int64_t value; casting any
       // other CRDT's struct pointer to int64_t* is a type-confusion that

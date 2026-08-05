@@ -1,0 +1,13 @@
+{
+  "name": "crabs-video-platform",
+  "version": "0.1.0",
+  "description": "Example video platform using CRABS for attribute-based authorization, threshold-triggered decryption, and CRDT state",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "crabs-node": "file:../../bindings/node"
+  },
+  "license": "MIT"
+}

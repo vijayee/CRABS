@@ -211,11 +211,11 @@ public:
       type = info[0].As<Napi::String>().Utf8Value();
     op_ = operation_create(type.c_str());
     if (!op_) throw Napi::Error::New(info.Env(), "Failed to create operation");
-    // De-wonk: do NOT default to HLC here — node.sign() sets the ordering
-    // system based on the node's configuration. Defaulting to HLC would
-    // cause operations in Lamport-mode nodes to carry zero HLC fields,
-    // which is inconsistent (though not a bug — the signature still
-    // verifies). The default (0 = CRABS_ORDERING_LAMPORT) is correct.
+    // Generate a random UUID so the idempotency check in state_machine_execute
+    // doesn't treat this as a duplicate of a prior operation (all-zeros UUID
+    // would match any prior all-zeros UUID, causing the op to be silently
+    // skipped before trigger processing).
+    crypto_random_bytes(op_->uuid, CRABS_UUID_SIZE);
   }
 
   ~Operation() {
@@ -335,6 +335,7 @@ public:
       InstanceMethod("decrementPNCounter", &Node::DecrementPNCounter),
       InstanceMethod("getPNCounter", &Node::GetPNCounter),
       InstanceMethod("getRegister", &Node::GetRegister),
+      InstanceMethod("setRegister", &Node::SetRegister),
       InstanceMethod("setContains", &Node::SetContains),
       InstanceMethod("setAdd", &Node::SetAdd),
       InstanceMethod("setRemove", &Node::SetRemove),
@@ -503,7 +504,19 @@ private:
       Napi::Object a = Napi::Object::New(env);
       a.Set("value", Napi::String::New(env, user->attributes[i].value));
       a.Set("verifiedBy", Napi::String::New(env, user->attributes[i].verified_by));
+      a.Set("temporary", Napi::Boolean::New(env, false));
       attrs.Set(i, a);
+    }
+    // Also include temporary attributes (issued by threshold triggers)
+    temp_attr_list_t* temp = user->temp_attrs;
+    while (temp != NULL) {
+      Napi::Object a = Napi::Object::New(env);
+      a.Set("value", Napi::String::New(env, temp->name));
+      a.Set("verifiedBy", Napi::String::New(env, "trigger"));
+      a.Set("temporary", Napi::Boolean::New(env, true));
+      a.Set("expiresAt", Napi::Number::New(env, (double)temp->expires_at));
+      attrs.Set(attrs.Length(), a);
+      temp = temp->next;
     }
     obj.Set("attributes", attrs);
     return obj;
@@ -663,6 +676,33 @@ private:
     return env.Undefined();
   }
 
+  Napi::Value SetRegister(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 2)
+      throw Napi::TypeError::New(env, "Expected (name, value[, nodeId])");
+    std::string name = info[0].As<Napi::String>().Utf8Value();
+    int64_t value = (int64_t)info[1].As<Napi::Number>().Int64Value();
+    std::string node_id = info.Length() > 2 ? info[2].As<Napi::String>().Utf8Value() : "system";
+    data_item_t* item = state_find_item(&am_->base_state, name.c_str());
+    if (!item) throw crabs_error(env, CRABS_ERR_RESOURCE_NOT_FOUND, "setRegister");
+    if (item->crdt_type != CRDT_LWW_REG)
+      throw crabs_error(env, CRABS_ERR_TYPE_MISMATCH, "setRegister (not a register)");
+    lww_register_t* reg = (lww_register_t*)item->value;
+    if (!reg) throw crabs_error(env, CRABS_ERR_INTERNAL, "setRegister (null register)");
+    // Free old value and set new one
+    if (reg->value) free(reg->value);
+    reg->value = (uint8_t*)malloc(sizeof(int64_t));
+    if (!reg->value) throw crabs_error(env, CRABS_ERR_OOM, "setRegister");
+    memcpy(reg->value, &value, sizeof(int64_t));
+    reg->value_size = sizeof(int64_t);
+    // Update timestamp: use HLC if available, else a monotonic counter
+    reg->timestamp = am_->base_state.version + 1;
+    strncpy(reg->node_id, node_id.c_str(), CRABS_MAX_USER_ID - 1);
+    reg->node_id[CRABS_MAX_USER_ID - 1] = '\0';
+    am_->base_state.version++;
+    return env.Undefined();
+  }
+
   Napi::Value SetContains(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
     std::string name = info[0].As<Napi::String>().Utf8Value();
@@ -806,7 +846,17 @@ private:
     // Build the operation payload for __create_trigger__
     std::string trigger_id = cfg.Get("triggerId").As<Napi::String>().Utf8Value();
     std::string condition = cfg.Get("condition").As<Napi::String>().Utf8Value();
-    std::string effect_type = cfg.Get("effectType").As<Napi::String>().Utf8Value();
+    std::string effect_type_str = cfg.Get("effectType").As<Napi::String>().Utf8Value();
+    // Map string effect type to the numeric enum value (trigger_effect_type_e
+    // in trigger.h: ISSUE_ATTRIBUTE=0x01, CREATE_TRIGGER=0x02, etc.)
+    int effect_type_num = 0;
+    if (effect_type_str == "issue_attribute") effect_type_num = 1;   // TRIGGER_EFFECT_ISSUE_ATTRIBUTE
+    else if (effect_type_str == "create_trigger") effect_type_num = 2;
+    else if (effect_type_str == "delete_trigger") effect_type_num = 3;
+    else if (effect_type_str == "disable_trigger") effect_type_num = 4;
+    else if (effect_type_str == "change_policy") effect_type_num = 5;
+    else throw Napi::Error::New(env, "Unknown effectType: " + effect_type_str);
+
     std::string description = cfg.Has("description") ? cfg.Get("description").As<Napi::String>().Utf8Value() : "";
     uint64_t cooldown = cfg.Has("cooldownMs") ? (uint64_t)cfg.Get("cooldownMs").As<Napi::Number>().DoubleValue() : 0;
     bool one_shot = cfg.Has("oneShot") ? cfg.Get("oneShot").As<Napi::Boolean>().Value() : false;
@@ -814,12 +864,12 @@ private:
     // Build payload string
     char payload[4096];
     int pos = snprintf(payload, sizeof(payload),
-      "trigger_id=%s;condition=%s;description=%s;effect_type=%s;cooldown_ms=%llu;one_shot=%d",
+      "trigger_id=%s;condition=%s;description=%s;effect_type=%d;cooldown_ms=%llu;one_shot=%d",
       trigger_id.c_str(), condition.c_str(), description.c_str(),
-      effect_type.c_str(), (unsigned long long)cooldown, one_shot ? 1 : 0);
+      effect_type_num, (unsigned long long)cooldown, one_shot ? 1 : 0);
 
     // Add effect-specific fields
-    if (effect_type == "issue_attribute") {
+    if (effect_type_str == "issue_attribute") {
       std::string attr = cfg.Get("issueAttribute").As<Napi::String>().Utf8Value();
       std::string role = cfg.Get("targetRole").As<Napi::String>().Utf8Value();
       std::string value = cfg.Get("attributeValue").As<Napi::String>().Utf8Value();
