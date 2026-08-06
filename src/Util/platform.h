@@ -69,6 +69,28 @@ static inline int platform_cond_wait(platform_cond_t* c, platform_mutex_t* m) {
   return SleepConditionVariableCS(c, m, INFINITE) ? 0 : 1;
 }
 
+#elif defined(__EMSCRIPTEN__)
+
+// WASM is single-threaded by default (no pthreads without -pthread flag +
+// SharedArrayBuffer). Mutexes and condition variables are no-ops. This is
+// safe because the CRABS state machine is not accessed from multiple threads
+// in a single-threaded WASM context.
+typedef int platform_mutex_t;
+typedef int platform_cond_t;
+typedef int platform_thread_t;
+
+static inline void platform_mutex_init(platform_mutex_t* m)   { (void)m; }
+static inline void platform_mutex_destroy(platform_mutex_t* m) { (void)m; }
+static inline void platform_mutex_lock(platform_mutex_t* m)    { (void)m; }
+static inline void platform_mutex_unlock(platform_mutex_t* m)  { (void)m; }
+static inline void platform_cond_init(platform_cond_t* c)      { (void)c; }
+static inline void platform_cond_destroy(platform_cond_t* c)   { (void)c; }
+static inline void platform_cond_signal(platform_cond_t* c)    { (void)c; }
+static inline void platform_cond_broadcast(platform_cond_t* c) { (void)c; }
+static inline int platform_cond_wait(platform_cond_t* c, platform_mutex_t* m) {
+  (void)c; (void)m; return 0;
+}
+
 #else // POSIX
 
 #include <pthread.h>

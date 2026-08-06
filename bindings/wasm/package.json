@@ -1,0 +1,30 @@
+{
+  "name": "crabs-wasm",
+  "version": "0.1.0",
+  "description": "WebAssembly bindings for the CRABS cryptographic attribute-based state machine library — runs in any browser, Node.js, edge worker, or standalone WASM runtime",
+  "main": "index.js",
+  "types": "index.d.ts",
+  "scripts": {
+    "build": "cd ../.. && OPENSSL_SRC=/tmp/openssl-3.4.0 bash build_wasm.sh",
+    "test": "node test/test.js"
+  },
+  "files": [
+    "src/",
+    "index.js",
+    "index.d.ts",
+    "README.md"
+  ],
+  "keywords": [
+    "crabs",
+    "wasm",
+    "webassembly",
+    "abe",
+    "attribute-based-encryption",
+    "crdt",
+    "ot",
+    "cryptographic",
+    "browser",
+    "isomorphic"
+  ],
+  "license": "MIT"
+}

@@ -26,7 +26,7 @@ for (const p of possiblePaths) {
     nativeModule = require(p);
     break;
   }
-}
+}so
 
 if (!nativeModule) {
   // Fall back to the bindings package if available

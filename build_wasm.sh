@@ -1,0 +1,149 @@
+#!/bin/bash
+#
+# build_wasm.sh — Cross-compile CRABS to WebAssembly.
+#
+# Links against the WASM-built RELIC and OpenABE static libraries from
+# the openabe-to-c project. Produces crabs.wasm + crabs.js.
+#
+# Usage:
+#   source /home/victor/emsdk/emsdk_env.sh
+#   ./build_wasm.sh
+#
+set -e
+
+ROOT_DIR="$(cd "$(dirname "$0")" && pwd)"
+OPENABE_DIR="${OPENABE_DIR:-/home/victor/Workspace/src/github.com/vijayee/openabe-to-c/openabe-c}"
+RELIC_WASM="$OPENABE_DIR/deps/relic/build-wasm"
+OPENABE_WASM="$OPENABE_DIR/build-wasm"
+OPENSSL_SRC="${OPENSSL_SRC:-/tmp/openssl-3.4.0}"
+OPENSSL_WASM_LIB="$OPENSSL_SRC"
+BUILD_DIR="$ROOT_DIR/build-wasm"
+
+echo "=== CRABS WASM Build ==="
+echo "  Root: $ROOT_DIR"
+echo "  OpenABE: $OPENABE_DIR"
+echo ""
+
+# Verify dependencies exist
+if [ ! -f "$RELIC_WASM/lib/librelic_s.a" ]; then
+  echo "ERROR: RELIC WASM build not found at $RELIC_WASM/lib/librelic_s.a"
+  echo "Run the openabe-to-c build_wasm.sh first."
+  exit 1
+fi
+if [ ! -f "$OPENABE_WASM/liboabe_c_wasm.a" ]; then
+  echo "ERROR: OpenABE WASM build not found at $OPENABE_WASM/liboabe_c_wasm.a"
+  echo "Run the openabe-to-c build_wasm.sh first."
+  exit 1
+fi
+
+rm -rf "$BUILD_DIR"
+mkdir -p "$BUILD_DIR"
+cd "$BUILD_DIR"
+
+# Collect all CRABS C source files
+CRABS_SRCS=$(find "$ROOT_DIR/src" -name '*.c' | sort)
+
+# Include paths — use OpenSSL source headers (architecture-correct for WASM)
+INCLUDES="-I$ROOT_DIR/src -I$OPENABE_DIR/include -I$RELIC_WASM/include -I$OPENABE_DIR/deps/relic/include -I$OPENSSL_SRC/include"
+
+# Compile flags
+CFLAGS="-std=c11 -O2 -DWITH_RELIC -DBP_WITH_OPENSSL -D_POSIX_C_SOURCE=200809L -include strings.h -D__GLIBC_PREREQ\(x,y\)=0 -fPIC"
+
+# Key functions to export for the JavaScript API
+EXPORTED_FUNCTIONS='[
+  "_crypto_ecdsa_generate",
+  "_crypto_ecdsa_sign",
+  "_crypto_ecdsa_verify",
+  "_crypto_ecdsa_keypair_destroy",
+  "_crypto_ecdsa_derive_public_key",
+  "_crypto_ecdsa_validate_public_key",
+  "_crypto_sha256",
+  "_crypto_random_bytes",
+  "_crypto_abe_setup",
+  "_crypto_abe_master_key_destroy",
+  "_crypto_abe_keygen",
+  "_crypto_abe_user_key_destroy",
+  "_crypto_abe_encrypt",
+  "_crypto_abe_decrypt",
+  "_crypto_abe_ciphertext_destroy",
+  "_crypto_abe_ciphertext_get_policy",
+  "_crypto_abe_ciphertext_get_data",
+  "_crypto_abe_user_key_serialize",
+  "_crypto_abe_user_key_deserialize",
+  "_crypto_sign_operation",
+  "_crypto_verify_operation",
+  "_crypto_key_envelope_create",
+  "_crypto_key_envelope_destroy",
+  "_crypto_key_envelope_verify",
+  "_crypto_key_envelope_serialize",
+  "_crypto_key_envelope_deserialize",
+  "_crypto_key_envelope_decrypt_sk",
+  "_crypto_compute_attributes_hash",
+  "_crypto_revoke_and_rotate",
+  "_crypto_recovery_result_destroy",
+  "_attribute_machine_create",
+  "_attribute_machine_destroy",
+  "_attribute_machine_register_user",
+  "_attribute_machine_grant_role",
+  "_attribute_machine_self_assert",
+  "_attribute_machine_verify_identity",
+  "_attribute_machine_revoke_role",
+  "_attribute_machine_suspend_user",
+  "_attribute_machine_revoke_user",
+  "_attribute_machine_find_user",
+  "_attribute_machine_user_has_role",
+  "_attribute_machine_set_time",
+  "_attribute_machine_prune_expired_temporary",
+  "_attribute_machine_issue_temporary",
+  "_state_create",
+  "_state_destroy",
+  "_state_add_item",
+  "_state_find_item",
+  "_state_add_policy",
+  "_state_find_policy",
+  "_state_set_node_key",
+  "_state_machine_execute",
+  "_operation_create",
+  "_operation_destroy",
+  "_crabs_serialize_for_signing",
+  "_crabs_serialize_state",
+  "_serialized_buffer_destroy",
+  "_malloc",
+  "_free"
+]'
+
+echo "Compiling CRABS sources..."
+OBJECTS=""
+for src in $CRABS_SRCS; do
+  obj="$BUILD_DIR/$(basename ${src%.c}).o"
+  echo "  CC  $(basename $src)"
+  emcc $CFLAGS $INCLUDES -c "$src" -o "$obj" 2>&1
+  OBJECTS="$OBJECTS $obj"
+done
+
+echo ""
+echo "Linking WASM module..."
+emcc $CFLAGS \
+  $OBJECTS \
+  "$OPENABE_WASM/liboabe_c_wasm.a" \
+  "$RELIC_WASM/lib/librelic_s.a" \
+  "$OPENSSL_WASM_LIB/libcrypto.a" \
+  "$OPENSSL_WASM_LIB/libssl.a" \
+  -o "$BUILD_DIR/crabs.js" \
+  -s WASM=1 \
+  -s MODULARIZE=1 \
+  -s EXPORT_NAME=createCRABSModule \
+  -s ALLOW_TABLE_GROWTH=1 \
+  -s ALLOW_MEMORY_GROWTH=1 \
+  -s INITIAL_MEMORY=64MB \
+  -s EXPORTED_FUNCTIONS="$EXPORTED_FUNCTIONS" \
+  -s EXPORTED_RUNTIME_METHODS='["ccall","cwrap","getValue","setValue","UTF8ToString","stringToUTF8","lengthBytesUTF8","addFunction","removeFunction","HEAP8","HEAPU8","HEAP16","HEAPU16","HEAP32","HEAPU32","HEAPF32","HEAPF64"]' \
+  -O2 \
+  2>&1
+
+echo ""
+echo "=== CRABS WASM Build Complete ==="
+ls -lh "$BUILD_DIR/crabs.wasm" "$BUILD_DIR/crabs.js" 2>/dev/null
+echo ""
+echo "  WASM: $BUILD_DIR/crabs.wasm"
+echo "  JS:   $BUILD_DIR/crabs.js"

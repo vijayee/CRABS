@@ -36,6 +36,12 @@ static void _ensure_registry_lock(void) {
   platform_mutex_init(&_registry_lock);
   _registry_lock_initialized = true;
 }
+#elif defined(__EMSCRIPTEN__)
+// WASM: single-threaded, no-op mutex. No initialization needed.
+static platform_mutex_t _registry_lock;
+static void _ensure_registry_lock(void) {
+  // No-op: WASM mutexes are no-ops (single-threaded).
+}
 #else
 // POSIX: static initialization eliminates the race entirely.
 static platform_mutex_t _registry_lock = PTHREAD_MUTEX_INITIALIZER;

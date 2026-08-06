@@ -29,12 +29,22 @@
 // "simulated" ABE whose decryption key was derivable from public material.
 static atomic_int _oabe_init_state = 0; // 0=uninit, 1=ready
 static void _ensure_oabe_init(void) {
+#ifdef __EMSCRIPTEN__
+  // WASM is single-threaded — C11 atomics may not be available without
+  // the -pthread flag. Use a simple flag instead.
+  if (_oabe_init_state == 0) {
+    if (oabe_init() == OABE_SUCCESS) {
+      _oabe_init_state = 1;
+    }
+  }
+#else
   int expected = 0;
   if (atomic_compare_exchange_strong(&_oabe_init_state, &expected, 1)) {
     if (oabe_init() != OABE_SUCCESS) {
       atomic_store(&_oabe_init_state, 0);
     }
   }
+#endif
 }
 
 // Internal struct definitions for the opaque ABE types.

@@ -28,7 +28,7 @@ const { Node, KeyPair, Operation } = require('crabs-node');
 // ============================================================
 // Configuration
 // ============================================================
-const PORT = 3000;
+const PORT = 5673;
 const FLAG_THRESHOLD = 3;        // flags needed to trigger contact info decryption
 const CONTACT_INFO = JSON.stringify({
   owner: 'video_creator@example.com',
