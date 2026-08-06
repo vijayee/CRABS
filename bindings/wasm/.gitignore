@@ -1,4 +1,3 @@
 node_modules/
 build-wasm/
-*.wasm
 *.js.map

@@ -9,7 +9,8 @@
     "test": "node test/test.js"
   },
   "files": [
-    "src/",
+    "crabs.wasm",
+    "crabs.js",
     "index.js",
     "index.d.ts",
     "README.md"

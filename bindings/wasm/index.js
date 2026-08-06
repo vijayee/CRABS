@@ -20,11 +20,11 @@
 const path = require('path');
 const fs = require('fs');
 
-// Locate the built WASM module
+// Locate the WASM module — the pre-built crabs.js + crabs.wasm ship with
+// the package, so no compilation is needed. Just `npm install crabs-wasm`.
 const wasmPaths = [
-  path.join(__dirname, '..', '..', 'build-wasm', 'crabs.js'),
-  path.join(__dirname, 'build-wasm', 'crabs.js'),
-  path.join(__dirname, 'crabs.js'),
+  path.join(__dirname, 'crabs.js'),                           // packaged (default)
+  path.join(__dirname, '..', '..', 'build-wasm', 'crabs.js'), // dev build
 ];
 
 let wasmModulePath = null;

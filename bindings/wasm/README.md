@@ -7,18 +7,20 @@ Runs in **any environment with a WASM runtime**: browsers, Node.js, Deno, Bun, C
 ## Installation
 
 ```bash
-# From the CRABS repository root:
-cd bindings/wasm
-npm run build   # compiles crabs.wasm + crabs.js via Emscripten
+npm install crabs-wasm
 ```
 
-### Prerequisites
+That's it — the pre-built `crabs.wasm` (1.7MB) ships with the package. No compilation needed. The same binary works in every environment.
 
-- **Emscripten SDK** (`emcc` 6.0+)
-- **OpenSSL source** (cross-compiled to WASM)
-- **OpenABE-c** (the `openabe-to-c/openabe-c` project with `build_wasm.sh`)
+### Rebuilding from source (optional)
 
-See `../../build_wasm.sh` for the full build process.
+If you need to rebuild the WASM module from source:
+
+```bash
+# Prerequisites: Emscripten SDK, OpenSSL source, openabe-to-c project
+cd bindings/wasm
+npm run build   # runs ../../build_wasm.sh
+```
 
 ## Quick Start
 
