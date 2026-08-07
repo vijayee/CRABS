@@ -100,6 +100,7 @@ export interface Node {
 
   setTime(nowMs: number): void;
   pruneExpiredTempAttrs(): number;
+  evaluateTriggers(): void;
   destroy(): void;
 }
 

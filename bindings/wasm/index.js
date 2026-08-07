@@ -572,6 +572,27 @@ class Node {
   setTime(nowMs) { this._M._crabs_wasm_set_time(this._am, BigInt(nowMs)); }
   pruneExpiredTempAttrs() { return this._M._crabs_wasm_prune_expired_temp_attrs(this._am); }
 
+  evaluateTriggers() {
+    const M = this._M;
+    const typePtr = writeString(M, 'noop');
+    const signerPtr = writeString(M, 'admin');
+    const nodePtr = writeString(M, 'admin');
+    const opPtr = M._operation_create(typePtr);
+    M._crabs_wasm_op_init_uuid(opPtr);
+    M._crabs_wasm_op_set_signer(opPtr, signerPtr);
+    M._crabs_wasm_op_set_node(opPtr, nodePtr);
+    freeAll(M, typePtr, signerPtr, nodePtr);
+    if (!opPtr) throw new Error('evaluateTriggers: operation_create failed');
+    const rcSign = M._crabs_wasm_sign_with_node_key(this._am, opPtr);
+    if (rcSign !== 0) {
+      M._operation_destroy(opPtr);
+      throw crabsError(rcSign, 'evaluateTriggers sign');
+    }
+    const rcExec = M._crabs_wasm_execute(this._am, opPtr);
+    M._operation_destroy(opPtr);
+    wrapRc(rcExec, 'evaluateTriggers execute');
+  }
+
   destroy() {
     if (this._am) { this._M._crabs_wasm_node_destroy(this._am); this._am = null; }
   }
