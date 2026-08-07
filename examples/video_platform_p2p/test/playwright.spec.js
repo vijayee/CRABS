@@ -179,7 +179,7 @@ test('debug drawer shows current user and CRABS video state', async ({ page }) =
   const body = page.locator('#debugBody');
   await expect(body).toContainText('alice');
   await expect(body).toContainText('Penguins in their natural habitat');
-  await expect(body).toContainText('Threshold0/3');
+  await expect(body).toContainText(/Threshold.*0\/3/);
 
   await page.locator('#debugClose').click();
   await expect(page.locator('#debugDrawer')).toHaveClass(/hidden/);
