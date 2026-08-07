@@ -1,0 +1,6 @@
+node_modules/
+public/client_bundle.js
+public/crabs.js
+public/crabs.wasm
+public/penguin.mp4
+package-lock.json
