@@ -12,7 +12,8 @@ const http = require('http');
 const fs = require('fs');
 const path = require('path');
 const { WebSocketServer } = require('ws');
-const { Node, KeyPair } = require('crabs-node');
+const { Node, KeyPair, Operation } = require('crabs-node');
+const { MOD1_PRIVATE_KEY } = require('./demo_keys');
 
 const PORT = 5674;
 const FLAG_THRESHOLD = 3;
@@ -35,14 +36,18 @@ const MIME = {
 // ============================================================
 const node = new Node('admin', { ordering: 'hlc' });
 
-// Demo moderator account used for attribute check.
-const modKey = KeyPair.generate();
-node.registerUser('mod1', modKey.publicKeyHex(), 'role:member|clearance:moderator|adult');
+// Demo moderator account used for the ABE contact gate.
+const modKey = KeyPair.fromPrivateHex(MOD1_PRIVATE_KEY);
+const mod1UserId = modKey.publicKeyHex().slice(0, 63);
+node.registerUser(mod1UserId, modKey.publicKeyHex(), 'role:member|clearance:moderator|adult');
 
 node.addCounter('flag_count');
+node.addOneShotSet('flaggers');
 node.setPolicy('__create_trigger__', 'role:admin');
 node.setPolicy('__change_config__', 'role:admin');
 node.setPolicy('__define_operation__', 'role:admin');
+node.setPolicy('noop', 'role:admin');
+
 node.createTrigger({
   triggerId: 'tos_threshold',
   condition: `flag_count >= ${FLAG_THRESHOLD}`,
@@ -56,8 +61,25 @@ node.createTrigger({
   cooldownMs: 60000
 });
 
+const nodeKey = node.getNodeKey();
+
 const encryptedContact = node.encrypt(Buffer.from(CONTACT_INFO), 'tos_investigator');
 console.log('ABE contact info encrypted');
+
+// Trigger evaluation only runs inside state_machine_execute. We use a signed
+// admin "noop" operation as a safe way to re-evaluate triggers after direct
+// state changes such as flag_event handling.
+function evaluateTriggers() {
+  try {
+    const op = new Operation('noop');
+    op.signerId = 'admin';
+    op.nodeId = 'admin';
+    node.sign(op, nodeKey.privateKeyHex);
+    node.execute(op);
+  } catch (e) {
+    console.warn('Trigger evaluation failed:', e.message);
+  }
+}
 
 // ============================================================
 // Static HTTP server
@@ -155,9 +177,10 @@ wss.on('connection', ws => {
           node.incrementCounter('flag_count', 1, msg.userId);
           node.setTime(Date.now());
           node.pruneExpiredTempAttrs();
+          evaluateTriggers();
         }
       } catch (e) {
-        // Ignore duplicate-flag errors.
+        // Ignore duplicate-flag errors and relay side effects.
       }
     }
 

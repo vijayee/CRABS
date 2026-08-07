@@ -5,7 +5,7 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "build:client": "esbuild client.js --bundle --outfile=public/client_bundle.js --format=iife --global-name=CRABSClient --platform=browser && cp ../../bindings/wasm/crabs.js public/crabs.js && cp ../../bindings/wasm/crabs.wasm public/crabs.wasm",
+    "build:client": "esbuild client.js --bundle --outfile=public/client_bundle.js --format=iife --global-name=CRABSClient --platform=browser --external:path --external:fs && cp ../../bindings/wasm/crabs.js public/crabs.js && cp ../../bindings/wasm/crabs.wasm public/crabs.wasm",
     "prestart": "npm run build:client"
   },
   "dependencies": {
@@ -16,9 +16,5 @@
   "devDependencies": {
     "esbuild": "^0.23.0"
   },
-  "license": "MIT",
-  "allowScripts": {
-    "esbuild@0.23.1": true,
-    "file:../../../bindings/node": true
-  }
+  "license": "MIT"
 }
