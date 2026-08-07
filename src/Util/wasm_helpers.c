@@ -144,8 +144,12 @@ crabs_error_e crabs_wasm_sign_operation(attribute_machine_t* am, operation_t* op
   if (!am || !op || !private_key) return CRABS_ERR_INVALID_PARAM;
 
   if (am->base_state.hlc_state_initialized) {
-    op->ordering_system = CRABS_ORDERING_HLC;
+    // The operation wire format does not preserve HLC fields, so sign using
+    // Lamport ordering. The HLC state is still advanced for local ordering.
     op->hlc = crabs_hlc_next(&am->base_state.hlc_state);
+    op->lamport_time = ((uint64_t)op->hlc.physical_seconds * 1000000000ULL +
+                        op->hlc.physical_nanos) * 1000ULL +
+                       op->hlc.logical_counter;
     strncpy(op->node_id, am->base_state.hlc_state.last.node_id, CRABS_MAX_USER_ID - 1);
     op->node_id[CRABS_MAX_USER_ID - 1] = '\0';
   }
