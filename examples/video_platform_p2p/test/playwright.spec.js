@@ -53,10 +53,8 @@ test.afterAll(() => {
 
 async function setupConsoleCapture(page) {
   page.on('console', (msg) => {
-    if (msg.type() === 'error') {
-      // eslint-disable-next-line no-console
-      console.error(`[browser ${page.url()}]`, msg.text());
-    }
+    // eslint-disable-next-line no-console
+    console.log(`[browser ${page.url()} ${msg.type()}]`, msg.text());
   });
   page.on('pageerror', (err) => {
     // eslint-disable-next-line no-console
@@ -67,6 +65,8 @@ async function setupConsoleCapture(page) {
 async function login(page, name, age) {
   await setupConsoleCapture(page);
   await page.goto(BASE_URL);
+  // Wait for the WASM loading screen to disappear before interacting.
+  await page.locator('#loadingScreen').waitFor({ state: 'hidden', timeout: 30000 });
   // Wait for the WASM bundle to load and present the auth screen.
   await expect(page.locator('#authScreen')).not.toHaveClass(/hidden/);
   await page.locator('#authName').fill(name);
@@ -100,6 +100,24 @@ test('adult users can like and comment, and changes propagate across tabs', asyn
     await expect(alice.locator('.comment .text')).toHaveText('Hello from Alice');
 
     await bob.locator('.comment .text').filter({ hasText: 'Hello from Alice' }).waitFor({ timeout: 10000 });
+
+    // Subscription is per-user: Alice subscribing only changes Alice's UI.
+    await alice.locator('#subscribeBtn').click();
+    await expect(alice.locator('#subscribeBtn')).toHaveText('Subscribed');
+    await expect(alice.locator('#subscribeBtn')).toHaveAttribute('class', /active/);
+    await expect(bob.locator('#subscribeBtn')).toHaveText('Subscribe');
+
+    // Bob subscribing changes Bob's UI and leaves Alice's unchanged.
+    await bob.locator('#subscribeBtn').click();
+    await expect(bob.locator('#subscribeBtn')).toHaveText('Subscribed');
+    await expect(bob.locator('#subscribeBtn')).toHaveAttribute('class', /active/);
+    await expect(alice.locator('#subscribeBtn')).toHaveText('Subscribed');
+
+    // Unsubscribe is also per-user.
+    await alice.locator('#subscribeBtn').click();
+    await expect(alice.locator('#subscribeBtn')).toHaveText('Subscribe');
+    await expect(alice.locator('#subscribeBtn')).not.toHaveAttribute('class', /active/);
+    await expect(bob.locator('#subscribeBtn')).toHaveText('Subscribed');
   } finally {
     await alice.close();
     await bob.close();
@@ -150,4 +168,19 @@ test('three flags unlock contact info for the moderator', async ({ browser }) =>
     await bob.close();
     await mod.close();
   }
+});
+
+test('debug drawer shows current user and CRABS video state', async ({ page }) => {
+  await login(page, 'alice', 25);
+
+  await page.locator('#debugBtn').click();
+  await expect(page.locator('#debugDrawer')).not.toHaveClass(/hidden/);
+
+  const body = page.locator('#debugBody');
+  await expect(body).toContainText('alice');
+  await expect(body).toContainText('Penguins in their natural habitat');
+  await expect(body).toContainText('Threshold0/3');
+
+  await page.locator('#debugClose').click();
+  await expect(page.locator('#debugDrawer')).toHaveClass(/hidden/);
 });
