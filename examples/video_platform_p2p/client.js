@@ -39,10 +39,14 @@ const commentsStore = [];
 function setLoading(isLoading) {
   const loading = document.getElementById('loadingScreen');
   const main = document.getElementById('mainContent');
+  const errEl = document.getElementById('loadingError');
+  const reloadBtn = document.getElementById('reloadBtn');
   if (!loading || !main) return;
   if (isLoading) {
     loading.classList.remove('hidden');
     main.classList.add('hidden');
+    if (errEl) errEl.classList.add('hidden');
+    if (reloadBtn) reloadBtn.classList.add('hidden');
   } else {
     loading.classList.add('hidden');
     main.classList.remove('hidden');
