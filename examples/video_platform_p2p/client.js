@@ -17,6 +17,7 @@ let currentUser = null;
 let ws = null;
 let viewRecorded = false;
 let reconnectTimer = null;
+let videoEl = null;
 
 // Demo accounts are pre-seeded so any tab can log in as them.
 const DEMO_ACCOUNTS = [
@@ -83,6 +84,7 @@ async function init() {
     initStateMachine();
     connectWebSocket();
     bindAuth();
+    bindDebugDrawer();
     setLoading(false);
   } catch (e) {
     console.error('CRABS init failed', e);
@@ -263,6 +265,30 @@ function bindAuth() {
   document.getElementById('registerBtn').addEventListener('click', () => doAuth(true));
 }
 
+function bindDebugDrawer() {
+  const btn = document.getElementById('debugBtn');
+  const close = document.getElementById('debugClose');
+  const backdrop = document.getElementById('debugBackdrop');
+  if (btn) btn.addEventListener('click', openDebugDrawer);
+  if (close) close.addEventListener('click', closeDebugDrawer);
+  if (backdrop) backdrop.addEventListener('click', closeDebugDrawer);
+}
+
+function openDebugDrawer() {
+  document.getElementById('debugBackdrop')?.classList.remove('hidden');
+  document.getElementById('debugDrawer')?.classList.remove('hidden');
+  renderDebugDrawer();
+}
+
+function closeDebugDrawer() {
+  document.getElementById('debugBackdrop')?.classList.add('hidden');
+  document.getElementById('debugDrawer')?.classList.add('hidden');
+}
+
+function isDebugDrawerOpen() {
+  return !document.getElementById('debugDrawer')?.classList.contains('hidden');
+}
+
 async function doAuth(isRegister) {
   const name = document.getElementById('authName').value.trim();
   const ageStr = document.getElementById('authAge').value.trim();
@@ -339,6 +365,9 @@ function broadcastRegister(user) {
 function showPlayer() {
   document.getElementById('authScreen').classList.add('hidden');
   document.getElementById('playerScreen').classList.remove('hidden');
+
+  videoEl = document.getElementById('videoPlayer');
+  document.getElementById('debugBtn')?.classList.remove('hidden');
 
   const video = document.getElementById('videoPlayer');
   const underage = currentUser.age < 13;
@@ -570,6 +599,112 @@ function applyCommentPayload(payloadBuf) {
 // UI refresh
 // ============================================================
 
+function renderDebugDrawer() {
+  if (!isDebugDrawerOpen()) return;
+  const body = document.getElementById('debugBody');
+  if (!body) return;
+  if (!node) {
+    body.innerHTML = '<p class="drawer-placeholder">Loading CRABS state…</p>';
+    return;
+  }
+
+  const sections = [];
+
+  let userHtml = '';
+  if (!currentUser) {
+    userHtml = '<p class="drawer-placeholder">Not logged in</p>';
+  } else {
+    const u = safeGet(() => node.getUser(currentUser.userId));
+    const attrs = u?.attributes?.map(a => a.value).join(', ') || 'none';
+    const subscribed = safeGet(() => node.setContains('subscribers', currentUser.userId), false);
+    const flagged = safeGet(() => node.setContains('flaggers', currentUser.userId), false);
+    userHtml = `
+      <div class="drawer-section">
+        <h3>Current User</h3>
+        <dl class="drawer-dl">
+          <dt>Name</dt><dd>${escapeHtml(currentUser.name)}</dd>
+          <dt>Age</dt><dd>${currentUser.age}</dd>
+          <dt>User ID</dt><dd>${escapeHtml(currentUser.userId)}</dd>
+          <dt>Roles</dt><dd>${currentUser.age >= 13 ? 'adult' : 'underage'}${currentUser.name === 'mod1' ? ', moderator' : ''}</dd>
+          <dt>Attributes</dt><dd>${escapeHtml(attrs)}</dd>
+          <dt>Subscribed</dt><dd>${subscribed ? 'yes' : 'no'}</dd>
+          <dt>Flagged</dt><dd>${flagged ? 'yes' : 'no'}</dd>
+        </dl>
+      </div>
+    `;
+  }
+  sections.push(userHtml);
+
+  const video = videoEl || document.getElementById('videoPlayer');
+  const playing = video ? !video.paused : false;
+  const currentTime = video ? formatTime(video.currentTime || 0) : '0:00';
+  const duration = video ? formatTime(video.duration || 0) : '0:00';
+  const views = safeGet(() => node.getCounter('views'), 0);
+  const ageGate = !document.getElementById('ageGate')?.classList.contains('hidden');
+  sections.push(`
+    <div class="drawer-section">
+      <h3>Video State</h3>
+      <dl class="drawer-dl">
+        <dt>Title</dt><dd>Penguins in their natural habitat</dd>
+        <dt>Playback</dt><dd>${playing ? 'playing' : 'paused'}</dd>
+        <dt>Current time</dt><dd>${currentTime} / ${duration}</dd>
+        <dt>Views</dt><dd>${views}</dd>
+        <dt>Age gate visible</dt><dd>${ageGate ? 'yes' : 'no'}</dd>
+      </dl>
+    </div>
+  `);
+
+  const likes = safeGet(() => node.getPNCounter('likes'), 0);
+  const dislikes = Math.max(0, -likes);
+  const flagCount = safeGet(() => node.getCounter('flag_count'), 0);
+  const flags = safeGet(() => knownSetMembers('flaggers'), []);
+  const subscribers = safeGet(() => knownSetMembers('subscribers'), []);
+  const comments = commentsStore.slice(0, 10);
+  const triggered = flagCount >= FLAG_THRESHOLD;
+  sections.push(`
+    <div class="drawer-section">
+      <h3>CRABS State</h3>
+      <dl class="drawer-dl">
+        <dt>Likes</dt><dd>${Math.max(0, likes)}</dd>
+        <dt>Dislikes</dt><dd>${dislikes}</dd>
+        <dt>Flag count</dt><dd>${flagCount}</dd>
+        <dt>Threshold</dt><dd>${triggered ? 'reached' : `${flagCount}/${FLAG_THRESHOLD}`}</dd>
+        <dt>Flaggers</dt><dd>${flags.length ? '<ul><li>' + flags.map(escapeHtml).join('</li><li>') + '</li></ul>' : 'none'}</dd>
+        <dt>Subscribers</dt><dd>${subscribers.length ? '<ul><li>' + subscribers.map(escapeHtml).join('</li><li>') + '</li></ul>' : 'none'}</dd>
+        <dt>Comments</dt><dd>${comments.length}
+          ${comments.length ? '<ul><li>' + comments.map(c => escapeHtml(`${c.user}: ${c.text}`)).join('</li><li>') + '</li></ul>' : ''}
+        </dd>
+      </dl>
+    </div>
+  `);
+
+  body.innerHTML = sections.join('');
+}
+
+function safeGet(fn, fallback = 'unavailable') {
+  try { return fn(); } catch (e) { return fallback; }
+}
+
+function knownSetMembers(setName) {
+  const found = [];
+  for (const demo of DEMO_ACCOUNTS) {
+    const u = localUsers.get(demo.name);
+    if (!u) continue;
+    try {
+      if (node.setContains(setName, u.userId)) found.push(demo.name);
+    } catch (e) { /* ignore */ }
+  }
+  return found;
+}
+
+function formatTime(seconds) {
+  const s = Math.floor(seconds % 60);
+  const m = Math.floor(seconds / 60);
+  const h = Math.floor(m / 60);
+  if (h > 0) return `${h}:${String(m % 60).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
+  return `${m}:${String(s).padStart(2, '0')}`;
+}
+
 function refreshUI() {
   const views = node.getCounter('views') || 0;
   const likes = node.getPNCounter('likes') || 0;
@@ -606,6 +741,7 @@ function refreshUI() {
   }
 
   renderComments();
+  renderDebugDrawer();
 }
 
 function renderComments() {
