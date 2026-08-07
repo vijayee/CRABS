@@ -1,0 +1,90 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>CRABS P2P Video Platform</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div id="app">
+    <header class="topbar">
+      <h1>CRABS P2P Video</h1>
+      <span id="connectionStatus" class="status">Connecting...</span>
+    </header>
+
+    <main>
+      <section id="authScreen" class="auth-screen">
+        <div class="auth-card">
+          <h2>Join the stream</h2>
+          <label>
+            Name
+            <input id="authName" type="text" placeholder="alice" autocomplete="off">
+          </label>
+          <label>
+            Age
+            <input id="authAge" type="number" min="1" max="120" placeholder="25">
+          </label>
+          <label>
+            Password (demo only, ignored)
+            <input id="authPassword" type="password" placeholder="ignored">
+          </label>
+          <div class="auth-actions">
+            <button id="loginBtn">Login / Join</button>
+            <button id="registerBtn" class="secondary">Register new user</button>
+          </div>
+          <p class="hint">Demo accounts: alice (25), bob (30), carol (10), mod1 (40)</p>
+          <div id="authError" class="error"></div>
+        </div>
+      </section>
+
+      <section id="playerScreen" class="player-screen hidden">
+        <div class="video-card">
+          <div id="ageGate" class="age-gate hidden">
+            <p>This content is not available to users under 12.</p>
+          </div>
+          <video id="videoPlayer" src="/penguin.mp4" controls preload="metadata"></video>
+          <div class="video-meta">
+            <h2>Penguins in their natural habitat</h2>
+            <div class="meta-row">
+              <span id="viewCount">0 views</span>
+              <span id="triggerStatus" class="trigger-badge">Flag threshold: 0/3</span>
+            </div>
+          </div>
+          <div class="engagement">
+            <div class="like-group">
+              <button id="likeBtn" class="engagement-btn">
+                <span class="icon">▲</span> <span id="likes">0</span>
+              </button>
+              <button id="dislikeBtn" class="engagement-btn">
+                <span class="icon">▼</span> <span id="dislikes">0</span>
+              </button>
+            </div>
+            <button id="subscribeBtn" class="subscribe-btn">Subscribe</button>
+            <button id="flagBtn" class="flag-btn">Flag</button>
+            <button id="contactBtn" class="contact-btn hidden">View contact info</button>
+          </div>
+          <div id="contactPanel" class="contact-panel hidden">
+            <h3>Decrypted contact info</h3>
+            <pre id="contactData"></pre>
+          </div>
+        </div>
+
+        <div class="comments-card">
+          <h3>Comments</h3>
+          <div id="commentList" class="comment-list"></div>
+          <div class="comment-input-row">
+            <input id="commentText" type="text" placeholder="Add a comment...">
+            <button id="postCommentBtn">Post</button>
+          </div>
+          <div id="commentError" class="error"></div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <script src="/crabs.js"></script>
+  <script src="/client_bundle.js"></script>
+  <script>CRABSClient.init();</script>
+</body>
+</html>
