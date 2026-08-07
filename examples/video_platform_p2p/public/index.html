@@ -13,7 +13,16 @@
       <span id="connectionStatus" class="status">Connecting...</span>
     </header>
 
-    <main>
+    <section id="loadingScreen" class="loading-screen">
+      <div class="loading-card">
+        <div class="spinner"></div>
+        <p>Loading CRABS node…</p>
+        <div id="loadingError" class="error hidden"></div>
+        <button id="reloadBtn" class="hidden secondary">Reload</button>
+      </div>
+    </section>
+
+    <main id="mainContent">
       <section id="authScreen" class="auth-screen">
         <div class="auth-card">
           <h2>Join the stream</h2>
