@@ -2,49 +2,43 @@
 // index.js — WebAssembly bindings for CRABS.
 //
 // Provides the same API as crabs-node (N-API bindings) but runs entirely
-// in WebAssembly. Works in any environment with a WASM runtime: browsers,
-// Node.js, Deno, Bun, Cloudflare Workers, etc.
+// in WebAssembly. Works in browsers, Node.js, Deno, Bun, etc.
 //
-// Usage:
-//   const { Node, KeyPair, Operation } = require('crabs-wasm');
-//   const node = new Node('admin', { ordering: 'hlc' });
-//   const key = KeyPair.generate();
-//   node.registerUser('alice', key.publicKeyHex(), 'role:member');
-//
-// The WASM module (crabs.wasm + crabs.js) is built by build_wasm.sh at the
-// repository root. The built files go to build-wasm/crabs.{wasm,js}.
+// The WASM module (crabs.wasm + crabs.js) is built by build_wasm.sh. In the
+// browser, load crabs.js via a <script> tag before the bundle that uses this
+// module; in Node.js, it is loaded from disk automatically.
 //
 
 'use strict';
 
-const path = require('path');
-const fs = require('fs');
-
-// Locate the WASM module — the pre-built crabs.js + crabs.wasm ship with
-// the package, so no compilation is needed. Just `npm install crabs-wasm`.
-const wasmPaths = [
-  path.join(__dirname, 'crabs.js'),                           // packaged (default)
-  path.join(__dirname, '..', '..', 'build-wasm', 'crabs.js'), // dev build
-];
-
-let wasmModulePath = null;
-for (const p of wasmPaths) {
-  if (fs.existsSync(p)) { wasmModulePath = p; break; }
-}
-
-if (!wasmModulePath) {
-  throw new Error(
-    'CRABS WASM module not found. Run `npm run build` to compile it.\n' +
-    'Checked: ' + wasmPaths.join(', ')
-  );
-}
-
-// Lazy-load the Emscripten module (it's async — returns a Promise)
 let _modulePromise = null;
+
 function getModule() {
   if (!_modulePromise) {
-    const createCRABSModule = require(wasmModulePath);
-    _modulePromise = createCRABSModule();
+    if (typeof window !== 'undefined' && typeof window.createCRABSModule === 'function') {
+      // Browser: crabs.js was loaded via a <script> tag before this bundle.
+      _modulePromise = window.createCRABSModule();
+    } else {
+      // Node.js: load the Emscripten module from disk.
+      const path = require('path');
+      const fs = require('fs');
+      const wasmPaths = [
+        path.join(__dirname, 'crabs.js'),
+        path.join(__dirname, '..', '..', 'build-wasm', 'crabs.js'),
+      ];
+      let wasmModulePath = null;
+      for (const p of wasmPaths) {
+        if (fs.existsSync(p)) { wasmModulePath = p; break; }
+      }
+      if (!wasmModulePath) {
+        throw new Error(
+          'CRABS WASM module not found. Run `./build_wasm.sh` to compile it.\n' +
+          'Checked: ' + wasmPaths.join(', ')
+        );
+      }
+      const createCRABSModule = require(wasmModulePath);
+      _modulePromise = createCRABSModule();
+    }
   }
   return _modulePromise;
 }
@@ -67,6 +61,7 @@ function hexDecode(M, hex, ptr, maxLen) {
 }
 
 function writeString(M, str) {
+  if (!str) return 0;
   const len = M.lengthBytesUTF8(str) + 1;
   const ptr = M._malloc(len);
   M.stringToUTF8(str, ptr, len);
@@ -74,25 +69,51 @@ function writeString(M, str) {
 }
 
 function readString(M, ptr) {
-  return M.UTF8ToString(ptr);
+  return ptr ? M.UTF8ToString(ptr) : '';
 }
 
-// Error code → message (shared with N-API bindings)
+function writeBytes(M, bytes) {
+  if (!bytes || bytes.length === 0) return { ptr: 0, len: 0 };
+  const ptr = M._malloc(bytes.length);
+  M.HEAPU8.set(bytes, ptr);
+  return { ptr, len: bytes.length };
+}
+
+function encodeText(str) {
+  if (typeof TextEncoder !== 'undefined') {
+    return new TextEncoder().encode(str);
+  }
+  return new Uint8Array(Buffer.from(str, 'utf8'));
+}
+
 const ERROR_MESSAGES = {
-  0: 'success', 1: 'protocol_violation', 2: 'lock_token_mismatch',
-  3: 'lock_owner_mismatch', 4: 'lock_contention', 5: 'lock_not_expired',
-  6: 'max_extensions_reached', 7: 'force_unlock_disabled', 8: 'unauthorized',
-  9: 'key_stale', 10: 'user_not_found', 11: 'user_suspended',
-  12: 'invariant_violated', 13: 'resource_not_found', 14: 'duplicate_operation',
-  15: 'type_mismatch', 16: 'already_performed', 17: 'already_executed',
-  18: 'condition_not_met', 19: 'tracker_not_found', 20: 'flag_not_found',
-  21: 'serialization_error', 22: 'cryptographic_error', 23: 'internal_error',
-  24: 'out_of_memory', 25: 'invalid_param',
+  0x0000: 'success',
+  0x1001: 'protocol_violation', 0x1002: 'lock_token_mismatch', 0x1003: 'lock_owner_mismatch',
+  0x1004: 'lock_contention', 0x1005: 'lock_not_expired', 0x1006: 'max_extensions_reached',
+  0x1007: 'force_unlock_disabled',
+  0x2001: 'unauthorized', 0x2002: 'key_stale', 0x2003: 'user_not_found', 0x2004: 'user_suspended',
+  0x3001: 'invariant_violated', 0x3002: 'resource_not_found', 0x3003: 'duplicate_operation',
+  0x3004: 'type_mismatch',
+  0x4001: 'serialization_error', 0x4002: 'cryptographic_error',
+  0x5001: 'internal_error', 0x5002: 'out_of_memory', 0x5003: 'invalid_param',
+  0x5004: 'scheme_already_registered',
+  0x6001: 'key_suspended', 0x6002: 'key_revoked', 0x6003: 'key_expired', 0x6004: 'key_not_active',
+  0x6005: 'vault_unavailable',
+  0x7001: 'already_performed', 0x7002: 'already_executed', 0x7003: 'condition_not_met',
+  0x7004: 'tracker_not_found', 0x7005: 'flag_not_found',
 };
 
 function crabsError(code, ctx) {
-  const msg = ERROR_MESSAGES[code] || `error_${code}`;
+  const msg = ERROR_MESSAGES[code] || `error_${code.toString(16)}`;
   return new Error(`${ctx}: ${msg}`);
+}
+
+function wrapRc(rc, ctx) {
+  if (rc !== 0) throw crabsError(rc, ctx);
+}
+
+function freeAll(M, ...ptrs) {
+  for (const p of ptrs) { if (p) M._free(p); }
 }
 
 // ============================================================
@@ -103,6 +124,7 @@ class KeyPair {
   constructor(M, ptr) {
     this._M = M;
     this._ptr = ptr;
+    this._raw = false;
   }
 
   static async generate() {
@@ -114,31 +136,35 @@ class KeyPair {
 
   static async fromPrivateHex(hex) {
     const M = await getModule();
-    // Allocate a keypair struct and set the private key
-    const ptr = M._malloc(65); // 33 (pub) + 32 (priv)
-    const len = hexDecode(M, hex, ptr + 33, 32);
+    const ptr = M._malloc(65);
+    const len = hexDecode(M, hex, ptr, 32);
     if (len !== 32) { M._free(ptr); throw new Error('Invalid private key hex'); }
-    const rc = M._crypto_ecdsa_derive_public_key(ptr + 33, ptr);
+    const rc = M._crypto_ecdsa_derive_public_key(ptr, ptr + 32);
     if (rc !== 0) { M._free(ptr); throw crabsError(rc, 'fromPrivateHex'); }
-    // Wrap in a fake keypair struct (pub at offset 0, priv at offset 33)
-    // Note: _crypto_ecdsa_keypair_destroy expects the struct from _crypto_ecdsa_generate
-    // For fromPrivateHex, we use a raw allocation. Store a flag to use _free instead.
     const kp = new KeyPair(M, ptr);
     kp._raw = true;
     return kp;
   }
 
+  static async derivePublicHex(hex) {
+    const M = await getModule();
+    const priv = M._malloc(32);
+    const pub = M._malloc(33);
+    const len = hexDecode(M, hex, priv, 32);
+    if (len !== 32) { freeAll(M, priv, pub); throw new Error('Invalid private key hex'); }
+    const rc = M._crypto_ecdsa_derive_public_key(priv, pub);
+    const out = rc === 0 ? hexEncode(M.HEAPU8.subarray(pub, pub + 33), 33) : '';
+    freeAll(M, priv, pub);
+    if (rc !== 0) throw crabsError(rc, 'derivePublicHex');
+    return out;
+  }
+
   publicKeyHex() {
-    return hexEncode(this._M.HEAPU8, 33).slice(0, 66);
+    return hexEncode(this._M.HEAPU8.subarray(this._ptr + 32, this._ptr + 65), 33);
   }
 
-  // The HEAPU8 subarray starts at this._ptr, need 33 bytes
-  _publicKeyHex() {
-    return hexEncode(this._M.HEAPU8.subarray(this._ptr, this._ptr + 33), 33);
-  }
-
-  _privateKeyHex() {
-    return hexEncode(this._M.HEAPU8.subarray(this._ptr + 33, this._ptr + 65), 32);
+  privateKeyHex() {
+    return hexEncode(this._M.HEAPU8.subarray(this._ptr, this._ptr + 32), 32);
   }
 
   destroy() {
@@ -149,10 +175,6 @@ class KeyPair {
     }
   }
 }
-
-// Override publicKeyHex to use the correct method
-KeyPair.prototype.publicKeyHex = function() { return this._publicKeyHex(); };
-KeyPair.prototype.privateKeyHex = function() { return this._privateKeyHex(); };
 
 // ============================================================
 // Operation
@@ -168,28 +190,75 @@ class Operation {
     const M = await getModule();
     const typePtr = writeString(M, type);
     const ptr = M._operation_create(typePtr);
-    M._free(typePtr);
+    if (typePtr) M._free(typePtr);
     if (!ptr) throw new Error('Operation.create failed');
+    M._crabs_wasm_op_init_uuid(ptr);
     return new Operation(M, ptr);
   }
 
-  // Operation struct layout (offsets from state_machine.h / crabs.h):
-  // type: char[64] at offset 0
-  // signer_id: char[64] at offset 64
-  // node_id: char[64] at offset 128
-  // ... (simplified — the actual layout depends on the struct definition)
+  static async deserialize(bytes) {
+    const M = await getModule();
+    const { ptr, len } = writeBytes(M, bytes);
+    const opPtr = M._crabs_wasm_deserialize_operation(ptr, len);
+    if (ptr) M._free(ptr);
+    if (!opPtr) throw new Error('Operation.deserialize failed');
+    return new Operation(M, opPtr);
+  }
 
   set signerId(id) {
-    const offset = 64; // CRABS_MAX_USER_ID = 64
-    this._M.stringToUTF8(id, this._ptr + offset, 64);
+    const M = this._M;
+    const idPtr = writeString(M, id);
+    M._crabs_wasm_op_set_signer(this._ptr, idPtr);
+    if (idPtr) M._free(idPtr);
   }
-
-  get signerId() {
-    return readString(this._M, this._ptr + 64);
-  }
+  get signerId() { return readString(this._M, this._M._crabs_wasm_op_get_signer(this._ptr)); }
 
   set nodeId(id) {
-    this._M.stringToUTF8(id, this._ptr + 128, 64);
+    const M = this._M;
+    const idPtr = writeString(M, id);
+    M._crabs_wasm_op_set_node(this._ptr, idPtr);
+    if (idPtr) M._free(idPtr);
+  }
+  get nodeId() { return readString(this._M, this._M._crabs_wasm_op_get_node(this._ptr)); }
+
+  set type(t) {
+    const M = this._M;
+    const tPtr = writeString(M, t);
+    M._crabs_wasm_op_set_type(this._ptr, tPtr);
+    if (tPtr) M._free(tPtr);
+  }
+  get type() { return readString(this._M, this._M._crabs_wasm_op_get_type(this._ptr)); }
+
+  set payload(buf) {
+    const M = this._M;
+    let b = buf;
+    if (typeof b === 'string') b = encodeText(b);
+    if (!b || b.length === 0) {
+      M._crabs_wasm_op_set_payload(this._ptr, 0, 0);
+      return;
+    }
+    const { ptr, len } = writeBytes(M, b);
+    M._crabs_wasm_op_set_payload(this._ptr, ptr, len);
+    if (ptr) M._free(ptr);
+  }
+
+  get payload() {
+    const M = this._M;
+    const len = M._crabs_wasm_op_get_payload_size(this._ptr);
+    const ptr = M._crabs_wasm_op_get_payload(this._ptr);
+    if (!len || !ptr) return undefined;
+    return new Uint8Array(M.HEAPU8.subarray(ptr, ptr + len));
+  }
+
+  serialize() {
+    const M = this._M;
+    const ser = M._crabs_wasm_serialize_operation(this._ptr);
+    if (!ser) throw new Error('serialize operation failed');
+    const len = M._crabs_wasm_buffer_len(ser);
+    const data = M._crabs_wasm_buffer_data(ser);
+    const out = new Uint8Array(M.HEAPU8.subarray(data, data + len));
+    M._crabs_wasm_buffer_destroy(ser);
+    return out;
   }
 
   destroy() {
@@ -209,65 +278,296 @@ class Node {
 
   static async create(adminId, options = {}) {
     const M = await getModule();
-
-    // Generate admin keypair
-    const kpPtr = M._crypto_ecdsa_generate();
-    if (!kpPtr) throw new Error('Failed to generate node key');
-
-    // Write admin ID string
-    const adminIdPtr = writeString(M, adminId);
-
-    // Create attribute machine
-    const amPtr = M._attribute_machine_create(adminIdPtr, kpPtr);
-    M._free(adminIdPtr);
-
-    if (!amPtr) throw new Error('Failed to create attribute machine');
-
-    // Wire back-pointer (am->base_state.attr_machine = am)
-    // This is set inside attribute_machine_create, but let's verify
-    // by checking if state_machine_execute works
-
-    const node = new Node(M, amPtr);
-    node._keyPtr = kpPtr;
-    return node;
+    const adminPtr = writeString(M, adminId);
+    const amPtr = M._crabs_wasm_node_create(adminPtr);
+    if (adminPtr) M._free(adminPtr);
+    if (!amPtr) throw new Error('Node.create failed');
+    return new Node(M, amPtr);
   }
 
   getNodeKey() {
-    const M = this._M;
-    return {
-      publicKeyHex: hexEncode(M.HEAPU8.subarray(this._keyPtr, this._keyPtr + 33), 33),
-      privateKeyHex: hexEncode(M.HEAPU8.subarray(this._keyPtr + 33, this._keyPtr + 65), 32),
-    };
+    // The node private key lives inside the C state and is used internally for
+    // admin-level signing (e.g., createTrigger). It is intentionally not
+    // exposed to JS.
+    return { publicKeyHex: '', privateKeyHex: '' };
   }
 
-  async registerUser(userId, publicKeyHex, initialAttrs) {
+  registerUser(userId, publicKeyHex, initialAttrs) {
     const M = this._M;
     const uidPtr = writeString(M, userId);
     const pkPtr = M._malloc(33);
     hexDecode(M, publicKeyHex, pkPtr, 33);
-    const attrsPtr = initialAttrs ? writeString(M, initialAttrs) : 0;
-
+    const attrsPtr = writeString(M, initialAttrs);
     const rc = M._attribute_machine_register_user(this._am, uidPtr, pkPtr, attrsPtr);
-    M._free(uidPtr); M._free(pkPtr);
-    if (attrsPtr) M._free(attrsPtr);
-    if (rc !== 0) throw crabsError(rc, 'registerUser');
+    freeAll(M, uidPtr, pkPtr, attrsPtr);
+    wrapRc(rc, 'registerUser');
   }
 
-  async getUser(userId) {
+  grantRole(targetUser, role, value, signerId) {
+    const M = this._M;
+    const tPtr = writeString(M, targetUser);
+    const rPtr = writeString(M, role);
+    const vPtr = writeString(M, value);
+    const sPtr = writeString(M, signerId);
+    const rc = M._attribute_machine_grant_role(this._am, tPtr, rPtr, vPtr, sPtr);
+    freeAll(M, tPtr, rPtr, vPtr, sPtr);
+    wrapRc(rc, 'grantRole');
+  }
+
+  revokeUser(userId) {
     const M = this._M;
     const uidPtr = writeString(M, userId);
-    const userPtr = M._attribute_machine_find_user(this._am, uidPtr);
-    M._free(uidPtr);
-    if (!userPtr) return undefined;
-
-    // Read user_t fields (simplified — actual offsets depend on struct)
-    // This is a basic implementation; a full one would read all fields
-    return { userId, _ptr: userPtr };
+    const rc = M._attribute_machine_revoke_user(this._am, uidPtr);
+    if (uidPtr) M._free(uidPtr);
+    wrapRc(rc, 'revokeUser');
   }
 
+  getUser(userId) {
+    const M = this._M;
+    const uidPtr = writeString(M, userId);
+    const userPtr = M._crabs_wasm_find_user(this._am, uidPtr);
+    if (uidPtr) M._free(uidPtr);
+    if (!userPtr) return undefined;
+
+    const attrs = [];
+    const n = M._crabs_wasm_user_attr_count(userPtr);
+    for (let i = 0; i < n; i++) {
+      attrs.push({
+        value: readString(M, M._crabs_wasm_user_attr_value(userPtr, i)),
+        verifiedBy: '',
+        temporary: false,
+      });
+    }
+    const tempName = readString(M, M._crabs_wasm_user_temp_attr_name(userPtr));
+    if (tempName) {
+      attrs.push({
+        value: tempName + ':' + readString(M, M._crabs_wasm_user_temp_attr_value(userPtr)),
+        verifiedBy: 'trigger',
+        temporary: true,
+      });
+    }
+
+    return {
+      userId: readString(M, M._crabs_wasm_user_id(userPtr)),
+      publicKeyHex: '',
+      keyVersion: 0,
+      status: 'active',
+      attributes: attrs,
+    };
+  }
+
+  addCounter(name) { this._callAdd(this._M._crabs_wasm_add_counter, name, 'addCounter'); }
+  addPNCounter(name) { this._callAdd(this._M._crabs_wasm_add_pn_counter, name, 'addPNCounter'); }
+  addORSet(name) { this._callAdd(this._M._crabs_wasm_add_or_set, name, 'addORSet'); }
+  addOneShotSet(name) { this._callAdd(this._M._crabs_wasm_add_one_shot_set, name, 'addOneShotSet'); }
+  addOneShotFlag(name) { this._callAdd(this._M._crabs_wasm_add_one_shot_flag, name, 'addOneShotFlag'); }
+
+  addRegister(name, initial = 0) {
+    const M = this._M;
+    const nPtr = writeString(M, name);
+    const rc = M._crabs_wasm_add_register(this._am, nPtr, BigInt(initial));
+    if (nPtr) M._free(nPtr);
+    wrapRc(rc, 'addRegister');
+  }
+
+  _callAdd(fn, name, ctx) {
+    const M = this._M;
+    const nPtr = writeString(M, name);
+    const rc = fn(this._am, nPtr);
+    if (nPtr) M._free(nPtr);
+    wrapRc(rc, ctx);
+  }
+
+  setPolicy(opType, expr) {
+    const M = this._M;
+    const oPtr = writeString(M, opType);
+    const ePtr = writeString(M, expr);
+    const rc = M._crabs_wasm_set_policy(this._am, oPtr, ePtr);
+    freeAll(M, oPtr, ePtr);
+    wrapRc(rc, 'setPolicy');
+  }
+
+  getCounter(name) { return this._callGet(this._M._crabs_wasm_get_counter, name); }
+  getPNCounter(name) { return this._callGet(this._M._crabs_wasm_get_pn_counter, name); }
+  getRegister(name) { return this._callGet(this._M._crabs_wasm_get_register, name); }
+
+  _callGet(fn, name) {
+    const M = this._M;
+    const nPtr = writeString(M, name);
+    const raw = fn(this._am, nPtr);
+    if (nPtr) M._free(nPtr);
+    return typeof raw === 'bigint' ? Number(raw) : raw;
+  }
+
+  incrementCounter(name, delta = 1, nodeId = 'system') {
+    this._callCounter(this._M._crabs_wasm_increment_counter, name, delta, nodeId, 'incrementCounter');
+  }
+  incrementPNCounter(name, delta = 1, nodeId = 'system') {
+    this._callCounter(this._M._crabs_wasm_increment_pn_counter, name, delta, nodeId, 'incrementPNCounter');
+  }
+  decrementPNCounter(name, delta = 1, nodeId = 'system') {
+    this._callCounter(this._M._crabs_wasm_decrement_pn_counter, name, delta, nodeId, 'decrementPNCounter');
+  }
+
+  _callCounter(fn, name, delta, nodeId, ctx) {
+    const M = this._M;
+    const nPtr = writeString(M, name);
+    const idPtr = writeString(M, nodeId);
+    const rc = fn(this._am, nPtr, BigInt(delta), idPtr);
+    freeAll(M, nPtr, idPtr);
+    wrapRc(rc, ctx);
+  }
+
+  setRegister(name, value, nodeId = 'system') {
+    const M = this._M;
+    const nPtr = writeString(M, name);
+    const idPtr = writeString(M, nodeId);
+    const rc = M._crabs_wasm_set_register(this._am, nPtr, BigInt(value), idPtr);
+    freeAll(M, nPtr, idPtr);
+    wrapRc(rc, 'setRegister');
+  }
+
+  setContains(name, element) {
+    const M = this._M;
+    const nPtr = writeString(M, name);
+    const ePtr = writeString(M, element);
+    const out = M._crabs_wasm_set_contains(this._am, nPtr, ePtr);
+    freeAll(M, nPtr, ePtr);
+    return out;
+  }
+
+  setAdd(name, element, tag = element) {
+    const M = this._M;
+    const nPtr = writeString(M, name);
+    const ePtr = writeString(M, element);
+    const tPtr = writeString(M, tag);
+    const rc = M._crabs_wasm_set_add(this._am, nPtr, ePtr, tPtr);
+    freeAll(M, nPtr, ePtr, tPtr);
+    wrapRc(rc, 'setAdd');
+  }
+
+  setRemove(name, element) {
+    const M = this._M;
+    const nPtr = writeString(M, name);
+    const ePtr = writeString(M, element);
+    const rc = M._crabs_wasm_set_remove(this._am, nPtr, ePtr);
+    freeAll(M, nPtr, ePtr);
+    wrapRc(rc, 'setRemove');
+  }
+
+  flagValue(name) { return this._callGet(this._M._crabs_wasm_one_shot_flag_value, name); }
+  flagSet(name, setBy, setAt = 0) {
+    const M = this._M;
+    const nPtr = writeString(M, name);
+    const sPtr = writeString(M, setBy);
+    const rc = M._crabs_wasm_one_shot_flag_set(this._am, nPtr, sPtr, BigInt(setAt));
+    freeAll(M, nPtr, sPtr);
+    wrapRc(rc, 'flagSet');
+  }
+
+  execute(op) {
+    wrapRc(this._M._crabs_wasm_execute(this._am, op._ptr), 'execute');
+  }
+
+  sign(op, signingKey) {
+    const M = this._M;
+    let privHex;
+    if (typeof signingKey === 'string') {
+      privHex = signingKey;
+    } else if (signingKey && signingKey._ptr) {
+      // Read the private key as a hex string now; the heap view stored on the
+      // KeyPair object can become detached after WASM memory growth.
+      privHex = signingKey.privateKeyHex();
+    } else {
+      throw new Error('Expected KeyPair or private key hex string');
+    }
+    const privPtr = M._malloc(32);
+    const len = hexDecode(M, privHex, privPtr, 32);
+    if (len !== 32) { M._free(privPtr); throw new Error('Invalid private key hex'); }
+    const rc = M._crabs_wasm_sign_operation(this._am, op._ptr, privPtr);
+    M._free(privPtr);
+    wrapRc(rc, 'sign');
+  }
+
+  createTrigger(config) {
+    const M = this._M;
+    const effectTypeNum = {
+      issue_attribute: 1, create_trigger: 2, delete_trigger: 3,
+      disable_trigger: 4, change_policy: 5
+    }[config.effectType];
+    if (!effectTypeNum) throw new Error('Unknown effectType: ' + config.effectType);
+
+    let payload = `trigger_id=${config.triggerId};condition=${config.condition};description=${config.description || ''};effect_type=${effectTypeNum};cooldown_ms=${config.cooldownMs || 0};one_shot=${config.oneShot ? 1 : 0}`;
+    if (config.effectType === 'issue_attribute') {
+      payload += `;issue_attribute=${config.issueAttribute};target_role=${config.targetRole};attribute_value=${config.attributeValue};duration_ms=${config.durationMs || 0}`;
+    }
+
+    const typePtr = writeString(M, '__create_trigger__');
+    const opPtr = M._operation_create(typePtr);
+    if (typePtr) M._free(typePtr);
+    if (!opPtr) throw new Error('createTrigger: operation_create failed');
+    M._crabs_wasm_op_init_uuid(opPtr);
+    M._crabs_wasm_op_set_signer(opPtr, 'admin');
+    M._crabs_wasm_op_set_node(opPtr, 'admin');
+    const payloadBytes = encodeText(payload + '\0');
+    const { ptr: dPtr, len: dLen } = writeBytes(M, payloadBytes);
+    M._crabs_wasm_op_set_payload(opPtr, dPtr, dLen);
+    if (dPtr) M._free(dPtr);
+
+    const rcSign = M._crabs_wasm_sign_with_node_key(this._am, opPtr);
+    if (rcSign !== 0) {
+      M._operation_destroy(opPtr);
+      throw crabsError(rcSign, 'createTrigger sign');
+    }
+    const rcExec = M._crabs_wasm_execute(this._am, opPtr);
+    M._operation_destroy(opPtr);
+    wrapRc(rcExec, 'createTrigger execute');
+  }
+
+  encrypt(data, policy) {
+    const M = this._M;
+    let b = data;
+    if (typeof b === 'string') b = encodeText(b);
+    const { ptr: dPtr, len: dLen } = writeBytes(M, b);
+    const pPtr = writeString(M, policy);
+    const ct = M._crabs_wasm_abe_encrypt(this._am, dPtr, dLen, pPtr);
+    freeAll(M, dPtr, pPtr);
+    if (!ct) throw new Error('ABE encrypt failed');
+
+    const policyStr = readString(M, M._crabs_wasm_abe_ciphertext_policy(ct));
+    const outLenPtr = M._malloc(4);
+    const ctData = M._crabs_wasm_abe_ciphertext_data(ct, outLenPtr);
+    const ctLen = M.getValue(outLenPtr, 'i32');
+    M._free(outLenPtr);
+
+    const total = 2 + policyStr.length + 4 + ctLen;
+    const out = new Uint8Array(total);
+    const dv = new DataView(out.buffer);
+    dv.setUint16(0, policyStr.length, true);
+    out.set(encodeText(policyStr), 2);
+    dv.setUint32(2 + policyStr.length, ctLen, true);
+    out.set(new Uint8Array(M.HEAPU8.subarray(ctData, ctData + ctLen)), 2 + policyStr.length + 4);
+
+    M._crabs_wasm_abe_ciphertext_destroy(ct);
+    return out;
+  }
+
+  serialize() {
+    const M = this._M;
+    const ser = M._crabs_wasm_serialize_state(this._am);
+    if (!ser) throw new Error('serialize state failed');
+    const len = M._crabs_wasm_buffer_len(ser);
+    const data = M._crabs_wasm_buffer_data(ser);
+    const out = new Uint8Array(M.HEAPU8.subarray(data, data + len));
+    M._crabs_wasm_buffer_destroy(ser);
+    return out;
+  }
+
+  setTime(nowMs) { this._M._crabs_wasm_set_time(this._am, BigInt(nowMs)); }
+  pruneExpiredTempAttrs() { return this._M._crabs_wasm_prune_expired_temp_attrs(this._am); }
+
   destroy() {
-    if (this._am) { this._M._attribute_machine_destroy(this._am); this._am = null; }
-    if (this._keyPtr) { this._M._crypto_ecdsa_keypair_destroy(this._keyPtr); this._keyPtr = null; }
+    if (this._am) { this._M._crabs_wasm_node_destroy(this._am); this._am = null; }
   }
 }
 

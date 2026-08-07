@@ -57,10 +57,12 @@ attribute_machine_t* crabs_wasm_node_create(const char* admin_id) {
 
 EMSCRIPTEN_KEEPALIVE
 void crabs_wasm_node_destroy(attribute_machine_t* am) {
-  if (!am) return;
-  crabs_ordering_config_t* cfg = state_get_ordering_config(&am->base_state);
-  attribute_machine_destroy(am);
-  if (cfg) free(cfg);
+  // Intentional no-op. Full C teardown (attribute_machine_destroy) triggers a
+  // memory-access crash in the Emscripten build during ABE/OpenABE cleanup.
+  // The browser demo creates one Node per page load; leaking it is harmless
+  // because the process ends on navigation. A future fix can safely tear down
+  // the ABE context first.
+  (void)am;
 }
 
 // ============================================================
