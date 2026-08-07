@@ -10,7 +10,10 @@
   <div id="app">
     <header class="topbar">
       <h1>CRABS P2P Video</h1>
-      <span id="connectionStatus" class="status">Connecting...</span>
+      <div class="topbar-actions">
+        <button id="debugBtn" class="debug-btn hidden">Debug</button>
+        <span id="connectionStatus" class="status">Connecting...</span>
+      </div>
     </header>
 
     <section id="loadingScreen" class="loading-screen">
@@ -90,6 +93,17 @@
         </div>
       </section>
     </main>
+
+    <div id="debugBackdrop" class="debug-backdrop hidden"></div>
+    <aside id="debugDrawer" class="debug-drawer hidden">
+      <div class="drawer-header">
+        <h2>CRABS Debug State</h2>
+        <button id="debugClose" aria-label="Close">×</button>
+      </div>
+      <div class="drawer-body" id="debugBody">
+        <p class="drawer-placeholder">Loading CRABS state…</p>
+      </div>
+    </aside>
   </div>
 
   <script src="/crabs.js"></script>
