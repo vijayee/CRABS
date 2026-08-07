@@ -36,17 +36,54 @@ const announcedUsers = new Set();
 // Parallel JS store for comments (OR-set iteration is not exposed to JS).
 const commentsStore = [];
 
+function setLoading(isLoading) {
+  const loading = document.getElementById('loadingScreen');
+  const main = document.getElementById('mainContent');
+  if (!loading || !main) return;
+  if (isLoading) {
+    loading.classList.remove('hidden');
+    main.classList.add('hidden');
+  } else {
+    loading.classList.add('hidden');
+    main.classList.remove('hidden');
+  }
+}
+
+function setLoadingError(msg) {
+  const loading = document.getElementById('loadingScreen');
+  const main = document.getElementById('mainContent');
+  const errEl = document.getElementById('loadingError');
+  const reloadBtn = document.getElementById('reloadBtn');
+  if (loading) loading.classList.remove('hidden');
+  if (main) main.classList.add('hidden');
+  if (errEl) {
+    errEl.textContent = msg;
+    errEl.classList.remove('hidden');
+  }
+  if (reloadBtn) {
+    reloadBtn.classList.remove('hidden');
+    reloadBtn.onclick = () => window.location.reload();
+  }
+}
+
 // ============================================================
 // Bootstrap
 // ============================================================
 
 async function init() {
-  await seedDemoUsers();
-  node = await Node.create('admin', { ordering: 'hlc' });
-  await registerDemoUsers();
-  initStateMachine();
-  connectWebSocket();
-  bindAuth();
+  setLoading(true);
+  try {
+    await seedDemoUsers();
+    node = await Node.create('admin', { ordering: 'hlc' });
+    await registerDemoUsers();
+    initStateMachine();
+    connectWebSocket();
+    bindAuth();
+    setLoading(false);
+  } catch (e) {
+    console.error('CRABS init failed', e);
+    setLoadingError(e.message || 'Failed to initialize CRABS node');
+  }
 }
 
 async function seedDemoUsers() {
