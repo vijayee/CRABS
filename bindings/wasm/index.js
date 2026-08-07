@@ -503,12 +503,18 @@ class Node {
     }
 
     const typePtr = writeString(M, '__create_trigger__');
+    const signerPtr = writeString(M, 'admin');
+    const nodePtr = writeString(M, 'admin');
     const opPtr = M._operation_create(typePtr);
     if (typePtr) M._free(typePtr);
-    if (!opPtr) throw new Error('createTrigger: operation_create failed');
+    if (!opPtr) {
+      freeAll(M, signerPtr, nodePtr);
+      throw new Error('createTrigger: operation_create failed');
+    }
     M._crabs_wasm_op_init_uuid(opPtr);
-    M._crabs_wasm_op_set_signer(opPtr, 'admin');
-    M._crabs_wasm_op_set_node(opPtr, 'admin');
+    M._crabs_wasm_op_set_signer(opPtr, signerPtr);
+    M._crabs_wasm_op_set_node(opPtr, nodePtr);
+    freeAll(M, signerPtr, nodePtr);
     const payloadBytes = encodeText(payload + '\0');
     const { ptr: dPtr, len: dLen } = writeBytes(M, payloadBytes);
     M._crabs_wasm_op_set_payload(opPtr, dPtr, dLen);
