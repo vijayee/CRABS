@@ -13,7 +13,7 @@ const fs = require('fs');
 const path = require('path');
 const { WebSocketServer } = require('ws');
 const { Node, KeyPair, Operation } = require('crabs-node');
-const { MOD1_PRIVATE_KEY } = require('./demo_keys');
+const { DEMO_KEYS } = require('./demo_keys');
 
 const PORT = 5674;
 const FLAG_THRESHOLD = 3;
@@ -37,8 +37,8 @@ const MIME = {
 const node = new Node('admin', { ordering: 'hlc' });
 
 // Demo moderator account used for the ABE contact gate.
-const modKey = KeyPair.fromPrivateHex(MOD1_PRIVATE_KEY);
-const mod1UserId = modKey.publicKeyHex().slice(0, 63);
+const modKey = KeyPair.fromPrivateHex(DEMO_KEYS.mod1);
+const mod1UserId = modKey.publicKeyHex().slice(0, 32);
 node.registerUser(mod1UserId, modKey.publicKeyHex(), 'role:member|clearance:moderator|adult');
 
 node.addCounter('flag_count');
@@ -184,10 +184,12 @@ wss.on('connection', ws => {
       }
     }
 
-    // Relay to all other sockets.
+    // Relay to all other sockets. ws stores incoming frames as Buffer; send
+    // them back as UTF-8 text so browsers receive strings instead of Blobs.
+    const text = raw.toString();
     for (const client of clients) {
       if (client !== ws && client.readyState === 1) {
-        client.send(raw);
+        client.send(text);
       }
     }
   });

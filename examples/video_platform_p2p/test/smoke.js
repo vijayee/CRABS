@@ -3,11 +3,11 @@
 const http = require('http');
 const WebSocket = require('ws');
 const { KeyPair } = require('crabs-node');
-const { MOD1_PRIVATE_KEY } = require('../demo_keys');
+const { DEMO_KEYS } = require('../demo_keys');
 
 const FLAG_THRESHOLD = 3;
-const modKey = KeyPair.fromPrivateHex(MOD1_PRIVATE_KEY);
-const MOD1_USER_ID = modKey.publicKeyHex().slice(0, 63);
+const modKey = KeyPair.fromPrivateHex(DEMO_KEYS.mod1);
+const MOD1_USER_ID = modKey.publicKeyHex().slice(0, 32);
 
 function postContact(userId) {
   return new Promise((resolve, reject) => {

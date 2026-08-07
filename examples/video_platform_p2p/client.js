@@ -8,7 +8,7 @@
 'use strict';
 
 const { Node, KeyPair, Operation } = require('crabs-wasm');
-const { MOD1_PRIVATE_KEY } = require('./demo_keys');
+const { DEMO_KEYS } = require('./demo_keys');
 
 const FLAG_THRESHOLD = 3;
 
@@ -29,6 +29,10 @@ const DEMO_ACCOUNTS = [
 // name -> { name, userId, publicKeyHex, privateKeyHex, age, keyPair }
 const localUsers = new Map();
 
+// Track which local users have been announced to the relay so every peer
+// learns their public key (generated per-tab for non-mod1 demo accounts).
+const announcedUsers = new Set();
+
 // Parallel JS store for comments (OR-set iteration is not exposed to JS).
 const commentsStore = [];
 
@@ -47,13 +51,15 @@ async function init() {
 
 async function seedDemoUsers() {
   for (const demo of DEMO_ACCOUNTS) {
-    const key = demo.name === 'mod1'
-      ? await KeyPair.fromPrivateHex(MOD1_PRIVATE_KEY)
+    const privateHex = DEMO_KEYS[demo.name];
+    const key = privateHex
+      ? await KeyPair.fromPrivateHex(privateHex)
       : await KeyPair.generate();
-    // CRABS user IDs are limited to 63 usable chars (CRABS_MAX_USER_ID=64
-    // minus the null terminator). The public key hex is 66 chars, so truncate.
+    // CRABS user IDs and data-item names are limited to 63 usable chars
+    // (CRABS_MAX_USER_ID=64 minus the null terminator). Names like vote_<userId>
+    // must also fit, so keep userIds short enough for per-user state items.
     const publicKeyHex = key.publicKeyHex();
-    const userId = publicKeyHex.slice(0, 63);
+    const userId = publicKeyHex.slice(0, 32);
     localUsers.set(demo.name, {
       name: demo.name,
       userId,
@@ -115,6 +121,7 @@ function initStateMachine() {
   node.setPolicy('__create_trigger__', 'role:admin');
   node.setPolicy('__change_config__', 'role:admin');
   node.setPolicy('__define_operation__', 'role:admin');
+  node.setPolicy('noop', 'role:admin');
 
   node.createTrigger({
     triggerId: 'tos_threshold',
@@ -237,10 +244,11 @@ async function doAuth(isRegister) {
       return;
     }
     const key = await KeyPair.generate();
-    // CRABS user IDs are limited to 63 usable chars (CRABS_MAX_USER_ID=64
-    // minus the null terminator). The public key hex is 66 chars, so truncate.
+    // CRABS user IDs and data-item names are limited to 63 usable chars
+    // (CRABS_MAX_USER_ID=64 minus the null terminator). Names like vote_<userId>
+    // must also fit, so keep userIds short enough for per-user state items.
     const publicKeyHex = key.publicKeyHex();
-    const userId = publicKeyHex.slice(0, 63);
+    const userId = publicKeyHex.slice(0, 32);
     currentUser = {
       name,
       userId,
@@ -260,6 +268,13 @@ async function doAuth(isRegister) {
       return;
     }
     currentUser = existing;
+  }
+
+  // Announce the current user to the relay so other peers can verify their
+  // operations. Demo users have per-tab keys, so login must broadcast too.
+  if (!announcedUsers.has(currentUser.userId)) {
+    broadcastRegister(currentUser);
+    announcedUsers.add(currentUser.userId);
   }
 
   showPlayer();
@@ -429,7 +444,8 @@ async function runOperation(type, payload) {
 
 function broadcastOperation(bytes) {
   if (!ws || ws.readyState !== WebSocket.OPEN) return;
-  ws.send(JSON.stringify({ type: 'operation', payload: bytesToBase64(bytes) }));
+  const payload = bytesToBase64(bytes);
+  ws.send(JSON.stringify({ type: 'operation', payload }));
 }
 
 function broadcastFlagEvent(userId) {
@@ -482,6 +498,7 @@ function applyFlagEvent(userId) {
       node.incrementCounter('flag_count', 1, userId);
       node.setTime(Date.now());
       node.pruneExpiredTempAttrs();
+      node.evaluateTriggers();
     } catch (e) {
       console.warn('flag event apply failed', e);
     }
