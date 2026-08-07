@@ -126,6 +126,12 @@ const uint8_t* crabs_wasm_op_get_payload(operation_t* op) {
   return op ? op->payload : NULL;
 }
 
+EMSCRIPTEN_KEEPALIVE
+void crabs_wasm_op_init_uuid(operation_t* op) {
+  if (!op) return;
+  crypto_random_bytes(op->uuid, CRABS_UUID_SIZE);
+}
+
 // ============================================================
 // Signing
 // ============================================================
