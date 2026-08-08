@@ -111,7 +111,9 @@ EXPORTED_FUNCTIONS='[
   "_malloc",
   "_free",
   "_crabs_wasm_register_handler",
-  "_crabs_wasm_unregister_handler"
+  "_crabs_wasm_unregister_handler",
+  "_crabs_wasm_handler_get_am",
+  "_crabs_wasm_handler_op_get_payload_str"
 ]'
 
 echo "Compiling CRABS sources..."

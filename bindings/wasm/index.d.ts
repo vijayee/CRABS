@@ -26,6 +26,27 @@ export namespace Operation {
   deserialize(bytes: Uint8Array): Promise<Operation>;
 }
 
+export interface HandlerState {
+  incrementCounter(name: string, delta?: number, nodeId?: string): void;
+  incrementPNCounter(name: string, delta?: number, nodeId?: string): void;
+  decrementPNCounter(name: string, delta?: number, nodeId?: string): void;
+  setRegister(name: string, value: number, nodeId?: string): void;
+  setAdd(name: string, element: string, tag?: string): void;
+  setRemove(name: string, element: string): void;
+  flagSet(name: string, setBy: string, setAt?: number): void;
+  getCounter(name: string): number;
+  getPNCounter(name: string): number;
+  getRegister(name: string): number;
+  setContains(name: string, element: string): boolean;
+}
+
+export interface HandlerOperation {
+  type: string;
+  signerId: string;
+  nodeId: string;
+  payload: string | undefined;
+}
+
 export interface UserInfo {
   userId: string;
   publicKeyHex: string;
@@ -94,6 +115,12 @@ export interface Node {
   execute(op: Operation): void;
   sign(op: Operation, key: KeyPair | string): void;
   createTrigger(config: TriggerConfig): void;
+
+  // Low-level handler: receives raw WASM pointers (statePtr, opPtr).
+  registerHandler(opType: string, handler: (statePtr: number, opPtr: number) => number): void;
+  // High-level handler: receives a mutable HandlerState proxy and a HandlerOperation.
+  registerHandlerJs(opType: string, handler: (state: HandlerState, op: HandlerOperation) => number): void;
+  unregisterHandler(opType: string): void;
 
   encrypt(payload: Uint8Array | string, policy: string): Uint8Array;
   serialize(): Uint8Array;

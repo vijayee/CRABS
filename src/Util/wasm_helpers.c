@@ -484,4 +484,27 @@ void crabs_wasm_unregister_handler(attribute_machine_t* am, const char* op_type)
   state_machine_unregister_handler(&am->base_state, op_type);
 }
 
+// ============================================================
+// Handler context helpers
+//
+// User-defined handlers receive (state_t*, operation_t*). The state helpers
+// below let a JS handler obtain the attribute_machine_t* needed by the
+// name-based mutation helpers and read the operation fields.
+// ============================================================
+
+EMSCRIPTEN_KEEPALIVE
+attribute_machine_t* crabs_wasm_handler_get_am(state_t* state) {
+  return state ? state->attr_machine : NULL;
+}
+
+EMSCRIPTEN_KEEPALIVE
+const char* crabs_wasm_handler_op_get_payload_str(operation_t* op) {
+  if (op == NULL || op->payload == NULL || op->payload_size == 0) return NULL;
+  // Ensure null termination for JSON/string payloads. The operation payload
+  // is a byte buffer; if it is not null-terminated we cannot safely expose it
+  // as a C string. Demo payloads are null-terminated JSON strings.
+  if (op->payload[op->payload_size - 1] != '\0') return NULL;
+  return (const char*)op->payload;
+}
+
 #endif /* __EMSCRIPTEN__ */

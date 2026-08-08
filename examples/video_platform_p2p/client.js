@@ -137,6 +137,8 @@ async function registerUserInNode(user) {
   }
 }
 
+const CRABS_SUCCESS = 0;
+
 function initStateMachine() {
   node.addCounter('views');
   node.addPNCounter('likes');
@@ -148,9 +150,6 @@ function initStateMachine() {
   for (const u of localUsers.values()) {
     ensureUserState(u.userId);
   }
-
-  // Note: a "reply" operation type is defined in the state machine for future
-  // threading, but the UI only supports top-level comments in this demo.
 
   const adultPolicy = 'AND role:member adult';
   node.setPolicy('view', adultPolicy);
@@ -177,6 +176,63 @@ function initStateMachine() {
     durationMs: 3600000,
     oneShot: false,
     cooldownMs: 60000,
+  });
+
+  registerOperationHandlers();
+}
+
+function registerOperationHandlers() {
+  node.registerHandlerJs('view', (state, op) => {
+    state.incrementCounter('views', 1, op.signerId);
+    return CRABS_SUCCESS;
+  });
+
+  node.registerHandlerJs('like', (state, op) => {
+    const signer = op.signerId;
+    if (state.getRegister(`vote_${signer}`) === -1) {
+      state.decrementPNCounter('likes', 1, signer);
+    }
+    state.incrementPNCounter('likes', 1, signer);
+    state.setRegister(`vote_${signer}`, 1, signer);
+    return CRABS_SUCCESS;
+  });
+
+  node.registerHandlerJs('dislike', (state, op) => {
+    const signer = op.signerId;
+    if (state.getRegister(`vote_${signer}`) === 1) {
+      state.decrementPNCounter('likes', 1, signer);
+    }
+    state.setRegister(`vote_${signer}`, -1, signer);
+    return CRABS_SUCCESS;
+  });
+
+  node.registerHandlerJs('subscribe', (state, op) => {
+    state.setAdd('subscribers', op.signerId, `sub_${op.signerId}_${Date.now()}`);
+    return CRABS_SUCCESS;
+  });
+
+  node.registerHandlerJs('unsubscribe', (state, op) => {
+    state.setRemove('subscribers', op.signerId);
+    return CRABS_SUCCESS;
+  });
+
+  node.registerHandlerJs('flag', (state, op) => {
+    const signer = op.signerId;
+    if (!state.setContains('flaggers', signer)) {
+      state.setAdd('flaggers', signer, `flag_${signer}`);
+      state.incrementCounter('flag_count', 1, signer);
+    }
+    return CRABS_SUCCESS;
+  });
+
+  node.registerHandlerJs('comment', (state, op) => {
+    const signer = op.signerId;
+    if (op.payload) {
+      const tag = `comment_${signer}_${Date.now()}`;
+      state.setAdd('comments', op.payload, tag);
+      state.incrementCounter(`comments_made_${signer}`, 1, signer);
+    }
+    return CRABS_SUCCESS;
   });
 }
 
@@ -245,7 +301,10 @@ async function handleMessage(evt) {
       console.warn('incoming operation failed', e.message);
     }
   } else if (msg.type === 'flag_event' && msg.userId) {
-    applyFlagEvent(msg.userId);
+    // flag_event is a lightweight server ABE gate channel. The state mutation
+    // is already applied by the 'flag' handler when the signed operation is
+    // received; this just re-evaluates triggers in case of out-of-order arrival.
+    evaluateFlagTriggers();
     refreshUI();
   }
 }
@@ -427,16 +486,12 @@ function bindEngagement() {
 async function doLike() {
   if (!canAct()) return;
   await runOperation('like');
-  node.incrementPNCounter('likes', 1, currentUser.userId);
-  node.setRegister(`vote_${currentUser.userId}`, 1, currentUser.userId);
   refreshUI();
 }
 
 async function doDislike() {
   if (!canAct()) return;
   await runOperation('dislike');
-  node.decrementPNCounter('likes', 1, currentUser.userId);
-  node.setRegister(`vote_${currentUser.userId}`, -1, currentUser.userId);
   refreshUI();
 }
 
@@ -445,11 +500,6 @@ async function doSubscribe() {
   const subscribed = node.setContains('subscribers', currentUser.userId);
   const type = subscribed ? 'unsubscribe' : 'subscribe';
   await runOperation(type);
-  if (subscribed) {
-    node.setRemove('subscribers', currentUser.userId);
-  } else {
-    node.setAdd('subscribers', currentUser.userId, `sub_${currentUser.userId}_${Date.now()}`);
-  }
   refreshUI();
 }
 
@@ -460,7 +510,7 @@ async function doFlag() {
     return;
   }
   await runOperation('flag');
-  applyFlagEvent(currentUser.userId);
+  evaluateFlagTriggers();
   broadcastFlagEvent(currentUser.userId);
   refreshUI();
 }
@@ -470,7 +520,6 @@ async function doView() {
   if (viewRecorded) return;
   viewRecorded = true;
   await runOperation('view');
-  node.incrementCounter('views', 1, currentUser.userId);
   refreshUI();
 }
 
@@ -491,7 +540,6 @@ async function doComment() {
 
   await runOperation('comment', JSON.stringify(comment));
   applyLocalComment(comment);
-  node.incrementCounter(`comments_made_${currentUser.userId}`, 1, currentUser.userId);
   input.value = '';
   document.getElementById('commentError').textContent = '';
   refreshUI();
@@ -528,32 +576,12 @@ function applyOperationEffect(op) {
   ensureUserState(signer);
 
   switch (op.type) {
-    case 'view':
-      node.incrementCounter('views', 1, signer);
-      break;
-    case 'like':
-      node.incrementPNCounter('likes', 1, signer);
-      node.setRegister(`vote_${signer}`, 1, signer);
-      break;
-    case 'dislike':
-      node.decrementPNCounter('likes', 1, signer);
-      node.setRegister(`vote_${signer}`, -1, signer);
-      break;
-    case 'subscribe':
-      node.setAdd('subscribers', signer, `sub_${signer}_${Date.now()}`);
-      break;
-    case 'unsubscribe':
-      node.setRemove('subscribers', signer);
-      break;
     case 'flag':
-      applyFlagEvent(signer);
+      evaluateFlagTriggers();
       break;
     case 'comment': {
       const payload = op.payload;
-      if (payload) {
-        applyCommentPayload(payload);
-        node.incrementCounter(`comments_made_${signer}`, 1, signer);
-      }
+      if (payload) applyCommentPayload(payload);
       break;
     }
     default:
@@ -561,34 +589,28 @@ function applyOperationEffect(op) {
   }
 }
 
-function applyFlagEvent(userId) {
-  if (!node.setContains('flaggers', userId)) {
-    try {
-      node.setAdd('flaggers', userId, `flag_${userId}`);
-      node.incrementCounter('flag_count', 1, userId);
-      node.setTime(Date.now());
-      node.pruneExpiredTempAttrs();
-      node.evaluateTriggers();
-    } catch (e) {
-      console.warn('flag event apply failed', e);
-    }
+function evaluateFlagTriggers() {
+  try {
+    node.setTime(Date.now());
+    node.pruneExpiredTempAttrs();
+    node.evaluateTriggers();
+  } catch (e) {
+    console.warn('trigger evaluation failed', e);
   }
 }
 
 function applyLocalComment(comment) {
-  try {
-    node.setAdd('comments', JSON.stringify(comment), `comment_${comment.id}`);
-  } catch (e) {
-    // Duplicate comment entries are harmless.
-  }
+  // The CRDT mutation happens inside the registered 'comment' handler;
+  // this function only updates the local UI store.
   if (!commentsStore.find(c => c.id === comment.id)) {
     commentsStore.push(comment);
   }
 }
 
-function applyCommentPayload(payloadBuf) {
+function applyCommentPayload(payload) {
   try {
-    const comment = JSON.parse(new TextDecoder().decode(payloadBuf));
+    const text = typeof payload === 'string' ? payload : new TextDecoder().decode(payload);
+    const comment = JSON.parse(text);
     if (comment && comment.id) applyLocalComment(comment);
   } catch (e) {
     // Ignore malformed comment payloads.

@@ -604,11 +604,103 @@ class Node {
     wrapRc(rc, 'registerHandler');
   }
 
+  // High-level handler API: the handler receives a mutable state proxy and a
+  // JS operation object, and returns CRABS_SUCCESS (0) on success.
+  registerHandlerJs(opType, handler) {
+    const M = this._M;
+    const node = this;
+    const wrapper = (statePtr, opPtr) => {
+      const amPtr = M._crabs_wasm_handler_get_am(statePtr);
+      const op = {
+        type: readString(M, M._crabs_wasm_op_get_type(opPtr)),
+        signerId: readString(M, M._crabs_wasm_op_get_signer(opPtr)),
+        nodeId: readString(M, M._crabs_wasm_op_get_node(opPtr)),
+        payload: readString(M, M._crabs_wasm_handler_op_get_payload_str(opPtr)),
+      };
+      const state = {
+        getCounter(name) { return node._callCounterGetFromAm(M, amPtr, M._crabs_wasm_get_counter, name); },
+        getPNCounter(name) { return node._callCounterGetFromAm(M, amPtr, M._crabs_wasm_get_pn_counter, name); },
+        getRegister(name) { return node._callCounterGetFromAm(M, amPtr, M._crabs_wasm_get_register, name); },
+        setContains(name, element) { return node._callSetContainsFromAm(M, amPtr, name, element); },
+        incrementCounter(name, delta = 1, nodeId = 'system') { return node._callCounterFromAm(M, amPtr, M._crabs_wasm_increment_counter, name, delta, nodeId); },
+        incrementPNCounter(name, delta = 1, nodeId = 'system') { return node._callCounterFromAm(M, amPtr, M._crabs_wasm_increment_pn_counter, name, delta, nodeId); },
+        decrementPNCounter(name, delta = 1, nodeId = 'system') { return node._callCounterFromAm(M, amPtr, M._crabs_wasm_decrement_pn_counter, name, delta, nodeId); },
+        setRegister(name, value, nodeId = 'system') { return node._callSetRegisterFromAm(M, amPtr, name, value, nodeId); },
+        setAdd(name, element, tag = element) { return node._callSetAddFromAm(M, amPtr, name, element, tag); },
+        setRemove(name, element) { return node._callSetRemoveFromAm(M, amPtr, name, element); },
+        flagSet(name, setBy, setAt = 0) { return node._callFlagSetFromAm(M, amPtr, name, setBy, setAt); },
+      };
+      return handler(state, op);
+    };
+    this.registerHandler(opType, wrapper);
+  }
+
   unregisterHandler(opType) {
     const M = this._M;
     const typePtr = writeString(M, opType);
     M._crabs_wasm_unregister_handler(this._am, typePtr);
     if (typePtr) M._free(typePtr);
+  }
+
+  _callCounterGetFromAm(M, amPtr, fn, name) {
+    const nPtr = writeString(M, name);
+    const raw = fn(amPtr, nPtr);
+    if (nPtr) M._free(nPtr);
+    return typeof raw === 'bigint' ? Number(raw) : raw;
+  }
+
+  _callSetContainsFromAm(M, amPtr, name, element) {
+    const nPtr = writeString(M, name);
+    const ePtr = writeString(M, element);
+    const out = M._crabs_wasm_set_contains(amPtr, nPtr, ePtr);
+    freeAll(M, nPtr, ePtr);
+    return out;
+  }
+
+  _callCounterFromAm(M, amPtr, fn, name, delta, nodeId) {
+    const nPtr = writeString(M, name);
+    const idPtr = writeString(M, nodeId);
+    const rc = fn(amPtr, nPtr, BigInt(delta), idPtr);
+    freeAll(M, nPtr, idPtr);
+    if (rc !== 0) throw crabsError(rc, 'handler counter mutation');
+    return 0;
+  }
+
+  _callSetRegisterFromAm(M, amPtr, name, value, nodeId) {
+    const nPtr = writeString(M, name);
+    const idPtr = writeString(M, nodeId);
+    const rc = M._crabs_wasm_set_register(amPtr, nPtr, BigInt(value), idPtr);
+    freeAll(M, nPtr, idPtr);
+    if (rc !== 0) throw crabsError(rc, 'handler setRegister');
+    return 0;
+  }
+
+  _callSetAddFromAm(M, amPtr, name, element, tag) {
+    const nPtr = writeString(M, name);
+    const ePtr = writeString(M, element);
+    const tPtr = writeString(M, tag);
+    const rc = M._crabs_wasm_set_add(amPtr, nPtr, ePtr, tPtr);
+    freeAll(M, nPtr, ePtr, tPtr);
+    if (rc !== 0) throw crabsError(rc, 'handler setAdd');
+    return 0;
+  }
+
+  _callSetRemoveFromAm(M, amPtr, name, element) {
+    const nPtr = writeString(M, name);
+    const ePtr = writeString(M, element);
+    const rc = M._crabs_wasm_set_remove(amPtr, nPtr, ePtr);
+    freeAll(M, nPtr, ePtr);
+    if (rc !== 0) throw crabsError(rc, 'handler setRemove');
+    return 0;
+  }
+
+  _callFlagSetFromAm(M, amPtr, name, setBy, setAt) {
+    const nPtr = writeString(M, name);
+    const sPtr = writeString(M, setBy);
+    const rc = M._crabs_wasm_one_shot_flag_set(amPtr, nPtr, sPtr, BigInt(setAt));
+    freeAll(M, nPtr, sPtr);
+    if (rc !== 0) throw crabsError(rc, 'handler flagSet');
+    return 0;
   }
 
   destroy() {
