@@ -42,6 +42,19 @@ crabs_error_e dedup_apply_mutation_spec(state_t* state,
                                           const operation_t* op);
 
 // ============================================================
+// Atomic check-and-apply (§5.4)
+// ============================================================
+
+// Combined guard check + mutation in a single call. Eliminates the TOCTOU
+// window between the separate check and apply steps. The guard is evaluated
+// and, if it passes, the mutation is applied immediately.
+// Returns CRABS_SUCCESS if the guard passed and mutation was applied,
+// or an error code if the guard rejected the operation.
+crabs_error_e dedup_check_and_apply_spec(state_t* state,
+                                          const dedup_spec_t* spec,
+                                          const operation_t* op);
+
+// ============================================================
 // Desugaring helpers
 // ============================================================
 

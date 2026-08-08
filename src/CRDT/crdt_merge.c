@@ -573,40 +573,8 @@ crabs_error_e crdt_merge_state(state_t* dst, const state_t* src) {
     }
   }
 
-  // Merge processed_ops (union)
-  if (src->processed_ops != NULL && src->processed_op_count > 0) {
-    // Simple union: allocate enough for both, add only new ones from src
-    uint64_t new_count = 0;
-    for (uint64_t i = 0; i < src->processed_op_count; i++) {
-      bool found = false;
-      for (uint64_t j = 0; j < dst->processed_op_count; j++) {
-        if (memcmp(dst->processed_ops[j], src->processed_ops[i], CRABS_UUID_SIZE) == 0) {
-          found = true;
-          break;
-        }
-      }
-      if (!found) new_count++;
-    }
-    if (new_count > 0) {
-      uint8_t(*new_ops)[CRABS_UUID_SIZE] = realloc(dst->processed_ops,
-        (dst->processed_op_count + new_count) * CRABS_UUID_SIZE);
-      if (new_ops == NULL) return CRABS_ERR_OOM;
-      dst->processed_ops = new_ops;
-      for (uint64_t i = 0; i < src->processed_op_count; i++) {
-        bool found = false;
-        for (uint64_t j = 0; j < dst->processed_op_count; j++) {
-          if (memcmp(dst->processed_ops[j], src->processed_ops[i], CRABS_UUID_SIZE) == 0) {
-            found = true;
-            break;
-          }
-        }
-        if (!found) {
-          memcpy(dst->processed_ops[dst->processed_op_count], src->processed_ops[i], CRABS_UUID_SIZE);
-          dst->processed_op_count++;
-        }
-      }
-    }
-  }
+  // Transaction manager state is owned by the tx_manager, not merged here.
+  // If merging tx_manager state is needed, add a merge method to the vtable.
 
   // Version = max(dst.version, src.version)
   if (src->version > dst->version) {

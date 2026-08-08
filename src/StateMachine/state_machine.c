@@ -15,7 +15,7 @@
 #include "../Compaction/compaction_engine.h"
 #include "../Compaction/crdt_compaction.h"
 #include "../Util/allocator.h"
-#include "../Util/bloom_filter.h"
+#include "../TxManager/tx_manager.h"
 #include <string.h>
 #include <stdlib.h>
 #include <time.h>
@@ -154,28 +154,6 @@ bool operation_is_builtin(const char* type) {
           strcmp(type, CRABS_OP_COMPACT) == 0);
 }
 
-// Check whether an operation targets any compactible CRDT type (2P-Set or
-// PN-Counter). These types lose semantic information during compaction,
-// so late-arriving operations on them must be checked against the bloom filter.
-static bool _op_targets_compactible_type(state_t* state, const operation_t* op) {
-  if (state == NULL || op == NULL) return false;
-  for (uint32_t i = 0; i < op->resource_count; i++) {
-    const data_item_t* item = state_find_item(state, op->resources[i]);
-    if (item == NULL) continue;
-    if (item->type == DATA_TYPE_2P_SET || item->crdt_type == CRDT_2P_SET) return true;
-    if (item->type == DATA_TYPE_PN_COUNTER || item->crdt_type == CRDT_PN_COUNTER) return true;
-  }
-  return false;
-}
-
-// Lazily allocate the compaction bloom filter on first use.
-static crabs_bloom_filter_t* _ensure_bloom(state_t* state) {
-  if (state->compaction_bloom == NULL) {
-    state->compaction_bloom = get_clear_memory(sizeof(crabs_bloom_filter_t));
-  }
-  return (crabs_bloom_filter_t*)state->compaction_bloom;
-}
-
 operation_t* operation_create(const char* type) {
   operation_t* op = get_clear_memory(sizeof(operation_t));
   strncpy(op->type, type, CRABS_MAX_OP_NAME - 1);
@@ -310,33 +288,6 @@ uint32_t state_machine_prune_expired(state_t* state, uint64_t now_ms) {
 }
 
 // ============================================================
-// Duplicate operation check
-// ============================================================
-static bool is_duplicate_op(state_t* state, const uint8_t uuid[CRABS_UUID_SIZE]) {
-  for (uint64_t i = 0; i < state->processed_op_count; i++) {
-    if (memcmp(state->processed_ops[i], uuid, CRABS_UUID_SIZE) == 0) {
-      return true;
-    }
-  }
-  return false;
-}
-
-static void record_processed_op(state_t* state, const uint8_t uuid[CRABS_UUID_SIZE]) {
-  // Audit L-b: cap growth so a long-running node does not exhaust memory.
-  // Beyond the cap the op is not recorded; replay protection across
-  // sessions relies on Lamport clocks and signatures, and within-session
-  // idempotency covers the recent window.
-  if (state->processed_op_count >= CRABS_PROCESSED_OPS_MAX) return;
-  uint64_t new_count = state->processed_op_count + 1;
-  uint8_t(*new_ops)[CRABS_UUID_SIZE] = realloc(state->processed_ops,
-    new_count * CRABS_UUID_SIZE);
-  if (new_ops == NULL) return; // keep old array; op unrecorded (replay risk)
-  state->processed_ops = new_ops;
-  state->processed_op_count = new_count;
-  memcpy(state->processed_ops[state->processed_op_count - 1], uuid, CRABS_UUID_SIZE);
-}
-
-// ============================================================
 // Log helper
 // ============================================================
 // Compute a tamper-evident hash-chain entry: state_hash = SHA256(prev_hash ||
@@ -468,18 +419,15 @@ crabs_error_e state_machine_execute(state_t* state, operation_t* op) {
     attribute_machine_prune_expired_temporary(state->attr_machine);
   }
 
-  // Step 2: Idempotency check
-  if (is_duplicate_op(state, op->uuid)) {
-    return CRABS_SUCCESS;
-  }
-
-  // Step 2b: Compaction safety bloom filter check. If this operation targets
-  // a compactible type (2P-Set or PN-Counter) and its UUID is already in the
-  // bloom filter, its effects may have been compacted away — reject it.
-  if (_op_targets_compactible_type(state, op)) {
-    crabs_bloom_filter_t* bf = (crabs_bloom_filter_t*)state->compaction_bloom;
-    if (bf != NULL && crabs_bloom_contains(bf, op->uuid)) {
-      return CRABS_ERR_ALREADY_EXECUTED;
+  // Step 2: Transaction manager check (replay protection).
+  // Delegates to the pluggable tx_manager — may be a no-op, an in-memory
+  // hash set, or a persistent store. Returns CRABS_ERR_ALREADY_EXECUTED
+  // for duplicates (caller treats as idempotent success).
+  if (state->tx_manager != NULL) {
+    crabs_tx_manager_t* tx = (crabs_tx_manager_t*)state->tx_manager;
+    if (tx->vtable.accept != NULL) {
+      crabs_error_e tx_result = tx->vtable.accept(tx, state, op);
+      if (tx_result != CRABS_SUCCESS) return tx_result;
     }
   }
 
@@ -747,10 +695,11 @@ crabs_error_e state_machine_execute(state_t* state, operation_t* op) {
   }
 
   // Step 8: Apply dedup state mutation (v1.4 §5.3)
-  // Audit F-2: apply the same effective spec used in step 5 (registered wins
-  // over op-carried), so the mutation matches the guard that was checked.
+  // Uses the atomic check-and-apply to eliminate the TOCTOU window between
+  // the guard check (step 5) and this mutation. The guard is re-evaluated
+  // and the mutation applied in a single call.
   if (effective_dedup->type != DEDUP_NONE) {
-    crabs_error_e mut_result = dedup_apply_mutation_spec(state, effective_dedup, op);
+    crabs_error_e mut_result = dedup_check_and_apply_spec(state, effective_dedup, op);
     if (mut_result != CRABS_SUCCESS) {
       // Mutation failure doesn't roll back the operation,
       // but we log the error for diagnostics
@@ -770,16 +719,11 @@ crabs_error_e state_machine_execute(state_t* state, operation_t* op) {
              op->lamport_time, op->node_id, state_hash);
   state->version++;
 
-  // Record for idempotency
-  record_processed_op(state, op->uuid);
-
-  // If this operation targeted a compactible type, insert its UUID into the
-  // compaction safety bloom filter. A late-arriving replay of this operation
-  // will be caught by the check in step 2b.
-  if (_op_targets_compactible_type(state, op)) {
-    crabs_bloom_filter_t* bf = _ensure_bloom(state);
-    if (bf != NULL) {
-      crabs_bloom_add(bf, op->uuid);
+  // Step 8c: Commit to transaction manager (replay protection).
+  if (state->tx_manager != NULL) {
+    crabs_tx_manager_t* tx = (crabs_tx_manager_t*)state->tx_manager;
+    if (tx->vtable.commit != NULL) {
+      tx->vtable.commit(tx, state, op);
     }
   }
 

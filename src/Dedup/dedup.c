@@ -30,12 +30,11 @@ data_item_t* dedup_resolve_path(state_t* state, const char* path) {
 // ============================================================
 // Dedup Guard Check (§5.2)
 // ============================================================
-// NOTE (audit L-9): the guard check (dedup_check_guard) and the mutation
-// (dedup_apply_mutation) are two separate steps performed in sequence by
-// state_machine_execute. This is a benign TOCTOU as long as execution stays
-// single-threaded per state — which it is today. If state_machine_execute
-// ever becomes concurrent, the guard/mutation pair must be made atomic
-// (e.g. a per-state lock around steps 5 and 8).
+// NOTE: state_machine_execute now uses dedup_check_and_apply_spec (below)
+// for the step 8 mutation, which re-checks the guard and applies the mutation
+// atomically in a single call. The step 5 guard check (dedup_check_guard_spec)
+// is a fast-fail before the handler runs; the step 8 atomic check-and-apply
+// is the authoritative enforcement.
 
 crabs_error_e dedup_check_guard_spec(const state_t* state,
                                         const dedup_spec_t* spec,
@@ -261,4 +260,118 @@ char* dedup_build_policy_guard(const dedup_spec_t* dedup, const char* signer_id)
   }
 
   return guard;
+}
+
+// ============================================================
+// Atomic check-and-apply (§5.4)
+// ============================================================
+// Eliminates the TOCTOU window between dedup_check_guard_spec (step 6) and
+// dedup_apply_mutation_spec (step 8) by performing both in a single call.
+// The guard is evaluated and, if it passes, the mutation is applied
+// immediately — no other operation can interleave.
+
+crabs_error_e dedup_check_and_apply_spec(state_t* state,
+                                          const dedup_spec_t* spec,
+                                          const operation_t* op) {
+  if (state == NULL || op == NULL || spec == NULL) return CRABS_ERR_INVALID_PARAM;
+
+  switch (spec->type) {
+    case DEDUP_NONE:
+      return CRABS_SUCCESS;
+
+    case DEDUP_PER_USER: {
+      data_item_t* tracker = state_find_item(state, spec->tracker_path);
+      if (tracker == NULL) return CRABS_ERR_TRACKER_NOT_FOUND;
+      if (tracker->type != DATA_TYPE_ONE_SHOT_SET) return CRABS_ERR_TRACKER_NOT_FOUND;
+
+      one_shot_set_t* set = (one_shot_set_t*)tracker->value;
+      if (set == NULL) return CRABS_ERR_TRACKER_NOT_FOUND;
+
+      // Guard: reject if signer already in set
+      if (one_shot_set_contains(set, op->signer_id)) {
+        return CRABS_ERR_ALREADY_PERFORMED;
+      }
+      // Mutation: add signer to set
+      return one_shot_set_add(set, op->signer_id);
+    }
+
+    case DEDUP_GLOBAL: {
+      data_item_t* flag_item = state_find_item(state, spec->flag_path);
+      if (flag_item == NULL) return CRABS_ERR_FLAG_NOT_FOUND;
+      if (flag_item->type != DATA_TYPE_ONE_SHOT_FLAG) return CRABS_ERR_FLAG_NOT_FOUND;
+
+      one_shot_flag_t* flag = (one_shot_flag_t*)flag_item->value;
+      if (flag == NULL) return CRABS_ERR_FLAG_NOT_FOUND;
+
+      // Guard: reject if flag already set
+      if (one_shot_flag_value(flag)) {
+        return CRABS_ERR_ALREADY_EXECUTED;
+      }
+      // Mutation: set the flag
+      return one_shot_flag_set(flag, op->signer_id, op->lamport_time);
+    }
+
+    case DEDUP_CUSTOM: {
+      // Guard: evaluate the condition
+      if (spec->condition[0] == '\0') return CRABS_ERR_CONDITION_NOT_MET;
+      condition_node_t* ast = condition_parse(spec->condition);
+      if (ast == NULL) return CRABS_ERR_CONDITION_NOT_MET;
+      bool passed = condition_evaluate(ast, state);
+      condition_node_destroy(ast);
+      if (!passed) return CRABS_ERR_CONDITION_NOT_MET;
+
+      // Mutation: apply the state mutation
+      const state_mutation_t* mut = &spec->update;
+      switch (mut->type) {
+        case MUTATION_SET_ADD: {
+          data_item_t* item = state_find_item(state, mut->set_path);
+          if (item == NULL) return CRABS_ERR_TRACKER_NOT_FOUND;
+          if (item->type != DATA_TYPE_ONE_SHOT_SET && item->type != DATA_TYPE_SET &&
+              item->type != DATA_TYPE_2P_SET) return CRABS_ERR_INVALID_PARAM;
+          one_shot_set_t* set = (one_shot_set_t*)item->value;
+          if (set == NULL) return CRABS_ERR_TRACKER_NOT_FOUND;
+          const char* elem = mut->element_value;
+          if (strcmp(elem, "{signer_id}") == 0) elem = op->signer_id;
+          return one_shot_set_add(set, elem);
+        }
+        case MUTATION_FLAG_SET: {
+          data_item_t* item = state_find_item(state, mut->flag_path);
+          if (item == NULL) return CRABS_ERR_FLAG_NOT_FOUND;
+          if (item->type != DATA_TYPE_ONE_SHOT_FLAG) return CRABS_ERR_FLAG_NOT_FOUND;
+          one_shot_flag_t* flag = (one_shot_flag_t*)item->value;
+          if (flag == NULL) return CRABS_ERR_FLAG_NOT_FOUND;
+          return one_shot_flag_set(flag, op->signer_id, op->lamport_time);
+        }
+        case MUTATION_COUNTER_INCREMENT: {
+          data_item_t* item = state_find_item(state, mut->counter_path);
+          if (item == NULL) return CRABS_ERR_RESOURCE_NOT_FOUND;
+          if (item->value == NULL) return CRABS_ERR_RESOURCE_NOT_FOUND;
+          if (item->type != DATA_TYPE_COUNTER && item->type != DATA_TYPE_PN_COUNTER &&
+              item->type != DATA_TYPE_RESOURCE) return CRABS_ERR_INVALID_PARAM;
+          int64_t* val = (int64_t*)item->value;
+          int64_t delta = (int64_t)mut->delta;
+          // Overflow guard
+          if (delta > 0 && *val > INT64_MAX - delta) return CRABS_ERR_INVALID_PARAM;
+          if (delta < 0 && *val < INT64_MIN - delta) return CRABS_ERR_INVALID_PARAM;
+          *val += delta;
+          return CRABS_SUCCESS;
+        }
+        case MUTATION_ASSIGN: {
+          data_item_t* item = state_find_item(state, mut->counter_path);
+          if (item == NULL) return CRABS_ERR_RESOURCE_NOT_FOUND;
+          if (item->value != NULL) {
+            int64_t* old = (int64_t*)item->value;
+            *old = atoll(mut->value);
+          }
+          return CRABS_SUCCESS;
+        }
+        case MUTATION_CUSTOM:
+        default:
+          return CRABS_SUCCESS;
+      }
+    }
+
+    default:
+      return CRABS_ERR_INVALID_PARAM;
+  }
 }

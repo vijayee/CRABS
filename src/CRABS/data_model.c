@@ -5,6 +5,7 @@
 #include "data_model.h"
 #include "../Trigger/trigger.h"
 #include "../Crypto/crypto.h"
+#include "../TxManager/tx_manager.h"
 #include "../OT/ot_ordered_set.h"
 #include "../OT/ot_document.h"
 #include "../OT/ot_tree.h"
@@ -93,8 +94,6 @@ state_t* state_create(void) {
   state->policy_count = 0;
   state->log = NULL;
   state->log_count = 0;
-  state->processed_ops = NULL;
-  state->processed_op_count = 0;
   state->triggers = NULL;
   state->trigger_count = 0;
   state->attr_machine = NULL;
@@ -125,10 +124,8 @@ void state_destroy(state_t* state) {
   }
   if (state->policies != NULL) free(state->policies);
   if (state->log != NULL) free(state->log);
-  if (state->processed_ops != NULL) free(state->processed_ops);
   if (state->op_type_defs != NULL) free(state->op_type_defs);
   if (state->op_handlers != NULL) free(state->op_handlers);
-  if (state->compaction_bloom != NULL) free(state->compaction_bloom);
   if (state->triggers != NULL) {
     for (uint32_t i = 0; i < state->trigger_count; i++) {
       if (state->triggers[i].condition_ast != NULL) {
@@ -136,6 +133,10 @@ void state_destroy(state_t* state) {
       }
     }
     free(state->triggers);
+  }
+  if (state->tx_manager != NULL) {
+    crabs_tx_manager_t* tx = (crabs_tx_manager_t*)state->tx_manager;
+    if (tx->vtable.destroy != NULL) tx->vtable.destroy(tx);
   }
   free(state);
 }

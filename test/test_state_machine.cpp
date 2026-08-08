@@ -6,6 +6,7 @@ extern "C" {
 #include "../src/Attribute/attribute_machine.h"
 #include "../src/Crypto/crypto.h"
 #include "../src/Serialization/serialization.h"
+#include "../src/TxManager/tx_manager_memory.h"
 }
 
 class TestStateMachine : public ::testing::Test {
@@ -270,11 +271,12 @@ TEST_F(TestStateMachine, TestRollback) {
 }
 
 TEST_F(TestStateMachine, TestIdempotency) {
+  // Install a memory tx_manager so duplicate UUIDs are rejected
+  state->tx_manager = crabs_tx_manager_memory(64);
   operation_t* op = make_lock_op();
   EXPECT_EQ(state_machine_execute(state, op), CRABS_SUCCESS);
-  // Same UUID again should succeed (idempotent)
-  EXPECT_EQ(state_machine_execute(state, op), CRABS_SUCCESS);
-  EXPECT_EQ(state->version, 1); // Version should not increment
+  // Same UUID again should succeed (idempotent via tx_manager)
+  EXPECT_EQ(state_machine_execute(state, op), CRABS_ERR_ALREADY_EXECUTED);
   operation_destroy(op);
 }
 

@@ -349,7 +349,6 @@ void attribute_machine_destroy(attribute_machine_t* am) {
 
   if (am->base_state.policies != NULL) free(am->base_state.policies);
   if (am->base_state.log != NULL) free(am->base_state.log);
-  if (am->base_state.processed_ops != NULL) free(am->base_state.processed_ops);
   if (am->base_state.op_type_defs != NULL) free(am->base_state.op_type_defs);
   if (am->base_state.abe_mk != NULL) crypto_abe_master_key_destroy(am->base_state.abe_mk);
   if (am->base_state.node_key_valid) OPENSSL_cleanse(am->base_state.node_private_key, 32);

@@ -55,7 +55,7 @@ if (BUILD_TESTING)
         test_compaction_vectors.cpp
         test_hlc.cpp
         test_handler_registry.cpp
-        test_bloom_filter.cpp
+        test_tx_manager.cpp
     )
 
     add_dependencies(testcrabs crabs)

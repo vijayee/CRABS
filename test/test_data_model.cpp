@@ -26,8 +26,7 @@ TEST(TestDataModel, StateCreateDefaults) {
   EXPECT_EQ(state->policy_count, (uint32_t)0);
   EXPECT_EQ(state->log, nullptr);
   EXPECT_EQ(state->log_count, (uint64_t)0);
-  EXPECT_EQ(state->processed_ops, nullptr);
-  EXPECT_EQ(state->processed_op_count, (uint64_t)0);
+  EXPECT_EQ(state->tx_manager, nullptr);
   EXPECT_EQ(state->triggers, nullptr);
   EXPECT_EQ(state->trigger_count, (uint32_t)0);
   EXPECT_EQ(state->attr_machine, nullptr);
@@ -507,8 +506,6 @@ TEST(TestDataModel, ProcessedOpsAfterExecution) {
 
   crabs_error_e rc = state_machine_execute(state, op);
   EXPECT_EQ(rc, CRABS_SUCCESS);
-  EXPECT_EQ(state->processed_op_count, (uint64_t)1);
-  EXPECT_EQ(memcmp(state->processed_ops[0], uuid1, CRABS_UUID_SIZE), 0);
 
   operation_destroy(op);
   crypto_ecdsa_keypair_destroy(node_key);

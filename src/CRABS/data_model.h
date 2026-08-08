@@ -285,8 +285,7 @@ typedef struct state_t {
   log_entry_t*    log;
   uint64_t        log_count;
   machine_config_t config;
-  uint8_t(*processed_ops)[CRABS_UUID_SIZE];
-  uint64_t        processed_op_count;
+  void*           tx_manager;           // crabs_tx_manager_t* — replay protection
   trigger_t*      triggers;
   uint32_t        trigger_count;
   attribute_machine_t* attr_machine;  // For key verification and policy evaluation
@@ -300,11 +299,6 @@ typedef struct state_t {
   // User-defined operation handler registry
   op_handler_entry_t* op_handlers;
   uint32_t            op_handler_count;
-  // Compaction safety bloom filter (crabs_bloom_filter_t*). Tracks operation
-  // UUIDs whose tombstones have been compacted away. Late-arriving operations
-  // on compactible types are checked against this filter to prevent replay
-  // of already-compacted mutations.
-  void* compaction_bloom;
   // v1.5.2 §4: Compaction config (crabs_tombstone_config_t*, if set auto-compaction runs after OT ops)
   void* compaction_config;
   // Audit F-3: optional compaction engine (crabs_compaction_engine_t*). When

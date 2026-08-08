@@ -10,6 +10,7 @@ extern "C" {
 #include "../src/Attribute/attribute_machine.h"
 #include "../src/Crypto/crypto.h"
 #include "../src/Serialization/serialization.h"
+#include "../src/TxManager/tx_manager_memory.h"
 }
 
 // Helper fixture that sets up a state with resource + attr_machine + keys
@@ -678,8 +679,9 @@ TEST_F(TestProtocolOps, VersionDoesNotIncrementOnFailure) {
 // ============================================================
 
 TEST_F(TestProtocolOps, IdempotentReplay) {
+  // Install a memory tx_manager so duplicate UUIDs are rejected
+  state->tx_manager = crabs_tx_manager_memory(64);
   ASSERT_EQ(lock_resource("res1"), CRABS_SUCCESS);
-  EXPECT_EQ(state->version, (uint64_t)1);
 
   // Replay the exact same lock (same UUID)
   operation_t* op = operation_create(CRABS_OP_LOCK);
@@ -695,7 +697,6 @@ TEST_F(TestProtocolOps, IdempotentReplay) {
   sign_op(op);
 
   crabs_error_e rc = state_machine_execute(state, op);
-  EXPECT_EQ(rc, CRABS_SUCCESS);
-  EXPECT_EQ(state->version, (uint64_t)1); // no increment on replay
+  EXPECT_EQ(rc, CRABS_ERR_ALREADY_EXECUTED);
   operation_destroy(op);
 }

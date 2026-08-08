@@ -145,7 +145,6 @@ static void destroy_state(state_t* state) {
   }
   if (state->policies) free(state->policies);
   if (state->log) free(state->log);
-  if (state->processed_ops) free(state->processed_ops);
   if (state->last_refresh_envelope)
     crypto_key_envelope_destroy((key_envelope_t*)state->last_refresh_envelope);
   free(state);
