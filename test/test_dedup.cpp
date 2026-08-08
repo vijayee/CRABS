@@ -8,6 +8,11 @@ extern "C" {
 #include "../src/CRDT/crdt_merge.h"
 }
 
+// Internal handlers not in public header — exposed for testing only.
+extern "C" {
+crabs_error_e state_machine_op_lock(state_t* state, operation_t* op, lock_response_t* response);
+}
+
 // ============================================================
 // DedupSpec enum tests
 // ============================================================

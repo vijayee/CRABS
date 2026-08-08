@@ -374,7 +374,7 @@ crabs_error_e crypto_ecdsa_sign(const uint8_t private_key[32],
 
   // Sign the digest (OpenSSL produces DER-encoded signature)
   unsigned char der_sig[128];
-  unsigned int der_sig_len = 0;
+  unsigned int der_sig_len = sizeof(der_sig);
   if (ECDSA_sign(0, digest, CRABS_HASH_SIZE, der_sig, &der_sig_len, eckey) != 1) {
     EC_KEY_free(eckey);
     return CRABS_ERR_CRYPTOGRAPHIC_ERROR;
@@ -700,7 +700,14 @@ abe_user_key_t* crypto_abe_keygen(const abe_master_key_t* mk, const char* attrs)
 
 void crypto_abe_user_key_destroy(abe_user_key_t* sk) {
   if (sk) {
-    if (sk->key_bytes) oabe_bytestring_free(sk->key_bytes);
+    if (sk->key_bytes) {
+      const uint8_t* key_data = oabe_bytestring_get_const_ptr(sk->key_bytes);
+      size_t key_len = oabe_bytestring_get_size(sk->key_bytes);
+      if (key_data != NULL && key_len > 0) {
+        OPENSSL_cleanse((void*)key_data, key_len);
+      }
+      oabe_bytestring_free(sk->key_bytes);
+    }
     if (sk->public_params) oabe_bytestring_free(sk->public_params);
     free(sk);
   }
@@ -1573,7 +1580,7 @@ key_envelope_t* crypto_key_envelope_deserialize(const abe_master_key_t* mk,
   uint32_t sk_len = 0;
   for (int i = 0; i < 4; i++) sk_len |= ((uint32_t)buf[pos + i]) << (i * 8);
   pos += 4;
-  if (pos + sk_len + CRABS_SIG_SIZE > len) {
+  if (pos > len || sk_len > len - pos || CRABS_SIG_SIZE > len - pos - sk_len) {
     free(env);
     return NULL;
   }

@@ -100,17 +100,22 @@ const signature_vtable_t* crypto_sig_scheme_get(signature_scheme_e scheme_id) {
 
 uint32_t crypto_sig_scheme_list(signature_scheme_e* out, uint32_t max_count) {
   if (out == NULL) return 0;
+  _ensure_registry_lock(); platform_mutex_lock(&_registry_lock);
   uint32_t count = _registry_count < max_count ? _registry_count : max_count;
   for (uint32_t i = 0; i < count; i++) {
     if (_registry[i] != NULL) {
       out[i] = _registry[i]->scheme_id;
     }
   }
+  platform_mutex_unlock(&_registry_lock);
   return count;
 }
 
 uint32_t crypto_sig_scheme_count(void) {
-  return _registry_count;
+  _ensure_registry_lock(); platform_mutex_lock(&_registry_lock);
+  uint32_t count = _registry_count;
+  platform_mutex_unlock(&_registry_lock);
+  return count;
 }
 
 // ============================================================
@@ -210,9 +215,17 @@ static signature_vtable_t _ecdsa_secp256k1_vtable = {
 void crypto_sig_scheme_init(void) {
   _ensure_registry_lock(); platform_mutex_lock(&_registry_lock);
   if (_registry_initialized) { platform_mutex_unlock(&_registry_lock); return; }
+  // Inline the ECDSA vtable registration while we hold the lock, so no other
+  // thread can see _registry_initialized before the built-in scheme is ready.
+  if (_registry_count < CRABS_MAX_REGISTERED_SCHEMES) {
+    signature_vtable_t* entry = get_clear_memory(sizeof(signature_vtable_t));
+    if (entry != NULL) {
+      memcpy(entry, &_ecdsa_secp256k1_vtable, sizeof(signature_vtable_t));
+      _registry[_registry_count++] = entry;
+    }
+  }
   _registry_initialized = true;
   platform_mutex_unlock(&_registry_lock);
-  crypto_sig_scheme_register(&_ecdsa_secp256k1_vtable);
 }
 
 void crypto_sig_scheme_cleanup(void) {

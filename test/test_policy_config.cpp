@@ -13,6 +13,11 @@ extern "C" {
 #include "../src/Util/allocator.h"
 }
 
+// Internal handlers not in public header — exposed for testing only.
+extern "C" {
+crabs_error_e state_machine_op_change_config(state_t* state, operation_t* op);
+}
+
 // ============================================================
 // SignatureConfig defaults and field access
 // ============================================================

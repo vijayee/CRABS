@@ -57,10 +57,12 @@ crabs_error_e crabs_vector_clock_increment(crabs_vector_clock_t* vc,
                                             const char* node_id) {
   if (vc == NULL || node_id == NULL) return CRABS_ERR_INVALID_PARAM;
 
-  // Increment existing entry
+  // Increment existing entry (saturating at UINT64_MAX to prevent wrap)
   for (uint32_t i = 0; i < vc->count; i++) {
     if (strcmp(vc->entries[i].node_id, node_id) == 0) {
-      vc->entries[i].sequence++;
+      if (vc->entries[i].sequence < UINT64_MAX) {
+        vc->entries[i].sequence++;
+      }
       return CRABS_SUCCESS;
     }
   }

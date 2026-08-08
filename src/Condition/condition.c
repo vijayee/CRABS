@@ -879,12 +879,11 @@ int64_t condition_resolve_path(const state_t* state, const char* path) {
       return v;
     }
     default:
-      // Only counter/register types store an int64_t value; casting any
-      // other CRDT's struct pointer to int64_t* is a type-confusion that
-      // can read out of bounds (e.g. a deserialized raw-byte value shorter
-      // than 8 bytes). Return 0 for non-numeric types instead of guessing.
       if (item->crdt_type == CRDT_LWW_REG || item->type == DATA_TYPE_REGISTER) {
-        return *(int64_t*)item->value;
+        const lww_register_t* reg = (const lww_register_t*)item->value;
+        if (reg != NULL && reg->value_size >= sizeof(int64_t)) {
+          return *(int64_t*)reg->value;
+        }
       }
       return 0;
   }
@@ -1135,6 +1134,8 @@ static void _ast_to_string(const condition_node_t* node, char* buf, size_t bufsi
   if (node == NULL || buf == NULL || bufsize == 0) return;
 
   size_t len = strlen(buf);
+  if (len >= bufsize) return;
+  size_t remaining = bufsize - len - 1;
 
   if (node->type == NODE_COMPARISON) {
     // Comparison: left_path op value
@@ -1150,16 +1151,21 @@ static void _ast_to_string(const condition_node_t* node, char* buf, size_t bufsi
       case CMP_BETWEEN:
         snprintf(tmp, sizeof(tmp), "%s BETWEEN %lld AND %lld",
                  node->left_path, (long long)node->right_literal, (long long)node->right_literal_2);
-        strncat(buf, tmp, bufsize - len - 1);
+        strncat(buf, tmp, remaining);
         return;
       case CMP_IN: {
         snprintf(tmp, sizeof(tmp), "%s IN (", node->left_path);
-        strncat(buf, tmp, bufsize - strlen(buf) - 1);
+        len = strlen(buf);
+        if (len < bufsize) strncat(buf, tmp, bufsize - len - 1);
         for (uint32_t i = 0; i < node->element_count; i++) {
-          if (i > 0) strncat(buf, ", ", bufsize - strlen(buf) - 1);
-          strncat(buf, node->element_values[i], bufsize - strlen(buf) - 1);
+          len = strlen(buf);
+          if (len >= bufsize) break;
+          if (i > 0) strncat(buf, ", ", bufsize - len - 1);
+          len = strlen(buf);
+          if (len < bufsize) strncat(buf, node->element_values[i], bufsize - len - 1);
         }
-        strncat(buf, ")", bufsize - strlen(buf) - 1);
+        len = strlen(buf);
+        if (len < bufsize) strncat(buf, ")", bufsize - len - 1);
         return;
       }
       default: op_str = "?"; break;
@@ -1170,17 +1176,21 @@ static void _ast_to_string(const condition_node_t* node, char* buf, size_t bufsi
     } else {
       snprintf(tmp, sizeof(tmp), "%s %s %lld", node->left_path, op_str, (long long)node->right_literal);
     }
-    strncat(buf, tmp, bufsize - len - 1);
+    strncat(buf, tmp, remaining);
   } else if (node->type == NODE_AND) {
     _ast_to_string(node->left, buf, bufsize);
-    strncat(buf, " AND ", bufsize - strlen(buf) - 1);
+    len = strlen(buf);
+    if (len < bufsize) strncat(buf, " AND ", bufsize - len - 1);
     _ast_to_string(node->right, buf, bufsize);
   } else if (node->type == NODE_OR) {
-    strncat(buf, "(", bufsize - strlen(buf) - 1);
+    len = strlen(buf);
+    if (len < bufsize) strncat(buf, "(", bufsize - len - 1);
     _ast_to_string(node->left, buf, bufsize);
-    strncat(buf, ") OR (", bufsize - strlen(buf) - 1);
+    len = strlen(buf);
+    if (len < bufsize) strncat(buf, ") OR (", bufsize - len - 1);
     _ast_to_string(node->right, buf, bufsize);
-    strncat(buf, ")", bufsize - strlen(buf) - 1);
+    len = strlen(buf);
+    if (len < bufsize) strncat(buf, ")", bufsize - len - 1);
   }
 }
 

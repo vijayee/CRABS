@@ -127,6 +127,8 @@ void state_destroy(state_t* state) {
   if (state->log != NULL) free(state->log);
   if (state->processed_ops != NULL) free(state->processed_ops);
   if (state->op_type_defs != NULL) free(state->op_type_defs);
+  if (state->op_handlers != NULL) free(state->op_handlers);
+  if (state->compaction_bloom != NULL) free(state->compaction_bloom);
   if (state->triggers != NULL) {
     for (uint32_t i = 0; i < state->trigger_count; i++) {
       if (state->triggers[i].condition_ast != NULL) {

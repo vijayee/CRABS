@@ -14,6 +14,13 @@ extern "C" {
 #include "test_helpers.h"
 }
 
+// Internal handlers not in public header — exposed for testing only.
+extern "C" {
+crabs_error_e state_machine_op_register_key(state_t* state, operation_t* op);
+crabs_error_e state_machine_op_revoke_key(state_t* state, operation_t* op);
+crabs_error_e state_machine_op_set_default_key(state_t* state, operation_t* op);
+}
+
 // ============================================================
 // Helper: Create a state with an attribute machine backed by a real
 // ECDSA admin keypair, with policies registered for all built-in ops.

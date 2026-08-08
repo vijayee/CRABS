@@ -1031,22 +1031,10 @@ crabs_error_e user_key_activate(user_t* user, const char* key_id) {
   key->suspended_at = 0;
   user->key_version++;
 
-  // If the user was suspended and now has an active key, reactivate
-  if (user->status == USER_SUSPENDED) {
-    // Check if user has at least one active key now
-    user_key_t* iter = user->keys;
-    bool has_active = false;
-    while (iter != NULL) {
-      if (iter->status == KEY_ACTIVE) {
-        has_active = true;
-        break;
-      }
-      iter = iter->next;
-    }
-    if (has_active) {
-      user->status = USER_ACTIVE;
-    }
-  }
+  // User status is NOT auto-reactivated here. A suspended user stays
+  // suspended even if a key is activated — reactivation requires an
+  // explicit administrative action. This prevents key activation from
+  // being used as a backdoor to unsuspend users.
 
   return CRABS_SUCCESS;
 }

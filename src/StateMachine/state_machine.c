@@ -15,12 +15,30 @@
 #include "../Compaction/compaction_engine.h"
 #include "../Compaction/crdt_compaction.h"
 #include "../Util/allocator.h"
+#include "../Util/bloom_filter.h"
 #include <string.h>
 #include <stdlib.h>
 #include <time.h>
 #include <openssl/rand.h>
 #include <openssl/crypto.h>
 #include <openssl/evp.h>
+
+// Forward declarations for handlers defined later in this file.
+// These are not in the public header — reachable only via state_machine_execute.
+crabs_error_e state_machine_op_lock(state_t* s, operation_t* o, lock_response_t* r);
+crabs_error_e state_machine_op_extend(state_t* s, operation_t* o);
+crabs_error_e state_machine_op_verify(state_t* s, operation_t* o);
+crabs_error_e state_machine_op_rollback(state_t* s, operation_t* o);
+crabs_error_e state_machine_op_unlock(state_t* s, operation_t* o);
+crabs_error_e state_machine_op_force_unlock(state_t* s, operation_t* o);
+crabs_error_e state_machine_op_change_config(state_t* s, operation_t* o);
+crabs_error_e state_machine_op_register_key(state_t* s, operation_t* o);
+crabs_error_e state_machine_op_revoke_key(state_t* s, operation_t* o);
+crabs_error_e state_machine_op_set_default_key(state_t* s, operation_t* o);
+crabs_error_e state_machine_op_suspend_key(state_t* s, operation_t* o);
+crabs_error_e state_machine_op_activate_key(state_t* s, operation_t* o);
+crabs_error_e state_machine_op_rotate_key(state_t* s, operation_t* o);
+crabs_error_e state_machine_op_compact(state_t* s, operation_t* o);
 
 // ============================================================
 // Transition Table (§6.3)
@@ -42,7 +60,9 @@ static const transition_t TRANSITIONS[] = {
   {PROTOCOL_LOCKED,   CRABS_OP_FORCE_UNLOCK,  PROTOCOL_IDLE},
   {PROTOCOL_ERROR,    CRABS_OP_ROLLBACK,      PROTOCOL_IDLE},
   {PROTOCOL_ERROR,    CRABS_OP_FORCE_UNLOCK,  PROTOCOL_IDLE},
-  {PROTOCOL_MODIFIED, CRABS_OP_VERIFY,        PROTOCOL_ERROR},
+  // Note: __verify__ on MODIFIED can transition to either VERIFIED or ERROR
+  // depending on invariant checks. The table records the primary (success)
+  // transition; the handler sets ERROR when invariants fail.
   // Key operations (v1.3 §5): valid in any state, no state change
   {PROTOCOL_IDLE,     CRABS_OP_REGISTER_KEY,    PROTOCOL_IDLE},
   {PROTOCOL_IDLE,     CRABS_OP_REVOKE_KEY,      PROTOCOL_IDLE},
@@ -132,6 +152,28 @@ bool operation_is_builtin(const char* type) {
           strcmp(type, CRABS_OP_CHECK_DEDUP) == 0 ||
           strcmp(type, CRABS_OP_EXECUTE_OT) == 0 ||
           strcmp(type, CRABS_OP_COMPACT) == 0);
+}
+
+// Check whether an operation targets any compactible CRDT type (2P-Set or
+// PN-Counter). These types lose semantic information during compaction,
+// so late-arriving operations on them must be checked against the bloom filter.
+static bool _op_targets_compactible_type(state_t* state, const operation_t* op) {
+  if (state == NULL || op == NULL) return false;
+  for (uint32_t i = 0; i < op->resource_count; i++) {
+    const data_item_t* item = state_find_item(state, op->resources[i]);
+    if (item == NULL) continue;
+    if (item->type == DATA_TYPE_2P_SET || item->crdt_type == CRDT_2P_SET) return true;
+    if (item->type == DATA_TYPE_PN_COUNTER || item->crdt_type == CRDT_PN_COUNTER) return true;
+  }
+  return false;
+}
+
+// Lazily allocate the compaction bloom filter on first use.
+static crabs_bloom_filter_t* _ensure_bloom(state_t* state) {
+  if (state->compaction_bloom == NULL) {
+    state->compaction_bloom = get_clear_memory(sizeof(crabs_bloom_filter_t));
+  }
+  return (crabs_bloom_filter_t*)state->compaction_bloom;
 }
 
 operation_t* operation_create(const char* type) {
@@ -352,6 +394,61 @@ static void append_log(state_t* state, const uint8_t uuid[CRABS_UUID_SIZE],
 }
 
 // ============================================================
+// User-Defined Operation Handler Registry
+// ============================================================
+
+crabs_error_e state_machine_register_handler(state_t* state, const char* op_type,
+                                              op_handler_fn handler) {
+  if (state == NULL || op_type == NULL || handler == NULL) return CRABS_ERR_INVALID_PARAM;
+
+  for (uint32_t i = 0; i < state->op_handler_count; i++) {
+    if (strcmp(state->op_handlers[i].op_type, op_type) == 0) {
+      state->op_handlers[i].handler = handler;
+      return CRABS_SUCCESS;
+    }
+  }
+
+  if (state->op_handler_count >= CRABS_MAX_OP_HANDLERS) return CRABS_ERR_OOM;
+
+  uint32_t new_count = state->op_handler_count + 1;
+  op_handler_entry_t* new_handlers = realloc(state->op_handlers,
+      new_count * sizeof(op_handler_entry_t));
+  if (new_handlers == NULL) return CRABS_ERR_OOM;
+  state->op_handlers = new_handlers;
+  uint32_t idx = state->op_handler_count;
+  state->op_handler_count = new_count;
+  memset(&state->op_handlers[idx], 0, sizeof(op_handler_entry_t));
+  strncpy(state->op_handlers[idx].op_type, op_type, CRABS_MAX_OP_NAME - 1);
+  state->op_handlers[idx].op_type[CRABS_MAX_OP_NAME - 1] = '\0';
+  state->op_handlers[idx].handler = handler;
+  return CRABS_SUCCESS;
+}
+
+void state_machine_unregister_handler(state_t* state, const char* op_type) {
+  if (state == NULL || op_type == NULL) return;
+  for (uint32_t i = 0; i < state->op_handler_count; i++) {
+    if (strcmp(state->op_handlers[i].op_type, op_type) == 0) {
+      if (i < state->op_handler_count - 1) {
+        memmove(&state->op_handlers[i], &state->op_handlers[i + 1],
+                (state->op_handler_count - i - 1) * sizeof(op_handler_entry_t));
+      }
+      state->op_handler_count--;
+      return;
+    }
+  }
+}
+
+op_handler_fn state_machine_find_handler(const state_t* state, const char* op_type) {
+  if (state == NULL || op_type == NULL) return NULL;
+  for (uint32_t i = 0; i < state->op_handler_count; i++) {
+    if (strcmp(state->op_handlers[i].op_type, op_type) == 0) {
+      return state->op_handlers[i].handler;
+    }
+  }
+  return NULL;
+}
+
+// ============================================================
 // Main Execution Algorithm (§7.4)
 // ============================================================
 crabs_error_e state_machine_execute(state_t* state, operation_t* op) {
@@ -374,6 +471,16 @@ crabs_error_e state_machine_execute(state_t* state, operation_t* op) {
   // Step 2: Idempotency check
   if (is_duplicate_op(state, op->uuid)) {
     return CRABS_SUCCESS;
+  }
+
+  // Step 2b: Compaction safety bloom filter check. If this operation targets
+  // a compactible type (2P-Set or PN-Counter) and its UUID is already in the
+  // bloom filter, its effects may have been compacted away — reject it.
+  if (_op_targets_compactible_type(state, op)) {
+    crabs_bloom_filter_t* bf = (crabs_bloom_filter_t*)state->compaction_bloom;
+    if (bf != NULL && crabs_bloom_contains(bf, op->uuid)) {
+      return CRABS_ERR_ALREADY_EXECUTED;
+    }
   }
 
   // Step 3: Authorization (§10.3) — fail closed. Every operation requires a
@@ -557,6 +664,7 @@ crabs_error_e state_machine_execute(state_t* state, operation_t* op) {
 
   // Step 7: Execute operation handler
   crabs_error_e result;
+  op_handler_fn custom_handler = NULL;
   if (strcmp(op->type, CRABS_OP_LOCK) == 0) {
     lock_response_t lock_resp;
     memset(&lock_resp, 0, sizeof(lock_resp));
@@ -608,23 +716,22 @@ crabs_error_e state_machine_execute(state_t* state, operation_t* op) {
     // Compaction operation (v1.5.2 §4.3)
     result = state_machine_op_compact(state, op);
   } else {
-    // Audit F-5: non-builtin (application-defined) operations have no C
-    // handler in this implementation. Their effect is the dedup state
-    // mutation (step 8) plus the protocol transition applied below.
-    // Previously the dispatch rejected them, which left the LOCKED→MODIFIED
-    // transition unreachable and made __verify__/__unlock__ impossible (the
-    // entire resource lifecycle could only end in force-unlock/rollback).
-    result = CRABS_SUCCESS;
+    // Check user-defined handler registry for non-builtin operation types
+    custom_handler = state_machine_find_handler(state, op->type);
+    if (custom_handler != NULL) {
+      result = custom_handler(state, op);
+    } else {
+      result = CRABS_SUCCESS;
+    }
   }
 
   if (result != CRABS_SUCCESS) return result;
 
   // Step 7b: Apply protocol state transitions for non-builtin operations
   // (§6.3 wildcard: LOCKED → MODIFIED). Builtin operations manage their own
-  // protocol state in their handlers (e.g. __lock__ sets LOCKED, __verify__
-  // sets VERIFIED or ERROR). This is the only path that reaches MODIFIED,
-  // without which __verify__ (which requires MODIFIED) can never succeed.
-  if (!operation_is_builtin(op->type)) {
+  // protocol state in their handlers. Skip when a custom handler was invoked
+  // — the handler owns its own protocol state transitions.
+  if (!operation_is_builtin(op->type) && custom_handler == NULL) {
     for (uint32_t i = 0; i < op->resource_count; i++) {
       data_item_t* item = state_find_item(state, op->resources[i]);
       if (item == NULL) return CRABS_ERR_RESOURCE_NOT_FOUND;
@@ -665,6 +772,16 @@ crabs_error_e state_machine_execute(state_t* state, operation_t* op) {
 
   // Record for idempotency
   record_processed_op(state, op->uuid);
+
+  // If this operation targeted a compactible type, insert its UUID into the
+  // compaction safety bloom filter. A late-arriving replay of this operation
+  // will be caught by the check in step 2b.
+  if (_op_targets_compactible_type(state, op)) {
+    crabs_bloom_filter_t* bf = _ensure_bloom(state);
+    if (bf != NULL) {
+      crabs_bloom_add(bf, op->uuid);
+    }
+  }
 
   // Step 9: Process triggers (Amendment 1, §5.2)
   // Pass the attribute machine so trigger effects (e.g. ISSUE_ATTRIBUTE) can
@@ -944,7 +1061,11 @@ crabs_error_e state_machine_op_change_config(state_t* state, operation_t* op) {
     state->config.max_lock_extensions = val;
   }
   if ((v = _config_value_after(payload_str, "allow_force_unlock")) != NULL) {
-    state->config.allow_force_unlock = (strcmp(v, "true") == 0);
+    bool requested = (strcmp(v, "true") == 0);
+    if (!requested && state->config.allow_force_unlock) {
+      return CRABS_ERR_UNAUTHORIZED;
+    }
+    state->config.allow_force_unlock = requested;
   }
   if ((v = _config_value_after(payload_str, "default_scheme")) != NULL) {
     state->config.sig_config.default_scheme = (signature_scheme_e)atoi(v);
@@ -960,6 +1081,7 @@ crabs_error_e state_machine_op_change_config(state_t* state, operation_t* op) {
   }
   if ((v = _config_value_after(payload_str, "co_sign_threshold")) != NULL) {
     uint32_t val = (uint32_t)atol(v);
+    if (val == 0) return CRABS_ERR_UNAUTHORIZED;
     if (val > 32) val = 32;
     state->config.sig_config.co_sign_threshold = val;
   }

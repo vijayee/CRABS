@@ -14,6 +14,11 @@ extern "C" {
 #include "test_helpers.h"
 }
 
+// Internal handlers not in public header — exposed for testing only.
+extern "C" {
+crabs_error_e state_machine_op_change_config(state_t* state, operation_t* op);
+}
+
 // ============================================================
 // Helper: create attribute machine with admin user
 // ============================================================
@@ -223,43 +228,24 @@ TEST(TestKeyLifecycle, ActivateRejectsExpiredKey) {
   attribute_machine_destroy(am);
 }
 
-TEST(TestKeyLifecycle, ActivateReactivatesSuspendedUser) {
+TEST(TestKeyLifecycle, ActivateDoesNotReactivatesSuspendedUser) {
+  // Key activation should NOT auto-reactivate a suspended user.
+  // Reactivation requires an explicit administrative action.
   attribute_machine_t* am = create_am_lifecycle();
   user_t* admin = attribute_machine_find_user(am, "admin");
-
-  uint8_t pk[33];
-  _gen_pk_lifecycle(pk);
-  ASSERT_EQ(user_key_register(admin, "k1", ECDSA_SECP256K1, pk, 33, "primary"), CRABS_SUCCESS);
-
-  // Revoke the only key, which suspends the user
-  ASSERT_EQ(user_key_revoke(admin, "k1"), CRABS_SUCCESS);
-  EXPECT_EQ(admin->status, USER_SUSPENDED);
-
-  // Register a new key (admin is suspended but we bypass check here)
-  user_key_t* new_key = user_key_find(admin, "k1");
-  // Actually, we can't register a new key on a suspended user through
-  // the state machine. But we can directly activate a key if one existed.
-  // Let's test the scenario where a key is suspended but not revoked:
-  attribute_machine_destroy(am);
-
-  // Better test: register two keys, suspend one, revoke the other (user suspended),
-  // then activate the suspended key
-  am = create_am_lifecycle();
-  admin = attribute_machine_find_user(am, "admin");
   uint8_t pk1[33]; _gen_pk_lifecycle(pk1);
   uint8_t pk2[33]; _gen_pk_lifecycle(pk2);
   ASSERT_EQ(user_key_register(admin, "k1", ECDSA_SECP256K1, pk1, 33, "primary"), CRABS_SUCCESS);
   ASSERT_EQ(user_key_register(admin, "k2", ECDSA_SECP256K1, pk2, 33, "secondary"), CRABS_SUCCESS);
 
-  // Suspend k1, revoke k2
+  // Suspend k1, revoke k2 — no active keys, user becomes suspended
   ASSERT_EQ(user_key_suspend(admin, "k1"), CRABS_SUCCESS);
   ASSERT_EQ(user_key_revoke(admin, "k2"), CRABS_SUCCESS);
-  // k1 is suspended (not active), k2 is revoked, no active keys -> user suspended
   EXPECT_EQ(admin->status, USER_SUSPENDED);
 
-  // Activate k1
+  // Activate k1 — key becomes active, but user stays suspended
   ASSERT_EQ(user_key_activate(admin, "k1"), CRABS_SUCCESS);
-  EXPECT_EQ(admin->status, USER_ACTIVE);
+  EXPECT_EQ(admin->status, USER_SUSPENDED);  // NOT reactivated
 
   attribute_machine_destroy(am);
 }

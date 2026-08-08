@@ -109,7 +109,9 @@ EXPORTED_FUNCTIONS='[
   "_crabs_serialize_state",
   "_serialized_buffer_destroy",
   "_malloc",
-  "_free"
+  "_free",
+  "_crabs_wasm_register_handler",
+  "_crabs_wasm_unregister_handler"
 ]'
 
 echo "Compiling CRABS sources..."

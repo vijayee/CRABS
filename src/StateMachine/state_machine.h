@@ -68,6 +68,18 @@ typedef struct {
 } operation_t;
 
 // ============================================================
+// User-Defined Operation Handler Registry
+// ============================================================
+#define CRABS_MAX_OP_HANDLERS  32
+
+typedef crabs_error_e (*op_handler_fn)(state_t* state, operation_t* op);
+
+typedef struct op_handler_entry_t {
+  char           op_type[CRABS_MAX_OP_NAME];
+  op_handler_fn  handler;
+} op_handler_entry_t;
+
+// ============================================================
 // Lock Response (§7.3.1)
 // ============================================================
 typedef struct {
@@ -85,37 +97,17 @@ bool           state_machine_is_valid_transition(protocol_state_e current, const
 crabs_error_e  state_machine_execute(state_t* state, operation_t* op);
 uint32_t       state_machine_prune_expired(state_t* state, uint64_t now_ms);
 
-// Built-in operations
-crabs_error_e  state_machine_op_lock(state_t* state, operation_t* op, lock_response_t* response);
-crabs_error_e  state_machine_op_extend(state_t* state, operation_t* op);
-crabs_error_e  state_machine_op_verify(state_t* state, operation_t* op);
-crabs_error_e  state_machine_op_rollback(state_t* state, operation_t* op);
-crabs_error_e  state_machine_op_unlock(state_t* state, operation_t* op);
-crabs_error_e  state_machine_op_force_unlock(state_t* state, operation_t* op);
-crabs_error_e  state_machine_op_change_config(state_t* state, operation_t* op);
-
-// Built-in trigger operations (Amendment 1, §4)
+// Built-in trigger operations (Amendment 1, §4) — defined in trigger.c
 crabs_error_e  state_machine_op_create_trigger(state_t* state, operation_t* op);
 crabs_error_e  state_machine_op_delete_trigger(state_t* state, operation_t* op);
 crabs_error_e  state_machine_op_disable_trigger(state_t* state, operation_t* op);
 crabs_error_e  state_machine_op_enable_trigger(state_t* state, operation_t* op);
 
-// Built-in key operations (v1.3 Amendment 3, §5)
-crabs_error_e  state_machine_op_register_key(state_t* state, operation_t* op);
-crabs_error_e  state_machine_op_revoke_key(state_t* state, operation_t* op);
-crabs_error_e  state_machine_op_set_default_key(state_t* state, operation_t* op);
-
-// Key lifecycle operations (v1.3 §9)
-crabs_error_e  state_machine_op_suspend_key(state_t* state, operation_t* op);
-crabs_error_e  state_machine_op_activate_key(state_t* state, operation_t* op);
-crabs_error_e  state_machine_op_rotate_key(state_t* state, operation_t* op);
-
-// Dedup built-in operations (v1.4 §7)
+// These handlers are called from CLI and must remain public. All other
+// built-in operation handlers are static in state_machine.c — they can
+// only be reached through state_machine_execute, which enforces auth.
 crabs_error_e  state_machine_op_define_operation(state_t* state, operation_t* op);
 crabs_error_e  state_machine_op_check_dedup(state_t* state, operation_t* op);
-
-// Compaction built-in operation (v1.5.2 §4.3)
-crabs_error_e  state_machine_op_compact(state_t* state, operation_t* op);
 
 // Auto-compact items that need compaction (v1.5.2 §4)
 // Returns count of items compacted. Requires compaction_config on state.
@@ -134,6 +126,12 @@ typedef struct {
 
 crabs_error_e  state_machine_op_refresh_key(state_t* state, operation_t* op,
                                              refresh_key_response_t* response);
+
+// User-defined operation handler registry
+crabs_error_e  state_machine_register_handler(state_t* state, const char* op_type,
+                                               op_handler_fn handler);
+void           state_machine_unregister_handler(state_t* state, const char* op_type);
+op_handler_fn  state_machine_find_handler(const state_t* state, const char* op_type);
 
 // Operation lifecycle
 operation_t*   operation_create(const char* type);

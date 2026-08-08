@@ -18,6 +18,11 @@ extern "C" {
 #include "test_helpers.h"
 }
 
+// Internal handlers not in public header — exposed for testing only.
+extern "C" {
+crabs_error_e state_machine_op_compact(state_t* state, operation_t* op);
+}
+
 // ============================================================
 // CRABS_OP_COMPACT constant
 // ============================================================

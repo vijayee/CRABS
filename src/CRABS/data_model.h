@@ -14,6 +14,7 @@
 // Forward declarations
 typedef struct trigger_t trigger_t;
 typedef struct attribute_machine_t attribute_machine_t;
+typedef struct op_handler_entry_t op_handler_entry_t;
 
 // ============================================================
 // Data Types (§5.1)
@@ -296,6 +297,14 @@ typedef struct state_t {
   // v1.4: Operation type definitions (§7)
   op_type_def_t* op_type_defs;
   uint32_t       op_type_def_count;
+  // User-defined operation handler registry
+  op_handler_entry_t* op_handlers;
+  uint32_t            op_handler_count;
+  // Compaction safety bloom filter (crabs_bloom_filter_t*). Tracks operation
+  // UUIDs whose tombstones have been compacted away. Late-arriving operations
+  // on compactible types are checked against this filter to prevent replay
+  // of already-compacted mutations.
+  void* compaction_bloom;
   // v1.5.2 §4: Compaction config (crabs_tombstone_config_t*, if set auto-compaction runs after OT ops)
   void* compaction_config;
   // Audit F-3: optional compaction engine (crabs_compaction_engine_t*). When

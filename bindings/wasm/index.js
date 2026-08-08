@@ -593,6 +593,24 @@ class Node {
     wrapRc(rcExec, 'evaluateTriggers execute');
   }
 
+  registerHandler(opType, handler) {
+    const M = this._M;
+    const typePtr = writeString(M, opType);
+    if (!this._handlers) this._handlers = [];
+    const wrapped = M.addFunction(handler, 'ipp');
+    this._handlers.push(wrapped);
+    const rc = M._crabs_wasm_register_handler(this._am, typePtr, wrapped);
+    if (typePtr) M._free(typePtr);
+    wrapRc(rc, 'registerHandler');
+  }
+
+  unregisterHandler(opType) {
+    const M = this._M;
+    const typePtr = writeString(M, opType);
+    M._crabs_wasm_unregister_handler(this._am, typePtr);
+    if (typePtr) M._free(typePtr);
+  }
+
   destroy() {
     if (this._am) { this._M._crabs_wasm_node_destroy(this._am); this._am = null; }
   }

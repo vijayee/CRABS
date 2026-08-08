@@ -10,6 +10,8 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <time.h>
+#include <errno.h>
+#include <limits.h>
 
 // ============================================================
 // Trigger Effect Creation
@@ -253,11 +255,14 @@ crabs_error_e state_machine_op_create_trigger(state_t* state, operation_t* op) {
   char policy_operation[CRABS_MAX_OP_NAME] = {0};
   char policy_expression[CRABS_MAX_POLICY_EXPR] = {0};
 
-  // Make a mutable copy of the payload
+  // Reject oversized payloads — truncation could change the meaning of
+  // security-critical fields like policy_expression or condition.
+  if (op->payload_size >= 4096) {
+    return CRABS_ERR_INVALID_PARAM;
+  }
   char buf[4096];
-  { size_t _c = op->payload_size < sizeof(buf) - 1 ? op->payload_size : (uint32_t)(sizeof(buf) - 1);
-    memcpy(buf, op->payload, _c);
-    buf[_c] = '\0'; }
+  memcpy(buf, op->payload, op->payload_size);
+  buf[op->payload_size] = '\0';
 
   char* saveptr = NULL;
   char* token = platform_strtok_r(buf, ";", &saveptr);
@@ -282,19 +287,29 @@ crabs_error_e state_machine_op_create_trigger(state_t* state, operation_t* op) {
     } else if (strcmp(key, "description") == 0) {
       strncpy(description, value, CRABS_MAX_POLICY_EXPR - 1);
     } else if (strcmp(key, "effect_type") == 0) {
-      effect_type = (trigger_effect_type_e)atoi(value);
+      errno = 0;
+      long ev = strtol(value, NULL, 10);
+      if (errno == 0 && ev >= 0 && ev <= 0xFF) {
+        effect_type = (trigger_effect_type_e)ev;
+      }
     } else if (strcmp(key, "cooldown_ms") == 0) {
-      cooldown_ms = (uint64_t)atoll(value);
+      errno = 0;
+      cooldown_ms = strtoull(value, NULL, 10);
+      if (errno != 0) cooldown_ms = 0;
     } else if (strcmp(key, "one_shot") == 0) {
       one_shot = (strcmp(value, "1") == 0 || strcmp(value, "true") == 0);
     } else if (strcmp(key, "expires_at") == 0) {
-      expires_at = (uint64_t)atoll(value);
+      errno = 0;
+      expires_at = strtoull(value, NULL, 10);
+      if (errno != 0) expires_at = 0;
     } else if (strcmp(key, "issue_attribute") == 0) {
       strncpy(issue_attribute, value, CRABS_MAX_POLICY_EXPR - 1);
     } else if (strcmp(key, "target_role") == 0) {
       strncpy(target_role, value, CRABS_MAX_USER_ID - 1);
     } else if (strcmp(key, "duration_ms") == 0) {
-      duration_ms = (uint64_t)atoll(value);
+      errno = 0;
+      duration_ms = strtoull(value, NULL, 10);
+      if (errno != 0) duration_ms = 0;
     } else if (strcmp(key, "attribute_value") == 0) {
       strncpy(attribute_value, value, CRABS_MAX_POLICY_EXPR - 1);
     } else if (strcmp(key, "policy_operation") == 0) {

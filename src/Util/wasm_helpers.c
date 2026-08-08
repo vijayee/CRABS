@@ -466,4 +466,22 @@ serialized_buffer_t* crabs_wasm_serialize_state(attribute_machine_t* am) {
   return am ? crabs_serialize_state(&am->base_state) : NULL;
 }
 
+// ============================================================
+// User-defined operation handler registry
+// ============================================================
+
+EMSCRIPTEN_KEEPALIVE
+crabs_error_e crabs_wasm_register_handler(attribute_machine_t* am,
+                                           const char* op_type,
+                                           op_handler_fn handler) {
+  if (am == NULL || op_type == NULL || handler == NULL) return CRABS_ERR_INVALID_PARAM;
+  return state_machine_register_handler(&am->base_state, op_type, handler);
+}
+
+EMSCRIPTEN_KEEPALIVE
+void crabs_wasm_unregister_handler(attribute_machine_t* am, const char* op_type) {
+  if (am == NULL || op_type == NULL) return;
+  state_machine_unregister_handler(&am->base_state, op_type);
+}
+
 #endif /* __EMSCRIPTEN__ */

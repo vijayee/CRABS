@@ -503,6 +503,27 @@ TEST_F(TestProtocolOps, ChangeConfigMaxExtensions) {
 }
 
 TEST_F(TestProtocolOps, ChangeConfigAllowForceUnlock) {
+  // allow_force_unlock defaults to true. Setting it to false is rejected —
+  // once enabled, force_unlock cannot be disabled to prevent permanent DoS.
+  operation_t* op = operation_create(CRABS_OP_CHANGE_CONFIG);
+  memset(op->uuid, 0xB1, CRABS_UUID_SIZE);
+  const char* payload = "allow_force_unlock=false";
+  op->payload = (uint8_t*)strdup(payload);
+  op->payload_size = strlen(payload);
+  op->resource_count = 0;
+  strncpy(op->signer_id, "alice", CRABS_MAX_USER_ID - 1);
+  sign_op(op);
+
+  crabs_error_e rc = state_machine_execute(state, op);
+  EXPECT_EQ(rc, CRABS_ERR_UNAUTHORIZED);
+  EXPECT_EQ(state->config.allow_force_unlock, true);  // unchanged
+  operation_destroy(op);
+}
+
+TEST_F(TestProtocolOps, ChangeConfigAllowForceUnlockAlreadyFalse) {
+  // Setting allow_force_unlock=false when it's already false is a no-op
+  // (not a security violation — there's nothing to disable).
+  state->config.allow_force_unlock = false;
   operation_t* op = operation_create(CRABS_OP_CHANGE_CONFIG);
   memset(op->uuid, 0xB1, CRABS_UUID_SIZE);
   const char* payload = "allow_force_unlock=false";
