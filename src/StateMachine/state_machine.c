@@ -513,17 +513,15 @@ crabs_error_e state_machine_execute(state_t* state, operation_t* op) {
     }
   }
 
-  // Step 6: Dedup guard check (v1.4 §5.2)
-  // Audit F-2: enforce the SERVER-REGISTERED dedup spec when one exists for
-  // this operation type, so a signer cannot bypass "vote once" by setting
-  // dedup.type = DEDUP_NONE (or a trivial custom condition) on the wire. The
-  // op-carried spec is only consulted when no spec is registered for the
-  // operation type (legacy/dynamic ops). The registered spec also wins for
-  // the mutation in step 8.
+  // Step 6: Dedup check-and-apply (v1.4 §5.2-5.3)
+  // Runs BEFORE the handler so the dedup record is written before any state
+  // mutation. If the handler subsequently fails, the operation cannot be
+  // replayed with the same UUID — the caller must use a fresh UUID to retry.
+  // The registered spec always wins over the op-carried spec.
   const dedup_spec_t* registered_dedup = state_find_op_type_def(state, op->type);
   const dedup_spec_t* effective_dedup = registered_dedup ? registered_dedup : &op->dedup;
   if (effective_dedup->type != DEDUP_NONE) {
-    crabs_error_e dedup_result = dedup_check_guard_spec(state, effective_dedup, op);
+    crabs_error_e dedup_result = dedup_check_and_apply_spec(state, effective_dedup, op);
     if (dedup_result != CRABS_SUCCESS) {
       return dedup_result;
     }
@@ -694,19 +692,7 @@ crabs_error_e state_machine_execute(state_t* state, operation_t* op) {
     }
   }
 
-  // Step 8: Apply dedup state mutation (v1.4 §5.3)
-  // Uses the atomic check-and-apply to eliminate the TOCTOU window between
-  // the guard check (step 5) and this mutation. The guard is re-evaluated
-  // and the mutation applied in a single call.
-  if (effective_dedup->type != DEDUP_NONE) {
-    crabs_error_e mut_result = dedup_check_and_apply_spec(state, effective_dedup, op);
-    if (mut_result != CRABS_SUCCESS) {
-      // Mutation failure doesn't roll back the operation,
-      // but we log the error for diagnostics
-    }
-  }
-
-  // Step 8b: Auto-compaction check after OT operations (v1.5.2 §4)
+  // Step 8: Auto-compaction check after OT operations (v1.5.2 §4)
   if (state->compaction_config != NULL &&
       strcmp(op->type, CRABS_OP_EXECUTE_OT) == 0) {
     state_machine_auto_compact(state);

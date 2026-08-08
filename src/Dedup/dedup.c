@@ -357,8 +357,9 @@ crabs_error_e dedup_check_and_apply_spec(state_t* state,
           return CRABS_SUCCESS;
         }
         case MUTATION_ASSIGN: {
-          data_item_t* item = state_find_item(state, mut->counter_path);
+          data_item_t* item = state_find_item(state, mut->target_path);
           if (item == NULL) return CRABS_ERR_RESOURCE_NOT_FOUND;
+          if (item->type != DATA_TYPE_REGISTER) return CRABS_ERR_INVALID_PARAM;
           if (item->value != NULL) {
             int64_t* old = (int64_t*)item->value;
             *old = atoll(mut->value);
@@ -366,8 +367,9 @@ crabs_error_e dedup_check_and_apply_spec(state_t* state,
           return CRABS_SUCCESS;
         }
         case MUTATION_CUSTOM:
+          return CRABS_ERR_INTERNAL;
         default:
-          return CRABS_SUCCESS;
+          return CRABS_ERR_INVALID_PARAM;
       }
     }
 

@@ -9,6 +9,7 @@
 #include "../Condition/condition.h"
 #include "../Util/allocator.h"
 #include "../CRDT/crdt_merge.h"
+#include "../TxManager/tx_manager.h"
 #include <openssl/crypto.h>
 #include <string.h>
 #include <strings.h>
@@ -350,6 +351,11 @@ void attribute_machine_destroy(attribute_machine_t* am) {
   if (am->base_state.policies != NULL) free(am->base_state.policies);
   if (am->base_state.log != NULL) free(am->base_state.log);
   if (am->base_state.op_type_defs != NULL) free(am->base_state.op_type_defs);
+  if (am->base_state.op_handlers != NULL) free(am->base_state.op_handlers);
+  if (am->base_state.tx_manager != NULL) {
+    crabs_tx_manager_t* tx = (crabs_tx_manager_t*)am->base_state.tx_manager;
+    if (tx->vtable.destroy != NULL) tx->vtable.destroy(tx);
+  }
   if (am->base_state.abe_mk != NULL) crypto_abe_master_key_destroy(am->base_state.abe_mk);
   if (am->base_state.node_key_valid) OPENSSL_cleanse(am->base_state.node_private_key, 32);
   if (am->base_state.triggers != NULL) {

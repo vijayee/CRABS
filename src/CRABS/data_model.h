@@ -299,14 +299,16 @@ typedef struct state_t {
   // User-defined operation handler registry
   op_handler_entry_t* op_handlers;
   uint32_t            op_handler_count;
-  // v1.5.2 §4: Compaction config (crabs_tombstone_config_t*, if set auto-compaction runs after OT ops)
+  // v1.5.2 §4: Compaction config (crabs_tombstone_config_t*). Externally owned
+  // — the caller must free it after state_destroy.
   void* compaction_config;
   // Audit F-3: optional compaction engine (crabs_compaction_engine_t*). When
   // set, the execute path records each ingested OT op into the engine's local
   // vector clock so the STRONG/QUORUM compaction safety check can be armed.
   // The state does NOT own the engine.
   void* compaction_engine;
-  // v1.6 Amd6: Ordering configuration (crabs_ordering_config_t*, if set uses HLC ordering)
+  // v1.6 Amd6: Ordering configuration (crabs_ordering_config_t*). Externally
+  // owned — the caller must free it after state_destroy.
   void* ordering_config;
   // ABE master key — generated once at state creation, used for all ABE operations
   void* abe_mk;
