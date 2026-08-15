@@ -9,6 +9,7 @@ extern "C" {
 #include "../src/Attribute/attribute_machine.h"
 #include "../src/Crypto/crypto.h"
 }
+#include "test_helpers.h"
 
 // ============================================================
 // Test Fixture
@@ -652,7 +653,7 @@ TEST_F(TestTrigger, TestIssueAttributeEffect) {
   ASSERT_NE(kp, nullptr);
   memcpy(user_pk, kp->public_key, 33);
   crypto_ecdsa_keypair_destroy(kp);
-  attribute_machine_register_user(am, "alice", user_pk, "role:viewer");
+  crabs_test_register_user_with_role(am, "alice", user_pk, "role", "viewer");
 
   // Set current time for temp attr expiry
   am->current_time_ms = 1000;

@@ -414,7 +414,7 @@ TEST(TestDataModel, LogEntryAfterLock) {
   attribute_machine_t* am = attribute_machine_create("admin", admin_pk);
   ASSERT_NE(am, nullptr);
   ecdsa_keypair_t* alice_key = crypto_ecdsa_generate();
-  attribute_machine_register_user(am, "alice", alice_key->public_key, "role:admin");
+  crabs_test_register_user_with_role(am, "alice", alice_key->public_key, "role", "admin");
   state->attr_machine = am;
 
   ecdsa_keypair_t* node_key = crypto_ecdsa_generate();
@@ -432,6 +432,8 @@ TEST(TestDataModel, LogEntryAfterLock) {
   op->next_state = (protocol_state_e*)malloc(sizeof(protocol_state_e));
   op->next_state[0] = PROTOCOL_LOCKED;
   strncpy(op->signer_id, "alice", CRABS_MAX_USER_ID - 1);
+  user_t* signer = attribute_machine_find_user(am, "alice");
+  if (signer != NULL) op->signer_key_version = signer->key_version;
   serialized_buffer_t* ser = crabs_serialize_for_signing(op);
   if (ser) {
     crypto_sign_operation(alice_key->private_key, ser->data, ser->len, op->signature);
@@ -479,7 +481,7 @@ TEST(TestDataModel, ProcessedOpsAfterExecution) {
   attribute_machine_t* am = attribute_machine_create("admin", admin_pk);
   ASSERT_NE(am, nullptr);
   ecdsa_keypair_t* alice_key = crypto_ecdsa_generate();
-  attribute_machine_register_user(am, "alice", alice_key->public_key, "role:admin");
+  crabs_test_register_user_with_role(am, "alice", alice_key->public_key, "role", "admin");
   state->attr_machine = am;
 
   ecdsa_keypair_t* node_key = crypto_ecdsa_generate();
@@ -498,6 +500,8 @@ TEST(TestDataModel, ProcessedOpsAfterExecution) {
   op->next_state = (protocol_state_e*)malloc(sizeof(protocol_state_e));
   op->next_state[0] = PROTOCOL_LOCKED;
   strncpy(op->signer_id, "alice", CRABS_MAX_USER_ID - 1);
+  user_t* signer = attribute_machine_find_user(am, "alice");
+  if (signer != NULL) op->signer_key_version = signer->key_version;
   serialized_buffer_t* ser = crabs_serialize_for_signing(op);
   if (ser) {
     crypto_sign_operation(alice_key->private_key, ser->data, ser->len, op->signature);
@@ -640,9 +644,9 @@ TEST(TestDataModel, InvariantViolationRejected) {
   // Register alice with a real keypair so she can sign.
   ecdsa_keypair_t* alice_key = crypto_ecdsa_generate();
   ASSERT_NE(alice_key, nullptr);
-  ASSERT_EQ(attribute_machine_register_user(state->attr_machine, "alice",
+  ASSERT_EQ(crabs_test_register_user_with_role(state->attr_machine, "alice",
                                                alice_key->public_key,
-                                               "role:admin"), CRABS_SUCCESS);
+                                               "role", "admin"), CRABS_SUCCESS);
 
   // Use a COUNTER type so invariant_check actually evaluates the value
   data_item_t* counter = data_item_create("c1", DATA_TYPE_COUNTER, CRDT_G_COUNTER);
@@ -674,7 +678,7 @@ TEST(TestDataModel, InvariantViolationRejected) {
   verify_op->next_state = (protocol_state_e*)malloc(sizeof(protocol_state_e));
   verify_op->next_state[0] = PROTOCOL_VERIFIED;
   strncpy(verify_op->signer_id, "alice", CRABS_MAX_USER_ID - 1);
-  crabs_test_sign_op_with(alice_key, verify_op);
+  crabs_test_sign_op_with(env.am, alice_key, verify_op);
 
   // Value 0 is not > 0, so verify should fail with INVARIANT_VIOLATED
   crabs_error_e rc = state_machine_execute(state, verify_op);

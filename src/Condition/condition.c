@@ -1178,25 +1178,30 @@ static void _ast_to_string(const condition_node_t* node, char* buf, size_t bufsi
     }
     strncat(buf, tmp, remaining);
   } else if (node->type == NODE_AND) {
+    // R7-09: emit prefix form ("AND <l> <r>") to match the ABE evaluator's
+    // grammar. The prior infix "left AND right" made every compound policy
+    // deny (the evaluator parsed the first token, then rejected the rest as
+    // trailing garbage).
+    strncat(buf, "AND ", remaining);
     _ast_to_string(node->left, buf, bufsize);
     len = strlen(buf);
-    if (len < bufsize) strncat(buf, " AND ", bufsize - len - 1);
+    if (len < bufsize) strncat(buf, " ", bufsize - len - 1);
     _ast_to_string(node->right, buf, bufsize);
   } else if (node->type == NODE_OR) {
-    len = strlen(buf);
-    if (len < bufsize) strncat(buf, "(", bufsize - len - 1);
+    strncat(buf, "OR ", remaining);
     _ast_to_string(node->left, buf, bufsize);
     len = strlen(buf);
-    if (len < bufsize) strncat(buf, ") OR (", bufsize - len - 1);
+    if (len < bufsize) strncat(buf, " ", bufsize - len - 1);
     _ast_to_string(node->right, buf, bufsize);
-    len = strlen(buf);
-    if (len < bufsize) strncat(buf, ")", bufsize - len - 1);
   }
 }
 
-// Resolve {user_id} placeholder in a string
-static void _resolve_user_id_placeholder(char* str, const char* signer_id) {
-  if (str == NULL || signer_id == NULL) return;
+// Resolve {user_id} placeholder in a string. Returns false on failure (the
+// replacement does not fit) so the caller can fail preprocessing instead of
+// truncating — the old truncation path memcpy'd the full placeholder length
+// from a shorter signer_id, reading past its NUL (R7-L-7).
+static bool _resolve_user_id_placeholder(char* str, const char* signer_id) {
+  if (str == NULL || signer_id == NULL) return false;
 
   char placeholder[] = "{user_id}";
   char* pos;
@@ -1217,12 +1222,12 @@ static void _resolve_user_id_placeholder(char* str, const char* signer_id) {
         memmove(pos + slen, pos + plen, remaining + 1);
         memcpy(pos, signer_id, slen);
       } else {
-        // Can't fit: truncate
-        memcpy(pos, signer_id, plen);
-        break;
+        // Can't fit: fail preprocessing instead of truncating.
+        return false;
       }
     }
   }
+  return true;
 }
 
 policy_preprocess_result_t preprocess_policy(const char* policy, const state_t* state, const char* signer_id) {
@@ -1239,7 +1244,10 @@ policy_preprocess_result_t preprocess_policy(const char* policy, const state_t* 
   strncpy(work_buf, policy, CRABS_MAX_POLICY_EXPR - 1);
   work_buf[CRABS_MAX_POLICY_EXPR - 1] = '\0';
 
-  _resolve_user_id_placeholder(work_buf, signer_id);
+  if (!_resolve_user_id_placeholder(work_buf, signer_id)) {
+    result.resolved_ok = false;
+    return result;
+  }
 
   // Step 2: Parse the policy into an AST
   condition_node_t* ast = condition_parse(work_buf);

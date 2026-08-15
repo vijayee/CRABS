@@ -164,6 +164,9 @@ uint32_t crabs_extract_ot_ops(const uint8_t* payload, uint32_t payload_size,
 
     if (offset + CRABS_MAX_USER_ID > payload_size) break;
     memcpy(ops[i].id.node_id, payload + offset, CRABS_MAX_USER_ID);
+    // R7-L-13: force NUL termination so strcmp/strlen consumers cannot read
+    // past the buffer on a wire-crafted 64-byte ID.
+    ops[i].id.node_id[CRABS_MAX_USER_ID - 1] = '\0';
     offset += CRABS_MAX_USER_ID;
 
     if (offset + 8 > payload_size) break;

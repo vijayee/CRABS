@@ -492,6 +492,10 @@ static data_item_t* _data_item_deep_copy(const data_item_t* item) {
   data_item_t* copy = data_item_create(item->name, item->type, item->crdt_type);
   copy->protocol_state = item->protocol_state;
   copy->lock_state = item->lock_state;
+  // R7-L-12: the shallow lock_state copy would share the pre_lock_snapshot
+  // pointer with the source — a latent double-free if both items are destroyed.
+  // The merge path does not use the snapshot, so drop it on the copy.
+  copy->lock_state.pre_lock_snapshot = NULL;
   // Deep copy value pointer - the caller must handle CRDT-specific deep copies
   if (item->value != NULL) {
     // We do not deep copy CRDT values here; the merge function handles that
