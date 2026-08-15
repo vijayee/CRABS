@@ -60,6 +60,7 @@ TEST(TimeSourceBackend, FreshCacheDoesNotQueryTransport) {
   config.server_url = "https://example.invalid";
   config.resync_interval_ms = 60000;  // long enough that both calls are fresh
   config.timeout_ms = 1000;
+  config.max_skew_ms = 0;  // disable plausibility check (fixed fake time)
 
   crabs_time_source_ops_t* ops =
       crabs_time_source_https_create_with_transport(&config, fake_transport);
@@ -88,6 +89,7 @@ TEST(TimeSourceBackend, StaleCacheQueriesTransport) {
   config.server_url = "https://example.invalid";
   config.resync_interval_ms = 0;  // every call is stale
   config.timeout_ms = 1000;
+  config.max_skew_ms = 0;  // disable plausibility check (fixed fake time)
 
   crabs_time_source_ops_t* ops =
       crabs_time_source_https_create_with_transport(&config, fake_transport);
@@ -100,7 +102,7 @@ TEST(TimeSourceBackend, StaleCacheQueriesTransport) {
   crabs_time_source_destroy(ops);
 }
 
-TEST(TimeSourceBackend, FailedFetchFallsBackToSystemClock) {
+TEST(TimeSourceBackend, FailedFetchReturnsInvalid) {
   reset_fake(1000000000, 0);
   fake_should_fail = true;
 
@@ -108,13 +110,16 @@ TEST(TimeSourceBackend, FailedFetchFallsBackToSystemClock) {
   config.server_url = "https://example.invalid";
   config.resync_interval_ms = 0;
   config.timeout_ms = 1000;
+  config.max_skew_ms = 0;  // disable plausibility check (fixed fake time)
 
   crabs_time_source_ops_t* ops =
       crabs_time_source_https_create_with_transport(&config, fake_transport);
   ASSERT_NE(ops, nullptr);
 
+  // R7-02: a failed fetch must NOT fall back to the unauthenticated system
+  // clock — it returns invalid so security callers fail closed.
   crabs_physical_time_t result = ops->get_time(ops->ctx);
-  EXPECT_TRUE(result.valid);  // system clock fallback is valid
+  EXPECT_FALSE(result.valid);
   EXPECT_EQ(fake_call_count, 1);
   EXPECT_FALSE(ops->is_available(ops->ctx));  // no anchor held
 
@@ -128,6 +133,7 @@ TEST(TimeSourceBackend, FailedFetchKeepsLastValidAnchor) {
   config.server_url = "https://example.invalid";
   config.resync_interval_ms = 0;
   config.timeout_ms = 1000;
+  config.max_skew_ms = 0;  // disable plausibility check (fixed fake time)
 
   crabs_time_source_ops_t* ops =
       crabs_time_source_https_create_with_transport(&config, fake_transport);
@@ -137,11 +143,11 @@ TEST(TimeSourceBackend, FailedFetchKeepsLastValidAnchor) {
   ASSERT_TRUE(first.valid);
   EXPECT_TRUE(ops->is_available(ops->ctx));
 
-  // Now the transport fails; the backend keeps the anchor but returns
-  // the system clock for this call.
+  // Now the transport fails; the backend keeps the anchor but returns invalid
+  // for this call (R7-02: no system-clock fallback).
   fake_should_fail = true;
   crabs_physical_time_t second = ops->get_time(ops->ctx);
-  EXPECT_TRUE(second.valid);
+  EXPECT_FALSE(second.valid);
   EXPECT_TRUE(ops->is_available(ops->ctx));  // anchor retained
 
   crabs_time_source_destroy(ops);
@@ -152,6 +158,7 @@ TEST(TimeSourceBackend, NullTransportReturnsNull) {
   config.server_url = "https://example.invalid";
   config.resync_interval_ms = 0;
   config.timeout_ms = 1000;
+  config.max_skew_ms = 0;  // disable plausibility check (fixed fake time)
 
   crabs_time_source_ops_t* ops =
       crabs_time_source_https_create_with_transport(&config, NULL);
@@ -159,7 +166,11 @@ TEST(TimeSourceBackend, NullTransportReturnsNull) {
 }
 
 TEST(TimeSourceBackend, DefaultsAppliedWhenConfigNull) {
-  reset_fake(1000000000, 0);
+  // Use a realistic fake time (current epoch) so the default plausibility
+  // bound (R7-18) does not reject it.
+  crabs_physical_time_t now = crabs_hlc_get_system_time(NULL);
+  ASSERT_TRUE(now.valid);
+  reset_fake(now.seconds, now.nanos);
 
   crabs_time_source_ops_t* ops =
       crabs_time_source_https_create_with_transport(NULL, fake_transport);
@@ -179,6 +190,7 @@ TEST(TimeSourceBackend, ResyncBoundaryBehavior) {
   config.server_url = "https://example.invalid";
   config.resync_interval_ms = 50;  // small interval so the boundary is reachable
   config.timeout_ms = 1000;
+  config.max_skew_ms = 0;  // disable plausibility check (fixed fake time)
 
   crabs_time_source_ops_t* ops =
       crabs_time_source_https_create_with_transport(&config, fake_transport);
@@ -205,6 +217,60 @@ TEST(TimeSourceBackend, ResyncBoundaryBehavior) {
   crabs_time_source_destroy(ops);
 }
 
+// R7-18: a fetched timestamp far outside the plausibility bound of the local
+// clock must be rejected (a compromised time server must not push time forward).
+TEST(TimeSourceBackend, ImplausibleTimeRejected) {
+  crabs_physical_time_t now = crabs_hlc_get_system_time(NULL);
+  ASSERT_TRUE(now.valid);
+  reset_fake(now.seconds + 100000, now.nanos);  // ~1.2 days ahead
+
+  crabs_time_source_config_t config;
+  config.server_url = "https://example.invalid";
+  config.resync_interval_ms = 0;
+  config.timeout_ms = 1000;
+  config.max_skew_ms = 1000;  // tight bound
+
+  crabs_time_source_ops_t* ops =
+      crabs_time_source_https_create_with_transport(&config, fake_transport);
+  ASSERT_NE(ops, nullptr);
+
+  crabs_physical_time_t result = ops->get_time(ops->ctx);
+  EXPECT_FALSE(result.valid);
+  EXPECT_FALSE(ops->is_available(ops->ctx));  // no anchor held
+
+  crabs_time_source_destroy(ops);
+}
+
+// R7-18: a fetched timestamp earlier than the current anchor must be rejected
+// (monotonicity — time must never go backwards across resyncs).
+TEST(TimeSourceBackend, BackwardsTimeRejected) {
+  crabs_physical_time_t now = crabs_hlc_get_system_time(NULL);
+  ASSERT_TRUE(now.valid);
+  reset_fake(now.seconds, now.nanos);
+
+  crabs_time_source_config_t config;
+  config.server_url = "https://example.invalid";
+  config.resync_interval_ms = 0;
+  config.timeout_ms = 1000;
+  config.max_skew_ms = 0;  // disable plausibility check; test monotonicity only
+
+  crabs_time_source_ops_t* ops =
+      crabs_time_source_https_create_with_transport(&config, fake_transport);
+  ASSERT_NE(ops, nullptr);
+
+  // First fetch establishes the anchor.
+  crabs_physical_time_t first = ops->get_time(ops->ctx);
+  ASSERT_TRUE(first.valid);
+  EXPECT_TRUE(ops->is_available(ops->ctx));
+
+  // Second fetch returns an earlier time — must be rejected.
+  reset_fake(now.seconds - 100, now.nanos);
+  crabs_physical_time_t second = ops->get_time(ops->ctx);
+  EXPECT_FALSE(second.valid);
+
+  crabs_time_source_destroy(ops);
+}
+
 // --- Network-gated integration tests ---
 // These hit a real public time server. They skip cleanly when offline so CI
 // without network does not fail.
@@ -223,6 +289,7 @@ TEST(TimeSourceIntegration, CloudflareTraceEndpoint) {
   config.server_url = NULL;  // default: https://cloudflare.com/cdn-cgi/trace
   config.resync_interval_ms = 0;  // force a fresh fetch
   config.timeout_ms = 5000;
+  config.max_skew_ms = 0;  // disable plausibility check (fixed fake time)
 
   crabs_time_source_ops_t* ops = crabs_time_source_https_create(&config);
   ASSERT_NE(ops, nullptr);
@@ -245,6 +312,7 @@ TEST(TimeSourceIntegration, JsonTimeApi) {
   config.server_url = "https://worldtimeapi.org/api/timezone/Etc/UTC";
   config.resync_interval_ms = 0;
   config.timeout_ms = 5000;
+  config.max_skew_ms = 0;  // disable plausibility check (fixed fake time)
 
   crabs_time_source_ops_t* ops = crabs_time_source_https_create(&config);
   ASSERT_NE(ops, nullptr);

@@ -349,6 +349,12 @@ void         state_set_compaction_engine(state_t* state, void* engine);
 void         state_set_ordering_config(state_t* state, crabs_ordering_config_t* config);
 crabs_ordering_config_t* state_get_ordering_config(state_t* state);
 
+// R7-01: attach an authenticated time source (crabs_time_source_ops_t) to the
+// state's HLC state. When set, state_machine_execute uses it for all expiry
+// decisions and fails closed if it is unavailable. The state does NOT own the
+// ops — the caller must keep it alive and destroy it after state_destroy.
+void         state_set_time_source(state_t* state, void* time_source_ops);
+
 // Initialize node ECDSA keypair for envelope signing (§11)
 crabs_error_e state_set_node_key(state_t* state,
                                   const uint8_t private_key[32],

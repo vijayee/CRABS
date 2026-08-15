@@ -55,6 +55,7 @@ typedef struct {
   char*     server_url;
   uint64_t  resync_interval_ms;
   uint64_t  timeout_ms;
+  uint64_t  max_skew_ms;  // R7-18: plausibility bound vs local clock (0 = off)
   crabs_time_source_fetch_fn transport;
 
   bool      has_anchor;
@@ -89,7 +90,9 @@ static crabs_physical_time_t _get_time(void* ctx) {
 
   platform_time_t monotonic_now = platform_get_monotonic();
   if (!monotonic_now.valid) {
-    return crabs_hlc_get_system_time(NULL);
+    // R7-02: never substitute the unauthenticated local clock for authenticated
+    // time. Without a monotonic reference we cannot anchor, so fail closed.
+    return result;
   }
 
   if (context->has_anchor) {
@@ -109,6 +112,33 @@ static crabs_physical_time_t _get_time(void* ctx) {
   crabs_time_source_fetch_result_t fetched =
       context->transport(context->server_url, context->timeout_ms);
   if (fetched.valid) {
+    // R7-18: reject a fetched timestamp outside a plausibility bound of the
+    // local clock, and never accept an anchor earlier than the current one.
+    // A compromised time server must not be able to push time arbitrarily far
+    // forward (extending all expiries) or backward.
+    if (context->max_skew_ms > 0) {
+      crabs_physical_time_t local = crabs_hlc_get_system_time(NULL);
+      if (local.valid) {
+        int64_t fetched_ms = (int64_t)fetched.seconds * 1000 +
+                             (int64_t)fetched.nanos / 1000000;
+        int64_t local_ms = (int64_t)local.seconds * 1000 +
+                           (int64_t)local.nanos / 1000000;
+        int64_t diff = fetched_ms - local_ms;
+        if (diff < 0) diff = -diff;
+        if ((uint64_t)diff > context->max_skew_ms) {
+          log_warn("time source returned implausible timestamp; rejecting");
+          return result;
+        }
+      }
+    }
+    if (context->has_anchor &&
+        (fetched.seconds < context->anchor_seconds ||
+         (fetched.seconds == context->anchor_seconds &&
+          fetched.nanos < context->anchor_nanos))) {
+      log_warn("time source went backwards; rejecting");
+      return result;
+    }
+
     context->has_anchor = true;
     context->anchor_seconds = fetched.seconds;
     context->anchor_nanos = fetched.nanos;
@@ -120,8 +150,11 @@ static crabs_physical_time_t _get_time(void* ctx) {
     return result;
   }
 
-  log_warn("time source unreachable; using system clock");
-  return crabs_hlc_get_system_time(NULL);
+  // R7-02: a failed fetch must NOT fall back to the unauthenticated local
+  // clock — that is the same attacker-controlled clock the time source exists
+  // to distrust. Return invalid so security callers fail closed.
+  log_warn("time source unreachable; returning invalid time");
+  return result;
 }
 
 static bool _is_available(void* ctx) {
@@ -144,6 +177,8 @@ static crabs_time_source_ops_t* _create(const crabs_time_source_config_t* config
       ? config->resync_interval_ms : CRABS_TIME_SOURCE_DEFAULT_RESYNC_MS;
   context->timeout_ms = (config != NULL)
       ? config->timeout_ms : CRABS_TIME_SOURCE_DEFAULT_TIMEOUT_MS;
+  context->max_skew_ms = (config != NULL)
+      ? config->max_skew_ms : CRABS_TIME_SOURCE_DEFAULT_MAX_SKEW_MS;
   context->transport = transport;
 
   crabs_time_source_ops_t* ops = get_clear_memory(sizeof(crabs_time_source_ops_t));
@@ -344,7 +379,17 @@ static platform_socket_t _tcp_connect(const char* host, int port, uint64_t timeo
 // trace format ("ts=1786764168.000") and the worldtimeapi JSON format
 // ("\"unixtime\":1786764168").
 static void _parse_timestamp(const char* response, crabs_time_source_fetch_result_t* result) {
-  const char* ts_marker = strstr(response, "ts=");
+  // R7-16: anchor "ts=" to a line start so an error page or unrelated JSON
+  // field containing "ts=" is not accepted as a timestamp.
+  const char* ts_marker = NULL;
+  const char* p = response;
+  while (*p) {
+    if (strncmp(p, "ts=", 3) == 0 && (p == response || p[-1] == '\n')) {
+      ts_marker = p;
+      break;
+    }
+    p++;
+  }
   if (ts_marker != NULL) {
     const char* value_start = ts_marker + 3;
     uint64_t seconds = 0;
@@ -498,6 +543,17 @@ static crabs_time_source_fetch_result_t _native_fetch_server_time(
   _platform_close_socket(socket_fd);
 
   if (response_len == 0) return result;
+
+  // R7-17: require a 2xx status line before parsing the body. A 404/500 page
+  // containing "ts=" must not yield a valid time.
+  if (response_len < 12 || strncmp(response, "HTTP/1.", 7) != 0) {
+    return result;
+  }
+  const char* status_code = response + 9;  // after "HTTP/1.1 "
+  if (status_code[0] != '2') {
+    return result;
+  }
+
   _parse_timestamp(response, &result);
   return result;
 }

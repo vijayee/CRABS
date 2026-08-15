@@ -12,6 +12,10 @@
 mergeInto(LibraryManager.library, {
   js_fetch_server_time: function (urlPtr, timeoutMs) {
     var url = UTF8ToString(urlPtr);
+    // R7-05: reject non-https URLs. The native transport enforces https:// in
+    // _parse_url; the JS glue must too, or an http:// config becomes a
+    // cleartext timestamp-forgery channel.
+    if (url.indexOf('https://') !== 0) return -1.0;
     // The C signature uses uint64_t, so emscripten passes timeoutMs as a
     // BigInt. Convert to a Number (timeouts are small) before bitwise use.
     var timeout = Number(timeoutMs) >>> 0;
@@ -62,12 +66,22 @@ mergeInto(LibraryManager.library, {
 
     if (body === null) return -1.0;
 
-    var match = body.match(/ts=(\d+)(?:\.(\d+))?/);
+    // R7-16: anchor "ts=" to a line start and bound the digit count so a huge
+    // digit string cannot become a double >= 2^53 (precision loss) or >= 2^64
+    // (undefined behavior when cast to uint64_t on the C side).
+    var match = body.match(/^ts=(\d{1,19})(?:\.(\d{1,9}))?/m);
     if (match) {
-      return parseFloat(match[1]) + (match[2] ? parseFloat('0.' + match[2]) : 0.0);
+      var seconds = parseFloat(match[1]);
+      if (seconds > 9007199254740991) return -1.0;  // > Number.MAX_SAFE_INTEGER
+      var frac = match[2] ? parseFloat('0.' + match[2]) : 0.0;
+      return seconds + frac;
     }
-    var unixtime = body.match(/"unixtime":\s*(\d+)/);
-    if (unixtime) return parseFloat(unixtime[1]);
+    var unixtime = body.match(/"unixtime":\s*(\d{1,19})/);
+    if (unixtime) {
+      var ut = parseFloat(unixtime[1]);
+      if (ut > 9007199254740991) return -1.0;
+      return ut;
+    }
     return -1.0;
   }
 });

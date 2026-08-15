@@ -173,6 +173,13 @@ crabs_ordering_config_t* state_get_ordering_config(state_t* state) {
   return (crabs_ordering_config_t*)state->ordering_config;
 }
 
+// R7-01: attach an authenticated time source to the HLC state. The state does
+// not own the ops — the caller keeps it alive and destroys it after the state.
+void state_set_time_source(state_t* state, void* time_source_ops) {
+  if (state == NULL) return;
+  state->hlc_state.time_source_ops = (crabs_time_source_ops_t*)time_source_ops;
+}
+
 // ============================================================
 // State query helpers
 // ============================================================

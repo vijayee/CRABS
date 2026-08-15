@@ -16,6 +16,7 @@
 #define CRABS_TIME_SOURCE_DEFAULT_URL         "https://cloudflare.com/cdn-cgi/trace"
 #define CRABS_TIME_SOURCE_DEFAULT_RESYNC_MS   30000
 #define CRABS_TIME_SOURCE_DEFAULT_TIMEOUT_MS  1000
+#define CRABS_TIME_SOURCE_DEFAULT_MAX_SKEW_MS 5000
 
 // Result of a single fetch from the time server.
 typedef struct {
@@ -31,6 +32,9 @@ typedef struct {
   const char* server_url;          // Default: CRABS_TIME_SOURCE_DEFAULT_URL
   uint64_t    resync_interval_ms;  // Default: CRABS_TIME_SOURCE_DEFAULT_RESYNC_MS
   uint64_t    timeout_ms;          // Default: CRABS_TIME_SOURCE_DEFAULT_TIMEOUT_MS
+  // R7-18: maximum allowed difference (ms) between a fetched timestamp and the
+  // local clock. Fetches outside this bound are rejected. 0 disables the check.
+  uint64_t    max_skew_ms;         // Default: CRABS_TIME_SOURCE_DEFAULT_MAX_SKEW_MS
 } crabs_time_source_config_t;
 
 // Transport seam: performs one HTTPS query and returns the server's time.
