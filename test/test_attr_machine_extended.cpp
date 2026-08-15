@@ -10,6 +10,7 @@ extern "C" {
 #include "../src/StateMachine/state_machine.h"
 #include "../src/Crypto/crypto.h"
 #include "../src/Serialization/serialization.h"
+#include "test_helpers.h"
 }
 
 class TestAttrMachine : public ::testing::Test {
@@ -38,7 +39,7 @@ protected:
     ASSERT_NE(kp, nullptr);
     memcpy(pk, kp->public_key, 33);
     crypto_ecdsa_keypair_destroy(kp);
-    crabs_error_e rc = attribute_machine_register_user(am, id, pk, "role:user");
+    crabs_error_e rc = crabs_test_register_user_with_role(am, id, pk, "role", "user");
     ASSERT_EQ(rc, CRABS_SUCCESS);
   }
 };
@@ -204,7 +205,7 @@ TEST_F(TestAttrMachine, KeyRefreshViaStateMachine) {
 
   // Register alice with real ECDSA key
   ecdsa_keypair_t* alice_key = crypto_ecdsa_generate();
-  attribute_machine_register_user(am, "alice", alice_key->public_key, "role:admin");
+  crabs_test_register_user_with_role(am, "alice", alice_key->public_key, "role", "admin");
 
   user_t* alice = attribute_machine_find_user(am, "alice");
   ASSERT_NE(alice, nullptr);
@@ -250,7 +251,7 @@ TEST_F(TestAttrMachine, CompromiseRecoveryScenario) {
   ASSERT_NE(kp, nullptr);
   memcpy(compromised_pk, kp->public_key, 33);
   crypto_ecdsa_keypair_destroy(kp);
-  attribute_machine_register_user(am, "alice", compromised_pk, "role:admin");
+  crabs_test_register_user_with_role(am, "alice", compromised_pk, "role", "admin");
 
   user_t* alice = attribute_machine_find_user(am, "alice");
   ASSERT_NE(alice, nullptr);
@@ -287,7 +288,7 @@ TEST_F(TestAttrMachine, PolicyEnforcementNoRole) {
   ASSERT_NE(kp, nullptr);
   memcpy(pk, kp->public_key, 33);
   crypto_ecdsa_keypair_destroy(kp);
-  attribute_machine_register_user(am, "alice", pk, "role:user");
+  crabs_test_register_user_with_role(am, "alice", pk, "role", "user");
 
   // Create state with policy requiring role:admin
   state_t* state = state_create();

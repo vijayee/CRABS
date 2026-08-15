@@ -4,6 +4,7 @@ extern "C" {
 #include "../src/Crypto/crypto.h"
 #include "../src/Attribute/attribute_machine.h"
 }
+#include "test_helpers.h"
 
 TEST(TestCrypto, TestEcdsaGenerate) {
   ecdsa_keypair_t* keypair = crypto_ecdsa_generate();
@@ -348,6 +349,25 @@ TEST(TestAbe, TestPolicyEvalAndOr) {
   EXPECT_FALSE(crypto_abe_eval_policy("OR admin manager", "viewer,editor"));
 }
 
+// R7-09: the ABE evaluator expected prefix form but the preprocessor emitted
+// infix, so compound and comparison policies always denied. Both grammars must
+// evaluate correctly.
+TEST(TestAbe, TestPolicyInfixAndComparison) {
+  // Infix AND (as emitted by the preprocessor's _ast_to_string).
+  EXPECT_TRUE(crypto_abe_eval_policy("role:admin AND dept:eng", "role:admin,dept:eng"));
+  EXPECT_FALSE(crypto_abe_eval_policy("role:admin AND dept:eng", "role:admin,dept:sales"));
+
+  // Infix OR.
+  EXPECT_TRUE(crypto_abe_eval_policy("role:admin OR role:viewer", "role:viewer"));
+  EXPECT_FALSE(crypto_abe_eval_policy("role:admin OR role:viewer", "role:guest"));
+
+  // Numeric comparison against the attribute value.
+  EXPECT_TRUE(crypto_abe_eval_policy("views >= 5", "views:10"));
+  EXPECT_FALSE(crypto_abe_eval_policy("views >= 5", "views:3"));
+  EXPECT_TRUE(crypto_abe_eval_policy("views < 5", "views:3"));
+  EXPECT_FALSE(crypto_abe_eval_policy("views < 5", "views:10"));
+}
+
 TEST(TestAbe, TestEncryptNullParams) {
   abe_master_key_t* mk = crypto_abe_setup();
   ASSERT_NE(mk, nullptr);
@@ -407,7 +427,9 @@ TEST_F(VerifyAuthTest, ModeA_AuthorizedUser) {
   ASSERT_NE(keypair, nullptr);
 
   // Register alice with role:admin and department:engineering
-  crabs_error_e rc = attribute_machine_register_user(am, "alice", keypair->public_key, "role:admin|department:engineering");
+  crabs_error_e rc = attribute_machine_register_user(am, "alice", keypair->public_key, "department:engineering");
+  ASSERT_EQ(rc, CRABS_SUCCESS);
+  rc = attribute_machine_grant_role(am, "alice", "role", "admin", "admin");
   EXPECT_EQ(rc, CRABS_SUCCESS);
 
   // Sign an operation
@@ -434,7 +456,7 @@ TEST_F(VerifyAuthTest, ModeA_UnauthorizedUser) {
   ASSERT_NE(keypair, nullptr);
 
   // Register alice with only "viewer" role
-  crabs_error_e rc = attribute_machine_register_user(am, "alice", keypair->public_key, "role:viewer");
+  crabs_error_e rc = crabs_test_register_user_with_role(am, "alice", keypair->public_key, "role", "viewer");
   EXPECT_EQ(rc, CRABS_SUCCESS);
 
   const uint8_t op_data[] = {0x01, 0x02, 0x03};
@@ -465,7 +487,40 @@ TEST_F(VerifyAuthTest, ModeA_UserNotFound) {
       mk, "role:admin", am, op_data, sizeof(op_data),
       signature, "nonexistent", VERIFY_MODE_A);
   EXPECT_FALSE(vr.authorized);
-  EXPECT_EQ(vr.error, CRABS_ERR_USER_NOT_FOUND);
+  // R7-14: user existence must not leak through a distinct error code.
+  EXPECT_EQ(vr.error, CRABS_ERR_UNAUTHORIZED);
+
+  crypto_ecdsa_keypair_destroy(keypair);
+}
+
+// R7-14: Mode A must not leak user existence or status through distinct error
+// codes. Nonexistent, suspended, and revoked users all yield a single
+// CRABS_ERR_UNAUTHORIZED at the trust boundary.
+TEST_F(VerifyAuthTest, ModeA_CollapsesUserExistenceAndStatus) {
+  ecdsa_keypair_t* keypair = crypto_ecdsa_generate();
+  ASSERT_NE(keypair, nullptr);
+  ASSERT_EQ(crabs_test_register_user_with_role(am, "alice", keypair->public_key,
+                                              "role", "admin"), CRABS_SUCCESS);
+
+  const uint8_t op_data[] = {0x01, 0x02, 0x03};
+  uint8_t signature[CRABS_SIG_SIZE];
+  ASSERT_EQ(crypto_sign_operation(keypair->private_key, op_data, sizeof(op_data),
+                                    signature), CRABS_SUCCESS);
+
+  // Nonexistent user → UNAUTHORIZED, not USER_NOT_FOUND.
+  verify_result_t vr = crypto_verify_operation_auth(
+      mk, "role:admin", am, op_data, sizeof(op_data),
+      signature, "nonexistent", VERIFY_MODE_A);
+  EXPECT_FALSE(vr.authorized);
+  EXPECT_EQ(vr.error, CRABS_ERR_UNAUTHORIZED);
+
+  // Suspended user → UNAUTHORIZED, not USER_SUSPENDED.
+  ASSERT_EQ(attribute_machine_suspend_user(am, "alice"), CRABS_SUCCESS);
+  vr = crypto_verify_operation_auth(
+      mk, "role:admin", am, op_data, sizeof(op_data),
+      signature, "alice", VERIFY_MODE_A);
+  EXPECT_FALSE(vr.authorized);
+  EXPECT_EQ(vr.error, CRABS_ERR_UNAUTHORIZED);
 
   crypto_ecdsa_keypair_destroy(keypair);
 }
@@ -477,9 +532,9 @@ TEST_F(VerifyAuthTest, ModeB_AuthorizedUser) {
   ASSERT_NE(keypair2, nullptr);
 
   // Register two users
-  crabs_error_e rc = attribute_machine_register_user(am, "alice", keypair1->public_key, "role:admin");
+  crabs_error_e rc = crabs_test_register_user_with_role(am, "alice", keypair1->public_key, "role", "admin");
   EXPECT_EQ(rc, CRABS_SUCCESS);
-  rc = attribute_machine_register_user(am, "bob", keypair2->public_key, "role:viewer");
+  rc = crabs_test_register_user_with_role(am, "bob", keypair2->public_key, "role", "viewer");
   EXPECT_EQ(rc, CRABS_SUCCESS);
 
   // Sign with alice's key
@@ -504,7 +559,7 @@ TEST_F(VerifyAuthTest, ModeB_NoMatchingUser) {
   ecdsa_keypair_t* keypair = crypto_ecdsa_generate();
   ASSERT_NE(keypair, nullptr);
 
-  crabs_error_e rc = attribute_machine_register_user(am, "charlie", keypair->public_key, "role:viewer");
+  crabs_error_e rc = crabs_test_register_user_with_role(am, "charlie", keypair->public_key, "role", "viewer");
   EXPECT_EQ(rc, CRABS_SUCCESS);
 
   const uint8_t op_data[] = {0x01, 0x02, 0x03};
@@ -526,7 +581,7 @@ TEST_F(VerifyAuthTest, EmptyPolicyAllowsAll) {
   ecdsa_keypair_t* keypair = crypto_ecdsa_generate();
   ASSERT_NE(keypair, nullptr);
 
-  crabs_error_e rc = attribute_machine_register_user(am, "alice", keypair->public_key, "role:admin");
+  crabs_error_e rc = crabs_test_register_user_with_role(am, "alice", keypair->public_key, "role", "admin");
   EXPECT_EQ(rc, CRABS_SUCCESS);
 
   const uint8_t op_data[] = {0x01, 0x02, 0x03};
@@ -548,7 +603,9 @@ TEST_F(VerifyAuthTest, AndPolicy) {
   ASSERT_NE(keypair, nullptr);
 
   // Register alice with role:admin AND department:engineering
-  crabs_error_e rc = attribute_machine_register_user(am, "alice", keypair->public_key, "role:admin|department:engineering");
+  crabs_error_e rc = attribute_machine_register_user(am, "alice", keypair->public_key, "department:engineering");
+  ASSERT_EQ(rc, CRABS_SUCCESS);
+  rc = attribute_machine_grant_role(am, "alice", "role", "admin", "admin");
   EXPECT_EQ(rc, CRABS_SUCCESS);
 
   const uint8_t op_data[] = {0x01, 0x02, 0x03};
@@ -592,8 +649,8 @@ TEST_F(VerifyAuthTest, SelfAssertValueDoesNotAuthorize) {
   ASSERT_NE(keypair, nullptr);
 
   // alice is a regular member (no role:admin).
-  ASSERT_EQ(attribute_machine_register_user(am, "alice", keypair->public_key,
-                                              "role:member"), CRABS_SUCCESS);
+  ASSERT_EQ(crabs_test_register_user_with_role(am, "alice", keypair->public_key,
+                                              "role", "member"), CRABS_SUCCESS);
   // Self-assert a non-privileged attribute whose value is "admin".
   ASSERT_EQ(attribute_machine_self_assert(am, "clearance", "admin", "alice"),
             CRABS_SUCCESS);
@@ -629,8 +686,8 @@ TEST_F(VerifyAuthTest, SelfAssertValueDoesNotAuthorize) {
 TEST_F(VerifyAuthTest, RevokedUserRejected) {
   ecdsa_keypair_t* keypair = crypto_ecdsa_generate();
   ASSERT_NE(keypair, nullptr);
-  ASSERT_EQ(attribute_machine_register_user(am, "alice", keypair->public_key,
-                                              "role:admin"), CRABS_SUCCESS);
+  ASSERT_EQ(crabs_test_register_user_with_role(am, "alice", keypair->public_key,
+                                              "role", "admin"), CRABS_SUCCESS);
 
   ASSERT_EQ(attribute_machine_revoke_user(am, "alice"), CRABS_SUCCESS);
 
@@ -643,7 +700,8 @@ TEST_F(VerifyAuthTest, RevokedUserRejected) {
       mk, "role:admin", am, op_data, sizeof(op_data),
       signature, "alice", VERIFY_MODE_A);
   EXPECT_FALSE(vr.authorized);
-  EXPECT_EQ(vr.error, CRABS_ERR_USER_NOT_FOUND); // revoked maps to NOT_FOUND
+  // R7-14: status must not leak through a distinct error code.
+  EXPECT_EQ(vr.error, CRABS_ERR_UNAUTHORIZED);
 
   // Mode B must also reject a revoked user (no user satisfies the policy).
   vr = crypto_verify_operation_auth(
@@ -664,8 +722,8 @@ TEST_F(VerifyAuthTest, RevokedUserRejected) {
 TEST_F(VerifyAuthTest, TempAttributeUsesFullNameColonToken) {
   ecdsa_keypair_t* keypair = crypto_ecdsa_generate();
   ASSERT_NE(keypair, nullptr);
-  ASSERT_EQ(attribute_machine_register_user(am, "alice", keypair->public_key,
-                                              "role:member"), CRABS_SUCCESS);
+  ASSERT_EQ(crabs_test_register_user_with_role(am, "alice", keypair->public_key,
+                                              "role", "member"), CRABS_SUCCESS);
 
   // Issue a temporary attribute clearance:secret to alice (who has role:member).
   // The role parameter matches the attribute NAME ("role"), not the full
@@ -714,8 +772,8 @@ protected:
     // Register alice with role:admin
     alice_key = crypto_ecdsa_generate();
     ASSERT_NE(alice_key, nullptr);
-    crabs_error_e rc = attribute_machine_register_user(
-        am, "alice", alice_key->public_key, "role:admin");
+    crabs_error_e rc = crabs_test_register_user_with_role(
+        am, "alice", alice_key->public_key, "role", "admin");
     EXPECT_EQ(rc, CRABS_SUCCESS);
   }
 
@@ -863,7 +921,7 @@ TEST_F(KeyEnvelopeTest, AttributesHash) {
   // Register bob with different attributes
   ecdsa_keypair_t* bob_key = crypto_ecdsa_generate();
   ASSERT_NE(bob_key, nullptr);
-  rc = attribute_machine_register_user(am, "bob", bob_key->public_key, "role:viewer");
+  rc = crabs_test_register_user_with_role(am, "bob", bob_key->public_key, "role", "viewer");
   EXPECT_EQ(rc, CRABS_SUCCESS);
 
   user_t* bob = attribute_machine_find_user(am, "bob");
@@ -937,4 +995,30 @@ TEST_F(KeyEnvelopeTest, RevokeAndRotateNullParams) {
   EXPECT_EQ(crypto_revoke_and_rotate(mk, node_key->private_key, am, nullptr, user_new_key->public_key, 1, 1000), nullptr);
   EXPECT_EQ(crypto_revoke_and_rotate(mk, node_key->private_key, am, "alice", nullptr, 1, 1000), nullptr);
   crypto_ecdsa_keypair_destroy(user_new_key);
+}
+
+// R7-06: an invalid new public key must be rejected BEFORE any state mutation.
+// The prior code suspended the user and overwrote user->public_key first, then
+// failed envelope creation — permanently bricking the user record.
+TEST_F(KeyEnvelopeTest, RevokeAndRotateInvalidKeyLeavesUserIntact) {
+  user_t* alice = attribute_machine_find_user(am, "alice");
+  ASSERT_NE(alice, nullptr);
+  uint8_t orig_pk[33];
+  memcpy(orig_pk, alice->public_key, 33);
+  uint64_t orig_version = alice->key_version;
+
+  // Not a valid compressed secp256k1 point (all zeros).
+  uint8_t invalid_pk[33];
+  memset(invalid_pk, 0, 33);
+
+  recovery_result_t* result = crypto_revoke_and_rotate(
+      mk, node_key->private_key, am, "alice", invalid_pk, 1, 1000);
+  EXPECT_EQ(result, nullptr);
+
+  // User must be untouched: still active, key unchanged, version unchanged.
+  alice = attribute_machine_find_user(am, "alice");
+  ASSERT_NE(alice, nullptr);
+  EXPECT_EQ(alice->status, USER_ACTIVE);
+  EXPECT_EQ(memcmp(alice->public_key, orig_pk, 33), 0);
+  EXPECT_EQ(alice->key_version, orig_version);
 }

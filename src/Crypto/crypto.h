@@ -168,10 +168,12 @@ verify_result_t crypto_verify_operation_auth_v2(
 // Verify a single co-signature against the serialized canonical form of the
 // operation. Resolves the co-signer's key via the attribute machine keyring
 // (key_id/sig_scheme) or the bootstrap public key (legacy). Returns
-// CRABS_SUCCESS only if the signature is valid and the co-signer is an
-// active user.
+// CRABS_SUCCESS only if the signature is valid, the co-signer is an active
+// user, and (R7-L-9) the co-signer's attributes satisfy the operation's ABE
+// policy — a co-signer is an approver, not merely a witness.
 crabs_error_e crypto_verify_co_signature(
     const attribute_machine_t* attr_machine,
+    const char* abe_policy,
     const char* signer_id,
     const char* key_id,
     signature_scheme_e sig_scheme,

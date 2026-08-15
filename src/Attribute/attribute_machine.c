@@ -417,6 +417,25 @@ crabs_error_e attribute_machine_register_user(attribute_machine_t* am, const cha
   // Parse initial attributes
   user->attribute_count = _parse_attributes(initial_attrs, user->attributes, CRABS_MAX_ATTRIBUTES);
 
+  // R7-08: register_user must not mint privileged attributes (role, admin,
+  // owner, ...) from initial_attrs. Privileged attributes are granted only via
+  // the admin grant_role path; a public register_user call must not be able to
+  // create a role:admin user. Reject the whole registration if any parsed
+  // attribute name is privileged.
+  for (uint32_t i = 0; i < user->attribute_count; i++) {
+    const char* colon = strchr(user->attributes[i].value, ':');
+    size_t name_len = (colon != NULL) ? (size_t)(colon - user->attributes[i].value)
+                                      : strlen(user->attributes[i].value);
+    char name_buf[CRABS_MAX_POLICY_EXPR];
+    if (name_len >= sizeof(name_buf)) name_len = sizeof(name_buf) - 1;
+    memcpy(name_buf, user->attributes[i].value, name_len);
+    name_buf[name_len] = '\0';
+    if (_is_privileged_attr_name(name_buf)) {
+      free(user);
+      return CRABS_ERR_INVALID_PARAM;
+    }
+  }
+
   // Prepend to linked list
   user->next = am->users;
   am->users = user;
@@ -661,6 +680,43 @@ crabs_error_e attribute_machine_suspend_user(attribute_machine_t* am, const char
 
   user->status = USER_SUSPENDED;
   user->key_version++;
+  am->base_state.version++;
+
+  return CRABS_SUCCESS;
+}
+
+// R7-07: reactivate a SUSPENDED user after key-compromise recovery. The
+// signer must be an active user holding the role:admin attribute. REVOKED
+// users are terminal (audit H-C) and cannot be reactivated. key_version is
+// intentionally NOT bumped: the suspension during recovery already invalidated
+// the old key, and the user's new key is bound to the current version.
+crabs_error_e attribute_machine_activate_user(attribute_machine_t* am, const char* target_user,
+                                               const char* signer_id) {
+  if (am == NULL || target_user == NULL || signer_id == NULL) {
+    return CRABS_ERR_INVALID_PARAM;
+  }
+
+  user_t* signer = attribute_machine_find_user(am, signer_id);
+  if (signer == NULL) return CRABS_ERR_USER_NOT_FOUND;
+  if (signer->status != USER_ACTIVE) return CRABS_ERR_USER_SUSPENDED;
+
+  // Admin authorization: the signer must hold the role:admin attribute.
+  bool is_admin = false;
+  for (uint32_t i = 0; i < signer->attribute_count; i++) {
+    if (strcmp(signer->attributes[i].value, "role:admin") == 0) {
+      is_admin = true;
+      break;
+    }
+  }
+  if (!is_admin) return CRABS_ERR_UNAUTHORIZED;
+
+  user_t* user = attribute_machine_find_user(am, target_user);
+  if (user == NULL) return CRABS_ERR_USER_NOT_FOUND;
+
+  // Only SUSPENDED users are recoverable; REVOKED is terminal.
+  if (user->status != USER_SUSPENDED) return CRABS_ERR_INVALID_PARAM;
+
+  user->status = USER_ACTIVE;
   am->base_state.version++;
 
   return CRABS_SUCCESS;

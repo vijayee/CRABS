@@ -37,6 +37,51 @@ static void _gen_pk_sv(uint8_t out[33]) {
 // _verify_sig_with_scheme (tested through v2 API)
 // ============================================================
 
+// R7-04: once a user has a keyring, the legacy user->public_key path must be
+// rejected. Otherwise a rotated-away legacy key keeps signing operations.
+TEST(TestSchemeVerify, LegacyKeyRejectedOnceKeyringExists) {
+  crypto_sig_scheme_init();
+  attribute_machine_t* am = create_am_for_verify();
+  abe_master_key_t* mk = crypto_abe_setup();
+
+  user_t* admin = attribute_machine_find_user(am, "admin");
+  ASSERT_NE(admin, nullptr);
+
+  // The bootstrap admin's legacy key.
+  ecdsa_keypair_t* legacy_kp = crypto_ecdsa_generate();
+  ASSERT_NE(legacy_kp, nullptr);
+  memcpy(admin->public_key, legacy_kp->public_key, 33);
+
+  // Add a keyring key, then rotate it away (revokes the old keyring key).
+  ecdsa_keypair_t* kp1 = crypto_ecdsa_generate();
+  ASSERT_NE(kp1, nullptr);
+  ASSERT_EQ(user_key_register(admin, "key1", ECDSA_SECP256K1, kp1->public_key, 33, "primary"),
+            CRABS_SUCCESS);
+  ecdsa_keypair_t* kp2 = crypto_ecdsa_generate();
+  ASSERT_NE(kp2, nullptr);
+  ASSERT_EQ(user_key_rotate(admin, "key1", "key2", ECDSA_SECP256K1, kp2->public_key, 33, "rotated"),
+            CRABS_SUCCESS);
+
+  // Sign with the legacy key and declare the legacy path (UNSPECIFIED, no key_id).
+  const uint8_t msg[] = "legacy key after rotation";
+  uint8_t sig[CRABS_SIG_SIZE];
+  ASSERT_EQ(crypto_ecdsa_sign(legacy_kp->private_key, msg, sizeof(msg), sig), CRABS_SUCCESS);
+
+  verify_result_t vr = crypto_verify_operation_auth_v2(
+      mk, "", am,
+      msg, sizeof(msg),
+      sig, CRABS_SIG_SIZE,
+      "admin", nullptr, SCHEME_UNSPECIFIED, VERIFY_MODE_A);
+  EXPECT_FALSE(vr.authorized);
+
+  crypto_ecdsa_keypair_destroy(legacy_kp);
+  crypto_ecdsa_keypair_destroy(kp1);
+  crypto_ecdsa_keypair_destroy(kp2);
+  crypto_abe_master_key_destroy(mk);
+  attribute_machine_destroy(am);
+  crypto_sig_scheme_cleanup();
+}
+
 TEST(TestSchemeVerify, LegacyECDSAViaV2) {
   crypto_sig_scheme_init();
   attribute_machine_t* am = create_am_for_verify();
@@ -73,6 +118,48 @@ TEST(TestSchemeVerify, LegacyECDSAViaV2) {
       sig, CRABS_SIG_SIZE,
       "admin", nullptr, SCHEME_UNSPECIFIED, VERIFY_MODE_A);
   EXPECT_TRUE(vr2.authorized);
+
+  crypto_ecdsa_keypair_destroy(kp);
+  crypto_abe_master_key_destroy(mk);
+  attribute_machine_destroy(am);
+  crypto_sig_scheme_cleanup();
+}
+
+// R7-10: an expired keyring key must be rejected even when the platform clock
+// is unset (now_ms == 0). The prior code skipped expiry enforcement when the
+// clock was 0, so a caller that never injected a clock silently accepted
+// expired keys forever.
+TEST(TestSchemeVerify, ExpiredKeyringKeyRejectedWhenClockUnset) {
+  crypto_sig_scheme_init();
+  attribute_machine_t* am = create_am_for_verify();
+  abe_master_key_t* mk = crypto_abe_setup();
+
+  user_t* admin = attribute_machine_find_user(am, "admin");
+  ASSERT_NE(admin, nullptr);
+
+  ecdsa_keypair_t* kp = crypto_ecdsa_generate();
+  ASSERT_NE(kp, nullptr);
+
+  crabs_error_e rc = user_key_register(admin, "key1", ECDSA_SECP256K1,
+                                       kp->public_key, 33, "primary");
+  ASSERT_EQ(rc, CRABS_SUCCESS);
+
+  user_key_t* key = user_key_find(admin, "key1");
+  ASSERT_NE(key, nullptr);
+  // Expired in the past; the platform clock is never set (current_time_ms == 0).
+  key->expires_at = 1000;
+
+  const uint8_t msg[] = "expired key with unset clock";
+  uint8_t sig[CRABS_SIG_SIZE];
+  ASSERT_EQ(crypto_ecdsa_sign(kp->private_key, msg, sizeof(msg), sig), CRABS_SUCCESS);
+
+  verify_result_t vr = crypto_verify_operation_auth_v2(
+      mk, "", am,
+      msg, sizeof(msg),
+      sig, CRABS_SIG_SIZE,
+      "admin", "key1", ECDSA_SECP256K1, VERIFY_MODE_A);
+  EXPECT_FALSE(vr.authorized);
+  EXPECT_EQ(vr.error, CRABS_ERR_UNAUTHORIZED);
 
   crypto_ecdsa_keypair_destroy(kp);
   crypto_abe_master_key_destroy(mk);
@@ -380,6 +467,7 @@ TEST(TestSchemeVerify, StateMachineDispatchesV2ForSchemeOps) {
   operation_t* op = operation_create(CRABS_OP_REGISTER_KEY);
   for (int i = 0; i < CRABS_UUID_SIZE; i++) op->uuid[i] = (uint8_t)i;
   strncpy(op->signer_id, "admin", CRABS_MAX_USER_ID - 1);
+  op->signer_key_version = attribute_machine_find_user(am, "admin")->key_version;
   op->payload = payload;
   op->payload_size = (uint32_t)payload_size;
   op->sig_scheme = ECDSA_SECP256K1;

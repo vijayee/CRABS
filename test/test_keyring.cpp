@@ -10,6 +10,7 @@ extern "C" {
 #include "../src/Crypto/crypto.h"
 #include "../src/CRABS/crabs.h"
 }
+#include "test_helpers.h"
 
 // Audit N-3: user_key_register now validates secp256k1 public keys, so tests
 // must use real generated keys (not 0xBB/0xCC fill).
@@ -608,7 +609,7 @@ TEST(TestKeyRing, RegisterKeyOnNonAdminUser) {
 
   uint8_t user_pk[33] = {0x02};
   memset(user_pk + 1, 0xDD, 32);
-  ASSERT_EQ(attribute_machine_register_user(am, "alice", user_pk, "role:user"), CRABS_SUCCESS);
+  ASSERT_EQ(crabs_test_register_user_with_role(am, "alice", user_pk, "role", "user"), CRABS_SUCCESS);
 
   user_t* alice = attribute_machine_find_user(am, "alice");
   ASSERT_NE(alice, nullptr);

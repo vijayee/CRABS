@@ -57,7 +57,7 @@ static void destroy_test_state(state_t* state) {
 }
 
 static void sign_as_admin(operation_t* op) {
-  crabs_test_sign_op_with(test_admin_key(), op);
+  crabs_test_sign_op_with(g_env.am, test_admin_key(), op);
 }
 
 static void fill_uuid(uint8_t* uuid) {
@@ -140,7 +140,8 @@ TEST(TestKeyOps, RegisterKeyRejectsUnknownUser) {
 
   sign_as_admin(op);
   crabs_error_e rc = state_machine_execute(state, op);
-  EXPECT_EQ(rc, CRABS_ERR_USER_NOT_FOUND);
+  // R7-14: user existence must not leak through a distinct error code.
+  EXPECT_EQ(rc, CRABS_ERR_UNAUTHORIZED);
 
   operation_destroy(op);
   destroy_test_state(state);
@@ -158,7 +159,8 @@ TEST(TestKeyOps, RegisterKeyRejectsSuspendedUser) {
 
   sign_as_admin(op);
   crabs_error_e rc = state_machine_execute(state, op);
-  EXPECT_EQ(rc, CRABS_ERR_USER_SUSPENDED);
+  // R7-14: user status must not leak through a distinct error code.
+  EXPECT_EQ(rc, CRABS_ERR_UNAUTHORIZED);
 
   operation_destroy(op);
   destroy_test_state(state);
@@ -459,8 +461,8 @@ TEST(TestKeyOps, RegisterKeyOnNonAdminUser) {
   // Register a regular user with a real ECDSA keypair so she can sign.
   ecdsa_keypair_t* alice_key = crypto_ecdsa_generate();
   ASSERT_NE(alice_key, nullptr);
-  attribute_machine_register_user(state->attr_machine, "alice",
-                                    alice_key->public_key, "role:user");
+  crabs_test_register_user_with_role(state->attr_machine, "alice",
+                                    alice_key->public_key, "role", "user");
 
   // Alice registers her own key
   const char* config = "key_id=alice-ecdsa;scheme=1;public_key_len=33";
@@ -476,7 +478,7 @@ TEST(TestKeyOps, RegisterKeyOnNonAdminUser) {
   op->payload = payload;
   op->payload_size = (uint32_t)payload_size;
 
-  crabs_test_sign_op_with(alice_key, op);
+  crabs_test_sign_op_with(state->attr_machine, alice_key, op);
   crabs_error_e rc = state_machine_execute(state, op);
   EXPECT_EQ(rc, CRABS_SUCCESS);
 
@@ -633,9 +635,10 @@ TEST(TestKeyOps, RegisterKeyRejectsDuplicateKeyId) {
 //
 // Through the signed-operation path, the revoked user is first rejected by
 // the authorization step (crypto_verify_operation_auth whitelists
-// USER_ACTIVE per the H-C fix), which returns CRABS_ERR_USER_NOT_FOUND for
-// REVOKED users. The handler-level != USER_ACTIVE check is defense-in-depth
-// for the direct API path (tested in test_attribute_machine.cpp).
+// USER_ACTIVE per the H-C fix), which returns CRABS_ERR_UNAUTHORIZED for
+// REVOKED users (R7-14: no status leak). The handler-level != USER_ACTIVE
+// check is defense-in-depth for the direct API path (tested in
+// test_attribute_machine.cpp).
 // ============================================================
 TEST(TestKeyOps, RegisterKeyRejectsRevokedUser) {
   state_t* state = create_test_state_with_attr();
@@ -649,8 +652,8 @@ TEST(TestKeyOps, RegisterKeyRejectsRevokedUser) {
 
   sign_as_admin(op);
   crabs_error_e rc = state_machine_execute(state, op);
-  // Auth step rejects REVOKED with USER_NOT_FOUND (H-C whitelist).
-  EXPECT_EQ(rc, CRABS_ERR_USER_NOT_FOUND);
+  // Auth step rejects REVOKED with UNAUTHORIZED (H-C whitelist, R7-14).
+  EXPECT_EQ(rc, CRABS_ERR_UNAUTHORIZED);
 
   operation_destroy(op);
   destroy_test_state(state);
@@ -682,7 +685,8 @@ TEST(TestKeyOps, RevokeKeyRejectsRevokedUser) {
 
   sign_as_admin(op);
   crabs_error_e rc = state_machine_execute(state, op);
-  EXPECT_EQ(rc, CRABS_ERR_USER_NOT_FOUND);
+  // R7-14: status must not leak through a distinct error code.
+  EXPECT_EQ(rc, CRABS_ERR_UNAUTHORIZED);
 
   operation_destroy(op);
   destroy_test_state(state);
@@ -707,7 +711,8 @@ TEST(TestKeyOps, SetDefaultKeyRejectsRevokedUser) {
 
   sign_as_admin(op);
   crabs_error_e rc = state_machine_execute(state, op);
-  EXPECT_EQ(rc, CRABS_ERR_USER_NOT_FOUND);
+  // R7-14: status must not leak through a distinct error code.
+  EXPECT_EQ(rc, CRABS_ERR_UNAUTHORIZED);
 
   operation_destroy(op);
   destroy_test_state(state);

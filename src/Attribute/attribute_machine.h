@@ -129,6 +129,15 @@ crabs_error_e attribute_machine_revoke_role(attribute_machine_t* am, const char*
                                               const char* role, const char* signer_id);
 crabs_error_e attribute_machine_suspend_user(attribute_machine_t* am, const char* user_id);
 
+// R7-07: reactivate a SUSPENDED user after key-compromise recovery
+// (crypto_revoke_and_rotate). Admin-authorized: the signer must be an active
+// user holding the role:admin attribute. REVOKED users are terminal and cannot
+// be reactivated. Does not bump key_version — the suspension during recovery
+// already invalidated the old key, and the user's new key is bound to the
+// current version.
+crabs_error_e attribute_machine_activate_user(attribute_machine_t* am, const char* target_user,
+                                               const char* signer_id);
+
 // Audit H-C: revoke a user. Unlike suspend (recoverable), revocation is the
 // terminal state — a revoked user cannot authorize, refresh, or be reactivated
 // without re-registration. Sets user->status = USER_REVOKED.

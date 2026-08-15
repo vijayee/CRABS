@@ -3,6 +3,7 @@ extern "C" {
 #include "../src/Attribute/attribute_machine.h"
 #include "../src/Crypto/crypto.h"
 }
+#include "test_helpers.h"
 
 // Audit N-3: the attribute machine now validates secp256k1 public keys at
 // registration, so tests must use real generated keys (not 0xAB/0xCD fill).
@@ -91,6 +92,25 @@ TEST_F(TestAttributeMachine, TestRegisterUserNullAttrs) {
   EXPECT_EQ(bob->attribute_count, 0u);
 }
 
+// R7-08: register_user must not mint privileged attributes (role, admin,
+// owner, ...) from initial_attrs. Privileged attributes are granted only via
+// the admin grant_role path; a public register_user call must not be able to
+// create a role:admin user.
+TEST_F(TestAttributeMachine, TestRegisterUserRejectsPrivilegedAttrs) {
+  uint8_t user_pk[33];
+  _gen_pk(user_pk);
+
+  crabs_error_e result = attribute_machine_register_user(am, "alice", user_pk, "role:admin");
+  EXPECT_EQ(result, CRABS_ERR_INVALID_PARAM);
+
+  // User must not have been created.
+  EXPECT_EQ(attribute_machine_find_user(am, "alice"), nullptr);
+
+  // Non-privileged attributes still work.
+  result = attribute_machine_register_user(am, "bob", user_pk, "dept:eng|level:senior");
+  EXPECT_EQ(result, CRABS_SUCCESS);
+}
+
 TEST_F(TestAttributeMachine, TestRegisterDuplicateUser) {
   uint8_t user_pk[33];
   _gen_pk(user_pk);
@@ -163,7 +183,7 @@ TEST_F(TestAttributeMachine, TestGrantRoleSuspendedUser) {
 TEST_F(TestAttributeMachine, TestRevokeRole) {
   uint8_t user_pk[33];
   _gen_pk(user_pk);
-  attribute_machine_register_user(am, "alice", user_pk, "role:editor");
+  crabs_test_register_user_with_role(am, "alice", user_pk, "role", "editor");
 
   user_t* alice = attribute_machine_find_user(am, "alice");
   EXPECT_EQ(alice->attribute_count, 1u);
@@ -196,7 +216,8 @@ TEST_F(TestAttributeMachine, TestRevokeRoleUserNotFound) {
 TEST_F(TestAttributeMachine, TestRevokeRoleShiftsAttributes) {
   uint8_t user_pk[33];
   _gen_pk(user_pk);
-  attribute_machine_register_user(am, "alice", user_pk, "role:editor|dept:eng|level:senior");
+  attribute_machine_register_user(am, "alice", user_pk, "dept:eng|level:senior");
+  attribute_machine_grant_role(am, "alice", "role", "editor", "admin");
 
   user_t* alice = attribute_machine_find_user(am, "alice");
   EXPECT_EQ(alice->attribute_count, 3u);
@@ -341,6 +362,84 @@ TEST_F(TestAttributeMachine, TestSuspendUserNotFound) {
   EXPECT_EQ(result, CRABS_ERR_USER_NOT_FOUND);
 }
 
+// R7-07: crypto_revoke_and_rotate suspends the user during key-compromise
+// recovery, but there was no reactivation path — the "recovery" was a
+// permanent lockout. attribute_machine_activate_user restores a SUSPENDED
+// user to ACTIVE under admin authorization.
+TEST_F(TestAttributeMachine, TestActivateUser) {
+  uint8_t user_pk[33];
+  _gen_pk(user_pk);
+  ASSERT_EQ(attribute_machine_register_user(am, "alice", user_pk, NULL), CRABS_SUCCESS);
+
+  user_t* alice = attribute_machine_find_user(am, "alice");
+  ASSERT_NE(alice, nullptr);
+  uint64_t version_before_suspend = alice->key_version;
+
+  ASSERT_EQ(attribute_machine_suspend_user(am, "alice"), CRABS_SUCCESS);
+  alice = attribute_machine_find_user(am, "alice");
+  ASSERT_NE(alice, nullptr);
+  EXPECT_EQ(alice->status, USER_SUSPENDED);
+  uint64_t version_after_suspend = alice->key_version;
+  EXPECT_EQ(version_after_suspend, version_before_suspend + 1);
+
+  crabs_error_e result = attribute_machine_activate_user(am, "alice", "admin");
+  EXPECT_EQ(result, CRABS_SUCCESS);
+
+  alice = attribute_machine_find_user(am, "alice");
+  ASSERT_NE(alice, nullptr);
+  EXPECT_EQ(alice->status, USER_ACTIVE);
+  // key_version is NOT bumped by reactivation: the suspension already
+  // invalidated the old key, and the user's new key is bound to the current
+  // version. Bumping again would force the user to guess an unknown version.
+  EXPECT_EQ(alice->key_version, version_after_suspend);
+}
+
+TEST_F(TestAttributeMachine, TestActivateUserRequiresAdmin) {
+  uint8_t user_pk[33];
+  _gen_pk(user_pk);
+  ASSERT_EQ(attribute_machine_register_user(am, "alice", user_pk, NULL), CRABS_SUCCESS);
+  ASSERT_EQ(attribute_machine_suspend_user(am, "alice"), CRABS_SUCCESS);
+
+  // bob has role:user, not role:admin — reactivation must be rejected.
+  uint8_t bob_pk[33];
+  _gen_pk(bob_pk);
+  ASSERT_EQ(crabs_test_register_user_with_role(am, "bob", bob_pk, "role", "user"), CRABS_SUCCESS);
+
+  crabs_error_e result = attribute_machine_activate_user(am, "alice", "bob");
+  EXPECT_EQ(result, CRABS_ERR_UNAUTHORIZED);
+
+  // alice stays suspended.
+  user_t* alice = attribute_machine_find_user(am, "alice");
+  ASSERT_NE(alice, nullptr);
+  EXPECT_EQ(alice->status, USER_SUSPENDED);
+}
+
+TEST_F(TestAttributeMachine, TestActivateUserNotFound) {
+  crabs_error_e result = attribute_machine_activate_user(am, "nonexistent", "admin");
+  EXPECT_EQ(result, CRABS_ERR_USER_NOT_FOUND);
+}
+
+TEST_F(TestAttributeMachine, TestActivateUserAlreadyActive) {
+  uint8_t user_pk[33];
+  _gen_pk(user_pk);
+  ASSERT_EQ(attribute_machine_register_user(am, "alice", user_pk, NULL), CRABS_SUCCESS);
+
+  // An already-active user is not in a recoverable state.
+  crabs_error_e result = attribute_machine_activate_user(am, "alice", "admin");
+  EXPECT_EQ(result, CRABS_ERR_INVALID_PARAM);
+}
+
+TEST_F(TestAttributeMachine, TestActivateRevokedUserRejected) {
+  uint8_t user_pk[33];
+  _gen_pk(user_pk);
+  ASSERT_EQ(attribute_machine_register_user(am, "alice", user_pk, NULL), CRABS_SUCCESS);
+  ASSERT_EQ(attribute_machine_revoke_user(am, "alice"), CRABS_SUCCESS);
+
+  // Revocation is terminal (audit H-C): a REVOKED user cannot be reactivated.
+  crabs_error_e result = attribute_machine_activate_user(am, "alice", "admin");
+  EXPECT_EQ(result, CRABS_ERR_INVALID_PARAM);
+}
+
 // Regression for audit H-C: attribute_machine_revoke_user sets USER_REVOKED.
 // Revocation is terminal — the enum value was previously declared but never
 // assigned, so there was no way to actually revoke a user.
@@ -370,7 +469,7 @@ TEST_F(TestAttributeMachine, TestRevokeUserNotFound) {
 TEST_F(TestAttributeMachine, TestTempAttrExpiredAfterSetTime) {
   uint8_t user_pk[33];
   _gen_pk(user_pk);
-  ASSERT_EQ(attribute_machine_register_user(am, "alice", user_pk, "role:member"), CRABS_SUCCESS);
+  ASSERT_EQ(crabs_test_register_user_with_role(am, "alice", user_pk, "role", "member"), CRABS_SUCCESS);
 
   // Issue a temp attribute with 5000ms duration at time 1000 → expires at 6000.
   // issue_temporary grants to users whose attribute NAME matches `role`; alice
@@ -432,7 +531,7 @@ TEST_F(TestAttributeMachine, TestFindAttribute) {
 
 TEST_F(TestAttributeMachine, TestFindAttributeNullParams) {
   uint8_t user_pk[33] = {0};
-  attribute_machine_register_user(am, "test", user_pk, "role:test");
+  crabs_test_register_user_with_role(am, "test", user_pk, "role", "test");
   user_t* user = attribute_machine_find_user(am, "test");
 
   EXPECT_EQ(attribute_machine_find_attribute(NULL, "role"), nullptr);
@@ -442,7 +541,8 @@ TEST_F(TestAttributeMachine, TestFindAttributeNullParams) {
 TEST_F(TestAttributeMachine, TestUserHasRole) {
   uint8_t user_pk[33];
   _gen_pk(user_pk);
-  attribute_machine_register_user(am, "alice", user_pk, "role:editor|dept:eng");
+  attribute_machine_register_user(am, "alice", user_pk, "dept:eng");
+  attribute_machine_grant_role(am, "alice", "role", "editor", "admin");
 
   user_t* alice = attribute_machine_find_user(am, "alice");
   ASSERT_NE(alice, nullptr);
@@ -455,7 +555,7 @@ TEST_F(TestAttributeMachine, TestUserHasRole) {
 
 TEST_F(TestAttributeMachine, TestUserHasRoleNullParams) {
   uint8_t user_pk[33] = {0};
-  attribute_machine_register_user(am, "test", user_pk, "role:test");
+  crabs_test_register_user_with_role(am, "test", user_pk, "role", "test");
   user_t* user = attribute_machine_find_user(am, "test");
 
   EXPECT_FALSE(attribute_machine_user_has_role(NULL, "role"));
@@ -765,7 +865,7 @@ TEST_F(TestAttributeMachine, TestRevokedUserRejectedByDirectAPIs) {
 TEST_F(TestAttributeMachine, TestPrivilegedAttrNamesIncludeVerifierIssuer) {
   uint8_t user_pk[33];
   _gen_pk(user_pk);
-  ASSERT_EQ(attribute_machine_register_user(am, "alice", user_pk, "role:staff"), CRABS_SUCCESS);
+  ASSERT_EQ(crabs_test_register_user_with_role(am, "alice", user_pk, "role", "staff"), CRABS_SUCCESS);
 
   // self_assert of "verifier" must be rejected.
   EXPECT_EQ(attribute_machine_self_assert(am, "verifier", "admin", "alice"),
@@ -944,7 +1044,9 @@ TEST_F(TestAttributeMachine, TestRegisterUserRejectsBadAttrNameInInitialAttrs) {
   // Valid charset in all name parts → all attributes stored.
   uint8_t user_pk4[33];
   _gen_pk(user_pk4);
-  ASSERT_EQ(attribute_machine_register_user(am, "dave", user_pk4, "role:staff|dept:eng|clearance:secret"),
+  ASSERT_EQ(attribute_machine_register_user(am, "dave", user_pk4, "dept:eng|clearance:secret"),
+            CRABS_SUCCESS);
+  ASSERT_EQ(attribute_machine_grant_role(am, "dave", "role", "staff", "admin"),
             CRABS_SUCCESS);
   user_t* dave = attribute_machine_find_user(am, "dave");
   ASSERT_NE(dave, nullptr);

@@ -531,26 +531,50 @@ static bool _attr_in_list(const char* attr, const char* attr_list) {
   return false;
 }
 
-static bool _eval_policy_expr(const char** pp, const char* attrs) {
+static bool _eval_policy_expr(const char** pp, const char* attrs);
+
+// R7-09: evaluate a numeric comparison "name op value" against the attribute
+// string (comma-separated "name:value" tokens). The right operand is parsed as
+// a numeric literal; a non-numeric operand yields 0 (best-effort).
+static bool _eval_comparison(const char* name, const char* op, const char* value,
+                             const char* attrs) {
+  size_t name_len = strlen(name);
+  const char* p = attrs;
+  long long attr_val = 0;
+  bool found = false;
+  while (*p) {
+    while (*p == ' ' || *p == ',') p++;
+    const char* tok_start = p;
+    while (*p && *p != ',') p++;
+    size_t tok_len = (size_t)(p - tok_start);
+    if (tok_len > name_len + 1 &&
+        strncmp(tok_start, name, name_len) == 0 && tok_start[name_len] == ':') {
+      char val_buf[64];
+      size_t val_len = tok_len - name_len - 1;
+      if (val_len >= sizeof(val_buf)) val_len = sizeof(val_buf) - 1;
+      memcpy(val_buf, tok_start + name_len + 1, val_len);
+      val_buf[val_len] = '\0';
+      attr_val = atoll(val_buf);
+      found = true;
+      break;
+    }
+  }
+  if (!found) return false;
+
+  long long cmp_val = atoll(value);
+  if (strcmp(op, ">=") == 0) return attr_val >= cmp_val;
+  if (strcmp(op, "<=") == 0) return attr_val <= cmp_val;
+  if (strcmp(op, ">") == 0) return attr_val > cmp_val;
+  if (strcmp(op, "<") == 0) return attr_val < cmp_val;
+  if (strcmp(op, "==") == 0) return attr_val == cmp_val;
+  if (strcmp(op, "!=") == 0) return attr_val != cmp_val;
+  return false;
+}
+
+// Parse a primary policy term: an attribute token, a numeric comparison, or a
+// parenthesized expression. Advances *pp past the term.
+static bool _eval_policy_term(const char** pp, const char* attrs) {
   while (**pp == ' ') (*pp)++;
-
-  if (strncmp(*pp, "AND", 3) == 0 && !isalpha((unsigned char)(*pp)[3])) {
-    // AND node: (left right) — both must match
-    *pp += 3;
-    while (**pp == ' ') (*pp)++;
-    bool left = _eval_policy_expr(pp, attrs);
-    bool right = _eval_policy_expr(pp, attrs);
-    return left && right;
-  }
-
-  if (strncmp(*pp, "OR", 2) == 0 && !isalpha((unsigned char)(*pp)[2])) {
-    // OR node: either must match
-    *pp += 2;
-    while (**pp == ' ') (*pp)++;
-    bool left = _eval_policy_expr(pp, attrs);
-    bool right = _eval_policy_expr(pp, attrs);
-    return left || right;
-  }
 
   if (**pp == '(') {
     (*pp)++;
@@ -560,18 +584,82 @@ static bool _eval_policy_expr(const char** pp, const char* attrs) {
     return result;
   }
 
-  // Parse attribute token
+  // Parse the left token (attribute name or name:value).
   const char* start = *pp;
   while (**pp && **pp != ' ' && **pp != ')' && **pp != ',') (*pp)++;
   size_t len = (size_t)(*pp - start);
   if (len == 0) return false;
 
-  char attr[CRABS_MAX_POLICY_EXPR];
-  if (len >= sizeof(attr)) len = sizeof(attr) - 1;
-  memcpy(attr, start, len);
-  attr[len] = '\0';
+  char left[CRABS_MAX_POLICY_EXPR];
+  if (len >= sizeof(left)) len = sizeof(left) - 1;
+  memcpy(left, start, len);
+  left[len] = '\0';
 
-  return _attr_in_list(attr, attrs);
+  // Check for a comparison operator after the left token.
+  const char* save = *pp;
+  while (**pp == ' ') (*pp)++;
+  const char* op = NULL;
+  if (strncmp(*pp, ">=", 2) == 0) { op = ">="; *pp += 2; }
+  else if (strncmp(*pp, "<=", 2) == 0) { op = "<="; *pp += 2; }
+  else if (strncmp(*pp, "==", 2) == 0) { op = "=="; *pp += 2; }
+  else if (strncmp(*pp, "!=", 2) == 0) { op = "!="; *pp += 2; }
+  else if (**pp == '>') { op = ">"; *pp += 1; }
+  else if (**pp == '<') { op = "<"; *pp += 1; }
+
+  if (op != NULL) {
+    while (**pp == ' ') (*pp)++;
+    const char* rstart = *pp;
+    while (**pp && **pp != ' ' && **pp != ')' && **pp != ',') (*pp)++;
+    size_t rlen = (size_t)(*pp - rstart);
+    if (rlen == 0) return false;
+    char right[CRABS_MAX_POLICY_EXPR];
+    if (rlen >= sizeof(right)) rlen = sizeof(right) - 1;
+    memcpy(right, rstart, rlen);
+    right[rlen] = '\0';
+    return _eval_comparison(left, op, right, attrs);
+  }
+
+  // No comparison — restore the pointer and treat as a bare attribute token.
+  *pp = save;
+  return _attr_in_list(left, attrs);
+}
+
+static bool _eval_policy_expr(const char** pp, const char* attrs) {
+  while (**pp == ' ') (*pp)++;
+
+  // Prefix operators (legacy form): AND <l> <r>, OR <l> <r>.
+  if (strncmp(*pp, "AND", 3) == 0 && !isalpha((unsigned char)(*pp)[3])) {
+    *pp += 3;
+    while (**pp == ' ') (*pp)++;
+    bool left = _eval_policy_expr(pp, attrs);
+    bool right = _eval_policy_expr(pp, attrs);
+    return left && right;
+  }
+
+  if (strncmp(*pp, "OR", 2) == 0 && !isalpha((unsigned char)(*pp)[2])) {
+    *pp += 2;
+    while (**pp == ' ') (*pp)++;
+    bool left = _eval_policy_expr(pp, attrs);
+    bool right = _eval_policy_expr(pp, attrs);
+    return left || right;
+  }
+
+  // Parse a primary term, then handle infix operators (R7-09: the
+  // preprocessor emits "left AND right" / "left OR right").
+  bool left = _eval_policy_term(pp, attrs);
+
+  while (**pp == ' ') (*pp)++;
+  if (strncmp(*pp, "AND", 3) == 0 && !isalpha((unsigned char)(*pp)[3])) {
+    *pp += 3;
+    bool right = _eval_policy_expr(pp, attrs);
+    return left && right;
+  }
+  if (strncmp(*pp, "OR", 2) == 0 && !isalpha((unsigned char)(*pp)[2])) {
+    *pp += 2;
+    bool right = _eval_policy_expr(pp, attrs);
+    return left || right;
+  }
+  return left;
 }
 
 bool crypto_abe_eval_policy(const char* policy, const char* attrs) {
@@ -946,35 +1034,35 @@ verify_result_t crypto_verify_operation_auth(
 
     user_t* user = attribute_machine_find_user((attribute_machine_t*)attr_machine, signer_id);
     if (!user) {
-      result.error = CRABS_ERR_USER_NOT_FOUND;
-      return result;
-    }
-
-    // Fail closed: only ACTIVE users may authorize. SUSPENDED and REVOKED
-    // users must be rejected.
-    if (user->status != USER_ACTIVE) {
-      result.error = (user->status == USER_SUSPENDED)
-                       ? CRABS_ERR_USER_SUSPENDED
-                       : CRABS_ERR_USER_NOT_FOUND;
-      return result;
-    }
-
-    // Verify the signature BEFORE the attribute policy check (audit L-7):
-    // checking the policy first returned distinct error codes for "user lacks
-    // attributes" vs "bad signature", a small information leak. Now the only
-    // signal on failure is a single UNAUTHORIZED.
-    if (!crypto_ecdsa_verify(user->public_key, serialized_op, op_len, signature)) {
+      // R7-14: collapse to a single UNAUTHORIZED so an unauthenticated caller
+      // cannot enumerate user IDs. The prior USER_NOT_FOUND leaked existence.
       result.error = CRABS_ERR_UNAUTHORIZED;
       return result;
     }
 
+    // Fail closed: only ACTIVE users may authorize. SUSPENDED and REVOKED
+    // users must be rejected. R7-14: collapse to a single UNAUTHORIZED so a
+    // caller cannot learn a user's status.
+    if (user->status != USER_ACTIVE) {
+      result.error = CRABS_ERR_UNAUTHORIZED;
+      return result;
+    }
+
+    // R7-L-8: evaluate BOTH the signature and the policy, then combine, so a
+    // caller cannot distinguish "bad signature" from "bad policy" by timing.
+    // The prior code returned early on a bad signature, skipping the policy
+    // evaluation and leaking which check failed through response latency.
+    const bool sig_ok = crypto_ecdsa_verify(user->public_key, serialized_op, op_len, signature);
+    bool policy_ok = true;
     if (has_attr_policy) {
       char attr_string[CRABS_ATTR_STRING_MAX];
       _build_attr_string(user, attr_string, sizeof(attr_string));
-      if (!crypto_abe_eval_policy(abe_policy, attr_string)) {
-        result.error = CRABS_ERR_UNAUTHORIZED;
-        return result;
-      }
+      policy_ok = crypto_abe_eval_policy(abe_policy, attr_string);
+    }
+
+    if (!sig_ok || !policy_ok) {
+      result.error = CRABS_ERR_UNAUTHORIZED;
+      return result;
     }
 
     result.authorized = true;
@@ -1052,6 +1140,13 @@ static crabs_error_e _verify_user_signature(
     const uint8_t* serialized_op, size_t op_len,
     const uint8_t* signature, uint32_t signature_len) {
   if (sig_scheme == SCHEME_UNSPECIFIED && (key_id == NULL || key_id[0] == '\0')) {
+    // R7-04: once a user has a keyring, the legacy user->public_key path is
+    // rejected. Otherwise a rotated-away legacy key would keep signing
+    // operations as the user. Users with a keyring must identify the key
+    // explicitly (key_id and/or sig_scheme).
+    if (user->keys != NULL) {
+      return CRABS_ERR_UNAUTHORIZED;
+    }
     // Legacy path: use user's default ECDSA key
     return _verify_sig_with_scheme(SCHEME_UNSPECIFIED,
                                     user->public_key, 33,
@@ -1065,10 +1160,10 @@ static crabs_error_e _verify_user_signature(
     if (key == NULL) return CRABS_ERR_RESOURCE_NOT_FOUND;
     if (key->status != KEY_ACTIVE) return CRABS_ERR_UNAUTHORIZED;
     // Audit H-C: enforce key expiry. A key with expires_at set and past is
-    // rejected (now_ms == 0 means the platform has not injected a clock yet;
-    // in that case we do not enforce time-based expiry, matching the prior
-    // behavior, but a future-dated expiry is still respected).
-    if (key->expires_at != 0 && now_ms != 0 && key->expires_at <= now_ms) {
+    // rejected. R7-10: now_ms == 0 means the platform has not injected a clock
+    // yet — treat that as "expiry unknown" and fail closed rather than
+    // silently accepting an expired key.
+    if (key->expires_at != 0 && (now_ms == 0 || key->expires_at <= now_ms)) {
       return CRABS_ERR_UNAUTHORIZED;
     }
     if (sig_scheme != SCHEME_UNSPECIFIED && key->scheme != sig_scheme) {
@@ -1084,7 +1179,7 @@ static crabs_error_e _verify_user_signature(
   if (sig_scheme != SCHEME_UNSPECIFIED) {
     user_key_t* key = user_key_find_active((user_t*)user, sig_scheme);
     if (key == NULL) return CRABS_ERR_RESOURCE_NOT_FOUND;
-    if (key->expires_at != 0 && now_ms != 0 && key->expires_at <= now_ms) {
+    if (key->expires_at != 0 && (now_ms == 0 || key->expires_at <= now_ms)) {
       return CRABS_ERR_UNAUTHORIZED;
     }
     return _verify_sig_with_scheme(key->scheme,
@@ -1128,35 +1223,36 @@ verify_result_t crypto_verify_operation_auth_v2(
 
     user_t* user = attribute_machine_find_user((attribute_machine_t*)attr_machine, signer_id);
     if (!user) {
-      result.error = CRABS_ERR_USER_NOT_FOUND;
+      // R7-14: collapse to a single UNAUTHORIZED so an unauthenticated caller
+      // cannot enumerate user IDs. The prior USER_NOT_FOUND leaked existence.
+      result.error = CRABS_ERR_UNAUTHORIZED;
       return result;
     }
     if (user->status != USER_ACTIVE) {
-      result.error = (user->status == USER_SUSPENDED)
-                       ? CRABS_ERR_USER_SUSPENDED
-                       : CRABS_ERR_USER_NOT_FOUND;
-      return result;
-    }
-
-    // Verify the signature BEFORE the attribute policy check (audit L-7):
-    // collapse the "bad signature" vs "lacks attributes" distinction into a
-    // single UNAUTHORIZED so a caller cannot distinguish them.
-    crabs_error_e sig_rc = _verify_user_signature(user, key_id, sig_scheme,
-                                                    attr_machine->current_time_ms,
-                                                    serialized_op, op_len,
-                                                    signature, signature_len);
-    if (sig_rc != CRABS_SUCCESS) {
+      // R7-14: collapse to a single UNAUTHORIZED so a caller cannot learn a
+      // user's status (SUSPENDED vs REVOKED).
       result.error = CRABS_ERR_UNAUTHORIZED;
       return result;
     }
 
+    // R7-L-8: evaluate BOTH the signature and the policy, then combine, so a
+    // caller cannot distinguish "bad signature" from "bad policy" by timing.
+    // The prior code returned early on a bad signature, skipping the policy
+    // evaluation and leaking which check failed through response latency.
+    crabs_error_e sig_rc = _verify_user_signature(user, key_id, sig_scheme,
+                                                    attr_machine->current_time_ms,
+                                                    serialized_op, op_len,
+                                                    signature, signature_len);
+    bool policy_ok = true;
     if (has_attr_policy) {
       char attr_string[CRABS_ATTR_STRING_MAX];
       _build_attr_string(user, attr_string, sizeof(attr_string));
-      if (!crypto_abe_eval_policy(abe_policy, attr_string)) {
-        result.error = CRABS_ERR_UNAUTHORIZED;
-        return result;
-      }
+      policy_ok = crypto_abe_eval_policy(abe_policy, attr_string);
+    }
+
+    if (sig_rc != CRABS_SUCCESS || !policy_ok) {
+      result.error = CRABS_ERR_UNAUTHORIZED;
+      return result;
     }
 
     result.authorized = true;
@@ -1214,6 +1310,7 @@ verify_result_t crypto_verify_operation_auth_v2(
 
 crabs_error_e crypto_verify_co_signature(
     const attribute_machine_t* attr_machine,
+    const char* abe_policy,
     const char* signer_id,
     const char* key_id,
     signature_scheme_e sig_scheme,
@@ -1229,6 +1326,16 @@ crabs_error_e crypto_verify_co_signature(
   if (user->status != USER_ACTIVE) {
     return (user->status == USER_SUSPENDED) ? CRABS_ERR_USER_SUSPENDED
                                               : CRABS_ERR_USER_NOT_FOUND;
+  }
+  // R7-L-9: a co-signer is an approver and must satisfy the op's ABE policy,
+  // not merely be an active user with a valid signature. Otherwise a
+  // threshold-2 "role:admin" policy is met by one admin plus any active user.
+  if (abe_policy != NULL && abe_policy[0] != '\0') {
+    char attr_string[CRABS_ATTR_STRING_MAX];
+    _build_attr_string(user, attr_string, sizeof(attr_string));
+    if (!crypto_abe_eval_policy(abe_policy, attr_string)) {
+      return CRABS_ERR_UNAUTHORIZED;
+    }
   }
   return _verify_user_signature(user, key_id, sig_scheme,
                                   attr_machine->current_time_ms,
@@ -1608,6 +1715,12 @@ crabs_error_e crypto_key_envelope_decrypt_sk(const key_envelope_t* env,
   // Minimum: eph_pub(33) + iv(12) + tag(16) = 61 (no ciphertext)
   if (env->sk_abe_len < 33 + 12 + 16) return CRABS_ERR_CRYPTOGRAPHIC_ERROR;
   const uint8_t* eph_pub = env->sk_abe;
+  // R7-L-3: validate the attacker-controlled ephemeral public key before ECDH.
+  // The encrypt side validates (R5-6); the decrypt side must too — an
+  // off-curve point would otherwise feed ECDH_compute_key unchecked.
+  if (!crypto_ecdsa_validate_public_key(eph_pub)) {
+    return CRABS_ERR_CRYPTOGRAPHIC_ERROR;
+  }
   const uint8_t* iv = env->sk_abe + 33;
   size_t ct_len = (size_t)env->sk_abe_len - 33 - 12 - 16;
   const uint8_t* ct = env->sk_abe + 45;
@@ -1664,6 +1777,14 @@ recovery_result_t* crypto_revoke_and_rotate(
     uint64_t state_version,
     uint64_t issued_at) {
   if (!mk || !node_private_key || !attr_machine || !user_id || !new_public_key) return NULL;
+
+  // R7-06: validate the user-supplied public key BEFORE any state mutation.
+  // The prior code suspended the user and overwrote user->public_key first,
+  // then failed envelope creation (via the R5-6 validation in
+  // _ecies_encrypt_to_pub) — leaving the user suspended with an invalid key
+  // and no recovery path. Reject invalid keys up front so a failed rotation
+  // leaves the user record untouched.
+  if (!crypto_ecdsa_validate_public_key(new_public_key)) return NULL;
 
   // Step 1: Suspend compromised user (also increments key_version per §8.4)
   user_t* user = attribute_machine_find_user(attr_machine, user_id);
