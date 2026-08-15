@@ -55,7 +55,8 @@ typedef enum {
   CRABS_TIME_SOURCE_SYSTEM_CLOCK = 0x00,
   CRABS_TIME_SOURCE_NTP_AUTH     = 0x01,
   CRABS_TIME_SOURCE_TPM          = 0x02,
-  CRABS_TIME_SOURCE_CONSENSUS    = 0x03
+  CRABS_TIME_SOURCE_CONSENSUS    = 0x03,
+  CRABS_TIME_SOURCE_HTTPS_AUTH   = 0x04
 } crabs_time_source_e;
 
 // ============================================================
