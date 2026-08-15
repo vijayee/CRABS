@@ -13,6 +13,27 @@
 #include <stdlib.h>
 #include <string.h>
 
+// Native HTTPS transport (OpenSSL). Guarded so the WASM build (which cannot
+// open sockets) does not compile it.
+#ifndef __EMSCRIPTEN__
+#include <openssl/ssl.h>
+#include <openssl/err.h>
+#include <stdio.h>
+
+#ifdef _WIN32
+#include <winsock2.h>
+#include <ws2tcpip.h>
+typedef SOCKET platform_socket_t;
+#define PLATFORM_INVALID_SOCKET INVALID_SOCKET
+#else
+#include <sys/socket.h>
+#include <netdb.h>
+#include <unistd.h>
+typedef int platform_socket_t;
+#define PLATFORM_INVALID_SOCKET (-1)
+#endif
+#endif // __EMSCRIPTEN__
+
 // Forward declaration: native OpenSSL transport (defined below). Guarded so
 // the WASM build (which cannot open sockets) does not compile it.
 #ifndef __EMSCRIPTEN__
@@ -142,16 +163,186 @@ void crabs_time_source_destroy(crabs_time_source_ops_t* ops) {
   free(ops);
 }
 
+#ifndef __EMSCRIPTEN__
+
 // ============================================================
 // Native HTTPS transport (OpenSSL)
 // ============================================================
 
-// Placeholder until Task 5 implements the real transport. Returns invalid so
-// the backend falls back to the system clock (a safe default).
+static void _platform_close_socket(platform_socket_t socket_fd) {
+#ifdef _WIN32
+  closesocket(socket_fd);
+#else
+  close(socket_fd);
+#endif
+}
+
+// Parse "https://host[:port]/path" into host, path, and port.
+static bool _parse_url(const char* url, char* host, size_t host_len,
+                       char* path, size_t path_len, int* port) {
+  if (url == NULL) return false;
+  const char* scheme = strstr(url, "://");
+  if (scheme == NULL) return false;
+  const char* host_start = scheme + 3;
+  const char* path_start = strchr(host_start, '/');
+  const char* host_end = path_start != NULL ? path_start : host_start + strlen(host_start);
+  size_t host_size = (size_t)(host_end - host_start);
+  if (host_size == 0 || host_size >= host_len) return false;
+  memcpy(host, host_start, host_size);
+  host[host_size] = '\0';
+  if (path_start != NULL) {
+    snprintf(path, path_len, "%s", path_start);
+  } else {
+    snprintf(path, path_len, "/");
+  }
+  *port = 443;
+  return true;
+}
+
+static platform_socket_t _tcp_connect(const char* host, int port) {
+  char port_str[16];
+  snprintf(port_str, sizeof(port_str), "%d", port);
+
+  struct addrinfo hints;
+  memset(&hints, 0, sizeof(hints));
+  hints.ai_family = AF_UNSPEC;
+  hints.ai_socktype = SOCK_STREAM;
+
+  struct addrinfo* addresses = NULL;
+  if (getaddrinfo(host, port_str, &hints, &addresses) != 0) {
+    return PLATFORM_INVALID_SOCKET;
+  }
+
+  platform_socket_t socket_fd = PLATFORM_INVALID_SOCKET;
+  for (struct addrinfo* address = addresses; address != NULL; address = address->ai_next) {
+    socket_fd = socket(address->ai_family, address->ai_socktype, address->ai_protocol);
+    if (socket_fd == PLATFORM_INVALID_SOCKET) continue;
+    if (connect(socket_fd, address->ai_addr, (int)address->ai_addrlen) == 0) break;
+    _platform_close_socket(socket_fd);
+    socket_fd = PLATFORM_INVALID_SOCKET;
+  }
+  freeaddrinfo(addresses);
+  return socket_fd;
+}
+
+// Parse a Unix timestamp from the response body. Supports the Cloudflare
+// trace format ("ts=1786764168.000") and the worldtimeapi JSON format
+// ("\"unixtime\":1786764168").
+static void _parse_timestamp(const char* response, crabs_time_source_fetch_result_t* result) {
+  const char* ts_marker = strstr(response, "ts=");
+  if (ts_marker != NULL) {
+    const char* value_start = ts_marker + 3;
+    uint64_t seconds = 0;
+    while (*value_start >= '0' && *value_start <= '9') {
+      seconds = seconds * 10 + (uint64_t)(*value_start - '0');
+      value_start++;
+    }
+    uint64_t nanos = 0;
+    if (*value_start == '.') {
+      value_start++;
+      uint64_t fraction = 0;
+      int digits = 0;
+      while (*value_start >= '0' && *value_start <= '9' && digits < 9) {
+        fraction = fraction * 10 + (uint64_t)(*value_start - '0');
+        value_start++;
+        digits++;
+      }
+      while (digits < 9) { fraction *= 10; digits++; }
+      nanos = fraction;
+    }
+    result->seconds = seconds;
+    result->nanos = nanos;
+    result->valid = true;
+    return;
+  }
+
+  const char* unixtime_marker = strstr(response, "\"unixtime\"");
+  if (unixtime_marker != NULL) {
+    const char* colon = strchr(unixtime_marker, ':');
+    if (colon != NULL) {
+      const char* value_start = colon + 1;
+      while (*value_start == ' ' || *value_start == '\t') value_start++;
+      uint64_t seconds = 0;
+      while (*value_start >= '0' && *value_start <= '9') {
+        seconds = seconds * 10 + (uint64_t)(*value_start - '0');
+        value_start++;
+      }
+      result->seconds = seconds;
+      result->nanos = 0;
+      result->valid = true;
+    }
+  }
+}
+
 static crabs_time_source_fetch_result_t _native_fetch_server_time(
     const char* url, uint64_t timeout_ms) {
-  (void)url;
-  (void)timeout_ms;
   crabs_time_source_fetch_result_t result = {0, 0, false};
+
+  char host[256];
+  char path[512];
+  int port = 443;
+  if (!_parse_url(url, host, sizeof(host), path, sizeof(path), &port)) {
+    return result;
+  }
+
+  platform_socket_t socket_fd = _tcp_connect(host, port);
+  if (socket_fd == PLATFORM_INVALID_SOCKET) return result;
+
+  struct timeval timeout;
+  timeout.tv_sec = (time_t)(timeout_ms / 1000);
+  timeout.tv_usec = (suseconds_t)((timeout_ms % 1000) * 1000);
+  setsockopt(socket_fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+  setsockopt(socket_fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+
+  SSL_CTX* ssl_ctx = SSL_CTX_new(TLS_client_method());
+  if (ssl_ctx == NULL) {
+    _platform_close_socket(socket_fd);
+    return result;
+  }
+  SSL* ssl = SSL_new(ssl_ctx);
+  if (ssl == NULL) {
+    SSL_CTX_free(ssl_ctx);
+    _platform_close_socket(socket_fd);
+    return result;
+  }
+  SSL_set_fd(ssl, socket_fd);
+  SSL_set_tlsext_host_name(ssl, host);
+  if (SSL_connect(ssl) != 1) {
+    SSL_free(ssl);
+    SSL_CTX_free(ssl_ctx);
+    _platform_close_socket(socket_fd);
+    return result;
+  }
+
+  char request[1024];
+  int request_len = snprintf(request, sizeof(request),
+      "GET %s HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n"
+      "User-Agent: crabs-time-source/1.0\r\n\r\n",
+      path, host);
+  if (SSL_write(ssl, request, request_len) <= 0) {
+    SSL_free(ssl);
+    SSL_CTX_free(ssl_ctx);
+    _platform_close_socket(socket_fd);
+    return result;
+  }
+
+  char response[8192];
+  int response_len = 0;
+  int read_result;
+  while (response_len < (int)sizeof(response) - 1 &&
+         (read_result = SSL_read(ssl, response + response_len,
+                                 (int)sizeof(response) - 1 - response_len)) > 0) {
+    response_len += read_result;
+  }
+  response[response_len] = '\0';
+
+  SSL_free(ssl);
+  SSL_CTX_free(ssl_ctx);
+  _platform_close_socket(socket_fd);
+
+  if (response_len == 0) return result;
+  _parse_timestamp(response, &result);
   return result;
 }
+
+#endif // __EMSCRIPTEN__
