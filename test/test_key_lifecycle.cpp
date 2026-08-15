@@ -543,7 +543,7 @@ static void destroy_lifecycle_state(state_t* state) {
 }
 
 static void sign_lifecycle_op(operation_t* op) {
-  crabs_test_sign_op_with(lifecycle_admin_key(), op);
+  crabs_test_sign_op_with(g_env.am, lifecycle_admin_key(), op);
 }
 
 TEST(TestKeyLifecycle, StateMachineSuspendKey) {

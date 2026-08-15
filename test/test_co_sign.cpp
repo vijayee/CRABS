@@ -26,7 +26,7 @@ static operation_t* make_lock_op_signed(ecdsa_keypair_t* key, const char* signer
   op->next_state[0] = PROTOCOL_LOCKED;
   strncpy(op->signer_id, signer_id, CRABS_MAX_USER_ID - 1);
   op->signer_key_version = attribute_machine_find_user(state->attr_machine, signer_id)->key_version;
-  crabs_test_sign_op_with(key, op);
+  crabs_test_sign_op_with(state->attr_machine, key, op);
   return op;
 }
 
@@ -72,7 +72,7 @@ TEST(TestCoSign, MeetsThresholdWithValidCoSigners) {
 
   // Register a second admin (bob) with a real key.
   ecdsa_keypair_t* bob_key = crypto_ecdsa_generate();
-  attribute_machine_register_user(state->attr_machine, "bob", bob_key->public_key, "role:admin");
+  crabs_test_register_user_with_role(state->attr_machine, "bob", bob_key->public_key, "role", "admin");
 
   add_resource(state, "res");
   operation_t* op = make_lock_op_signed(env.admin_key, "admin", "res", state);
@@ -83,7 +83,7 @@ TEST(TestCoSign, MeetsThresholdWithValidCoSigners) {
   free(cs0);
   // Second co-signer: register a third user carol.
   ecdsa_keypair_t* carol_key = crypto_ecdsa_generate();
-  attribute_machine_register_user(state->attr_machine, "carol", carol_key->public_key, "role:admin");
+  crabs_test_register_user_with_role(state->attr_machine, "carol", carol_key->public_key, "role", "admin");
   co_signature_t* cs1 = make_co_sig(carol_key, "carol", op);
   op->co_signers[1] = *cs1;
   free(cs1);
@@ -103,7 +103,7 @@ TEST(TestCoSign, InvalidCoSignatureRejected) {
   state->config.sig_config.co_sign_threshold = 1;
 
   ecdsa_keypair_t* bob_key = crypto_ecdsa_generate();
-  attribute_machine_register_user(state->attr_machine, "bob", bob_key->public_key, "role:admin");
+  crabs_test_register_user_with_role(state->attr_machine, "bob", bob_key->public_key, "role", "admin");
 
   add_resource(state, "res");
   operation_t* op = make_lock_op_signed(env.admin_key, "admin", "res", state);
@@ -121,6 +121,38 @@ TEST(TestCoSign, InvalidCoSignatureRejected) {
   crabs_test_env_destroy(&env);
 }
 
+TEST(TestCoSign, CoSignerMustSatisfyPolicy) {
+  crabs_test_env_t env;
+  crabs_test_env_init(&env);
+  state_t* state = env.state;
+  state->config.sig_config.co_sign_threshold = 1;
+
+  // mallory is an active user but has NO attributes — she does not satisfy
+  // the "role:admin" policy for LOCK.
+  ecdsa_keypair_t* mallory_key = crypto_ecdsa_generate();
+  ASSERT_NE(mallory_key, nullptr);
+  ASSERT_EQ(attribute_machine_register_user(state->attr_machine, "mallory",
+                                            mallory_key->public_key, ""),
+            CRABS_SUCCESS);
+
+  add_resource(state, "res");
+  operation_t* op = make_lock_op_signed(env.admin_key, "admin", "res", state);
+
+  op->co_signers = (co_signature_t*)get_clear_memory(sizeof(co_signature_t));
+  co_signature_t* cs = make_co_sig(mallory_key, "mallory", op);
+  op->co_signers[0] = *cs;
+  free(cs);
+  op->co_signer_count = 1;
+
+  // R7-L-9: a co-signer is an approver and must satisfy the op's ABE policy.
+  // mallory's signature is valid and she is active, but she lacks role:admin,
+  // so the threshold-1 "role:admin" policy must not be met by her.
+  EXPECT_EQ(state_machine_execute(state, op), CRABS_ERR_UNAUTHORIZED);
+  operation_destroy(op);
+  crypto_ecdsa_keypair_destroy(mallory_key);
+  crabs_test_env_destroy(&env);
+}
+
 TEST(TestCoSign, DuplicateCoSignerRejected) {
   crabs_test_env_t env;
   crabs_test_env_init(&env);
@@ -128,7 +160,7 @@ TEST(TestCoSign, DuplicateCoSignerRejected) {
   state->config.sig_config.co_sign_threshold = 2;
 
   ecdsa_keypair_t* bob_key = crypto_ecdsa_generate();
-  attribute_machine_register_user(state->attr_machine, "bob", bob_key->public_key, "role:admin");
+  crabs_test_register_user_with_role(state->attr_machine, "bob", bob_key->public_key, "role", "admin");
 
   add_resource(state, "res");
   operation_t* op = make_lock_op_signed(env.admin_key, "admin", "res", state);
