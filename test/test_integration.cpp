@@ -42,9 +42,9 @@ TEST_F(TestIntegration, LockModifyVerifyUnlock) {
   // Register alice with a real keypair and role:admin so she can sign.
   ecdsa_keypair_t* alice_key = crypto_ecdsa_generate();
   ASSERT_NE(alice_key, nullptr);
-  ASSERT_EQ(attribute_machine_register_user(state->attr_machine, "alice",
+  ASSERT_EQ(crabs_test_register_user_with_role(state->attr_machine, "alice",
                                                alice_key->public_key,
-                                               "role:admin"), CRABS_SUCCESS);
+                                               "role", "admin"), CRABS_SUCCESS);
 
   data_item_t* res = data_item_create("resource1", DATA_TYPE_RESOURCE, CRDT_PN_COUNTER);
   ASSERT_NE(res, nullptr);
@@ -67,7 +67,7 @@ TEST_F(TestIntegration, LockModifyVerifyUnlock) {
   lock_op->next_state = (protocol_state_e*)malloc(sizeof(protocol_state_e));
   lock_op->next_state[0] = PROTOCOL_LOCKED;
   strncpy(lock_op->signer_id, "alice", CRABS_MAX_USER_ID - 1);
-  crabs_test_sign_op_with(alice_key, lock_op);
+  crabs_test_sign_op_with(state->attr_machine, alice_key,lock_op);
 
   crabs_error_e result = state_machine_execute(state, lock_op);
   EXPECT_EQ(result, CRABS_SUCCESS);
@@ -102,7 +102,7 @@ TEST_F(TestIntegration, LockModifyVerifyUnlock) {
   memcpy(verify_op->lock_claims[0].lock_token, item->lock_state.lock_token, CRABS_LOCK_TOKEN_SIZE);
   verify_op->lock_claim_count = 1;
   strncpy(verify_op->signer_id, "alice", CRABS_MAX_USER_ID - 1);
-  crabs_test_sign_op_with(alice_key, verify_op);
+  crabs_test_sign_op_with(state->attr_machine, alice_key,verify_op);
 
   result = state_machine_execute(state, verify_op);
   EXPECT_EQ(result, CRABS_SUCCESS);
@@ -126,7 +126,7 @@ TEST_F(TestIntegration, LockModifyVerifyUnlock) {
   memcpy(unlock_op->lock_claims[0].lock_token, item->lock_state.lock_token, CRABS_LOCK_TOKEN_SIZE);
   unlock_op->lock_claim_count = 1;
   strncpy(unlock_op->signer_id, "alice", CRABS_MAX_USER_ID - 1);
-  crabs_test_sign_op_with(alice_key, unlock_op);
+  crabs_test_sign_op_with(state->attr_machine, alice_key,unlock_op);
 
   result = state_machine_execute(state, unlock_op);
   EXPECT_EQ(result, CRABS_SUCCESS);
@@ -511,8 +511,8 @@ TEST_F(TestIntegration, KeyVersionVerification) {
   attribute_machine_t* am = attribute_machine_create("admin", admin_pk);
   ASSERT_NE(am, nullptr);
 
-  crabs_error_e reg_rc = attribute_machine_register_user(
-      am, "alice", alice_key->public_key, "role:admin");
+  crabs_error_e reg_rc = crabs_test_register_user_with_role(
+      am, "alice", alice_key->public_key, "role", "admin");
   ASSERT_EQ(reg_rc, CRABS_SUCCESS);
 
   // Set alice's key_version to 3
@@ -522,8 +522,11 @@ TEST_F(TestIntegration, KeyVersionVerification) {
 
   state->attr_machine = am;
 
-  // Helper to sign an operation
+  // Helper to sign an operation. R7-11: Lamport monotonicity is enforced per
+  // signer, so each op must carry a strictly increasing lamport_time.
+  uint64_t lamport_counter = 0;
   auto sign_op = [&](operation_t* op) {
+    op->lamport_time = ++lamport_counter;
     serialized_buffer_t* ser = crabs_serialize_for_signing(op);
     if (ser) {
       crypto_sign_operation(alice_key->private_key, ser->data, ser->len, op->signature);
@@ -577,7 +580,8 @@ TEST_F(TestIntegration, KeyVersionVerification) {
   EXPECT_EQ(result, CRABS_ERR_KEY_STALE);
   operation_destroy(op2);
 
-  // Execute operation with key_version=0 — SUCCESS (skip check)
+  // Execute operation with key_version=0 — R7-04: the bypass is closed, so a
+  // signer with a nonzero key_version can no longer skip the staleness check.
   uint8_t uuid3[CRABS_UUID_SIZE];
   memset(uuid3, 0x03, CRABS_UUID_SIZE);
   operation_t* op3 = operation_create(CRABS_OP_LOCK);
@@ -590,11 +594,11 @@ TEST_F(TestIntegration, KeyVersionVerification) {
   op3->next_state = (protocol_state_e*)malloc(sizeof(protocol_state_e));
   op3->next_state[0] = PROTOCOL_LOCKED;
   strncpy(op3->signer_id, "alice", CRABS_MAX_USER_ID - 1);
-  op3->signer_key_version = 0;  // skip check
+  op3->signer_key_version = 0;  // stale version
   sign_op(op3);
 
   result = state_machine_execute(state, op3);
-  EXPECT_EQ(result, CRABS_SUCCESS);
+  EXPECT_EQ(result, CRABS_ERR_KEY_STALE);
   operation_destroy(op3);
 
   state->attr_machine = NULL;

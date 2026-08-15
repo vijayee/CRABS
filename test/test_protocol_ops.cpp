@@ -12,6 +12,7 @@ extern "C" {
 #include "../src/Serialization/serialization.h"
 #include "../src/TxManager/tx_manager_memory.h"
 }
+#include "test_helpers.h"
 
 // Helper fixture that sets up a state with resource + attr_machine + keys
 class TestProtocolOps : public ::testing::Test {
@@ -19,6 +20,9 @@ protected:
   state_t* state;
   attribute_machine_t* am;
   ecdsa_keypair_t* alice_key;
+  // R7-11: Lamport monotonicity is enforced per signer, so each op must carry
+  // a strictly increasing lamport_time. Stamped in sign_op.
+  uint64_t lamport_counter = 0;
 
   void SetUp() override {
     state = state_create();
@@ -32,7 +36,7 @@ protected:
     am = attribute_machine_create("admin", admin_pk);
     ASSERT_NE(am, nullptr);
     alice_key = crypto_ecdsa_generate();
-    attribute_machine_register_user(am, "alice", alice_key->public_key, "role:admin");
+    crabs_test_register_user_with_role(am, "alice", alice_key->public_key, "role", "admin");
     state->attr_machine = am;
 
     ecdsa_keypair_t* node_key = crypto_ecdsa_generate();
@@ -68,6 +72,7 @@ protected:
 
   // Sign an operation AFTER all fields are set
   void sign_op(operation_t* op) {
+    op->lamport_time = ++lamport_counter;
     op->signer_key_version = attribute_machine_find_user(am, "alice")->key_version;
     serialized_buffer_t* ser = crabs_serialize_for_signing(op);
     if (ser) {
@@ -206,7 +211,7 @@ TEST_F(TestProtocolOps, LockOwnerMismatch) {
 
   // Register bob with admin role
   ecdsa_keypair_t* bob_key = crypto_ecdsa_generate();
-  attribute_machine_register_user(am, "bob", bob_key->public_key, "role:admin");
+  crabs_test_register_user_with_role(am, "bob", bob_key->public_key, "role", "admin");
 
   // Bob tries to verify with alice's lock token but bob is not the lock owner
   operation_t* op = operation_create(CRABS_OP_VERIFY);

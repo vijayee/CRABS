@@ -402,11 +402,48 @@ op_handler_fn state_machine_find_handler(const state_t* state, const char* op_ty
 // ============================================================
 // Main Execution Algorithm (§7.4)
 // ============================================================
+
+// R7-01: get the current physical time in ms from the state's HLC time source.
+// Returns false when no authenticated time is available (fail-closed for
+// expiry decisions). When no time source is configured, falls back to the
+// system clock (backward compatible).
+static bool state_get_time_ms(const state_t* state, uint64_t* now_ms) {
+  if (state == NULL || now_ms == NULL) return false;
+  crabs_physical_time_t phys = crabs_hlc_get_physical_time(&((state_t*)state)->hlc_state);
+  if (!phys.valid) return false;
+  *now_ms = phys.seconds * 1000 + phys.nanos / 1000000;
+  return true;
+}
+
+// R7-11: the last lamport_time logged for a signer. Returns false if the
+// signer has no logged ops (so a first op is never rejected for carrying
+// lamport_time 0). Scans the log from the most recent entry (a signer's
+// latest op is near the tail). Used to enforce Lamport monotonicity so a
+// replayed op — which carries the same lamport_time as the original — is
+// rejected even after a restart, when the in-memory tx_manager has been reset.
+static bool state_last_lamport_for_signer(const state_t* state, const char* signer_id,
+                                          uint64_t* out) {
+  if (state == NULL || signer_id == NULL || out == NULL) return false;
+  for (uint64_t i = state->log_count; i > 0; i--) {
+    const log_entry_t* entry = &state->log[i - 1];
+    if (strcmp(entry->signer_id, signer_id) == 0) {
+      *out = entry->lamport_time;
+      return true;
+    }
+  }
+  return false;
+}
+
 crabs_error_e state_machine_execute(state_t* state, operation_t* op) {
   if (state == NULL || op == NULL) return CRABS_ERR_INVALID_PARAM;
 
   // Step 1: Prune expired locks
-  uint64_t now_ms = (uint64_t)time(NULL) * 1000;
+  uint64_t now_ms;
+  if (!state_get_time_ms(state, &now_ms)) {
+    // R7-01: no authenticated time — fail closed rather than use the
+    // attacker-controlled local clock for expiry decisions.
+    return CRABS_ERR_CRYPTOGRAPHIC_ERROR;
+  }
   state_machine_prune_expired(state, now_ms);
 
   // Audit H-C: inject the wall clock into the attribute machine and prune
@@ -417,18 +454,6 @@ crabs_error_e state_machine_execute(state_t* state, operation_t* op) {
   if (state->attr_machine != NULL) {
     attribute_machine_set_time(state->attr_machine, now_ms);
     attribute_machine_prune_expired_temporary(state->attr_machine);
-  }
-
-  // Step 2: Transaction manager check (replay protection).
-  // Delegates to the pluggable tx_manager — may be a no-op, an in-memory
-  // hash set, or a persistent store. Returns CRABS_ERR_ALREADY_EXECUTED
-  // for duplicates (caller treats as idempotent success).
-  if (state->tx_manager != NULL) {
-    crabs_tx_manager_t* tx = (crabs_tx_manager_t*)state->tx_manager;
-    if (tx->vtable.accept != NULL) {
-      crabs_error_e tx_result = tx->vtable.accept(tx, state, op);
-      if (tx_result != CRABS_SUCCESS) return tx_result;
-    }
   }
 
   // Step 3: Authorization (§10.3) — fail closed. Every operation requires a
@@ -486,6 +511,37 @@ crabs_error_e state_machine_execute(state_t* state, operation_t* op) {
     return vr.error;
   }
 
+  // Step 3b: Transaction manager accept (replay protection).
+  // R7-L-4: this runs AFTER signature verification but BEFORE the protocol
+  // state / lock / dedup checks. The prior placement at the top of execute()
+  // let an attacker probe whether a UUID was already processed by sending an
+  // op with a bad signature and observing ALREADY_EXECUTED vs UNAUTHORIZED — a
+  // processed-UUID existence oracle. Placing it after authorization closes
+  // the oracle while still detecting a replayed op as a duplicate before any
+  // state-dependent check (e.g. a replayed LOCK whose resource is now LOCKED)
+  // can misreport it as a protocol violation. Delegates to the pluggable
+  // tx_manager — may be a no-op, an in-memory hash set, or a persistent store.
+  // Returns CRABS_ERR_ALREADY_EXECUTED for duplicates (caller treats as
+  // idempotent success).
+  if (state->tx_manager != NULL) {
+    crabs_tx_manager_t* tx = (crabs_tx_manager_t*)state->tx_manager;
+    if (tx->vtable.accept != NULL) {
+      crabs_error_e tx_result = tx->vtable.accept(tx, state, op);
+      if (tx_result != CRABS_SUCCESS) return tx_result;
+    }
+  }
+
+  // Step 3c: Lamport monotonicity (R7-11). A replayed op carries the same
+  // lamport_time as the original, so require strictly greater than the last
+  // logged time for this signer. This survives restarts when the log is
+  // durable, closing the cross-session replay gap for plain (non-dedup) ops
+  // that the in-memory tx_manager cannot cover after a reset.
+  uint64_t last_lamport = 0;
+  if (state_last_lamport_for_signer(state, op->signer_id, &last_lamport) &&
+      op->lamport_time <= last_lamport) {
+    return CRABS_ERR_ALREADY_EXECUTED;
+  }
+
   // Step 4: Verify protocol state transitions
   for (uint32_t i = 0; i < op->resource_count; i++) {
     data_item_t* item = state_find_item(state, op->resources[i]);
@@ -513,30 +569,39 @@ crabs_error_e state_machine_execute(state_t* state, operation_t* op) {
     }
   }
 
-  // Step 6: Dedup check-and-apply (v1.4 §5.2-5.3)
-  // Runs BEFORE the handler so the dedup record is written before any state
-  // mutation. If the handler subsequently fails, the operation cannot be
-  // replayed with the same UUID — the caller must use a fresh UUID to retry.
+  // Step 6: Dedup guard check (v1.4 §5.2-5.3)
+  // R7-13: check the guard BEFORE the handler but apply the mutation only
+  // AFTER the handler succeeds. The prior check-and-apply burned the dedup
+  // slot (e.g. a ONE_SHOT_SET membership) even when the handler failed,
+  // letting an authorized signer permanently consume a "vote once" slot.
   // The registered spec always wins over the op-carried spec.
   const dedup_spec_t* registered_dedup = state_find_op_type_def(state, op->type);
   const dedup_spec_t* effective_dedup = registered_dedup ? registered_dedup : &op->dedup;
   if (effective_dedup->type != DEDUP_NONE) {
-    crabs_error_e dedup_result = dedup_check_and_apply_spec(state, effective_dedup, op);
+    crabs_error_e dedup_result = dedup_check_guard_spec(state, effective_dedup, op);
     if (dedup_result != CRABS_SUCCESS) {
       return dedup_result;
     }
   }
 
   // Step 6: Key version verification (§10.4)
-  if (op->signer_key_version > 0 && state->attr_machine != NULL) {
+  // R7-04: the check is mandatory when the signer has a nonzero key_version.
+  // The prior `op->signer_key_version > 0` guard let a crafted op with
+  // signer_key_version = 0 skip the staleness check entirely, so a replayed op
+  // signed with a rotated-out key was accepted.
+  if (state->attr_machine != NULL) {
     user_t* signer = attribute_machine_find_user(state->attr_machine, op->signer_id);
-    if (signer != NULL && signer->key_version != op->signer_key_version) {
+    if (signer != NULL && signer->key_version > 0 &&
+        signer->key_version != op->signer_key_version) {
       return CRABS_ERR_KEY_STALE;
     }
   }
 
   // Step 6b: Scheme constraint enforcement (v1.3 §7)
-  if (op->sig_scheme != SCHEME_UNSPECIFIED && state->policies != NULL) {
+  // R7-04: the allowlist is enforced regardless of the op's declared scheme.
+  // The prior `op->sig_scheme != SCHEME_UNSPECIFIED` guard let an op bypass
+  // the allowlist by declaring the legacy path.
+  if (state->policies != NULL) {
     const policy_t* policy = NULL;
     for (uint32_t i = 0; i < state->policy_count; i++) {
       if (strcmp(state->policies[i].operation, op->type) == 0) {
@@ -592,6 +657,7 @@ crabs_error_e state_machine_execute(state_t* state, operation_t* op) {
       }
       crabs_error_e cs_rc = crypto_verify_co_signature(
           state->attr_machine,
+          pp.abe_policy,
           cs->signer_id, cs->key_id, cs->sig_scheme,
           co_ser->data, co_ser->len,
           cs->signature, cs->signature_len);
@@ -692,6 +758,15 @@ crabs_error_e state_machine_execute(state_t* state, operation_t* op) {
     }
   }
 
+  // R7-13: apply the dedup mutation only after the handler (and protocol
+  // transition) succeeded, so a failing op does not burn its dedup slot.
+  if (effective_dedup->type != DEDUP_NONE) {
+    crabs_error_e dedup_result = dedup_apply_mutation_spec(state, effective_dedup, op);
+    if (dedup_result != CRABS_SUCCESS) {
+      return dedup_result;
+    }
+  }
+
   // Step 8: Auto-compaction check after OT operations (v1.5.2 §4)
   if (state->compaction_config != NULL &&
       strcmp(op->type, CRABS_OP_EXECUTE_OT) == 0) {
@@ -720,7 +795,10 @@ crabs_error_e state_machine_execute(state_t* state, operation_t* op) {
   // function checks `if (am == NULL) return CRABS_SUCCESS;`). This meant
   // threshold triggers never issued attributes — a functional bug.
   if (state->triggers != NULL && state->trigger_count > 0) {
-    uint64_t trigger_now_ms = (uint64_t)time(NULL) * 1000;
+    uint64_t trigger_now_ms;
+    if (!state_get_time_ms(state, &trigger_now_ms)) {
+      return CRABS_ERR_CRYPTOGRAPHIC_ERROR;
+    }
     trigger_process_all(state, state->triggers, state->trigger_count,
                         (attribute_machine_t*)state->attr_machine, trigger_now_ms);
   }
@@ -739,14 +817,20 @@ crabs_error_e state_machine_op_lock(state_t* state, operation_t* op, lock_respon
     if (item->type != DATA_TYPE_RESOURCE) return CRABS_ERR_TYPE_MISMATCH;
     if (item->protocol_state != PROTOCOL_IDLE) return CRABS_ERR_PROTOCOL_VIOLATION;
     if (item->lock_state.lock_token_valid) {
-      uint64_t lock_check_ms = (uint64_t)time(NULL) * 1000;
+      uint64_t lock_check_ms;
+      if (!state_get_time_ms(state, &lock_check_ms)) {
+        return CRABS_ERR_CRYPTOGRAPHIC_ERROR;
+      }
       if (!state_machine_lock_expired(state, &item->lock_state, lock_check_ms)) {
         return CRABS_ERR_LOCK_OWNER_MISMATCH;
       }
     }
   }
 
-  uint64_t now_ms = (uint64_t)time(NULL) * 1000;
+  uint64_t now_ms;
+  if (!state_get_time_ms(state, &now_ms)) {
+    return CRABS_ERR_CRYPTOGRAPHIC_ERROR;
+  }
   uint64_t expiry = now_ms + state->config.max_lock_duration_ms;
 
   // v1.6 Amd6 §8: Set HLC acquired_at if using HLC ordering. Reuse the
@@ -837,7 +921,10 @@ crabs_error_e state_machine_op_extend(state_t* state, operation_t* op) {
     if (item->lock_state.lock_extensions >= state->config.max_lock_extensions) {
       return CRABS_ERR_MAX_EXTENSIONS_REACHED;
     }
-    uint64_t now_ms = (uint64_t)time(NULL) * 1000;
+    uint64_t now_ms;
+    if (!state_get_time_ms(state, &now_ms)) {
+      return CRABS_ERR_CRYPTOGRAPHIC_ERROR;
+    }
     item->lock_state.lock_expiry = now_ms + state->config.max_lock_duration_ms;
     item->lock_state.lock_extensions++;
   }
@@ -914,7 +1001,10 @@ crabs_error_e state_machine_op_unlock(state_t* state, operation_t* op) {
 
 crabs_error_e state_machine_op_force_unlock(state_t* state, operation_t* op) {
   if (!state->config.allow_force_unlock) return CRABS_ERR_FORCE_UNLOCK_DISABLED;
-  uint64_t now_ms = (uint64_t)time(NULL) * 1000;
+  uint64_t now_ms;
+  if (!state_get_time_ms(state, &now_ms)) {
+    return CRABS_ERR_CRYPTOGRAPHIC_ERROR;
+  }
   for (uint32_t i = 0; i < op->resource_count; i++) {
     data_item_t* item = state_find_item(state, op->resources[i]);
     if (item == NULL) return CRABS_ERR_RESOURCE_NOT_FOUND;
@@ -1350,7 +1440,10 @@ crabs_error_e state_machine_op_refresh_key(state_t* state, operation_t* op,
   if (state->abe_mk == NULL) return CRABS_ERR_CRYPTOGRAPHIC_ERROR;
 
   // Create key envelope
-  uint64_t now_ms = (uint64_t)time(NULL) * 1000;
+  uint64_t now_ms;
+  if (!state_get_time_ms(state, &now_ms)) {
+    return CRABS_ERR_CRYPTOGRAPHIC_ERROR;
+  }
   key_envelope_t* envelope = crypto_key_envelope_create(
       (abe_master_key_t*)state->abe_mk, state->node_private_key, user,
       state->version, now_ms, 0);
@@ -1425,7 +1518,10 @@ uint32_t state_machine_auto_compact(state_t* state) {
   crabs_compaction_engine_init(&engine, config);
   crabs_register_crdt_vtables(&engine.registry);
 
-  uint64_t now_ms = (uint64_t)time(NULL) * 1000;
+  uint64_t now_ms;
+  if (!state_get_time_ms(state, &now_ms)) {
+    return CRABS_ERR_CRYPTOGRAPHIC_ERROR;
+  }
   uint32_t compacted = 0;
   data_item_t* item = state->items;
   while (item != NULL) {

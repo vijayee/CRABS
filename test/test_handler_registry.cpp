@@ -8,6 +8,7 @@ extern "C" {
 #include "../src/Serialization/serialization.h"
 #include "../src/CRDT/crdt_merge.h"
 }
+#include "test_helpers.h"
 
 // ============================================================
 // Registry CRUD tests
@@ -165,8 +166,8 @@ protected:
     am = attribute_machine_create("admin", admin_pk);
     ASSERT_NE(am, nullptr);
 
-    crabs_error_e rc = attribute_machine_register_user(
-        am, "alice", alice_key->public_key, "role:admin");
+    crabs_error_e rc = crabs_test_register_user_with_role(
+        am, "alice", alice_key->public_key, "role", "admin");
     ASSERT_EQ(rc, CRABS_SUCCESS);
 
     state->attr_machine = am;
@@ -196,6 +197,8 @@ protected:
     op->next_state[0] = PROTOCOL_IDLE;
     op->lamport_time = 1;
 
+    user_t* signer = attribute_machine_find_user(am, "alice");
+    if (signer != NULL) op->signer_key_version = signer->key_version;
     serialized_buffer_t* ser = crabs_serialize_for_signing(op);
     crypto_sign_operation(alice_key->private_key, ser->data, ser->len, op->signature);
     serialized_buffer_destroy(ser);
@@ -241,6 +244,34 @@ TEST_F(HandlerRegistryIntegration, HandlerErrorPropagates) {
   operation_t* op = create_signed_op("transfer");
   crabs_error_e result = state_machine_execute(state, op);
   EXPECT_EQ(result, CRABS_ERR_INVALID_PARAM);
+
+  operation_destroy(op);
+}
+
+// R7-13: the dedup mutation was applied before the handler, so a failing op
+// burned the dedup slot (e.g. a ONE_SHOT_SET membership). The mutation must
+// only be applied after the handler succeeds.
+TEST_F(HandlerRegistryIntegration, FailingHandlerDoesNotBurnDedupSlot) {
+  data_item_t* voters = data_item_create("proposal_voters", DATA_TYPE_ONE_SHOT_SET, CRDT_ONE_SHOT_SET);
+  voters->value = one_shot_set_create();
+  state_add_item(state, voters);
+
+  dedup_spec_t spec;
+  memset(&spec, 0, sizeof(spec));
+  spec.type = DEDUP_PER_USER;
+  strncpy(spec.tracker_path, "proposal_voters", CRABS_MAX_DEDUP_PATH - 1);
+  ASSERT_EQ(state_register_op_type_def(state, "transfer", &spec), CRABS_SUCCESS);
+
+  state_machine_register_handler(state, "transfer", test_handler_error);
+
+  operation_t* op = create_signed_op("transfer");
+  crabs_error_e result = state_machine_execute(state, op);
+  EXPECT_EQ(result, CRABS_ERR_INVALID_PARAM);
+
+  // The signer must NOT be in the tracker — the failed op did not burn the slot.
+  one_shot_set_t* set = (one_shot_set_t*)voters->value;
+  EXPECT_FALSE(one_shot_set_contains(set, "alice"));
+  EXPECT_EQ(one_shot_set_count(set), (uint32_t)0);
 
   operation_destroy(op);
 }

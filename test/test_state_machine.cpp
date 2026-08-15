@@ -8,6 +8,7 @@ extern "C" {
 #include "../src/Serialization/serialization.h"
 #include "../src/TxManager/tx_manager_memory.h"
 }
+#include "test_helpers.h"
 
 class TestStateMachine : public ::testing::Test {
 protected:
@@ -15,6 +16,9 @@ protected:
   uint8_t test_uuid[CRABS_UUID_SIZE];
   attribute_machine_t* am;
   ecdsa_keypair_t* alice_key;
+  // R7-11: Lamport monotonicity is enforced per signer, so each op must carry
+  // a strictly increasing lamport_time. Stamped in sign_operation.
+  uint64_t lamport_counter = 0;
 
   void SetUp() override {
     state = state_create();
@@ -49,8 +53,8 @@ protected:
     am = attribute_machine_create("admin", admin_pk);
     ASSERT_NE(am, nullptr);
 
-    crabs_error_e rc = attribute_machine_register_user(
-        am, "alice", alice_key->public_key, "role:admin");
+    crabs_error_e rc = crabs_test_register_user_with_role(
+        am, "alice", alice_key->public_key, "role", "admin");
     ASSERT_EQ(rc, CRABS_SUCCESS);
 
     // Attach attribute machine to state so ABE verification is enforced
@@ -81,11 +85,22 @@ protected:
     op->next_state = (protocol_state_e*)malloc(sizeof(protocol_state_e));
     op->next_state[0] = PROTOCOL_LOCKED;
     strncpy(op->signer_id, "alice", CRABS_MAX_USER_ID - 1);
+    // R7-04: the key-version check is now mandatory, so ops must carry the
+    // signer's current key_version.
+    user_t* signer = attribute_machine_find_user(am, "alice");
+    if (signer != NULL) op->signer_key_version = signer->key_version;
     sign_operation(op);
     return op;
   }
 
+  // R7-04: ops must carry the signer's current key_version before signing.
+  void set_signer_key_version(operation_t* op) {
+    user_t* signer = attribute_machine_find_user(am, "alice");
+    if (signer != NULL) op->signer_key_version = signer->key_version;
+  }
+
   void sign_operation(operation_t* op) {
+    op->lamport_time = ++lamport_counter;
     serialized_buffer_t* ser = crabs_serialize_for_signing(op);
     if (ser != NULL) {
       crypto_sign_operation(alice_key->private_key, ser->data, ser->len, op->signature);
@@ -124,6 +139,30 @@ TEST_F(TestStateMachine, TestLockOperation) {
   operation_destroy(op);
 }
 
+// R7-01: when an authenticated time source is configured but unavailable,
+// state_machine_execute must fail closed rather than fall back to the
+// attacker-controlled local clock for expiry decisions.
+TEST_F(TestStateMachine, TestUnavailableTimeSourceFailsClosed) {
+  static crabs_time_source_ops_t unavailable_ops;
+  unavailable_ops.get_time = [](void* ctx) -> crabs_physical_time_t {
+    (void)ctx;
+    crabs_physical_time_t t = {0, 0, false};
+    return t;
+  };
+  unavailable_ops.is_available = [](void* ctx) -> bool {
+    (void)ctx;
+    return false;
+  };
+  unavailable_ops.ctx = NULL;
+
+  state_set_time_source(state, &unavailable_ops);
+
+  operation_t* op = make_lock_op();
+  crabs_error_e result = state_machine_execute(state, op);
+  EXPECT_EQ(result, CRABS_ERR_CRYPTOGRAPHIC_ERROR);
+  operation_destroy(op);
+}
+
 TEST_F(TestStateMachine, TestLockThenExtend) {
   // Lock first
   operation_t* lock_op = make_lock_op();
@@ -141,6 +180,7 @@ TEST_F(TestStateMachine, TestLockThenExtend) {
   extend_op->next_state = (protocol_state_e*)malloc(sizeof(protocol_state_e));
   extend_op->next_state[0] = PROTOCOL_LOCKED;
   strncpy(extend_op->signer_id, "alice", CRABS_MAX_USER_ID - 1);
+  set_signer_key_version(extend_op);
   sign_operation(extend_op);
 
   crabs_error_e result = state_machine_execute(state, extend_op);
@@ -182,6 +222,7 @@ TEST_F(TestStateMachine, TestLockVerifyUnlockCycle) {
   memcpy(verify_op->lock_claims[0].lock_token, item->lock_state.lock_token, CRABS_LOCK_TOKEN_SIZE);
   verify_op->lock_claim_count = 1;
   strncpy(verify_op->signer_id, "alice", CRABS_MAX_USER_ID - 1);
+  set_signer_key_version(verify_op);
   sign_operation(verify_op);
 
   EXPECT_EQ(state_machine_execute(state, verify_op), CRABS_SUCCESS);
@@ -203,6 +244,7 @@ TEST_F(TestStateMachine, TestLockVerifyUnlockCycle) {
   memcpy(unlock_op->lock_claims[0].lock_token, item->lock_state.lock_token, CRABS_LOCK_TOKEN_SIZE);
   unlock_op->lock_claim_count = 1;
   strncpy(unlock_op->signer_id, "alice", CRABS_MAX_USER_ID - 1);
+  set_signer_key_version(unlock_op);
   sign_operation(unlock_op);
 
   EXPECT_EQ(state_machine_execute(state, unlock_op), CRABS_SUCCESS);
@@ -262,6 +304,7 @@ TEST_F(TestStateMachine, TestRollback) {
   memcpy(rollback_op->lock_claims[0].lock_token, item->lock_state.lock_token, CRABS_LOCK_TOKEN_SIZE);
   rollback_op->lock_claim_count = 1;
   strncpy(rollback_op->signer_id, "alice", CRABS_MAX_USER_ID - 1);
+  set_signer_key_version(rollback_op);
   sign_operation(rollback_op);
 
   EXPECT_EQ(state_machine_execute(state, rollback_op), CRABS_SUCCESS);
@@ -291,6 +334,8 @@ TEST_F(TestStateMachine, TestResourceNotFound) {
   op->next_state = (protocol_state_e*)malloc(sizeof(protocol_state_e));
   op->next_state[0] = PROTOCOL_LOCKED;
   strncpy(op->signer_id, "alice", CRABS_MAX_USER_ID - 1);
+  user_t* signer = attribute_machine_find_user(am, "alice");
+  if (signer != NULL) op->signer_key_version = signer->key_version;
   sign_operation(op);
 
   EXPECT_EQ(state_machine_execute(state, op), CRABS_ERR_RESOURCE_NOT_FOUND);
@@ -338,6 +383,8 @@ TEST_F(TestStateMachine, TestLockTokenEntropy) {
   op2->next_state = (protocol_state_e*)malloc(sizeof(protocol_state_e));
   op2->next_state[0] = PROTOCOL_LOCKED;
   strncpy(op2->signer_id, "alice", CRABS_MAX_USER_ID - 1);
+  user_t* signer = attribute_machine_find_user(am, "alice");
+  if (signer != NULL) op2->signer_key_version = signer->key_version;
   sign_operation(op2);
   EXPECT_EQ(state_machine_execute(state, op2), CRABS_SUCCESS);
 
@@ -379,6 +426,7 @@ TEST_F(TestStateMachine, TestRollbackRestoresOriginalValue) {
   memcpy(rollback_op->lock_claims[0].lock_token, item->lock_state.lock_token, CRABS_LOCK_TOKEN_SIZE);
   rollback_op->lock_claim_count = 1;
   strncpy(rollback_op->signer_id, "alice", CRABS_MAX_USER_ID - 1);
+  set_signer_key_version(rollback_op);
   sign_operation(rollback_op);
 
   EXPECT_EQ(state_machine_execute(state, rollback_op), CRABS_SUCCESS);
@@ -394,6 +442,8 @@ TEST_F(TestStateMachine, TestChangeConfig) {
   op->payload_size = strlen(payload_str);
   op->resource_count = 0;
   strncpy(op->signer_id, "alice", CRABS_MAX_USER_ID - 1);
+  user_t* signer = attribute_machine_find_user(am, "alice");
+  if (signer != NULL) op->signer_key_version = signer->key_version;
   sign_operation(op);
 
   state_add_policy(state, CRABS_OP_CHANGE_CONFIG, "role:admin");
@@ -473,11 +523,47 @@ TEST_F(TestStateMachine, TestKeyVersionVerification_ZeroKeyVersion) {
   ASSERT_NE(user, nullptr);
   user->key_version = 5;
 
-  // signer_key_version = 0 means "skip version check" (per spec §10.4)
-  operation_t* op = make_lock_op();
+  // R7-04: signer_key_version = 0 must NOT skip the staleness check when the
+  // signer has a nonzero key_version — otherwise a replayed op signed with a
+  // rotated-out key is accepted. The op must carry the matching version.
+  // Build the op manually so signer_key_version=0 is set BEFORE signing.
+  operation_t* op = operation_create(CRABS_OP_LOCK);
+  memcpy(op->uuid, test_uuid, CRABS_UUID_SIZE);
+  op->resources = (char(*)[CRABS_MAX_USER_ID])malloc(sizeof(char[CRABS_MAX_USER_ID]));
+  strncpy(op->resources[0], "test_resource", CRABS_MAX_USER_ID - 1);
+  op->resource_count = 1;
+  op->required_state = (protocol_state_e*)malloc(sizeof(protocol_state_e));
+  op->required_state[0] = PROTOCOL_IDLE;
+  op->next_state = (protocol_state_e*)malloc(sizeof(protocol_state_e));
+  op->next_state[0] = PROTOCOL_LOCKED;
+  strncpy(op->signer_id, "alice", CRABS_MAX_USER_ID - 1);
   op->signer_key_version = 0;
+  sign_operation(op);
 
-  EXPECT_EQ(state_machine_execute(state, op), CRABS_SUCCESS);
+  EXPECT_EQ(state_machine_execute(state, op), CRABS_ERR_KEY_STALE);
+  operation_destroy(op);
+}
+
+// R7-04: a policy that restricts allowed schemes must reject an op declaring
+// SCHEME_UNSPECIFIED — otherwise the allowlist is bypassed by declaring the
+// legacy path.
+TEST_F(TestStateMachine, SchemeConstraintRejectsUnspecified) {
+  // Restrict __lock__ to ECDSA_SECP256K1 only.
+  policy_t* policy = NULL;
+  for (uint32_t i = 0; i < state->policy_count; i++) {
+    if (strcmp(state->policies[i].operation, CRABS_OP_LOCK) == 0) {
+      policy = &state->policies[i];
+      break;
+    }
+  }
+  ASSERT_NE(policy, nullptr);
+  policy->allowed_schemes[0] = ECDSA_SECP256K1;
+  policy->allowed_scheme_count = 1;
+
+  // make_lock_op signs with alice's legacy key and leaves sig_scheme
+  // UNSPECIFIED (zero-init). The allowlist must reject it.
+  operation_t* op = make_lock_op();
+  EXPECT_EQ(state_machine_execute(state, op), CRABS_ERR_UNAUTHORIZED);
   operation_destroy(op);
 }
 
@@ -525,6 +611,8 @@ TEST_F(TestStateMachine, TestRefreshKeyNoNodeKey) {
   memcpy(op->uuid, test_uuid, CRABS_UUID_SIZE);
   op->resource_count = 0;
   strncpy(op->signer_id, "alice", CRABS_MAX_USER_ID - 1);
+  user_t* signer = attribute_machine_find_user(am, "alice");
+  if (signer != NULL) op->signer_key_version = signer->key_version;
   sign_operation(op);
 
   crabs_error_e result = state_machine_execute(no_key_state, op);
@@ -566,6 +654,8 @@ TEST_F(TestStateMachine, AuditLogHashChainIsNonZeroAndChained) {
   op2->next_state = (protocol_state_e*)malloc(sizeof(protocol_state_e));
   op2->next_state[0] = PROTOCOL_LOCKED;
   strncpy(op2->signer_id, "alice", CRABS_MAX_USER_ID - 1);
+  user_t* signer = attribute_machine_find_user(am, "alice");
+  if (signer != NULL) op2->signer_key_version = signer->key_version;
   sign_operation(op2);
   ASSERT_EQ(state_machine_execute(state, op2), CRABS_SUCCESS);
   operation_destroy(op2);

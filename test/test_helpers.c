@@ -58,8 +58,24 @@ void crabs_test_env_destroy(crabs_test_env_t* env) {
   if (env->admin_key != NULL) crypto_ecdsa_keypair_destroy(env->admin_key);
 }
 
-void crabs_test_sign_op_with(ecdsa_keypair_t* key, operation_t* op) {
+// R7-11: Lamport monotonicity is enforced per signer, so ops signed through
+// this helper must carry strictly increasing lamport times. A global counter
+// is fine — each test builds a fresh state, and the check compares against
+// that state's log. Only stamp when the caller left lamport_time 0, so tests
+// that set explicit lamport times (e.g. dedup ordering tests) are preserved.
+static uint64_t crabs_test_lamport_counter = 0;
+
+void crabs_test_sign_op_with(attribute_machine_t* am, ecdsa_keypair_t* key, operation_t* op) {
   if (key == NULL || op == NULL) return;
+  if (op->lamport_time == 0) {
+    op->lamport_time = ++crabs_test_lamport_counter;
+  }
+  // R7-04: stamp the signer's current key_version so the state machine's
+  // mandatory staleness check passes.
+  if (am != NULL) {
+    user_t* signer = attribute_machine_find_user(am, op->signer_id);
+    if (signer != NULL) op->signer_key_version = signer->key_version;
+  }
   serialized_buffer_t* ser = crabs_serialize_for_signing(op);
   if (ser == NULL) return;
   crypto_sign_operation(key->private_key, ser->data, ser->len, op->signature);
@@ -67,5 +83,18 @@ void crabs_test_sign_op_with(ecdsa_keypair_t* key, operation_t* op) {
 }
 
 void crabs_test_sign_op(crabs_test_env_t* env, operation_t* op) {
-  crabs_test_sign_op_with(env->admin_key, op);
+  crabs_test_sign_op_with(env->am, env->admin_key, op);
+}
+
+crabs_error_e crabs_test_register_user_with_role(attribute_machine_t* am,
+                                                  const char* user_id,
+                                                  const uint8_t public_key[33],
+                                                  const char* role,
+                                                  const char* value) {
+  if (am == NULL || user_id == NULL || public_key == NULL || role == NULL || value == NULL) {
+    return CRABS_ERR_INVALID_PARAM;
+  }
+  crabs_error_e rc = attribute_machine_register_user(am, user_id, public_key, "");
+  if (rc != CRABS_SUCCESS) return rc;
+  return attribute_machine_grant_role(am, user_id, role, value, "admin");
 }

@@ -10,6 +10,7 @@ extern "C" {
 #include "../src/Serialization/serialization.h"
 #include "../src/Util/allocator.h"
 }
+#include "test_helpers.h"
 
 // ============================================================
 // None tx_manager tests
@@ -130,6 +131,9 @@ protected:
   state_t* state;
   attribute_machine_t* am;
   ecdsa_keypair_t* alice_key;
+  // R7-11: Lamport monotonicity is enforced per signer, so each op must carry
+  // a strictly increasing lamport_time.
+  uint64_t lamport_counter = 0;
 
   static crabs_error_e noop_handler(state_t* s, operation_t* o) {
     (void)s;
@@ -158,7 +162,7 @@ protected:
     am = attribute_machine_create("admin", admin_pk);
     ASSERT_NE(am, nullptr);
 
-    ASSERT_EQ(attribute_machine_register_user(am, "alice", alice_key->public_key, "role:admin"),
+    ASSERT_EQ(crabs_test_register_user_with_role(am, "alice", alice_key->public_key, "role", "admin"),
               CRABS_SUCCESS);
     state->attr_machine = am;
 
@@ -180,8 +184,10 @@ protected:
     op->required_state[0] = PROTOCOL_IDLE;
     op->next_state = (protocol_state_e*)malloc(sizeof(protocol_state_e));
     op->next_state[0] = PROTOCOL_IDLE;
-    op->lamport_time = 1;
+    op->lamport_time = ++lamport_counter;
 
+    user_t* signer = attribute_machine_find_user(am, "alice");
+    if (signer != NULL) op->signer_key_version = signer->key_version;
     serialized_buffer_t* ser = crabs_serialize_for_signing(op);
     crypto_sign_operation(alice_key->private_key, ser->data, ser->len, op->signature);
     serialized_buffer_destroy(ser);
@@ -216,6 +222,53 @@ TEST_F(TxManagerIntegration, MemoryTxManagerRejectsDuplicate) {
 
   // Same UUID — rejected by tx_manager
   op = make_op(uuid);
+  EXPECT_EQ(state_machine_execute(state, op), CRABS_ERR_ALREADY_EXECUTED);
+  operation_destroy(op);
+}
+
+TEST_F(TxManagerIntegration, UnauthorizedOpDoesNotLeakProcessedUuid) {
+  // R7-L-4: the tx_manager accept must run AFTER signature verification.
+  // Otherwise an attacker can probe whether a UUID was already processed by
+  // sending an op with a bad signature and observing ALREADY_EXECUTED vs
+  // UNAUTHORIZED — a processed-UUID existence oracle.
+  state->tx_manager = crabs_tx_manager_memory(64);
+
+  uint8_t uuid[16];
+  memset(uuid, 0xEF, 16);
+
+  operation_t* op = make_op(uuid);
+  EXPECT_EQ(state_machine_execute(state, op), CRABS_SUCCESS);
+  operation_destroy(op);
+
+  // Same UUID, but the signature is corrupted: authorization must fail with
+  // UNAUTHORIZED, NOT ALREADY_EXECUTED (which would leak UUID existence).
+  op = make_op(uuid);
+  op->signature[0] ^= 0xFF;
+  EXPECT_EQ(state_machine_execute(state, op), CRABS_ERR_UNAUTHORIZED);
+  operation_destroy(op);
+}
+
+TEST_F(TxManagerIntegration, LamportMonotonicityRejectsReplayWithoutTxManager) {
+  // R7-11: even without a tx_manager, a replayed op (same uuid, same
+  // lamport_time) is rejected by the per-signer Lamport monotonicity check.
+  // This closes the cross-session replay gap: after a restart the in-memory
+  // tx_manager is empty, but the log-derived lamport check still catches a
+  // replayed op.
+  uint8_t uuid[16];
+  memset(uuid, 0x77, 16);
+
+  operation_t* op = make_op(uuid);
+  uint64_t original_lamport = op->lamport_time;
+  EXPECT_EQ(state_machine_execute(state, op), CRABS_SUCCESS);
+  operation_destroy(op);
+
+  // Replay: same uuid, same lamport_time as the original. Re-sign so the
+  // signature covers the replayed lamport_time.
+  op = make_op(uuid);
+  op->lamport_time = original_lamport;
+  serialized_buffer_t* ser = crabs_serialize_for_signing(op);
+  crypto_sign_operation(alice_key->private_key, ser->data, ser->len, op->signature);
+  serialized_buffer_destroy(ser);
   EXPECT_EQ(state_machine_execute(state, op), CRABS_ERR_ALREADY_EXECUTED);
   operation_destroy(op);
 }
