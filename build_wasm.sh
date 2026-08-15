@@ -142,6 +142,7 @@ emcc $CFLAGS \
   -s INITIAL_MEMORY=64MB \
   -s EXPORTED_FUNCTIONS="$EXPORTED_FUNCTIONS" \
   -s EXPORTED_RUNTIME_METHODS='["ccall","cwrap","getValue","setValue","UTF8ToString","stringToUTF8","lengthBytesUTF8","addFunction","removeFunction","HEAP8","HEAPU8","HEAP16","HEAPU16","HEAP32","HEAPU32","HEAPF32","HEAPF64"]' \
+  --js-library "$ROOT_DIR/src/TimeSource/wasm_time_library.js" \
   -O2 \
   2>&1
 

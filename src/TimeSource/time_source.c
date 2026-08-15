@@ -44,6 +44,13 @@ static crabs_time_source_fetch_result_t _native_fetch_server_time(
     const char* url, uint64_t timeout_ms);
 #endif
 
+// Forward declaration: WASM transport that delegates the HTTPS fetch to the
+// host JS glue (see wasm_time_library.js). Only compiled for emscripten.
+#ifdef __EMSCRIPTEN__
+static crabs_time_source_fetch_result_t _wasm_fetch_server_time(
+    const char* url, uint64_t timeout_ms);
+#endif
+
 typedef struct {
   char*     server_url;
   uint64_t  resync_interval_ms;
@@ -148,7 +155,11 @@ static crabs_time_source_ops_t* _create(const crabs_time_source_config_t* config
 
 crabs_time_source_ops_t* crabs_time_source_https_create(
     const crabs_time_source_config_t* config) {
+#ifdef __EMSCRIPTEN__
+  return _create(config, _wasm_fetch_server_time);
+#else
   return _create(config, _native_fetch_server_time);
+#endif
 }
 
 crabs_time_source_ops_t* crabs_time_source_https_create_with_transport(
@@ -488,6 +499,29 @@ static crabs_time_source_fetch_result_t _native_fetch_server_time(
 
   if (response_len == 0) return result;
   _parse_timestamp(response, &result);
+  return result;
+}
+
+#endif // __EMSCRIPTEN__
+
+#ifdef __EMSCRIPTEN__
+
+// ============================================================
+// WASM HTTPS transport (host JS glue)
+// ============================================================
+
+// Imported from the JS glue (see wasm_time_library.js). Returns Unix seconds
+// as a double, or a negative value on failure.
+extern double js_fetch_server_time(const char* url, uint64_t timeout_ms);
+
+static crabs_time_source_fetch_result_t _wasm_fetch_server_time(
+    const char* url, uint64_t timeout_ms) {
+  crabs_time_source_fetch_result_t result = {0, 0, false};
+  double server_time = js_fetch_server_time(url, timeout_ms);
+  if (server_time < 0.0) return result;
+  result.seconds = (uint64_t)server_time;
+  result.nanos = (uint64_t)((server_time - (double)result.seconds) * 1000000000.0);
+  result.valid = true;
   return result;
 }
 
