@@ -113,7 +113,10 @@ EXPORTED_FUNCTIONS='[
   "_crabs_wasm_register_handler",
   "_crabs_wasm_unregister_handler",
   "_crabs_wasm_handler_get_am",
-  "_crabs_wasm_handler_op_get_payload_str"
+  "_crabs_wasm_handler_op_get_payload_str",
+  "_crabs_time_source_https_create",
+  "_crabs_time_source_https_create_with_transport",
+  "_crabs_time_source_destroy"
 ]'
 
 echo "Compiling CRABS sources..."
