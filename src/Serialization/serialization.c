@@ -5,6 +5,7 @@
 #include "serialization.h"
 #include "../Util/platform.h"
 #include "../Util/allocator.h"
+#include "../Crypto/crypto.h"
 #include "../OT/ot_ordered_set.h"
 #include "../OT/ot_document.h"
 #include "../OT/ot_tree.h"
@@ -165,12 +166,15 @@ static bool _read_string16(read_buf_t* buf, char* out, size_t max_len) {
   uint16_t slen;
   if (!_read_uint16_le(buf, &slen)) return false;
   if (slen > buf->len - buf->offset) return false;
-  size_t copy_len = slen < (max_len - 1) ? slen : (max_len - 1);
+  // R7-L-5: reject over-long strings instead of truncating. A truncated string
+  // could alias a different legitimate value (e.g. "role:admi" matching a
+  // truncated "role:admin").
+  if (slen >= max_len) return false;
   if (slen > 0) {
-    memcpy(out, buf->data + buf->offset, copy_len);
+    memcpy(out, buf->data + buf->offset, slen);
     buf->offset += slen;
   }
-  out[copy_len] = '\0';
+  out[slen] = '\0';
   return true;
 }
 
@@ -254,16 +258,22 @@ static bool _deserialize_ot_op(read_buf_t* buf, crabs_ot_operation_t* op) {
   op->payload = payload;
   op->payload_size = payload_size;
 
-  if (!_read_uint32_le(buf, &op->dep_count)) return false;
+  if (!_read_uint32_le(buf, &op->dep_count)) goto fail;
   // Audit M-E: reject (do not clamp) oversized dep_count. Clamping desynced
   // the parse — the writer emitted `dep_count` deps but we'd only consume
   // CRABS_OT_MAX_DEPS, leaving subsequent ops misaligned.
-  if (op->dep_count > CRABS_OT_MAX_DEPS) return false;
+  if (op->dep_count > CRABS_OT_MAX_DEPS) goto fail;
   for (uint32_t i = 0; i < op->dep_count; i++) {
-    if (!_deserialize_ot_op_id(buf, &op->deps[i])) return false;
+    if (!_deserialize_ot_op_id(buf, &op->deps[i])) goto fail;
   }
-  if (!_read_uint32_le(buf, &op->transform_fn_id)) return false;
+  if (!_read_uint32_le(buf, &op->transform_fn_id)) goto fail;
   return true;
+
+fail:
+  // R7-L-14: free the payload allocated above so a malformed op does not leak.
+  if (op->payload != NULL) free(op->payload);
+  op->payload = NULL;
+  return false;
 }
 
 // ============================================================
@@ -971,8 +981,12 @@ static bool _deserialize_data_item(read_buf_t* buf, data_item_t* item, uint32_t 
       uint16_t msg_len;
       if (!_read_uint16_le(buf, &msg_len)) { free(msg_lens); return false; }
       msg_lens_arr[i] = msg_len;
-      str_space += msg_len + 1; // +1 for null terminator
+      // R7-12: only accumulate str_space for in-bounds messages, mirroring
+      // the second pass. The prior code added msg_len+1 unconditionally, so a
+      // crafted msg_len of 0xFFFF with a nearly-empty buffer forced a ~16.7 MB
+      // allocation per item (get_clear_memory aborts on OOM → remote crash).
       if (msg_len > 0 && msg_len <= buf->len - buf->offset) {
+        str_space += msg_len + 1; // +1 for null terminator
         buf->offset += msg_len;
       }
     }
@@ -1359,6 +1373,52 @@ fail:
   return NULL;
 }
 
+// R7-03: authenticated state snapshot. Serializes the state (with its SHA-256
+// corruption checksum) and appends an ECDSA signature over the whole blob from
+// the node's private key. The bare SHA-256 is not authentication — an attacker
+// who can write the state file can recompute it.
+serialized_buffer_t* crabs_serialize_state_signed(const state_t* state) {
+  if (state == NULL) return NULL;
+  if (!state->node_key_valid) return NULL;
+
+  serialized_buffer_t* payload = crabs_serialize_state(state);
+  if (payload == NULL) return NULL;
+
+  serialized_buffer_t* result = serialized_buffer_create(payload->len + CRABS_SIG_SIZE);
+  if (result == NULL) {
+    serialized_buffer_destroy(payload);
+    return NULL;
+  }
+  memcpy(result->data, payload->data, payload->len);
+  result->len = payload->len + CRABS_SIG_SIZE;
+
+  if (crypto_ecdsa_sign(state->node_private_key, payload->data, payload->len,
+                        result->data + payload->len) != CRABS_SUCCESS) {
+    serialized_buffer_destroy(payload);
+    serialized_buffer_destroy(result);
+    return NULL;
+  }
+
+  serialized_buffer_destroy(payload);
+  return result;
+}
+
+// R7-03: verify the node-key signature over the blob BEFORE parsing, then
+// delegate to the plain deserializer (which checks the SHA-256 corruption
+// checksum). Returns NULL on any verification or parse failure.
+state_t* crabs_deserialize_state_signed(const uint8_t* data, size_t len,
+                                         const uint8_t node_public_key[33]) {
+  if (data == NULL || node_public_key == NULL) return NULL;
+  if (len <= CRABS_SIG_SIZE) return NULL;
+
+  size_t payload_len = len - CRABS_SIG_SIZE;
+  if (!crypto_ecdsa_verify(node_public_key, data, payload_len,
+                           data + payload_len)) {
+    return NULL;
+  }
+  return crabs_deserialize_state(data, payload_len);
+}
+
 // ============================================================
 // Operation serialization
 // ============================================================
@@ -1368,7 +1428,7 @@ serialized_buffer_t* crabs_serialize_operation(const operation_t* op) {
   write_buf_t* buf = _write_buf_create(1024);
 
   // Operation format version
-  _write_uint32_le(buf, 3); // v3: adds dedup_spec
+  _write_uint32_le(buf, 4); // v3: adds dedup_spec; v4: adds ordering_system + HLC
 
   // type (length-prefixed string)
   _write_string16(buf, op->type);
@@ -1453,15 +1513,28 @@ serialized_buffer_t* crabs_serialize_operation(const operation_t* op) {
     _write_string16(buf, op->dedup.rejection_message);
     // state_mutation
     _write_uint8(buf, (uint8_t)op->dedup.update.type);
-    if (op->dedup.update.type != MUTATION_CUSTOM && op->dedup.update.type != 0) {
-      _write_string16(buf, op->dedup.update.set_path);
-      _write_string16(buf, op->dedup.update.element_value);
-      _write_string16(buf, op->dedup.update.flag_path);
-      _write_string16(buf, op->dedup.update.counter_path);
-      _write_int64_le(buf, op->dedup.update.delta);
-      _write_string16(buf, op->dedup.update.target_path);
-      _write_string16(buf, op->dedup.update.value);
-    }
+    // R7-L-15: always write all 7 mutation fields, matching the canonical
+    // signing form. The prior conditional dropped them for MUTATION_CUSTOM, so
+    // an op carrying such fields failed verification after gossip.
+    _write_string16(buf, op->dedup.update.set_path);
+    _write_string16(buf, op->dedup.update.element_value);
+    _write_string16(buf, op->dedup.update.flag_path);
+    _write_string16(buf, op->dedup.update.counter_path);
+    _write_int64_le(buf, op->dedup.update.delta);
+    _write_string16(buf, op->dedup.update.target_path);
+    _write_string16(buf, op->dedup.update.value);
+  }
+
+  // v4: ordering_system + HLC fields (v1.6 Amd6 §6.2). R7-15: the wire format
+  // must cover the same field set as the canonical signing form, otherwise an
+  // HLC-ordered op cannot verify after gossip (the deserialized op re-serializes
+  // to different bytes).
+  _write_uint8(buf, (uint8_t)op->ordering_system);
+  if (op->ordering_system == CRABS_ORDERING_HLC) {
+    _write_uint64_le(buf, op->hlc.physical_seconds);
+    _write_uint64_le(buf, op->hlc.physical_nanos);
+    _write_uint64_le(buf, op->hlc.logical_counter);
+    _write_string16(buf, op->hlc.node_id);
   }
 
   // Create output
@@ -1488,7 +1561,7 @@ operation_t* crabs_deserialize_operation(const uint8_t* data, size_t len) {
   // Operation format version
   uint32_t op_version;
   if (!_read_uint32_le(&buf, &op_version)) goto fail;
-  if (op_version < 1 || op_version > 3) goto fail;
+  if (op_version < 1 || op_version > 4) goto fail;
 
   // type
   if (!_read_string16(&buf, op->type, CRABS_MAX_OP_NAME)) goto fail;
@@ -1637,17 +1710,35 @@ operation_t* crabs_deserialize_operation(const uint8_t* data, size_t len) {
       if (!_read_uint8(&buf, &mut_type)) goto fail;
       op->dedup.update.type = (mutation_type_e)mut_type;
 
-      if (mut_type != MUTATION_CUSTOM && mut_type != 0) {
-        if (!_read_string16(&buf, op->dedup.update.set_path, CRABS_MAX_DEDUP_PATH)) goto fail;
-        if (!_read_string16(&buf, op->dedup.update.element_value, CRABS_MAX_USER_ID)) goto fail;
-        if (!_read_string16(&buf, op->dedup.update.flag_path, CRABS_MAX_DEDUP_PATH)) goto fail;
-        if (!_read_string16(&buf, op->dedup.update.counter_path, CRABS_MAX_DEDUP_PATH)) goto fail;
-        if (!_read_int64_le(&buf, &op->dedup.update.delta)) goto fail;
-        if (!_read_string16(&buf, op->dedup.update.target_path, CRABS_MAX_DEDUP_PATH)) goto fail;
-        if (!_read_string16(&buf, op->dedup.update.value, CRABS_MAX_DEDUP_PATH)) goto fail;
-      }
+      // R7-L-15: always read all 7 mutation fields, matching the canonical
+      // signing form (the writer now always emits them).
+      if (!_read_string16(&buf, op->dedup.update.set_path, CRABS_MAX_DEDUP_PATH)) goto fail;
+      if (!_read_string16(&buf, op->dedup.update.element_value, CRABS_MAX_USER_ID)) goto fail;
+      if (!_read_string16(&buf, op->dedup.update.flag_path, CRABS_MAX_DEDUP_PATH)) goto fail;
+      if (!_read_string16(&buf, op->dedup.update.counter_path, CRABS_MAX_DEDUP_PATH)) goto fail;
+      if (!_read_int64_le(&buf, &op->dedup.update.delta)) goto fail;
+      if (!_read_string16(&buf, op->dedup.update.target_path, CRABS_MAX_DEDUP_PATH)) goto fail;
+      if (!_read_string16(&buf, op->dedup.update.value, CRABS_MAX_DEDUP_PATH)) goto fail;
     }
   }
+
+  // v4: ordering_system + HLC fields (v1.6 Amd6 §6.2). Older versions default
+  // to LAMPORT (zero-init) with no HLC fields.
+  if (op_version >= 4) {
+    uint8_t ordering;
+    if (!_read_uint8(&buf, &ordering)) goto fail;
+    op->ordering_system = (crabs_ordering_system_e)ordering;
+    if (op->ordering_system == CRABS_ORDERING_HLC) {
+      if (!_read_uint64_le(&buf, &op->hlc.physical_seconds)) goto fail;
+      if (!_read_uint64_le(&buf, &op->hlc.physical_nanos)) goto fail;
+      if (!_read_uint64_le(&buf, &op->hlc.logical_counter)) goto fail;
+      if (!_read_string16(&buf, op->hlc.node_id, CRABS_HLC_NODE_ID_SIZE)) goto fail;
+    }
+  }
+
+  // R7-L-6: require full consumption of the buffer. Trailing bytes would let
+  // arbitrary data be appended to a signed op without invalidating it.
+  if (buf.offset != buf.len) goto fail;
 
   return op;
 

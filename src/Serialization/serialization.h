@@ -34,6 +34,16 @@ typedef struct {
 serialized_buffer_t* crabs_serialize_state(const state_t* state);
 state_t*             crabs_deserialize_state(const uint8_t* data, size_t len);
 
+// R7-03: authenticated state snapshots. crabs_serialize_state_signed appends
+// an ECDSA signature (from state->node_private_key) over the whole blob after
+// the SHA-256 checksum; crabs_deserialize_state_signed verifies it with the
+// node public key BEFORE parsing. The bare SHA-256 is only a corruption check
+// — an attacker who can write the state file can recompute it, so snapshot
+// load from untrusted sources must use the signed variants.
+serialized_buffer_t* crabs_serialize_state_signed(const state_t* state);
+state_t*             crabs_deserialize_state_signed(const uint8_t* data, size_t len,
+                                                     const uint8_t node_public_key[33]);
+
 // ============================================================
 // Operation serialization (§7.5)
 // ============================================================

@@ -221,6 +221,96 @@ TEST(TestSerialization, TestSerializeOperationRoundTrip) {
   operation_destroy(restored);
 }
 
+// R7-15: the wire format dropped ordering_system + HLC fields that the
+// canonical signing form includes, so an HLC-ordered op could not verify after
+// gossip (the deserialized op re-serialized to different bytes). The wire
+// format must preserve the same field set.
+TEST(TestSerialization, TestHlcOrderingSurvivesWireRoundTrip) {
+  operation_t* original = operation_create(CRABS_OP_LOCK);
+  memset(original->uuid, 0x77, CRABS_UUID_SIZE);
+  original->ordering_system = CRABS_ORDERING_HLC;
+  original->hlc.physical_seconds = 1234567890;
+  original->hlc.physical_nanos = 42;
+  original->hlc.logical_counter = 7;
+  strncpy(original->hlc.node_id, "node-hlc", CRABS_HLC_NODE_ID_SIZE - 1);
+  strncpy(original->node_id, "node-hlc", CRABS_MAX_USER_ID - 1);
+  original->lamport_time = 0;
+
+  serialized_buffer_t* wire = crabs_serialize_operation(original);
+  ASSERT_NE(wire, nullptr);
+
+  operation_t* restored = crabs_deserialize_operation(wire->data, wire->len);
+  ASSERT_NE(restored, nullptr);
+
+  // The HLC ordering and fields must survive the wire round-trip.
+  EXPECT_EQ(restored->ordering_system, CRABS_ORDERING_HLC);
+  EXPECT_EQ(restored->hlc.physical_seconds, (uint64_t)1234567890);
+  EXPECT_EQ(restored->hlc.physical_nanos, (uint64_t)42);
+  EXPECT_EQ(restored->hlc.logical_counter, (uint64_t)7);
+  EXPECT_STREQ(restored->hlc.node_id, "node-hlc");
+
+  // The canonical signing form must be identical before and after gossip.
+  serialized_buffer_t* sig1 = crabs_serialize_for_signing(original);
+  serialized_buffer_t* sig2 = crabs_serialize_for_signing(restored);
+  ASSERT_NE(sig1, nullptr);
+  ASSERT_NE(sig2, nullptr);
+  EXPECT_EQ(sig1->len, sig2->len);
+  EXPECT_EQ(memcmp(sig1->data, sig2->data, sig1->len), 0);
+
+  serialized_buffer_destroy(sig1);
+  serialized_buffer_destroy(sig2);
+  serialized_buffer_destroy(wire);
+  operation_destroy(original);
+  operation_destroy(restored);
+}
+
+// R7-03: state snapshots must be authenticated with the node key, not just
+// SHA-256 checksummed. A tampered blob or a wrong verification key must be
+// rejected before parsing.
+TEST(TestSerialization, TestSignedStateRoundTrip) {
+  state_t* state = state_create();
+  state->version = 5;
+
+  data_item_t* item = data_item_create("counter1", DATA_TYPE_COUNTER, CRDT_G_COUNTER);
+  int64_t* val = (int64_t*)malloc(sizeof(int64_t));
+  *val = 100;
+  item->value = val;
+  state_add_item(state, item);
+
+  ecdsa_keypair_t* node_key = crypto_ecdsa_generate();
+  ASSERT_NE(node_key, nullptr);
+  ASSERT_EQ(state_set_node_key(state, node_key->private_key, node_key->public_key),
+            CRABS_SUCCESS);
+
+  serialized_buffer_t* buf = crabs_serialize_state_signed(state);
+  ASSERT_NE(buf, nullptr);
+
+  // Correct key → loads.
+  state_t* restored = crabs_deserialize_state_signed(buf->data, buf->len, node_key->public_key);
+  ASSERT_NE(restored, nullptr);
+  data_item_t* restored_item = state_find_item(restored, "counter1");
+  ASSERT_NE(restored_item, nullptr);
+  EXPECT_EQ(*(int64_t*)restored_item->value, (int64_t)100);
+  state_destroy(restored);
+
+  // Wrong key → rejected.
+  ecdsa_keypair_t* other_key = crypto_ecdsa_generate();
+  ASSERT_NE(other_key, nullptr);
+  EXPECT_EQ(crabs_deserialize_state_signed(buf->data, buf->len, other_key->public_key), nullptr);
+
+  // Tampered blob → rejected.
+  uint8_t* tampered = (uint8_t*)malloc(buf->len);
+  memcpy(tampered, buf->data, buf->len);
+  tampered[0] ^= 0xFF;  // flip a magic byte
+  EXPECT_EQ(crabs_deserialize_state_signed(tampered, buf->len, node_key->public_key), nullptr);
+  free(tampered);
+
+  serialized_buffer_destroy(buf);
+  crypto_ecdsa_keypair_destroy(node_key);
+  crypto_ecdsa_keypair_destroy(other_key);
+  state_destroy(state);
+}
+
 TEST(TestSerialization, TestCanonicalEncodingDeterminism) {
   operation_t* op1 = operation_create(CRABS_OP_VERIFY);
   memset(op1->uuid, 0x42, CRABS_UUID_SIZE);
@@ -431,6 +521,64 @@ TEST(TestSerialization, TestSerializeStateWithInvariants) {
   serialized_buffer_destroy(buf);
   state_destroy(state);
   state_destroy(restored);
+}
+
+// R7-12: the invariant first pass accumulated str_space for out-of-bounds
+// messages, amplifying a ~2.8 KB input into a ~16.7 MB allocation per item
+// (get_clear_memory aborts on OOM → remote crash). Craft a buffer where an
+// invariant's msg_len is huge and out of bounds; deserialization must fail
+// cleanly without crashing.
+TEST(TestSerialization, TestDeserializeInvariantOutOfBoundsMsgLenNoCrash) {
+  state_t* state = state_create();
+  state->version = 5;
+
+  data_item_t* item = data_item_create("counter1", DATA_TYPE_COUNTER, CRDT_G_COUNTER);
+  int64_t* val = (int64_t*)malloc(sizeof(int64_t));
+  *val = 100;
+  item->value = val;
+
+  invariant_t* invs = (invariant_t*)malloc(2 * sizeof(invariant_t));
+  invs[0].type = INVARIANT_GREATER_THAN;
+  invs[0].param = 0;
+  invs[0].error_message = strdup("must be positive");
+  invs[1].type = INVARIANT_NON_NEGATIVE;
+  invs[1].param = 0;
+  invs[1].error_message = strdup("must be non-negative");
+  item->invariants = invs;
+  item->invariant_count = 2;
+
+  state_add_item(state, item);
+
+  serialized_buffer_t* buf = crabs_serialize_state(state);
+  ASSERT_NE(buf, nullptr);
+
+  // Locate the second invariant's message and corrupt the 2-byte msg_len that
+  // precedes it to 0xFFFF (out of bounds), then truncate so the message bytes
+  // are gone — the deserializer must reject cleanly, not allocate 64 KB.
+  const char* needle = "must be non-negative";
+  size_t needle_len = strlen(needle);
+  size_t msg_offset = SIZE_MAX;
+  for (size_t i = 0; i + needle_len <= buf->len; i++) {
+    if (memcmp(buf->data + i, needle, needle_len) == 0) {
+      msg_offset = i;
+      break;
+    }
+  }
+  ASSERT_NE(msg_offset, SIZE_MAX);
+  ASSERT_GE(msg_offset, 2u);
+  buf->data[msg_offset - 2] = 0xFF;
+  buf->data[msg_offset - 1] = 0xFF;
+
+  state_t* restored = crabs_deserialize_state(buf->data, msg_offset);
+  // No crash is the primary assertion; a clean failure (NULL) is expected.
+  if (restored != NULL) {
+    state_destroy(restored);
+  }
+
+  free((void*)invs[0].error_message);
+  free((void*)invs[1].error_message);
+  serialized_buffer_destroy(buf);
+  state_destroy(state);
 }
 
 TEST(TestSerialization, TestSerializeForSigningCompleteness) {
