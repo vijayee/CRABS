@@ -54,6 +54,7 @@ if (BUILD_TESTING)
         test_compaction_periodic.cpp
         test_compaction_vectors.cpp
         test_hlc.cpp
+        test_time_source.cpp
         test_handler_registry.cpp
         test_tx_manager.cpp
     )

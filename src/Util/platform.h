@@ -27,6 +27,10 @@
 #include <time.h>
 #include <string.h>
 
+#ifdef __EMSCRIPTEN__
+#include <emscripten/emscripten.h>
+#endif
+
 // ============================================================
 // Threading Primitives
 // ============================================================
@@ -173,6 +177,43 @@ static inline platform_time_t platform_get_time(void) {
 #endif
 
   return t;
+}
+
+// ============================================================
+// Monotonic Time
+// ============================================================
+// Returns seconds + nanoseconds from an arbitrary fixed origin that never
+// moves backward (CLOCK_MONOTONIC on POSIX, QueryPerformanceCounter on
+// Windows, emscripten_get_now on WASM). Only differences are meaningful.
+
+static inline platform_time_t platform_get_monotonic(void) {
+  platform_time_t result = {0, 0, false};
+
+#ifdef _WIN32
+  LARGE_INTEGER counter;
+  LARGE_INTEGER frequency;
+  if (QueryPerformanceCounter(&counter) &&
+      QueryPerformanceFrequency(&frequency) && frequency.QuadPart > 0) {
+    result.seconds = (uint64_t)(counter.QuadPart / frequency.QuadPart);
+    uint64_t remainder = (uint64_t)(counter.QuadPart % frequency.QuadPart);
+    result.nanos = (uint64_t)((remainder * 1000000000ULL) / frequency.QuadPart);
+    result.valid = true;
+  }
+#elif defined(__EMSCRIPTEN__)
+  double now_ms = emscripten_get_now();
+  result.seconds = (uint64_t)(now_ms / 1000.0);
+  result.nanos = (uint64_t)((now_ms - (double)result.seconds * 1000.0) * 1000000.0);
+  result.valid = true;
+#else
+  struct timespec ts;
+  if (clock_gettime(CLOCK_MONOTONIC, &ts) == 0) {
+    result.seconds = (uint64_t)ts.tv_sec;
+    result.nanos = (uint64_t)ts.tv_nsec;
+    result.valid = true;
+  }
+#endif
+
+  return result;
 }
 
 // ============================================================
