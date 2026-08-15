@@ -3,6 +3,8 @@
 //
 
 #include <gtest/gtest.h>
+#include <chrono>
+#include <thread>
 
 extern "C" {
 #include "Util/platform.h"
@@ -166,6 +168,39 @@ TEST(TimeSourceBackend, DefaultsAppliedWhenConfigNull) {
   crabs_physical_time_t result = ops->get_time(ops->ctx);
   EXPECT_TRUE(result.valid);
   EXPECT_EQ(fake_call_count, 1);
+
+  crabs_time_source_destroy(ops);
+}
+
+TEST(TimeSourceBackend, ResyncBoundaryBehavior) {
+  reset_fake(1000000000, 0);
+
+  crabs_time_source_config_t config;
+  config.server_url = "https://example.invalid";
+  config.resync_interval_ms = 50;  // small interval so the boundary is reachable
+  config.timeout_ms = 1000;
+
+  crabs_time_source_ops_t* ops =
+      crabs_time_source_https_create_with_transport(&config, fake_transport);
+  ASSERT_NE(ops, nullptr);
+
+  // First call: no anchor yet, so the transport is queried.
+  crabs_physical_time_t first = ops->get_time(ops->ctx);
+  ASSERT_TRUE(first.valid);
+  EXPECT_EQ(fake_call_count, 1);
+
+  // Immediate second call: still inside the 50ms interval, cache hit.
+  crabs_physical_time_t second = ops->get_time(ops->ctx);
+  ASSERT_TRUE(second.valid);
+  EXPECT_EQ(fake_call_count, 1);  // cache hit — no second transport call
+  EXPECT_TRUE(second.seconds > first.seconds ||
+              (second.seconds == first.seconds && second.nanos >= first.nanos));
+
+  // Sleep past the interval, then the cache is stale and re-queries.
+  std::this_thread::sleep_for(std::chrono::milliseconds(60));
+  crabs_physical_time_t third = ops->get_time(ops->ctx);
+  ASSERT_TRUE(third.valid);
+  EXPECT_EQ(fake_call_count, 2);  // stale cache — transport queried again
 
   crabs_time_source_destroy(ops);
 }

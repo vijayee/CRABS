@@ -24,7 +24,9 @@ typedef struct {
   bool     valid;     // Whether the fetch succeeded
 } crabs_time_source_fetch_result_t;
 
-// Configuration. NULL fields fall back to defaults.
+// Configuration. Pass NULL to use all defaults. A non-NULL config's values
+// are used as-is: 0 is a valid value (e.g. resync_interval_ms = 0 means
+// re-query on every call).
 typedef struct {
   const char* server_url;          // Default: CRABS_TIME_SOURCE_DEFAULT_URL
   uint64_t    resync_interval_ms;  // Default: CRABS_TIME_SOURCE_DEFAULT_RESYNC_MS
