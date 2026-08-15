@@ -19,15 +19,18 @@ mergeInto(LibraryManager.library, {
 
     if (typeof XMLHttpRequest !== 'undefined') {
       // Browser: synchronous request so the C caller blocks until done.
+      // Note: the XHR spec does not apply `timeout` to synchronous requests,
+      // and setting it in a Window context throws InvalidAccessError. The
+      // browser path therefore cannot bound sync XHR; timeout_ms is only
+      // honored on the Node path below.
       var xhr = new XMLHttpRequest();
       xhr.open('GET', url, false);
-      xhr.timeout = timeout;
       try {
         xhr.send(null);
         if (xhr.status >= 200 && xhr.status < 300) {
           body = xhr.responseText;
         }
-      } catch (e) {
+      } catch (err) {
         body = null;
       }
     } else if (typeof require !== 'undefined') {
@@ -52,7 +55,7 @@ mergeInto(LibraryManager.library, {
           timeout: timeout,
           stdio: ['ignore', 'pipe', 'ignore']
         }).toString();
-      } catch (e) {
+      } catch (err) {
         body = null;
       }
     }
