@@ -7,9 +7,10 @@
 // values all update. A second browser tab acts as a peer: fired ops are
 // relayed as serialized signed bytes over BroadcastChannel and re-executed.
 //
-// Identity layout mirrors bindings/wasm/test/smoke.js:
-//   - Node.create(actorId + '-admin') bootstraps an admin user whose private
-//     key never leaves the WASM heap, so it cannot sign demo ops.
+// Identity layout:
+//   - Each node bootstraps a literal 'admin' user whose private key never
+//     leaves the WASM heap, so it cannot sign demo ops (and so the
+//     createTrigger/evaluateTriggers admin ops verify — see setupNode).
 //   - The demo actor (alice/bob) is registered as a regular user with a
 //     fixed demo keypair and granted role:member via the admin grantRole
 //     path (register_user rejects privileged attribute names, audit R7-08).
@@ -21,6 +22,15 @@
 
 const CHANNEL_NAME = 'crabs-devtools-demo';
 
+// Devtools controllers, populated in main(); refreshPanels() re-renders them
+// after mutations that happen outside state_machine_execute (execute already
+// auto-refreshes the panel of the node it ran on).
+let panelControllers = [];
+
+function refreshPanels() {
+  for (const { controller } of panelControllers) controller.refresh();
+}
+
 // Fixed demo signing keys (secp256r1 scalars, generated once out-of-band).
 const DEMO_PRIVATE_KEYS = {
   alice: '0ea17cd46d644f2660952d724a1ed4718aabe0b1415752a2883d7731ea200ad8',
@@ -28,16 +38,39 @@ const DEMO_PRIVATE_KEYS = {
 };
 
 async function setupNode(dev, actorId, signingKeypair) {
-  const node = await dev.Node.create(actorId + '-admin', { ordering: 'hlc' });
+  // The bootstrap admin must be literally 'admin': createTrigger and
+  // evaluateTriggers sign admin ops as signer 'admin' with the node key
+  // (same convention as examples/video_platform).
+  const node = await dev.Node.create('admin', { ordering: 'hlc' });
 
   node.addCounter('views');
   node.addPNCounter('likes');
   node.addORSet('subscribers');
   node.addOneShotSet('flaggers');
+  node.addCounter('flag_count');
+  node.addRegister('contact');
   node.setPolicy('view', 'role:member');
   node.setPolicy('like', 'role:member');
+  node.setPolicy('flag', 'role:member');
+  // Admin-only ops used by createTrigger and evaluateTriggers (mirrors
+  // examples/video_platform).
+  node.setPolicy('__create_trigger__', 'role:admin');
+  node.setPolicy('noop', 'role:admin');
   node.registerUser(actorId, signingKeypair.publicKeyHex(), 'adult');
-  node.grantRole(actorId, 'role', 'member', actorId + '-admin');
+  node.grantRole(actorId, 'role', 'member', 'admin');
+
+  node.createTrigger({
+    triggerId: 'tos_threshold',
+    condition: 'flag_count >= 3',
+    description: 'Issue tos_investigator attribute when flag threshold reached',
+    effectType: 'issue_attribute',
+    issueAttribute: 'tos_investigator',
+    targetRole: 'clearance',
+    attributeValue: 'verified',
+    durationMs: 3600000,
+    oneShot: false,
+    cooldownMs: 60000
+  });
 
   node.registerHandlerJs('view', (state, operation) => {
     state.incrementCounter('views', 1, operation.nodeId);
@@ -56,6 +89,7 @@ async function setupNode(dev, actorId, signingKeypair) {
     return 0;
   });
   node.registerHandlerJs('flag', (state, operation) => {
+    state.incrementCounter('flag_count', 1, operation.nodeId);
     state.setAdd('flaggers', operation.signerId, operation.signerId + ':1');
     return 0;
   });
@@ -75,6 +109,10 @@ async function fireOperation(dev, node, actorId, signingKeypair, opType) {
     // already appear in the devtools timeline; keep them out of the console.
     console.info('execute rejected ' + opType + ': ' + executeError.message);
   }
+  // Trigger evaluation runs outside execute, so refresh the panels explicitly
+  // afterwards (e.g. three Flag ops fire the tos_threshold trigger).
+  node.evaluateTriggers();
+  refreshPanels();
   // Broadcast regardless of the local outcome: a peer that has not applied
   // this operation yet may still accept it.
   if (window.demoChannel) {
@@ -91,6 +129,8 @@ function startRelay(dev, node) {
     } catch (executeError) {
       console.info('relay rejected ' + operation.type + ': ' + executeError.message);
     }
+    node.evaluateTriggers();
+    refreshPanels();
   };
 }
 
@@ -108,8 +148,18 @@ function startRelay(dev, node) {
   const aliceNode = await setupNode(dev, 'alice', aliceKeypair);
   const bobNode = await setupNode(dev, 'bob', bobKeypair);
 
-  attach(aliceNode, { nodeId: 'alice', mount: document.getElementById('alice-panel') });
-  attach(bobNode, { nodeId: 'bob', mount: document.getElementById('bob-panel') });
+  // ABE-encrypt the demo contact once (the encrypting node acts as admin) and
+  // store the raw ciphertext bytes in both nodes' contact registers. The CRDT
+  // tab then shows "[encrypted: N bytes]" instead of the plaintext address.
+  const encryptedContact = aliceNode.encrypt(
+    new TextEncoder().encode('alice@example.com'), 'tos_investigator');
+  aliceNode.setRegisterBytes('contact', encryptedContact, 'alice');
+  bobNode.setRegisterBytes('contact', encryptedContact, 'bob');
+
+  panelControllers = [
+    attach(aliceNode, { nodeId: 'alice', mount: document.getElementById('alice-panel') }),
+    attach(bobNode, { nodeId: 'bob', mount: document.getElementById('bob-panel') }),
+  ];
 
   const actions = [
     ['View (increment views)', (node, actorId, keypair) => fireOperation(dev, node, actorId, keypair, 'view')],

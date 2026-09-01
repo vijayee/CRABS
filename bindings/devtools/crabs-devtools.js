@@ -77,6 +77,22 @@
     .fsm { display: flex; align-items: center; gap: 4px; margin-top: 6px; flex-wrap: wrap; }
     .fsm .stop { padding: 1px 8px; border-radius: 999px; font-size: 10px; }
     .fsm .arrow { color: #9ca3af; }
+    .toggle {
+      position: fixed; bottom: 16px; right: 16px; z-index: 2147483647;
+      width: 36px; height: 36px; border-radius: 999px;
+      font: 700 9px/1 -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      letter-spacing: .04em; cursor: pointer; user-select: none;
+      box-shadow: 0 2px 8px rgba(0,0,0,.12);
+    }
+    .toggle.open { background: #1a56db; color: #ffffff; border: 1px solid #1a56db; }
+    .toggle.collapsed { background: #ffffff; color: #1a56db; border: 1px solid #e5e7eb; }
+    .pause {
+      padding: 3px 10px; border-radius: 999px; cursor: pointer; user-select: none;
+      border: 1px solid #e5e7eb; background: #ffffff; color: #1a56db;
+      font-size: 11px; font-weight: 600; font-family: inherit;
+    }
+    .pause:hover { background: #e8f0fe; }
+    .paused-banner { color: #9ca3af; font-size: 11px; margin-bottom: 6px; }
   `;
 
   const ORDERED_STATES = ['idle', 'locked', 'modified', 'verified'];
@@ -89,24 +105,54 @@
       this.data = { snapshot: null, allEvents: [] };
       this.filterText = '';
       this.selectedItem = null;
+      this.paused = false;
+      this.collapsedState = false;
+    }
+
+    get collapsed() { return this.collapsedState; }
+    set collapsed(value) {
+      this.collapsedState = Boolean(value);
+      this.applyCollapsed();
     }
 
     connectedCallback() {
+      // Re-connecting an already-initialized element (e.g. a DOM move) must
+      // not append a second panel/toggle.
+      if (this.root) return;
       const style = document.createElement('style');
       style.textContent = STYLES;
       const root = document.createElement('div');
       root.className = 'panel';
-      this.shadowRoot.append(style, root);
+      const toggle = document.createElement('button');
+      toggle.className = 'toggle';
+      toggle.textContent = 'CRABS';
+      toggle.addEventListener('click', () => {
+        this.collapsed = !this.collapsed;
+      });
+      this.shadowRoot.append(style, root, toggle);
       this.root = root;
+      this.toggleButton = toggle;
+      this.applyCollapsed();
       this.render();
     }
 
+    applyCollapsed() {
+      if (!this.root || !this.toggleButton) return;
+      this.root.style.display = this.collapsedState ? 'none' : '';
+      this.toggleButton.className =
+        'toggle ' + (this.collapsedState ? 'collapsed' : 'open');
+      this.toggleButton.setAttribute('aria-expanded', String(!this.collapsedState));
+    }
+
     update(data) {
+      const wasConnected = this.isConnected;
       this.data = {
         snapshot: data.snapshot || this.data.snapshot,
         allEvents: data.allEvents || this.data.allEvents,
       };
-      if (this.isConnected) this.render();
+      // While paused the panel stays frozen on the pause-moment view; the
+      // merged data is picked up by the next render (e.g. on resume).
+      if (wasConnected && !this.paused) this.render();
     }
 
     render() {
@@ -238,7 +284,23 @@
         }
       });
       toolbar.appendChild(filter);
+      const pauseButton = document.createElement('button');
+      pauseButton.className = 'pause';
+      pauseButton.textContent = this.paused ? '▶ Resume' : '⏸ Pause';
+      pauseButton.addEventListener('click', () => {
+        this.paused = !this.paused;
+        this.render();
+      });
+      toolbar.appendChild(pauseButton);
       body.appendChild(toolbar);
+
+      if (this.paused) {
+        const banner = document.createElement('div');
+        banner.className = 'paused-banner';
+        banner.textContent = 'Paused — ' + this.data.allEvents.length +
+          ' events buffered';
+        body.appendChild(banner);
+      }
 
       const needle = this.filterText.toLowerCase();
       const events = this.data.allEvents.filter((event) => {
