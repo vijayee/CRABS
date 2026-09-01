@@ -16,6 +16,8 @@ async function main() {
     'production artifact must not expose devtools exports');
   assert.strictEqual(typeof prodM._crabs_wasm_devtools_drain_events, 'undefined',
     'production artifact must not expose devtools exports');
+  assert.strictEqual(typeof prodM._crabs_wasm_devtools_string_destroy, 'undefined',
+    'production artifact must not expose devtools exports');
   console.log('prod artifact: devtools exports correctly absent');
 
   const dev = require('../dev.js');
