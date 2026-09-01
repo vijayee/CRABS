@@ -5,7 +5,10 @@ const { Node, KeyPair, Operation } = require('..');
 (async () => {
   const node = await Node.create('admin', { ordering: 'hlc' });
   const key = await KeyPair.generate();
-  node.registerUser('alice', key.publicKeyHex(), 'role:member|adult');
+  // register_user rejects privileged attribute names (audit R7-08), so the
+  // role must be granted via the admin grantRole path after registration.
+  node.registerUser('alice', key.publicKeyHex(), 'adult');
+  node.grantRole('alice', 'role', 'member', 'admin');
 
   node.addCounter('views');
   node.addPNCounter('likes');

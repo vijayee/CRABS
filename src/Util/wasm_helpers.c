@@ -156,6 +156,14 @@ crabs_error_e crabs_wasm_sign_operation(attribute_machine_t* am, operation_t* op
     op->node_id[CRABS_MAX_USER_ID - 1] = '\0';
   }
 
+  // R7-04: the execute path's key-staleness check is mandatory — the op must
+  // declare the signer's current key version or it is rejected as stale. The
+  // signer signs with their current key, so stamp it from their user record.
+  user_t* signer = attribute_machine_find_user(am, op->signer_id);
+  if (signer != NULL) {
+    op->signer_key_version = signer->key_version;
+  }
+
   serialized_buffer_t* ser = crabs_serialize_for_signing(op);
   if (!ser) return CRABS_ERR_SERIALIZATION_ERROR;
   crabs_error_e rc = crypto_ecdsa_sign(private_key, ser->data, ser->len, op->signature);

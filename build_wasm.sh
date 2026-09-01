@@ -36,7 +36,7 @@ if [ ! -f "$OPENABE_WASM/liboabe_c_wasm.a" ]; then
   exit 1
 fi
 
-rm -rf "$BUILD_DIR"
+rm -rf "$BUILD_DIR" "$BUILD_DIR.dev"
 mkdir -p "$BUILD_DIR"
 
 CRABS_SRCS=$(find "$ROOT_DIR/src" -name '*.c' | sort)
@@ -163,4 +163,5 @@ build_variant ".dev" "-DCRABS_ENABLE_DEVTOOLS" "createCRABSModuleDev" "${BASE_EX
 
 echo ""
 echo "=== CRABS WASM Build Complete ==="
-ls -lh "$BUILD_DIR"/crabs*.js "$BUILD_DIR"/crabs*.wasm 2>/dev/null
+ls -lh "$BUILD_DIR"/crabs*.js "$BUILD_DIR"/crabs*.wasm \
+       "$BUILD_DIR.dev"/crabs*.js "$BUILD_DIR.dev"/crabs*.wasm 2>/dev/null
