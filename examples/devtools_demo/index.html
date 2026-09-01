@@ -1,0 +1,50 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>CRABS Devtools Demo</title>
+  <style>
+    body { font: 14px/1.5 -apple-system, 'Segoe UI', Roboto, sans-serif;
+           background: #f9fafb; color: #111827; max-width: 1200px; margin: 0 auto; padding: 20px; }
+    h1 { font-size: 20px; margin-bottom: 4px; }
+    .subtitle { color: #6b7280; margin-bottom: 16px; font-size: 13px; }
+    .nodes { display: flex; gap: 20px; align-items: flex-start; flex-wrap: wrap; }
+    .node-col { flex: 1; min-width: 480px; }
+    .node-col h2 { font-size: 15px; margin: 0 0 8px; }
+    .op-grid { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 12px; }
+    button { background: #e8f0fe; color: #1a56db; border: none; padding: 8px 14px;
+             border-radius: 999px; cursor: pointer; font-size: 13px; font-weight: 600; }
+    button:hover { background: #dbeafe; }
+    button.bad { background: #fee2e2; color: #991b1b; }
+    .hint { color: #6b7280; font-size: 12px; margin-bottom: 10px; }
+    crabs-devtools { display: block; }
+  </style>
+</head>
+<body>
+  <h1>CRABS Devtools Demo</h1>
+  <p class="subtitle">
+    Two nodes (alice, bob) in this tab share one WASM module; each has its own panel.
+    Open a second tab for "two tabs = two peers" mode (ops replicate via BroadcastChannel).
+  </p>
+  <div class="nodes">
+    <div class="node-col">
+      <h2>Alice's node</h2>
+      <div class="hint">The replay guard accepts only each signer's first operation per node; later ops appear in the timeline as already_executed rejections. Dislike has no policy, so it is always rejected.</div>
+      <div class="op-grid" id="alice-ops"></div>
+      <div id="alice-panel"></div>
+    </div>
+    <div class="node-col">
+      <h2>Bob's node</h2>
+      <div class="hint">The replay guard accepts only each signer's first operation per node; later ops appear in the timeline as already_executed rejections. Dislike has no policy, so it is always rejected.</div>
+      <div class="op-grid" id="bob-ops"></div>
+      <div id="bob-panel"></div>
+    </div>
+  </div>
+  <script src="../../bindings/wasm/crabs.dev.js"></script>
+  <script src="../../bindings/wasm/bindings-core.js"></script>
+  <script src="../../bindings/devtools/devtools-api.js"></script>
+  <script src="../../bindings/devtools/crabs-devtools.js"></script>
+  <script src="demo.js"></script>
+</body>
+</html>
