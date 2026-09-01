@@ -38,19 +38,12 @@ fi
 
 rm -rf "$BUILD_DIR"
 mkdir -p "$BUILD_DIR"
-cd "$BUILD_DIR"
 
-# Collect all CRABS C source files
 CRABS_SRCS=$(find "$ROOT_DIR/src" -name '*.c' | sort)
-
-# Include paths — use OpenSSL source headers (architecture-correct for WASM)
 INCLUDES="-I$ROOT_DIR/src -I$OPENABE_DIR/include -I$RELIC_WASM/include -I$OPENABE_DIR/deps/relic/include -I$OPENSSL_SRC/include"
-
-# Compile flags
 CFLAGS="-std=c11 -O2 -DWITH_RELIC -DBP_WITH_OPENSSL -D_POSIX_C_SOURCE=200809L -include strings.h -D__GLIBC_PREREQ\(x,y\)=0 -fPIC"
 
-# Key functions to export for the JavaScript API
-EXPORTED_FUNCTIONS='[
+BASE_EXPORTS='[
   "_crypto_ecdsa_generate",
   "_crypto_ecdsa_sign",
   "_crypto_ecdsa_verify",
@@ -119,39 +112,55 @@ EXPORTED_FUNCTIONS='[
   "_crabs_time_source_destroy"
 ]'
 
-echo "Compiling CRABS sources..."
-OBJECTS=""
-for src in $CRABS_SRCS; do
-  obj="$BUILD_DIR/$(basename ${src%.c}).o"
-  echo "  CC  $(basename $src)"
-  emcc $CFLAGS $INCLUDES -c "$src" -o "$obj" 2>&1
-  OBJECTS="$OBJECTS $obj"
-done
+DEVTOOLS_EXPORTS='[
+  "_crabs_wasm_devtools_snapshot",
+  "_crabs_wasm_devtools_drain_events",
+  "_crabs_wasm_devtools_string_destroy"
+]'
 
-echo ""
-echo "Linking WASM module..."
-emcc $CFLAGS \
-  $OBJECTS \
-  "$OPENABE_WASM/liboabe_c_wasm.a" \
-  "$RELIC_WASM/lib/librelic_s.a" \
-  "$OPENSSL_WASM_LIB/libcrypto.a" \
-  "$OPENSSL_WASM_LIB/libssl.a" \
-  -o "$BUILD_DIR/crabs.js" \
-  -s WASM=1 \
-  -s MODULARIZE=1 \
-  -s EXPORT_NAME=createCRABSModule \
-  -s ALLOW_TABLE_GROWTH=1 \
-  -s ALLOW_MEMORY_GROWTH=1 \
-  -s INITIAL_MEMORY=64MB \
-  -s EXPORTED_FUNCTIONS="$EXPORTED_FUNCTIONS" \
-  -s EXPORTED_RUNTIME_METHODS='["ccall","cwrap","getValue","setValue","UTF8ToString","stringToUTF8","lengthBytesUTF8","addFunction","removeFunction","HEAP8","HEAPU8","HEAP16","HEAPU16","HEAP32","HEAPU32","HEAPF32","HEAPF64"]' \
-  --js-library "$ROOT_DIR/src/TimeSource/wasm_time_library.js" \
-  -O2 \
-  2>&1
+build_variant() {
+  VARIANT_SUFFIX="$1"   # "" for production, ".dev" for devtools build
+  EXTRA_DEFINES="$2"    # "" or "-DCRABS_ENABLE_DEVTOOLS"
+  EXPORT_NAME="$3"
+  EXPORTS_JSON="$4"
+
+  VARIANT_DIR="$BUILD_DIR$VARIANT_SUFFIX"
+  mkdir -p "$VARIANT_DIR"
+
+  echo "Compiling CRABS sources (variant: ${VARIANT_SUFFIX:-prod})..."
+  OBJECTS=""
+  for src in $CRABS_SRCS; do
+    obj="$VARIANT_DIR/$(basename ${src%.c}).o"
+    emcc $CFLAGS $EXTRA_DEFINES $INCLUDES -c "$src" -o "$obj" 2>&1
+    OBJECTS="$OBJECTS $obj"
+  done
+
+  echo "Linking WASM module (${VARIANT_SUFFIX:-prod})..."
+  emcc $CFLAGS $EXTRA_DEFINES \
+    $OBJECTS \
+    "$OPENABE_WASM/liboabe_c_wasm.a" \
+    "$RELIC_WASM/lib/librelic_s.a" \
+    "$OPENSSL_WASM_LIB/libcrypto.a" \
+    "$OPENSSL_WASM_LIB/libssl.a" \
+    -o "$VARIANT_DIR/crabs$VARIANT_SUFFIX.js" \
+    -s WASM=1 \
+    -s MODULARIZE=1 \
+    -s EXPORT_NAME="$EXPORT_NAME" \
+    -s ALLOW_TABLE_GROWTH=1 \
+    -s ALLOW_MEMORY_GROWTH=1 \
+    -s INITIAL_MEMORY=64MB \
+    -s EXPORTED_FUNCTIONS="$EXPORTS_JSON" \
+    -s EXPORTED_RUNTIME_METHODS='["ccall","cwrap","getValue","setValue","UTF8ToString","stringToUTF8","lengthBytesUTF8","addFunction","removeFunction","HEAP8","HEAPU8","HEAP16","HEAPU16","HEAP32","HEAPU32","HEAPF32","HEAPF64"]' \
+    --js-library "$ROOT_DIR/src/TimeSource/wasm_time_library.js" \
+    -O2 \
+    2>&1
+}
+
+build_variant "" "" "createCRABSModule" "$BASE_EXPORTS"
+# Merge the two JSON arrays into one (emcc's -s parser splits on commas and
+# cannot handle a "],[" junction between the lists).
+build_variant ".dev" "-DCRABS_ENABLE_DEVTOOLS" "createCRABSModuleDev" "${BASE_EXPORTS%]},${DEVTOOLS_EXPORTS#[}"
 
 echo ""
 echo "=== CRABS WASM Build Complete ==="
-ls -lh "$BUILD_DIR/crabs.wasm" "$BUILD_DIR/crabs.js" 2>/dev/null
-echo ""
-echo "  WASM: $BUILD_DIR/crabs.wasm"
-echo "  JS:   $BUILD_DIR/crabs.js"
+ls -lh "$BUILD_DIR"/crabs*.js "$BUILD_DIR"/crabs*.wasm 2>/dev/null

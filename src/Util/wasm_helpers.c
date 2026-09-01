@@ -21,6 +21,10 @@
 #include "../CRDT/crdt_merge.h"
 #include "../CRDT/one_shot.h"
 
+#ifdef CRABS_ENABLE_DEVTOOLS
+#include "../Devtools/devtools.h"
+#endif
+
 // ============================================================
 // Node lifecycle (HLC-enabled)
 // ============================================================
@@ -172,7 +176,11 @@ crabs_error_e crabs_wasm_sign_with_node_key(attribute_machine_t* am, operation_t
 EMSCRIPTEN_KEEPALIVE
 crabs_error_e crabs_wasm_execute(attribute_machine_t* am, operation_t* op) {
   if (!am || !op) return CRABS_ERR_INVALID_PARAM;
-  return state_machine_execute(&am->base_state, op);
+  crabs_error_e result = state_machine_execute(&am->base_state, op);
+#ifdef CRABS_ENABLE_DEVTOOLS
+  devtools_record_event(&am->base_state, op, result);
+#endif
+  return result;
 }
 
 // ============================================================
@@ -337,6 +345,7 @@ bool crabs_wasm_set_contains(attribute_machine_t* am, const char* name, const ch
     return one_shot_set_contains((one_shot_set_t*)item->value, element);
   return false;
 }
+
 
 EMSCRIPTEN_KEEPALIVE
 crabs_error_e crabs_wasm_set_add(attribute_machine_t* am, const char* name,
@@ -504,5 +513,29 @@ const char* crabs_wasm_handler_op_get_payload_str(operation_t* op) {
   if (op->payload[op->payload_size - 1] != '\0') return NULL;
   return (const char*)op->payload;
 }
+
+// ============================================================
+// Devtools (only present in builds with CRABS_ENABLE_DEVTOOLS)
+// ============================================================
+
+#ifdef CRABS_ENABLE_DEVTOOLS
+
+EMSCRIPTEN_KEEPALIVE
+const char* crabs_wasm_devtools_snapshot(attribute_machine_t* am) {
+  if (!am) return NULL;
+  return devtools_snapshot_json(&am->base_state);
+}
+
+EMSCRIPTEN_KEEPALIVE
+const char* crabs_wasm_devtools_drain_events(void) {
+  return devtools_events_json();
+}
+
+EMSCRIPTEN_KEEPALIVE
+void crabs_wasm_devtools_string_destroy(const char* str) {
+  free((void*)str);
+}
+
+#endif // CRABS_ENABLE_DEVTOOLS
 
 #endif /* __EMSCRIPTEN__ */
