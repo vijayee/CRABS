@@ -12,6 +12,7 @@ extern "C" {
 #include "HLC/hlc.h"
 #include "Serialization/serialization.h"
 #include "StateMachine/state_machine.h"
+#include "Crypto/crypto.h"
 }
 
 // ============================================================
@@ -362,6 +363,18 @@ static crabs_hlc_state_t make_mock_state(const char* node_id,
 // ============================================================
 // HLC Generation Tests (§4.1, §12.1-12.3)
 // ============================================================
+
+TEST(HLCGeneration, HttpsAuthWithoutOpsFailsClosed) {
+  // R8-H-1: HTTPS_AUTH must not fall back to the unauthenticated system clock
+  // when no time source ops are attached. Fail closed instead.
+  crabs_hlc_state_t state;
+  crabs_hlc_state_init(&state, "alice");
+  state.time_source = CRABS_TIME_SOURCE_HTTPS_AUTH;
+  state.time_source_ops = NULL;
+
+  crabs_physical_time_t phys = crabs_hlc_get_physical_time(&state);
+  EXPECT_FALSE(phys.valid);
+}
 
 TEST(HLCGeneration, NullState) {
   crabs_hlc_t hlc = crabs_hlc_next(NULL);
@@ -1280,8 +1293,9 @@ TEST(HLCLockIntegration, StateMachineLockExpiredHLCMode) {
   // Acquired at a far-past timestamp — should be expired with short duration
   lock.lock_acquired_at = {1000, 0, 0, "test"};
 
-  // Even with generous duration, acquired_at is decades in the past
-  bool expired = state_machine_lock_expired(state, &lock, 0);
+  // R8-T-1: expiry uses the authenticated now_ms (not the system clock). Pass a
+  // realistic "now" (2023-11-14) so the 1970 acquisition is long expired.
+  bool expired = state_machine_lock_expired(state, &lock, 1700000000000ULL);
   EXPECT_TRUE(expired);
 
   state_destroy(state);
@@ -1501,4 +1515,126 @@ TEST(HLCTestVectors, TV12_8_RejectExtremeLogicalCounter) {
   // The local counter must NOT have been pushed to UINT64_MAX by the rejected
   // receives.
   EXPECT_LT(state.last.logical_counter, UINT64_MAX / 2);
+}
+// ============================================================
+// HLC Replay Protection (R7-11 + v1.6 Amd6)
+//
+// Ops signed with HLC ordering carry lamport_time 0, so the replay guard
+// must compare HLC-ordered ops by their HLC against the signer's last
+// logged HLC — not by lamport_time (which would reject every op after a
+// signer's first, as seen through the WASM bindings).
+// ============================================================
+
+extern "C" {
+#include "test_helpers.h"
+#include "../src/Util/allocator.h"
+}
+
+// Signs an HLC-ordered op with lamport_time left at 0, mirroring the
+// production WASM signing path (key version stamped, no lamport stamp).
+static void sign_hlc_op(crabs_test_env_t* env, operation_t* op) {
+  state_t* state = env->state;
+  user_t* signer = attribute_machine_find_user(state->attr_machine, op->signer_id);
+  op->signer_key_version = signer->key_version;
+  serialized_buffer_t* ser = crabs_serialize_for_signing(op);
+  crypto_ecdsa_sign(env->admin_key->private_key, ser->data, ser->len, op->signature);
+  serialized_buffer_destroy(ser);
+}
+
+static operation_t* make_hlc_lock_op(crabs_test_env_t* env, const char* resource) {
+  state_t* state = env->state;
+  operation_t* op = operation_create(CRABS_OP_LOCK);
+  op->resources = (char(*)[CRABS_MAX_USER_ID])get_clear_memory(sizeof(char[CRABS_MAX_USER_ID]));
+  strncpy(op->resources[0], resource, CRABS_MAX_USER_ID - 1);
+  op->resource_count = 1;
+  op->required_state = (protocol_state_e*)get_clear_memory(sizeof(protocol_state_e));
+  op->required_state[0] = PROTOCOL_IDLE;
+  op->next_state = (protocol_state_e*)get_clear_memory(sizeof(protocol_state_e));
+  op->next_state[0] = PROTOCOL_LOCKED;
+  strncpy(op->signer_id, "admin", CRABS_MAX_USER_ID - 1);
+
+  // Stamp HLC ordering from the node's HLC state (as crabs_wasm_sign_operation does).
+  op->ordering_system = CRABS_ORDERING_HLC;
+  op->hlc = crabs_hlc_next(&state->hlc_state);
+  strncpy(op->node_id, state->hlc_state.last.node_id, CRABS_MAX_USER_ID - 1);
+
+  // Sign WITHOUT the test helper's lamport stamping: production WASM ops
+  // carry lamport_time 0, and this test must reproduce exactly that.
+  sign_hlc_op(env, op);
+  return op;
+}
+
+TEST(HLCReplay, SecondHlcOpBySameSignerAccepted) {
+  crabs_test_env_t env;
+  crabs_test_env_init(&env);
+  state_t* state = env.state;
+
+  // Put the node on HLC ordering with a mock clock (fresh, so ops differ).
+  g_mock_time.seconds = 1000000;
+  g_mock_time.nanos = 0;
+  g_mock_time.valid = true;
+  crabs_ordering_config_t* ordering_config =
+      (crabs_ordering_config_t*)get_clear_memory(sizeof(crabs_ordering_config_t));
+  crabs_ordering_config_init_hlc(ordering_config, HLC_STRATEGY_BOUNDED);
+  state_set_ordering_config(state, ordering_config);
+  crabs_hlc_state_init(&state->hlc_state, "admin");
+  state->hlc_state.time_source_ops = &g_mock_ops;
+  state->hlc_state_initialized = true;
+
+  data_item_t* first = data_item_create("res1", DATA_TYPE_RESOURCE, CRDT_PN_COUNTER);
+  state_add_item(state, first);
+  data_item_t* second = data_item_create("res2", DATA_TYPE_RESOURCE, CRDT_PN_COUNTER);
+  state_add_item(state, second);
+
+  operation_t* first_op = make_hlc_lock_op(&env, "res1");
+  EXPECT_EQ(state_machine_execute(state, first_op), CRABS_SUCCESS);
+
+  // A second, different op from the same signer with a newer HLC must be
+  // accepted — it carries lamport_time 0, which the old lamport-only check
+  // misread as a replay.
+  operation_t* second_op = make_hlc_lock_op(&env, "res2");
+  EXPECT_EQ(state_machine_execute(state, second_op), CRABS_SUCCESS);
+
+  operation_destroy(first_op);
+  operation_destroy(second_op);
+  crabs_test_env_destroy(&env);
+}
+
+TEST(HLCReplay, ReplayedHlcOpRejected) {
+  crabs_test_env_t env;
+  crabs_test_env_init(&env);
+  state_t* state = env.state;
+
+  g_mock_time.seconds = 1000000;
+  g_mock_time.nanos = 0;
+  g_mock_time.valid = true;
+  crabs_ordering_config_t* ordering_config =
+      (crabs_ordering_config_t*)get_clear_memory(sizeof(crabs_ordering_config_t));
+  crabs_ordering_config_init_hlc(ordering_config, HLC_STRATEGY_BOUNDED);
+  state_set_ordering_config(state, ordering_config);
+  crabs_hlc_state_init(&state->hlc_state, "admin");
+  state->hlc_state.time_source_ops = &g_mock_ops;
+  state->hlc_state_initialized = true;
+
+  data_item_t* resource = data_item_create("res1", DATA_TYPE_RESOURCE, CRDT_PN_COUNTER);
+  state_add_item(state, resource);
+
+  operation_t* op = make_hlc_lock_op(&env, "res1");
+  EXPECT_EQ(state_machine_execute(state, op), CRABS_SUCCESS);
+
+  // Restore the pre-execute protocol state so the replay reaches the
+  // ordering check rather than failing on a transition violation, and give
+  // it a fresh UUID (re-signed, since the uuid is covered by the signature)
+  // so only the HLC can identify it as a replay.
+  resource->protocol_state = PROTOCOL_IDLE;
+  resource->lock_state.lock_token_valid = false;
+  for (uint32_t uuid_index = 0; uuid_index < CRABS_UUID_SIZE; uuid_index++) {
+    op->uuid[uuid_index] = (uint8_t)(uuid_index + 200);
+  }
+  sign_hlc_op(&env, op);
+
+  EXPECT_EQ(state_machine_execute(state, op), CRABS_ERR_ALREADY_EXECUTED);
+
+  operation_destroy(op);
+  crabs_test_env_destroy(&env);
 }

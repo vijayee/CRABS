@@ -248,14 +248,17 @@ bool state_machine_lock_expired(state_t* state, const lock_state_t* lock, uint64
 
   crabs_ordering_config_t* config = state_get_ordering_config(state);
   if (config != NULL && config->ordering_system == CRABS_ORDERING_HLC) {
-    // HLC-based expiry: compare physical time against acquired_at + duration
-    crabs_physical_time_t now = crabs_hlc_get_system_time(NULL);
-    if (!now.valid) return now_ms >= lock->lock_expiry;
+    // R8-T-1: use the authenticated now_ms passed in, NOT the unauthenticated
+    // system clock. The prior code called crabs_hlc_get_system_time(NULL),
+    // letting a browser attacker (WASM Date.now is page-overridable) freeze
+    // lock expiry. now_ms is milliseconds since epoch; convert to s/ns.
+    uint64_t now_seconds = now_ms / 1000;
+    uint64_t now_nanos = (now_ms % 1000) * 1000000;
     uint64_t total_duration_ms = state->config.max_lock_duration_ms +
       (uint64_t)lock->lock_extensions * state->config.max_lock_duration_ms;
     crabs_hlc_t expiry = crabs_hlc_add_duration(lock->lock_acquired_at, total_duration_ms);
-    return (now.seconds > expiry.physical_seconds) ||
-           (now.seconds == expiry.physical_seconds && now.nanos > expiry.physical_nanos);
+    return (now_seconds > expiry.physical_seconds) ||
+           (now_seconds == expiry.physical_seconds && now_nanos > expiry.physical_nanos);
   }
 
   // Fallback: wall-clock millisecond comparison
@@ -321,18 +324,32 @@ static void _compute_log_chain_hash(state_t* state, log_entry_t* entry) {
   EVP_MD_CTX_free(ctx);
 }
 
-static void append_log(state_t* state, const uint8_t uuid[CRABS_UUID_SIZE],
+// R8-S-4: returns false on realloc failure so the caller can fail the op
+// instead of silently continuing (which would leave a gap in the audit chain
+// and skip the R7-11 lamport backstop entry).
+static bool append_log(state_t* state, const uint8_t uuid[CRABS_UUID_SIZE],
                        const char* type, const char* signer_id,
                        uint64_t lamport_time, const char* node_id,
+                       crabs_ordering_system_e ordering_system,
+                       const crabs_hlc_t* hlc,
                        const uint8_t state_hash[CRABS_HASH_SIZE]) {
   (void)state_hash; // the chain hash is computed below; the caller's value is ignored
   uint64_t new_count = state->log_count + 1;
   log_entry_t* new_log = realloc(state->log, new_count * sizeof(log_entry_t));
-  if (new_log == NULL) return;
+  if (new_log == NULL) return false;
   state->log = new_log;
   state->log_count = new_count;
   log_entry_t* entry = &state->log[state->log_count - 1];
   entry->version = state->version;
+  // v1.6 Amd6: record the ordering system and HLC so the R7-11 replay
+  // backstop can compare HLC-ordered ops by HLC. Zero the HLC for lamport
+  // ops so log entries never carry uninitialized bytes.
+  entry->ordering_system = ordering_system;
+  if (ordering_system == CRABS_ORDERING_HLC && hlc != NULL) {
+    entry->hlc = *hlc;
+  } else {
+    memset(&entry->hlc, 0, sizeof(entry->hlc));
+  }
   memcpy(entry->uuid, uuid, CRABS_UUID_SIZE);
   entry->type[0] = '\0';
   strncat(entry->type, type, CRABS_MAX_OP_NAME - 1);
@@ -342,6 +359,7 @@ static void append_log(state_t* state, const uint8_t uuid[CRABS_UUID_SIZE],
   entry->node_id[0] = '\0';
   strncat(entry->node_id, node_id, CRABS_MAX_USER_ID - 1);
   _compute_log_chain_hash(state, entry);
+  return true;
 }
 
 // ============================================================
@@ -415,19 +433,19 @@ static bool state_get_time_ms(const state_t* state, uint64_t* now_ms) {
   return true;
 }
 
-// R7-11: the last lamport_time logged for a signer. Returns false if the
-// signer has no logged ops (so a first op is never rejected for carrying
-// lamport_time 0). Scans the log from the most recent entry (a signer's
-// latest op is near the tail). Used to enforce Lamport monotonicity so a
-// replayed op — which carries the same lamport_time as the original — is
-// rejected even after a restart, when the in-memory tx_manager has been reset.
-static bool state_last_lamport_for_signer(const state_t* state, const char* signer_id,
-                                          uint64_t* out) {
+// R7-11: the most recent log entry for a signer. Returns false if the
+// signer has no logged ops (so a first op is never rejected). Scans the log
+// from the tail (a signer's latest op is near the end). Used to enforce
+// ordering monotonicity so a replayed op — which carries the same ordering
+// timestamp as the original — is rejected even after a restart, when the
+// in-memory tx_manager has been reset.
+static bool state_last_log_entry_for_signer(const state_t* state, const char* signer_id,
+                                            const log_entry_t** out) {
   if (state == NULL || signer_id == NULL || out == NULL) return false;
-  for (uint64_t i = state->log_count; i > 0; i--) {
-    const log_entry_t* entry = &state->log[i - 1];
+  for (uint64_t entry_index = state->log_count; entry_index > 0; entry_index--) {
+    const log_entry_t* entry = &state->log[entry_index - 1];
     if (strcmp(entry->signer_id, signer_id) == 0) {
-      *out = entry->lamport_time;
+      *out = entry;
       return true;
     }
   }
@@ -531,15 +549,30 @@ crabs_error_e state_machine_execute(state_t* state, operation_t* op) {
     }
   }
 
-  // Step 3c: Lamport monotonicity (R7-11). A replayed op carries the same
-  // lamport_time as the original, so require strictly greater than the last
-  // logged time for this signer. This survives restarts when the log is
-  // durable, closing the cross-session replay gap for plain (non-dedup) ops
-  // that the in-memory tx_manager cannot cover after a reset.
-  uint64_t last_lamport = 0;
-  if (state_last_lamport_for_signer(state, op->signer_id, &last_lamport) &&
-      op->lamport_time <= last_lamport) {
-    return CRABS_ERR_ALREADY_EXECUTED;
+  // Step 3c: Ordering monotonicity (R7-11 + v1.6 Amd6). A replayed op
+  // carries the same ordering timestamp as the original, so require the op
+  // to be strictly newer than the signer's last logged op. HLC-ordered ops
+  // are compared by HLC (they may legitimately carry lamport_time 0);
+  // lamport-ordered ops by lamport_time. Cross-system: lamport ops sort
+  // before HLC ops, so an HLC op is always newer than a lamport-logged one.
+  // This survives restarts when the log is durable, closing the
+  // cross-session replay gap for plain (non-dedup) ops that the in-memory
+  // tx_manager cannot cover after a reset.
+  const log_entry_t* last_signer_entry = NULL;
+  if (state_last_log_entry_for_signer(state, op->signer_id, &last_signer_entry)) {
+    bool is_replay = false;
+    if (op->ordering_system == CRABS_ORDERING_HLC) {
+      if (last_signer_entry->ordering_system == CRABS_ORDERING_HLC) {
+        is_replay = crabs_hlc_compare(&op->hlc, &last_signer_entry->hlc) <= 0;
+      }
+      // Last entry was lamport-ordered: any HLC op is newer by the
+      // cross-system ordering rule (lamport sorts before HLC).
+    } else {
+      is_replay = op->lamport_time <= last_signer_entry->lamport_time;
+    }
+    if (is_replay) {
+      return CRABS_ERR_ALREADY_EXECUTED;
+    }
   }
 
   // Step 4: Verify protocol state transitions
@@ -579,6 +612,15 @@ crabs_error_e state_machine_execute(state_t* state, operation_t* op) {
   const dedup_spec_t* effective_dedup = registered_dedup ? registered_dedup : &op->dedup;
   if (effective_dedup->type != DEDUP_NONE) {
     crabs_error_e dedup_result = dedup_check_guard_spec(state, effective_dedup, op);
+    if (dedup_result != CRABS_SUCCESS) {
+      return dedup_result;
+    }
+    // R8-S-3: validate the mutation BEFORE the handler runs. The mutation is
+    // applied after the handler (R7-13, so a failing op does not burn its
+    // dedup slot); validating first ensures a mutation that would fail is
+    // rejected before the handler's effects are applied, avoiding partial
+    // application.
+    dedup_result = dedup_validate_mutation_spec(state, effective_dedup, op);
     if (dedup_result != CRABS_SUCCESS) {
       return dedup_result;
     }
@@ -776,8 +818,14 @@ crabs_error_e state_machine_execute(state_t* state, operation_t* op) {
   // Step 9: Transition protocol states and log operation
   uint8_t state_hash[CRABS_HASH_SIZE];
   memset(state_hash, 0, CRABS_HASH_SIZE);
-  append_log(state, op->uuid, op->type, op->signer_id,
-             op->lamport_time, op->node_id, state_hash);
+  // R8-S-4: a failed append_log must fail the op BEFORE version++ and the
+  // tx_manager commit, so the audit chain and the R7-11 lamport backstop stay
+  // consistent (no gap, no missing entry).
+  if (!append_log(state, op->uuid, op->type, op->signer_id,
+                  op->lamport_time, op->node_id, op->ordering_system, &op->hlc,
+                  state_hash)) {
+    return CRABS_ERR_OOM;
+  }
   state->version++;
 
   // Step 8c: Commit to transaction manager (replay protection).
@@ -918,6 +966,13 @@ crabs_error_e state_machine_op_extend(state_t* state, operation_t* op) {
     data_item_t* item = state_find_item(state, op->resources[i]);
     if (item == NULL) return CRABS_ERR_RESOURCE_NOT_FOUND;
     if (item->protocol_state != PROTOCOL_LOCKED) return CRABS_ERR_PROTOCOL_VIOLATION;
+    // R8-S-1: only the lock owner may extend. The Step-5 lock-claim check only
+    // runs when the op carries claims; an op without claims must still be
+    // rejected if the signer is not the owner.
+    if (!item->lock_state.lock_token_valid ||
+        strcmp(item->lock_state.lock_owner, op->signer_id) != 0) {
+      return CRABS_ERR_LOCK_OWNER_MISMATCH;
+    }
     if (item->lock_state.lock_extensions >= state->config.max_lock_extensions) {
       return CRABS_ERR_MAX_EXTENSIONS_REACHED;
     }
@@ -963,6 +1018,13 @@ crabs_error_e state_machine_op_rollback(state_t* state, operation_t* op) {
         item->protocol_state != PROTOCOL_ERROR) {
       return CRABS_ERR_PROTOCOL_VIOLATION;
     }
+    // R8-S-1: only the lock owner may roll back. The Step-5 lock-claim check
+    // only runs when the op carries claims; an op without claims must still be
+    // rejected if the signer is not the owner.
+    if (!item->lock_state.lock_token_valid ||
+        strcmp(item->lock_state.lock_owner, op->signer_id) != 0) {
+      return CRABS_ERR_LOCK_OWNER_MISMATCH;
+    }
     if (item->lock_state.pre_lock_snapshot != NULL && item->value != NULL) {
       size_t value_size = 0;
       if (item->type == DATA_TYPE_COUNTER || item->type == DATA_TYPE_PN_COUNTER ||
@@ -987,6 +1049,13 @@ crabs_error_e state_machine_op_unlock(state_t* state, operation_t* op) {
     data_item_t* item = state_find_item(state, op->resources[i]);
     if (item == NULL) return CRABS_ERR_RESOURCE_NOT_FOUND;
     if (item->protocol_state != PROTOCOL_VERIFIED) return CRABS_ERR_PROTOCOL_VIOLATION;
+    // R8-S-1: only the lock owner may unlock. The Step-5 lock-claim check only
+    // runs when the op carries claims; an op without claims must still be
+    // rejected if the signer is not the owner.
+    if (!item->lock_state.lock_token_valid ||
+        strcmp(item->lock_state.lock_owner, op->signer_id) != 0) {
+      return CRABS_ERR_LOCK_OWNER_MISMATCH;
+    }
     item->protocol_state = PROTOCOL_IDLE;
     item->lock_state.lock_token_valid = false;
     memset(item->lock_state.lock_owner, 0, CRABS_MAX_USER_ID);
@@ -1065,7 +1134,24 @@ crabs_error_e state_machine_op_change_config(state_t* state, operation_t* op) {
   payload_buf[copy_len] = '\0';
   char* payload_str = payload_buf;
 
+  // R8-S-2: validate every pair BEFORE applying any, so a later failing pair
+  // cannot leave earlier pairs applied (partial config mutation). The prior
+  // code applied pairs incrementally and returned on the first failure, so an
+  // authorized user could set max_lock_duration_ms=1 then trigger a failure,
+  // permanently shortening all lock durations.
   char* v;
+  if ((v = _config_value_after(payload_str, "allow_force_unlock")) != NULL) {
+    bool requested = (strcmp(v, "true") == 0);
+    if (!requested && state->config.allow_force_unlock) {
+      return CRABS_ERR_UNAUTHORIZED;
+    }
+  }
+  if ((v = _config_value_after(payload_str, "co_sign_threshold")) != NULL) {
+    uint32_t val = (uint32_t)atol(v);
+    if (val == 0) return CRABS_ERR_UNAUTHORIZED;
+  }
+
+  // Apply pass — cannot fail after the validation pass above.
   if ((v = _config_value_after(payload_str, "max_lock_duration_ms")) != NULL) {
     uint64_t val = (uint64_t)atoll(v);
     // Audit M-B: clamp to a sane ceiling so the expiry arithmetic cannot wrap.
