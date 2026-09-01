@@ -14,3 +14,5 @@ cmake-build-debug
 *.fdb_latexmk
 *.fls
 *.synctex.gz
+.superpowers/
+Testing/

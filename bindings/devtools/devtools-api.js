@@ -34,7 +34,11 @@ function createDevtoolsController(node, options) {
       try {
         batch = JSON.parse(text || '[]');
       } catch (parseError) {
+        // The C ring is already drained at this point, so the malformed
+        // batch is unrecoverable — warn rather than silently dropping it.
         batch = [];
+        console.warn('crabs-devtools: dropped malformed event batch:',
+                     parseError.message);
       }
       if (batch.length > 0) {
         controller.events.push(...batch);
