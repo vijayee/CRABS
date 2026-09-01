@@ -102,7 +102,7 @@ TEST(DevtoolsEvents, RingWraparoundDropsOldest) {
   std::string marker_text = marker_json;
   devtools_string_destroy(marker_json);
 
-  size_t marker_seq_position = marker_text.find("\"seq\":");
+  size_t marker_seq_position = marker_text.rfind("\"seq\":");
   ASSERT_NE(marker_seq_position, std::string::npos);
   uint64_t marker_seq = strtoull(marker_text.c_str() + marker_seq_position + strlen("\"seq\":"), nullptr, 10);
 
