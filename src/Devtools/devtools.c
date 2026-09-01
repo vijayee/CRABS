@@ -325,12 +325,21 @@ static void _write_item_value_json(json_writer_t* writer, const data_item_t* ite
     case CRDT_LWW_REG: {
       const lww_register_t* reg = (const lww_register_t*)item->value;
       _json_writer_raw(writer, "{\"value\":");
-      if (reg->value && reg->value_size >= sizeof(int64_t)) {
+      if (reg->value && reg->value_size == sizeof(int64_t)) {
+        // Exactly-8-byte payloads follow the app's int64 register convention
+        // (crabs_wasm_set_register always stores sizeof(int64_t)).
         int64_t register_value;
         memcpy(&register_value, reg->value, sizeof(int64_t));
         _json_writer_int(writer, register_value);
       } else {
-        _json_writer_raw(writer, "null");
+        // Opaque payloads are typically ABE ciphertext (the app encrypted
+        // the value before storing it). The ABE policy is not recoverable
+        // from raw bytes, so report the size instead. Never render the
+        // bytes themselves — they must not leak into the panel.
+        char opaque_marker[64];
+        snprintf(opaque_marker, sizeof(opaque_marker),
+                 "[encrypted: %u bytes]", reg->value_size);
+        _json_writer_string(writer, opaque_marker);
       }
       _json_writer_raw(writer, ",\"timestamp\":");
       _json_writer_uint(writer, reg->timestamp);

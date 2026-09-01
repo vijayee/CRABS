@@ -221,6 +221,14 @@ TEST(DevtoolsSnapshot, AllValueTypes) {
   reg->value = lww_register_create((const uint8_t*)"x", 1, 5, "alice");
   state_add_item(state, reg);
 
+  // Exactly-8-byte payloads follow the int64 register convention and must
+  // keep rendering as numbers (not as the opaque marker).
+  data_item_t* int64_reg = data_item_create("score", DATA_TYPE_REGISTER, CRDT_LWW_REG);
+  const int64_t score_value = -42;
+  int64_reg->value = lww_register_create((const uint8_t*)&score_value,
+                                         sizeof(score_value), 7, "bob");
+  state_add_item(state, int64_reg);
+
   data_item_t* one_shot_item = data_item_create("flaggers", DATA_TYPE_ONE_SHOT_SET, CRDT_ONE_SHOT_SET);
   one_shot_set_t* one_shot = one_shot_set_create();
   one_shot_set_add(one_shot, "dave");
@@ -245,6 +253,8 @@ TEST(DevtoolsSnapshot, AllValueTypes) {
   EXPECT_TRUE(contains(text, "\"bob\":3"));
   EXPECT_TRUE(contains(text, "\"value\":-2"));
   EXPECT_TRUE(contains(text, "\"elements\":[\"carol\"]"));
+  EXPECT_TRUE(contains(text, "[encrypted: 1 bytes]"));
+  EXPECT_TRUE(contains(text, "\"value\":-42"));
   EXPECT_TRUE(contains(text, "\"timestamp\":5"));
   EXPECT_TRUE(contains(text, "\"set_by\":\"alice\""));
   EXPECT_TRUE(contains(text, "\"set_at\":42"));
