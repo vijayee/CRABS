@@ -57,12 +57,19 @@ if (BUILD_TESTING)
         test_time_source.cpp
         test_handler_registry.cpp
         test_tx_manager.cpp
+        test_devtools.cpp
     )
 
     add_dependencies(testcrabs crabs)
     target_link_libraries(testcrabs PRIVATE crabs)
     target_link_libraries(testcrabs PRIVATE GTest::gtest_main)
     target_link_libraries(testcrabs PRIVATE GTest::gmock)
+
+    set_source_files_properties(
+        ${CMAKE_SOURCE_DIR}/src/Devtools/devtools.c
+        PROPERTIES COMPILE_DEFINITIONS CRABS_ENABLE_DEVTOOLS
+    )
+    target_sources(testcrabs PRIVATE ${CMAKE_SOURCE_DIR}/src/Devtools/devtools.c)
 
     include(GoogleTest)
     # The test suite now uses real CP-ABE (Waters'09 pairing operations)
