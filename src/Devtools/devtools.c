@@ -118,6 +118,12 @@ static void _json_writer_uint(json_writer_t* writer, uint64_t value) {
   _json_writer_raw(writer, scratch);
 }
 
+static void _json_writer_int(json_writer_t* writer, int64_t value) {
+  char scratch[24];
+  snprintf(scratch, sizeof(scratch), "%lld", (long long)value);
+  _json_writer_raw(writer, scratch);
+}
+
 static void _json_writer_string(json_writer_t* writer, const char* text) {
   _json_writer_raw(writer, "\"");
   for (const char* cursor = text ? text : ""; *cursor; cursor++) {
@@ -285,7 +291,7 @@ static void _write_item_value_json(json_writer_t* writer, const data_item_t* ite
       _json_writer_raw(writer, ",\"neg\":");
       _write_g_counter_json(writer, &counter->neg);
       _json_writer_raw(writer, ",\"value\":");
-      _json_writer_uint(writer, (uint64_t)pn_counter_value(counter));
+      _json_writer_int(writer, pn_counter_value(counter));
       _json_writer_raw(writer, "}");
       break;
     }
@@ -322,7 +328,7 @@ static void _write_item_value_json(json_writer_t* writer, const data_item_t* ite
       if (reg->value && reg->value_size >= sizeof(int64_t)) {
         int64_t register_value;
         memcpy(&register_value, reg->value, sizeof(int64_t));
-        _json_writer_uint(writer, (uint64_t)register_value);
+        _json_writer_int(writer, register_value);
       } else {
         _json_writer_raw(writer, "null");
       }
@@ -372,7 +378,7 @@ static void _write_invariants_json(json_writer_t* writer, const data_item_t* ite
     _json_writer_raw(writer, "{\"type\":");
     _json_writer_uint(writer, (uint64_t)invariant->type);
     _json_writer_raw(writer, ",\"param\":");
-    _json_writer_uint(writer, (uint64_t)invariant->param);
+    _json_writer_int(writer, invariant->param);
     _json_writer_raw(writer, ",\"message\":");
     _json_writer_string(writer, invariant->error_message);
     _json_writer_raw(writer, "}");

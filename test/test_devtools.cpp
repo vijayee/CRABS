@@ -92,6 +92,20 @@ TEST(DevtoolsEvents, RejectedOperationRecordsError) {
 
 TEST(DevtoolsEvents, RingWraparoundDropsOldest) {
   state_t* state = make_state_with_g_counter();
+
+  operation_t* marker_op = make_operation("increment", "alice");
+  devtools_record_event(state, marker_op, CRABS_SUCCESS);
+  operation_destroy(marker_op);
+
+  char* marker_json = devtools_events_json();
+  ASSERT_NE(marker_json, nullptr);
+  std::string marker_text = marker_json;
+  devtools_string_destroy(marker_json);
+
+  size_t marker_seq_position = marker_text.find("\"seq\":");
+  ASSERT_NE(marker_seq_position, std::string::npos);
+  uint64_t marker_seq = strtoull(marker_text.c_str() + marker_seq_position + strlen("\"seq\":"), nullptr, 10);
+
   for (uint32_t op_index = 0; op_index < CRABS_DEVTOOLS_RING_SIZE + 5; op_index++) {
     operation_t* op = make_operation("increment", "alice");
     devtools_record_event(state, op, CRABS_SUCCESS);
@@ -112,7 +126,7 @@ TEST(DevtoolsEvents, RingWraparoundDropsOldest) {
     search_position += strlen("\"seq\":");
   }
   EXPECT_EQ(object_count, (uint32_t)CRABS_DEVTOOLS_RING_SIZE);
-  EXPECT_EQ(minimum_seq, 6u);
+  EXPECT_EQ(minimum_seq, marker_seq + 6u);
 }
 
 TEST(DevtoolsEvents, NullOperationIsIgnored) {
@@ -185,13 +199,17 @@ TEST(DevtoolsSnapshot, ItemsAndGCounterValue) {
   EXPECT_TRUE(contains(text, "\"alice\":12"));
 }
 
+TEST(DevtoolsSnapshot, NullStateReturnsNull) {
+  EXPECT_EQ(devtools_snapshot_json(nullptr), nullptr);
+}
+
 TEST(DevtoolsSnapshot, AllValueTypes) {
   state_t* state = state_create();
 
   data_item_t* pn = data_item_create("likes", DATA_TYPE_PN_COUNTER, CRDT_PN_COUNTER);
   pn->value = pn_counter_create();
-  pn_counter_increment((pn_counter_t*)pn->value, "bob", 5);
-  pn_counter_decrement((pn_counter_t*)pn->value, "bob", 2);
+  pn_counter_increment((pn_counter_t*)pn->value, "bob", 3);
+  pn_counter_decrement((pn_counter_t*)pn->value, "bob", 5);
   state_add_item(state, pn);
 
   data_item_t* set = data_item_create("subscribers", DATA_TYPE_SET, CRDT_OR_SET);
@@ -224,7 +242,8 @@ TEST(DevtoolsSnapshot, AllValueTypes) {
 
   EXPECT_TRUE(contains(text, "\"pos\":{"));
   EXPECT_TRUE(contains(text, "\"neg\":{"));
-  EXPECT_TRUE(contains(text, "\"bob\":5"));
+  EXPECT_TRUE(contains(text, "\"bob\":3"));
+  EXPECT_TRUE(contains(text, "\"value\":-2"));
   EXPECT_TRUE(contains(text, "\"elements\":[\"carol\"]"));
   EXPECT_TRUE(contains(text, "\"timestamp\":5"));
   EXPECT_TRUE(contains(text, "\"set_by\":\"alice\""));
