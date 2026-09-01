@@ -81,12 +81,6 @@
 
   const ORDERED_STATES = ['idle', 'locked', 'modified', 'verified'];
 
-  function escapeHtml(text) {
-    return String(text == null ? '' : text)
-      .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
-      .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
-  }
-
   class CrabsDevtools extends HTMLElement {
     constructor() {
       super();
@@ -205,13 +199,16 @@
           }
           const itemEvents = this.data.allEvents.filter(
             (event) => event.target === item.name);
+          const fsmHistory = document.createElement('div');
+          fsmHistory.className = 'fsm-history';
           for (const event of itemEvents.slice(-5).reverse()) {
             const line = document.createElement('div');
             line.className = 'muted';
             line.textContent = event.op_type + ' ' +
               (event.transition ? '(' + event.transition + ')' : '');
-            fsm.appendChild(line);
+            fsmHistory.appendChild(line);
           }
+          fsm.after(fsmHistory);
         }
         card.addEventListener('click', () => {
           this.selectedItem = this.selectedItem === item.name ? null : item.name;
@@ -229,8 +226,16 @@
       filter.placeholder = 'filter: type, signer, item…';
       filter.value = this.filterText;
       filter.addEventListener('input', () => {
+        // Filter the existing rows in place: a full re-render would rebuild
+        // the body and destroy the input (losing focus and open details).
         this.filterText = filter.value;
-        this.render();
+        const needle = this.filterText.toLowerCase();
+        for (const row of timelineRows) {
+          const event = row._event;
+          const haystack = (event.op_type + ' ' + event.signer + ' ' +
+            event.target + ' ' + event.node).toLowerCase();
+          row.style.display = haystack.includes(needle) ? '' : 'none';
+        }
       });
       toolbar.appendChild(filter);
       body.appendChild(toolbar);
@@ -241,8 +246,10 @@
         return (event.op_type + ' ' + event.signer + ' ' + event.target + ' ' + event.node)
           .toLowerCase().includes(needle);
       });
+      const timelineRows = [];
       for (const event of events.slice().reverse().slice(0, 200)) {
         const row = document.createElement('div');
+        row._event = event;
         row.className = 'row ' + (event.result === 'accepted' ? 'accept' : 'reject');
         const left = document.createElement('span');
         left.textContent = event.signer + ' · ' + event.op_type +
@@ -251,9 +258,10 @@
         right.className = event.result === 'accepted' ? 'ok' : 'bad';
         right.textContent = event.result === 'accepted'
           ? '✓' + (event.transition ? ' ' + event.transition : '')
-          : '✗ ' + event.error;
+          : '✗ ' + (event.error || '');
         row.appendChild(left);
         row.appendChild(right);
+        timelineRows.push(row);
         row.addEventListener('click', () => {
           const existing = row.nextSibling;
           if (existing && existing.className === 'detail') { existing.remove(); return; }
@@ -351,9 +359,18 @@
   }
 
   function attach(node, options = {}) {
-    const createDevtoolsController = window.CRABSDevtoolsApi
-      ? window.CRABSDevtoolsApi.createDevtoolsController
-      : require('./devtools-api.js').createDevtoolsController;
+    let createDevtoolsController;
+    if (window.CRABSDevtoolsApi) {
+      createDevtoolsController = window.CRABSDevtoolsApi.createDevtoolsController;
+    } else if (typeof require === 'function') {
+      createDevtoolsController =
+        require('./devtools-api.js').createDevtoolsController;
+    }
+    if (!createDevtoolsController) {
+      throw new Error(
+        'crabs-devtools: load devtools-api.js before crabs-devtools.js ' +
+        '(window.CRABSDevtoolsApi missing)');
+    }
     const controller = createDevtoolsController(node, options);
     const panel = document.createElement('crabs-devtools');
     controller.onUpdate((data) => panel.update({
