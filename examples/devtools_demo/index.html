@@ -30,13 +30,13 @@
   <div class="nodes">
     <div class="node-col">
       <h2>Alice's node</h2>
-      <div class="hint">The replay guard accepts only each signer's first operation per node; later ops appear in the timeline as already_executed rejections. Dislike has no policy, so it is always rejected.</div>
+      <div class="hint">Ops are HLC-ordered, so every operation from a signer is accepted in sequence. Dislike has no policy, so it is always rejected — rejections show up in the timeline too.</div>
       <div class="op-grid" id="alice-ops"></div>
       <div id="alice-panel"></div>
     </div>
     <div class="node-col">
       <h2>Bob's node</h2>
-      <div class="hint">The replay guard accepts only each signer's first operation per node; later ops appear in the timeline as already_executed rejections. Dislike has no policy, so it is always rejected.</div>
+      <div class="hint">Ops are HLC-ordered, so every operation from a signer is accepted in sequence. Dislike has no policy, so it is always rejected — rejections show up in the timeline too.</div>
       <div class="op-grid" id="bob-ops"></div>
       <div id="bob-panel"></div>
     </div>

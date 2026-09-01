@@ -78,6 +78,35 @@ The API mirrors `crabs-node` (the N-API bindings). See `../node/index.d.ts` for 
 | ABE keygen | ~2-5 seconds | ~5-15 seconds |
 | Binary size | Links against system libs | 1.7MB self-contained `.wasm` |
 
+## Devtools build
+
+`build_wasm.sh` produces two artifacts:
+
+- `crabs.js` + `crabs.wasm` — production. No devtools code.
+- `crabs.dev.js` + `crabs.dev.wasm` — devtools-enabled (`CRABS_ENABLE_DEVTOOLS`).
+
+To inspect CRABS state machines in the browser:
+
+```js
+const { Node } = require('crabs-wasm/dev');   // dev build
+const { attach } = require('crabs-devtools'); // bindings/devtools
+
+const node = await Node.create('admin');
+attach(node, { nodeId: 'admin' });            // appends <crabs-devtools> to <body>
+```
+
+The panel has four tabs — **States** (per-item protocol state), **Timeline**
+(live operation stream with accept/reject reasons), **CRDT** (current
+replicated values), and **Config** (policies, triggers, users, audit-log head).
+
+Importing `crabs-wasm/dev` and attaching to a production module throws
+"not compiled with devtools support" — the devtools snapshot exposes
+plaintext CRDT values, users, and key metadata, so it is only available in
+the dev artifact.
+
+See `examples/devtools_demo/` for a working two-node demo (open the page in
+two tabs to watch operations replicate between peers over BroadcastChannel).
+
 ## License
 
 MIT
