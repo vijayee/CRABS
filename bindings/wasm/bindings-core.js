@@ -402,6 +402,19 @@ class Node {
     wrapRc(rc, 'setRegister');
   }
 
+  // Stores raw bytes (e.g. ABE ciphertext) in an lww_register. setRegister
+  // only accepts an int64, which would force payloads into the 8-byte-int
+  // convention; this keeps opaque payloads byte-exact.
+  setRegisterBytes(name, bytes, nodeId = 'system') {
+    const M = this._M;
+    const nPtr = writeString(M, name);
+    const { ptr: dPtr, len: dLen } = writeBytes(M, bytes || new Uint8Array(0));
+    const idPtr = writeString(M, nodeId);
+    const rc = M._crabs_wasm_set_register_bytes(this._am, nPtr, dPtr, dLen, idPtr);
+    freeAll(M, nPtr, dPtr, idPtr);
+    wrapRc(rc, 'setRegisterBytes');
+  }
+
   setContains(name, element) {
     const M = this._M;
     const nPtr = writeString(M, name);

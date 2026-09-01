@@ -100,6 +100,7 @@ export interface Node {
   getPNCounter(name: string): number;
   getRegister(name: string): number;
   setRegister(name: string, value: number, nodeId?: string): void;
+  setRegisterBytes(name: string, bytes: Uint8Array, nodeId?: string): void;
   setContains(name: string, element: string): boolean;
 
   incrementCounter(name: string, delta?: number, nodeId?: string): void;

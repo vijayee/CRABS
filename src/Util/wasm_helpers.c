@@ -344,6 +344,31 @@ crabs_error_e crabs_wasm_set_register(attribute_machine_t* am, const char* name,
 }
 
 EMSCRIPTEN_KEEPALIVE
+crabs_error_e crabs_wasm_set_register_bytes(attribute_machine_t* am, const char* name,
+                                            const uint8_t* data, uint32_t len,
+                                            const char* node_id) {
+  if (len > 0 && !data) return CRABS_ERR_INTERNAL;
+  data_item_t* item = state_find_item(&am->base_state, name);
+  if (!item || item->crdt_type != CRDT_LWW_REG) return CRABS_ERR_RESOURCE_NOT_FOUND;
+  lww_register_t* reg = (lww_register_t*)item->value;
+  if (!reg) return CRABS_ERR_INTERNAL;
+  uint8_t* copy = NULL;
+  if (len > 0) {
+    copy = (uint8_t*)malloc(len);
+    if (!copy) return CRABS_ERR_OOM;
+    memcpy(copy, data, len);
+  }
+  if (reg->value) free(reg->value);
+  reg->value = copy;
+  reg->value_size = len;
+  reg->timestamp = am->base_state.version + 1;
+  strncpy(reg->node_id, node_id, CRABS_MAX_USER_ID - 1);
+  reg->node_id[CRABS_MAX_USER_ID - 1] = '\0';
+  am->base_state.version++;
+  return CRABS_SUCCESS;
+}
+
+EMSCRIPTEN_KEEPALIVE
 bool crabs_wasm_set_contains(attribute_machine_t* am, const char* name, const char* element) {
   data_item_t* item = state_find_item(&am->base_state, name);
   if (!item) return false;
