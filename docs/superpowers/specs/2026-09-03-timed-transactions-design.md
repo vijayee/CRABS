@@ -109,12 +109,26 @@ typedef struct scheduled_operation_t {
      checks, dedup, handlers, `append_log`, tx-manager commit — **skips**
      signature/policy/key-staleness and the ordering check (authorized at
      submission). Mirrors how trigger effects execute ops internally.
-- **Failure at T** (state drifted: resource re-locked, invariant violated):
-  the entry is consumed, the op is dropped, and the error is returned from
-  the tick. Checks run before effects, so no partial state.
+- **Failure at T** (state drifted: resource re-locked, invariant violated —
+  e.g. a scheduled drawdown when the balance has already hit zero): the entry
+  is consumed, the op is dropped, and the failure is **recorded durably** as
+  a log entry (`__schedule_failed__` carrying the schedule id, the embedded
+  op's uuid, and the error code) so the hash-chained audit log stays
+  complete and other nodes get a deterministic marker that the schedule
+  resolved as failed. The tick **does not propagate the error** to the
+  enclosing user op — materialization failures are recorded, never returned
+  (same rule as trigger processing; an unrelated op must not fail because a
+  scheduled one did). No retry: a schedule fires once — success or failure.
+  Checks run before effects, so no partial state.
 - **Cross-node:** each node materializes on its own authenticated clock and
   converges eventually. The materialized op's uuid enters each node's
-  log/dedup, so a node receiving it through replication does not re-apply it.
+  log/dedup, so a node receiving it through replication does not re-apply
+  it. Clock-skew caveat: two nodes can resolve the same schedule differently
+  (one fails on an invariant, one succeeds after intervening state) — each
+  applies its own deterministic check at its own materialization time, the
+  same class of divergence as any conflicting concurrent ops in CRABS:
+  CRDT-typed items reconcile via merge, non-CRDT items may diverge as any
+  conflicting direct ops can. Documented, not hidden.
 
 ## API surface
 
@@ -134,7 +148,7 @@ typedef struct scheduled_operation_t {
 | `execute_at_ms` in the past at submission | Rejected (`CRABS_ERR_INVALID_PARAM`) |
 | No authenticated time source at process-due | Nothing materializes (fail-closed) |
 | Embedded op fails validation at submission | `__schedule__` rejected; nothing stored |
-| Embedded op fails at materialization | Entry consumed, op dropped, error to the tick; no partial state |
+| Embedded op fails at materialization | Entry consumed, op dropped, `__schedule_failed__` log entry recorded; tick returns normally; no partial state, no retry |
 | Embedded `__schedule__` (nesting) | Rejected at submission |
 | Cancel of unknown id | `CRABS_ERR_RESOURCE_NOT_FOUND` |
 | Clock skew between nodes | Accepted; eventual convergence |
@@ -145,7 +159,10 @@ typedef struct scheduled_operation_t {
   materialized exactly once; CRDT mutated by a scheduled handler op; embedded
   validation failures rejected at submission (bad signature, failing policy,
   transition mismatch); nesting rejected; cancel works; past `execute_at`
-  rejected; serialization roundtrip preserves the pending set.
+  rejected; serialization roundtrip preserves the pending set; **failed
+  materialization** (invariant violated at T) → entry consumed,
+  `__schedule_failed__` log entry present, and the unrelated user op that
+  triggered the tick still succeeds.
 - **Replay-guard interaction:** a scheduled op whose signer later performs
   normal ops must materialize without tripping the HLC replay check (the
   bypass's regression test).
