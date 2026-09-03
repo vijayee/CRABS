@@ -1431,6 +1431,16 @@ state_t* crabs_deserialize_state(const uint8_t* data, size_t len) {
         tail->next = entry;
       }
     }
+    // Defense against a hostile blob carrying a low schedule_seq alongside
+    // high entry ids: the next scheduled id must not collide with any
+    // restored entry. Blobs require external authentication (M-1), so this
+    // is hardening, not a trust boundary.
+    for (const scheduled_operation_t* schedule_entry = state->scheduled_operations;
+         schedule_entry != NULL; schedule_entry = schedule_entry->next) {
+      if (state->schedule_seq < schedule_entry->schedule_id) {
+        state->schedule_seq = schedule_entry->schedule_id;
+      }
+    }
   }
 
   return state;
