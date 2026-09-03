@@ -15,6 +15,8 @@ extern "C" {
 #include "Trigger/trigger.h"
 #include "CRDT/crdt_merge.h"
 #include "CRDT/one_shot.h"
+#include "Scheduler/scheduler.h"
+#include "test_helpers.h"
 }
 
 static state_t* make_state_with_g_counter(void) {
@@ -283,4 +285,25 @@ TEST(DevtoolsSnapshot, PoliciesTriggersUsersLogHead) {
   EXPECT_TRUE(contains(text, "\"condition\":\"flag_count >= 3\""));
   EXPECT_TRUE(contains(text, "\"fired\":false"));
   EXPECT_TRUE(contains(text, "\"entries\":0"));
+}
+
+TEST(DevtoolsSnapshot, SchedulesSection) {
+  crabs_test_env_t env;
+  crabs_test_env_init(&env);
+  operation_t* embedded = operation_create("mint");
+  strncpy(embedded->signer_id, "admin", CRABS_MAX_USER_ID - 1);
+  uint64_t schedule_id = scheduler_schedule(env.state, 5555555, "admin", embedded);
+
+  char* json = devtools_snapshot_json(env.state);
+  ASSERT_NE(json, nullptr);
+  std::string text = json;
+  devtools_string_destroy(json);
+
+  EXPECT_NE(text.find("\"schedules\":["), std::string::npos);
+  EXPECT_NE(text.find("\"id\":" + std::to_string(schedule_id)), std::string::npos);
+  EXPECT_NE(text.find("\"execute_at\":5555555"), std::string::npos);
+  EXPECT_NE(text.find("\"submitter\":\"admin\""), std::string::npos);
+
+  operation_destroy(embedded);
+  crabs_test_env_destroy(&env);
 }

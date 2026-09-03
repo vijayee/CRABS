@@ -413,6 +413,30 @@
           (snapshot.log_head.state_hash || '').slice(0, 12);
         body.appendChild(head);
       }
+      const schedules = snapshot.schedules || [];
+      if (schedules.length > 0) {
+        const schedulesHeading = document.createElement('div');
+        schedulesHeading.className = 'muted';
+        schedulesHeading.textContent = 'Schedules';
+        body.appendChild(schedulesHeading);
+        for (const schedule of schedules) {
+          const row = document.createElement('div');
+          row.className = 'row';
+          const left = document.createElement('span');
+          const dueInMs = schedule.execute_at - Date.now();
+          const dueLabel = dueInMs <= 0
+            ? 'due'
+            : 'in ' + Math.max(1, Math.round(dueInMs / 1000)) + 's';
+          left.textContent = '#' + schedule.id + ' · ' + schedule.submitter +
+            ' · ' + dueLabel;
+          const right = document.createElement('span');
+          right.className = 'muted mono';
+          right.textContent = new Date(schedule.execute_at).toISOString().slice(11, 19);
+          row.appendChild(left);
+          row.appendChild(right);
+          body.appendChild(row);
+        }
+      }
     }
   }
 

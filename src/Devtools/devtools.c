@@ -13,6 +13,7 @@
 #include "../CRDT/one_shot.h"
 #include "../HLC/hlc.h"
 #include "../Trigger/trigger.h"
+#include "../Scheduler/scheduler.h"
 #include "../Util/allocator.h"
 #include <stdlib.h>
 #include <string.h>
@@ -509,6 +510,25 @@ static void _write_log_head_json(json_writer_t* writer, const state_t* state) {
   _json_writer_raw(writer, "}");
 }
 
+static void _write_schedules_json(json_writer_t* writer, const state_t* state) {
+  _json_writer_raw(writer, "\"schedules\":[");
+  const scheduled_operation_t* entry = state->scheduled_operations;
+  bool first_entry = true;
+  while (entry != NULL) {
+    if (!first_entry) _json_writer_raw(writer, ",");
+    first_entry = false;
+    _json_writer_raw(writer, "{\"id\":");
+    _json_writer_uint(writer, entry->schedule_id);
+    _json_writer_raw(writer, ",\"execute_at\":");
+    _json_writer_uint(writer, entry->execute_at_ms);
+    _json_writer_raw(writer, ",\"submitter\":");
+    _json_writer_string(writer, entry->submitter);
+    _json_writer_raw(writer, "}");
+    entry = entry->next;
+  }
+  _json_writer_raw(writer, "]");
+}
+
 char* devtools_snapshot_json(const state_t* state) {
   if (!state) return NULL;
 
@@ -545,6 +565,8 @@ char* devtools_snapshot_json(const state_t* state) {
   _write_users_json(&writer, state);
   _json_writer_raw(&writer, ",");
   _write_log_head_json(&writer, state);
+  _json_writer_raw(&writer, ",");
+  _write_schedules_json(&writer, state);
   _json_writer_raw(&writer, "}");
   return writer.data;
 }
