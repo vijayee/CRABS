@@ -790,3 +790,70 @@ TEST(SchedulerOps, MalformedSchedulePayloadsRejected) {
   EXPECT_EQ(scheduler_count(env.state), 0u);
   crabs_test_env_destroy(&env);
 }
+
+TEST(SchedulerRecurring, ScheduleRecurringStoresCadence) {
+  crabs_test_env_t env;
+  crabs_test_env_init(&env);
+  operation_t* op = make_counter_op("mint", "admin");
+
+  uint64_t schedule_id = scheduler_schedule_recurring(
+      env.state, 1000000000, 60000, 5, 0, "admin", op);
+
+  EXPECT_NE(schedule_id, 0u);
+  const scheduled_operation_t* pending = scheduler_first(env.state);
+  ASSERT_NE(pending, nullptr);
+  EXPECT_EQ(pending->schedule_id, schedule_id);
+  EXPECT_EQ(pending->execute_at_ms, 1000000000u);
+  EXPECT_EQ(pending->interval_ms, 60000u);
+  EXPECT_EQ(pending->repeat_count, 5u);
+  EXPECT_EQ(pending->end_at_ms, 0u);
+
+  operation_destroy(op);
+  crabs_test_env_destroy(&env);
+}
+
+TEST(SchedulerRecurring, RecurringValidationRejections) {
+  crabs_test_env_t env;
+  crabs_test_env_init(&env);
+  operation_t* op = make_counter_op("mint", "admin");
+
+  // interval 0 is meaningless
+  EXPECT_EQ(scheduler_schedule_recurring(env.state, 1000, 0, 5, 0, "admin", op), 0u);
+  // end_at must be strictly after start_at (or 0 = none)
+  EXPECT_EQ(scheduler_schedule_recurring(env.state, 1000000000, 60000, 5,
+                                         999999, "admin", op), 0u);
+  EXPECT_EQ(scheduler_schedule_recurring(env.state, 1000000000, 60000, 5,
+                                         1000000000, "admin", op), 0u);
+  // plain invalid-input guards still apply
+  EXPECT_EQ(scheduler_schedule_recurring(NULL, 1000, 60000, 5, 0, "admin", op), 0u);
+  EXPECT_EQ(scheduler_schedule_recurring(env.state, 1000, 60000, 5, 0, NULL, op), 0u);
+  EXPECT_EQ(scheduler_count(env.state), 0u);
+
+  operation_destroy(op);
+  crabs_test_env_destroy(&env);
+}
+
+TEST(SchedulerSerialization, RecurringFieldsSurviveRoundtrip) {
+  crabs_test_env_t env;
+  crabs_test_env_init(&env);
+  operation_t* op = make_counter_op("mint", "admin");
+  uint64_t schedule_id = scheduler_schedule_recurring(
+      env.state, 1000000000, 60000, 5, 2000000000, "admin", op);
+  operation_destroy(op);
+
+  serialized_buffer_t* blob = crabs_serialize_state(env.state);
+  ASSERT_NE(blob, nullptr);
+  state_t* restored = crabs_deserialize_state(blob->data, blob->len);
+  serialized_buffer_destroy(blob);
+  ASSERT_NE(restored, nullptr);
+
+  const scheduled_operation_t* pending = scheduler_first(restored);
+  ASSERT_NE(pending, nullptr);
+  EXPECT_EQ(pending->schedule_id, schedule_id);
+  EXPECT_EQ(pending->interval_ms, 60000u);
+  EXPECT_EQ(pending->repeat_count, 5u);
+  EXPECT_EQ(pending->end_at_ms, 2000000000u);
+  state_destroy(restored);
+
+  crabs_test_env_destroy(&env);
+}

@@ -20,6 +20,15 @@
 uint64_t scheduler_schedule(state_t* state, uint64_t execute_at_ms,
                             const char* submitter, const operation_t* op);
 
+// Add a recurring pending schedule: fires at start_at_ms, then every
+// interval_ms, until repeat_count fires have happened (0 = infinite) or
+// execute_at passes end_at_ms (0 = none), whichever comes first. Same
+// ownership/return semantics as scheduler_schedule (0 on invalid input).
+uint64_t scheduler_schedule_recurring(state_t* state, uint64_t start_at_ms,
+                                      uint64_t interval_ms, uint64_t repeat_count,
+                                      uint64_t end_at_ms, const char* submitter,
+                                      const operation_t* op);
+
 // Remove a pending schedule by id. CRABS_ERR_RESOURCE_NOT_FOUND when absent.
 crabs_error_e scheduler_cancel(state_t* state, uint64_t schedule_id);
 

@@ -280,6 +280,9 @@ typedef struct {
 typedef struct scheduled_operation_t {
   uint64_t    schedule_id;    // per-state monotonic counter
   uint64_t    execute_at_ms;  // epoch ms; compared against authenticated now
+  uint64_t    interval_ms;    // 0 = one-shot
+  uint64_t    repeat_count;   // remaining fires; 0 = infinite
+  uint64_t    end_at_ms;      // 0 = no end date
   char        submitter[CRABS_MAX_USER_ID];
   uint8_t*    op_bytes;       // crabs_serialize_operation of the embedded op
   uint32_t    op_len;

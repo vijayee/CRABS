@@ -31,12 +31,13 @@ const scheduled_operation_t* scheduler_first(const state_t* state) {
   return state ? state->scheduled_operations : NULL;
 }
 
-uint64_t scheduler_schedule(state_t* state, uint64_t execute_at_ms,
-                            const char* submitter, const operation_t* op) {
-  if (state == NULL || op == NULL || submitter == NULL || submitter[0] == '\0') {
-    return 0;
-  }
-
+// Shared tail of scheduler_schedule / scheduler_schedule_recurring: serialize
+// the op, allocate the entry, append at the tail. interval/repeat/end are the
+// cadence fields (one-shot callers pass interval 0, repeat 1, end 0).
+static uint64_t _append_schedule(state_t* state, uint64_t execute_at_ms,
+                                 const char* submitter, const operation_t* op,
+                                 uint64_t interval_ms, uint64_t repeat_count,
+                                 uint64_t end_at_ms) {
   serialized_buffer_t* serialized = crabs_serialize_operation(op);
   if (serialized == NULL) return 0;
 
@@ -44,6 +45,9 @@ uint64_t scheduler_schedule(state_t* state, uint64_t execute_at_ms,
       (scheduled_operation_t*)get_clear_memory(sizeof(scheduled_operation_t));
   entry->schedule_id = ++state->schedule_seq;
   entry->execute_at_ms = execute_at_ms;
+  entry->interval_ms = interval_ms;
+  entry->repeat_count = repeat_count;
+  entry->end_at_ms = end_at_ms;
   strncpy(entry->submitter, submitter, CRABS_MAX_USER_ID - 1);
   entry->op_len = serialized->len;
   entry->op_bytes = (uint8_t*)get_clear_memory(serialized->len);
@@ -60,6 +64,27 @@ uint64_t scheduler_schedule(state_t* state, uint64_t execute_at_ms,
     tail->next = entry;
   }
   return entry->schedule_id;
+}
+
+uint64_t scheduler_schedule(state_t* state, uint64_t execute_at_ms,
+                            const char* submitter, const operation_t* op) {
+  if (state == NULL || op == NULL || submitter == NULL || submitter[0] == '\0') {
+    return 0;
+  }
+  return _append_schedule(state, execute_at_ms, submitter, op, 0, 1, 0);
+}
+
+uint64_t scheduler_schedule_recurring(state_t* state, uint64_t start_at_ms,
+                                      uint64_t interval_ms, uint64_t repeat_count,
+                                      uint64_t end_at_ms, const char* submitter,
+                                      const operation_t* op) {
+  if (state == NULL || op == NULL || submitter == NULL || submitter[0] == '\0') {
+    return 0;
+  }
+  if (interval_ms == 0) return 0;                       // recurring requires a cadence
+  if (end_at_ms != 0 && end_at_ms <= start_at_ms) return 0;
+  return _append_schedule(state, start_at_ms, submitter, op,
+                          interval_ms, repeat_count, end_at_ms);
 }
 
 crabs_error_e scheduler_cancel(state_t* state, uint64_t schedule_id) {

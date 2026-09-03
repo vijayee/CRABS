@@ -1281,6 +1281,9 @@ serialized_buffer_t* crabs_serialize_state(const state_t* state) {
        schedule_entry != NULL; schedule_entry = schedule_entry->next) {
     _write_uint64_le(buf, schedule_entry->schedule_id);
     _write_uint64_le(buf, schedule_entry->execute_at_ms);
+    _write_uint64_le(buf, schedule_entry->interval_ms);
+    _write_uint64_le(buf, schedule_entry->repeat_count);
+    _write_uint64_le(buf, schedule_entry->end_at_ms);
     _write_bytes(buf, (const uint8_t*)schedule_entry->submitter, CRABS_MAX_USER_ID);
     _write_uint32_le(buf, schedule_entry->op_len);
     _write_bytes(buf, schedule_entry->op_bytes, schedule_entry->op_len);
@@ -1405,8 +1408,21 @@ state_t* crabs_deserialize_state(const uint8_t* data, size_t len) {
       scheduled_operation_t* entry =
           (scheduled_operation_t*)get_clear_memory(sizeof(scheduled_operation_t));
       if (!_read_uint64_le(&buf, &entry->schedule_id) ||
-          !_read_uint64_le(&buf, &entry->execute_at_ms) ||
-          !_read_bytes(&buf, (uint8_t*)entry->submitter, CRABS_MAX_USER_ID)) {
+          !_read_uint64_le(&buf, &entry->execute_at_ms)) {
+        free(entry);
+        goto fail;
+      }
+      // v7: recurring cadence fields, written right after execute_at_ms (a
+      // v6 blob does not contain them).
+      if (version >= 7) {
+        if (!_read_uint64_le(&buf, &entry->interval_ms) ||
+            !_read_uint64_le(&buf, &entry->repeat_count) ||
+            !_read_uint64_le(&buf, &entry->end_at_ms)) {
+          free(entry);
+          goto fail;
+        }
+      }
+      if (!_read_bytes(&buf, (uint8_t*)entry->submitter, CRABS_MAX_USER_ID)) {
         free(entry);
         goto fail;
       }
