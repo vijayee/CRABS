@@ -108,6 +108,13 @@ crabs_error_e  state_machine_validate(state_t* state, const operation_t* op);
 // presence in the log, enforced in scheduler_process_due).
 crabs_error_e  state_machine_execute_scheduled(state_t* state, operation_t* op);
 
+// Record a failed scheduled materialization in the audit log (system entry,
+// no signature, lamport 0 / LAMPORT ordering). Used by the scheduler; never
+// fails the caller's op.
+void state_machine_log_schedule_failure(state_t* state,
+                                        const uint8_t uuid[CRABS_UUID_SIZE],
+                                        const char* signer_id);
+
 uint32_t       state_machine_prune_expired(state_t* state, uint64_t now_ms);
 
 // Built-in trigger operations (Amendment 1, §4) — defined in trigger.c

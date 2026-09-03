@@ -427,6 +427,232 @@ TEST(SchedulerValidate, TransitionMismatchRejectedWithoutApplying) {
   crabs_test_env_destroy(&env);
 }
 
+// ============================================================
+// Timed Transactions (v1): materialization (scheduler_process_due)
+// ============================================================
+
+// Mock time source so tests control the authenticated clock: with these ops
+// installed, state_get_time_ms returns seconds*1000 + nanos/1e6.
+static crabs_physical_time_t g_sched_mock_time = {0, 0, false};
+
+static crabs_physical_time_t sched_mock_get_time(void* ctx) {
+  (void)ctx;
+  return g_sched_mock_time;
+}
+
+static bool sched_mock_is_available(void* ctx) {
+  (void)ctx;
+  return g_sched_mock_time.valid;
+}
+
+static crabs_time_source_ops_t g_sched_mock_ops = {
+  sched_mock_get_time, sched_mock_is_available, NULL
+};
+
+// operation_create leaves the uuid all-zero, and the production entry points
+// (CLI, wasm bindings) stamp random uuids that the test helpers skip. The
+// materialization idempotency guard keys on the uuid, so every op below gets
+// a distinct nonzero uuid or the guard matches the zero-uuid __schedule__ log
+// entry and silently skips real materializations.
+static uint64_t g_sched_uuid_counter = 0;
+
+static void stamp_unique_uuid(operation_t* op) {
+  g_sched_uuid_counter++;
+  store_u64_le(op->uuid, g_sched_uuid_counter);
+  memset(op->uuid + 8, 0xA7, CRABS_UUID_SIZE - 8);
+}
+
+TEST(SchedulerMaterialize, DueOpMaterializedExactlyOnce) {
+  crabs_test_env_t env;
+  crabs_test_env_init(&env);
+  register_schedule_test_policies(&env);
+  state_t* state = env.state;
+  state_set_time_source(state, &g_sched_mock_ops);
+
+  g_sched_mock_time.seconds = 1000000;
+  g_sched_mock_time.nanos = 0;
+  g_sched_mock_time.valid = true;
+
+  operation_t* embedded = make_counter_op("mint", "admin");
+  stamp_unique_uuid(embedded);
+  crabs_test_sign_op_with(state->attr_machine, env.admin_key, embedded);
+
+  // execute_at just past the mock's 1000000000 ms so __schedule__ accepts it
+  // AND the due tick finds it.
+  operation_t* schedule_op = make_schedule_op(&env, 1000005000, embedded);
+  ASSERT_EQ(state_machine_execute(state, schedule_op), CRABS_SUCCESS);
+  EXPECT_EQ(scheduler_count(state), 1u);
+
+  // Not due yet.
+  ASSERT_EQ(scheduler_process_due(state, 1000004999u), CRABS_SUCCESS);
+  EXPECT_EQ(scheduler_count(state), 1u);
+
+  // Due: materializes.
+  ASSERT_EQ(scheduler_process_due(state, 1000005000u), CRABS_SUCCESS);
+  EXPECT_EQ(scheduler_count(state), 0u);
+
+  // Idempotent: a second tick is a no-op.
+  ASSERT_EQ(scheduler_process_due(state, 1000006000u), CRABS_SUCCESS);
+  EXPECT_EQ(scheduler_count(state), 0u);
+
+  // The embedded op's uuid appears in the log exactly once.
+  uint32_t uuid_matches = 0;
+  for (uint64_t entry_index = 0; entry_index < state->log_count; entry_index++) {
+    if (memcmp(state->log[entry_index].uuid, embedded->uuid, CRABS_UUID_SIZE) == 0) {
+      uuid_matches++;
+    }
+  }
+  EXPECT_EQ(uuid_matches, 1u);
+
+  operation_destroy(embedded);
+  operation_destroy(schedule_op);
+  crabs_test_env_destroy(&env);
+}
+
+TEST(SchedulerMaterialize, SignerSubsequentOpsNotBlockedByReplayGuard) {
+  crabs_test_env_t env;
+  crabs_test_env_init(&env);
+  register_schedule_test_policies(&env);
+  state_t* state = env.state;
+  state_set_time_source(state, &g_sched_mock_ops);
+  g_sched_mock_time.seconds = 1000000;
+  g_sched_mock_time.nanos = 0;
+  g_sched_mock_time.valid = true;
+
+  operation_t* embedded = make_counter_op("mint", "admin");
+  stamp_unique_uuid(embedded);
+  crabs_test_sign_op_with(state->attr_machine, env.admin_key, embedded);
+  operation_t* schedule_op = make_schedule_op(&env, 1000005000, embedded);
+  ASSERT_EQ(state_machine_execute(state, schedule_op), CRABS_SUCCESS);
+
+  // Signer does a normal op NOW (after scheduling, before materialization).
+  operation_t* direct = make_counter_op("mint", "admin");
+  stamp_unique_uuid(direct);
+  crabs_test_sign_op_with(state->attr_machine, env.admin_key, direct);
+  ASSERT_EQ(state_machine_execute(state, direct), CRABS_SUCCESS);
+  operation_destroy(direct);
+
+  // Materialize: must not trip any replay guard.
+  g_sched_mock_time.seconds = 1000005;
+  EXPECT_EQ(scheduler_process_due(state, 1000005000u), CRABS_SUCCESS);
+  EXPECT_EQ(scheduler_count(state), 0u);
+
+  operation_destroy(embedded);
+  operation_destroy(schedule_op);
+  crabs_test_env_destroy(&env);
+}
+
+TEST(SchedulerMaterialize, FailedMaterializationRecordedNotPropagated) {
+  crabs_test_env_t env;
+  crabs_test_env_init(&env);
+  register_schedule_test_policies(&env);
+  state_t* state = env.state;
+  state_set_time_source(state, &g_sched_mock_ops);
+  g_sched_mock_time.seconds = 1000000;
+  g_sched_mock_time.nanos = 0;
+  g_sched_mock_time.valid = true;
+
+  data_item_t* resource = data_item_create("res1", DATA_TYPE_RESOURCE, CRDT_PN_COUNTER);
+  int64_t* value = (int64_t*)get_clear_memory(sizeof(int64_t));
+  *value = 5;
+  resource->value = value;
+  ASSERT_EQ(state_add_item(state, resource), CRABS_SUCCESS);
+
+  // Signed __lock__ op on "res1" (IDLE → LOCKED), mirroring
+  // test/test_co_sign.cpp's make_lock_op_signed.
+  operation_t* embedded = operation_create(CRABS_OP_LOCK);
+  embedded->resources =
+      (char(*)[CRABS_MAX_USER_ID])get_clear_memory(sizeof(char[CRABS_MAX_USER_ID]));
+  strncpy(embedded->resources[0], "res1", CRABS_MAX_USER_ID - 1);
+  embedded->resource_count = 1;
+  embedded->required_state = (protocol_state_e*)get_clear_memory(sizeof(protocol_state_e));
+  embedded->required_state[0] = PROTOCOL_IDLE;
+  embedded->next_state = (protocol_state_e*)get_clear_memory(sizeof(protocol_state_e));
+  embedded->next_state[0] = PROTOCOL_LOCKED;
+  strncpy(embedded->signer_id, "admin", CRABS_MAX_USER_ID - 1);
+  stamp_unique_uuid(embedded);
+  crabs_test_sign_op_with(state->attr_machine, env.admin_key, embedded);
+
+  operation_t* schedule_op = make_schedule_op(&env, 1000005000, embedded);
+  ASSERT_EQ(state_machine_execute(state, schedule_op), CRABS_SUCCESS);
+
+  // State drift: lock the resource directly before materialization. The lock
+  // must look valid and unexpired so state_machine_prune_expired (which runs
+  // inside the tick) does not reset the item to IDLE — otherwise the
+  // scheduled __lock__ would succeed instead of failing. The test env has no
+  // ordering config, so state_machine_lock_expired falls back to
+  // now_ms >= lock_expiry and UINT64_MAX holds through both prunes.
+  resource->protocol_state = PROTOCOL_LOCKED;
+  resource->lock_state.lock_token_valid = true;
+  memset(resource->lock_state.lock_token, 0xAB, CRABS_LOCK_TOKEN_SIZE);
+  resource->lock_state.lock_expiry = UINT64_MAX;
+
+  // A normal user op executes at the same tick (the tick runs at the end of
+  // its execute pipeline) and MUST still succeed even though the scheduled
+  // materialization fails.
+  g_sched_mock_time.seconds = 1000005;
+  operation_t* unrelated = make_counter_op("mint", "admin");
+  stamp_unique_uuid(unrelated);
+  crabs_test_sign_op_with(state->attr_machine, env.admin_key, unrelated);
+  EXPECT_EQ(state_machine_execute(state, unrelated), CRABS_SUCCESS);
+
+  // The failure is recorded: exactly one __schedule_failed__ log entry whose
+  // uuid matches the embedded op, and the pending entry is consumed.
+  uint32_t failure_records = 0;
+  for (uint64_t entry_index = 0; entry_index < state->log_count; entry_index++) {
+    if (strcmp(state->log[entry_index].type, "__schedule_failed__") == 0 &&
+        memcmp(state->log[entry_index].uuid, embedded->uuid, CRABS_UUID_SIZE) == 0) {
+      failure_records++;
+    }
+  }
+  EXPECT_EQ(failure_records, 1u);
+  EXPECT_EQ(scheduler_count(state), 0u);
+
+  operation_destroy(unrelated);
+  operation_destroy(embedded);
+  operation_destroy(schedule_op);
+  crabs_test_env_destroy(&env);
+}
+
+TEST(SchedulerMaterialize, AlreadyAppliedOpSkipsIdempotently) {
+  crabs_test_env_t env;
+  crabs_test_env_init(&env);
+  register_schedule_test_policies(&env);
+  state_t* state = env.state;
+  state_set_time_source(state, &g_sched_mock_ops);
+  g_sched_mock_time.seconds = 1000000;
+  g_sched_mock_time.nanos = 0;
+  g_sched_mock_time.valid = true;
+
+  operation_t* embedded = make_counter_op("mint", "admin");
+  stamp_unique_uuid(embedded);
+  crabs_test_sign_op_with(state->attr_machine, env.admin_key, embedded);
+
+  // Execute the embedded op normally FIRST (uuid lands in the log).
+  ASSERT_EQ(state_machine_execute(state, embedded), CRABS_SUCCESS);
+
+  // Schedule the SAME op for the future.
+  operation_t* schedule_op = make_schedule_op(&env, 1000005000, embedded);
+  ASSERT_EQ(state_machine_execute(state, schedule_op), CRABS_SUCCESS);
+
+  // Tick: the uuid is already in the log → idempotent skip, no failure record.
+  g_sched_mock_time.seconds = 1000005;
+  ASSERT_EQ(scheduler_process_due(state, 1000005000u), CRABS_SUCCESS);
+  EXPECT_EQ(scheduler_count(state), 0u);
+
+  uint32_t uuid_matches = 0;
+  for (uint64_t entry_index = 0; entry_index < state->log_count; entry_index++) {
+    if (memcmp(state->log[entry_index].uuid, embedded->uuid, CRABS_UUID_SIZE) == 0) {
+      uuid_matches++;
+    }
+  }
+  EXPECT_EQ(uuid_matches, 1u);  // the direct execution only
+
+  operation_destroy(embedded);
+  operation_destroy(schedule_op);
+  crabs_test_env_destroy(&env);
+}
+
 TEST(SchedulerOps, MalformedSchedulePayloadsRejected) {
   crabs_test_env_t env;
   crabs_test_env_init(&env);

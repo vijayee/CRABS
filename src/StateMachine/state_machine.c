@@ -926,9 +926,12 @@ static crabs_error_e state_machine_execute_internal(state_t* state, operation_t*
                         (attribute_machine_t*)state->attr_machine, trigger_now_ms);
   }
 
-  // Task 4: scheduler_process_due(state, now_ms) runs here when
-  // process_schedules is set (normal path only — scheduled execution must
-  // not recurse into the tick).
+  // Step 9b: Materialize due scheduled operations (timed transactions v1).
+  // Failures are recorded as __schedule_failed__ log entries, never
+  // propagated to this op.
+  if (process_schedules) {
+    scheduler_process_due(state, now_ms);
+  }
 
   return CRABS_SUCCESS;
 }
@@ -986,6 +989,27 @@ static uint32_t _load_u32_le(const uint8_t* bytes) {
     value |= ((uint32_t)bytes[byte_index]) << (byte_index * 8);
   }
   return value;
+}
+
+// Record a failed scheduled materialization as a durable, LAMPORT-ordered log
+// entry so all nodes agree the schedule resolved as failed. Never fails the
+// caller's op: an OOM while appending simply drops the record (the tick must
+// not crash), and a NULL/invalid input is ignored.
+void state_machine_log_schedule_failure(state_t* state,
+                                        const uint8_t uuid[CRABS_UUID_SIZE],
+                                        const char* signer_id) {
+  if (state == NULL || uuid == NULL || signer_id == NULL) return;
+  uint8_t state_hash[CRABS_HASH_SIZE];
+  memset(state_hash, 0, CRABS_HASH_SIZE);
+  crabs_hlc_t zero_hlc;
+  memset(&zero_hlc, 0, sizeof(zero_hlc));
+  if (!append_log(state, uuid, "__schedule_failed__", signer_id,
+                  0, state->hlc_state_initialized
+                         ? state->hlc_state.last.node_id : "",
+                  CRABS_ORDERING_LAMPORT, &zero_hlc, state_hash)) {
+    return;  // OOM appending a failure record must not crash the tick
+  }
+  state->version++;
 }
 
 crabs_error_e state_machine_op_schedule(state_t* state, operation_t* op) {
