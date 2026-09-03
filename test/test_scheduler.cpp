@@ -222,6 +222,179 @@ TEST(SchedulerSerialization, ScheduleIdsContinueAfterRestore) {
   crabs_test_env_destroy(&env);
 }
 
+// ============================================================
+// Timed Transactions (v1): __schedule__ / __cancel_schedule__
+// ============================================================
+
+// The test env's state falls back to the unauthenticated system clock, so
+// "future" must be a fixed epoch far enough ahead to stay stable on any
+// machine (4000000000000 ms is roughly year 2096). "Past" is 1 ms.
+static const uint64_t SCHEDULE_FUTURE_MS = 4000000000000ull;
+
+// The env registers policies only for the builtin ops it knows about; the
+// schedule ops and the custom embedded op type used below need explicit
+// policies so the fail-closed authorization step passes for admin.
+static void register_schedule_test_policies(crabs_test_env_t* env) {
+  state_add_policy(env->state, CRABS_OP_SCHEDULE, "role:admin");
+  state_add_policy(env->state, CRABS_OP_CANCEL_SCHEDULE, "role:admin");
+  state_add_policy(env->state, "mint", "role:admin");
+}
+
+static void store_u64_le(uint8_t* out, uint64_t value) {
+  for (int byte_index = 0; byte_index < 8; byte_index++) {
+    out[byte_index] = (uint8_t)((value >> (byte_index * 8)) & 0xFF);
+  }
+}
+
+static void store_u32_le(uint8_t* out, uint32_t value) {
+  for (int byte_index = 0; byte_index < 4; byte_index++) {
+    out[byte_index] = (uint8_t)((value >> (byte_index * 8)) & 0xFF);
+  }
+}
+
+// Payload layout for __schedule__: [u64 execute_at_ms LE][u32 op_len LE][op_bytes].
+static void set_schedule_payload(operation_t* op, uint64_t execute_at_ms,
+                                 const operation_t* embedded) {
+  serialized_buffer_t* inner = crabs_serialize_operation(embedded);
+  ASSERT_NE(inner, nullptr);
+  uint32_t payload_len = 8 + 4 + (uint32_t)inner->len;
+  uint8_t* payload = (uint8_t*)get_clear_memory(payload_len);
+  store_u64_le(payload, execute_at_ms);
+  store_u32_le(payload + 8, (uint32_t)inner->len);
+  memcpy(payload + 12, inner->data, inner->len);
+  serialized_buffer_destroy(inner);
+  op->payload = payload;
+  op->payload_size = payload_len;
+}
+
+static operation_t* make_schedule_op(crabs_test_env_t* env, uint64_t execute_at_ms,
+                                     operation_t* embedded) {
+  operation_t* op = operation_create(CRABS_OP_SCHEDULE);
+  strncpy(op->signer_id, "admin", CRABS_MAX_USER_ID - 1);
+  set_schedule_payload(op, execute_at_ms, embedded);
+  crabs_test_sign_op_with(env->state->attr_machine, env->admin_key, op);
+  return op;
+}
+
+TEST(SchedulerOps, ScheduleStoresPendingEntryAndLogs) {
+  crabs_test_env_t env;
+  crabs_test_env_init(&env);
+  register_schedule_test_policies(&env);
+  operation_t* embedded = make_counter_op("mint", "admin");
+  crabs_test_sign_op_with(env.state->attr_machine, env.admin_key, embedded);
+
+  operation_t* schedule_op = make_schedule_op(&env, SCHEDULE_FUTURE_MS, embedded);
+  EXPECT_EQ(state_machine_execute(env.state, schedule_op), CRABS_SUCCESS);
+  EXPECT_EQ(scheduler_count(env.state), 1u);
+  EXPECT_STREQ(scheduler_first(env.state)->submitter, "admin");
+  EXPECT_GT(scheduler_first(env.state)->op_len, 0u);
+
+  operation_destroy(schedule_op);
+  operation_destroy(embedded);
+  crabs_test_env_destroy(&env);
+}
+
+TEST(SchedulerOps, ScheduleInPastRejected) {
+  crabs_test_env_t env;
+  crabs_test_env_init(&env);
+  register_schedule_test_policies(&env);
+  operation_t* embedded = make_counter_op("mint", "admin");
+  crabs_test_sign_op_with(env.state->attr_machine, env.admin_key, embedded);
+
+  operation_t* schedule_op = make_schedule_op(&env, 1, embedded);
+  EXPECT_EQ(state_machine_execute(env.state, schedule_op), CRABS_ERR_INVALID_PARAM);
+  EXPECT_EQ(scheduler_count(env.state), 0u);
+
+  operation_destroy(schedule_op);
+  operation_destroy(embedded);
+  crabs_test_env_destroy(&env);
+}
+
+TEST(SchedulerOps, NestedScheduleRejected) {
+  crabs_test_env_t env;
+  crabs_test_env_init(&env);
+  register_schedule_test_policies(&env);
+  operation_t* inner_schedule = operation_create(CRABS_OP_SCHEDULE);
+  strncpy(inner_schedule->signer_id, "admin", CRABS_MAX_USER_ID - 1);
+  crabs_test_sign_op_with(env.state->attr_machine, env.admin_key, inner_schedule);
+
+  operation_t* schedule_op = make_schedule_op(&env, SCHEDULE_FUTURE_MS, inner_schedule);
+  EXPECT_EQ(state_machine_execute(env.state, schedule_op), CRABS_ERR_INVALID_PARAM);
+  EXPECT_EQ(scheduler_count(env.state), 0u);
+
+  operation_destroy(schedule_op);
+  operation_destroy(inner_schedule);
+  crabs_test_env_destroy(&env);
+}
+
+TEST(SchedulerOps, ScheduleWithInvalidEmbeddedOpRejected) {
+  crabs_test_env_t env;
+  crabs_test_env_init(&env);
+  register_schedule_test_policies(&env);
+  operation_t* embedded = operation_create("nosuchop");
+  strncpy(embedded->signer_id, "admin", CRABS_MAX_USER_ID - 1);
+  crabs_test_sign_op_with(env.state->attr_machine, env.admin_key, embedded);
+
+  operation_t* schedule_op = make_schedule_op(&env, SCHEDULE_FUTURE_MS, embedded);
+  EXPECT_EQ(state_machine_execute(env.state, schedule_op), CRABS_ERR_SCHEDULE_INVALID);
+  EXPECT_EQ(scheduler_count(env.state), 0u);
+
+  operation_destroy(schedule_op);
+  operation_destroy(embedded);
+  crabs_test_env_destroy(&env);
+}
+
+TEST(SchedulerOps, CancelScheduleRemovesPendingEntry) {
+  crabs_test_env_t env;
+  crabs_test_env_init(&env);
+  register_schedule_test_policies(&env);
+  operation_t* embedded = make_counter_op("mint", "admin");
+  crabs_test_sign_op_with(env.state->attr_machine, env.admin_key, embedded);
+
+  operation_t* schedule_op = make_schedule_op(&env, SCHEDULE_FUTURE_MS, embedded);
+  ASSERT_EQ(state_machine_execute(env.state, schedule_op), CRABS_SUCCESS);
+  uint64_t schedule_id = scheduler_first(env.state)->schedule_id;
+  operation_destroy(schedule_op);
+
+  // Cancel via a signed __cancel_schedule__ op carrying the 8-byte id.
+  operation_t* cancel_op = operation_create(CRABS_OP_CANCEL_SCHEDULE);
+  strncpy(cancel_op->signer_id, "admin", CRABS_MAX_USER_ID - 1);
+  uint8_t* payload = (uint8_t*)get_clear_memory(8);
+  store_u64_le(payload, schedule_id);
+  cancel_op->payload = payload;
+  cancel_op->payload_size = 8;
+  crabs_test_sign_op_with(env.state->attr_machine, env.admin_key, cancel_op);
+
+  EXPECT_EQ(state_machine_execute(env.state, cancel_op), CRABS_SUCCESS);
+  EXPECT_EQ(scheduler_count(env.state), 0u);
+
+  operation_destroy(cancel_op);
+  operation_destroy(embedded);
+  crabs_test_env_destroy(&env);
+}
+
+TEST(SchedulerOps, PendingEntryPreservesEmbeddedOpBytes) {
+  crabs_test_env_t env;
+  crabs_test_env_init(&env);
+  register_schedule_test_policies(&env);
+  operation_t* embedded = make_counter_op("mint", "admin");
+  crabs_test_sign_op_with(env.state->attr_machine, env.admin_key, embedded);
+
+  operation_t* schedule_op = make_schedule_op(&env, SCHEDULE_FUTURE_MS, embedded);
+  ASSERT_EQ(state_machine_execute(env.state, schedule_op), CRABS_SUCCESS);
+
+  serialized_buffer_t* expected = crabs_serialize_operation(embedded);
+  ASSERT_NE(expected, nullptr);
+  const scheduled_operation_t* pending = scheduler_first(env.state);
+  ASSERT_EQ(pending->op_len, expected->len);
+  EXPECT_EQ(memcmp(pending->op_bytes, expected->data, expected->len), 0);
+  serialized_buffer_destroy(expected);
+
+  operation_destroy(schedule_op);
+  operation_destroy(embedded);
+  crabs_test_env_destroy(&env);
+}
+
 TEST(SchedulerValidate, TransitionMismatchRejectedWithoutApplying) {
   crabs_test_env_t env;
   crabs_test_env_init(&env);

@@ -122,6 +122,12 @@ crabs_error_e  state_machine_op_enable_trigger(state_t* state, operation_t* op);
 crabs_error_e  state_machine_op_define_operation(state_t* state, operation_t* op);
 crabs_error_e  state_machine_op_check_dedup(state_t* state, operation_t* op);
 
+// Timed transactions (v1): __schedule__ stores a validated pending entry;
+// __cancel_schedule__ removes one by id. Both are dispatched from
+// state_machine_execute's builtin chain.
+crabs_error_e  state_machine_op_schedule(state_t* state, operation_t* op);
+crabs_error_e  state_machine_op_cancel_schedule(state_t* state, operation_t* op);
+
 // Auto-compact items that need compaction (v1.5.2 §4)
 // Returns count of items compacted. Requires compaction_config on state.
 uint32_t       state_machine_auto_compact(state_t* state);

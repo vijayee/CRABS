@@ -90,6 +90,7 @@ typedef enum {
   CRABS_ERR_CONDITION_NOT_MET     = 0x7003,
   CRABS_ERR_TRACKER_NOT_FOUND    = 0x7004,
   CRABS_ERR_FLAG_NOT_FOUND       = 0x7005,
+  CRABS_ERR_SCHEDULE_INVALID     = 0x7006,
 
   // 0x8xxx: OT errors (v1.5 §8)
   CRABS_ERR_NO_OT_OPS            = 0x8001,
@@ -140,5 +141,9 @@ typedef enum {
 
 // Compaction Operation (v1.5.2 §4.3)
 #define CRABS_OP_COMPACT           "__compact__"
+
+// Timed Transactions (v1)
+#define CRABS_OP_SCHEDULE        "__schedule__"
+#define CRABS_OP_CANCEL_SCHEDULE "__cancel_schedule__"
 
 #endif // CRABS_CRABS_H

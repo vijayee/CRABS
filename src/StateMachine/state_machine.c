@@ -16,6 +16,7 @@
 #include "../Compaction/crdt_compaction.h"
 #include "../Util/allocator.h"
 #include "../TxManager/tx_manager.h"
+#include "../Scheduler/scheduler.h"
 #include <string.h>
 #include <stdlib.h>
 #include <time.h>
@@ -39,6 +40,8 @@ crabs_error_e state_machine_op_suspend_key(state_t* s, operation_t* o);
 crabs_error_e state_machine_op_activate_key(state_t* s, operation_t* o);
 crabs_error_e state_machine_op_rotate_key(state_t* s, operation_t* o);
 crabs_error_e state_machine_op_compact(state_t* s, operation_t* o);
+crabs_error_e state_machine_op_schedule(state_t* s, operation_t* o);
+crabs_error_e state_machine_op_cancel_schedule(state_t* s, operation_t* o);
 
 // ============================================================
 // Transition Table (§6.3)
@@ -151,7 +154,9 @@ bool operation_is_builtin(const char* type) {
           strcmp(type, CRABS_OP_DEFINE_OPERATION) == 0 ||
           strcmp(type, CRABS_OP_CHECK_DEDUP) == 0 ||
           strcmp(type, CRABS_OP_EXECUTE_OT) == 0 ||
-          strcmp(type, CRABS_OP_COMPACT) == 0);
+          strcmp(type, CRABS_OP_COMPACT) == 0 ||
+          strcmp(type, CRABS_OP_SCHEDULE) == 0 ||
+          strcmp(type, CRABS_OP_CANCEL_SCHEDULE) == 0);
 }
 
 operation_t* operation_create(const char* type) {
@@ -834,6 +839,11 @@ static crabs_error_e state_machine_execute_internal(state_t* state, operation_t*
   } else if (strcmp(op->type, CRABS_OP_COMPACT) == 0) {
     // Compaction operation (v1.5.2 §4.3)
     result = state_machine_op_compact(state, op);
+  } else if (strcmp(op->type, CRABS_OP_SCHEDULE) == 0) {
+    // Timed transactions (v1)
+    result = state_machine_op_schedule(state, op);
+  } else if (strcmp(op->type, CRABS_OP_CANCEL_SCHEDULE) == 0) {
+    result = state_machine_op_cancel_schedule(state, op);
   } else {
     // Check user-defined handler registry for non-builtin operation types
     custom_handler = state_machine_find_handler(state, op->type);
@@ -955,6 +965,82 @@ crabs_error_e state_machine_validate(state_t* state, const operation_t* op) {
   rc = _verify_co_signatures(state, op, &pp);
   if (rc != CRABS_SUCCESS) return rc;
   return CRABS_SUCCESS;
+}
+
+// ============================================================
+// Timed Transactions (v1)
+// ============================================================
+
+// The codebase avoids <endian.h>; payloads are little-endian by spec
+// (mirrors serialization.c's _read_uint64_le logic).
+static uint64_t _load_u64_le(const uint8_t* bytes) {
+  uint64_t value = 0;
+  for (int byte_index = 0; byte_index < 8; byte_index++) {
+    value |= ((uint64_t)bytes[byte_index]) << (byte_index * 8);
+  }
+  return value;
+}
+
+static uint32_t _load_u32_le(const uint8_t* bytes) {
+  uint32_t value = 0;
+  for (int byte_index = 0; byte_index < 4; byte_index++) {
+    value |= ((uint32_t)bytes[byte_index]) << (byte_index * 8);
+  }
+  return value;
+}
+
+crabs_error_e state_machine_op_schedule(state_t* state, operation_t* op) {
+  if (state == NULL || op == NULL || op->payload == NULL ||
+      op->payload_size < 12) {
+    return CRABS_ERR_INVALID_PARAM;
+  }
+
+  // Payload layout: [u64 execute_at_ms LE][u32 op_len LE][op_bytes].
+  uint64_t execute_at_ms = _load_u64_le(op->payload);
+  uint32_t inner_len = _load_u32_le(op->payload + 8);
+  if (inner_len == 0 || op->payload_size != 12 + inner_len) {
+    return CRABS_ERR_INVALID_PARAM;
+  }
+
+  // Cheap check first: reject past (or exactly-now) execution times before
+  // paying for deserialization and full pipeline validation.
+  uint64_t now_ms;
+  if (!state_get_time_ms(state, &now_ms)) return CRABS_ERR_CRYPTOGRAPHIC_ERROR;
+  if (execute_at_ms <= now_ms) return CRABS_ERR_INVALID_PARAM;
+
+  operation_t* embedded = crabs_deserialize_operation(op->payload + 12, inner_len);
+  if (embedded == NULL) return CRABS_ERR_INVALID_PARAM;
+
+  // No nesting: a scheduled operation cannot itself be a schedule, so
+  // deferred execution can never recursively defer.
+  if (strcmp(embedded->type, CRABS_OP_SCHEDULE) == 0) {
+    operation_destroy(embedded);
+    return CRABS_ERR_INVALID_PARAM;
+  }
+
+  // Authorize the embedded operation NOW (full pipeline checks, nothing
+  // applied). The embedded op carries its own signer_id and signature, and
+  // validate checks them independently of the __schedule__ submitter. A
+  // failing embedded op rejects the whole __schedule__ so nothing is stored.
+  crabs_error_e validation = state_machine_validate(state, embedded);
+  if (validation != CRABS_SUCCESS) {
+    operation_destroy(embedded);
+    return CRABS_ERR_SCHEDULE_INVALID;
+  }
+
+  uint64_t schedule_id = scheduler_schedule(state, execute_at_ms, op->signer_id, embedded);
+  operation_destroy(embedded);
+  if (schedule_id == 0) return CRABS_ERR_OOM;
+  return CRABS_SUCCESS;
+}
+
+crabs_error_e state_machine_op_cancel_schedule(state_t* state, operation_t* op) {
+  if (state == NULL || op == NULL || op->payload == NULL ||
+      op->payload_size != 8) {
+    return CRABS_ERR_INVALID_PARAM;
+  }
+  uint64_t schedule_id = _load_u64_le(op->payload);
+  return scheduler_cancel(state, schedule_id);
 }
 
 // ============================================================
