@@ -49,7 +49,9 @@ async function setupNode(dev, actorId, signingKeypair) {
   node.addOneShotSet('flaggers');
   node.addCounter('flag_count');
   node.addRegister('contact');
+  node.addCounter('tokens');
   node.setPolicy('view', 'role:member');
+  node.setPolicy('mint', 'role:member');
   node.setPolicy('like', 'role:member');
   node.setPolicy('flag', 'role:member');
   // Admin-only ops used by createTrigger and evaluateTriggers (mirrors
@@ -93,8 +95,27 @@ async function setupNode(dev, actorId, signingKeypair) {
     state.setAdd('flaggers', operation.signerId, operation.signerId + ':1');
     return 0;
   });
+  node.registerHandlerJs('mint', (state, operation) => {
+    state.incrementCounter('tokens', 1, operation.nodeId);
+    return 0;
+  });
 
   return node;
+}
+
+// Schedule a mint 60 seconds out. The signed operation goes into the node's
+// durable pending set (no execute, no broadcast) and materializes locally when
+// the node's clock passes the scheduled time — scheduling is a per-node
+// decision, so the peer never sees the pending op.
+async function scheduleMint(dev, node, actorId, signingKeypair) {
+  const mintOperation = await dev.Operation.create('mint');
+  mintOperation.signerId = actorId;
+  mintOperation.nodeId = actorId;
+  node.sign(mintOperation, signingKeypair);
+  node.schedule(mintOperation, Date.now() + 60000);
+  // Scheduling runs outside execute, so refresh the panels explicitly to show
+  // the new Schedules row in the Config tab.
+  refreshPanels();
 }
 
 async function fireOperation(dev, node, actorId, signingKeypair, opType) {
@@ -167,6 +188,7 @@ function startRelay(dev, node) {
     ['Dislike (no policy, may reject)', (node, actorId, keypair) => fireOperation(dev, node, actorId, keypair, 'dislike'), 'bad'],
     ['Subscribe', (node, actorId, keypair) => fireOperation(dev, node, actorId, keypair, 'subscribe')],
     ['Flag', (node, actorId, keypair) => fireOperation(dev, node, actorId, keypair, 'flag')],
+    ['Schedule mint (+60s)', (node, actorId, keypair) => scheduleMint(dev, node, actorId, keypair)],
   ];
 
   for (const [gridId, node, actorId, keypair] of [

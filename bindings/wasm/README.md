@@ -107,6 +107,35 @@ the dev artifact.
 See `examples/devtools_demo/` for a working two-node demo (open the page in
 two tabs to watch operations replicate between peers over BroadcastChannel).
 
+## Timed transactions
+
+Operations whose effects apply at a future time. A signed operation is stored
+in the node's durable pending set and materialized — applied exactly as
+signed — when the node's clock passes the scheduled time.
+
+```js
+const inner = await Operation.create('mint');
+inner.signerId = 'alice';
+inner.nodeId = 'alice';
+node.sign(inner, key.privateKeyHex());
+
+const scheduleId = node.schedule(inner, Date.now() + 60_000); // bigint id
+node.pendingSchedules();   // [{ id, executeAt, submitter }]
+node.processSchedules();   // materialize anything due (also runs on every execute)
+node.cancelSchedule(scheduleId);
+```
+
+Notes:
+
+- `node.schedule` stores the operation directly (like the other convenience
+  methods) without re-running policy validation — the operation must already
+  be signed by an authorized signer. The policy-gated path is the
+  `__schedule__` operation type itself.
+- Materialization failures (state drifted, invariant violated) are recorded
+  durably as `__schedule_failed__` audit-log entries and never affect other
+  operations. A schedule fires exactly once.
+- Pending schedules are part of the serialized state and survive restarts.
+
 ## License
 
 MIT
