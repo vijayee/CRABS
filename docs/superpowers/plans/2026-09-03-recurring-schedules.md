@@ -248,7 +248,9 @@ TEST(SchedulerRecurring, CatchUpFiresAllMissedSlotsInOrder) {
                                          "admin", embedded) != 0, true);
 
   // Jump 5 slots ahead: one tick fires all 5 missed occurrences in order.
-  ASSERT_EQ(scheduler_process_due(state, 1000006000u), CRABS_SUCCESS);
+  // (Tick between slots — 1000005500 — so the 5 slots 1000001000..5000 fire
+  // and the next slot 1000006000 remains future.)
+  ASSERT_EQ(scheduler_process_due(state, 1000005500u), CRABS_SUCCESS);
   uint32_t mint_entries = 0;
   for (uint64_t entry_index = 0; entry_index < state->log_count; entry_index++) {
     if (strcmp(state->log[entry_index].type, "mint") == 0) mint_entries++;
@@ -286,10 +288,14 @@ Restructure: after finding `entry` by id and BEFORE the one-shot removal, branch
     }
 
     // Recurring: fire all due slots in order; the entry stays resident.
+    // Termination bookkeeping: repeat_count is "remaining fires" where
+    // 0 = INFINITE (never decremented). A finite series counts down and is
+    // removed the moment its count HITS 0 after a fire (series_exhausted).
+    bool bytes_corrupt = false;
+    bool series_exhausted = false;
     uint32_t fires_this_tick = 0;
     while (entry->execute_at_ms <= now_ms) {
       if (entry->end_at_ms != 0 && entry->execute_at_ms > entry->end_at_ms) break;
-      if (entry->repeat_count != 0 && fires_used(entry) >= entry->repeat_count) break;
 
       // (de)materialize one occurrence:
       operation_t* occurrence = crabs_deserialize_operation(entry->op_bytes, entry->op_len);
@@ -298,6 +304,7 @@ Restructure: after finding `entry` by id and BEFORE the one-shot removal, branch
         memset(failure_uuid, 0, sizeof(failure_uuid));
         crypto_random_bytes(failure_uuid, CRABS_UUID_SIZE);  // best effort (zero fallback)
         state_machine_log_schedule_failure(state, failure_uuid, entry->submitter);
+        bytes_corrupt = true;
         break;  // undecodable: terminate the series
       }
       if (fires_this_tick > 0) {
@@ -314,17 +321,33 @@ Restructure: after finding `entry` by id and BEFORE the one-shot removal, branch
       }
       fires_this_tick++;
 
-      // Advance cadence and termination bookkeeping.
+      // Advance cadence and termination bookkeeping. Decrement ONLY finite
+      // counts (0 = infinite sentinel, never decremented).
       entry->execute_at_ms += entry->interval_ms;
-      if (entry->repeat_count != 0) entry->repeat_count--;
+      if (entry->repeat_count != 0) {
+        entry->repeat_count--;
+        if (entry->repeat_count == 0) {
+          series_exhausted = true;  // last allowed fire consumed
+          break;
+        }
+      }
       if (entry->end_at_ms != 0 && entry->execute_at_ms > entry->end_at_ms) break;
-      if (entry->repeat_count != 0 && entry->repeat_count == 0) { /* count reached 0 after firing the last allowed fire */ }
+
+      // A handler may have cancelled the entry mid-loop — re-find by identity
+      // and stop if it was unlinked (it is freed; do not touch it further).
+      scheduled_operation_t** recheck_link = &state->scheduled_operations;
+      bool still_linked_mid_loop = false;
+      while (*recheck_link != NULL) {
+        if (*recheck_link == entry) { still_linked_mid_loop = true; break; }
+        recheck_link = &(*recheck_link)->next;
+      }
+      if (!still_linked_mid_loop) return CRABS_SUCCESS;  // cancelled mid-series
     }
 
-    // Termination: remove the entry when the count is exhausted or the next
-    // slot is past end_at. Guard against mid-loop cancellation: the entry
-    // pointer may have been unlinked by a handler calling cancelSchedule —
-    // re-find by id before touching it; if absent, it is gone.
+    // Termination: remove the entry when the count is exhausted, the next
+    // slot is past end_at, or the series was terminated by corrupt bytes.
+    // (Re-find by identity first — a handler may have cancelled the entry,
+    // unlinking and freeing it; touching `entry` then would be use-after-free.)
     scheduled_operation_t** recheck = &state->scheduled_operations;
     bool still_linked = false;
     while (*recheck != NULL) {
@@ -333,10 +356,8 @@ Restructure: after finding `entry` by id and BEFORE the one-shot removal, branch
     }
     if (!still_linked) continue;
 
-    bool exhausted = (entry->repeat_count != 0 && entry->repeat_count == 0);
     bool past_end = (entry->end_at_ms != 0 && entry->execute_at_ms > entry->end_at_ms);
-    bool undecodable_terminated = ...;  // handled via the break above: use a flag
-    if (exhausted || past_end || series_terminated) {
+    if (series_exhausted || past_end || bytes_corrupt) {
       *link = entry->next;
       free(entry->op_bytes);
       free(entry);
