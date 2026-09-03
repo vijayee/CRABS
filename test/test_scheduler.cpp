@@ -3,6 +3,7 @@
 //
 
 #include <gtest/gtest.h>
+#include <cstdint>
 #include <cstring>
 #include <string>
 
@@ -12,6 +13,7 @@ extern "C" {
 #include "StateMachine/state_machine.h"
 #include "Serialization/serialization.h"
 #include "Crypto/crypto.h"
+#include "Util/allocator.h"
 #include "test_helpers.h"
 }
 
@@ -217,5 +219,37 @@ TEST(SchedulerSerialization, ScheduleIdsContinueAfterRestore) {
   EXPECT_EQ(scheduler_first(restored)->schedule_id, first_id);
   operation_destroy(second);
   state_destroy(restored);
+  crabs_test_env_destroy(&env);
+}
+
+TEST(SchedulerValidate, TransitionMismatchRejectedWithoutApplying) {
+  crabs_test_env_t env;
+  crabs_test_env_init(&env);
+  // A __lock__ op whose resource is in a non-IDLE state fails the
+  // transition-feasibility branch of state_machine_validate. The lock must be
+  // valid and unexpired — validate prunes expired locks first, which would
+  // otherwise reset the resource to IDLE before the transition check runs.
+  data_item_t* resource = data_item_create("res1", DATA_TYPE_RESOURCE, CRDT_PN_COUNTER);
+  ASSERT_EQ(state_add_item(env.state, resource), CRABS_SUCCESS);
+  resource->protocol_state = PROTOCOL_LOCKED;  // op requires IDLE
+  resource->lock_state.lock_token_valid = true;
+  resource->lock_state.lock_expiry = UINT64_MAX;
+
+  operation_t* op = operation_create(CRABS_OP_LOCK);
+  op->resources =
+      (char(*)[CRABS_MAX_USER_ID])get_clear_memory(sizeof(char[CRABS_MAX_USER_ID]));
+  strncpy(op->resources[0], "res1", CRABS_MAX_USER_ID - 1);
+  op->resource_count = 1;
+  op->required_state = (protocol_state_e*)get_clear_memory(sizeof(protocol_state_e));
+  op->required_state[0] = PROTOCOL_IDLE;
+  op->next_state = (protocol_state_e*)get_clear_memory(sizeof(protocol_state_e));
+  op->next_state[0] = PROTOCOL_LOCKED;
+  strncpy(op->signer_id, "admin", CRABS_MAX_USER_ID - 1);
+  crabs_test_sign_op_with(env.state->attr_machine, env.admin_key, op);
+
+  EXPECT_EQ(state_machine_validate(env.state, op), CRABS_ERR_PROTOCOL_VIOLATION);
+  EXPECT_EQ(env.state->log_count, 0u);
+
+  operation_destroy(op);
   crabs_test_env_destroy(&env);
 }

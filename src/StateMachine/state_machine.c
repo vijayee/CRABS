@@ -517,10 +517,11 @@ static crabs_error_e _verify_operation_authorization(state_t* state, const opera
 
 // Step 4 helper: Verify protocol state transitions (§7.4 step 4).
 static crabs_error_e _check_transitions(state_t* state, const operation_t* op) {
-  for (uint32_t i = 0; i < op->resource_count; i++) {
-    data_item_t* item = state_find_item(state, op->resources[i]);
+  for (uint32_t resource_index = 0; resource_index < op->resource_count;
+       resource_index++) {
+    data_item_t* item = state_find_item(state, op->resources[resource_index]);
     if (item == NULL) return CRABS_ERR_RESOURCE_NOT_FOUND;
-    if (item->protocol_state != op->required_state[i]) {
+    if (item->protocol_state != op->required_state[resource_index]) {
       return CRABS_ERR_PROTOCOL_VIOLATION;
     }
   }
@@ -686,10 +687,12 @@ static crabs_error_e state_machine_execute_internal(state_t* state, operation_t*
     }
   }
 
-  // Step 3c: Ordering monotonicity (R7-11 + v1.6 Amd6). Skipped for scheduled
-  // materialization — the ordering timestamp was checked at submission time,
-  // and the scheduled executor must not reject a materialized op that a later
-  // submission advanced past.
+  // Step 3c: Ordering monotonicity (R7-11 + v1.6 Amd6). The R7-11 ordering
+  // check does not apply to scheduled materializations — it is replaced by
+  // the scheduler's idempotency guard (pending-list removal + uuid presence
+  // in the log, enforced in scheduler_process_due), and the scheduled
+  // executor must not reject a materialized op that a later submission
+  // advanced past.
   if (!skip_authorization) {
     const log_entry_t* last_signer_entry = NULL;
     if (state_last_log_entry_for_signer(state, op->signer_id, &last_signer_entry)) {
@@ -940,7 +943,7 @@ crabs_error_e state_machine_validate(state_t* state, const operation_t* op) {
     attribute_machine_prune_expired_temporary(state->attr_machine);
   }
 
-  policy_preprocess_result_t pp;
+  policy_preprocess_result_t pp = {0};
   crabs_error_e rc = _verify_operation_authorization(state, op, &pp);
   if (rc != CRABS_SUCCESS) return rc;
   rc = _check_transitions(state, op);

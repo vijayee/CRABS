@@ -102,8 +102,10 @@ crabs_error_e  state_machine_execute(state_t* state, operation_t* op);
 crabs_error_e  state_machine_validate(state_t* state, const operation_t* op);
 
 // Internal executor for scheduled materialization: transitions, dedup,
-// handlers, and logging apply; user-facing authorization and the ordering
-// check are skipped (enforced at submission).
+// handlers, and logging apply; user-facing authorization is skipped. The
+// R7-11 ordering check does not apply to scheduled materializations — it is
+// replaced by the scheduler's idempotency guard (pending-list removal + uuid
+// presence in the log, enforced in scheduler_process_due).
 crabs_error_e  state_machine_execute_scheduled(state_t* state, operation_t* op);
 
 uint32_t       state_machine_prune_expired(state_t* state, uint64_t now_ms);
