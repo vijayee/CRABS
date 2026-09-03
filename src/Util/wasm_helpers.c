@@ -556,6 +556,11 @@ EMSCRIPTEN_KEEPALIVE
 uint64_t crabs_wasm_schedule(attribute_machine_t* am, operation_t* inner_op,
                              uint64_t execute_at_ms) {
   if (!am || !inner_op) return 0;
+  // Submission-time authorization: the op must already be signed by an
+  // authorized signer (mirrors the __schedule__ op path). Read-only checks.
+  if (state_machine_validate(&am->base_state, inner_op) != CRABS_SUCCESS) {
+    return 0;
+  }
   return scheduler_schedule(&am->base_state, execute_at_ms,
                             inner_op->signer_id, inner_op);
 }
