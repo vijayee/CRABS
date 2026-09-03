@@ -438,20 +438,43 @@ static bool state_get_time_ms(const state_t* state, uint64_t* now_ms) {
   return true;
 }
 
-// R7-11: the most recent log entry for a signer. Returns false if the
-// signer has no logged ops (so a first op is never rejected). Scans the log
-// from the tail (a signer's latest op is near the end). Used to enforce
-// ordering monotonicity so a replayed op — which carries the same ordering
-// timestamp as the original — is rejected even after a restart, when the
-// in-memory tx_manager has been reset.
-static bool state_last_log_entry_for_signer(const state_t* state, const char* signer_id,
-                                            const log_entry_t** out) {
-  if (state == NULL || signer_id == NULL || out == NULL) return false;
+// R7-11 replay backstop: true when the signer's log already contains an op
+// that is NOT strictly older than `op`. Uses the MAXIMUM ordering timestamp
+// across the signer's entries (not the tail-most) so late-logged materialized
+// schedules and lamport-0 __schedule_failed__ records cannot regress the
+// watermark. __schedule_failed__ entries are system records and are skipped
+// entirely. Used to enforce ordering monotonicity so a replayed op — which
+// carries the same ordering timestamp as the original — is rejected even
+// after a restart, when the in-memory tx_manager has been reset.
+//
+// The scan covers the whole log with no tail-most-first early exit — that
+// early exit was removed deliberately (correctness over speed): the tail-most
+// entry can be older than an earlier one once materialized schedules and
+// failure records interleave. O(n) per op; a per-signer watermark cache is
+// the future optimization.
+static bool state_signer_has_replay(const state_t* state, const operation_t* op) {
+  if (state == NULL || op == NULL) return false;
   for (uint64_t entry_index = state->log_count; entry_index > 0; entry_index--) {
     const log_entry_t* entry = &state->log[entry_index - 1];
-    if (strcmp(entry->signer_id, signer_id) == 0) {
-      *out = entry;
-      return true;
+    if (strcmp(entry->signer_id, op->signer_id) != 0) continue;
+    if (strcmp(entry->type, "__schedule_failed__") == 0) continue;
+
+    if (op->ordering_system == CRABS_ORDERING_HLC) {
+      if (entry->ordering_system == CRABS_ORDERING_HLC &&
+          crabs_hlc_compare(&op->hlc, &entry->hlc) <= 0) {
+        return true;
+      }
+      // Lamport-ordered entry vs HLC op: lamport sorts before HLC, so this
+      // entry can never make the op a replay.
+    } else {
+      if (entry->ordering_system == CRABS_ORDERING_LAMPORT &&
+          op->lamport_time <= entry->lamport_time) {
+        return true;
+      }
+      // HLC-ordered entry vs lamport op: the op is older by the cross-system
+      // rule, but the previous behavior compared lamport values only (an HLC
+      // entry carries lamport 0 and never rejects) — preserve that: HLC
+      // entries do not reject lamport ops.
     }
   }
   return false;
@@ -692,28 +715,17 @@ static crabs_error_e state_machine_execute_internal(state_t* state, operation_t*
     }
   }
 
-  // Step 3c: Ordering monotonicity (R7-11 + v1.6 Amd6). The R7-11 ordering
-  // check does not apply to scheduled materializations — it is replaced by
-  // the scheduler's idempotency guard (pending-list removal + uuid presence
-  // in the log, enforced in scheduler_process_due), and the scheduled
-  // executor must not reject a materialized op that a later submission
-  // advanced past.
+  // Step 3c: Ordering monotonicity (R7-11 + v1.6 Amd6). Rejects the op when
+  // any of the signer's logged ops is NOT strictly older than it (see
+  // state_signer_has_replay for why the maximum across all entries is used
+  // instead of the tail-most entry). The R7-11 ordering check does not apply
+  // to scheduled materializations — it is replaced by the scheduler's
+  // idempotency guard (pending-list removal + uuid presence in the log,
+  // enforced in scheduler_process_due), and the scheduled executor must not
+  // reject a materialized op that a later submission advanced past.
   if (!skip_authorization) {
-    const log_entry_t* last_signer_entry = NULL;
-    if (state_last_log_entry_for_signer(state, op->signer_id, &last_signer_entry)) {
-      bool is_replay = false;
-      if (op->ordering_system == CRABS_ORDERING_HLC) {
-        if (last_signer_entry->ordering_system == CRABS_ORDERING_HLC) {
-          is_replay = crabs_hlc_compare(&op->hlc, &last_signer_entry->hlc) <= 0;
-        }
-        // Last entry was lamport-ordered: any HLC op is newer by the
-        // cross-system ordering rule (lamport sorts before HLC).
-      } else {
-        is_replay = op->lamport_time <= last_signer_entry->lamport_time;
-      }
-      if (is_replay) {
-        return CRABS_ERR_ALREADY_EXECUTED;
-      }
+    if (state_signer_has_replay(state, op)) {
+      return CRABS_ERR_ALREADY_EXECUTED;
     }
   }
 

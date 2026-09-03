@@ -333,6 +333,10 @@ typedef struct state_t {
   // state, resetting the counter and losing monotonicity).
   crabs_hlc_state_t hlc_state;
   bool             hlc_state_initialized;
+  // Runtime-only; never serialized. Guards scheduler_process_due against
+  // re-entrant ticks (a materialized op's custom handler calling back into
+  // state_machine_execute), which would otherwise recurse unboundedly.
+  bool             scheduler_ticking;
 } state_t;
 
 // ============================================================

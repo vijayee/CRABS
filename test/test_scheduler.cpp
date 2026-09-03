@@ -267,10 +267,27 @@ static void set_schedule_payload(operation_t* op, uint64_t execute_at_ms,
   op->payload_size = payload_len;
 }
 
+// operation_create leaves the uuid all-zero, and the production entry points
+// (CLI, wasm bindings) stamp random uuids that the test helpers skip. The
+// materialization idempotency guard keys on the uuid, so every op below gets
+// a distinct nonzero uuid or the guard matches the zero-uuid __schedule__ log
+// entry and silently skips real materializations.
+static uint64_t g_sched_uuid_counter = 0;
+
+static void stamp_unique_uuid(operation_t* op) {
+  g_sched_uuid_counter++;
+  store_u64_le(op->uuid, g_sched_uuid_counter);
+  memset(op->uuid + 8, 0xA7, CRABS_UUID_SIZE - 8);
+}
+
 static operation_t* make_schedule_op(crabs_test_env_t* env, uint64_t execute_at_ms,
                                      operation_t* embedded) {
   operation_t* op = operation_create(CRABS_OP_SCHEDULE);
   strncpy(op->signer_id, "admin", CRABS_MAX_USER_ID - 1);
+  // The uuid is covered by the signature, so it must be stamped before
+  // signing — a zero uuid would let the materialization guard (and later
+  // replay checks) match the all-zero sentinel.
+  stamp_unique_uuid(op);
   set_schedule_payload(op, execute_at_ms, embedded);
   crabs_test_sign_op_with(env->state->attr_machine, env->admin_key, op);
   return op;
@@ -449,19 +466,6 @@ static crabs_time_source_ops_t g_sched_mock_ops = {
   sched_mock_get_time, sched_mock_is_available, NULL
 };
 
-// operation_create leaves the uuid all-zero, and the production entry points
-// (CLI, wasm bindings) stamp random uuids that the test helpers skip. The
-// materialization idempotency guard keys on the uuid, so every op below gets
-// a distinct nonzero uuid or the guard matches the zero-uuid __schedule__ log
-// entry and silently skips real materializations.
-static uint64_t g_sched_uuid_counter = 0;
-
-static void stamp_unique_uuid(operation_t* op) {
-  g_sched_uuid_counter++;
-  store_u64_le(op->uuid, g_sched_uuid_counter);
-  memset(op->uuid + 8, 0xA7, CRABS_UUID_SIZE - 8);
-}
-
 TEST(SchedulerMaterialize, DueOpMaterializedExactlyOnce) {
   crabs_test_env_t env;
   crabs_test_env_init(&env);
@@ -610,6 +614,82 @@ TEST(SchedulerMaterialize, FailedMaterializationRecordedNotPropagated) {
 
   operation_destroy(unrelated);
   operation_destroy(embedded);
+  operation_destroy(schedule_op);
+  crabs_test_env_destroy(&env);
+}
+
+// R7-11: a __schedule_failed__ record is LAMPORT-ordered with lamport 0 and
+// lands at the tail of the log. The replay watermark must consider ALL of the
+// signer's entries and skip system records, so a failed materialization never
+// lets the signer replay an op that is already in the log.
+TEST(SchedulerMaterialize, FailureRecordDoesNotRegressReplayWatermark) {
+  crabs_test_env_t env;
+  crabs_test_env_init(&env);
+  register_schedule_test_policies(&env);
+  state_t* state = env.state;
+  state_set_time_source(state, &g_sched_mock_ops);
+  g_sched_mock_time.seconds = 1000000;
+  g_sched_mock_time.nanos = 0;
+  g_sched_mock_time.valid = true;
+
+  // Signer executes a normal op (lamport stamped by the test helper, entry
+  // logged). Replaying this exact op later must be rejected.
+  operation_t* first = make_counter_op("mint", "admin");
+  stamp_unique_uuid(first);
+  crabs_test_sign_op_with(state->attr_machine, env.admin_key, first);
+  ASSERT_EQ(state_machine_execute(state, first), CRABS_SUCCESS);
+
+  // A scheduled op by the same signer fails at materialization: a signed
+  // __lock__ on "res1" (IDLE → LOCKED), mirroring
+  // FailedMaterializationRecordedNotPropagated's drift pattern.
+  data_item_t* resource = data_item_create("res1", DATA_TYPE_RESOURCE, CRDT_PN_COUNTER);
+  ASSERT_EQ(state_add_item(state, resource), CRABS_SUCCESS);
+  operation_t* doomed = operation_create(CRABS_OP_LOCK);
+  doomed->resources =
+      (char(*)[CRABS_MAX_USER_ID])get_clear_memory(sizeof(char[CRABS_MAX_USER_ID]));
+  strncpy(doomed->resources[0], "res1", CRABS_MAX_USER_ID - 1);
+  doomed->resource_count = 1;
+  doomed->required_state = (protocol_state_e*)get_clear_memory(sizeof(protocol_state_e));
+  doomed->required_state[0] = PROTOCOL_IDLE;
+  doomed->next_state = (protocol_state_e*)get_clear_memory(sizeof(protocol_state_e));
+  doomed->next_state[0] = PROTOCOL_LOCKED;
+  strncpy(doomed->signer_id, "admin", CRABS_MAX_USER_ID - 1);
+  stamp_unique_uuid(doomed);
+  crabs_test_sign_op_with(state->attr_machine, env.admin_key, doomed);
+
+  operation_t* schedule_op = make_schedule_op(&env, 1000005000, doomed);
+  ASSERT_EQ(state_machine_execute(state, schedule_op), CRABS_SUCCESS);
+
+  // State drift: "res1" is already locked by someone else with a valid,
+  // unexpired lock, so the scheduled __lock__ fails the transition check
+  // (op requires IDLE). The lock must look valid and unexpired so
+  // state_machine_prune_expired does not reset the item to IDLE.
+  resource->protocol_state = PROTOCOL_LOCKED;
+  resource->lock_state.lock_token_valid = true;
+  memset(resource->lock_state.lock_token, 0xAB, CRABS_LOCK_TOKEN_SIZE);
+  resource->lock_state.lock_expiry = UINT64_MAX;
+
+  // Tick: materialization fails and a __schedule_failed__ record (lamport 0,
+  // signer "admin") lands at the tail of the log.
+  ASSERT_EQ(scheduler_process_due(state, 1000005000u), CRABS_SUCCESS);
+  EXPECT_EQ(scheduler_count(state), 0u);
+  bool failure_recorded = false;
+  for (uint64_t entry_index = 0; entry_index < state->log_count; entry_index++) {
+    if (strcmp(state->log[entry_index].type, "__schedule_failed__") == 0 &&
+        memcmp(state->log[entry_index].uuid, doomed->uuid, CRABS_UUID_SIZE) == 0) {
+      failure_recorded = true;
+    }
+  }
+  ASSERT_TRUE(failure_recorded);
+
+  // Replay `first` (same op object, so the same uuid and lamport): the
+  // tail-most signer entry is now the lamport-0 failure record, but the
+  // signer's own earlier entry still makes this op a replay. The in-memory
+  // test env has no tx_manager, so the ordering check is the only guard.
+  EXPECT_EQ(state_machine_execute(state, first), CRABS_ERR_ALREADY_EXECUTED);
+
+  operation_destroy(first);
+  operation_destroy(doomed);
   operation_destroy(schedule_op);
   crabs_test_env_destroy(&env);
 }

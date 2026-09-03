@@ -32,7 +32,10 @@ const scheduled_operation_t* scheduler_first(const state_t* state);
 
 // Materialize every pending schedule whose execute_at_ms <= now_ms.
 // Failures are recorded as __schedule_failed__ log entries and never
-// propagated. Returns CRABS_SUCCESS.
+// propagated; CRABS_ERR_ALREADY_EXECUTED from the materialized op is treated
+// as an idempotent skip. Re-entrant calls (a materialized handler invoking
+// state_machine_execute, which ticks) are deferred to the enclosing tick.
+// Returns CRABS_SUCCESS.
 crabs_error_e scheduler_process_due(state_t* state, uint64_t now_ms);
 
 // Free the entire pending list (called from state_destroy).

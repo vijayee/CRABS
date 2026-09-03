@@ -10,6 +10,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "../Util/allocator.h"
+#include "../Crypto/crypto.h"
 #include "../Serialization/serialization.h"
 #include "../StateMachine/state_machine.h"
 
@@ -98,6 +99,14 @@ static bool _uuid_in_log(const state_t* state, const uint8_t uuid[CRABS_UUID_SIZ
 crabs_error_e scheduler_process_due(state_t* state, uint64_t now_ms) {
   if (state == NULL) return CRABS_ERR_INVALID_PARAM;
 
+  if (state->scheduler_ticking) {
+    // A materialized handler re-entered the tick — defer to the enclosing
+    // tick instead of recursing (bounds stack depth; due work still runs
+    // because the outer tick keeps processing its snapshot).
+    return CRABS_SUCCESS;
+  }
+  state->scheduler_ticking = true;
+
   // Snapshot the due ids first so cancellation during materialization
   // cannot skip or double-process entries. At most
   // CRABS_SCHEDULER_MAX_DUE_PER_TICK entries materialize per tick; anything
@@ -131,11 +140,14 @@ crabs_error_e scheduler_process_due(state_t* state, uint64_t now_ms) {
 
     operation_t* embedded = crabs_deserialize_operation(entry->op_bytes, entry->op_len);
     if (embedded == NULL) {
-      // Undecodable bytes: record with a zero uuid (the op identity is not
-      // recoverable) and the submitter as the log signer.
-      uint8_t zero_uuid[CRABS_UUID_SIZE];
-      memset(zero_uuid, 0, sizeof(zero_uuid));
-      state_machine_log_schedule_failure(state, zero_uuid, entry->submitter);
+      // Undecodable bytes: the op identity is not recoverable, so record
+      // with a RANDOM uuid and the submitter as the log signer. A random
+      // uuid prevents a permanent collision with any later all-zero-uuid op.
+      uint8_t failure_uuid[CRABS_UUID_SIZE];
+      if (crypto_random_bytes(failure_uuid, CRABS_UUID_SIZE) != CRABS_SUCCESS) {
+        memset(failure_uuid, 0, sizeof(failure_uuid));  // best effort only
+      }
+      state_machine_log_schedule_failure(state, failure_uuid, entry->submitter);
       free(entry->op_bytes);
       free(entry);
       continue;
@@ -152,9 +164,19 @@ crabs_error_e scheduler_process_due(state_t* state, uint64_t now_ms) {
     // Internal execution: authorization was enforced at submission.
     // state_machine_execute_scheduled passes process_schedules=false, so the
     // tick inside the materialized op's execute pipeline does NOT re-enter
-    // scheduler_process_due — no recursion while materializing.
+    // scheduler_process_due — no recursion while materializing. (Custom
+    // handlers can still re-enter via state_machine_execute; the
+    // scheduler_ticking guard above defers those to this tick.)
     crabs_error_e materialize_rc =
         state_machine_execute_scheduled(state, embedded);
+    if (materialize_rc == CRABS_ERR_ALREADY_EXECUTED) {
+      // The tx_manager accepted the uuid elsewhere (persistent store case):
+      // treat as idempotent success, not a failure.
+      operation_destroy(embedded);
+      free(entry->op_bytes);
+      free(entry);
+      continue;
+    }
     if (materialize_rc != CRABS_SUCCESS) {
       // Durable failure record keyed by the embedded op's uuid, so all nodes
       // agree the schedule resolved as failed and the devtools Timeline can
@@ -167,5 +189,7 @@ crabs_error_e scheduler_process_due(state_t* state, uint64_t now_ms) {
     free(entry->op_bytes);
     free(entry);
   }
+
+  state->scheduler_ticking = false;
   return CRABS_SUCCESS;
 }
