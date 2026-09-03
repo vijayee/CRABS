@@ -175,9 +175,101 @@ typedef struct scheduled_operation_t {
 
 ## Out of scope (v1)
 
-- Recurring schedules (next feature: recurring flag re-inserting the next
-  pending instance deterministically at each materialization).
 - Persisted failure records for dropped materializations (the consumed-entry +
   error-return contract is the v1 observability; devtools surfaces the rest).
 - Cross-node coordination of *which* node materializes (every node does, by
   design).
+
+---
+
+# Addendum: Recurring Schedules (v2)
+
+Date: 2026-09-03. Extends the scheduler above; all v1 decisions carry over.
+
+## Decisions made
+
+- **Termination:** `repeat_count` (0 = infinite, N = fires N times) **and**
+  an optional `end_at_ms` (0 = none); whichever limit arrives first stops the
+  schedule.
+- **Missed occurrences (catch-up):** fire ALL missed occurrences in slot
+  order on the next tick, each merged with other ops through the normal
+  pipeline. Each node fires what its own clock says it missed; copies
+  converge via CRDT merge/replication like any divergent ops — the
+  documented reconciliation stance (application's responsibility).
+- **Cadence anchoring:** fixed slots — `execute_at += interval_ms` per fire
+  (drift-free), NOT materialization-time + interval.
+- **API:** new binding `node.scheduleRecurring(op, startAtMs, intervalMs,
+  repeatCount, endAtMs)`; the one-shot `node.schedule` is unchanged.
+  C-side: `scheduler_schedule_recurring(state, start_at_ms, interval_ms,
+  repeat_count, end_at_ms, submitter, op)`.
+- **Per-occurrence identity:** each occurrence is materialized as its own
+  execution with a fresh random uuid (stamped by the scheduler for the 2nd+
+  fire; the first fire keeps the embedded op's original uuid). This is safe
+  because materialization skips signature verification (authorized at
+  submission). Occurrences execute sequentially in slot order, ordered with
+  any other ops through the normal pipeline.
+
+## Data model changes
+
+`scheduled_operation_t` gains:
+
+```c
+  uint64_t    interval_ms;    // 0 = one-shot
+  uint64_t    repeat_count;   // remaining fires; 0 = infinite
+  uint64_t    end_at_ms;      // 0 = no end date
+```
+
+Serialization v7: the schedules section writes `interval_ms`, `repeat_count`,
+`end_at_ms` per entry (after `execute_at_ms`); readers gated on `version >= 7`;
+`schedule_seq` clamp and ordering unchanged. `CRABS_SERIAL_VERSION` bumps to 7.
+
+## Materialization (recurring branch)
+
+In `scheduler_process_due`, a due entry with `interval_ms > 0` is NOT removed
+from the pending list up front. Instead, before firing each occurrence:
+
+1. If `end_at_ms != 0 && execute_at > end_at_ms` → remove entry, done.
+2. If `repeat_count != 0 && fires_used >= repeat_count` → remove entry, done.
+3. Fire once (uuid-in-log skip / failure record as in v1; the entry stays in
+   the pending list while firing — remove it only on termination).
+4. `execute_at += interval_ms`; increment `fires_used` (or decrement
+   `repeat_count` when finite).
+
+The catch-up loop repeats while `execute_at <= now_ms`, firing every missed
+slot back-to-back in slot order, bounded by the remaining count. The tick
+re-entrancy guard is unchanged; a handler that schedules new work defers to
+the next tick as before.
+
+**Validation at scheduling:** `interval_ms > 0` when recurring;
+`repeat_count >= 0`; `end_at_ms == 0 || end_at_ms > start_at_ms`. The
+`node.scheduleRecurring` convenience path runs `state_machine_validate` on
+the embedded op, same as `node.schedule`.
+
+## Termination rules
+
+| Condition | Result |
+|---|---|
+| `repeat_count` exhausted | Entry removed after the final fire |
+| `end_at_ms` passed | Entry removed before the next fire (no partial fire past the end) |
+| Cancelled by id | Removed immediately (same as one-shot) |
+| `end_at` before `start_at` | Rejected at scheduling (`CRABS_ERR_INVALID_PARAM`) |
+
+## API surface (recurring)
+
+- **C:** `scheduler_schedule_recurring(state, start_at_ms, interval_ms,
+  repeat_count, end_at_ms, submitter, op)` → id.
+- **Bindings:** `node.scheduleRecurring(innerOp, startAtMs, intervalMs,
+  repeatCount, endAtMs)` → bigint id (runs validation, like `node.schedule`).
+  `pendingSchedules()` rows gain `intervalMs`, `repeatCount`, `endAt`.
+- **Devtools:** Config tab rows show the cadence (`every 60s × 24` or
+  `every 60s ∞`).
+
+## Testing (recurring)
+
+- Native: fires on cadence; count termination; end_at termination; catch-up
+  fires all missed slots in order after simulated downtime; one-shot entries
+  unaffected; serialization roundtrip preserves the three new fields;
+  validation rejections (interval 0, end before start).
+- WASM smoke: `scheduleRecurring` → two due fires via injected ticks →
+  exhausted removal; cancel mid-series.
+- Demo: a "Schedule 3 mints (every 15s)" button; browser verification.
