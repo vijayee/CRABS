@@ -427,8 +427,16 @@
           const dueLabel = dueInMs <= 0
             ? 'due'
             : 'in ' + Math.max(1, Math.round(dueInMs / 1000)) + 's';
+          // Recurring cadence: interval 0 = one-shot (no label). repeat 0
+          // with an interval means fire until cancelled or past end_at.
+          let cadenceLabel = '';
+          if (schedule.interval > 0) {
+            const everySeconds = Math.round(schedule.interval / 1000);
+            cadenceLabel = ' · every ' + everySeconds + 's ' +
+              (schedule.repeat > 0 ? '× ' + schedule.repeat : '∞');
+          }
           left.textContent = '#' + schedule.id + ' · ' + schedule.submitter +
-            ' · ' + dueLabel;
+            ' · ' + dueLabel + cadenceLabel;
           const right = document.createElement('span');
           right.className = 'muted mono';
           right.textContent = new Date(schedule.execute_at).toISOString().slice(11, 19);

@@ -307,3 +307,28 @@ TEST(DevtoolsSnapshot, SchedulesSection) {
   operation_destroy(embedded);
   crabs_test_env_destroy(&env);
 }
+
+TEST(DevtoolsSnapshot, RecurringSchedulesSection) {
+  crabs_test_env_t env;
+  crabs_test_env_init(&env);
+  operation_t* embedded = operation_create("mint");
+  strncpy(embedded->signer_id, "admin", CRABS_MAX_USER_ID - 1);
+  uint64_t schedule_id = scheduler_schedule_recurring(
+      env.state, 1000000, 15000, 3, 0, "admin", embedded);
+
+  char* json = devtools_snapshot_json(env.state);
+  ASSERT_NE(json, nullptr);
+  std::string text = json;
+  devtools_string_destroy(json);
+
+  EXPECT_NE(text.find("\"schedules\":["), std::string::npos);
+  EXPECT_NE(text.find("\"id\":" + std::to_string(schedule_id)), std::string::npos);
+  EXPECT_NE(text.find("\"execute_at\":1000000"), std::string::npos);
+  EXPECT_NE(text.find("\"interval\":15000"), std::string::npos);
+  EXPECT_NE(text.find("\"repeat\":3"), std::string::npos);
+  EXPECT_NE(text.find("\"end_at\":0"), std::string::npos);
+  EXPECT_NE(text.find("\"submitter\":\"admin\""), std::string::npos);
+
+  operation_destroy(embedded);
+  crabs_test_env_destroy(&env);
+}

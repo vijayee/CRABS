@@ -130,9 +130,13 @@ export interface Node {
   pruneExpiredTempAttrs(): number;
 
   schedule(innerOp: Operation, executeAtMs: number): bigint;
+  scheduleRecurring(innerOp: Operation, startAtMs: number, intervalMs: number,
+                    repeatCount: number, endAtMs: number): bigint;
   cancelSchedule(scheduleId: bigint): void;
   processSchedules(nowMs?: number): void;
-  pendingSchedules(): Array<{ id: bigint; executeAt: bigint; submitter: string }>;
+  pendingSchedules(): Array<{ id: bigint; executeAt: bigint;
+                              intervalMs: bigint; repeatCount: bigint;
+                              endAt: bigint; submitter: string }>;
 
   evaluateTriggers(): void;
   destroy(): void;

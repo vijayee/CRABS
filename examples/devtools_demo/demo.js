@@ -118,6 +118,18 @@ async function scheduleMint(dev, node, actorId, signingKeypair) {
   refreshPanels();
 }
 
+// Schedule a mint every 15 seconds, three times. The series fires in order
+// (catch-up on missed slots) and disappears from the Schedules section once
+// the third mint has materialized.
+async function scheduleRecurringMint(dev, node, actorId, signingKeypair) {
+  const mintOperation = await dev.Operation.create('mint');
+  mintOperation.signerId = actorId;
+  mintOperation.nodeId = actorId;
+  node.sign(mintOperation, signingKeypair);
+  node.scheduleRecurring(mintOperation, Date.now() + 15000, 15000, 3, 0);
+  refreshPanels();
+}
+
 async function fireOperation(dev, node, actorId, signingKeypair, opType) {
   const operation = await dev.Operation.create(opType);
   operation.signerId = actorId;
@@ -189,6 +201,7 @@ function startRelay(dev, node) {
     ['Subscribe', (node, actorId, keypair) => fireOperation(dev, node, actorId, keypair, 'subscribe')],
     ['Flag', (node, actorId, keypair) => fireOperation(dev, node, actorId, keypair, 'flag')],
     ['Schedule mint (+60s)', (node, actorId, keypair) => scheduleMint(dev, node, actorId, keypair)],
+    ['Schedule 3 mints (every 15s)', (node, actorId, keypair) => scheduleRecurringMint(dev, node, actorId, keypair)],
   ];
 
   for (const [gridId, node, actorId, keypair] of [

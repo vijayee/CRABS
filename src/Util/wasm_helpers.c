@@ -566,6 +566,20 @@ uint64_t crabs_wasm_schedule(attribute_machine_t* am, operation_t* inner_op,
 }
 
 EMSCRIPTEN_KEEPALIVE
+uint64_t crabs_wasm_schedule_recurring(attribute_machine_t* am, operation_t* inner_op,
+                                       uint64_t start_at_ms, uint64_t interval_ms,
+                                       uint64_t repeat_count, uint64_t end_at_ms) {
+  if (!am || !inner_op) return 0;
+  // Submission-time authorization (mirrors crabs_wasm_schedule). Read-only.
+  if (state_machine_validate(&am->base_state, inner_op) != CRABS_SUCCESS) {
+    return 0;
+  }
+  return scheduler_schedule_recurring(&am->base_state, start_at_ms, interval_ms,
+                                      repeat_count, end_at_ms,
+                                      inner_op->signer_id, inner_op);
+}
+
+EMSCRIPTEN_KEEPALIVE
 crabs_error_e crabs_wasm_cancel_schedule(attribute_machine_t* am, uint64_t schedule_id) {
   if (!am) return CRABS_ERR_INVALID_PARAM;
   return scheduler_cancel(&am->base_state, schedule_id);
@@ -605,6 +619,21 @@ uint64_t crabs_wasm_schedule_execute_at(const scheduled_operation_t* entry) {
 EMSCRIPTEN_KEEPALIVE
 const char* crabs_wasm_schedule_submitter(const scheduled_operation_t* entry) {
   return entry ? entry->submitter : NULL;
+}
+
+EMSCRIPTEN_KEEPALIVE
+uint64_t crabs_wasm_schedule_interval(const scheduled_operation_t* entry) {
+  return entry ? entry->interval_ms : 0;
+}
+
+EMSCRIPTEN_KEEPALIVE
+uint64_t crabs_wasm_schedule_repeat_count(const scheduled_operation_t* entry) {
+  return entry ? entry->repeat_count : 0;
+}
+
+EMSCRIPTEN_KEEPALIVE
+uint64_t crabs_wasm_schedule_end_at(const scheduled_operation_t* entry) {
+  return entry ? entry->end_at_ms : 0;
 }
 
 // ============================================================

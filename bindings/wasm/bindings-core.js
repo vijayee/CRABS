@@ -566,6 +566,14 @@ class Node {
     return scheduleId;
   }
 
+  scheduleRecurring(innerOp, startAtMs, intervalMs, repeatCount, endAtMs) {
+    const scheduleId = this._M._crabs_wasm_schedule_recurring(
+        this._am, innerOp._ptr, BigInt(startAtMs), BigInt(intervalMs),
+        BigInt(repeatCount), BigInt(endAtMs));
+    if (!scheduleId) throw new Error('scheduleRecurring failed');
+    return scheduleId;
+  }
+
   cancelSchedule(scheduleId) {
     wrapRc(this._M._crabs_wasm_cancel_schedule(this._am, BigInt(scheduleId)), 'cancelSchedule');
   }
@@ -583,6 +591,9 @@ class Node {
       schedules.push({
         id: M._crabs_wasm_schedule_id(entry),
         executeAt: M._crabs_wasm_schedule_execute_at(entry),
+        intervalMs: M._crabs_wasm_schedule_interval(entry),
+        repeatCount: M._crabs_wasm_schedule_repeat_count(entry),
+        endAt: M._crabs_wasm_schedule_end_at(entry),
         submitter: submitterPtr ? M.UTF8ToString(submitterPtr) : '',
       });
     }

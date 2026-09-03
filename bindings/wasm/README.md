@@ -125,6 +125,14 @@ node.processSchedules();   // materialize anything due (also runs on every execu
 node.cancelSchedule(scheduleId);
 ```
 
+Recurring schedules repeat on a fixed cadence and terminate on a repeat
+count (0 = infinite), an end date, or `cancelSchedule` — whichever comes
+first. Missed slots fire in order on the next tick (catch-up):
+
+```js
+node.scheduleRecurring(mintOp, Date.now() + 15_000, 15_000, 3, 0); // 3 fires
+```
+
 Notes:
 
 - `node.schedule` stores the operation directly (like the other convenience

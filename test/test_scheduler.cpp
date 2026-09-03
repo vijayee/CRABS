@@ -890,6 +890,58 @@ TEST(SchedulerRecurring, FiresOnCadenceUntilCountExhausted) {
   crabs_test_env_destroy(&env);
 }
 
+// Regression: each occurrence needs an identity distinct from every earlier
+// fire, even across separate ticks. Deriving occurrences from the bare
+// embedded uuid made every tick's first occurrence collide with the log
+// entry a previous tick's fire wrote, so only the first slot ever applied.
+TEST(SchedulerRecurring, FiresAcrossSeparateTicksWithDistinctIdentity) {
+  crabs_test_env_t env;
+  crabs_test_env_init(&env);
+  register_schedule_test_policies(&env);
+  state_t* state = env.state;
+  state_set_time_source(state, &g_sched_mock_ops);
+  g_sched_mock_time.seconds = 1000000;
+  g_sched_mock_time.nanos = 0;
+  g_sched_mock_time.valid = true;
+
+  operation_t* embedded = make_counter_op("mint", "admin");
+  stamp_unique_uuid(embedded);
+  crabs_test_sign_op_with(state->attr_machine, env.admin_key, embedded);
+  uint64_t schedule_id = scheduler_schedule_recurring(
+      state, 1000001000, 1000, 3, 0, "admin", embedded);
+  ASSERT_NE(schedule_id, 0u);
+
+  // One tick per slot (no catch-up): each tick must apply its slot, not skip
+  // it as already-in-log.
+  ASSERT_EQ(scheduler_process_due(state, 1000001000u), CRABS_SUCCESS);
+  ASSERT_EQ(scheduler_count(state), 1u);
+  ASSERT_EQ(scheduler_process_due(state, 1000002000u), CRABS_SUCCESS);
+  ASSERT_EQ(scheduler_count(state), 1u);
+  ASSERT_EQ(scheduler_process_due(state, 1000003000u), CRABS_SUCCESS);
+  EXPECT_EQ(scheduler_count(state), 0u);
+
+  uint32_t mint_entries = 0;
+  for (uint64_t entry_index = 0; entry_index < state->log_count; entry_index++) {
+    if (strcmp(state->log[entry_index].type, "mint") == 0) mint_entries++;
+  }
+  EXPECT_EQ(mint_entries, 3u);
+
+  // Every occurrence carries a distinct uuid.
+  uint32_t duplicate_uuids = 0;
+  for (uint64_t entry_a = 0; entry_a < state->log_count; entry_a++) {
+    for (uint64_t entry_b = entry_a + 1; entry_b < state->log_count; entry_b++) {
+      if (memcmp(state->log[entry_a].uuid, state->log[entry_b].uuid,
+                 CRABS_UUID_SIZE) == 0) {
+        duplicate_uuids++;
+      }
+    }
+  }
+  EXPECT_EQ(duplicate_uuids, 0u);
+
+  operation_destroy(embedded);
+  crabs_test_env_destroy(&env);
+}
+
 TEST(SchedulerRecurring, EndAtTerminatesBeforeNextFire) {
   crabs_test_env_t env;
   crabs_test_env_init(&env);

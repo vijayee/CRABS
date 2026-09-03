@@ -250,7 +250,6 @@ crabs_error_e scheduler_process_due(state_t* state, uint64_t now_ms) {
     // ---- after a fire.
     bool bytes_corrupt = false;
     bool series_exhausted = false;
-    uint32_t fires_this_tick = 0;
     while (entry->execute_at_ms <= now_ms) {
       if (entry->end_at_ms != 0 && entry->execute_at_ms > entry->end_at_ms) break;
 
@@ -273,19 +272,19 @@ crabs_error_e scheduler_process_due(state_t* state, uint64_t now_ms) {
         bytes_corrupt = true;
         break;
       }
-      if (fires_this_tick > 0) {
-        // Fresh identity per occurrence (2nd+ fires). SAFE: materialization
-        // skips signature verification — authorization happened at submission,
-        // so re-signing per occurrence is unnecessary and a fresh uuid cannot
-        // break any signature check.
-        if (crypto_random_bytes(occurrence->uuid, CRABS_UUID_SIZE) !=
-            CRABS_SUCCESS) {
-          // RNG unavailable (best effort): keep occurrences distinguishable
-          // anyway — a reused uuid would be dropped as already-in-log. Zero
-          // bytes then a fire-index byte gives every slot a distinct identity.
-          memset(occurrence->uuid, 0, CRABS_UUID_SIZE);
-          occurrence->uuid[CRABS_UUID_SIZE - 1] = (uint8_t)fires_this_tick;
-        }
+      // Occurrence identity: the embedded uuid XORed with this slot's
+      // execute_at_ms (little-endian, into the first 8 bytes). Distinct per
+      // slot AND stable across ticks — keying the bare embedded uuid would
+      // collide with the log entry an earlier tick's fire wrote (the per-tick
+      // fire index resets, so only a multi-fire catch-up tick got fresh
+      // identities) and skip every later slot of the series. Injective per
+      // entry: XOR with the strictly increasing execute_at values maps the
+      // same embedded uuid to distinct uuids. SAFE: materialization skips
+      // signature verification — authorization happened at submission, so a
+      // derived uuid cannot break any signature check.
+      for (uint32_t uuid_byte_index = 0; uuid_byte_index < 8; uuid_byte_index++) {
+        occurrence->uuid[uuid_byte_index] ^=
+            (uint8_t)(entry->execute_at_ms >> (8 * uuid_byte_index));
       }
       if (_uuid_in_log(state, occurrence->uuid)) {
         // Already applied via replication? Idempotent skip (still advances
@@ -293,6 +292,11 @@ crabs_error_e scheduler_process_due(state_t* state, uint64_t now_ms) {
         operation_destroy(occurrence);
       } else {
         crabs_error_e fire_rc = state_machine_execute_scheduled(state, occurrence);
+#ifdef CRABS_ENABLE_DEVTOOLS
+        // Same reason as the one-shot path above: materialized ops never pass
+        // through crabs_wasm_execute, so record the outcome for the Timeline.
+        devtools_record_event(state, occurrence, fire_rc);
+#endif
         if (fire_rc != CRABS_SUCCESS && fire_rc != CRABS_ERR_ALREADY_EXECUTED) {
           // A failed slot does NOT terminate the series: durable failure
           // record keyed by the occurrence's uuid, cadence keeps advancing.
@@ -301,7 +305,6 @@ crabs_error_e scheduler_process_due(state_t* state, uint64_t now_ms) {
         }
         operation_destroy(occurrence);
       }
-      fires_this_tick++;
 
       // A handler may have cancelled the entry during the fire — re-find by
       // id BEFORE touching it again (scheduler_cancel unlinks AND frees the

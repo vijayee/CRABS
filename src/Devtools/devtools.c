@@ -521,6 +521,12 @@ static void _write_schedules_json(json_writer_t* writer, const state_t* state) {
     _json_writer_uint(writer, entry->schedule_id);
     _json_writer_raw(writer, ",\"execute_at\":");
     _json_writer_uint(writer, entry->execute_at_ms);
+    _json_writer_raw(writer, ",\"interval\":");
+    _json_writer_uint(writer, entry->interval_ms);
+    _json_writer_raw(writer, ",\"repeat\":");
+    _json_writer_uint(writer, entry->repeat_count);
+    _json_writer_raw(writer, ",\"end_at\":");
+    _json_writer_uint(writer, entry->end_at_ms);
     _json_writer_raw(writer, ",\"submitter\":");
     _json_writer_string(writer, entry->submitter);
     _json_writer_raw(writer, "}");

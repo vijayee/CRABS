@@ -108,6 +108,7 @@ BASE_EXPORTS='[
   "_crabs_wasm_handler_get_am",
   "_crabs_wasm_handler_op_get_payload_str",
   "_crabs_wasm_schedule",
+  "_crabs_wasm_schedule_recurring",
   "_crabs_wasm_cancel_schedule",
   "_crabs_wasm_process_schedules",
   "_crabs_wasm_schedule_count",
@@ -116,6 +117,9 @@ BASE_EXPORTS='[
   "_crabs_wasm_schedule_id",
   "_crabs_wasm_schedule_execute_at",
   "_crabs_wasm_schedule_submitter",
+  "_crabs_wasm_schedule_interval",
+  "_crabs_wasm_schedule_repeat_count",
+  "_crabs_wasm_schedule_end_at",
   "_crabs_time_source_https_create",
   "_crabs_time_source_https_create_with_transport",
   "_crabs_time_source_destroy"

@@ -47,7 +47,31 @@ async function main() {
   node.cancelSchedule(cancelId);
   assert.strictEqual(node.pendingSchedules().length, 0);
 
-  console.log('schedules smoke OK: id=' + scheduleId);
+  // Recurring: 3-fire series with 1s interval, driven by injected ticks.
+  const recurring = await Operation.create('mint');
+  recurring.signerId = 'alice';
+  recurring.nodeId = 'alice';
+  node.sign(recurring, key.privateKeyHex());
+  const recurringId = node.scheduleRecurring(recurring, now + 1000, 1000, 3, 0);
+  assert.ok(recurringId > 0n, 'scheduleRecurring must return a positive id');
+
+  const recurringRow = node.pendingSchedules()[0];
+  assert.strictEqual(recurringRow.intervalMs, 1000n);
+  assert.strictEqual(recurringRow.repeatCount, 3n);
+  assert.strictEqual(recurringRow.endAt, 0n);
+  assert.strictEqual(recurringRow.executeAt, BigInt(now + 1000));
+
+  // Not due yet: still pending, nothing materialized.
+  node.processSchedules(now);
+  assert.strictEqual(node.pendingSchedules().length, 1);
+
+  // Catch-up: all 3 slots (1000/2000/3000) fire in order, then the
+  // series is exhausted and the row disappears.
+  node.processSchedules(now + 3500);
+  assert.strictEqual(node.pendingSchedules().length, 0);
+
+  console.log('schedules smoke OK: id=' + scheduleId +
+              ' recurring=' + recurringId);
   process.exit(0);
 }
 
