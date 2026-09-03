@@ -452,35 +452,17 @@ static bool state_last_log_entry_for_signer(const state_t* state, const char* si
   return false;
 }
 
-crabs_error_e state_machine_execute(state_t* state, operation_t* op) {
-  if (state == NULL || op == NULL) return CRABS_ERR_INVALID_PARAM;
-
-  // Step 1: Prune expired locks
-  uint64_t now_ms;
-  if (!state_get_time_ms(state, &now_ms)) {
-    // R7-01: no authenticated time — fail closed rather than use the
-    // attacker-controlled local clock for expiry decisions.
-    return CRABS_ERR_CRYPTOGRAPHIC_ERROR;
-  }
-  state_machine_prune_expired(state, now_ms);
-
-  // Audit H-C: inject the wall clock into the attribute machine and prune
-  // expired temporary attributes BEFORE authorization. Without this, an
-  // expired temporary attribute (issued via attribute_machine_issue_temporary)
-  // would continue to satisfy policies indefinitely — current_time_ms stays 0
-  // and prune_expired_temporary never removes anything.
-  if (state->attr_machine != NULL) {
-    attribute_machine_set_time(state->attr_machine, now_ms);
-    attribute_machine_prune_expired_temporary(state->attr_machine);
-  }
-
-  // Step 3: Authorization (§10.3) — fail closed. Every operation requires a
-  // registered policy and a valid signature.
-  // Audit L-a: authorize BEFORE the protocol/lock/dedup checks (steps 4-6)
-  // so an unauthenticated caller cannot learn resource existence, lock
-  // state, or dedup-tracker membership from distinct error codes. An
-  // unauthenticated caller gets a single CRABS_ERR_UNAUTHORIZED; an
-  // authenticated caller still receives the specific protocol error below.
+// Step 3 helper: Authorization (§10.3) — fail closed. Every operation
+// requires a registered policy and a valid signature.
+// Audit L-a: authorize BEFORE the protocol/lock/dedup checks (steps 4-6)
+// so an unauthenticated caller cannot learn resource existence, lock
+// state, or dedup-tracker membership from distinct error codes. An
+// unauthenticated caller gets a single CRABS_ERR_UNAUTHORIZED; an
+// authenticated caller still receives the specific protocol error below.
+// On success, *pp_out receives the preprocessed policy result (needed by
+// the co-signature check in step 6c).
+static crabs_error_e _verify_operation_authorization(state_t* state, const operation_t* op,
+                                                     policy_preprocess_result_t* pp_out) {
   if (state->attr_machine == NULL) {
     return CRABS_ERR_UNAUTHORIZED;
   }
@@ -529,6 +511,161 @@ crabs_error_e state_machine_execute(state_t* state, operation_t* op) {
     return vr.error;
   }
 
+  *pp_out = pp;
+  return CRABS_SUCCESS;
+}
+
+// Step 4 helper: Verify protocol state transitions (§7.4 step 4).
+static crabs_error_e _check_transitions(state_t* state, const operation_t* op) {
+  for (uint32_t i = 0; i < op->resource_count; i++) {
+    data_item_t* item = state_find_item(state, op->resources[i]);
+    if (item == NULL) return CRABS_ERR_RESOURCE_NOT_FOUND;
+    if (item->protocol_state != op->required_state[i]) {
+      return CRABS_ERR_PROTOCOL_VIOLATION;
+    }
+  }
+  return CRABS_SUCCESS;
+}
+
+// Step 6 helper: Key version verification (§10.4).
+static crabs_error_e _check_key_version(state_t* state, const operation_t* op) {
+  // R7-04: the check is mandatory when the signer has a nonzero key_version.
+  // The prior `op->signer_key_version > 0` guard let a crafted op with
+  // signer_key_version = 0 skip the staleness check entirely, so a replayed op
+  // signed with a rotated-out key was accepted.
+  if (state->attr_machine != NULL) {
+    user_t* signer = attribute_machine_find_user(state->attr_machine, op->signer_id);
+    if (signer != NULL && signer->key_version > 0 &&
+        signer->key_version != op->signer_key_version) {
+      return CRABS_ERR_KEY_STALE;
+    }
+  }
+  return CRABS_SUCCESS;
+}
+
+// Step 6b helper: Scheme constraint enforcement (v1.3 §7).
+static crabs_error_e _check_scheme_constraints(state_t* state, const operation_t* op) {
+  // R7-04: the allowlist is enforced regardless of the op's declared scheme.
+  // The prior `op->sig_scheme != SCHEME_UNSPECIFIED` guard let an op bypass
+  // the allowlist by declaring the legacy path.
+  if (state->policies != NULL) {
+    const policy_t* policy = NULL;
+    for (uint32_t i = 0; i < state->policy_count; i++) {
+      if (strcmp(state->policies[i].operation, op->type) == 0) {
+        policy = &state->policies[i];
+        break;
+      }
+    }
+    if (policy != NULL && policy->allowed_scheme_count > 0) {
+      bool scheme_allowed = false;
+      for (uint32_t i = 0; i < policy->allowed_scheme_count; i++) {
+        if (policy->allowed_schemes[i] == op->sig_scheme) {
+          scheme_allowed = true;
+          break;
+        }
+      }
+      if (!scheme_allowed) {
+        return CRABS_ERR_UNAUTHORIZED;
+      }
+    }
+    if (policy != NULL && policy->min_key_version > 0 && state->attr_machine != NULL) {
+      user_t* signer = attribute_machine_find_user(state->attr_machine, op->signer_id);
+      if (signer != NULL && signer->key_version < policy->min_key_version) {
+        return CRABS_ERR_KEY_STALE;
+      }
+    }
+  }
+  return CRABS_SUCCESS;
+}
+
+// Step 6c helper: Co-signature verification and threshold enforcement
+// (v1.3 §4.2). Every co-signature is cryptographically verified against the
+// canonical signed form; co-signers must be distinct from each other and from
+// the primary signer. When a threshold is configured, it is enforced
+// unconditionally (no fail-open bypass). `pp` is the preprocessed policy from
+// step 3 — co-signatures verify against the same ABE policy as the primary
+// signer.
+static crabs_error_e _verify_co_signatures(state_t* state, const operation_t* op,
+                                           const policy_preprocess_result_t* pp) {
+  if (op->co_signer_count > 0) {
+    serialized_buffer_t* co_ser = crabs_serialize_for_signing(op);
+    if (co_ser == NULL) return CRABS_ERR_SERIALIZATION_ERROR;
+
+    for (uint32_t i = 0; i < op->co_signer_count; i++) {
+      const co_signature_t* cs = &op->co_signers[i];
+      if (cs->signer_id[0] == '\0') {
+        serialized_buffer_destroy(co_ser);
+        return CRABS_ERR_INVALID_PARAM;
+      }
+      // Distinctness: no co-signer may duplicate another or the primary signer.
+      if (strcmp(cs->signer_id, op->signer_id) == 0) {
+        serialized_buffer_destroy(co_ser);
+        return CRABS_ERR_DUPLICATE_OPERATION;
+      }
+      for (uint32_t j = 0; j < i; j++) {
+        if (strcmp(cs->signer_id, op->co_signers[j].signer_id) == 0) {
+          serialized_buffer_destroy(co_ser);
+          return CRABS_ERR_DUPLICATE_OPERATION;
+        }
+      }
+      crabs_error_e cs_rc = crypto_verify_co_signature(
+          state->attr_machine,
+          pp->abe_policy,
+          cs->signer_id, cs->key_id, cs->sig_scheme,
+          co_ser->data, co_ser->len,
+          cs->signature, cs->signature_len);
+      if (cs_rc != CRABS_SUCCESS) {
+        serialized_buffer_destroy(co_ser);
+        return CRABS_ERR_UNAUTHORIZED;
+      }
+    }
+    serialized_buffer_destroy(co_ser);
+  }
+
+  if (state->config.sig_config.co_sign_threshold > 0 &&
+      op->co_signer_count < state->config.sig_config.co_sign_threshold) {
+    return CRABS_ERR_UNAUTHORIZED;
+  }
+
+  return CRABS_SUCCESS;
+}
+
+static crabs_error_e state_machine_execute_internal(state_t* state, operation_t* op,
+                                                    bool skip_authorization,
+                                                    bool process_schedules) {
+  if (state == NULL || op == NULL) return CRABS_ERR_INVALID_PARAM;
+
+  // Step 1: Prune expired locks
+  uint64_t now_ms;
+  if (!state_get_time_ms(state, &now_ms)) {
+    // R7-01: no authenticated time — fail closed rather than use the
+    // attacker-controlled local clock for expiry decisions.
+    return CRABS_ERR_CRYPTOGRAPHIC_ERROR;
+  }
+  state_machine_prune_expired(state, now_ms);
+
+  // Audit H-C: inject the wall clock into the attribute machine and prune
+  // expired temporary attributes BEFORE authorization. Without this, an
+  // expired temporary attribute (issued via attribute_machine_issue_temporary)
+  // would continue to satisfy policies indefinitely — current_time_ms stays 0
+  // and prune_expired_temporary never removes anything.
+  if (state->attr_machine != NULL) {
+    attribute_machine_set_time(state->attr_machine, now_ms);
+    attribute_machine_prune_expired_temporary(state->attr_machine);
+  }
+
+  // Step 3: Authorization — skipped for scheduled materialization, where
+  // authorization was already enforced at submission time
+  // (state_machine_validate). Declared unconditionally so the co-signature
+  // helper can take its address in either mode.
+  policy_preprocess_result_t pp = {0};
+  if (!skip_authorization) {
+    crabs_error_e auth_rc = _verify_operation_authorization(state, op, &pp);
+    if (auth_rc != CRABS_SUCCESS) {
+      return auth_rc;
+    }
+  }
+
   // Step 3b: Transaction manager accept (replay protection).
   // R7-L-4: this runs AFTER signature verification but BEFORE the protocol
   // state / lock / dedup checks. The prior placement at the top of execute()
@@ -549,39 +686,33 @@ crabs_error_e state_machine_execute(state_t* state, operation_t* op) {
     }
   }
 
-  // Step 3c: Ordering monotonicity (R7-11 + v1.6 Amd6). A replayed op
-  // carries the same ordering timestamp as the original, so require the op
-  // to be strictly newer than the signer's last logged op. HLC-ordered ops
-  // are compared by HLC (they may legitimately carry lamport_time 0);
-  // lamport-ordered ops by lamport_time. Cross-system: lamport ops sort
-  // before HLC ops, so an HLC op is always newer than a lamport-logged one.
-  // This survives restarts when the log is durable, closing the
-  // cross-session replay gap for plain (non-dedup) ops that the in-memory
-  // tx_manager cannot cover after a reset.
-  const log_entry_t* last_signer_entry = NULL;
-  if (state_last_log_entry_for_signer(state, op->signer_id, &last_signer_entry)) {
-    bool is_replay = false;
-    if (op->ordering_system == CRABS_ORDERING_HLC) {
-      if (last_signer_entry->ordering_system == CRABS_ORDERING_HLC) {
-        is_replay = crabs_hlc_compare(&op->hlc, &last_signer_entry->hlc) <= 0;
+  // Step 3c: Ordering monotonicity (R7-11 + v1.6 Amd6). Skipped for scheduled
+  // materialization — the ordering timestamp was checked at submission time,
+  // and the scheduled executor must not reject a materialized op that a later
+  // submission advanced past.
+  if (!skip_authorization) {
+    const log_entry_t* last_signer_entry = NULL;
+    if (state_last_log_entry_for_signer(state, op->signer_id, &last_signer_entry)) {
+      bool is_replay = false;
+      if (op->ordering_system == CRABS_ORDERING_HLC) {
+        if (last_signer_entry->ordering_system == CRABS_ORDERING_HLC) {
+          is_replay = crabs_hlc_compare(&op->hlc, &last_signer_entry->hlc) <= 0;
+        }
+        // Last entry was lamport-ordered: any HLC op is newer by the
+        // cross-system ordering rule (lamport sorts before HLC).
+      } else {
+        is_replay = op->lamport_time <= last_signer_entry->lamport_time;
       }
-      // Last entry was lamport-ordered: any HLC op is newer by the
-      // cross-system ordering rule (lamport sorts before HLC).
-    } else {
-      is_replay = op->lamport_time <= last_signer_entry->lamport_time;
-    }
-    if (is_replay) {
-      return CRABS_ERR_ALREADY_EXECUTED;
+      if (is_replay) {
+        return CRABS_ERR_ALREADY_EXECUTED;
+      }
     }
   }
 
   // Step 4: Verify protocol state transitions
-  for (uint32_t i = 0; i < op->resource_count; i++) {
-    data_item_t* item = state_find_item(state, op->resources[i]);
-    if (item == NULL) return CRABS_ERR_RESOURCE_NOT_FOUND;
-    if (item->protocol_state != op->required_state[i]) {
-      return CRABS_ERR_PROTOCOL_VIOLATION;
-    }
+  crabs_error_e transition_rc = _check_transitions(state, op);
+  if (transition_rc != CRABS_SUCCESS) {
+    return transition_rc;
   }
 
   // Step 5: Verify lock claims
@@ -626,94 +757,25 @@ crabs_error_e state_machine_execute(state_t* state, operation_t* op) {
     }
   }
 
-  // Step 6: Key version verification (§10.4)
-  // R7-04: the check is mandatory when the signer has a nonzero key_version.
-  // The prior `op->signer_key_version > 0` guard let a crafted op with
-  // signer_key_version = 0 skip the staleness check entirely, so a replayed op
-  // signed with a rotated-out key was accepted.
-  if (state->attr_machine != NULL) {
-    user_t* signer = attribute_machine_find_user(state->attr_machine, op->signer_id);
-    if (signer != NULL && signer->key_version > 0 &&
-        signer->key_version != op->signer_key_version) {
-      return CRABS_ERR_KEY_STALE;
+  // Steps 6, 6b, 6c: key staleness, scheme constraints, co-signatures.
+  // Skipped for scheduled materialization — all three were enforced at
+  // submission time via state_machine_validate, against the same signer and
+  // key state the scheduled op carries.
+  if (!skip_authorization) {
+    crabs_error_e key_version_rc = _check_key_version(state, op);
+    if (key_version_rc != CRABS_SUCCESS) {
+      return key_version_rc;
     }
-  }
 
-  // Step 6b: Scheme constraint enforcement (v1.3 §7)
-  // R7-04: the allowlist is enforced regardless of the op's declared scheme.
-  // The prior `op->sig_scheme != SCHEME_UNSPECIFIED` guard let an op bypass
-  // the allowlist by declaring the legacy path.
-  if (state->policies != NULL) {
-    const policy_t* policy = NULL;
-    for (uint32_t i = 0; i < state->policy_count; i++) {
-      if (strcmp(state->policies[i].operation, op->type) == 0) {
-        policy = &state->policies[i];
-        break;
-      }
+    crabs_error_e scheme_rc = _check_scheme_constraints(state, op);
+    if (scheme_rc != CRABS_SUCCESS) {
+      return scheme_rc;
     }
-    if (policy != NULL && policy->allowed_scheme_count > 0) {
-      bool scheme_allowed = false;
-      for (uint32_t i = 0; i < policy->allowed_scheme_count; i++) {
-        if (policy->allowed_schemes[i] == op->sig_scheme) {
-          scheme_allowed = true;
-          break;
-        }
-      }
-      if (!scheme_allowed) {
-        return CRABS_ERR_UNAUTHORIZED;
-      }
-    }
-    if (policy != NULL && policy->min_key_version > 0 && state->attr_machine != NULL) {
-      user_t* signer = attribute_machine_find_user(state->attr_machine, op->signer_id);
-      if (signer != NULL && signer->key_version < policy->min_key_version) {
-        return CRABS_ERR_KEY_STALE;
-      }
-    }
-  }
 
-  // Step 6c: Co-signature verification and threshold enforcement (v1.3 §4.2).
-  // Every co-signature is cryptographically verified against the canonical
-  // signed form; co-signers must be distinct from each other and from the
-  // primary signer. When a threshold is configured, it is enforced
-  // unconditionally (no fail-open bypass).
-  if (op->co_signer_count > 0) {
-    serialized_buffer_t* co_ser = crabs_serialize_for_signing(op);
-    if (co_ser == NULL) return CRABS_ERR_SERIALIZATION_ERROR;
-
-    for (uint32_t i = 0; i < op->co_signer_count; i++) {
-      const co_signature_t* cs = &op->co_signers[i];
-      if (cs->signer_id[0] == '\0') {
-        serialized_buffer_destroy(co_ser);
-        return CRABS_ERR_INVALID_PARAM;
-      }
-      // Distinctness: no co-signer may duplicate another or the primary signer.
-      if (strcmp(cs->signer_id, op->signer_id) == 0) {
-        serialized_buffer_destroy(co_ser);
-        return CRABS_ERR_DUPLICATE_OPERATION;
-      }
-      for (uint32_t j = 0; j < i; j++) {
-        if (strcmp(cs->signer_id, op->co_signers[j].signer_id) == 0) {
-          serialized_buffer_destroy(co_ser);
-          return CRABS_ERR_DUPLICATE_OPERATION;
-        }
-      }
-      crabs_error_e cs_rc = crypto_verify_co_signature(
-          state->attr_machine,
-          pp.abe_policy,
-          cs->signer_id, cs->key_id, cs->sig_scheme,
-          co_ser->data, co_ser->len,
-          cs->signature, cs->signature_len);
-      if (cs_rc != CRABS_SUCCESS) {
-        serialized_buffer_destroy(co_ser);
-        return CRABS_ERR_UNAUTHORIZED;
-      }
+    crabs_error_e co_signature_rc = _verify_co_signatures(state, op, &pp);
+    if (co_signature_rc != CRABS_SUCCESS) {
+      return co_signature_rc;
     }
-    serialized_buffer_destroy(co_ser);
-  }
-
-  if (state->config.sig_config.co_sign_threshold > 0 &&
-      op->co_signer_count < state->config.sig_config.co_sign_threshold) {
-    return CRABS_ERR_UNAUTHORIZED;
   }
 
   // Step 7: Execute operation handler
@@ -851,6 +913,44 @@ crabs_error_e state_machine_execute(state_t* state, operation_t* op) {
                         (attribute_machine_t*)state->attr_machine, trigger_now_ms);
   }
 
+  if (process_schedules) {
+    // Timed transactions: materialize scheduled operations whose execute_at_ms
+    // has passed. Added by the scheduler materialization step — not wired up yet.
+  }
+
+  return CRABS_SUCCESS;
+}
+
+crabs_error_e state_machine_execute(state_t* state, operation_t* op) {
+  return state_machine_execute_internal(state, op, false, true);
+}
+
+crabs_error_e state_machine_execute_scheduled(state_t* state, operation_t* op) {
+  return state_machine_execute_internal(state, op, true, false);
+}
+
+crabs_error_e state_machine_validate(state_t* state, const operation_t* op) {
+  if (state == NULL || op == NULL) return CRABS_ERR_INVALID_PARAM;
+
+  uint64_t now_ms;
+  if (!state_get_time_ms(state, &now_ms)) return CRABS_ERR_CRYPTOGRAPHIC_ERROR;
+  state_machine_prune_expired(state, now_ms);
+  if (state->attr_machine != NULL) {
+    attribute_machine_set_time(state->attr_machine, now_ms);
+    attribute_machine_prune_expired_temporary(state->attr_machine);
+  }
+
+  policy_preprocess_result_t pp;
+  crabs_error_e rc = _verify_operation_authorization(state, op, &pp);
+  if (rc != CRABS_SUCCESS) return rc;
+  rc = _check_transitions(state, op);
+  if (rc != CRABS_SUCCESS) return rc;
+  rc = _check_key_version(state, op);
+  if (rc != CRABS_SUCCESS) return rc;
+  rc = _check_scheme_constraints(state, op);
+  if (rc != CRABS_SUCCESS) return rc;
+  rc = _verify_co_signatures(state, op, &pp);
+  if (rc != CRABS_SUCCESS) return rc;
   return CRABS_SUCCESS;
 }
 

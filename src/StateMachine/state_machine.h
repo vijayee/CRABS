@@ -95,6 +95,17 @@ typedef struct {
 // ============================================================
 bool           state_machine_is_valid_transition(protocol_state_e current, const char* op_type);
 crabs_error_e  state_machine_execute(state_t* state, operation_t* op);
+
+// Authorization-only pipeline: signature + policy + key staleness + scheme +
+// co-signatures + transition feasibility, applied to nothing. Used by the
+// scheduler to authorize a scheduled operation at submission time.
+crabs_error_e  state_machine_validate(state_t* state, const operation_t* op);
+
+// Internal executor for scheduled materialization: transitions, dedup,
+// handlers, and logging apply; user-facing authorization and the ordering
+// check are skipped (enforced at submission).
+crabs_error_e  state_machine_execute_scheduled(state_t* state, operation_t* op);
+
 uint32_t       state_machine_prune_expired(state_t* state, uint64_t now_ms);
 
 // Built-in trigger operations (Amendment 1, §4) — defined in trigger.c

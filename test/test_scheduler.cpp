@@ -143,6 +143,57 @@ TEST(SchedulerSerialization, PendingSetSurvivesRoundtrip) {
   crabs_test_env_destroy(&env);
 }
 
+// Build a signed operation of the given type. "verify" is used because the
+// test env registers a role:admin policy for it and the bootstrap admin
+// satisfies that policy.
+static operation_t* make_signed_view_op(crabs_test_env_t* env, const char* op_type) {
+  operation_t* op = operation_create(op_type);
+  strncpy(op->signer_id, "admin", CRABS_MAX_USER_ID - 1);
+  crabs_test_sign_op_with(env->state->attr_machine, env->admin_key, op);
+  return op;
+}
+
+TEST(SchedulerValidate, ValidOpPassesWithoutApplying) {
+  crabs_test_env_t env;
+  crabs_test_env_init(&env);
+  operation_t* op = make_signed_view_op(&env, CRABS_OP_VERIFY);
+  uint64_t version_before = env.state->version;
+
+  EXPECT_EQ(state_machine_validate(env.state, op), CRABS_SUCCESS);
+  // Nothing applied: no log entry, version unchanged.
+  EXPECT_EQ(env.state->log_count, 0u);
+  EXPECT_EQ(env.state->version, version_before);
+
+  operation_destroy(op);
+  crabs_test_env_destroy(&env);
+}
+
+TEST(SchedulerValidate, BadSignatureRejectedWithoutApplying) {
+  crabs_test_env_t env;
+  crabs_test_env_init(&env);
+  operation_t* op = make_signed_view_op(&env, CRABS_OP_VERIFY);
+  op->signature[0] ^= 0xFF;
+
+  EXPECT_EQ(state_machine_validate(env.state, op), CRABS_ERR_UNAUTHORIZED);
+  EXPECT_EQ(env.state->log_count, 0u);
+
+  operation_destroy(op);
+  crabs_test_env_destroy(&env);
+}
+
+TEST(SchedulerValidate, MissingPolicyRejectedWithoutApplying) {
+  crabs_test_env_t env;
+  crabs_test_env_init(&env);
+  operation_t* op = make_signed_view_op(&env, CRABS_OP_VERIFY);
+  strncpy(op->type, "nosuchop", CRABS_MAX_OP_NAME - 1);
+  memset(op->signature, 0, CRABS_SIG_SIZE);
+
+  EXPECT_EQ(state_machine_validate(env.state, op), CRABS_ERR_UNAUTHORIZED);
+
+  operation_destroy(op);
+  crabs_test_env_destroy(&env);
+}
+
 TEST(SchedulerSerialization, ScheduleIdsContinueAfterRestore) {
   crabs_test_env_t env;
   crabs_test_env_init(&env);
