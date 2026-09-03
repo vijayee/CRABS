@@ -202,12 +202,23 @@ Date: 2026-09-03. Extends the scheduler above; all v1 decisions carry over.
   repeatCount, endAtMs)`; the one-shot `node.schedule` is unchanged.
   C-side: `scheduler_schedule_recurring(state, start_at_ms, interval_ms,
   repeat_count, end_at_ms, submitter, op)`.
-- **Per-occurrence identity:** each occurrence is materialized as its own
-  execution with a fresh random uuid (stamped by the scheduler for the 2nd+
-  fire; the first fire keeps the embedded op's original uuid). This is safe
-  because materialization skips signature verification (authorized at
-  submission). Occurrences execute sequentially in slot order, ordered with
-  any other ops through the normal pipeline.
+- **Per-occurrence identity (as implemented — supersedes the original
+  random-uuid design):** each occurrence's uuid is derived deterministically
+  as the embedded op's uuid XOR the slot's `execute_at_ms` (little-endian,
+  first 8 bytes), recomputed at fire time. Injective per series, stable
+  across ticks, and identical across replicas — two nodes catching up the
+  same missed slot derive the same uuid, so `_uuid_in_log` converges them
+  idempotently instead of producing divergent duplicates. Safe because
+  materialization skips signature verification (authorized at submission).
+  Regression test: `SchedulerRecurring.FiresAcrossSeparateTicksWithDistinctIdentity`.
+  Occurrences execute sequentially in slot order, ordered with any other ops
+  through the normal pipeline.
+- **Catch-up burst risk (documented, accepted):** catch-up fires ALL missed
+  slots in one tick by design; a very small interval combined with long
+  downtime (or a crafted state blob with a tiny interval) produces a large
+  burst on the node's main thread. There is no per-tick occurrence budget in
+  v2 — accepted per the "fire ALL missed occurrences" decision; a budget is
+  the escape hatch if this ever matters in practice.
 
 ## Data model changes
 

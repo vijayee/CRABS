@@ -133,6 +133,12 @@ first. Missed slots fire in order on the next tick (catch-up):
 node.scheduleRecurring(mintOp, Date.now() + 15_000, 15_000, 3, 0); // 3 fires
 ```
 
+Catch-up is unbounded by design: after long downtime with a small interval,
+the next tick fires every missed occurrence back-to-back. Occurrence identity
+is derived deterministically from the embedded operation and its slot time,
+so replicas converging on the same missed slots deduplicate via the audit
+log instead of double-firing.
+
 Notes:
 
 - `node.schedule` stores the operation directly (like the other convenience
