@@ -16,3 +16,6 @@ cmake-build-debug
 *.synctex.gz
 .superpowers/
 Testing/
+
+# Node deps
+node_modules/
