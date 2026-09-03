@@ -124,6 +124,25 @@ static bool _uuid_in_log(const state_t* state, const uint8_t uuid[CRABS_UUID_SIZ
   return false;
 }
 
+// Re-find a pending entry by schedule_id. Returns the link slot that holds
+// the entry (usable for unlinking) and sets *found_entry, or NULL when the
+// id is absent (cancelled). Matching by id — never by node pointer — is what
+// makes this safe against a cancel-then-reschedule during materialization:
+// schedule ids are monotonically increasing and never reused, so a freshly
+// allocated entry can never collide with a cancelled one's id.
+static scheduled_operation_t** _find_schedule_link(
+    state_t* state, uint64_t schedule_id, scheduled_operation_t** found_entry) {
+  scheduled_operation_t** link_slot = &state->scheduled_operations;
+  while (*link_slot != NULL) {
+    if ((*link_slot)->schedule_id == schedule_id) {
+      *found_entry = *link_slot;
+      return link_slot;
+    }
+    link_slot = &(*link_slot)->next;
+  }
+  return NULL;
+}
+
 crabs_error_e scheduler_process_due(state_t* state, uint64_t now_ms) {
   if (state == NULL) return CRABS_ERR_INVALID_PARAM;
 
@@ -151,78 +170,177 @@ crabs_error_e scheduler_process_due(state_t* state, uint64_t now_ms) {
 
   for (uint32_t due_index = 0; due_index < due_count; due_index++) {
     uint64_t schedule_id = due_ids[due_index];
-    scheduled_operation_t** link = &state->scheduled_operations;
     scheduled_operation_t* entry = NULL;
-    while (*link != NULL) {
-      if ((*link)->schedule_id == schedule_id) {
-        entry = *link;
+    scheduled_operation_t** link =
+        _find_schedule_link(state, schedule_id, &entry);
+    if (link == NULL) continue;  // cancelled during this tick
+
+    if (entry->interval_ms == 0) {
+      // ---- one-shot: remove from the pending list FIRST (idempotency guard
+      // ---- — replaces the R7-11 ordering check for scheduled
+      // ---- materializations), then materialize exactly once.
+      *link = entry->next;
+
+      operation_t* embedded =
+          crabs_deserialize_operation(entry->op_bytes, entry->op_len);
+      if (embedded == NULL) {
+        // Undecodable bytes: the op identity is not recoverable, so record
+        // with a RANDOM uuid and the submitter as the log signer. A random
+        // uuid prevents a permanent collision with any later all-zero-uuid op.
+        uint8_t failure_uuid[CRABS_UUID_SIZE];
+        if (crypto_random_bytes(failure_uuid, CRABS_UUID_SIZE) != CRABS_SUCCESS) {
+          memset(failure_uuid, 0, sizeof(failure_uuid));  // best effort only
+        }
+        state_machine_log_schedule_failure(state, failure_uuid, entry->submitter);
+        free(entry->op_bytes);
+        free(entry);
+        continue;
+      }
+
+      // Already applied via replication? Idempotent skip.
+      if (_uuid_in_log(state, embedded->uuid)) {
+        operation_destroy(embedded);
+        free(entry->op_bytes);
+        free(entry);
+        continue;
+      }
+
+      // Internal execution: authorization was enforced at submission.
+      // state_machine_execute_scheduled passes process_schedules=false, so the
+      // tick inside the materialized op's execute pipeline does NOT re-enter
+      // scheduler_process_due — no recursion while materializing. (Custom
+      // handlers can still re-enter via state_machine_execute; the
+      // scheduler_ticking guard above defers those to this tick.)
+      crabs_error_e materialize_rc =
+          state_machine_execute_scheduled(state, embedded);
+      if (materialize_rc == CRABS_ERR_ALREADY_EXECUTED) {
+        // The tx_manager accepted the uuid elsewhere (persistent store case):
+        // treat as idempotent success, not a failure.
+        operation_destroy(embedded);
+        free(entry->op_bytes);
+        free(entry);
+        continue;
+      }
+#ifdef CRABS_ENABLE_DEVTOOLS
+      // Materialized ops never pass through crabs_wasm_execute, so without
+      // this the Timeline would not show them at all (the ring is fed by the
+      // execute wrapper). Record the outcome, including failures — a rejected
+      // entry next to the durable __schedule_failed__ log record.
+      devtools_record_event(state, embedded, materialize_rc);
+#endif
+      if (materialize_rc != CRABS_SUCCESS) {
+        // Durable failure record keyed by the embedded op's uuid, so all nodes
+        // agree the schedule resolved as failed and the devtools Timeline can
+        // show it. The record is LAMPORT-ordered with lamport 0, so it never
+        // blocks the signer's later ops (HLC sorts after lamport; lamport
+        // signers already need lamport > their signed value).
+        state_machine_log_schedule_failure(state, embedded->uuid, embedded->signer_id);
+      }
+      operation_destroy(embedded);
+      free(entry->op_bytes);
+      free(entry);
+      continue;
+    }
+
+    // ---- recurring: fire ALL due slots in order; the entry stays resident
+    // ---- until the series terminates (count exhausted, past end_at, or the
+    // ---- embedded bytes prove undecodable). repeat_count is "remaining
+    // ---- fires" where 0 = INFINITE (never decremented when 0); a finite
+    // ---- series counts down and is removed the instant its count hits 0
+    // ---- after a fire.
+    bool bytes_corrupt = false;
+    bool series_exhausted = false;
+    uint32_t fires_this_tick = 0;
+    while (entry->execute_at_ms <= now_ms) {
+      if (entry->end_at_ms != 0 && entry->execute_at_ms > entry->end_at_ms) break;
+
+      // Overflow guard: execute_at += interval must not wrap (a hostile
+      // UINT64_MAX interval would wrap to a small value and re-fire).
+      if (entry->interval_ms > UINT64_MAX - entry->execute_at_ms) break;
+
+      operation_t* occurrence =
+          crabs_deserialize_operation(entry->op_bytes, entry->op_len);
+      if (occurrence == NULL) {
+        // Undecodable bytes: the op identity is not recoverable, so record
+        // with a RANDOM uuid and the submitter as the log signer (same
+        // reasoning as the one-shot path). Undecodable bytes would re-fail
+        // on every slot forever, so the series terminates here.
+        uint8_t failure_uuid[CRABS_UUID_SIZE];
+        if (crypto_random_bytes(failure_uuid, CRABS_UUID_SIZE) != CRABS_SUCCESS) {
+          memset(failure_uuid, 0, sizeof(failure_uuid));  // best effort only
+        }
+        state_machine_log_schedule_failure(state, failure_uuid, entry->submitter);
+        bytes_corrupt = true;
         break;
       }
-      link = &(*link)->next;
-    }
-    if (entry == NULL) continue;  // cancelled during this tick
-
-    // Remove from the pending list FIRST (idempotency guard — replaces the
-    // R7-11 ordering check for scheduled materializations).
-    *link = entry->next;
-
-    operation_t* embedded = crabs_deserialize_operation(entry->op_bytes, entry->op_len);
-    if (embedded == NULL) {
-      // Undecodable bytes: the op identity is not recoverable, so record
-      // with a RANDOM uuid and the submitter as the log signer. A random
-      // uuid prevents a permanent collision with any later all-zero-uuid op.
-      uint8_t failure_uuid[CRABS_UUID_SIZE];
-      if (crypto_random_bytes(failure_uuid, CRABS_UUID_SIZE) != CRABS_SUCCESS) {
-        memset(failure_uuid, 0, sizeof(failure_uuid));  // best effort only
+      if (fires_this_tick > 0) {
+        // Fresh identity per occurrence (2nd+ fires). SAFE: materialization
+        // skips signature verification — authorization happened at submission,
+        // so re-signing per occurrence is unnecessary and a fresh uuid cannot
+        // break any signature check.
+        if (crypto_random_bytes(occurrence->uuid, CRABS_UUID_SIZE) !=
+            CRABS_SUCCESS) {
+          // RNG unavailable (best effort): keep occurrences distinguishable
+          // anyway — a reused uuid would be dropped as already-in-log. Zero
+          // bytes then a fire-index byte gives every slot a distinct identity.
+          memset(occurrence->uuid, 0, CRABS_UUID_SIZE);
+          occurrence->uuid[CRABS_UUID_SIZE - 1] = (uint8_t)fires_this_tick;
+        }
       }
-      state_machine_log_schedule_failure(state, failure_uuid, entry->submitter);
-      free(entry->op_bytes);
-      free(entry);
-      continue;
+      if (_uuid_in_log(state, occurrence->uuid)) {
+        // Already applied via replication? Idempotent skip (still advances
+        // the cadence below).
+        operation_destroy(occurrence);
+      } else {
+        crabs_error_e fire_rc = state_machine_execute_scheduled(state, occurrence);
+        if (fire_rc != CRABS_SUCCESS && fire_rc != CRABS_ERR_ALREADY_EXECUTED) {
+          // A failed slot does NOT terminate the series: durable failure
+          // record keyed by the occurrence's uuid, cadence keeps advancing.
+          state_machine_log_schedule_failure(state, occurrence->uuid,
+                                             occurrence->signer_id);
+        }
+        operation_destroy(occurrence);
+      }
+      fires_this_tick++;
+
+      // Advance cadence + bookkeeping. Decrement ONLY finite counts (0 stays
+      // 0 = INFINITE forever).
+      entry->execute_at_ms += entry->interval_ms;
+      if (entry->repeat_count != 0) {
+        entry->repeat_count--;
+        if (entry->repeat_count == 0) {
+          series_exhausted = true;  // last allowed fire consumed
+          break;
+        }
+      }
+      if (entry->end_at_ms != 0 && entry->execute_at_ms > entry->end_at_ms) break;
+
+      // A handler may have cancelled the entry mid-loop — re-find by schedule
+      // id and stop if unlinked (freed; do not touch it further). Breaking
+      // here (instead of returning) keeps the single function exit, so the
+      // re-entrancy guard is always cleared; the termination re-find below
+      // then observes the unlink and moves on to the next due id.
+      scheduled_operation_t* recheck_entry = NULL;
+      if (_find_schedule_link(state, schedule_id, &recheck_entry) == NULL) {
+        break;  // cancelled mid-series
+      }
     }
 
-    // Already applied via replication? Idempotent skip.
-    if (_uuid_in_log(state, embedded->uuid)) {
-      operation_destroy(embedded);
-      free(entry->op_bytes);
-      free(entry);
-      continue;
-    }
+    // Termination removal: re-find by schedule id first (a handler may have
+    // cancelled the entry, unlinking and freeing it).
+    scheduled_operation_t** recheck =
+        _find_schedule_link(state, schedule_id, &entry);
+    if (recheck == NULL) continue;
 
-    // Internal execution: authorization was enforced at submission.
-    // state_machine_execute_scheduled passes process_schedules=false, so the
-    // tick inside the materialized op's execute pipeline does NOT re-enter
-    // scheduler_process_due — no recursion while materializing. (Custom
-    // handlers can still re-enter via state_machine_execute; the
-    // scheduler_ticking guard above defers those to this tick.)
-    crabs_error_e materialize_rc =
-        state_machine_execute_scheduled(state, embedded);
-    if (materialize_rc == CRABS_ERR_ALREADY_EXECUTED) {
-      // The tx_manager accepted the uuid elsewhere (persistent store case):
-      // treat as idempotent success, not a failure.
-      operation_destroy(embedded);
+    bool past_end = (entry->end_at_ms != 0 && entry->execute_at_ms > entry->end_at_ms);
+    if (series_exhausted || past_end || bytes_corrupt) {
+      // `recheck` points at the exact link slot that holds `entry`, so
+      // unlinking through it is safe even if OTHER entries were removed while
+      // handlers ran.
+      *recheck = entry->next;
       free(entry->op_bytes);
       free(entry);
-      continue;
     }
-#ifdef CRABS_ENABLE_DEVTOOLS
-    // Materialized ops never pass through crabs_wasm_execute, so without
-    // this the Timeline would not show them at all (the ring is fed by the
-    // execute wrapper). Record the outcome, including failures — a rejected
-    // entry next to the durable __schedule_failed__ log record.
-    devtools_record_event(state, embedded, materialize_rc);
-#endif
-    if (materialize_rc != CRABS_SUCCESS) {
-      // Durable failure record keyed by the embedded op's uuid, so all nodes
-      // agree the schedule resolved as failed and the devtools Timeline can
-      // show it. The record is LAMPORT-ordered with lamport 0, so it never
-      // blocks the signer's later ops (HLC sorts after lamport; lamport
-      // signers already need lamport > their signed value).
-      state_machine_log_schedule_failure(state, embedded->uuid, embedded->signer_id);
-    }
-    operation_destroy(embedded);
-    free(entry->op_bytes);
-    free(entry);
   }
 
   state->scheduler_ticking = false;

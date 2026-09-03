@@ -857,3 +857,156 @@ TEST(SchedulerSerialization, RecurringFieldsSurviveRoundtrip) {
 
   crabs_test_env_destroy(&env);
 }
+
+TEST(SchedulerRecurring, FiresOnCadenceUntilCountExhausted) {
+  crabs_test_env_t env;
+  crabs_test_env_init(&env);
+  register_schedule_test_policies(&env);
+  state_t* state = env.state;
+  state_set_time_source(state, &g_sched_mock_ops);
+  g_sched_mock_time.seconds = 1000000;
+  g_sched_mock_time.nanos = 0;
+  g_sched_mock_time.valid = true;
+
+  operation_t* embedded = make_counter_op("mint", "admin");
+  stamp_unique_uuid(embedded);
+  crabs_test_sign_op_with(state->attr_machine, env.admin_key, embedded);
+  uint64_t schedule_id = scheduler_schedule_recurring(
+      state, 1000001000, 1000, 3, 0, "admin", embedded);
+  ASSERT_NE(schedule_id, 0u);
+
+  // One tick fires all three slots (1000001000, 2000, 3000) in order; the
+  // series is exhausted after the third fire and the entry is removed.
+  ASSERT_EQ(scheduler_process_due(state, 1000003000u), CRABS_SUCCESS);
+  EXPECT_EQ(scheduler_count(state), 0u);
+
+  uint32_t mint_entries = 0;
+  for (uint64_t entry_index = 0; entry_index < state->log_count; entry_index++) {
+    if (strcmp(state->log[entry_index].type, "mint") == 0) mint_entries++;
+  }
+  EXPECT_EQ(mint_entries, 3u);
+
+  operation_destroy(embedded);
+  crabs_test_env_destroy(&env);
+}
+
+TEST(SchedulerRecurring, EndAtTerminatesBeforeNextFire) {
+  crabs_test_env_t env;
+  crabs_test_env_init(&env);
+  register_schedule_test_policies(&env);
+  state_t* state = env.state;
+  state_set_time_source(state, &g_sched_mock_ops);
+  g_sched_mock_time.seconds = 1000000;
+  g_sched_mock_time.nanos = 0;
+  g_sched_mock_time.valid = true;
+
+  operation_t* embedded = make_counter_op("mint", "admin");
+  stamp_unique_uuid(embedded);
+  crabs_test_sign_op_with(state->attr_machine, env.admin_key, embedded);
+  ASSERT_NE(scheduler_schedule_recurring(
+      state, 1000001000, 1000, 0, 1000002000, "admin", embedded), 0u);
+
+  // Slots 1000001000 and 1000002000 fire (both <= end_at); the next slot
+  // (1000003000) is past end_at → entry removed, no third fire.
+  ASSERT_EQ(scheduler_process_due(state, 1000003000u), CRABS_SUCCESS);
+  EXPECT_EQ(scheduler_count(state), 0u);
+
+  uint32_t mint_entries = 0;
+  for (uint64_t entry_index = 0; entry_index < state->log_count; entry_index++) {
+    if (strcmp(state->log[entry_index].type, "mint") == 0) mint_entries++;
+  }
+  EXPECT_EQ(mint_entries, 2u);
+
+  operation_destroy(embedded);
+  crabs_test_env_destroy(&env);
+}
+
+TEST(SchedulerRecurring, CatchUpFiresAllMissedSlotsInOrder) {
+  crabs_test_env_t env;
+  crabs_test_env_init(&env);
+  register_schedule_test_policies(&env);
+  state_t* state = env.state;
+  state_set_time_source(state, &g_sched_mock_ops);
+  g_sched_mock_time.seconds = 1000000;
+  g_sched_mock_time.nanos = 0;
+  g_sched_mock_time.valid = true;
+
+  operation_t* embedded = make_counter_op("mint", "admin");
+  stamp_unique_uuid(embedded);
+  crabs_test_sign_op_with(state->attr_machine, env.admin_key, embedded);
+  ASSERT_NE(scheduler_schedule_recurring(
+      state, 1000001000, 1000, 0, 0, "admin", embedded), 0u);
+
+  // Tick BETWEEN slots (1000005500) so slots 1000001000..5000 fire (5 fires)
+  // and slot 1000006000 stays future.
+  ASSERT_EQ(scheduler_process_due(state, 1000005500u), CRABS_SUCCESS);
+  uint32_t mint_entries = 0;
+  for (uint64_t entry_index = 0; entry_index < state->log_count; entry_index++) {
+    if (strcmp(state->log[entry_index].type, "mint") == 0) mint_entries++;
+  }
+  EXPECT_EQ(mint_entries, 5u);
+
+  // Infinite series stays resident with execute_at advanced to the next slot.
+  ASSERT_EQ(scheduler_count(state), 1u);
+  EXPECT_EQ(scheduler_first(state)->execute_at_ms, 1000006000u);
+
+  operation_destroy(embedded);
+  crabs_test_env_destroy(&env);
+}
+
+TEST(SchedulerRecurring, FailureDoesNotTerminateSeries) {
+  crabs_test_env_t env;
+  crabs_test_env_init(&env);
+  register_schedule_test_policies(&env);
+  state_t* state = env.state;
+  state_set_time_source(state, &g_sched_mock_ops);
+  g_sched_mock_time.seconds = 1000000;
+  g_sched_mock_time.nanos = 0;
+  g_sched_mock_time.valid = true;
+
+  // Signed __lock__ op on "res1" that will fail at materialization
+  // (resource re-locked with a valid unexpired lock so prune keeps it LOCKED).
+  data_item_t* resource = data_item_create("res1", DATA_TYPE_RESOURCE, CRDT_PN_COUNTER);
+  int64_t* value = (int64_t*)get_clear_memory(sizeof(int64_t));
+  *value = 5;
+  resource->value = value;
+  ASSERT_EQ(state_add_item(state, resource), CRABS_SUCCESS);
+
+  operation_t* embedded = operation_create(CRABS_OP_LOCK);
+  embedded->resources =
+      (char(*)[CRABS_MAX_USER_ID])get_clear_memory(sizeof(char[CRABS_MAX_USER_ID]));
+  strncpy(embedded->resources[0], "res1", CRABS_MAX_USER_ID - 1);
+  embedded->resource_count = 1;
+  embedded->required_state = (protocol_state_e*)get_clear_memory(sizeof(protocol_state_e));
+  embedded->required_state[0] = PROTOCOL_IDLE;
+  embedded->next_state = (protocol_state_e*)get_clear_memory(sizeof(protocol_state_e));
+  embedded->next_state[0] = PROTOCOL_LOCKED;
+  strncpy(embedded->signer_id, "admin", CRABS_MAX_USER_ID - 1);
+  crabs_test_sign_op_with(state->attr_machine, env.admin_key, embedded);
+
+  ASSERT_NE(scheduler_schedule_recurring(state, 1000001000, 1000, 0, 0,
+                                         "admin", embedded), 0u);
+
+  // Drift: lock the resource (valid unexpired lock survives pruning).
+  resource->protocol_state = PROTOCOL_LOCKED;
+  resource->lock_state.lock_token_valid = true;
+  memset(resource->lock_state.lock_token, 0xAB, CRABS_LOCK_TOKEN_SIZE);
+  resource->lock_state.lock_expiry = UINT64_MAX;
+
+  // Two due slots fire, both fail; the series CONTINUES (2 failure records,
+  // entry still resident, cadence advanced).
+  ASSERT_EQ(scheduler_process_due(state, 1000002500u), CRABS_SUCCESS);
+  EXPECT_EQ(scheduler_count(state), 1u);
+  EXPECT_EQ(scheduler_first(state)->execute_at_ms, 1000003000u);
+
+  uint32_t failure_records = 0;
+  for (uint64_t entry_index = 0; entry_index < state->log_count; entry_index++) {
+    if (strcmp(state->log[entry_index].type, "__schedule_failed__") == 0) {
+      failure_records++;
+    }
+  }
+  EXPECT_EQ(failure_records, 2u);
+
+  operation_destroy(embedded);
+  crabs_test_env_destroy(&env);
+}
