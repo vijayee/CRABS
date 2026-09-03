@@ -426,3 +426,61 @@ TEST(SchedulerValidate, TransitionMismatchRejectedWithoutApplying) {
   operation_destroy(op);
   crabs_test_env_destroy(&env);
 }
+
+TEST(SchedulerOps, MalformedSchedulePayloadsRejected) {
+  crabs_test_env_t env;
+  crabs_test_env_init(&env);
+  register_schedule_test_policies(&env);
+
+  // payload_size == 12 with no embedded op bytes
+  operation_t* op = operation_create(CRABS_OP_SCHEDULE);
+  strncpy(op->signer_id, "admin", CRABS_MAX_USER_ID - 1);
+  uint8_t* payload = (uint8_t*)get_clear_memory(12);
+  store_u64_le(payload, SCHEDULE_FUTURE_MS);
+  store_u32_le(payload + 8, 0);
+  op->payload = payload;
+  op->payload_size = 12;
+  crabs_test_sign_op_with(env.state->attr_machine, env.admin_key, op);
+  EXPECT_EQ(state_machine_execute(env.state, op), CRABS_ERR_INVALID_PARAM);
+  operation_destroy(op);
+
+  // inner_len lies: claims 4 bytes, payload carries 8
+  op = operation_create(CRABS_OP_SCHEDULE);
+  strncpy(op->signer_id, "admin", CRABS_MAX_USER_ID - 1);
+  payload = (uint8_t*)get_clear_memory(20);
+  store_u64_le(payload, SCHEDULE_FUTURE_MS);
+  store_u32_le(payload + 8, 4);
+  memset(payload + 12, 0xAB, 8);
+  op->payload = payload;
+  op->payload_size = 20;
+  crabs_test_sign_op_with(env.state->attr_machine, env.admin_key, op);
+  EXPECT_EQ(state_machine_execute(env.state, op), CRABS_ERR_INVALID_PARAM);
+  operation_destroy(op);
+
+  // huge inner_len targeting the uint32 wrap in 12 + inner_len
+  op = operation_create(CRABS_OP_SCHEDULE);
+  strncpy(op->signer_id, "admin", CRABS_MAX_USER_ID - 1);
+  payload = (uint8_t*)get_clear_memory(16);
+  store_u64_le(payload, SCHEDULE_FUTURE_MS);
+  store_u32_le(payload + 8, 0xFFFFFFF4u);
+  memset(payload + 12, 0xAB, 4);
+  op->payload = payload;
+  op->payload_size = 16;
+  crabs_test_sign_op_with(env.state->attr_machine, env.admin_key, op);
+  EXPECT_EQ(state_machine_execute(env.state, op), CRABS_ERR_INVALID_PARAM);
+  operation_destroy(op);
+
+  // wrong-size __cancel_schedule__ payload
+  op = operation_create(CRABS_OP_CANCEL_SCHEDULE);
+  strncpy(op->signer_id, "admin", CRABS_MAX_USER_ID - 1);
+  payload = (uint8_t*)get_clear_memory(4);
+  memset(payload, 0, 4);
+  op->payload = payload;
+  op->payload_size = 4;
+  crabs_test_sign_op_with(env.state->attr_machine, env.admin_key, op);
+  EXPECT_EQ(state_machine_execute(env.state, op), CRABS_ERR_INVALID_PARAM);
+  operation_destroy(op);
+
+  EXPECT_EQ(scheduler_count(env.state), 0u);
+  crabs_test_env_destroy(&env);
+}

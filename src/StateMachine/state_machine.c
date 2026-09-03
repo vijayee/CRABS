@@ -926,10 +926,9 @@ static crabs_error_e state_machine_execute_internal(state_t* state, operation_t*
                         (attribute_machine_t*)state->attr_machine, trigger_now_ms);
   }
 
-  if (process_schedules) {
-    // Timed transactions: materialize scheduled operations whose execute_at_ms
-    // has passed. Added by the scheduler materialization step — not wired up yet.
-  }
+  // Task 4: scheduler_process_due(state, now_ms) runs here when
+  // process_schedules is set (normal path only — scheduled execution must
+  // not recurse into the tick).
 
   return CRABS_SUCCESS;
 }
@@ -998,6 +997,9 @@ crabs_error_e state_machine_op_schedule(state_t* state, operation_t* op) {
   // Payload layout: [u64 execute_at_ms LE][u32 op_len LE][op_bytes].
   uint64_t execute_at_ms = _load_u64_le(op->payload);
   uint32_t inner_len = _load_u32_le(op->payload + 8);
+  // 12 + inner_len wraps mod 2^32 for huge inner_len, but any overflowed sum
+  // is < 12 while payload_size >= 12 was already verified, so the equality
+  // below can never match an overflowed value.
   if (inner_len == 0 || op->payload_size != 12 + inner_len) {
     return CRABS_ERR_INVALID_PARAM;
   }
