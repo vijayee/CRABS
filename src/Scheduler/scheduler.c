@@ -37,25 +37,16 @@ uint64_t scheduler_schedule(state_t* state, uint64_t execute_at_ms,
 
   scheduled_operation_t* entry =
       (scheduled_operation_t*)get_clear_memory(sizeof(scheduled_operation_t));
-  if (entry == NULL) {
-    serialized_buffer_destroy(serialized);
-    return 0;
-  }
   entry->schedule_id = ++state->schedule_seq;
   entry->execute_at_ms = execute_at_ms;
   strncpy(entry->submitter, submitter, CRABS_MAX_USER_ID - 1);
   entry->op_len = serialized->len;
   entry->op_bytes = (uint8_t*)get_clear_memory(serialized->len);
-  if (entry->op_bytes == NULL) {
-    serialized_buffer_destroy(serialized);
-    free(entry);
-    return 0;
-  }
   memcpy(entry->op_bytes, serialized->data, serialized->len);
   serialized_buffer_destroy(serialized);
 
   // Append at the tail so the list follows submission order; due entries
-  // are materialized in execute_at order by scheduler_process_due.
+  // are materialized in list order by scheduler_process_due.
   if (state->scheduled_operations == NULL) {
     state->scheduled_operations = entry;
   } else {

@@ -26,7 +26,8 @@ crabs_error_e scheduler_cancel(state_t* state, uint64_t schedule_id);
 // Number of pending schedules.
 uint32_t scheduler_count(const state_t* state);
 
-// Head of the pending list (oldest insertion first). NULL when empty.
+// Head of the pending list in submission order (also after restore).
+// NULL when empty.
 const scheduled_operation_t* scheduler_first(const state_t* state);
 
 // Materialize every pending schedule whose execute_at_ms <= now_ms.

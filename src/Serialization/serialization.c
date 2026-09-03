@@ -23,6 +23,9 @@
 // parent-lookup scans cannot be driven to a multi-minute CPU DoS by a crafted
 // blob (CRABS_DESER_MAX_LOG allows 1M nodes → ~10¹² strcmp calls).
 #define CRABS_DESER_MAX_TREE_NODES 10000
+// Bound on a single scheduled operation's serialized payload read from the
+// wire; blocks a tiny crafted blob from driving a huge allocation (audit M-2).
+#define CRABS_DESER_MAX_SCHEDULE_OP_BYTES (1024u * 1024u)
 
 // ============================================================
 // Write buffer helper
@@ -1267,6 +1270,7 @@ serialized_buffer_t* crabs_serialize_state(const state_t* state) {
   }
 
   // schedules (v6): pending timed transactions
+  _write_uint64_le(buf, state->schedule_seq);
   uint32_t schedule_count = 0;
   for (const scheduled_operation_t* schedule_entry = state->scheduled_operations;
        schedule_entry != NULL; schedule_entry = schedule_entry->next) {
@@ -1393,6 +1397,7 @@ state_t* crabs_deserialize_state(const uint8_t* data, size_t len) {
 
   // schedules (v6+): pending timed transactions
   if (version >= 6) {
+    if (!_read_uint64_le(&buf, &state->schedule_seq)) goto fail;
     uint32_t schedule_count;
     if (!_read_uint32_le(&buf, &schedule_count)) goto fail;
     if (schedule_count > CRABS_DESER_MAX_ITEMS) goto fail;
@@ -1400,28 +1405,31 @@ state_t* crabs_deserialize_state(const uint8_t* data, size_t len) {
       scheduled_operation_t* entry =
           (scheduled_operation_t*)get_clear_memory(sizeof(scheduled_operation_t));
       if (!_read_uint64_le(&buf, &entry->schedule_id) ||
-          !_read_uint64_le(&buf, &entry->execute_at_ms)) {
-        free(entry);
-        goto fail;
-      }
-      if (!_read_bytes(&buf, (uint8_t*)entry->submitter, CRABS_MAX_USER_ID)) {
+          !_read_uint64_le(&buf, &entry->execute_at_ms) ||
+          !_read_bytes(&buf, (uint8_t*)entry->submitter, CRABS_MAX_USER_ID)) {
         free(entry);
         goto fail;
       }
       if (!_read_uint32_le(&buf, &entry->op_len) || entry->op_len == 0 ||
-          entry->op_len > 1024u * 1024u) {
+          entry->op_len > CRABS_DESER_MAX_SCHEDULE_OP_BYTES) {
         free(entry);
         goto fail;
       }
       entry->op_bytes = (uint8_t*)get_clear_memory(entry->op_len);
-      if (entry->op_bytes == NULL ||
-          !_read_bytes(&buf, entry->op_bytes, entry->op_len)) {
+      if (!_read_bytes(&buf, entry->op_bytes, entry->op_len)) {
         free(entry->op_bytes);
         free(entry);
         goto fail;
       }
-      entry->next = state->scheduled_operations;
-      state->scheduled_operations = entry;
+      // Append at the tail so the restored list follows submission order,
+      // matching scheduler_schedule's insertion order.
+      if (state->scheduled_operations == NULL) {
+        state->scheduled_operations = entry;
+      } else {
+        scheduled_operation_t* tail = state->scheduled_operations;
+        while (tail->next != NULL) tail = tail->next;
+        tail->next = entry;
+      }
     }
   }
 

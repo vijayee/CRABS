@@ -89,11 +89,30 @@ TEST(SchedulerList, CancelRemovesPendingEntry) {
   crabs_test_env_destroy(&env);
 }
 
+TEST(SchedulerList, CancelMiddleEntryPreservesRest) {
+  crabs_test_env_t env;
+  crabs_test_env_init(&env);
+  operation_t* op = make_counter_op("mint", "admin");
+  uint64_t first_id = scheduler_schedule(env.state, 1000, "admin", op);
+  uint64_t middle_id = scheduler_schedule(env.state, 2000, "admin", op);
+  uint64_t last_id = scheduler_schedule(env.state, 3000, "admin", op);
+
+  EXPECT_EQ(scheduler_cancel(env.state, middle_id), CRABS_SUCCESS);
+  EXPECT_EQ(scheduler_count(env.state), 2u);
+  EXPECT_EQ(scheduler_first(env.state)->schedule_id, first_id);
+  EXPECT_EQ(scheduler_cancel(env.state, middle_id), CRABS_ERR_RESOURCE_NOT_FOUND);
+
+  operation_destroy(op);
+  crabs_test_env_destroy(&env);
+}
+
 TEST(SchedulerSerialization, PendingSetSurvivesRoundtrip) {
   crabs_test_env_t env;
   crabs_test_env_init(&env);
   operation_t* op = make_counter_op("mint", "admin");
-  uint64_t schedule_id = scheduler_schedule(env.state, 1234567, "admin", op);
+  uint64_t first_id = scheduler_schedule(env.state, 1000, "admin", op);
+  uint64_t second_id = scheduler_schedule(env.state, 2000, "admin", op);
+  uint64_t third_id = scheduler_schedule(env.state, 3000, "admin", op);
   operation_destroy(op);
 
   serialized_buffer_t* blob = crabs_serialize_state(env.state);
@@ -102,14 +121,50 @@ TEST(SchedulerSerialization, PendingSetSurvivesRoundtrip) {
   serialized_buffer_destroy(blob);
   ASSERT_NE(restored, nullptr);
 
-  EXPECT_EQ(scheduler_count(restored), 1u);
+  EXPECT_EQ(scheduler_count(restored), 3u);
+  // Submission order must be preserved across the roundtrip: the first entry
+  // after restore is the earliest-scheduled one.
   const scheduled_operation_t* pending = scheduler_first(restored);
   ASSERT_NE(pending, nullptr);
-  EXPECT_EQ(pending->schedule_id, schedule_id);
-  EXPECT_EQ(pending->execute_at_ms, 1234567u);
+  EXPECT_EQ(pending->schedule_id, first_id);
+  EXPECT_EQ(pending->execute_at_ms, 1000u);
   EXPECT_STREQ(pending->submitter, "admin");
   EXPECT_GT(pending->op_len, 0u);
+  pending = pending->next;
+  ASSERT_NE(pending, nullptr);
+  EXPECT_EQ(pending->schedule_id, second_id);
+  EXPECT_EQ(pending->execute_at_ms, 2000u);
+  pending = pending->next;
+  ASSERT_NE(pending, nullptr);
+  EXPECT_EQ(pending->schedule_id, third_id);
+  EXPECT_EQ(pending->execute_at_ms, 3000u);
   state_destroy(restored);
 
+  crabs_test_env_destroy(&env);
+}
+
+TEST(SchedulerSerialization, ScheduleIdsContinueAfterRestore) {
+  crabs_test_env_t env;
+  crabs_test_env_init(&env);
+  operation_t* first = make_counter_op("mint", "admin");
+  uint64_t first_id = scheduler_schedule(env.state, 1000, "admin", first);
+  operation_destroy(first);
+
+  serialized_buffer_t* blob = crabs_serialize_state(env.state);
+  ASSERT_NE(blob, nullptr);
+  state_t* restored = crabs_deserialize_state(blob->data, blob->len);
+  serialized_buffer_destroy(blob);
+  ASSERT_NE(restored, nullptr);
+
+  operation_t* second = make_counter_op("mint", "admin");
+  uint64_t second_id = scheduler_schedule(restored, 2000, "admin", second);
+  EXPECT_GT(second_id, first_id);  // must not collide with the restored entry's id
+  // Also verify cancel targets the right entry: cancel the new id must not
+  // remove the restored pending entry.
+  EXPECT_EQ(scheduler_cancel(restored, second_id), CRABS_SUCCESS);
+  EXPECT_EQ(scheduler_count(restored), 1u);
+  EXPECT_EQ(scheduler_first(restored)->schedule_id, first_id);
+  operation_destroy(second);
+  state_destroy(restored);
   crabs_test_env_destroy(&env);
 }
