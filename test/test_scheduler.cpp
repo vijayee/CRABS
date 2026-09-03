@@ -954,6 +954,69 @@ TEST(SchedulerRecurring, CatchUpFiresAllMissedSlotsInOrder) {
   crabs_test_env_destroy(&env);
 }
 
+// ============================================================
+// UAF regression: a handler cancels the recurring series it is
+// materialized from, while the tick loop is advancing the cadence.
+// ============================================================
+
+// The handler below must cancel the series' own schedule id, captured after
+// scheduling (ids are assigned by the scheduler, so the test reads it back).
+static uint64_t g_cancel_schedule_id = 0;
+
+// A handler for 'mint' that cancels the recurring schedule mid-fire. The
+// scheduler unlinks AND frees the entry inside this call, so the tick loop
+// must re-find the entry before touching it again.
+static crabs_error_e cancel_own_series_handler(state_t* state, operation_t* op) {
+  (void)op;
+  return scheduler_cancel(state, g_cancel_schedule_id);
+}
+
+TEST(SchedulerRecurring, HandlerCancelDuringFireIsSafe) {
+  crabs_test_env_t env;
+  crabs_test_env_init(&env);
+  register_schedule_test_policies(&env);
+  state_t* state = env.state;
+  state_set_time_source(state, &g_sched_mock_ops);
+  g_sched_mock_time.seconds = 1000000;
+  g_sched_mock_time.nanos = 0;
+  g_sched_mock_time.valid = true;
+
+  operation_t* embedded = make_counter_op("mint", "admin");
+  stamp_unique_uuid(embedded);
+  crabs_test_sign_op_with(state->attr_machine, env.admin_key, embedded);
+
+  // Infinite series (repeat_count 0) with 1000 ms cadence so several slots
+  // are due within one tick: the first fire's handler cancels the entry.
+  uint64_t schedule_id = scheduler_schedule_recurring(
+      state, 1000001000, 1000, 0, 0, "admin", embedded);
+  ASSERT_NE(schedule_id, 0u);
+  g_cancel_schedule_id = schedule_id;
+
+  // Re-register 'mint' so the materialized occurrence cancels its own series.
+  ASSERT_EQ(state_machine_register_handler(state, "mint",
+                                           cancel_own_series_handler),
+            CRABS_SUCCESS);
+
+  // Two slots are due (1000001000, 1000002000). The first fire's handler
+  // cancels the series: the loop must stop cleanly without touching the
+  // freed entry, and the function must return success with the re-entrancy
+  // flag cleared.
+  ASSERT_EQ(scheduler_process_due(state, 1000002500u), CRABS_SUCCESS);
+
+  EXPECT_EQ(scheduler_count(state), 0u);
+  EXPECT_FALSE(state->scheduler_ticking);
+
+  // Exactly one fire happened (the second slot never fires after the cancel).
+  uint32_t mint_entries = 0;
+  for (uint64_t entry_index = 0; entry_index < state->log_count; entry_index++) {
+    if (strcmp(state->log[entry_index].type, "mint") == 0) mint_entries++;
+  }
+  EXPECT_EQ(mint_entries, 1u);
+
+  operation_destroy(embedded);
+  crabs_test_env_destroy(&env);
+}
+
 TEST(SchedulerRecurring, FailureDoesNotTerminateSeries) {
   crabs_test_env_t env;
   crabs_test_env_init(&env);

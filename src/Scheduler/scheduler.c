@@ -303,8 +303,21 @@ crabs_error_e scheduler_process_due(state_t* state, uint64_t now_ms) {
       }
       fires_this_tick++;
 
-      // Advance cadence + bookkeeping. Decrement ONLY finite counts (0 stays
-      // 0 = INFINITE forever).
+      // A handler may have cancelled the entry during the fire — re-find by
+      // id BEFORE touching it again (scheduler_cancel unlinks AND frees the
+      // entry, so the cadence fields below would read freed memory). Breaking
+      // here (instead of returning) keeps the single function exit, so the
+      // re-entrancy guard is always cleared; the termination re-find after
+      // the loop then observes the unlink and moves on to the next due id.
+      scheduled_operation_t* recheck_entry = NULL;
+      scheduled_operation_t** mid_link =
+          _find_schedule_link(state, schedule_id, &recheck_entry);
+      if (mid_link == NULL) break;  // cancelled mid-series: entry already freed
+      entry = recheck_entry;
+
+      // Advance cadence + bookkeeping (safe: the re-find above confirmed the
+      // entry is still linked). Decrement ONLY finite counts (0 stays 0 =
+      // INFINITE forever).
       entry->execute_at_ms += entry->interval_ms;
       if (entry->repeat_count != 0) {
         entry->repeat_count--;
@@ -315,15 +328,8 @@ crabs_error_e scheduler_process_due(state_t* state, uint64_t now_ms) {
       }
       if (entry->end_at_ms != 0 && entry->execute_at_ms > entry->end_at_ms) break;
 
-      // A handler may have cancelled the entry mid-loop — re-find by schedule
-      // id and stop if unlinked (freed; do not touch it further). Breaking
-      // here (instead of returning) keeps the single function exit, so the
-      // re-entrancy guard is always cleared; the termination re-find below
-      // then observes the unlink and moves on to the next due id.
-      scheduled_operation_t* recheck_entry = NULL;
-      if (_find_schedule_link(state, schedule_id, &recheck_entry) == NULL) {
-        break;  // cancelled mid-series
-      }
+      // No second re-find here: nothing runs between this point and the loop
+      // condition that could free the entry.
     }
 
     // Termination removal: re-find by schedule id first (a handler may have
