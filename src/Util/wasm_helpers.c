@@ -20,6 +20,7 @@
 #include "../HLC/hlc.h"
 #include "../CRDT/crdt_merge.h"
 #include "../CRDT/one_shot.h"
+#include "../Scheduler/scheduler.h"
 
 #ifdef CRABS_ENABLE_DEVTOOLS
 #include "../Devtools/devtools.h"
@@ -545,6 +546,60 @@ const char* crabs_wasm_handler_op_get_payload_str(operation_t* op) {
   // as a C string. Demo payloads are null-terminated JSON strings.
   if (op->payload[op->payload_size - 1] != '\0') return NULL;
   return (const char*)op->payload;
+}
+
+// ============================================================
+// Timed transactions (v1)
+// ============================================================
+
+EMSCRIPTEN_KEEPALIVE
+uint64_t crabs_wasm_schedule(attribute_machine_t* am, operation_t* inner_op,
+                             uint64_t execute_at_ms) {
+  if (!am || !inner_op) return 0;
+  return scheduler_schedule(&am->base_state, execute_at_ms,
+                            inner_op->signer_id, inner_op);
+}
+
+EMSCRIPTEN_KEEPALIVE
+crabs_error_e crabs_wasm_cancel_schedule(attribute_machine_t* am, uint64_t schedule_id) {
+  if (!am) return CRABS_ERR_INVALID_PARAM;
+  return scheduler_cancel(&am->base_state, schedule_id);
+}
+
+EMSCRIPTEN_KEEPALIVE
+crabs_error_e crabs_wasm_process_schedules(attribute_machine_t* am, uint64_t now_ms) {
+  if (!am) return CRABS_ERR_INVALID_PARAM;
+  return scheduler_process_due(&am->base_state, now_ms);
+}
+
+EMSCRIPTEN_KEEPALIVE
+uint32_t crabs_wasm_schedule_count(attribute_machine_t* am) {
+  return am ? scheduler_count(&am->base_state) : 0;
+}
+
+EMSCRIPTEN_KEEPALIVE
+const scheduled_operation_t* crabs_wasm_schedule_first(attribute_machine_t* am) {
+  return am ? scheduler_first(&am->base_state) : NULL;
+}
+
+EMSCRIPTEN_KEEPALIVE
+const scheduled_operation_t* crabs_wasm_schedule_next(const scheduled_operation_t* entry) {
+  return entry ? entry->next : NULL;
+}
+
+EMSCRIPTEN_KEEPALIVE
+uint64_t crabs_wasm_schedule_id(const scheduled_operation_t* entry) {
+  return entry ? entry->schedule_id : 0;
+}
+
+EMSCRIPTEN_KEEPALIVE
+uint64_t crabs_wasm_schedule_execute_at(const scheduled_operation_t* entry) {
+  return entry ? entry->execute_at_ms : 0;
+}
+
+EMSCRIPTEN_KEEPALIVE
+const char* crabs_wasm_schedule_submitter(const scheduled_operation_t* entry) {
+  return entry ? entry->submitter : NULL;
 }
 
 // ============================================================

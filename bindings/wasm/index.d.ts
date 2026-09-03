@@ -23,7 +23,7 @@ export interface Operation {
 
 export namespace Operation {
   function create(type: string): Promise<Operation>;
-  deserialize(bytes: Uint8Array): Promise<Operation>;
+  function deserialize(bytes: Uint8Array): Promise<Operation>;
 }
 
 export interface HandlerState {
@@ -128,6 +128,12 @@ export interface Node {
 
   setTime(nowMs: number): void;
   pruneExpiredTempAttrs(): number;
+
+  schedule(innerOp: Operation, executeAtMs: number): bigint;
+  cancelSchedule(scheduleId: bigint): void;
+  processSchedules(nowMs?: number): void;
+  pendingSchedules(): Array<{ id: bigint; executeAt: bigint; submitter: string }>;
+
   evaluateTriggers(): void;
   destroy(): void;
 }

@@ -560,6 +560,35 @@ class Node {
   setTime(nowMs) { this._M._crabs_wasm_set_time(this._am, BigInt(nowMs)); }
   pruneExpiredTempAttrs() { return this._M._crabs_wasm_prune_expired_temp_attrs(this._am); }
 
+  schedule(innerOp, executeAtMs) {
+    const scheduleId = this._M._crabs_wasm_schedule(this._am, innerOp._ptr, BigInt(executeAtMs));
+    if (!scheduleId) throw new Error('schedule failed');
+    return scheduleId;
+  }
+
+  cancelSchedule(scheduleId) {
+    wrapRc(this._M._crabs_wasm_cancel_schedule(this._am, BigInt(scheduleId)), 'cancelSchedule');
+  }
+
+  processSchedules(nowMs = Date.now()) {
+    wrapRc(this._M._crabs_wasm_process_schedules(this._am, BigInt(nowMs)), 'processSchedules');
+  }
+
+  pendingSchedules() {
+    const M = this._M;
+    const schedules = [];
+    for (let entry = M._crabs_wasm_schedule_first(this._am); entry;
+         entry = M._crabs_wasm_schedule_next(entry)) {
+      const submitterPtr = M._crabs_wasm_schedule_submitter(entry);
+      schedules.push({
+        id: M._crabs_wasm_schedule_id(entry),
+        executeAt: M._crabs_wasm_schedule_execute_at(entry),
+        submitter: submitterPtr ? M.UTF8ToString(submitterPtr) : '',
+      });
+    }
+    return schedules;
+  }
+
   evaluateTriggers() {
     const M = this._M;
     const typePtr = writeString(M, 'noop');
