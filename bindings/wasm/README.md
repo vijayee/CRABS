@@ -131,9 +131,18 @@ Notes:
   methods) without re-running policy validation — the operation must already
   be signed by an authorized signer. The policy-gated path is the
   `__schedule__` operation type itself.
+- `cancelSchedule` is policy-gated, not submitter-bound: any caller satisfying
+  the `__cancel_schedule__` policy can cancel any pending schedule id (admins
+  retain full power).
+- `processSchedules(nowMs?)` trusts the JS-supplied clock (default
+  `Date.now()`). The automatic tick — which runs on every `execute` — always
+  uses the node's authenticated time source and materializes nothing without
+  one (fail-closed).
 - Materialization failures (state drifted, invariant violated) are recorded
   durably as `__schedule_failed__` audit-log entries and never affect other
-  operations. A schedule fires exactly once.
+  operations. A schedule fires exactly once. Two nodes with skewed clocks may
+  resolve the same schedule differently; CRDT-typed items reconcile via merge,
+  non-CRDT items can diverge like any conflicting concurrent ops.
 - Pending schedules are part of the serialized state and survive restarts.
 
 ## License
