@@ -13,6 +13,9 @@
 #include "../Crypto/crypto.h"
 #include "../Serialization/serialization.h"
 #include "../StateMachine/state_machine.h"
+#ifdef CRABS_ENABLE_DEVTOOLS
+#include "../Devtools/devtools.h"
+#endif
 
 uint32_t scheduler_count(const state_t* state) {
   if (state == NULL) return 0;
@@ -177,6 +180,13 @@ crabs_error_e scheduler_process_due(state_t* state, uint64_t now_ms) {
       free(entry);
       continue;
     }
+#ifdef CRABS_ENABLE_DEVTOOLS
+    // Materialized ops never pass through crabs_wasm_execute, so without
+    // this the Timeline would not show them at all (the ring is fed by the
+    // execute wrapper). Record the outcome, including failures — a rejected
+    // entry next to the durable __schedule_failed__ log record.
+    devtools_record_event(state, embedded, materialize_rc);
+#endif
     if (materialize_rc != CRABS_SUCCESS) {
       // Durable failure record keyed by the embedded op's uuid, so all nodes
       // agree the schedule resolved as failed and the devtools Timeline can
