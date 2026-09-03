@@ -6,11 +6,13 @@
 
 #include <gtest/gtest.h>
 #include <cstdlib>
+#include <cstring>
 extern "C" {
 #include "../src/Serialization/serialization.h"
 #include "../src/CRABS/crabs.h"
 #include "../src/CRABS/data_model.h"
 #include "../src/StateMachine/state_machine.h"
+#include "../src/Crypto/crypto.h"
 #include "../src/OT/ot_types.h"
 #include "../src/OT/ot_ordered_set.h"
 #include "../src/OT/ot_document.h"
@@ -323,7 +325,42 @@ TEST(OTSerialization, StateWithTreeRoundTrip) {
   serialized_buffer_destroy(buf);
 }
 
-// ============================================================
+// R8-SER-4: a blob whose root_id matches no node must be rejected. The prior
+// code left tree->root NULL and skipped cycle detection, so a crafted blob
+// with a parent cycle passed deserialization and could hang downstream
+// parent-chain walkers.
+TEST(OTSerialization, TreeDeserializerRejectsUnmatchedRoot) {
+  state_t* original = state_create();
+  original->version = 300;
+  data_item_t* item = crabs_register_ot_type(original, "tree1", DATA_TYPE_OT_TREE, nullptr);
+  ASSERT_NE(item, nullptr);
+  crabs_ot_tree_t* tree = (crabs_ot_tree_t*)item->value;
+  crabs_ot_tree_insert_node(tree, nullptr, 0, "root", nullptr, 0);
+
+  serialized_buffer_t* buf = crabs_serialize_state(original);
+  ASSERT_NE(buf, nullptr);
+
+  // Find the last occurrence of the root_id string16 "root" and change it to
+  // "Xoot" (same length, matches no node). The node id "root" appears first;
+  // the root_id is written last in the tree state.
+  const uint8_t needle[] = {0x04, 0x00, 'r', 'o', 'o', 't'};
+  int last = -1;
+  for (size_t i = 0; i + sizeof(needle) <= buf->len; i++) {
+    if (memcmp(buf->data + i, needle, sizeof(needle)) == 0) last = (int)i;
+  }
+  ASSERT_GE(last, 0);
+  buf->data[last + 2] = 'X';  // "root" -> "Xoot"
+
+  // Recompute the SHA-256 checksum over the modified payload.
+  crypto_sha256(buf->data, buf->len - CRABS_HASH_SIZE, buf->data + buf->len - CRABS_HASH_SIZE);
+
+  state_t* restored = crabs_deserialize_state(buf->data, buf->len);
+  EXPECT_EQ(restored, nullptr);
+
+  state_destroy(original);
+  serialized_buffer_destroy(buf);
+}
+
 // Backward Compatibility Test
 // ============================================================
 

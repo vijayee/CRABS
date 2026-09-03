@@ -663,6 +663,15 @@ TEST_F(TestCondition, TestPreprocessPolicyUserIdPlaceholder) {
   EXPECT_TRUE(result2.resolved_ok);
 }
 
+TEST_F(TestCondition, TestPreprocessPolicyPlaceholderEqualsSignerId) {
+  // R8-CL-1: a signer_id equal to the placeholder must not cause an infinite
+  // loop in _resolve_user_id_placeholder. The placeholder resolves to itself,
+  // so preprocessing must terminate and leave the policy intact.
+  auto result = preprocess_policy("{user_id} AND video_abc >= 5", state, "{user_id}");
+  EXPECT_TRUE(result.resolved_ok);
+  EXPECT_STRNE(result.abe_policy, "");
+}
+
 TEST_F(TestCondition, TestPreprocessPolicyNullInput) {
   auto result = preprocess_policy(NULL, state, "alice");
   EXPECT_TRUE(result.resolved_ok);

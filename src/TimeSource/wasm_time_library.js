@@ -45,6 +45,7 @@ mergeInto(LibraryManager.library, {
         'var url = process.argv[1];',
         'var timeout = parseInt(process.argv[2], 10);',
         'var req = https.get(url, { timeout: timeout }, function (res) {',
+        '  if (res.statusCode < 200 || res.statusCode >= 300) { process.exit(1); }',
         '  var data = "";',
         '  res.on("data", function (chunk) { data += chunk; });',
         '  res.on("end", function () { process.stdout.write(data); });',

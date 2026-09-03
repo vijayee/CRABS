@@ -405,6 +405,57 @@ TEST_F(DedupMutationTest, CustomCounterIncrementMutation) {
   operation_destroy(op);
 }
 
+// R8-S-3: the dedup mutation must be validated BEFORE the handler runs, so a
+// failing mutation cannot leave the handler's effects applied. These tests
+// exercise dedup_validate_mutation_spec, which state_machine_execute calls
+// before dispatching to the handler.
+TEST_F(DedupMutationTest, ValidateRejectsMissingSetPath) {
+  operation_t* op = operation_create("custom_op");
+  op->dedup.type = DEDUP_CUSTOM;
+  strncpy(op->dedup.condition, "true", CRABS_MAX_POLICY_EXPR - 1);
+  op->dedup.update.type = MUTATION_SET_ADD;
+  strncpy(op->dedup.update.set_path, "nonexistent_set", CRABS_MAX_DEDUP_PATH - 1);
+  strncpy(op->dedup.update.element_value, "bob", CRABS_MAX_USER_ID - 1);
+  strncpy(op->signer_id, "alice", CRABS_MAX_USER_ID - 1);
+
+  EXPECT_EQ(dedup_validate_mutation_spec(state, &op->dedup, op), CRABS_ERR_TRACKER_NOT_FOUND);
+
+  operation_destroy(op);
+}
+
+TEST_F(DedupMutationTest, ValidateRejectsCounterOverflow) {
+  operation_t* op = operation_create("spend");
+  op->dedup.type = DEDUP_CUSTOM;
+  strncpy(op->dedup.condition, "true", CRABS_MAX_POLICY_EXPR - 1);
+  op->dedup.update.type = MUTATION_COUNTER_INCREMENT;
+  strncpy(op->dedup.update.counter_path, "balance", CRABS_MAX_DEDUP_PATH - 1);
+  op->dedup.update.delta = INT64_MAX;  // balance=1000, adding INT64_MAX overflows
+  strncpy(op->signer_id, "alice", CRABS_MAX_USER_ID - 1);
+
+  EXPECT_EQ(dedup_validate_mutation_spec(state, &op->dedup, op), CRABS_ERR_INVALID_PARAM);
+
+  operation_destroy(op);
+}
+
+TEST_F(DedupMutationTest, ValidateRejectsFullPerUserSet) {
+  // Fill the voters set to capacity so a PER_USER add would fail with OOM.
+  one_shot_set_t* set = (one_shot_set_t*)voters->value;
+  for (uint32_t i = 0; i < CRABS_ONE_SHOT_SET_MAX; i++) {
+    char id[32];
+    snprintf(id, sizeof(id), "user%u", i);
+    ASSERT_EQ(one_shot_set_add(set, id), CRABS_SUCCESS);
+  }
+
+  operation_t* op = operation_create("vote");
+  op->dedup.type = DEDUP_PER_USER;
+  strncpy(op->dedup.tracker_path, "proposal_42_voters", CRABS_MAX_DEDUP_PATH - 1);
+  strncpy(op->signer_id, "alice", CRABS_MAX_USER_ID - 1);
+
+  EXPECT_EQ(dedup_validate_mutation_spec(state, &op->dedup, op), CRABS_ERR_OOM);
+
+  operation_destroy(op);
+}
+
 // ============================================================
 // Desugaring tests
 // ============================================================

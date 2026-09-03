@@ -339,6 +339,20 @@ TEST_F(TestAttributeMachine, TestVerifyIdentitySuspendedUser) {
   EXPECT_EQ(result, CRABS_ERR_USER_SUSPENDED);
 }
 
+TEST_F(TestAttributeMachine, TestVerifyIdentityRejectsPrivilegedAttribute) {
+  // R8-A-1: verify_identity must not mint privileged attributes (role:admin).
+  uint8_t user_pk[33];
+  _gen_pk(user_pk);
+  attribute_machine_register_user(am, "alice", user_pk, NULL);
+
+  crabs_error_e result = attribute_machine_verify_identity(am, "alice", "role", "admin", "admin");
+  EXPECT_EQ(result, CRABS_ERR_UNAUTHORIZED);
+
+  user_t* alice = attribute_machine_find_user(am, "alice");
+  ASSERT_NE(alice, nullptr);
+  EXPECT_EQ(alice->attribute_count, 0u);
+}
+
 TEST_F(TestAttributeMachine, TestSuspendUser) {
   uint8_t user_pk[33];
   _gen_pk(user_pk);
@@ -360,6 +374,23 @@ TEST_F(TestAttributeMachine, TestSuspendUser) {
 TEST_F(TestAttributeMachine, TestSuspendUserNotFound) {
   crabs_error_e result = attribute_machine_suspend_user(am, "nonexistent");
   EXPECT_EQ(result, CRABS_ERR_USER_NOT_FOUND);
+}
+
+// R8-C-4: revocation is terminal. suspend_user must not downgrade a REVOKED
+// user to the recoverable SUSPENDED state, or activate_user could resurrect
+// a revoked user.
+TEST_F(TestAttributeMachine, TestSuspendRevokedUserIsTerminal) {
+  uint8_t user_pk[33];
+  _gen_pk(user_pk);
+  ASSERT_EQ(attribute_machine_register_user(am, "alice", user_pk, NULL), CRABS_SUCCESS);
+  ASSERT_EQ(attribute_machine_revoke_user(am, "alice"), CRABS_SUCCESS);
+
+  crabs_error_e result = attribute_machine_suspend_user(am, "alice");
+  EXPECT_NE(result, CRABS_SUCCESS);
+
+  user_t* alice = attribute_machine_find_user(am, "alice");
+  ASSERT_NE(alice, nullptr);
+  EXPECT_EQ(alice->status, USER_REVOKED);
 }
 
 // R7-07: crypto_revoke_and_rotate suspends the user during key-compromise
@@ -388,10 +419,10 @@ TEST_F(TestAttributeMachine, TestActivateUser) {
   alice = attribute_machine_find_user(am, "alice");
   ASSERT_NE(alice, nullptr);
   EXPECT_EQ(alice->status, USER_ACTIVE);
-  // key_version is NOT bumped by reactivation: the suspension already
-  // invalidated the old key, and the user's new key is bound to the current
-  // version. Bumping again would force the user to guess an unknown version.
-  EXPECT_EQ(alice->key_version, version_after_suspend);
+  // R8-A-5: key_version IS bumped by reactivation, so signatures made during
+  // suspension at the old version are invalidated even if the key was not
+  // rotated.
+  EXPECT_EQ(alice->key_version, version_after_suspend + 1);
 }
 
 TEST_F(TestAttributeMachine, TestActivateUserRequiresAdmin) {

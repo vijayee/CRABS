@@ -1210,6 +1210,13 @@ static bool _resolve_user_id_placeholder(char* str, const char* signer_id) {
     size_t slen = strlen(signer_id);
     size_t remaining = strlen(pos + plen);
 
+    // R8-CL-1: if the replacement is identical to the placeholder (signer_id is
+    // literally "{user_id}"), replacing it with itself would loop forever. The
+    // placeholder already equals the resolved value, so stop.
+    if (slen == plen && memcmp(pos, signer_id, plen) == 0) {
+      break;
+    }
+
     if (slen <= plen) {
       // Replacement is shorter or equal: safe to copy in place
       memmove(pos + slen, pos + plen, remaining + 1);

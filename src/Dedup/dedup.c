@@ -219,6 +219,110 @@ crabs_error_e dedup_apply_mutation(state_t* state, const operation_t* op) {
   return dedup_apply_mutation_spec(state, &op->dedup, op);
 }
 
+// R8-S-3: validate that the dedup mutation can be applied WITHOUT mutating
+// state. state_machine_execute calls this BEFORE the handler runs, so a
+// mutation that would fail (missing tracker/flag, counter overflow, full set)
+// is rejected before the handler's effects are applied — otherwise the op
+// would return an error after the handler committed, leaving partial state.
+crabs_error_e dedup_validate_mutation_spec(const state_t* state,
+                                           const dedup_spec_t* spec,
+                                           const operation_t* op) {
+  if (state == NULL || op == NULL || spec == NULL) return CRABS_ERR_INVALID_PARAM;
+
+  switch (spec->type) {
+    case DEDUP_NONE:
+      return CRABS_SUCCESS;
+
+    case DEDUP_PER_USER: {
+      data_item_t* tracker = state_find_item((state_t*)state, spec->tracker_path);
+      if (tracker == NULL) return CRABS_ERR_TRACKER_NOT_FOUND;
+      if (tracker->type != DATA_TYPE_ONE_SHOT_SET) return CRABS_ERR_TRACKER_NOT_FOUND;
+      one_shot_set_t* set = (one_shot_set_t*)tracker->value;
+      if (set == NULL) return CRABS_ERR_TRACKER_NOT_FOUND;
+      // Pre-check capacity so the post-handler apply cannot fail with OOM.
+      if (!one_shot_set_contains(set, op->signer_id) &&
+          set->element_count >= CRABS_ONE_SHOT_SET_MAX) {
+        return CRABS_ERR_OOM;
+      }
+      return CRABS_SUCCESS;
+    }
+
+    case DEDUP_GLOBAL: {
+      data_item_t* flag_item = state_find_item((state_t*)state, spec->flag_path);
+      if (flag_item == NULL) return CRABS_ERR_FLAG_NOT_FOUND;
+      if (flag_item->type != DATA_TYPE_ONE_SHOT_FLAG) return CRABS_ERR_FLAG_NOT_FOUND;
+      one_shot_flag_t* flag = (one_shot_flag_t*)flag_item->value;
+      if (flag == NULL) return CRABS_ERR_FLAG_NOT_FOUND;
+      return CRABS_SUCCESS;
+    }
+
+    case DEDUP_CUSTOM: {
+      state_mutation_t* mut = (state_mutation_t*)&spec->update;
+      switch (mut->type) {
+        case MUTATION_SET_ADD: {
+          data_item_t* item = state_find_item((state_t*)state, mut->set_path);
+          if (item == NULL) return CRABS_ERR_TRACKER_NOT_FOUND;
+          if (item->type != DATA_TYPE_ONE_SHOT_SET && item->type != DATA_TYPE_SET &&
+              item->type != DATA_TYPE_2P_SET) return CRABS_ERR_INVALID_PARAM;
+          one_shot_set_t* set = (one_shot_set_t*)item->value;
+          if (set == NULL) return CRABS_ERR_TRACKER_NOT_FOUND;
+          const char* elem = mut->element_value;
+          if (strcmp(elem, "{signer_id}") == 0) elem = op->signer_id;
+          if (!one_shot_set_contains(set, elem) &&
+              set->element_count >= CRABS_ONE_SHOT_SET_MAX) {
+            return CRABS_ERR_OOM;
+          }
+          return CRABS_SUCCESS;
+        }
+
+        case MUTATION_FLAG_SET: {
+          data_item_t* item = state_find_item((state_t*)state, mut->flag_path);
+          if (item == NULL) return CRABS_ERR_FLAG_NOT_FOUND;
+          if (item->type != DATA_TYPE_ONE_SHOT_FLAG) return CRABS_ERR_FLAG_NOT_FOUND;
+          one_shot_flag_t* flag = (one_shot_flag_t*)item->value;
+          if (flag == NULL) return CRABS_ERR_FLAG_NOT_FOUND;
+          return CRABS_SUCCESS;
+        }
+
+        case MUTATION_COUNTER_INCREMENT: {
+          data_item_t* item = state_find_item((state_t*)state, mut->counter_path);
+          if (item == NULL) return CRABS_ERR_RESOURCE_NOT_FOUND;
+          if (item->value == NULL) return CRABS_ERR_RESOURCE_NOT_FOUND;
+          if (item->type == DATA_TYPE_COUNTER || item->type == DATA_TYPE_PN_COUNTER ||
+              item->type == DATA_TYPE_RESOURCE) {
+            int64_t* val = (int64_t*)item->value;
+            if (mut->delta > 0 && *val > INT64_MAX - mut->delta) {
+              return CRABS_ERR_INVALID_PARAM;
+            }
+            if (mut->delta < 0 && *val < INT64_MIN - mut->delta) {
+              return CRABS_ERR_INVALID_PARAM;
+            }
+          } else {
+            return CRABS_ERR_TYPE_MISMATCH;
+          }
+          return CRABS_SUCCESS;
+        }
+
+        case MUTATION_ASSIGN: {
+          data_item_t* item = state_find_item((state_t*)state, mut->target_path);
+          if (item == NULL) return CRABS_ERR_RESOURCE_NOT_FOUND;
+          if (item->type != DATA_TYPE_REGISTER) return CRABS_ERR_TYPE_MISMATCH;
+          return CRABS_SUCCESS;
+        }
+
+        case MUTATION_CUSTOM:
+          return CRABS_ERR_INTERNAL;
+
+        default:
+          return CRABS_ERR_INVALID_PARAM;
+      }
+    }
+
+    default:
+      return CRABS_ERR_INVALID_PARAM;
+  }
+}
+
 // ============================================================
 // Desugaring: Build policy guard from DedupSpec (§4)
 // ============================================================

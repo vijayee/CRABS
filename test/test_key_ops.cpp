@@ -8,6 +8,7 @@ extern "C" {
 #include "../src/Attribute/attribute_machine.h"
 #include "../src/Crypto/sig_scheme.h"
 #include "../src/Crypto/crypto.h"
+#include "../src/Serialization/serialization.h"
 #include "../src/CRABS/crabs.h"
 #include "../src/CRABS/data_model.h"
 #include "../src/Util/allocator.h"
@@ -30,6 +31,7 @@ static crabs_test_env_t g_env;
 static bool g_env_initialized = false;
 
 static state_t* create_test_state_with_attr() {
+  crypto_sig_scheme_init();
   crabs_test_env_init(&g_env);
   g_env_initialized = true;
   return g_env.state;
@@ -54,10 +56,39 @@ static void destroy_test_state(state_t* state) {
     crabs_test_env_destroy(&g_env);
     g_env_initialized = false;
   }
+  crypto_sig_scheme_cleanup();
 }
 
+// R7-11: Lamport monotonicity is enforced per signer, so each op must carry a
+// strictly increasing lamport_time.
+static uint64_t g_key_ops_lamport = 0;
+
 static void sign_as_admin(operation_t* op) {
+  op->lamport_time = ++g_key_ops_lamport;
   crabs_test_sign_op_with(g_env.am, test_admin_key(), op);
+}
+
+// R8-C-2: once a keyring exists, the legacy bootstrap key is rejected, so ops
+// must be signed with a keyring key. These helpers register a key with a known
+// keypair and sign with it.
+static void register_admin_key(const char* key_id, const char* label, ecdsa_keypair_t** out) {
+  ecdsa_keypair_t* kp = crypto_ecdsa_generate();
+  ASSERT_NE(kp, nullptr);
+  user_t* admin = attribute_machine_find_user(g_env.am, "admin");
+  ASSERT_NE(admin, nullptr);
+  ASSERT_EQ(user_key_register(admin, key_id, ECDSA_SECP256K1, kp->public_key, 33, label),
+            CRABS_SUCCESS);
+  *out = kp;
+}
+
+static void sign_as_admin_with_key(operation_t* op, const char* key_id, ecdsa_keypair_t* key) {
+  op->lamport_time = ++g_key_ops_lamport;
+  strncpy(op->key_id, key_id, CRABS_MAX_KEY_ID - 1);
+  op->sig_scheme = ECDSA_SECP256K1;
+  op->signer_key_version = attribute_machine_find_user(g_env.am, "admin")->key_version;
+  serialized_buffer_t* ser = crabs_serialize_for_signing(op);
+  crypto_sign_operation(key->private_key, ser->data, ser->len, op->signature);
+  serialized_buffer_destroy(ser);
 }
 
 static void fill_uuid(uint8_t* uuid) {
@@ -188,11 +219,10 @@ TEST(TestKeyOps, RegisterKeyRejectsNullPayload) {
 TEST(TestKeyOps, RevokeKeyBasic) {
   state_t* state = create_test_state_with_attr();
 
-  // First register a key
+  // First register a key with a known keypair so we can sign with it (R8-C-2).
+  ecdsa_keypair_t* kp = nullptr;
+  register_admin_key("mykey", "test", &kp);
   user_t* admin = attribute_machine_find_user(state->attr_machine, "admin");
-  uint8_t pk[33];
-  _gen_pk_ops(pk);
-  ASSERT_EQ(user_key_register(admin, "mykey", ECDSA_SECP256K1, pk, 33, "test"), CRABS_SUCCESS);
 
   // Now revoke via state machine
   const char* config = "key_id=mykey";
@@ -206,7 +236,7 @@ TEST(TestKeyOps, RevokeKeyBasic) {
   op->payload = payload;
   op->payload_size = (uint32_t)payload_size;
 
-  sign_as_admin(op);
+  sign_as_admin_with_key(op, "mykey", kp);
   crabs_error_e rc = state_machine_execute(state, op);
   EXPECT_EQ(rc, CRABS_SUCCESS);
 
@@ -216,6 +246,7 @@ TEST(TestKeyOps, RevokeKeyBasic) {
   EXPECT_EQ(key->status, KEY_REVOKED);
 
   operation_destroy(op);
+  crypto_ecdsa_keypair_destroy(kp);
   destroy_test_state(state);
 }
 
@@ -248,14 +279,12 @@ TEST(TestKeyOps, RevokeKeyRejectsUnknownKeyId) {
 TEST(TestKeyOps, SetDefaultKeyBasic) {
   state_t* state = create_test_state_with_attr();
 
-  // Register two keys
+  // Register two keys with known keypairs (R8-C-2).
+  ecdsa_keypair_t* kp1 = nullptr;
+  ecdsa_keypair_t* kp2 = nullptr;
+  register_admin_key("key1", "primary", &kp1);
+  register_admin_key("key2", "secondary", &kp2);
   user_t* admin = attribute_machine_find_user(state->attr_machine, "admin");
-  uint8_t pk1[33];
-  _gen_pk_ops(pk1);
-  uint8_t pk2[33];
-  _gen_pk_ops(pk2);
-  ASSERT_EQ(user_key_register(admin, "key1", ECDSA_SECP256K1, pk1, 33, "primary"), CRABS_SUCCESS);
-  ASSERT_EQ(user_key_register(admin, "key2", ECDSA_SECP256K1, pk2, 33, "secondary"), CRABS_SUCCESS);
   EXPECT_STREQ(admin->default_key_id, "key1");
 
   // Set key2 as default via state machine
@@ -270,25 +299,25 @@ TEST(TestKeyOps, SetDefaultKeyBasic) {
   op->payload = payload;
   op->payload_size = (uint32_t)payload_size;
 
-  sign_as_admin(op);
+  sign_as_admin_with_key(op, "key1", kp1);
   crabs_error_e rc = state_machine_execute(state, op);
   EXPECT_EQ(rc, CRABS_SUCCESS);
   EXPECT_STREQ(admin->default_key_id, "key2");
 
   operation_destroy(op);
+  crypto_ecdsa_keypair_destroy(kp1);
+  crypto_ecdsa_keypair_destroy(kp2);
   destroy_test_state(state);
 }
 
 TEST(TestKeyOps, SetDefaultKeyRejectsInactiveKey) {
   state_t* state = create_test_state_with_attr();
 
+  ecdsa_keypair_t* kp1 = nullptr;
+  ecdsa_keypair_t* kp2 = nullptr;
+  register_admin_key("key1", "primary", &kp1);
+  register_admin_key("key2", "secondary", &kp2);
   user_t* admin = attribute_machine_find_user(state->attr_machine, "admin");
-  uint8_t pk1[33];
-  _gen_pk_ops(pk1);
-  uint8_t pk2[33];
-  _gen_pk_ops(pk2);
-  ASSERT_EQ(user_key_register(admin, "key1", ECDSA_SECP256K1, pk1, 33, "primary"), CRABS_SUCCESS);
-  ASSERT_EQ(user_key_register(admin, "key2", ECDSA_SECP256K1, pk2, 33, "secondary"), CRABS_SUCCESS);
   ASSERT_EQ(user_key_revoke(admin, "key2"), CRABS_SUCCESS);
 
   const char* config = "key_id=key2";
@@ -302,11 +331,13 @@ TEST(TestKeyOps, SetDefaultKeyRejectsInactiveKey) {
   op->payload = payload;
   op->payload_size = (uint32_t)payload_size;
 
-  sign_as_admin(op);
+  sign_as_admin_with_key(op, "key1", kp1);
   crabs_error_e rc = state_machine_execute(state, op);
   EXPECT_EQ(rc, CRABS_ERR_KEY_NOT_ACTIVE);
 
   operation_destroy(op);
+  crypto_ecdsa_keypair_destroy(kp1);
+  crypto_ecdsa_keypair_destroy(kp2);
   destroy_test_state(state);
 }
 
@@ -551,11 +582,10 @@ TEST(TestKeyOps, RegisterKeyRejectsUnspecifiedScheme) {
 TEST(TestKeyOps, RevokeLastKeySuspendsUserViaStateMachine) {
   state_t* state = create_test_state_with_attr();
 
-  // Register a single key for admin
+  // Register a single key for admin with a known keypair (R8-C-2).
+  ecdsa_keypair_t* kp = nullptr;
+  register_admin_key("onlykey", "primary", &kp);
   user_t* admin = attribute_machine_find_user(state->attr_machine, "admin");
-  uint8_t pk[33];
-  _gen_pk_ops(pk);
-  ASSERT_EQ(user_key_register(admin, "onlykey", ECDSA_SECP256K1, pk, 33, "primary"), CRABS_SUCCESS);
   EXPECT_EQ(admin->status, USER_ACTIVE);
 
   // Revoke it via state machine
@@ -570,12 +600,13 @@ TEST(TestKeyOps, RevokeLastKeySuspendsUserViaStateMachine) {
   op->payload = payload;
   op->payload_size = (uint32_t)payload_size;
 
-  sign_as_admin(op);
+  sign_as_admin_with_key(op, "onlykey", kp);
   crabs_error_e rc = state_machine_execute(state, op);
   EXPECT_EQ(rc, CRABS_SUCCESS);
   EXPECT_EQ(admin->status, USER_SUSPENDED);
 
   operation_destroy(op);
+  crypto_ecdsa_keypair_destroy(kp);
   destroy_test_state(state);
 }
 
@@ -586,7 +617,10 @@ TEST(TestKeyOps, RevokeLastKeySuspendsUserViaStateMachine) {
 TEST(TestKeyOps, RegisterKeyRejectsDuplicateKeyId) {
   state_t* state = create_test_state_with_attr();
 
-  // Register first key
+  // Register first key with a known keypair so the duplicate op can be signed
+  // with it (R8-C-2: once a keyring exists, the legacy key is rejected).
+  ecdsa_keypair_t* kp = crypto_ecdsa_generate();
+  ASSERT_NE(kp, nullptr);
   const char* config = "key_id=dupkey;scheme=1;public_key_len=33";
   size_t config_len = strlen(config) + 1;
   size_t payload_size = config_len + 33;
@@ -594,7 +628,7 @@ TEST(TestKeyOps, RegisterKeyRejectsDuplicateKeyId) {
   // First registration
   uint8_t* payload1 = (uint8_t*)calloc(payload_size, 1);
   memcpy(payload1, config, config_len);
-  { uint8_t _pk[33]; _gen_pk_ops(_pk); memcpy(payload1 + config_len, _pk, 33); }
+  memcpy(payload1 + config_len, kp->public_key, 33);
 
   operation_t* op1 = operation_create(CRABS_OP_REGISTER_KEY);
   fill_uuid(op1->uuid);
@@ -619,11 +653,12 @@ TEST(TestKeyOps, RegisterKeyRejectsDuplicateKeyId) {
   op2->payload = payload2;
   op2->payload_size = (uint32_t)payload_size;
 
-  sign_as_admin(op2);
+  sign_as_admin_with_key(op2, "dupkey", kp);
   rc = state_machine_execute(state, op2);
   EXPECT_EQ(rc, CRABS_ERR_DUPLICATE_OPERATION);
   operation_destroy(op2);
 
+  crypto_ecdsa_keypair_destroy(kp);
   destroy_test_state(state);
 }
 

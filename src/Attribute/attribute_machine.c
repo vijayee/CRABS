@@ -50,6 +50,9 @@ static bool _is_policy_keyword(const char* id) {
 
 static bool _is_safe_user_id(const char* id) {
   if (id == NULL || id[0] == '\0') return false;
+  // R8-A-4: reject over-long ids. register_user truncates to 63 bytes, so two
+  // distinct long ids sharing a 63-byte prefix would collide after truncation.
+  if (strlen(id) >= CRABS_MAX_USER_ID) return false;
   for (const char* p = id; *p != '\0'; p++) {
     char c = *p;
     bool ok = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
@@ -197,7 +200,10 @@ static bool _attribute_matches_name(const attribute_value_t* attr, const char* n
 // written against the verifier namespace. Add them now.
 static const char* _PRIVILEGED_ATTR_NAMES[] = {
   "role", "admin", "member", "owner", "root", "superuser", "manager",
-  "verifier", "issuer", NULL
+  "verifier", "issuer",
+  // R8-A-10: defense-in-depth — block additional privileged-looking names.
+  "role_admin", "administrator", "superadmin", "sysadmin", "moderator",
+  "operator", NULL
 };
 
 static bool _is_privileged_attr_name(const char* name) {
@@ -248,7 +254,10 @@ static bool _is_safe_attr_value(const char* value) {
   if (value == NULL) return false;
   for (const char* p = value; *p != '\0'; p++) {
     char c = *p;
-    if (c == ',' || c == ' ') return false;
+    // R8-A-3: also reject '|', which _crabs_attrs_to_oabe preserves as the
+    // OABE attribute separator. A self-asserted value like "x|role_admin"
+    // would inject "role_admin" as a separate attribute into the CP-ABE key.
+    if (c == ',' || c == ' ' || c == '|') return false;
   }
   return true;
 }
@@ -464,6 +473,21 @@ crabs_error_e attribute_machine_grant_role(attribute_machine_t* am, const char* 
   // token injection (see _is_safe_attr_value).
   if (!_is_safe_attr_value(value)) return CRABS_ERR_INVALID_PARAM;
 
+  // R8-A-2: the signer must be an active user holding role:admin. The prior
+  // code stored signer_id in verified_by without checking authorization, so
+  // any caller could grant role:admin to anyone.
+  user_t* signer = attribute_machine_find_user(am, signer_id);
+  if (signer == NULL) return CRABS_ERR_USER_NOT_FOUND;
+  if (signer->status != USER_ACTIVE) return CRABS_ERR_USER_SUSPENDED;
+  bool signer_is_admin = false;
+  for (uint32_t i = 0; i < signer->attribute_count; i++) {
+    if (strcmp(signer->attributes[i].value, "role:admin") == 0) {
+      signer_is_admin = true;
+      break;
+    }
+  }
+  if (!signer_is_admin) return CRABS_ERR_UNAUTHORIZED;
+
   user_t* user = attribute_machine_find_user(am, target_user);
   if (user == NULL) return CRABS_ERR_USER_NOT_FOUND;
 
@@ -591,6 +615,23 @@ crabs_error_e attribute_machine_verify_identity(attribute_machine_t* am, const c
   // De-wonk: reject values containing comma/space to prevent attribute-string
   // token injection (see _is_safe_attr_value).
   if (!_is_safe_attr_value(value)) return CRABS_ERR_INVALID_PARAM;
+  // R8-A-1: verify_identity must not mint privileged attributes (role:admin,
+  // owner, ...). Only grant_role may issue those. Without this, any caller
+  // could mint a verified role:admin on any target.
+  if (_is_privileged_attr_name(attribute)) return CRABS_ERR_UNAUTHORIZED;
+
+  // R8-A-1: the signer must be an authorized verifier (holds role:admin).
+  user_t* signer = attribute_machine_find_user(am, signer_id);
+  if (signer == NULL) return CRABS_ERR_USER_NOT_FOUND;
+  if (signer->status != USER_ACTIVE) return CRABS_ERR_USER_SUSPENDED;
+  bool signer_is_admin = false;
+  for (uint32_t i = 0; i < signer->attribute_count; i++) {
+    if (strcmp(signer->attributes[i].value, "role:admin") == 0) {
+      signer_is_admin = true;
+      break;
+    }
+  }
+  if (!signer_is_admin) return CRABS_ERR_UNAUTHORIZED;
 
   user_t* user = attribute_machine_find_user(am, target_user);
   if (user == NULL) return CRABS_ERR_USER_NOT_FOUND;
@@ -678,6 +719,11 @@ crabs_error_e attribute_machine_suspend_user(attribute_machine_t* am, const char
   user_t* user = attribute_machine_find_user(am, user_id);
   if (user == NULL) return CRABS_ERR_USER_NOT_FOUND;
 
+  // R8-C-4: revocation is terminal. Suspending a REVOKED user would downgrade
+  // them to the recoverable SUSPENDED state, letting activate_user resurrect
+  // a revoked user. Refuse instead.
+  if (user->status == USER_REVOKED) return CRABS_ERR_INVALID_PARAM;
+
   user->status = USER_SUSPENDED;
   user->key_version++;
   am->base_state.version++;
@@ -687,9 +733,10 @@ crabs_error_e attribute_machine_suspend_user(attribute_machine_t* am, const char
 
 // R7-07: reactivate a SUSPENDED user after key-compromise recovery. The
 // signer must be an active user holding the role:admin attribute. REVOKED
-// users are terminal (audit H-C) and cannot be reactivated. key_version is
-// intentionally NOT bumped: the suspension during recovery already invalidated
-// the old key, and the user's new key is bound to the current version.
+// users are terminal (audit H-C) and cannot be reactivated.
+// R8-A-5: key_version IS bumped on activation. The prior code left it
+// unchanged, so signatures made during suspension at that version remained
+// valid after reactivation if the compromised key was not rotated.
 crabs_error_e attribute_machine_activate_user(attribute_machine_t* am, const char* target_user,
                                                const char* signer_id) {
   if (am == NULL || target_user == NULL || signer_id == NULL) {
@@ -717,6 +764,7 @@ crabs_error_e attribute_machine_activate_user(attribute_machine_t* am, const cha
   if (user->status != USER_SUSPENDED) return CRABS_ERR_INVALID_PARAM;
 
   user->status = USER_ACTIVE;
+  user->key_version++;
   am->base_state.version++;
 
   return CRABS_SUCCESS;
@@ -1013,8 +1061,10 @@ crabs_error_e user_key_revoke(user_t* user, const char* key_id) {
     }
   }
 
-  // If no active keys remain, suspend the user
-  if (active_count == 0) {
+  // If no active keys remain, suspend the user. R8-A-6: revocation is
+  // terminal — never downgrade a REVOKED user to the recoverable SUSPENDED
+  // state, or activate_user could resurrect them.
+  if (active_count == 0 && user->status != USER_REVOKED) {
     user->status = USER_SUSPENDED;
   }
 

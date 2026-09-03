@@ -27,21 +27,35 @@
 // CP-ABE (Waters '09) so that ciphertexts can only be decrypted by users
 // whose attributes satisfy the access policy — replacing the prior
 // "simulated" ABE whose decryption key was derivable from public material.
-static atomic_int _oabe_init_state = 0; // 0=uninit, 1=ready
+static atomic_int _oabe_init_state = 0; // 0=uninit, 1=initializing, 2=ready
 static void _ensure_oabe_init(void) {
 #ifdef __EMSCRIPTEN__
   // WASM is single-threaded — C11 atomics may not be available without
   // the -pthread flag. Use a simple flag instead.
   if (_oabe_init_state == 0) {
     if (oabe_init() == OABE_SUCCESS) {
-      _oabe_init_state = 1;
+      _oabe_init_state = 2;
     }
   }
 #else
-  int expected = 0;
-  if (atomic_compare_exchange_strong(&_oabe_init_state, &expected, 1)) {
-    if (oabe_init() != OABE_SUCCESS) {
-      atomic_store(&_oabe_init_state, 0);
+  // R8-C-1: distinguish "initializing" from "ready". The prior code set the
+  // state to 1 before oabe_init() completed, so a concurrent thread that lost
+  // the CAS saw state==1 and used OpenABE before it was initialized.
+  for (;;) {
+    int expected = 0;
+    if (atomic_compare_exchange_strong(&_oabe_init_state, &expected, 1)) {
+      // This thread owns initialization.
+      if (oabe_init() == OABE_SUCCESS) {
+        atomic_store(&_oabe_init_state, 2);
+      } else {
+        atomic_store(&_oabe_init_state, 0);
+      }
+      return;
+    }
+    if (atomic_load(&_oabe_init_state) == 2) return; // already ready
+    // state == 1: another thread is initializing. Spin until it finishes,
+    // then loop back (retry if it failed, return if it succeeded).
+    while (atomic_load(&_oabe_init_state) == 1) {
     }
   }
 #endif
@@ -192,6 +206,24 @@ static EC_KEY* _eckey_from_private(const uint8_t private_key[32]) {
     return NULL;
   }
 
+  // R8-C-7: validate the private key is in [1, n-1]. A zero or out-of-range
+  // key yields a point-at-infinity public key silently.
+  const EC_GROUP* group = EC_KEY_get0_group(eckey);
+  BIGNUM* order = BN_new();
+  if (!order || EC_GROUP_get_order(group, order, NULL) != 1) {
+    BN_free(order);
+    BN_free(bn_priv);
+    EC_KEY_free(eckey);
+    return NULL;
+  }
+  if (BN_is_zero(bn_priv) || BN_is_negative(bn_priv) || BN_cmp(bn_priv, order) >= 0) {
+    BN_free(order);
+    BN_free(bn_priv);
+    EC_KEY_free(eckey);
+    return NULL;
+  }
+  BN_free(order);
+
   if (EC_KEY_set_private_key(eckey, bn_priv) != 1) {
     BN_free(bn_priv);
     EC_KEY_free(eckey);
@@ -199,7 +231,6 @@ static EC_KEY* _eckey_from_private(const uint8_t private_key[32]) {
   }
 
   // Derive public key from private key
-  const EC_GROUP* group = EC_KEY_get0_group(eckey);
   EC_POINT* pub_point = EC_POINT_new(group);
   if (!pub_point) {
     BN_free(bn_priv);
@@ -694,7 +725,7 @@ bool crypto_abe_eval_policy(const char* policy, const char* attrs) {
 
 abe_master_key_t* crypto_abe_setup(void) {
   _ensure_oabe_init();
-  if (atomic_load(&_oabe_init_state) != 1) return NULL;
+  if (atomic_load(&_oabe_init_state) != 2) return NULL;
 
   abe_master_key_t* mk = get_clear_memory(sizeof(abe_master_key_t));
   if (!mk) return NULL;
@@ -766,6 +797,9 @@ abe_user_key_t* crypto_abe_keygen(const abe_master_key_t* mk, const char* attrs)
     return NULL;
   }
   if (oabe_context_cp_export_key(mk->ctx, key_id, &sk->key_bytes) != OABE_SUCCESS) {
+    // R8-C-8: remove the key from the authority keystore on export failure,
+    // otherwise every failed keygen leaks a key in the keystore.
+    oabe_context_delete_key((OABE_Context*)mk->ctx, key_id);
     free(sk);
     return NULL;
   }
@@ -941,7 +975,7 @@ bool crypto_verify_operation(const uint8_t public_key[33],
 // ABE-Gated Signature Verification (§10.3)
 // ============================================================
 
-static void _build_attr_string(const user_t* user, char* buf, size_t buf_len) {
+static void _build_attr_string(const user_t* user, char* buf, size_t buf_len, uint64_t now_ms) {
   if (!user || !buf || buf_len == 0) {
     if (buf) buf[0] = '\0';
     return;
@@ -983,6 +1017,13 @@ static void _build_attr_string(const user_t* user, char* buf, size_t buf_len) {
   // permanent attributes (full name:value tokens everywhere).
   temp_attr_list_t* temp = user->temp_attrs;
   while (temp != NULL) {
+    // R8-A-8: skip expired temporary attributes (fail-closed). When the clock
+    // is 0 (uninitialized), treat any temp attribute with an expiry as expired
+    // rather than including it and granting access the user should not have.
+    if (temp->expires_at > 0 && (now_ms == 0 || temp->expires_at <= now_ms)) {
+      temp = temp->next;
+      continue;
+    }
     const char* token = temp->name;
     size_t tok_len = strlen(token);
     if (tok_len > 0) {
@@ -1052,11 +1093,15 @@ verify_result_t crypto_verify_operation_auth(
     // caller cannot distinguish "bad signature" from "bad policy" by timing.
     // The prior code returned early on a bad signature, skipping the policy
     // evaluation and leaking which check failed through response latency.
-    const bool sig_ok = crypto_ecdsa_verify(user->public_key, serialized_op, op_len, signature);
+    // R8-C-2: once a user has a keyring, the legacy bootstrap key is rejected
+    // (same rule as _verify_user_signature). Otherwise a rotated-away legacy
+    // key would keep authorizing via this path.
+    const bool sig_ok = (user->keys == NULL) &&
+                        crypto_ecdsa_verify(user->public_key, serialized_op, op_len, signature);
     bool policy_ok = true;
     if (has_attr_policy) {
       char attr_string[CRABS_ATTR_STRING_MAX];
-      _build_attr_string(user, attr_string, sizeof(attr_string));
+      _build_attr_string(user, attr_string, sizeof(attr_string), attr_machine->current_time_ms);
       policy_ok = crypto_abe_eval_policy(abe_policy, attr_string);
     }
 
@@ -1079,8 +1124,10 @@ verify_result_t crypto_verify_operation_auth(
     user_t* user = ((attribute_machine_t*)attr_machine)->users;
     while (user != NULL) {
       if (user->status == USER_ACTIVE) {
+        // R8-C-2: skip users with a keyring on the legacy path (see Mode A).
         if (!has_attr_policy) {
-          if (crypto_ecdsa_verify(user->public_key, serialized_op, op_len, signature)) {
+          if (user->keys == NULL &&
+              crypto_ecdsa_verify(user->public_key, serialized_op, op_len, signature)) {
             result.authorized = true;
             result.error = CRABS_SUCCESS;
             strncpy(result.signer_id, user->user_id, CRABS_MAX_USER_ID - 1);
@@ -1088,8 +1135,9 @@ verify_result_t crypto_verify_operation_auth(
           }
         } else {
           char attr_string[CRABS_ATTR_STRING_MAX];
-          _build_attr_string(user, attr_string, sizeof(attr_string));
+          _build_attr_string(user, attr_string, sizeof(attr_string), attr_machine->current_time_ms);
           if (crypto_abe_eval_policy(abe_policy, attr_string) &&
+              user->keys == NULL &&
               crypto_ecdsa_verify(user->public_key, serialized_op, op_len, signature)) {
             result.authorized = true;
             result.error = CRABS_SUCCESS;
@@ -1246,7 +1294,7 @@ verify_result_t crypto_verify_operation_auth_v2(
     bool policy_ok = true;
     if (has_attr_policy) {
       char attr_string[CRABS_ATTR_STRING_MAX];
-      _build_attr_string(user, attr_string, sizeof(attr_string));
+      _build_attr_string(user, attr_string, sizeof(attr_string), attr_machine->current_time_ms);
       policy_ok = crypto_abe_eval_policy(abe_policy, attr_string);
     }
 
@@ -1271,7 +1319,7 @@ verify_result_t crypto_verify_operation_auth_v2(
         bool attr_ok = true;
         if (has_attr_policy) {
           char attr_string[CRABS_ATTR_STRING_MAX];
-          _build_attr_string(user, attr_string, sizeof(attr_string));
+          _build_attr_string(user, attr_string, sizeof(attr_string), attr_machine->current_time_ms);
           attr_ok = crypto_abe_eval_policy(abe_policy, attr_string);
         }
         if (attr_ok) {
@@ -1282,10 +1330,13 @@ verify_result_t crypto_verify_operation_auth_v2(
                                              serialized_op, op_len,
                                              signature, signature_len);
           } else {
-            sig_rc = _verify_sig_with_scheme(SCHEME_UNSPECIFIED,
-                                              user->public_key, 33,
-                                              serialized_op, (uint32_t)op_len,
-                                              signature, signature_len);
+            // R8-C-2: route the legacy path through _verify_user_signature so
+            // a user with a keyring cannot authorize with the rotated-away
+            // bootstrap key.
+            sig_rc = _verify_user_signature(user, NULL, SCHEME_UNSPECIFIED,
+                                             attr_machine->current_time_ms,
+                                             serialized_op, op_len,
+                                             signature, signature_len);
           }
           if (sig_rc == CRABS_SUCCESS) {
             result.authorized = true;
@@ -1322,17 +1373,17 @@ crabs_error_e crypto_verify_co_signature(
   }
 
   user_t* user = attribute_machine_find_user((attribute_machine_t*)attr_machine, signer_id);
-  if (user == NULL) return CRABS_ERR_USER_NOT_FOUND;
-  if (user->status != USER_ACTIVE) {
-    return (user->status == USER_SUSPENDED) ? CRABS_ERR_USER_SUSPENDED
-                                              : CRABS_ERR_USER_NOT_FOUND;
-  }
+  // R8-C-6: collapse user-not-found / suspended to UNAUTHORIZED so a caller
+  // cannot probe for user existence or status (matching the R7-14 collapse in
+  // Mode A).
+  if (user == NULL) return CRABS_ERR_UNAUTHORIZED;
+  if (user->status != USER_ACTIVE) return CRABS_ERR_UNAUTHORIZED;
   // R7-L-9: a co-signer is an approver and must satisfy the op's ABE policy,
   // not merely be an active user with a valid signature. Otherwise a
   // threshold-2 "role:admin" policy is met by one admin plus any active user.
   if (abe_policy != NULL && abe_policy[0] != '\0') {
     char attr_string[CRABS_ATTR_STRING_MAX];
-    _build_attr_string(user, attr_string, sizeof(attr_string));
+    _build_attr_string(user, attr_string, sizeof(attr_string), attr_machine->current_time_ms);
     if (!crypto_abe_eval_policy(abe_policy, attr_string)) {
       return CRABS_ERR_UNAUTHORIZED;
     }
@@ -1515,9 +1566,10 @@ key_envelope_t* crypto_key_envelope_create(
     uint64_t expires_at) {
   if (!mk || !node_private_key || !user) return NULL;
 
-  // Build the attribute string and its hash.
+  // Build the attribute string and its hash. The envelope is issued at
+  // issued_at, so temporary attributes are evaluated against that clock.
   char attrs[CRABS_ATTR_STRING_MAX];
-  _build_attr_string(user, attrs, sizeof(attrs));
+  _build_attr_string(user, attrs, sizeof(attrs), issued_at);
   uint8_t attributes_hash[CRABS_HASH_SIZE];
   if (crypto_compute_attributes_hash(user, attributes_hash) != CRABS_SUCCESS) return NULL;
 
@@ -1675,6 +1727,10 @@ key_envelope_t* crypto_key_envelope_deserialize(const abe_master_key_t* mk,
     return NULL;
   }
   memcpy(env->user_id, buf + pos, CRABS_MAX_USER_ID);
+  // R8-C-9: force NUL termination. The wire format carries CRABS_MAX_USER_ID
+  // raw bytes; a crafted blob without a NUL would leave env->user_id
+  // unterminated and any downstream str* would over-read.
+  env->user_id[CRABS_MAX_USER_ID - 1] = '\0';
   pos += CRABS_MAX_USER_ID;
   for (int i = 0; i < 8; i++) env->state_version |= ((uint64_t)buf[pos + i]) << (i * 8);
   pos += 8;
@@ -1753,7 +1809,9 @@ crabs_error_e crypto_compute_attributes_hash(const user_t* user, uint8_t hash[CR
   if (!user || !hash) return CRABS_ERR_INVALID_PARAM;
 
   char attr_string[CRABS_ATTR_STRING_MAX];
-  _build_attr_string(user, attr_string, sizeof(attr_string));
+  // No clock is in scope here, so pass 0 — per R8-A-8 that fail-closed
+  // excludes temporary attributes with an expiry from the hash.
+  _build_attr_string(user, attr_string, sizeof(attr_string), 0);
 
   if (strlen(attr_string) == 0) {
     // Empty attributes - hash a single zero byte
@@ -1786,21 +1844,32 @@ recovery_result_t* crypto_revoke_and_rotate(
   // leaves the user record untouched.
   if (!crypto_ecdsa_validate_public_key(new_public_key)) return NULL;
 
-  // Step 1: Suspend compromised user (also increments key_version per §8.4)
+  // Step 1: Find the user.
   user_t* user = attribute_machine_find_user(attr_machine, user_id);
   if (!user) return NULL;
 
-  attribute_machine_suspend_user(attr_machine, user_id);
-
-  // Audit H-B: record the USER-SUPPLIED public key. The node never generates
-  // or sees the user's new private key, so a node compromise cannot
-  // impersonate rotated users.
+  // R8-C-3: build the envelope BEFORE mutating the user, so a failed envelope
+  // creation leaves the user record untouched. The envelope is encrypted to
+  // the new public key, so temporarily swap it in and restore on any failure.
+  uint8_t old_public_key[33];
+  memcpy(old_public_key, user->public_key, 33);
   memcpy(user->public_key, new_public_key, 33);
 
-  // Step 5: Generate a new ABE key envelope for the user's current attributes.
   key_envelope_t* envelope = crypto_key_envelope_create(
       mk, node_private_key, user, state_version, issued_at, 0);
-  if (!envelope) return NULL;
+  if (!envelope) {
+    memcpy(user->public_key, old_public_key, 33);
+    return NULL;
+  }
+
+  // Envelope succeeded. Suspend the user (increments key_version). If the
+  // user is REVOKED (terminal), suspend fails and we must roll back.
+  if (attribute_machine_suspend_user(attr_machine, user_id) != CRABS_SUCCESS) {
+    memcpy(user->public_key, old_public_key, 33);
+    crypto_key_envelope_destroy(envelope);
+    return NULL;
+  }
+  // public_key stays as new_public_key (already set above).
 
   // Step 6: Build result (envelope only; no private key on the node)
   recovery_result_t* result = get_clear_memory(sizeof(recovery_result_t));

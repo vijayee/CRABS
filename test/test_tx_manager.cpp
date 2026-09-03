@@ -210,6 +210,23 @@ TEST_F(TxManagerIntegration, NoTxManagerAcceptsAll) {
   operation_destroy(op);
 }
 
+// R8-S-4: append_log now returns a status and the op fails if it cannot log.
+// Regression: a successful op must still be logged and versioned.
+TEST_F(TxManagerIntegration, SuccessfulOpIsLoggedAndVersioned) {
+  uint8_t uuid[16];
+  memset(uuid, 0xEE, 16);
+
+  uint64_t version_before = state->version;
+  uint64_t log_before = state->log_count;
+
+  operation_t* op = make_op(uuid);
+  EXPECT_EQ(state_machine_execute(state, op), CRABS_SUCCESS);
+  operation_destroy(op);
+
+  EXPECT_EQ(state->log_count, log_before + 1);
+  EXPECT_EQ(state->version, version_before + 1);
+}
+
 TEST_F(TxManagerIntegration, MemoryTxManagerRejectsDuplicate) {
   state->tx_manager = crabs_tx_manager_memory(64);
 

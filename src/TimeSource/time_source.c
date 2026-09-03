@@ -84,6 +84,16 @@ static void _add_ms(uint64_t* seconds, uint64_t* nanos, uint64_t ms) {
   *nanos = *nanos % 1000000000;
 }
 
+// R8-T-3: saturating seconds→ms conversion. `(int64_t)seconds * 1000` is
+// signed-overflow UB for seconds > ~9.2e15; the parser accepts 19-digit
+// values, so a compromised server could wrap the value into the plausibility
+// window. Clamp instead.
+static int64_t _saturating_seconds_to_ms(uint64_t seconds) {
+  const uint64_t max_seconds = (uint64_t)INT64_MAX / 1000;
+  if (seconds > max_seconds) return INT64_MAX;
+  return (int64_t)(seconds * 1000);
+}
+
 static crabs_physical_time_t _get_time(void* ctx) {
   crabs_time_source_ctx_t* context = (crabs_time_source_ctx_t*)ctx;
   crabs_physical_time_t result = {0, 0, false};
@@ -119,9 +129,9 @@ static crabs_physical_time_t _get_time(void* ctx) {
     if (context->max_skew_ms > 0) {
       crabs_physical_time_t local = crabs_hlc_get_system_time(NULL);
       if (local.valid) {
-        int64_t fetched_ms = (int64_t)fetched.seconds * 1000 +
+        int64_t fetched_ms = _saturating_seconds_to_ms(fetched.seconds) +
                              (int64_t)fetched.nanos / 1000000;
-        int64_t local_ms = (int64_t)local.seconds * 1000 +
+        int64_t local_ms = _saturating_seconds_to_ms(local.seconds) +
                            (int64_t)local.nanos / 1000000;
         int64_t diff = fetched_ms - local_ms;
         if (diff < 0) diff = -diff;
@@ -294,6 +304,86 @@ static int _wait_for_connect(platform_socket_t socket_fd, uint64_t timeout_ms) {
 #endif
 }
 
+#ifndef _WIN32
+// R8-T-4: bound getaddrinfo() (DNS resolution) by timeout_ms. A blackholed
+// DNS server would otherwise block the synchronous authorization path
+// indefinitely. Run the resolution in a detached thread and wait on a
+// condition variable with a timeout. On timeout the thread and its eventual
+// result are leaked (bounded, rare) rather than risking a use-after-free.
+typedef struct {
+  char host[256];
+  char port[16];
+  struct addrinfo hints;
+  struct addrinfo* result;
+  int rc;
+  bool done;
+  platform_mutex_t mutex;
+  platform_cond_t cond;
+} _dns_resolve_ctx_t;
+
+static void* _dns_resolve_thread(void* arg) {
+  _dns_resolve_ctx_t* ctx = (_dns_resolve_ctx_t*)arg;
+  int rc = getaddrinfo(ctx->host, ctx->port, &ctx->hints, &ctx->result);
+  platform_mutex_lock(&ctx->mutex);
+  ctx->rc = rc;
+  ctx->done = true;
+  platform_cond_signal(&ctx->cond);
+  platform_mutex_unlock(&ctx->mutex);
+  return NULL;
+}
+
+static int _bounded_getaddrinfo(const char* host, const char* port,
+                                const struct addrinfo* hints,
+                                struct addrinfo** result, uint64_t timeout_ms) {
+  _dns_resolve_ctx_t* ctx = (_dns_resolve_ctx_t*)get_clear_memory(sizeof(_dns_resolve_ctx_t));
+  if (ctx == NULL) return EAI_MEMORY;
+  strncpy(ctx->host, host, sizeof(ctx->host) - 1);
+  strncpy(ctx->port, port, sizeof(ctx->port) - 1);
+  ctx->hints = *hints;
+  platform_mutex_init(&ctx->mutex);
+  platform_cond_init(&ctx->cond);
+
+  pthread_t thread;
+  if (pthread_create(&thread, NULL, _dns_resolve_thread, ctx) != 0) {
+    platform_cond_destroy(&ctx->cond);
+    platform_mutex_destroy(&ctx->mutex);
+    free(ctx);
+    return getaddrinfo(host, port, hints, result); // fallback
+  }
+  pthread_detach(thread);
+
+  platform_mutex_lock(&ctx->mutex);
+  if (!ctx->done) {
+    struct timespec deadline;
+    clock_gettime(CLOCK_REALTIME, &deadline);
+    deadline.tv_sec += (time_t)(timeout_ms / 1000);
+    deadline.tv_nsec += (long)((timeout_ms % 1000) * 1000000);
+    if (deadline.tv_nsec >= 1000000000L) {
+      deadline.tv_sec += 1;
+      deadline.tv_nsec -= 1000000000L;
+    }
+    pthread_cond_timedwait(&ctx->cond, &ctx->mutex, &deadline);
+  }
+
+  int rc;
+  if (ctx->done) {
+    *result = ctx->result;
+    rc = ctx->rc;
+    platform_mutex_unlock(&ctx->mutex);
+    platform_cond_destroy(&ctx->cond);
+    platform_mutex_destroy(&ctx->mutex);
+    free(ctx);
+  } else {
+    // Timeout: the detached thread still owns ctx and will write to it.
+    // Leak ctx (and the eventual getaddrinfo result) rather than risk a
+    // use-after-free. Bounded and rare.
+    platform_mutex_unlock(&ctx->mutex);
+    rc = EAI_AGAIN;
+  }
+  return rc;
+}
+#endif
+
 static platform_socket_t _tcp_connect(const char* host, int port, uint64_t timeout_ms) {
   char port_str[16];
   snprintf(port_str, sizeof(port_str), "%d", port);
@@ -303,12 +393,18 @@ static platform_socket_t _tcp_connect(const char* host, int port, uint64_t timeo
   hints.ai_family = AF_UNSPEC;
   hints.ai_socktype = SOCK_STREAM;
 
-  // Note: getaddrinfo() performs DNS resolution and is not bounded by
-  // timeout_ms. A blackholed DNS server can still block here.
   struct addrinfo* addresses = NULL;
+#ifdef _WIN32
+  // Windows: getaddrinfo is not bounded here (GetAddrInfoEx would be needed
+  // for async resolution); the connect() below is still bounded by timeout_ms.
   if (getaddrinfo(host, port_str, &hints, &addresses) != 0) {
     return PLATFORM_INVALID_SOCKET;
   }
+#else
+  if (_bounded_getaddrinfo(host, port_str, &hints, &addresses, timeout_ms) != 0) {
+    return PLATFORM_INVALID_SOCKET;
+  }
+#endif
 
   platform_socket_t socket_fd = PLATFORM_INVALID_SOCKET;
   for (struct addrinfo* address = addresses; address != NULL; address = address->ai_next) {

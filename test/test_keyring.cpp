@@ -454,6 +454,27 @@ TEST(TestKeyRing, RevokeAllKeysSuspendsUser) {
   attribute_machine_destroy(am);
 }
 
+// R8-A-6: revocation is terminal. Revoking the last key of a REVOKED user
+// must not downgrade them to the recoverable SUSPENDED state.
+TEST(TestKeyRing, RevokeLastKeyOnRevokedUserStaysRevoked) {
+  attribute_machine_t* am = create_test_am();
+  user_t* admin = attribute_machine_find_user(am, "admin");
+
+  uint8_t pk[33];
+  _gen_pk_kr(pk);
+  ASSERT_EQ(user_key_register(admin, "key1", ECDSA_SECP256K1, pk, 33, "primary"), CRABS_SUCCESS);
+
+  ASSERT_EQ(attribute_machine_revoke_user(am, "admin"), CRABS_SUCCESS);
+  EXPECT_EQ(admin->status, USER_REVOKED);
+
+  ASSERT_EQ(user_key_revoke(admin, "key1"), CRABS_SUCCESS);
+
+  // Revocation is terminal: the user must stay REVOKED, not SUSPENDED.
+  EXPECT_EQ(admin->status, USER_REVOKED);
+
+  attribute_machine_destroy(am);
+}
+
 // ============================================================
 // user_key_set_default
 // ============================================================

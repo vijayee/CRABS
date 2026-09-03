@@ -41,6 +41,13 @@ crabs_error_e dedup_apply_mutation_spec(state_t* state,
                                           const dedup_spec_t* spec,
                                           const operation_t* op);
 
+// R8-S-3: validate that the dedup mutation can be applied WITHOUT mutating
+// state. state_machine_execute calls this before the handler runs so a failing
+// mutation is rejected before the handler's effects are applied.
+crabs_error_e dedup_validate_mutation_spec(const state_t* state,
+                                            const dedup_spec_t* spec,
+                                            const operation_t* op);
+
 // ============================================================
 // Atomic check-and-apply (§5.4)
 // ============================================================

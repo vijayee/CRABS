@@ -241,6 +241,30 @@ TEST(TimeSourceBackend, ImplausibleTimeRejected) {
   crabs_time_source_destroy(ops);
 }
 
+// R8-T-3: a fetched timestamp with a huge seconds value must be rejected via
+// saturating arithmetic, not wrapped (signed-overflow UB) into the plausibility
+// window. A compromised server must not be able to push the anchor forward.
+TEST(TimeSourceBackend, HugeSecondsRejectedNotWrapped) {
+  crabs_physical_time_t now = crabs_hlc_get_system_time(NULL);
+  ASSERT_TRUE(now.valid);
+  reset_fake(UINT64_MAX, 0);  // far beyond INT64_MAX/1000
+
+  crabs_time_source_config_t config;
+  config.server_url = "https://example.invalid";
+  config.resync_interval_ms = 0;
+  config.timeout_ms = 1000;
+  config.max_skew_ms = 1000;
+
+  crabs_time_source_ops_t* ops =
+      crabs_time_source_https_create_with_transport(&config, fake_transport);
+  ASSERT_NE(ops, nullptr);
+
+  crabs_physical_time_t result = ops->get_time(ops->ctx);
+  EXPECT_FALSE(result.valid);
+
+  crabs_time_source_destroy(ops);
+}
+
 // R7-18: a fetched timestamp earlier than the current anchor must be rejected
 // (monotonicity — time must never go backwards across resyncs).
 TEST(TimeSourceBackend, BackwardsTimeRejected) {

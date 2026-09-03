@@ -287,3 +287,29 @@ TEST(TestPolicyConfig, ChangeConfigMultipleFieldsSequentially) {
 
   free(state);
 }
+
+// R8-S-2: CHANGE_CONFIG must be atomic. A later failing pair (co_sign_threshold=0)
+// must not leave earlier pairs applied — otherwise an authorized user could set
+// max_lock_duration_ms=1 then trigger a failure, permanently shortening locks.
+TEST(TestPolicyConfig, ChangeConfigAtomicOnLaterFailure) {
+  state_t* state = (state_t*)get_clear_memory(sizeof(state_t));
+  state->version = 1;
+  state->config.max_lock_duration_ms = 5000;
+  state->config.allow_force_unlock = true;
+
+  // Valid pair first, then a pair that fails validation.
+  const char* payload = "max_lock_duration_ms=1;co_sign_threshold=0";
+  operation_t* op = operation_create(CRABS_OP_CHANGE_CONFIG);
+  op->payload = (uint8_t*)strdup(payload);
+  op->payload_size = (uint32_t)strlen(payload) + 1;
+  memcpy(op->uuid, "\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b\x0c\x0d\x0e\x0f\x10", 16);
+
+  crabs_error_e rc = state_machine_op_change_config(state, op);
+  EXPECT_EQ(rc, CRABS_ERR_UNAUTHORIZED);
+
+  // The earlier pair must NOT have been applied.
+  EXPECT_EQ(state->config.max_lock_duration_ms, 5000u);
+
+  operation_destroy(op);
+  free(state);
+}

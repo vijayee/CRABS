@@ -8,6 +8,7 @@ extern "C" {
 #include "../src/StateMachine/state_machine.h"
 #include "../src/Crypto/sig_scheme.h"
 #include "../src/Crypto/crypto.h"
+#include "../src/Serialization/serialization.h"
 #include "../src/CRABS/crabs.h"
 #include "../src/CRABS/data_model.h"
 #include "../src/Util/allocator.h"
@@ -542,8 +543,25 @@ static void destroy_lifecycle_state(state_t* state) {
   }
 }
 
+// R7-11: Lamport monotonicity is enforced per signer, so each op must carry a
+// strictly increasing lamport_time.
+static uint64_t g_lifecycle_lamport = 0;
+
 static void sign_lifecycle_op(operation_t* op) {
+  op->lamport_time = ++g_lifecycle_lamport;
   crabs_test_sign_op_with(g_env.am, lifecycle_admin_key(), op);
+}
+
+// R8-C-2: once a keyring exists, the legacy bootstrap key is rejected, so ops
+// must be signed with a keyring key.
+static void sign_lifecycle_op_with_key(operation_t* op, const char* key_id, ecdsa_keypair_t* key) {
+  op->lamport_time = ++g_lifecycle_lamport;
+  strncpy(op->key_id, key_id, CRABS_MAX_KEY_ID - 1);
+  op->sig_scheme = ECDSA_SECP256K1;
+  op->signer_key_version = attribute_machine_find_user(g_env.am, "admin")->key_version;
+  serialized_buffer_t* ser = crabs_serialize_for_signing(op);
+  crypto_sign_operation(key->private_key, ser->data, ser->len, op->signature);
+  serialized_buffer_destroy(ser);
 }
 
 TEST(TestKeyLifecycle, StateMachineSuspendKey) {
@@ -551,13 +569,16 @@ TEST(TestKeyLifecycle, StateMachineSuspendKey) {
   state_t* state = create_state_with_am_for_lifecycle();
   user_t* admin = attribute_machine_find_user(state->attr_machine, "admin");
 
-  // Register a key first
+  // Register a key first with a known keypair so the suspend op can be signed
+  // with it (R8-C-2).
+  ecdsa_keypair_t* kp = crypto_ecdsa_generate();
+  ASSERT_NE(kp, nullptr);
   const char* config = "key_id=suskey;scheme=1;public_key_len=33";
   size_t config_len = strlen(config) + 1;
   size_t payload_size = config_len + 33;
   uint8_t* payload = (uint8_t*)calloc(payload_size, 1);
   memcpy(payload, config, config_len);
-  { uint8_t _pk[33]; _gen_pk_lifecycle(_pk); memcpy(payload + config_len, _pk, 33); }
+  memcpy(payload + config_len, kp->public_key, 33);
 
   operation_t* reg_op = operation_create(CRABS_OP_REGISTER_KEY);
   memcpy(reg_op->uuid, "\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b\x0c\x0d\x0e\x0f\x10", 16);
@@ -576,12 +597,13 @@ TEST(TestKeyLifecycle, StateMachineSuspendKey) {
   sus_op->payload = (uint8_t*)strdup(suspend_payload);
   sus_op->payload_size = (uint32_t)strlen(suspend_payload) + 1;
 
-  sign_lifecycle_op(sus_op);
+  sign_lifecycle_op_with_key(sus_op, "suskey", kp);
   crabs_error_e rc = state_machine_execute(state, sus_op);
   EXPECT_EQ(rc, CRABS_SUCCESS);
   EXPECT_EQ(user_key_find(admin, "suskey")->status, KEY_SUSPENDED);
 
   operation_destroy(sus_op);
+  crypto_ecdsa_keypair_destroy(kp);
   destroy_lifecycle_state(state);
   crypto_sig_scheme_cleanup();
 }
@@ -591,13 +613,18 @@ TEST(TestKeyLifecycle, StateMachineActivateKey) {
   state_t* state = create_state_with_am_for_lifecycle();
   user_t* admin = attribute_machine_find_user(state->attr_machine, "admin");
 
-  // Register a key, then suspend it
+  // Register two keys with known keypairs. The suspend/activate ops are signed
+  // with the still-active key (R8-C-2: a suspended key cannot sign).
+  ecdsa_keypair_t* kp1 = crypto_ecdsa_generate();
+  ecdsa_keypair_t* kp2 = crypto_ecdsa_generate();
+  ASSERT_NE(kp1, nullptr);
+  ASSERT_NE(kp2, nullptr);
   const char* config = "key_id=actkey;scheme=1;public_key_len=33";
   size_t config_len = strlen(config) + 1;
   size_t payload_size = config_len + 33;
   uint8_t* payload = (uint8_t*)calloc(payload_size, 1);
   memcpy(payload, config, config_len);
-  { uint8_t _pk[33]; _gen_pk_lifecycle(_pk); memcpy(payload + config_len, _pk, 33); }
+  memcpy(payload + config_len, kp2->public_key, 33);
 
   operation_t* reg_op = operation_create(CRABS_OP_REGISTER_KEY);
   memcpy(reg_op->uuid, "\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b\x0c\x0d\x0e\x0f\x10", 16);
@@ -608,18 +635,34 @@ TEST(TestKeyLifecycle, StateMachineActivateKey) {
   ASSERT_EQ(state_machine_execute(state, reg_op), CRABS_SUCCESS);
   operation_destroy(reg_op);
 
-  // Suspend
+  // Register a second active key to sign the suspend/activate ops.
+  const char* config2 = "key_id=adminkey;scheme=1;public_key_len=33";
+  size_t config2_len = strlen(config2) + 1;
+  size_t payload2_size = config2_len + 33;
+  uint8_t* payload2 = (uint8_t*)calloc(payload2_size, 1);
+  memcpy(payload2, config2, config2_len);
+  memcpy(payload2 + config2_len, kp1->public_key, 33);
+  operation_t* reg2 = operation_create(CRABS_OP_REGISTER_KEY);
+  memcpy(reg2->uuid, "\x31\x32\x33\x34\x35\x36\x37\x38\x39\x3a\x3b\x3c\x3d\x3e\x3f\x40", 16);
+  strncpy(reg2->signer_id, "admin", CRABS_MAX_USER_ID - 1);
+  reg2->payload = payload2;
+  reg2->payload_size = (uint32_t)payload2_size;
+  sign_lifecycle_op_with_key(reg2, "actkey", kp2);
+  ASSERT_EQ(state_machine_execute(state, reg2), CRABS_SUCCESS);
+  operation_destroy(reg2);
+
+  // Suspend actkey
   const char* suspend_payload = "key_id=actkey";
   operation_t* sus_op = operation_create(CRABS_OP_SUSPEND_KEY);
   memcpy(sus_op->uuid, "\x11\x12\x13\x14\x15\x16\x17\x18\x19\x1a\x1b\x1c\x1d\x1e\x1f\x20", 16);
   strncpy(sus_op->signer_id, "admin", CRABS_MAX_USER_ID - 1);
   sus_op->payload = (uint8_t*)strdup(suspend_payload);
   sus_op->payload_size = (uint32_t)strlen(suspend_payload) + 1;
-  sign_lifecycle_op(sus_op);
+  sign_lifecycle_op_with_key(sus_op, "adminkey", kp1);
   ASSERT_EQ(state_machine_execute(state, sus_op), CRABS_SUCCESS);
   operation_destroy(sus_op);
 
-  // Activate
+  // Activate actkey
   const char* activate_payload = "key_id=actkey";
   operation_t* act_op = operation_create(CRABS_OP_ACTIVATE_KEY);
   memcpy(act_op->uuid, "\x21\x22\x23\x24\x25\x26\x27\x28\x29\x2a\x2b\x2c\x2d\x2e\x2f\x30", 16);
@@ -627,12 +670,14 @@ TEST(TestKeyLifecycle, StateMachineActivateKey) {
   act_op->payload = (uint8_t*)strdup(activate_payload);
   act_op->payload_size = (uint32_t)strlen(activate_payload) + 1;
 
-  sign_lifecycle_op(act_op);
+  sign_lifecycle_op_with_key(act_op, "adminkey", kp1);
   crabs_error_e rc = state_machine_execute(state, act_op);
   EXPECT_EQ(rc, CRABS_SUCCESS);
   EXPECT_EQ(user_key_find(admin, "actkey")->status, KEY_ACTIVE);
 
   operation_destroy(act_op);
+  crypto_ecdsa_keypair_destroy(kp1);
+  crypto_ecdsa_keypair_destroy(kp2);
   destroy_lifecycle_state(state);
   crypto_sig_scheme_cleanup();
 }

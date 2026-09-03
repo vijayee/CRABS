@@ -72,6 +72,21 @@ TEST(TestCrypto, TestEcdsaWrongKey) {
   crypto_ecdsa_keypair_destroy(keypair2);
 }
 
+// R8-C-7: a zero or out-of-range private key must be rejected, not silently
+// produce a point-at-infinity public key.
+TEST(TestCrypto, DerivePublicKeyRejectsInvalidPrivateKey) {
+  uint8_t public_key[33];
+
+  uint8_t zero_key[32] = {0};
+  EXPECT_EQ(crypto_ecdsa_derive_public_key(zero_key, public_key),
+            CRABS_ERR_CRYPTOGRAPHIC_ERROR);
+
+  uint8_t max_key[32];
+  memset(max_key, 0xFF, 32);  // >= secp256k1 order n
+  EXPECT_EQ(crypto_ecdsa_derive_public_key(max_key, public_key),
+            CRABS_ERR_CRYPTOGRAPHIC_ERROR);
+}
+
 TEST(TestCrypto, TestSha256) {
   const uint8_t data[] = "CRABS protocol test data";
   uint8_t hash1[CRABS_HASH_SIZE];
@@ -523,6 +538,38 @@ TEST_F(VerifyAuthTest, ModeA_CollapsesUserExistenceAndStatus) {
   EXPECT_EQ(vr.error, CRABS_ERR_UNAUTHORIZED);
 
   crypto_ecdsa_keypair_destroy(keypair);
+}
+
+TEST_F(VerifyAuthTest, ModeA_LegacyKeyRejectedWhenKeyringExists) {
+  // R8-C-2: once a user has a keyring, the legacy bootstrap key must not
+  // authorize via the v1 Mode A path (which bypasses _verify_user_signature).
+  ecdsa_keypair_t* keypair = crypto_ecdsa_generate();
+  ASSERT_NE(keypair, nullptr);
+  ASSERT_EQ(crabs_test_register_user_with_role(am, "alice", keypair->public_key, "role", "admin"),
+            CRABS_SUCCESS);
+
+  // Register a key in alice's keyring.
+  user_t* alice = attribute_machine_find_user(am, "alice");
+  ASSERT_NE(alice, nullptr);
+  ecdsa_keypair_t* new_key = crypto_ecdsa_generate();
+  ASSERT_NE(new_key, nullptr);
+  ASSERT_EQ(user_key_register(alice, "key1", ECDSA_SECP256K1, new_key->public_key, 33, "primary"),
+            CRABS_SUCCESS);
+
+  // Sign an op with the legacy bootstrap key.
+  const uint8_t op_data[] = {0x01, 0x02, 0x03};
+  uint8_t signature[CRABS_SIG_SIZE];
+  ASSERT_EQ(crypto_sign_operation(keypair->private_key, op_data, sizeof(op_data), signature),
+            CRABS_SUCCESS);
+
+  // v1 Mode A must reject the legacy key now that a keyring exists.
+  verify_result_t vr = crypto_verify_operation_auth(
+      mk, "role:admin", am, op_data, sizeof(op_data), signature, "alice", VERIFY_MODE_A);
+  EXPECT_FALSE(vr.authorized);
+  EXPECT_EQ(vr.error, CRABS_ERR_UNAUTHORIZED);
+
+  crypto_ecdsa_keypair_destroy(keypair);
+  crypto_ecdsa_keypair_destroy(new_key);
 }
 
 TEST_F(VerifyAuthTest, ModeB_AuthorizedUser) {

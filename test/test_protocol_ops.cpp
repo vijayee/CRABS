@@ -243,6 +243,37 @@ TEST_F(TestProtocolOps, LockOwnerMismatch) {
   crypto_ecdsa_keypair_destroy(bob_key);
 }
 
+TEST_F(TestProtocolOps, ExtendRejectsNonOwnerWithoutClaim) {
+  // R8-S-1: lock ownership must be enforced even when the op carries no lock
+  // claim. bob is authorized for EXTEND but does not own alice's lock.
+  ecdsa_keypair_t* bob_key = crypto_ecdsa_generate();
+  ASSERT_NE(bob_key, nullptr);
+  ASSERT_EQ(crabs_test_register_user_with_role(am, "bob", bob_key->public_key, "role", "admin"),
+            CRABS_SUCCESS);
+
+  ASSERT_EQ(lock_resource("res1"), CRABS_SUCCESS);
+
+  operation_t* op = operation_create(CRABS_OP_EXTEND);
+  memset(op->uuid, 0x51, CRABS_UUID_SIZE);
+  op->resources = (char(*)[CRABS_MAX_USER_ID])malloc(sizeof(char[CRABS_MAX_USER_ID]));
+  strncpy(op->resources[0], "res1", CRABS_MAX_USER_ID - 1);
+  op->resource_count = 1;
+  op->required_state = (protocol_state_e*)malloc(sizeof(protocol_state_e));
+  op->required_state[0] = PROTOCOL_LOCKED;
+  op->next_state = (protocol_state_e*)malloc(sizeof(protocol_state_e));
+  op->next_state[0] = PROTOCOL_LOCKED;
+  strncpy(op->signer_id, "bob", CRABS_MAX_USER_ID - 1);
+  op->lamport_time = ++lamport_counter;
+  op->signer_key_version = attribute_machine_find_user(am, "bob")->key_version;
+  serialized_buffer_t* ser = crabs_serialize_for_signing(op);
+  crypto_sign_operation(bob_key->private_key, ser->data, ser->len, op->signature);
+  serialized_buffer_destroy(ser);
+
+  EXPECT_EQ(state_machine_execute(state, op), CRABS_ERR_LOCK_OWNER_MISMATCH);
+  operation_destroy(op);
+  crypto_ecdsa_keypair_destroy(bob_key);
+}
+
 // ============================================================
 // Protocol Violation via Wrong Required State
 // ============================================================

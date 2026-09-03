@@ -273,18 +273,15 @@ crabs_physical_time_t crabs_hlc_get_physical_time(crabs_hlc_state_t* state) {
     return state->time_source_ops->get_time(state->time_source_ops->ctx);
   }
 
-  // Fall back to system clock based on configured source
-  switch (state->time_source) {
-    case CRABS_TIME_SOURCE_SYSTEM_CLOCK:
-    case CRABS_TIME_SOURCE_NTP_AUTH:
-    case CRABS_TIME_SOURCE_TPM:
-    case CRABS_TIME_SOURCE_CONSENSUS:
-      // All non-system sources fall back to system clock for now
-      // (NTP, TPM, and consensus require external infrastructure)
-      return crabs_hlc_get_system_time(NULL);
-    default:
-      return crabs_hlc_get_system_time(NULL);
+  // R8-H-1: only the explicit system clock may fall back to the unauthenticated
+  // platform clock. Every other configured source (NTP, TPM, consensus, HTTPS)
+  // requires its time source ops to be attached; without them, fail closed
+  // rather than silently trusting the attacker-controllable local clock.
+  if (state->time_source == CRABS_TIME_SOURCE_SYSTEM_CLOCK) {
+    return crabs_hlc_get_system_time(NULL);
   }
+  crabs_physical_time_t invalid = {0, 0, false};
+  return invalid;
 }
 
 // ============================================================
