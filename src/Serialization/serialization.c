@@ -19,6 +19,10 @@
 #define CRABS_DESER_MAX_ITEMS   100000
 #define CRABS_DESER_MAX_POLICIES 10000
 #define CRABS_DESER_MAX_LOG     1000000
+// R8-SER-2/3: bound the OT tree node count so the O(n²) duplicate-id and
+// parent-lookup scans cannot be driven to a multi-minute CPU DoS by a crafted
+// blob (CRABS_DESER_MAX_LOG allows 1M nodes → ~10¹² strcmp calls).
+#define CRABS_DESER_MAX_TREE_NODES 10000
 
 // ============================================================
 // Write buffer helper
@@ -515,7 +519,7 @@ static bool _deserialize_ot_type_state(read_buf_t* buf, data_item_t* item) {
 
       uint32_t node_count;
       if (!_read_uint32_le(buf, &node_count)) return false;
-      if (node_count > CRABS_DESER_MAX_LOG) return false;
+      if (node_count > CRABS_DESER_MAX_TREE_NODES) return false;
 
       crabs_tree_node_t* first_node = NULL;
       crabs_tree_node_t* prev_node = NULL;
@@ -550,10 +554,10 @@ static bool _deserialize_ot_type_state(read_buf_t* buf, data_item_t* item) {
 
         // Deserialize child position map
         uint32_t bst_count;
-        if (!_read_uint32_le(buf, &bst_count)) return false;
+        if (!_read_uint32_le(buf, &bst_count)) { crabs_tree_node_destroy(node); return false; }
         if (bst_count > 0) {
           node->child_position_map = _deserialize_bst_recursive(buf, 0);
-          if (node->child_position_map == NULL) return false;
+          if (node->child_position_map == NULL) { crabs_tree_node_destroy(node); return false; }
         }
 
         // Build pool linkage
@@ -586,6 +590,11 @@ static bool _deserialize_ot_type_state(read_buf_t* buf, data_item_t* item) {
           }
           node = node->pool_next;
         }
+
+        // R8-SER-4: a non-empty root_id that matches no node leaves tree->root
+        // NULL, which skips the cycle-detection walk below. Reject it so a
+        // crafted blob with a parent cycle cannot pass deserialization.
+        if (tree->root == NULL) return false;
 
         // Link parent-child relationships
         node = tree->node_pool;
@@ -1257,6 +1266,22 @@ serialized_buffer_t* crabs_serialize_state(const state_t* state) {
     _serialize_log_entry(buf, &state->log[i]);
   }
 
+  // schedules (v6): pending timed transactions
+  uint32_t schedule_count = 0;
+  for (const scheduled_operation_t* schedule_entry = state->scheduled_operations;
+       schedule_entry != NULL; schedule_entry = schedule_entry->next) {
+    schedule_count++;
+  }
+  _write_uint32_le(buf, schedule_count);
+  for (const scheduled_operation_t* schedule_entry = state->scheduled_operations;
+       schedule_entry != NULL; schedule_entry = schedule_entry->next) {
+    _write_uint64_le(buf, schedule_entry->schedule_id);
+    _write_uint64_le(buf, schedule_entry->execute_at_ms);
+    _write_bytes(buf, (const uint8_t*)schedule_entry->submitter, CRABS_MAX_USER_ID);
+    _write_uint32_le(buf, schedule_entry->op_len);
+    _write_bytes(buf, schedule_entry->op_bytes, schedule_entry->op_len);
+  }
+
   // Checksum: SHA-256 of all preceding bytes.
   // NOTE: this is an INTEGRITY/CORRUPTION check, NOT authentication. An
   // attacker who can modify the blob can recompute this hash. Loading state
@@ -1363,6 +1388,40 @@ state_t* crabs_deserialize_state(const uint8_t* data, size_t len) {
     state->log_count = log_count;
     for (uint32_t i = 0; i < log_count; i++) {
       if (!_deserialize_log_entry(&buf, &state->log[i])) goto fail;
+    }
+  }
+
+  // schedules (v6+): pending timed transactions
+  if (version >= 6) {
+    uint32_t schedule_count;
+    if (!_read_uint32_le(&buf, &schedule_count)) goto fail;
+    if (schedule_count > CRABS_DESER_MAX_ITEMS) goto fail;
+    for (uint32_t schedule_index = 0; schedule_index < schedule_count; schedule_index++) {
+      scheduled_operation_t* entry =
+          (scheduled_operation_t*)get_clear_memory(sizeof(scheduled_operation_t));
+      if (!_read_uint64_le(&buf, &entry->schedule_id) ||
+          !_read_uint64_le(&buf, &entry->execute_at_ms)) {
+        free(entry);
+        goto fail;
+      }
+      if (!_read_bytes(&buf, (uint8_t*)entry->submitter, CRABS_MAX_USER_ID)) {
+        free(entry);
+        goto fail;
+      }
+      if (!_read_uint32_le(&buf, &entry->op_len) || entry->op_len == 0 ||
+          entry->op_len > 1024u * 1024u) {
+        free(entry);
+        goto fail;
+      }
+      entry->op_bytes = (uint8_t*)get_clear_memory(entry->op_len);
+      if (entry->op_bytes == NULL ||
+          !_read_bytes(&buf, entry->op_bytes, entry->op_len)) {
+        free(entry->op_bytes);
+        free(entry);
+        goto fail;
+      }
+      entry->next = state->scheduled_operations;
+      state->scheduled_operations = entry;
     }
   }
 

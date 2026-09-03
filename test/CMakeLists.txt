@@ -58,6 +58,7 @@ if (BUILD_TESTING)
         test_handler_registry.cpp
         test_tx_manager.cpp
         test_devtools.cpp
+        test_scheduler.cpp
     )
 
     add_dependencies(testcrabs crabs)

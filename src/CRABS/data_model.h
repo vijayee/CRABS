@@ -275,6 +275,18 @@ typedef struct {
 } log_entry_t;
 
 // ============================================================
+// Scheduled Operation (timed transactions v1)
+// ============================================================
+typedef struct scheduled_operation_t {
+  uint64_t    schedule_id;    // per-state monotonic counter
+  uint64_t    execute_at_ms;  // epoch ms; compared against authenticated now
+  char        submitter[CRABS_MAX_USER_ID];
+  uint8_t*    op_bytes;       // crabs_serialize_operation of the embedded op
+  uint32_t    op_len;
+  struct scheduled_operation_t* next;
+} scheduled_operation_t;
+
+// ============================================================
 // State (§4.1)
 // ============================================================
 typedef struct state_t {
@@ -288,6 +300,9 @@ typedef struct state_t {
   void*           tx_manager;           // crabs_tx_manager_t* — replay protection
   trigger_t*      triggers;
   uint32_t        trigger_count;
+  // Timed transactions (v1): pending operations awaiting materialization.
+  scheduled_operation_t* scheduled_operations;
+  uint64_t        schedule_seq;
   attribute_machine_t* attr_machine;  // For key verification and policy evaluation
   uint8_t node_private_key[32];       // Node ECDSA private key for envelope signing (§11)
   uint8_t node_public_key[33];        // Node ECDSA public key

@@ -3,6 +3,7 @@
 //
 
 #include "data_model.h"
+#include "../Scheduler/scheduler.h"
 #include "../Trigger/trigger.h"
 #include "../Crypto/crypto.h"
 #include "../TxManager/tx_manager.h"
@@ -134,6 +135,7 @@ void state_destroy(state_t* state) {
     }
     free(state->triggers);
   }
+  scheduler_destroy_all(state);
   if (state->tx_manager != NULL) {
     crabs_tx_manager_t* tx = (crabs_tx_manager_t*)state->tx_manager;
     if (tx->vtable.destroy != NULL) tx->vtable.destroy(tx);
