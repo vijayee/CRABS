@@ -306,6 +306,10 @@ typedef struct state_t {
   // Timed transactions (v1): pending operations awaiting materialization.
   scheduled_operation_t* scheduled_operations;
   uint64_t        schedule_seq;
+  // Node-local runtime policy (NOT serialized): maximum scheduled occurrences
+  // materialized per tick, so a long offline catch-up cannot run unbounded in
+  // one tick. 0 = unlimited. Set via scheduler_set_max_occurrences_per_tick.
+  uint32_t        max_occurrences_per_tick;
   attribute_machine_t* attr_machine;  // For key verification and policy evaluation
   uint8_t node_private_key[32];       // Node ECDSA private key for envelope signing (§11)
   uint8_t node_public_key[33];        // Node ECDSA public key

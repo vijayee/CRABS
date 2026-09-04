@@ -12,6 +12,13 @@
 
 #define CRABS_SCHEDULER_MAX_DUE_PER_TICK 64
 
+// Default ceiling on scheduled occurrences materialized per tick. Bounds the
+// work a single tick does when catching up after a long offline window; the
+// remainder carries over to subsequent ticks (nothing is dropped). Node-local
+// runtime policy — override with scheduler_set_max_occurrences_per_tick, 0 =
+// unlimited. Not part of the serialized state.
+#define CRABS_SCHEDULER_DEFAULT_MAX_OCCURRENCES_PER_TICK 64
+
 // Add a pending scheduled operation. `op` is the embedded operation (already
 // fully signed by its authorizer); it is serialized with
 // crabs_serialize_operation and stored. Returns the new schedule_id, or 0 on
@@ -44,8 +51,15 @@ const scheduled_operation_t* scheduler_first(const state_t* state);
 // propagated; CRABS_ERR_ALREADY_EXECUTED from the materialized op is treated
 // as an idempotent skip. Re-entrant calls (a materialized handler invoking
 // state_machine_execute, which ticks) are deferred to the enclosing tick.
+// At most state->max_occurrences_per_tick occurrences materialize per tick;
+// the rest carry over (entries stay pending, cadence keeps its position).
 // Returns CRABS_SUCCESS.
 crabs_error_e scheduler_process_due(state_t* state, uint64_t now_ms);
+
+// Override the per-tick occurrence ceiling (node-local runtime policy; not
+// serialized, so a restored state reverts to
+// CRABS_SCHEDULER_DEFAULT_MAX_OCCURRENCES_PER_TICK). 0 = unlimited.
+void scheduler_set_max_occurrences_per_tick(state_t* state, uint32_t max_occurrences);
 
 // Free the entire pending list (called from state_destroy).
 void scheduler_destroy_all(state_t* state);

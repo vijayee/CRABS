@@ -1006,6 +1006,138 @@ TEST(SchedulerRecurring, CatchUpFiresAllMissedSlotsInOrder) {
   crabs_test_env_destroy(&env);
 }
 
+// Audit follow-up: an unbounded catch-up burst. With a budget of 2, a tick
+// that would fire 5 missed slots fires exactly 2 and leaves the series
+// resident on the NEXT unfired slot; a later tick resumes exactly where it
+// stopped (no slot skipped, no slot double-fired).
+TEST(SchedulerRecurring, BudgetLimitsCatchUpWithCarryOver) {
+  crabs_test_env_t env;
+  crabs_test_env_init(&env);
+  register_schedule_test_policies(&env);
+  state_t* state = env.state;
+  state_set_time_source(state, &g_sched_mock_ops);
+  g_sched_mock_time.seconds = 1000000;
+  g_sched_mock_time.nanos = 0;
+  g_sched_mock_time.valid = true;
+
+  operation_t* embedded = make_counter_op("mint", "admin");
+  stamp_unique_uuid(embedded);
+  crabs_test_sign_op_with(state->attr_machine, env.admin_key, embedded);
+  ASSERT_NE(scheduler_schedule_recurring(
+      state, 1000001000, 1000, 0, 0, "admin", embedded), 0u);
+
+  scheduler_set_max_occurrences_per_tick(state, 2);
+
+  // First tick: slots 1000001000 and 1000002000 fire; slot 1000003000 is the
+  // next unfired slot the entry now rests on.
+  ASSERT_EQ(scheduler_process_due(state, 1000005500u), CRABS_SUCCESS);
+  uint32_t mint_entries = 0;
+  for (uint64_t entry_index = 0; entry_index < state->log_count; entry_index++) {
+    if (strcmp(state->log[entry_index].type, "mint") == 0) mint_entries++;
+  }
+  EXPECT_EQ(mint_entries, 2u);
+  ASSERT_EQ(scheduler_count(state), 1u);
+  EXPECT_EQ(scheduler_first(state)->execute_at_ms, 1000003000u);
+
+  // Second tick at the SAME time: budget applies per tick, so the next two
+  // slots fire and the entry carries over again.
+  ASSERT_EQ(scheduler_process_due(state, 1000005500u), CRABS_SUCCESS);
+  mint_entries = 0;
+  for (uint64_t entry_index = 0; entry_index < state->log_count; entry_index++) {
+    if (strcmp(state->log[entry_index].type, "mint") == 0) mint_entries++;
+  }
+  EXPECT_EQ(mint_entries, 4u);
+  EXPECT_EQ(scheduler_first(state)->execute_at_ms, 1000005000u);
+
+  // Unlimited budget (0): the remaining slot fires immediately.
+  scheduler_set_max_occurrences_per_tick(state, 0);
+  ASSERT_EQ(scheduler_process_due(state, 1000005500u), CRABS_SUCCESS);
+  mint_entries = 0;
+  for (uint64_t entry_index = 0; entry_index < state->log_count; entry_index++) {
+    if (strcmp(state->log[entry_index].type, "mint") == 0) mint_entries++;
+  }
+  EXPECT_EQ(mint_entries, 5u);
+  EXPECT_EQ(scheduler_first(state)->execute_at_ms, 1000006000u);
+
+  operation_destroy(embedded);
+  crabs_test_env_destroy(&env);
+}
+
+// Budget 0 is the explicit unlimited escape hatch: a long catch-up fires
+// every missed slot in a single tick, exactly as before the budget existed.
+TEST(SchedulerRecurring, ZeroBudgetMeansUnlimited) {
+  crabs_test_env_t env;
+  crabs_test_env_init(&env);
+  register_schedule_test_policies(&env);
+  state_t* state = env.state;
+  state_set_time_source(state, &g_sched_mock_ops);
+  g_sched_mock_time.seconds = 1000000;
+  g_sched_mock_time.nanos = 0;
+  g_sched_mock_time.valid = true;
+
+  operation_t* embedded = make_counter_op("mint", "admin");
+  stamp_unique_uuid(embedded);
+  crabs_test_sign_op_with(state->attr_machine, env.admin_key, embedded);
+  ASSERT_NE(scheduler_schedule_recurring(
+      state, 1000001000, 1000, 0, 0, "admin", embedded), 0u);
+
+  scheduler_set_max_occurrences_per_tick(state, 0);
+
+  ASSERT_EQ(scheduler_process_due(state, 1000005500u), CRABS_SUCCESS);
+  uint32_t mint_entries = 0;
+  for (uint64_t entry_index = 0; entry_index < state->log_count; entry_index++) {
+    if (strcmp(state->log[entry_index].type, "mint") == 0) mint_entries++;
+  }
+  EXPECT_EQ(mint_entries, 5u);
+  EXPECT_EQ(scheduler_first(state)->execute_at_ms, 1000006000u);
+
+  operation_destroy(embedded);
+  crabs_test_env_destroy(&env);
+}
+
+// The budget also caps one-shot schedules: with 3 due one-shots and a budget
+// of 2, only 2 materialize this tick and the third stays pending.
+TEST(SchedulerRecurring, BudgetLimitsOneShotFires) {
+  crabs_test_env_t env;
+  crabs_test_env_init(&env);
+  register_schedule_test_policies(&env);
+  state_t* state = env.state;
+  state_set_time_source(state, &g_sched_mock_ops);
+  g_sched_mock_time.seconds = 1000000;
+  g_sched_mock_time.nanos = 0;
+  g_sched_mock_time.valid = true;
+
+  for (uint32_t op_index = 0; op_index < 3; op_index++) {
+    operation_t* embedded = make_counter_op("mint", "admin");
+    stamp_unique_uuid(embedded);
+    crabs_test_sign_op_with(state->attr_machine, env.admin_key, embedded);
+    ASSERT_NE(scheduler_schedule(
+        state, 1000001000 + op_index, "admin", embedded), 0u);
+    operation_destroy(embedded);
+  }
+
+  scheduler_set_max_occurrences_per_tick(state, 2);
+
+  ASSERT_EQ(scheduler_process_due(state, 1000001100u), CRABS_SUCCESS);
+  uint32_t mint_entries = 0;
+  for (uint64_t entry_index = 0; entry_index < state->log_count; entry_index++) {
+    if (strcmp(state->log[entry_index].type, "mint") == 0) mint_entries++;
+  }
+  EXPECT_EQ(mint_entries, 2u);
+  ASSERT_EQ(scheduler_count(state), 1u);
+
+  // Next tick materializes the deferred one-shot.
+  ASSERT_EQ(scheduler_process_due(state, 1000001100u), CRABS_SUCCESS);
+  mint_entries = 0;
+  for (uint64_t entry_index = 0; entry_index < state->log_count; entry_index++) {
+    if (strcmp(state->log[entry_index].type, "mint") == 0) mint_entries++;
+  }
+  EXPECT_EQ(mint_entries, 3u);
+  EXPECT_EQ(scheduler_count(state), 0u);
+
+  crabs_test_env_destroy(&env);
+}
+
 // ============================================================
 // UAF regression: a handler cancels the recurring series it is
 // materialized from, while the tick loop is advancing the cadence.

@@ -98,6 +98,7 @@ state_t* state_create(void) {
   state->triggers = NULL;
   state->trigger_count = 0;
   state->attr_machine = NULL;
+  state->max_occurrences_per_tick = CRABS_SCHEDULER_DEFAULT_MAX_OCCURRENCES_PER_TICK;
   state->config.max_lock_duration_ms = CRABS_DEFAULT_LOCK_MS;
   state->config.max_lock_extensions = CRABS_MAX_LOCK_EXTENDS;
   state->config.allow_force_unlock = true;

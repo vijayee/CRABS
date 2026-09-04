@@ -31,6 +31,11 @@ const scheduled_operation_t* scheduler_first(const state_t* state) {
   return state ? state->scheduled_operations : NULL;
 }
 
+void scheduler_set_max_occurrences_per_tick(state_t* state, uint32_t max_occurrences) {
+  if (state == NULL) return;
+  state->max_occurrences_per_tick = max_occurrences;
+}
+
 // Shared tail of scheduler_schedule / scheduler_schedule_recurring: serialize
 // the op, allocate the entry, append at the tail. interval/repeat/end are the
 // cadence fields (one-shot callers pass interval 0, repeat 1, end 0).
@@ -168,7 +173,18 @@ crabs_error_e scheduler_process_due(state_t* state, uint64_t now_ms) {
     }
   }
 
+  // Occurrence budget (audit follow-up: unbounded catch-up burst). A node
+  // returning online after a long gap would otherwise materialize every
+  // missed slot in a single tick. The budget caps FIRES per tick (one-shots
+  // and recurring slots alike); deferred work carries over because deferred
+  // entries stay pending with their cadence position intact. 0 = unlimited.
+  uint32_t fires_this_tick = 0;
+
   for (uint32_t due_index = 0; due_index < due_count; due_index++) {
+    if (state->max_occurrences_per_tick != 0 &&
+        fires_this_tick >= state->max_occurrences_per_tick) {
+      break;  // budget exhausted: remaining due entries stay pending
+    }
     uint64_t schedule_id = due_ids[due_index];
     scheduled_operation_t* entry = NULL;
     scheduled_operation_t** link =
@@ -213,6 +229,7 @@ crabs_error_e scheduler_process_due(state_t* state, uint64_t now_ms) {
       // scheduler_ticking guard above defers those to this tick.)
       crabs_error_e materialize_rc =
           state_machine_execute_scheduled(state, embedded);
+      fires_this_tick++;
       if (materialize_rc == CRABS_ERR_ALREADY_EXECUTED) {
         // The tx_manager accepted the uuid elsewhere (persistent store case):
         // treat as idempotent success, not a failure.
@@ -252,6 +269,14 @@ crabs_error_e scheduler_process_due(state_t* state, uint64_t now_ms) {
     bool series_exhausted = false;
     while (entry->execute_at_ms <= now_ms) {
       if (entry->end_at_ms != 0 && entry->execute_at_ms > entry->end_at_ms) break;
+
+      // Budget check BEFORE the fire: breaking here leaves execute_at_ms on
+      // the not-yet-fired slot, so the series resumes exactly where it left
+      // off on the next tick (no slot skipped, no slot double-fired).
+      if (state->max_occurrences_per_tick != 0 &&
+          fires_this_tick >= state->max_occurrences_per_tick) {
+        break;
+      }
 
       // Overflow guard: execute_at += interval must not wrap (a hostile
       // UINT64_MAX interval would wrap to a small value and re-fire).
@@ -304,6 +329,7 @@ crabs_error_e scheduler_process_due(state_t* state, uint64_t now_ms) {
                                              occurrence->signer_id);
         }
         operation_destroy(occurrence);
+        fires_this_tick++;
       }
 
       // A handler may have cancelled the entry during the fire — re-find by
