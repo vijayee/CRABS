@@ -217,23 +217,55 @@ static void _write_event_json(json_writer_t* writer, const devtools_event_t* eve
   _json_writer_raw(writer, "}");
 }
 
-char* devtools_events_json(void) {
+char* devtools_events_json_for(const char* node_id) {
   json_writer_t writer;
   _json_writer_init(&writer);
   _json_writer_raw(&writer, "[");
 
-  uint32_t oldest = (devtools_ring_head + CRABS_DEVTOOLS_RING_SIZE - devtools_ring_used)
+  uint32_t used = devtools_ring_used;
+  uint32_t oldest = (devtools_ring_head + CRABS_DEVTOOLS_RING_SIZE - used)
                     % CRABS_DEVTOOLS_RING_SIZE;
-  for (uint32_t event_index = 0; event_index < devtools_ring_used; event_index++) {
-    if (event_index > 0) _json_writer_raw(&writer, ",");
-    uint32_t slot = (oldest + event_index) % CRABS_DEVTOOLS_RING_SIZE;
-    _write_event_json(&writer, &devtools_ring[slot]);
+
+  // Events not owned by node_id must survive for their owning node's later
+  // drain. Compacting in place is unsafe when the ring wraps (the write slot
+  // can alias a not-yet-read slot), so work from a copy of the used region.
+  devtools_event_t* drained = NULL;
+  if (used > 0) {
+    drained = (devtools_event_t*)malloc(used * sizeof(devtools_event_t));
+    if (drained == NULL) {
+      // Leave the ring untouched so a later drain can still recover the
+      // events instead of dropping them.
+      free(writer.data);
+      return NULL;
+    }
+    for (uint32_t event_index = 0; event_index < used; event_index++) {
+      drained[event_index] = devtools_ring[(oldest + event_index) % CRABS_DEVTOOLS_RING_SIZE];
+    }
+  }
+
+  bool first_written = true;
+  uint32_t kept_count = 0;
+  for (uint32_t event_index = 0; event_index < used; event_index++) {
+    const devtools_event_t* event = &drained[event_index];
+    bool matches = (node_id == NULL) || (strcmp(event->node_id, node_id) == 0);
+    if (matches) {
+      if (!first_written) _json_writer_raw(&writer, ",");
+      first_written = false;
+      _write_event_json(&writer, event);
+    } else {
+      devtools_ring[kept_count++] = *event;
+    }
   }
   _json_writer_raw(&writer, "]");
 
-  devtools_ring_head = 0;
-  devtools_ring_used = 0;
+  free(drained);
+  devtools_ring_head = kept_count % CRABS_DEVTOOLS_RING_SIZE;
+  devtools_ring_used = kept_count;
   return writer.data;
+}
+
+char* devtools_events_json(void) {
+  return devtools_events_json_for(NULL);
 }
 
 // ============================================================

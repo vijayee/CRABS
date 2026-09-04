@@ -139,6 +139,10 @@ export interface Node {
                               endAt: bigint; submitter: string }>;
 
   evaluateTriggers(): void;
+  // The bootstrap admin id this node was created with — also the node's HLC
+  // identity, which signing stamps into op->node_id (used by devtools
+  // per-node event drains).
+  readonly adminId: string;
   destroy(): void;
 }
 

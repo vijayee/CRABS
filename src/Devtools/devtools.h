@@ -20,6 +20,13 @@ void     devtools_record_event(state_t* state, const operation_t* op, crabs_erro
 // emptied. Caller owns the returned string.
 char*    devtools_events_json(void);
 
+// Drain only the events whose node_id equals the given id; events belonging
+// to other nodes are preserved in the ring (in order) for their owner's later
+// drain. A NULL node_id matches every event (equivalent to
+// devtools_events_json). Caller owns the returned string, which is NULL when
+// the internal copy cannot be allocated (the ring is left intact).
+char*    devtools_events_json_for(const char* node_id);
+
 // Render the full state as a JSON document string. Caller owns the string.
 char*    devtools_snapshot_json(const state_t* state);
 

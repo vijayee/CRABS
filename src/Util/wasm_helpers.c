@@ -654,6 +654,11 @@ const char* crabs_wasm_devtools_drain_events(void) {
 }
 
 EMSCRIPTEN_KEEPALIVE
+const char* crabs_wasm_devtools_drain_events_for(const char* node_id) {
+  return devtools_events_json_for(node_id);
+}
+
+EMSCRIPTEN_KEEPALIVE
 void crabs_wasm_devtools_string_destroy(const char* str) {
   free((void*)str);
 }

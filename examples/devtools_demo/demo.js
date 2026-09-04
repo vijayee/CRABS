@@ -8,9 +8,12 @@
 // relayed as serialized signed bytes over BroadcastChannel and re-executed.
 //
 // Identity layout:
-//   - Each node bootstraps a literal 'admin' user whose private key never
-//     leaves the WASM heap, so it cannot sign demo ops (and so the
-//     createTrigger/evaluateTriggers admin ops verify — see setupNode).
+//   - Each node bootstraps a distinct admin user ('alice-admin'/'bob-admin')
+//     whose private key never leaves the WASM heap, so it cannot sign demo
+//     ops. The admin id is also the node's HLC identity: signing stamps it
+//     into op->node_id, so the devtools panels can drain events per node
+//     (createTrigger/evaluateTriggers sign admin ops as that user — see
+//     setupNode).
 //   - The demo actor (alice/bob) is registered as a regular user with a
 //     fixed demo keypair and granted role:member via the admin grantRole
 //     path (register_user rejects privileged attribute names, audit R7-08).
@@ -37,11 +40,12 @@ const DEMO_PRIVATE_KEYS = {
   bob: '72e779b58fe8e6358059c28791345b8484294a2993aa46351d8f8e4e318d1bd1',
 };
 
-async function setupNode(dev, actorId, signingKeypair) {
-  // The bootstrap admin must be literally 'admin': createTrigger and
-  // evaluateTriggers sign admin ops as signer 'admin' with the node key
-  // (same convention as examples/video_platform).
-  const node = await dev.Node.create('admin', { ordering: 'hlc' });
+async function setupNode(dev, adminId, actorId, signingKeypair) {
+  // The bootstrap admin id doubles as the node's HLC identity —
+  // createTrigger and evaluateTriggers sign admin ops as that user with the
+  // node key, and devtools drains filter events by it. Each demo node gets a
+  // distinct admin id so the two panels never attribute each other's events.
+  const node = await dev.Node.create(adminId, { ordering: 'hlc' });
 
   node.addCounter('views');
   node.addPNCounter('likes');
@@ -178,8 +182,8 @@ function startRelay(dev, node) {
   const aliceKeypair = await dev.KeyPair.fromPrivateHex(DEMO_PRIVATE_KEYS.alice);
   const bobKeypair = await dev.KeyPair.fromPrivateHex(DEMO_PRIVATE_KEYS.bob);
 
-  const aliceNode = await setupNode(dev, 'alice', aliceKeypair);
-  const bobNode = await setupNode(dev, 'bob', bobKeypair);
+  const aliceNode = await setupNode(dev, 'alice-admin', 'alice', aliceKeypair);
+  const bobNode = await setupNode(dev, 'bob-admin', 'bob', bobKeypair);
 
   // ABE-encrypt the demo contact once (the encrypting node acts as admin) and
   // store the raw ciphertext bytes in both nodes' contact registers. The CRDT
@@ -190,8 +194,8 @@ function startRelay(dev, node) {
   bobNode.setRegisterBytes('contact', encryptedContact, 'bob');
 
   panelControllers = [
-    attach(aliceNode, { nodeId: 'alice', mount: document.getElementById('alice-panel') }),
-    attach(bobNode, { nodeId: 'bob', mount: document.getElementById('bob-panel') }),
+    attach(aliceNode, { nodeId: 'alice-admin', mount: document.getElementById('alice-panel') }),
+    attach(bobNode, { nodeId: 'bob-admin', mount: document.getElementById('bob-panel') }),
   ];
 
   const actions = [

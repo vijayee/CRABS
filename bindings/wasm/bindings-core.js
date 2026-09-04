@@ -249,6 +249,7 @@ class Node {
   constructor(M, amPtr) {
     this._M = M;
     this._am = amPtr;
+    this.adminId = null;
   }
 
   static async create(adminId, options = {}) {
@@ -257,7 +258,11 @@ class Node {
     const amPtr = M._crabs_wasm_node_create(adminPtr);
     if (adminPtr) M._free(adminPtr);
     if (!amPtr) throw new Error('Node.create failed');
-    return new Node(M, amPtr);
+    const node = new Node(M, amPtr);
+    // The bootstrap admin id becomes the node's HLC identity: signing stamps
+    // op->node_id from it, and devtools events are attributed per node by it.
+    node.adminId = adminId;
+    return node;
   }
 
   getNodeKey() {
@@ -271,7 +276,11 @@ class Node {
     const M = this._M;
     const uidPtr = writeString(M, userId);
     const pkPtr = M._malloc(33);
-    hexDecode(M, publicKeyHex, pkPtr, 33);
+    const keyLength = hexDecode(M, publicKeyHex, pkPtr, 33);
+    if (keyLength !== 33) {
+      freeAll(M, uidPtr, pkPtr);
+      throw new Error('Invalid public key hex');
+    }
     const attrsPtr = writeString(M, initialAttrs);
     const rc = M._attribute_machine_register_user(this._am, uidPtr, pkPtr, attrsPtr);
     freeAll(M, uidPtr, pkPtr, attrsPtr);
@@ -491,8 +500,8 @@ class Node {
     }
 
     const typePtr = writeString(M, '__create_trigger__');
-    const signerPtr = writeString(M, 'admin');
-    const nodePtr = writeString(M, 'admin');
+    const signerPtr = writeString(M, this.adminId || 'admin');
+    const nodePtr = writeString(M, this.adminId || 'admin');
     const opPtr = M._operation_create(typePtr);
     if (typePtr) M._free(typePtr);
     if (!opPtr) {
@@ -529,18 +538,25 @@ class Node {
     if (!ct) throw new Error('ABE encrypt failed');
 
     const policyStr = readString(M, M._crabs_wasm_abe_ciphertext_policy(ct));
+    const policyBytes = encodeText(policyStr);
+    // The container's length prefix is a uint16, so a policy larger than that
+    // cannot be represented — fail loudly instead of silently truncating.
+    if (policyBytes.length > 0xFFFF) {
+      M._crabs_wasm_abe_ciphertext_destroy(ct);
+      throw new Error(`ABE policy too large: ${policyBytes.length} UTF-8 bytes (max 65535)`);
+    }
     const outLenPtr = M._malloc(4);
     const ctData = M._crabs_wasm_abe_ciphertext_data(ct, outLenPtr);
     const ctLen = M.getValue(outLenPtr, 'i32');
     M._free(outLenPtr);
 
-    const total = 2 + policyStr.length + 4 + ctLen;
+    const total = 2 + policyBytes.length + 4 + ctLen;
     const out = new Uint8Array(total);
     const dv = new DataView(out.buffer);
-    dv.setUint16(0, policyStr.length, true);
-    out.set(encodeText(policyStr), 2);
-    dv.setUint32(2 + policyStr.length, ctLen, true);
-    out.set(new Uint8Array(M.HEAPU8.subarray(ctData, ctData + ctLen)), 2 + policyStr.length + 4);
+    dv.setUint16(0, policyBytes.length, true);
+    out.set(policyBytes, 2);
+    dv.setUint32(2 + policyBytes.length, ctLen, true);
+    out.set(new Uint8Array(M.HEAPU8.subarray(ctData, ctData + ctLen)), 2 + policyBytes.length + 4);
 
     M._crabs_wasm_abe_ciphertext_destroy(ct);
     return out;
@@ -603,8 +619,8 @@ class Node {
   evaluateTriggers() {
     const M = this._M;
     const typePtr = writeString(M, 'noop');
-    const signerPtr = writeString(M, 'admin');
-    const nodePtr = writeString(M, 'admin');
+    const signerPtr = writeString(M, this.adminId || 'admin');
+    const nodePtr = writeString(M, this.adminId || 'admin');
     const opPtr = M._operation_create(typePtr);
     M._crabs_wasm_op_init_uuid(opPtr);
     M._crabs_wasm_op_set_signer(opPtr, signerPtr);
@@ -624,12 +640,22 @@ class Node {
   registerHandler(opType, handler) {
     const M = this._M;
     const typePtr = writeString(M, opType);
-    if (!this._handlers) this._handlers = [];
-    const wrapped = M.addFunction(handler, 'ipp');
-    this._handlers.push(wrapped);
-    const rc = M._crabs_wasm_register_handler(this._am, typePtr, wrapped);
+    if (!this._handlerTable) this._handlerTable = {};
+    const previousTableIndex = this._handlerTable[opType];
+    const tableIndex = M.addFunction(handler, 'ipp');
+    const rc = M._crabs_wasm_register_handler(this._am, typePtr, tableIndex);
     if (typePtr) M._free(typePtr);
-    wrapRc(rc, 'registerHandler');
+    if (rc !== 0) {
+      // The C registry still points at the previous handler (if any), so only
+      // the fresh, unused table slot is released here.
+      M.removeFunction(tableIndex);
+      throw crabsError(rc, 'registerHandler');
+    }
+    // Only after the C registry points at the new slot may the old function
+    // table entry be released; until then a re-registered op could still be
+    // dispatched through it.
+    if (previousTableIndex !== undefined) M.removeFunction(previousTableIndex);
+    this._handlerTable[opType] = tableIndex;
   }
 
   // High-level handler API: the handler receives a mutable state proxy and a
@@ -668,6 +694,11 @@ class Node {
     const typePtr = writeString(M, opType);
     M._crabs_wasm_unregister_handler(this._am, typePtr);
     if (typePtr) M._free(typePtr);
+    const tableIndex = this._handlerTable ? this._handlerTable[opType] : undefined;
+    if (tableIndex !== undefined) {
+      M.removeFunction(tableIndex);
+      delete this._handlerTable[opType];
+    }
   }
 
   _callCounterGetFromAm(M, amPtr, fn, name) {

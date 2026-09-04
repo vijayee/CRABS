@@ -128,6 +128,7 @@ BASE_EXPORTS='[
 DEVTOOLS_EXPORTS='[
   "_crabs_wasm_devtools_snapshot",
   "_crabs_wasm_devtools_drain_events",
+  "_crabs_wasm_devtools_drain_events_for",
   "_crabs_wasm_devtools_string_destroy"
 ]'
 

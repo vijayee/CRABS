@@ -17,6 +17,11 @@ function readWasmString(M, pointer) {
 
 function createDevtoolsController(node, options) {
   const M = node._M;
+  // nodeId is the node's bootstrap admin id — the identity crabs_wasm_sign
+  // stamps into op->node_id. All WASM nodes share one global C event ring, so
+  // an unfiltered drain would attribute every node's events to this panel.
+  // Passing nodeId drains only this node's events and preserves the rest for
+  // their owning panels; without it the unfiltered global drain is used.
   const nodeId = (options && options.nodeId) || null;
   const maxEvents = (options && options.maxEvents) || MAX_KEPT_EVENTS;
 
@@ -28,7 +33,13 @@ function createDevtoolsController(node, options) {
     closed: false,
 
     drainEvents() {
-      const pointer = M._crabs_wasm_devtools_drain_events();
+      const hasFilteredDrain = typeof M._crabs_wasm_devtools_drain_events_for === 'function';
+      // Raw exported functions cannot take JS strings, so the node id goes
+      // through ccall (which converts it to a heap-allocated C string).
+      const pointer = nodeId && hasFilteredDrain
+        ? M.ccall('crabs_wasm_devtools_drain_events_for', 'number',
+                  ['string'], [nodeId])
+        : M._crabs_wasm_devtools_drain_events();
       const text = readWasmString(M, pointer);
       let batch = [];
       try {
