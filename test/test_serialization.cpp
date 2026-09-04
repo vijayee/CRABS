@@ -6,6 +6,7 @@ extern "C" {
 #include "../src/CRABS/crabs.h"
 #include "../src/CRABS/data_model.h"
 #include "../src/StateMachine/state_machine.h"
+#include "../src/Scheduler/scheduler.h"
 #include "../src/Crypto/sig_scheme.h"
 #include "../src/Crypto/crypto.h"
 #include "../src/Attribute/attribute_machine.h"
@@ -921,6 +922,91 @@ TEST(TestSerializationV2, TestV1BackwardCompatAcceptsV1) {
   EXPECT_EQ(restored->config.vault_config.provider, VAULT_NONE);
 
   state_destroy(state);
+  state_destroy(restored);
+}
+
+// v6 introduced the pending-schedules section but carried no recurring
+// cadence fields (v7 added interval/repeat/end right after execute_at_ms).
+// A v7 reader must accept a v6 blob and restore the schedule with one-shot
+// cadence semantics (interval/repeat/end all zero).
+TEST(TestSerializationV2, TestV6BackwardCompatAcceptsV6WithSchedule) {
+  std::vector<uint8_t> v6buf;
+  auto write_u8 = [&](uint8_t v) { v6buf.push_back(v); };
+  auto write_u32 = [&](uint32_t v) { for (uint32_t b = 0; b < 4; b++) v6buf.push_back((uint8_t)((v >> (b * 8)) & 0xFF)); };
+  auto write_u64 = [&](uint64_t v) { for (uint32_t b = 0; b < 8; b++) v6buf.push_back((uint8_t)((v >> (b * 8)) & 0xFF)); };
+  auto write_str16 = [&](const char* s) {
+    uint16_t slen = s ? (uint16_t)strlen(s) : 0;
+    v6buf.push_back((uint8_t)(slen & 0xFF));
+    v6buf.push_back((uint8_t)((slen >> 8) & 0xFF));
+    for (uint16_t ch = 0; ch < slen; ch++) v6buf.push_back((uint8_t)s[ch]);
+  };
+  auto write_fixed = [&](const char* s, size_t len) {
+    size_t str_len = s ? strlen(s) : 0;
+    for (size_t ch = 0; ch < len; ch++) {
+      v6buf.push_back(ch < str_len ? (uint8_t)s[ch] : 0);
+    }
+  };
+
+  // Magic "CRAB" + version 6
+  v6buf.push_back(0x43); v6buf.push_back(0x52);
+  v6buf.push_back(0x41); v6buf.push_back(0x42);
+  write_u32(6);
+  write_u64(7);       // state_version
+  write_u32(0);       // item_count
+  write_u32(0);       // policy_count
+  write_u32(0);       // log_count
+
+  // config: base fields + sig_config + vault_config (layout stable since v2)
+  write_u64(5000);    // max_lock_duration_ms
+  write_u32(3);       // max_lock_extensions
+  write_u8(1);        // allow_force_unlock
+  write_str16("admin");
+  write_u8(1);        // sig_config.default_scheme = ECDSA_SECP256K1
+  write_u32(4);       // sig_config.max_keys_per_user
+  write_u8(0);        // sig_config.key_rotation_enabled
+  write_u32(1);       // sig_config.co_sign_threshold
+  write_u8(0);        // sig_config.key_expiry_enabled
+  write_u64(0);       // sig_config.default_key_ttl_ms
+  write_u64(0);       // sig_config.max_key_age_ms
+  write_u8(0);        // vault_config.provider = VAULT_NONE
+  write_str16("");    // vault_config.address
+  write_str16("");    // vault_config.auth_token
+  write_u8(0);        // vault_config.signing_delegated
+  write_u8(0);        // vault_config.rotation_delegated
+
+  // schedules (v6 layout: no cadence fields)
+  write_u64(42);      // schedule_seq
+  write_u32(1);       // schedule_count
+  write_u64(42);      // schedule_id
+  write_u64(1000001000);  // execute_at_ms
+  write_fixed("admin", 64);  // submitter (fixed CRABS_MAX_USER_ID bytes)
+  write_u32(4);       // op_len
+  v6buf.push_back(0xAA); v6buf.push_back(0xBB);
+  v6buf.push_back(0xCC); v6buf.push_back(0xDD);  // op_bytes (not decoded on load)
+
+  uint8_t v6hash[32];
+  SHA256(v6buf.data(), v6buf.size(), v6hash);
+  for (int i = 0; i < 32; i++) v6buf.push_back(v6hash[i]);
+
+  state_t* restored = crabs_deserialize_state(v6buf.data(), v6buf.size());
+  ASSERT_NE(restored, nullptr);
+
+  EXPECT_EQ(restored->version, (uint64_t)7);
+  EXPECT_EQ(restored->config.max_lock_duration_ms, (uint64_t)5000);
+  EXPECT_STREQ(restored->config.bootstrap_admin, "admin");
+
+  // The pending schedule survived, as a one-shot (v6 has no cadence fields).
+  EXPECT_EQ(restored->schedule_seq, 42u);
+  const scheduled_operation_t* pending = scheduler_first(restored);
+  ASSERT_NE(pending, nullptr);
+  EXPECT_EQ(pending->schedule_id, 42u);
+  EXPECT_EQ(pending->execute_at_ms, 1000001000u);
+  EXPECT_EQ(pending->interval_ms, 0u);
+  EXPECT_EQ(pending->repeat_count, 0u);
+  EXPECT_EQ(pending->end_at_ms, 0u);
+  EXPECT_STREQ(pending->submitter, "admin");
+  EXPECT_EQ(pending->op_len, 4u);
+
   state_destroy(restored);
 }
 
