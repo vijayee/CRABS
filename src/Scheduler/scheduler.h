@@ -12,13 +12,6 @@
 
 #define CRABS_SCHEDULER_MAX_DUE_PER_TICK 64
 
-// Default ceiling on scheduled occurrences materialized per tick. Bounds the
-// work a single tick does when catching up after a long offline window; the
-// remainder carries over to subsequent ticks (nothing is dropped). Node-local
-// runtime policy — override with scheduler_set_max_occurrences_per_tick, 0 =
-// unlimited. Not part of the serialized state.
-#define CRABS_SCHEDULER_DEFAULT_MAX_OCCURRENCES_PER_TICK 64
-
 // Add a pending scheduled operation. `op` is the embedded operation (already
 // fully signed by its authorizer); it is serialized with
 // crabs_serialize_operation and stored. Returns the new schedule_id, or 0 on
