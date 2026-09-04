@@ -7,6 +7,7 @@ extern "C" {
 #include "../src/Crypto/crypto.h"
 #include "../src/Serialization/serialization.h"
 #include "../src/TxManager/tx_manager_memory.h"
+#include "../src/CRDT/crdt_merge.h"
 }
 #include "test_helpers.h"
 
@@ -108,6 +109,43 @@ protected:
     }
   }
 };
+
+// Audit: an op-carried dedup spec is signer-authored (condition, target and
+// delta are all covered only by the op's own signature). When no spec is
+// registered for the op type via __define_operation_type__, the executor must
+// reject the op instead of falling back to the op-carried spec — otherwise the
+// spec's MUTATION section is an unauthorized mutation primitive on any state
+// item.
+TEST_F(TestStateMachine, OpCarriedDedupSpecRejectedWithoutRegistration) {
+  // The mutation target: a g-counter the op does not own and that no
+  // registered spec covers.
+  data_item_t* counter_item =
+      data_item_create("smuggled_target", DATA_TYPE_COUNTER, CRDT_G_COUNTER);
+  g_counter_t* counter_value = g_counter_create();
+  ASSERT_EQ(g_counter_increment(counter_value, "admin", 10), CRABS_SUCCESS);
+  counter_item->value = counter_value;
+  ASSERT_EQ(state_add_item(state, counter_item), CRABS_SUCCESS);
+
+  operation_t* op = make_lock_op();
+  op->dedup.type = DEDUP_CUSTOM;
+  strncpy(op->dedup.condition, "true", CRABS_MAX_POLICY_EXPR - 1);
+  op->dedup.update.type = MUTATION_COUNTER_INCREMENT;
+  strncpy(op->dedup.update.counter_path, "smuggled_target", CRABS_MAX_DEDUP_PATH - 1);
+  op->dedup.update.delta = 1000;
+  sign_operation(op);  // re-sign after attaching the spec
+
+  EXPECT_EQ(state_machine_execute(state, op), CRABS_ERR_UNAUTHORIZED);
+
+  // Neither the smuggled mutation nor the handler may have run.
+  data_item_t* target = state_find_item(state, "smuggled_target");
+  ASSERT_NE(target, nullptr);
+  EXPECT_EQ(g_counter_value((g_counter_t*)target->value), 10);
+  data_item_t* resource = state_find_item(state, "test_resource");
+  ASSERT_NE(resource, nullptr);
+  EXPECT_EQ(resource->protocol_state, PROTOCOL_IDLE);
+
+  operation_destroy(op);
+}
 
 TEST_F(TestStateMachine, TestValidTransition) {
   EXPECT_TRUE(state_machine_is_valid_transition(PROTOCOL_IDLE, CRABS_OP_LOCK));

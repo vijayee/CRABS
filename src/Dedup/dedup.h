@@ -20,11 +20,14 @@
 // Returns CRABS_SUCCESS if the guard passes, or an appropriate error code.
 crabs_error_e dedup_check_guard(const state_t* state, const operation_t* op);
 
-// Audit F-2: check/apply an explicit dedup spec. The executor uses the
-// server-registered spec (state_find_op_type_def) when one exists, so a
-// signer cannot bypass "vote once" by setting dedup.type = DEDUP_NONE on
-// the wire. The op-carried spec is only consulted when no spec is
-// registered for the operation type.
+// Audit F-2: check/apply an explicit dedup spec. The executor uses ONLY the
+// server-registered spec (state_find_op_type_def), so a signer cannot bypass
+// "vote once" by setting dedup.type = DEDUP_NONE on the wire. An op-carried
+// spec is never used to guard or mutate state: state_machine_execute rejects
+// an op carrying a non-NONE spec for an op type with no registered spec
+// (CRABS_ERR_UNAUTHORIZED), because an op-carried spec's MUTATION section is
+// signer-authored and unauthorized on its target. The op-carried spec remains
+// readable via dedup_check_guard for guard-only queries (e.g. __check_dedup__).
 crabs_error_e dedup_check_guard_spec(const state_t* state,
                                         const dedup_spec_t* spec,
                                         const operation_t* op);

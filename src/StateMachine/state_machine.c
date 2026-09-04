@@ -759,9 +759,19 @@ static crabs_error_e state_machine_execute_internal(state_t* state, operation_t*
   // slot (e.g. a ONE_SHOT_SET membership) even when the handler failed,
   // letting an authorized signer permanently consume a "vote once" slot.
   // The registered spec always wins over the op-carried spec.
+  // Audit: an op-carried dedup spec is signer-authored — its condition,
+  // mutation target and delta are covered only by the op's own signature.
+  // Its MUTATION section would be applied post-handler with no authorization
+  // on the target item, making it an unauthorized mutation primitive. Only
+  // specs registered through __define_operation_type__ may guard or mutate
+  // state; an op that carries a non-NONE spec for an op type with no
+  // registered spec is rejected outright.
   const dedup_spec_t* registered_dedup = state_find_op_type_def(state, op->type);
-  const dedup_spec_t* effective_dedup = registered_dedup ? registered_dedup : &op->dedup;
-  if (effective_dedup->type != DEDUP_NONE) {
+  if (registered_dedup == NULL && op->dedup.type != DEDUP_NONE) {
+    return CRABS_ERR_UNAUTHORIZED;
+  }
+  const dedup_spec_t* effective_dedup = registered_dedup;
+  if (effective_dedup != NULL && effective_dedup->type != DEDUP_NONE) {
     crabs_error_e dedup_result = dedup_check_guard_spec(state, effective_dedup, op);
     if (dedup_result != CRABS_SUCCESS) {
       return dedup_result;
@@ -889,7 +899,7 @@ static crabs_error_e state_machine_execute_internal(state_t* state, operation_t*
 
   // R7-13: apply the dedup mutation only after the handler (and protocol
   // transition) succeeded, so a failing op does not burn its dedup slot.
-  if (effective_dedup->type != DEDUP_NONE) {
+  if (effective_dedup != NULL && effective_dedup->type != DEDUP_NONE) {
     crabs_error_e dedup_result = dedup_apply_mutation_spec(state, effective_dedup, op);
     if (dedup_result != CRABS_SUCCESS) {
       return dedup_result;
@@ -1858,6 +1868,12 @@ crabs_error_e state_machine_op_define_operation(state_t* state, operation_t* op)
 
   // The operation type name to define is carried in resources[0]
   if (op->resource_count == 0 || op->resources == NULL) return CRABS_ERR_INVALID_PARAM;
+
+  // Audit: built-in operation types have their own handlers and protocol
+  // transitions; a registered dedup spec on one would stack a signer-chosen
+  // guard/mutation on top of them. The define operation may only register
+  // specs for user-defined operation types.
+  if (operation_is_builtin(op->resources[0])) return CRABS_ERR_INVALID_PARAM;
 
   crabs_error_e rc = state_register_op_type_def(state, op->resources[0], &op->dedup);
   if (rc != CRABS_SUCCESS) return rc;

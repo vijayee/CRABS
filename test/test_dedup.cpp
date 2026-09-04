@@ -269,24 +269,29 @@ protected:
     executed->value = one_shot_flag_create();
     state_add_item(state, executed);
 
+    // Audit: counter items created the way wasm/CRDT helpers create them hold
+    // a g_counter_t* (not a raw int64_t*). The dedup mutation dispatch must
+    // route through g_counter_increment for these.
     counter = data_item_create("balance", DATA_TYPE_COUNTER, CRDT_G_COUNTER);
-    int64_t* val = (int64_t*)malloc(sizeof(int64_t));
-    *val = 1000;
-    counter->value = val;
+    g_counter_t* seeded_counter = g_counter_create();
+    EXPECT_EQ(g_counter_increment(seeded_counter, "node1", 1000), CRABS_SUCCESS);
+    counter->value = seeded_counter;
     state_add_item(state, counter);
   }
 
   void TearDown() override {
-    // Free CRDT struct values manually.
-    // Skip COUNTER/PN_COUNTER as they may store raw int64_t handled by free().
+    // Free CRDT struct values manually (data_item_destroy only free()s the
+    // value pointer, which leaks the struct internals).
     for (data_item_t* item = state->items; item != NULL; item = item->next) {
       if (item->value != NULL) {
         switch (item->crdt_type) {
-          case CRDT_ONE_SHOT_SET:
-          case CRDT_ONE_SHOT_FLAG:
+          case CRDT_G_COUNTER:
+          case CRDT_PN_COUNTER:
           case CRDT_OR_SET:
           case CRDT_2P_SET:
           case CRDT_LWW_REG:
+          case CRDT_ONE_SHOT_SET:
+          case CRDT_ONE_SHOT_FLAG:
             crdt_value_destroy(item->crdt_type, item->value);
             item->value = NULL;
             break;
@@ -389,18 +394,20 @@ TEST_F(DedupMutationTest, CustomSetAddMutation) {
 }
 
 TEST_F(DedupMutationTest, CustomCounterIncrementMutation) {
-  operation_t* op = operation_create("spend");
+  operation_t* op = operation_create("credit");
   op->dedup.type = DEDUP_CUSTOM;
   strncpy(op->dedup.condition, "balance >= 100", CRABS_MAX_POLICY_EXPR - 1);
   op->dedup.update.type = MUTATION_COUNTER_INCREMENT;
   strncpy(op->dedup.update.counter_path, "balance", CRABS_MAX_DEDUP_PATH - 1);
-  op->dedup.update.delta = -100;
+  // A G-Counter only grows, so the mutation applies a positive delta through
+  // g_counter_increment (the item's actual value representation).
+  op->dedup.update.delta = 100;
   strncpy(op->signer_id, "alice", CRABS_MAX_USER_ID - 1);
 
   EXPECT_EQ(dedup_apply_mutation(state, op), CRABS_SUCCESS);
 
-  int64_t* val = (int64_t*)counter->value;
-  EXPECT_EQ(*val, (int64_t)900);
+  g_counter_t* counter_value = (g_counter_t*)counter->value;
+  EXPECT_EQ(g_counter_value(counter_value), (int64_t)1100);
 
   operation_destroy(op);
 }
@@ -452,6 +459,153 @@ TEST_F(DedupMutationTest, ValidateRejectsFullPerUserSet) {
   strncpy(op->signer_id, "alice", CRABS_MAX_USER_ID - 1);
 
   EXPECT_EQ(dedup_validate_mutation_spec(state, &op->dedup, op), CRABS_ERR_OOM);
+
+  operation_destroy(op);
+}
+
+// ============================================================
+// Audit: mutation dispatch must match the item's actual value representation
+// ============================================================
+// Items created by the wasm/CRDT helpers hold real CRDT structs (g_counter_t*,
+// pn_counter_t*, lww_register_t*). The old counter/assign mutations blind-cast
+// item->value to int64_t*, corrupting the struct. These tests pin the dispatch.
+
+TEST_F(DedupMutationTest, CounterIncrementOnGCounterRoutesThroughCounterStruct) {
+  g_counter_t* counter_value = (g_counter_t*)counter->value;
+  g_counter_entry_t* entries_before = counter_value->entries;
+
+  operation_t* op = operation_create("credit");
+  op->dedup.type = DEDUP_CUSTOM;
+  strncpy(op->dedup.condition, "true", CRABS_MAX_POLICY_EXPR - 1);
+  op->dedup.update.type = MUTATION_COUNTER_INCREMENT;
+  strncpy(op->dedup.update.counter_path, "balance", CRABS_MAX_DEDUP_PATH - 1);
+  op->dedup.update.delta = 5;
+  strncpy(op->signer_id, "alice", CRABS_MAX_USER_ID - 1);
+  // The counter was seeded for node "node1"; mutating as the same node keeps
+  // the entries array in place, so the pointer-stability assertion below is
+  // an exact check that no struct memory was corrupted.
+  strncpy(op->node_id, "node1", CRABS_MAX_USER_ID - 1);
+
+  EXPECT_EQ(dedup_validate_mutation_spec(state, &op->dedup, op), CRABS_SUCCESS);
+  EXPECT_EQ(dedup_apply_mutation_spec(state, &op->dedup, op), CRABS_SUCCESS);
+
+  // No pointer corruption: the counter struct and its entries array are the
+  // same allocations as before, and the value moved by exactly the delta.
+  EXPECT_EQ(counter->value, counter_value);
+  EXPECT_EQ(counter_value->entries, entries_before);
+  EXPECT_EQ(g_counter_value(counter_value), (int64_t)1005);
+  EXPECT_EQ(g_counter_value((g_counter_t*)counter->value), (int64_t)1005);
+
+  operation_destroy(op);
+}
+
+TEST_F(DedupMutationTest, ValidateRejectsNegativeDeltaOnGCounter) {
+  operation_t* op = operation_create("spend");
+  op->dedup.type = DEDUP_CUSTOM;
+  strncpy(op->dedup.condition, "true", CRABS_MAX_POLICY_EXPR - 1);
+  op->dedup.update.type = MUTATION_COUNTER_INCREMENT;
+  strncpy(op->dedup.update.counter_path, "balance", CRABS_MAX_DEDUP_PATH - 1);
+  // g_counter_increment rejects negative deltas (a G-Counter only grows), so
+  // the pre-handler validation must reject them too.
+  op->dedup.update.delta = -1;
+  strncpy(op->signer_id, "alice", CRABS_MAX_USER_ID - 1);
+
+  EXPECT_EQ(dedup_validate_mutation_spec(state, &op->dedup, op), CRABS_ERR_INVALID_PARAM);
+  EXPECT_EQ(g_counter_value((g_counter_t*)counter->value), (int64_t)1000);
+
+  operation_destroy(op);
+}
+
+TEST_F(DedupMutationTest, CounterIncrementOnPnCounterRoutesThroughCounterStruct) {
+  data_item_t* pn_item = data_item_create("pn_balance", DATA_TYPE_PN_COUNTER, CRDT_PN_COUNTER);
+  pn_counter_t* pn_value = pn_counter_create();
+  EXPECT_EQ(pn_counter_increment(pn_value, "node1", 50), CRABS_SUCCESS);
+  pn_item->value = pn_value;
+  state_add_item(state, pn_item);
+
+  operation_t* op = operation_create("spend");
+  op->dedup.type = DEDUP_CUSTOM;
+  strncpy(op->dedup.condition, "true", CRABS_MAX_POLICY_EXPR - 1);
+  op->dedup.update.type = MUTATION_COUNTER_INCREMENT;
+  strncpy(op->dedup.update.counter_path, "pn_balance", CRABS_MAX_DEDUP_PATH - 1);
+  op->dedup.update.delta = -30;
+  strncpy(op->signer_id, "alice", CRABS_MAX_USER_ID - 1);
+
+  EXPECT_EQ(dedup_validate_mutation_spec(state, &op->dedup, op), CRABS_SUCCESS);
+  EXPECT_EQ(dedup_apply_mutation_spec(state, &op->dedup, op), CRABS_SUCCESS);
+
+  EXPECT_EQ(pn_item->value, pn_value);
+  EXPECT_EQ(pn_counter_value(pn_value), (int64_t)20);
+
+  operation_destroy(op);
+}
+
+TEST_F(DedupMutationTest, AssignOnLwwRegisterUsesRegisterSemantics) {
+  data_item_t* register_item = data_item_create("config_level", DATA_TYPE_REGISTER, CRDT_LWW_REG);
+  int64_t initial_value = 1;
+  register_item->value =
+      lww_register_create((const uint8_t*)&initial_value, sizeof(int64_t), 0, "system");
+  state_add_item(state, register_item);
+
+  operation_t* op = operation_create("set_level");
+  op->dedup.type = DEDUP_CUSTOM;
+  strncpy(op->dedup.condition, "true", CRABS_MAX_POLICY_EXPR - 1);
+  op->dedup.update.type = MUTATION_ASSIGN;
+  strncpy(op->dedup.update.target_path, "config_level", CRABS_MAX_DEDUP_PATH - 1);
+  strncpy(op->dedup.update.value, "777", CRABS_MAX_DEDUP_PATH - 1);
+  strncpy(op->signer_id, "alice", CRABS_MAX_USER_ID - 1);
+
+  EXPECT_EQ(dedup_validate_mutation_spec(state, &op->dedup, op), CRABS_SUCCESS);
+  EXPECT_EQ(dedup_apply_mutation_spec(state, &op->dedup, op), CRABS_SUCCESS);
+
+  // The register struct must still be intact and readable via the same path
+  // crabs_wasm_get_register uses (value pointer + 8-byte int payload).
+  lww_register_t* register_value = (lww_register_t*)register_item->value;
+  ASSERT_NE(register_value, nullptr);
+  ASSERT_NE(register_value->value, nullptr);
+  ASSERT_GE(register_value->value_size, sizeof(int64_t));
+  EXPECT_EQ(*(int64_t*)register_value->value, (int64_t)777);
+  EXPECT_GT(register_value->timestamp, (uint64_t)0);
+
+  operation_destroy(op);
+}
+
+TEST_F(DedupMutationTest, SetAddRejectsOrSetTarget) {
+  data_item_t* or_set_item = data_item_create("or_members", DATA_TYPE_SET, CRDT_OR_SET);
+  or_set_t* set_value = or_set_create();
+  or_set_item->value = set_value;
+  state_add_item(state, or_set_item);
+
+  operation_t* op = operation_create("join");
+  op->dedup.type = DEDUP_CUSTOM;
+  strncpy(op->dedup.condition, "true", CRABS_MAX_POLICY_EXPR - 1);
+  op->dedup.update.type = MUTATION_SET_ADD;
+  strncpy(op->dedup.update.set_path, "or_members", CRABS_MAX_DEDUP_PATH - 1);
+  strncpy(op->dedup.update.element_value, "mallory", CRABS_MAX_USER_ID - 1);
+  strncpy(op->signer_id, "mallory", CRABS_MAX_USER_ID - 1);
+
+  // Casting an or_set_t to one_shot_set_t and calling one_shot_set_add is
+  // memory corruption; both validate and apply must reject with TYPE_MISMATCH.
+  EXPECT_EQ(dedup_validate_mutation_spec(state, &op->dedup, op), CRABS_ERR_TYPE_MISMATCH);
+  EXPECT_EQ(dedup_apply_mutation_spec(state, &op->dedup, op), CRABS_ERR_TYPE_MISMATCH);
+
+  // The OR-set is untouched.
+  EXPECT_EQ(set_value->element_count, (uint32_t)0);
+
+  operation_destroy(op);
+}
+
+TEST_F(DedupMutationTest, CheckAndApplyCounterIncrementOnGCounter) {
+  operation_t* op = operation_create("credit");
+  op->dedup.type = DEDUP_CUSTOM;
+  strncpy(op->dedup.condition, "balance >= 100", CRABS_MAX_POLICY_EXPR - 1);
+  op->dedup.update.type = MUTATION_COUNTER_INCREMENT;
+  strncpy(op->dedup.update.counter_path, "balance", CRABS_MAX_DEDUP_PATH - 1);
+  op->dedup.update.delta = 7;
+  strncpy(op->signer_id, "alice", CRABS_MAX_USER_ID - 1);
+
+  EXPECT_EQ(dedup_check_and_apply_spec(state, &op->dedup, op), CRABS_SUCCESS);
+  EXPECT_EQ(g_counter_value((g_counter_t*)counter->value), (int64_t)1007);
 
   operation_destroy(op);
 }
@@ -904,6 +1058,30 @@ TEST(DedupBuiltinOp, DefineOperationRegistersType) {
   for (data_item_t* it = state->items; it != NULL; it = it->next) {
     if (it->value != NULL) { crdt_value_destroy(it->crdt_type, it->value); it->value = NULL; }
   }
+  state_destroy(state);
+}
+
+// Audit: __define_operation_type__ must not be able to attach a dedup spec to
+// a built-in operation type (e.g. __lock__) — builtin handlers own their own
+// authorization and a registered spec would only add an unauthorized
+// mutation/guard surface on top of them.
+TEST(DedupBuiltinOp, DefineOperationRejectsBuiltinTarget) {
+  state_t* state = state_create();
+
+  operation_t* op = operation_create(CRABS_OP_DEFINE_OPERATION);
+  memset(op->uuid, 0x01, CRABS_UUID_SIZE);
+  strncpy(op->signer_id, "admin", CRABS_MAX_USER_ID - 1);
+  op->lamport_time = 1;
+  op->resource_count = 1;
+  op->resources = (char(*)[CRABS_MAX_USER_ID])malloc(CRABS_MAX_USER_ID);
+  strncpy(op->resources[0], CRABS_OP_LOCK, CRABS_MAX_USER_ID - 1);
+  op->dedup.type = DEDUP_PER_USER;
+  strncpy(op->dedup.tracker_path, "voters", CRABS_MAX_DEDUP_PATH - 1);
+
+  EXPECT_EQ(state_machine_op_define_operation(state, op), CRABS_ERR_INVALID_PARAM);
+  EXPECT_EQ(state_find_op_type_def(state, CRABS_OP_LOCK), nullptr);
+
+  operation_destroy(op);
   state_destroy(state);
 }
 

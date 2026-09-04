@@ -5,10 +5,141 @@
 #include "dedup.h"
 #include "../Util/allocator.h"
 #include "../Condition/condition.h"
+#include "../CRDT/crdt_merge.h"
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
 #include <stdint.h>
+
+// ============================================================
+// Mutation dispatch (value-representation aware)
+// ============================================================
+// A data item's value can live in two representations depending on the
+// creator:
+//   - The wasm/CRDT helpers (crabs_wasm_add_counter, crabs_wasm_add_register,
+//     ...) store real CRDT structs: g_counter_t* for DATA_TYPE_COUNTER,
+//     pn_counter_t* for DATA_TYPE_PN_COUNTER, lww_register_t* for
+//     CRDT_LWW_REG registers.
+//   - Legacy creators (state restore in serialization.c, the RESOURCE lock
+//     snapshot code in state_machine.c) store a bare heap int64_t*.
+// The item's crdt_type is the discriminator: the canonical struct CRDT type
+// for the item's data type selects the CRDT dispatch; everything else
+// (CRDT_CUSTOM / unset) selects the raw int64_t* path. DATA_TYPE_RESOURCE
+// always takes the raw int64_t* path: every RESOURCE creator stores a bare
+// int64_t even when its crdt_type is CRDT_PN_COUNTER.
+// ============================================================
+
+static const char* _mutation_node_id(const operation_t* op) {
+  if (op->node_id[0] != '\0') return op->node_id;
+  return op->signer_id;
+}
+
+// True when the item's value is a CRDT struct (not a bare int64_t*).
+static bool _counter_is_struct_backed(const data_item_t* item) {
+  if (item->type == DATA_TYPE_COUNTER && item->crdt_type == CRDT_G_COUNTER) return true;
+  if (item->type == DATA_TYPE_PN_COUNTER && item->crdt_type == CRDT_PN_COUNTER) return true;
+  return false;
+}
+
+// Type gate for counter mutations. COUNTER / PN_COUNTER / RESOURCE targets
+// are accepted; anything else is a type mismatch.
+static crabs_error_e _counter_target_check(const data_item_t* item) {
+  if (item->type == DATA_TYPE_COUNTER || item->type == DATA_TYPE_PN_COUNTER ||
+      item->type == DATA_TYPE_RESOURCE) {
+    return CRABS_SUCCESS;
+  }
+  return CRABS_ERR_TYPE_MISMATCH;
+}
+
+// Non-mutating overflow/semantics check mirroring _apply_counter_mutation.
+static crabs_error_e _check_counter_delta(const data_item_t* item, int64_t delta) {
+  if (item->type == DATA_TYPE_COUNTER && item->crdt_type == CRDT_G_COUNTER) {
+    // g_counter_increment rejects negative deltas (a G-Counter only grows).
+    if (delta < 0) return CRABS_ERR_INVALID_PARAM;
+    int64_t current = g_counter_value((const g_counter_t*)item->value);
+    if (current > INT64_MAX - delta) return CRABS_ERR_INVALID_PARAM;
+    return CRABS_SUCCESS;
+  }
+  if (item->type == DATA_TYPE_PN_COUNTER && item->crdt_type == CRDT_PN_COUNTER) {
+    int64_t current = pn_counter_value((const pn_counter_t*)item->value);
+    if (delta > 0 && current > INT64_MAX - delta) return CRABS_ERR_INVALID_PARAM;
+    if (delta < 0 && current < INT64_MIN - delta) return CRABS_ERR_INVALID_PARAM;
+    return CRABS_SUCCESS;
+  }
+  // Raw int64_t* representation (RESOURCE, legacy counters).
+  const int64_t* value = (const int64_t*)item->value;
+  if (delta > 0 && *value > INT64_MAX - delta) return CRABS_ERR_INVALID_PARAM;
+  if (delta < 0 && *value < INT64_MIN - delta) return CRABS_ERR_INVALID_PARAM;
+  return CRABS_SUCCESS;
+}
+
+// Apply a counter mutation through the item's actual value representation.
+static crabs_error_e _apply_counter_mutation(data_item_t* item, int64_t delta,
+                                             const operation_t* op) {
+  if (item->type == DATA_TYPE_COUNTER && item->crdt_type == CRDT_G_COUNTER) {
+    return g_counter_increment((g_counter_t*)item->value, _mutation_node_id(op), delta);
+  }
+  if (item->type == DATA_TYPE_PN_COUNTER && item->crdt_type == CRDT_PN_COUNTER) {
+    if (delta >= 0) {
+      return pn_counter_increment((pn_counter_t*)item->value, _mutation_node_id(op), delta);
+    }
+    if (delta == INT64_MIN) return CRABS_ERR_INVALID_PARAM;  // abs(delta) overflows
+    return pn_counter_decrement((pn_counter_t*)item->value, _mutation_node_id(op), -delta);
+  }
+  // Raw int64_t* representation (RESOURCE, legacy counters).
+  int64_t* value = (int64_t*)item->value;
+  // Audit N-15: checked addition. mut->delta is signed and covered by the
+  // operation signature (C-6 fix), but a large delta in a registered dedup
+  // spec could overflow the counter — undefined behavior. Reject on overflow
+  // instead of wrapping, matching g_counter_increment's checked-add discipline.
+  if (delta > 0 && *value > INT64_MAX - delta) return CRABS_ERR_INVALID_PARAM;
+  if (delta < 0 && *value < INT64_MIN - delta) return CRABS_ERR_INVALID_PARAM;
+  *value += delta;
+  return CRABS_SUCCESS;
+}
+
+// MUTATION_SET_ADD casts item->value to one_shot_set_t. An OR-set or 2P-set
+// has a different layout, so only ONE_SHOT_SET targets are legal.
+static crabs_error_e _set_add_target_check(const data_item_t* item) {
+  if (item->type == DATA_TYPE_ONE_SHOT_SET) return CRABS_SUCCESS;
+  if (item->type == DATA_TYPE_SET || item->type == DATA_TYPE_2P_SET) {
+    return CRABS_ERR_TYPE_MISMATCH;
+  }
+  return CRABS_ERR_INVALID_PARAM;
+}
+
+// MUTATION_ASSIGN on a register. LWW-Register items (CRDT_LWW_REG, as created
+// by crabs_wasm_add_register) get register semantics mirroring
+// crabs_wasm_set_register: replace the payload, bump the register timestamp.
+// Legacy registers hold a bare int64_t* and are updated in place.
+static crabs_error_e _apply_register_assign(state_t* state, data_item_t* item,
+                                            const char* value_text,
+                                            const operation_t* op) {
+  if (item->type != DATA_TYPE_REGISTER) return CRABS_ERR_TYPE_MISMATCH;
+  if (item->value == NULL) return CRABS_SUCCESS;
+
+  if (item->crdt_type == CRDT_LWW_REG) {
+    lww_register_t* register_value = (lww_register_t*)item->value;
+    int64_t new_value = atoll(value_text);
+    uint8_t* new_payload = (uint8_t*)malloc(sizeof(int64_t));
+    if (new_payload == NULL) return CRABS_ERR_OOM;
+    memcpy(new_payload, &new_value, sizeof(int64_t));
+    if (register_value->value != NULL) free(register_value->value);
+    register_value->value = new_payload;
+    register_value->value_size = sizeof(int64_t);
+    // The executor owns state->version; the register timestamp uses
+    // version+1 for LWW ordering (same as crabs_wasm_set_register).
+    register_value->timestamp = state->version + 1;
+    const char* mutation_node = _mutation_node_id(op);
+    strncpy(register_value->node_id, mutation_node, CRABS_MAX_USER_ID - 1);
+    register_value->node_id[CRABS_MAX_USER_ID - 1] = '\0';
+    return CRABS_SUCCESS;
+  }
+
+  int64_t* current_value = (int64_t*)item->value;
+  *current_value = atoll(value_text);
+  return CRABS_SUCCESS;
+}
 
 // ============================================================
 // Path resolution
@@ -140,8 +271,8 @@ crabs_error_e dedup_apply_mutation_spec(state_t* state,
         case MUTATION_SET_ADD: {
           data_item_t* item = state_find_item(state, mut->set_path);
           if (item == NULL) return CRABS_ERR_TRACKER_NOT_FOUND;
-          if (item->type != DATA_TYPE_ONE_SHOT_SET && item->type != DATA_TYPE_SET &&
-              item->type != DATA_TYPE_2P_SET) return CRABS_ERR_INVALID_PARAM;
+          crabs_error_e target_rc = _set_add_target_check(item);
+          if (target_rc != CRABS_SUCCESS) return target_rc;
 
           one_shot_set_t* set = (one_shot_set_t*)item->value;
           if (set == NULL) return CRABS_ERR_TRACKER_NOT_FOUND;
@@ -166,38 +297,15 @@ crabs_error_e dedup_apply_mutation_spec(state_t* state,
           if (item == NULL) return CRABS_ERR_RESOURCE_NOT_FOUND;
           if (item->value == NULL) return CRABS_ERR_RESOURCE_NOT_FOUND;
 
-          if (item->type == DATA_TYPE_COUNTER || item->type == DATA_TYPE_PN_COUNTER ||
-              item->type == DATA_TYPE_RESOURCE) {
-            int64_t* val = (int64_t*)item->value;
-            // Audit N-15: checked addition. mut->delta is signed and covered by
-            // the operation signature (C-6 fix), but a large delta in a
-            // registered dedup spec could overflow the counter — undefined
-            // behavior. Reject on overflow instead of wrapping, matching
-            // g_counter_increment's checked-add discipline.
-            if (mut->delta > 0 && *val > INT64_MAX - mut->delta) {
-              return CRABS_ERR_INVALID_PARAM;
-            }
-            if (mut->delta < 0 && *val < INT64_MIN - mut->delta) {
-              return CRABS_ERR_INVALID_PARAM;
-            }
-            *val += mut->delta;
-            return CRABS_SUCCESS;
-          }
-          return CRABS_ERR_TYPE_MISMATCH;
+          crabs_error_e target_rc = _counter_target_check(item);
+          if (target_rc != CRABS_SUCCESS) return target_rc;
+          return _apply_counter_mutation(item, mut->delta, op);
         }
 
         case MUTATION_ASSIGN: {
           data_item_t* item = state_find_item(state, mut->target_path);
           if (item == NULL) return CRABS_ERR_RESOURCE_NOT_FOUND;
-          if (item->type != DATA_TYPE_REGISTER) return CRABS_ERR_TYPE_MISMATCH;
-
-          // For registers, store the value as an int64
-          if (item->value != NULL) {
-            int64_t* old = (int64_t*)item->value;
-            // Value is a string representation, parse it
-            *old = atoll(mut->value);
-          }
-          return CRABS_SUCCESS;
+          return _apply_register_assign(state, item, mut->value, op);
         }
 
         case MUTATION_CUSTOM:
@@ -262,8 +370,8 @@ crabs_error_e dedup_validate_mutation_spec(const state_t* state,
         case MUTATION_SET_ADD: {
           data_item_t* item = state_find_item((state_t*)state, mut->set_path);
           if (item == NULL) return CRABS_ERR_TRACKER_NOT_FOUND;
-          if (item->type != DATA_TYPE_ONE_SHOT_SET && item->type != DATA_TYPE_SET &&
-              item->type != DATA_TYPE_2P_SET) return CRABS_ERR_INVALID_PARAM;
+          crabs_error_e target_rc = _set_add_target_check(item);
+          if (target_rc != CRABS_SUCCESS) return target_rc;
           one_shot_set_t* set = (one_shot_set_t*)item->value;
           if (set == NULL) return CRABS_ERR_TRACKER_NOT_FOUND;
           const char* elem = mut->element_value;
@@ -288,19 +396,9 @@ crabs_error_e dedup_validate_mutation_spec(const state_t* state,
           data_item_t* item = state_find_item((state_t*)state, mut->counter_path);
           if (item == NULL) return CRABS_ERR_RESOURCE_NOT_FOUND;
           if (item->value == NULL) return CRABS_ERR_RESOURCE_NOT_FOUND;
-          if (item->type == DATA_TYPE_COUNTER || item->type == DATA_TYPE_PN_COUNTER ||
-              item->type == DATA_TYPE_RESOURCE) {
-            int64_t* val = (int64_t*)item->value;
-            if (mut->delta > 0 && *val > INT64_MAX - mut->delta) {
-              return CRABS_ERR_INVALID_PARAM;
-            }
-            if (mut->delta < 0 && *val < INT64_MIN - mut->delta) {
-              return CRABS_ERR_INVALID_PARAM;
-            }
-          } else {
-            return CRABS_ERR_TYPE_MISMATCH;
-          }
-          return CRABS_SUCCESS;
+          crabs_error_e target_rc = _counter_target_check(item);
+          if (target_rc != CRABS_SUCCESS) return target_rc;
+          return _check_counter_delta(item, mut->delta);
         }
 
         case MUTATION_ASSIGN: {
@@ -430,8 +528,8 @@ crabs_error_e dedup_check_and_apply_spec(state_t* state,
         case MUTATION_SET_ADD: {
           data_item_t* item = state_find_item(state, mut->set_path);
           if (item == NULL) return CRABS_ERR_TRACKER_NOT_FOUND;
-          if (item->type != DATA_TYPE_ONE_SHOT_SET && item->type != DATA_TYPE_SET &&
-              item->type != DATA_TYPE_2P_SET) return CRABS_ERR_INVALID_PARAM;
+          crabs_error_e target_rc = _set_add_target_check(item);
+          if (target_rc != CRABS_SUCCESS) return target_rc;
           one_shot_set_t* set = (one_shot_set_t*)item->value;
           if (set == NULL) return CRABS_ERR_TRACKER_NOT_FOUND;
           const char* elem = mut->element_value;
@@ -450,25 +548,14 @@ crabs_error_e dedup_check_and_apply_spec(state_t* state,
           data_item_t* item = state_find_item(state, mut->counter_path);
           if (item == NULL) return CRABS_ERR_RESOURCE_NOT_FOUND;
           if (item->value == NULL) return CRABS_ERR_RESOURCE_NOT_FOUND;
-          if (item->type != DATA_TYPE_COUNTER && item->type != DATA_TYPE_PN_COUNTER &&
-              item->type != DATA_TYPE_RESOURCE) return CRABS_ERR_INVALID_PARAM;
-          int64_t* val = (int64_t*)item->value;
-          int64_t delta = (int64_t)mut->delta;
-          // Overflow guard
-          if (delta > 0 && *val > INT64_MAX - delta) return CRABS_ERR_INVALID_PARAM;
-          if (delta < 0 && *val < INT64_MIN - delta) return CRABS_ERR_INVALID_PARAM;
-          *val += delta;
-          return CRABS_SUCCESS;
+          crabs_error_e target_rc = _counter_target_check(item);
+          if (target_rc != CRABS_SUCCESS) return target_rc;
+          return _apply_counter_mutation(item, mut->delta, op);
         }
         case MUTATION_ASSIGN: {
           data_item_t* item = state_find_item(state, mut->target_path);
           if (item == NULL) return CRABS_ERR_RESOURCE_NOT_FOUND;
-          if (item->type != DATA_TYPE_REGISTER) return CRABS_ERR_INVALID_PARAM;
-          if (item->value != NULL) {
-            int64_t* old = (int64_t*)item->value;
-            *old = atoll(mut->value);
-          }
-          return CRABS_SUCCESS;
+          return _apply_register_assign(state, item, mut->value, op);
         }
         case MUTATION_CUSTOM:
           return CRABS_ERR_INTERNAL;
