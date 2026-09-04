@@ -114,8 +114,8 @@ TEST_F(TestAttrMachine, VerifyIdentityNullParams) {
 // ============================================================
 
 TEST_F(TestAttrMachine, SuspendUserNullParams) {
-  EXPECT_EQ(attribute_machine_suspend_user(nullptr, "alice"), CRABS_ERR_INVALID_PARAM);
-  EXPECT_EQ(attribute_machine_suspend_user(am, nullptr), CRABS_ERR_INVALID_PARAM);
+  EXPECT_EQ(attribute_machine_suspend_user(nullptr, "alice", "admin"), CRABS_ERR_INVALID_PARAM);
+  EXPECT_EQ(attribute_machine_suspend_user(am, nullptr, "admin"), CRABS_ERR_INVALID_PARAM);
 }
 
 // ============================================================
@@ -259,7 +259,7 @@ TEST_F(TestAttrMachine, CompromiseRecoveryScenario) {
   uint64_t old_key_version = alice->key_version;
 
   // Suspend the compromised user (key compromise response)
-  crabs_error_e rc = attribute_machine_suspend_user(am, "alice");
+  crabs_error_e rc = attribute_machine_suspend_user(am, "alice", "admin");
   EXPECT_EQ(rc, CRABS_SUCCESS);
   alice = attribute_machine_find_user(am, "alice");
   ASSERT_NE(alice, nullptr);

@@ -36,8 +36,11 @@ const nodeKey = node.getNodeKey();
 assert(nodeKey.publicKeyHex.length === 66, 'Node public key should be 66 hex chars');
 
 // Test 5: Register a user
+// register_user rejects privileged (role:) initial attributes (audit R7-08),
+// so the role is granted via the admin grantRole path after registration.
 const aliceKey = KeyPair.generate();
-node.registerUser('alice', aliceKey.publicKeyHex(), 'role:member');
+node.registerUser('alice', aliceKey.publicKeyHex(), '');
+node.grantRole('alice', 'role', 'member', 'admin');
 const alice = node.getUser('alice');
 assert(alice !== undefined, 'Alice should be found');
 assert(alice.userId === 'alice', 'Alice userId should match');

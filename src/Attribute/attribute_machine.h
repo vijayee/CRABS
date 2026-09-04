@@ -125,9 +125,24 @@ crabs_error_e attribute_machine_self_assert(attribute_machine_t* am, const char*
 crabs_error_e attribute_machine_verify_identity(attribute_machine_t* am, const char* target_user,
                                                   const char* attribute, const char* value,
                                                   const char* signer_id);
+// Audit follow-up (module-level gates): every user-mutating operation —
+// grant, revoke_role, suspend, revoke_user — requires the signer to be an
+// ACTIVE user holding the role:admin attribute. Previously revoke_role,
+// suspend_user and revoke_user performed no signer check at all, so any
+// caller with a reference to the attribute machine could decommission any
+// user.
 crabs_error_e attribute_machine_revoke_role(attribute_machine_t* am, const char* target_user,
                                               const char* role, const char* signer_id);
-crabs_error_e attribute_machine_suspend_user(attribute_machine_t* am, const char* user_id);
+crabs_error_e attribute_machine_suspend_user(attribute_machine_t* am, const char* user_id,
+                                               const char* signer_id);
+
+// System-internal suspension for the key-compromise recovery flow
+// (crypto_revoke_and_rotate): the NODE suspends the user while rotating
+// their key, with no signing user behind the action. Bypasses the admin
+// gate deliberately — use attribute_machine_suspend_user for all
+// operator-driven suspensions.
+crabs_error_e attribute_machine_suspend_user_internal(attribute_machine_t* am,
+                                                        const char* user_id);
 
 // R7-07: reactivate a SUSPENDED user after key-compromise recovery
 // (crypto_revoke_and_rotate). Admin-authorized: the signer must be an active
@@ -140,8 +155,10 @@ crabs_error_e attribute_machine_activate_user(attribute_machine_t* am, const cha
 
 // Audit H-C: revoke a user. Unlike suspend (recoverable), revocation is the
 // terminal state — a revoked user cannot authorize, refresh, or be reactivated
-// without re-registration. Sets user->status = USER_REVOKED.
-crabs_error_e attribute_machine_revoke_user(attribute_machine_t* am, const char* user_id);
+// without re-registration. Sets user->status = USER_REVOKED. Admin-authorized:
+// the signer must be an active user holding the role:admin attribute.
+crabs_error_e attribute_machine_revoke_user(attribute_machine_t* am, const char* user_id,
+                                              const char* signer_id);
 
 // Audit H-C: inject the platform wall clock (ms) used for temporary-attribute
 // expiry and key expiry. Without this, current_time_ms stays 0 and expired

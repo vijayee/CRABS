@@ -270,7 +270,7 @@ TEST_F(TestIntegration, AttributeMachineLifecycle) {
   EXPECT_FALSE(attribute_machine_user_has_role(alice, "role"));
 
   // Suspend user
-  result = attribute_machine_suspend_user(am, "alice");
+  result = attribute_machine_suspend_user(am, "alice", "admin");
   EXPECT_EQ(result, CRABS_SUCCESS);
 
   alice = attribute_machine_find_user(am, "alice");

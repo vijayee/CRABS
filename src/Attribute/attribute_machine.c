@@ -454,6 +454,22 @@ crabs_error_e attribute_machine_register_user(attribute_machine_t* am, const cha
   return CRABS_SUCCESS;
 }
 
+// Shared admin gate (audit follow-up: module-level gates). Every
+// user-mutating operation requires the signer to be an ACTIVE user holding
+// the role:admin attribute.
+static crabs_error_e _check_signer_is_active_admin(attribute_machine_t* am,
+                                                     const char* signer_id) {
+  user_t* signer = attribute_machine_find_user(am, signer_id);
+  if (signer == NULL) return CRABS_ERR_USER_NOT_FOUND;
+  if (signer->status != USER_ACTIVE) return CRABS_ERR_USER_SUSPENDED;
+  for (uint32_t i = 0; i < signer->attribute_count; i++) {
+    if (strcmp(signer->attributes[i].value, "role:admin") == 0) {
+      return CRABS_SUCCESS;
+    }
+  }
+  return CRABS_ERR_UNAUTHORIZED;
+}
+
 crabs_error_e attribute_machine_grant_role(attribute_machine_t* am, const char* target_user,
                                             const char* role, const char* value,
                                             const char* signer_id) {
@@ -476,17 +492,8 @@ crabs_error_e attribute_machine_grant_role(attribute_machine_t* am, const char* 
   // R8-A-2: the signer must be an active user holding role:admin. The prior
   // code stored signer_id in verified_by without checking authorization, so
   // any caller could grant role:admin to anyone.
-  user_t* signer = attribute_machine_find_user(am, signer_id);
-  if (signer == NULL) return CRABS_ERR_USER_NOT_FOUND;
-  if (signer->status != USER_ACTIVE) return CRABS_ERR_USER_SUSPENDED;
-  bool signer_is_admin = false;
-  for (uint32_t i = 0; i < signer->attribute_count; i++) {
-    if (strcmp(signer->attributes[i].value, "role:admin") == 0) {
-      signer_is_admin = true;
-      break;
-    }
-  }
-  if (!signer_is_admin) return CRABS_ERR_UNAUTHORIZED;
+  crabs_error_e signer_rc = _check_signer_is_active_admin(am, signer_id);
+  if (signer_rc != CRABS_SUCCESS) return signer_rc;
 
   user_t* user = attribute_machine_find_user(am, target_user);
   if (user == NULL) return CRABS_ERR_USER_NOT_FOUND;
@@ -678,6 +685,12 @@ crabs_error_e attribute_machine_revoke_role(attribute_machine_t* am, const char*
     return CRABS_ERR_INVALID_PARAM;
   }
 
+  // Audit follow-up: admin gate. Stripping roles is exactly the privilege
+  // that must not be available to a non-admin caller — revoking role:admin
+  // from the real admins would hand the machine to whoever calls next.
+  crabs_error_e signer_rc = _check_signer_is_active_admin(am, signer_id);
+  if (signer_rc != CRABS_SUCCESS) return signer_rc;
+
   user_t* user = attribute_machine_find_user(am, target_user);
   if (user == NULL) return CRABS_ERR_USER_NOT_FOUND;
 
@@ -713,7 +726,21 @@ crabs_error_e attribute_machine_revoke_role(attribute_machine_t* am, const char*
   return CRABS_SUCCESS;
 }
 
-crabs_error_e attribute_machine_suspend_user(attribute_machine_t* am, const char* user_id) {
+crabs_error_e attribute_machine_suspend_user(attribute_machine_t* am, const char* user_id,
+                                               const char* signer_id) {
+  if (am == NULL || user_id == NULL || signer_id == NULL) return CRABS_ERR_INVALID_PARAM;
+
+  // Audit follow-up: admin gate. Suspension denies a user every
+  // authorization gate, so an ungated suspend was a full account-takeover
+  // primitive.
+  crabs_error_e signer_rc = _check_signer_is_active_admin(am, signer_id);
+  if (signer_rc != CRABS_SUCCESS) return signer_rc;
+
+  return attribute_machine_suspend_user_internal(am, user_id);
+}
+
+crabs_error_e attribute_machine_suspend_user_internal(attribute_machine_t* am,
+                                                        const char* user_id) {
   if (am == NULL || user_id == NULL) return CRABS_ERR_INVALID_PARAM;
 
   user_t* user = attribute_machine_find_user(am, user_id);
@@ -743,19 +770,10 @@ crabs_error_e attribute_machine_activate_user(attribute_machine_t* am, const cha
     return CRABS_ERR_INVALID_PARAM;
   }
 
-  user_t* signer = attribute_machine_find_user(am, signer_id);
-  if (signer == NULL) return CRABS_ERR_USER_NOT_FOUND;
-  if (signer->status != USER_ACTIVE) return CRABS_ERR_USER_SUSPENDED;
-
-  // Admin authorization: the signer must hold the role:admin attribute.
-  bool is_admin = false;
-  for (uint32_t i = 0; i < signer->attribute_count; i++) {
-    if (strcmp(signer->attributes[i].value, "role:admin") == 0) {
-      is_admin = true;
-      break;
-    }
-  }
-  if (!is_admin) return CRABS_ERR_UNAUTHORIZED;
+  // Admin authorization: the signer must be an active user holding the
+  // role:admin attribute.
+  crabs_error_e signer_rc = _check_signer_is_active_admin(am, signer_id);
+  if (signer_rc != CRABS_SUCCESS) return signer_rc;
 
   user_t* user = attribute_machine_find_user(am, target_user);
   if (user == NULL) return CRABS_ERR_USER_NOT_FOUND;
@@ -773,8 +791,14 @@ crabs_error_e attribute_machine_activate_user(attribute_machine_t* am, const cha
 // Audit H-C: revocation is terminal. A revoked user is rejected by every
 // authorization gate (all gates check status == USER_ACTIVE, a whitelist),
 // and may not refresh keys. Re-registration is required to restore access.
-crabs_error_e attribute_machine_revoke_user(attribute_machine_t* am, const char* user_id) {
-  if (am == NULL || user_id == NULL) return CRABS_ERR_INVALID_PARAM;
+crabs_error_e attribute_machine_revoke_user(attribute_machine_t* am, const char* user_id,
+                                              const char* signer_id) {
+  if (am == NULL || user_id == NULL || signer_id == NULL) return CRABS_ERR_INVALID_PARAM;
+
+  // Audit follow-up: admin gate. Revocation is terminal — an ungated call
+  // permanently destroyed any account with no recovery path.
+  crabs_error_e signer_rc = _check_signer_is_active_admin(am, signer_id);
+  if (signer_rc != CRABS_SUCCESS) return signer_rc;
 
   user_t* user = attribute_machine_find_user(am, user_id);
   if (user == NULL) return CRABS_ERR_USER_NOT_FOUND;

@@ -298,11 +298,14 @@ class Node {
     wrapRc(rc, 'grantRole');
   }
 
-  revokeUser(userId) {
+  revokeUser(userId, signerId) {
     const M = this._M;
+    // Audit follow-up: revoke_user is admin-gated in C now, so the signer
+    // must be passed and default to the node's admin identity.
     const uidPtr = writeString(M, userId);
-    const rc = M._attribute_machine_revoke_user(this._am, uidPtr);
-    if (uidPtr) M._free(uidPtr);
+    const sPtr = writeString(M, signerId || this.adminId || 'admin');
+    const rc = M._attribute_machine_revoke_user(this._am, uidPtr, sPtr);
+    freeAll(M, uidPtr, sPtr);
     wrapRc(rc, 'revokeUser');
   }
 

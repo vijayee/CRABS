@@ -602,7 +602,12 @@ cli_result_e cli_cmd_user_suspend(cli_node_t* node, const char* user_id) {
   if (node == NULL || !node->initialized) return CLI_ERR_NOT_INIT;
   if (user_id == NULL) return CLI_ERR_ARGS;
 
-  crabs_error_e err = attribute_machine_suspend_user(node->attr_machine, user_id);
+  // The CLI acts as the bootstrap admin (same signer resolution as grant/
+  // revoke_role): users may be prepended by later registrations, so the list
+  // head is not necessarily an admin.
+  crabs_error_e err = attribute_machine_suspend_user(
+      node->attr_machine, user_id,
+      node->attr_machine->base_state.config.bootstrap_admin);
   if (err != CRABS_SUCCESS) {
     printf("Error: %s\n", cli_error_string(err));
     return CLI_ERR_EXEC;

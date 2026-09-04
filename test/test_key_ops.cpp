@@ -182,7 +182,7 @@ TEST(TestKeyOps, RegisterKeyRejectsSuspendedUser) {
   state_t* state = create_test_state_with_attr();
 
   // Suspend admin
-  attribute_machine_suspend_user(state->attr_machine, "admin");
+  attribute_machine_suspend_user(state->attr_machine, "admin", "admin");
 
   operation_t* op = operation_create(CRABS_OP_REGISTER_KEY);
   fill_uuid(op->uuid);
@@ -679,7 +679,7 @@ TEST(TestKeyOps, RegisterKeyRejectsRevokedUser) {
   state_t* state = create_test_state_with_attr();
 
   // Revoke admin
-  attribute_machine_revoke_user(state->attr_machine, "admin");
+  attribute_machine_revoke_user(state->attr_machine, "admin", "admin");
 
   operation_t* op = operation_create(CRABS_OP_REGISTER_KEY);
   fill_uuid(op->uuid);
@@ -704,7 +704,7 @@ TEST(TestKeyOps, RevokeKeyRejectsRevokedUser) {
   ASSERT_EQ(user_key_register(admin, "mykey", ECDSA_SECP256K1, pk, 33, "test"), CRABS_SUCCESS);
 
   // Revoke admin
-  attribute_machine_revoke_user(state->attr_machine, "admin");
+  attribute_machine_revoke_user(state->attr_machine, "admin", "admin");
 
   // Now try to revoke the key — must be rejected by auth step
   const char* config = "key_id=mykey";
@@ -731,7 +731,7 @@ TEST(TestKeyOps, SetDefaultKeyRejectsRevokedUser) {
   state_t* state = create_test_state_with_attr();
 
   // Revoke admin
-  attribute_machine_revoke_user(state->attr_machine, "admin");
+  attribute_machine_revoke_user(state->attr_machine, "admin", "admin");
 
   const char* config = "key_id=somekey";
   size_t payload_size = strlen(config) + 1;

@@ -377,6 +377,7 @@ public:
     if (!node_key_) throw Napi::Error::New(env, "Failed to generate node key");
 
     // Create attribute machine with admin
+    admin_id_ = admin_id;
     am_ = attribute_machine_create(admin_id.c_str(), node_key_->public_key);
     if (!am_) throw Napi::Error::New(env, "Failed to create attribute machine");
 
@@ -407,6 +408,7 @@ public:
 private:
   ecdsa_keypair_t* node_key_;
   attribute_machine_t* am_;
+  std::string admin_id_;
   crabs_ordering_config_t ordering_config_;
 
   // --- User management ---
@@ -477,7 +479,12 @@ private:
   Napi::Value RevokeUser(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
     std::string user_id = info[0].As<Napi::String>().Utf8Value();
-    crabs_error_e rc = attribute_machine_revoke_user(am_, user_id.c_str());
+    // Admin-gated in C (audit follow-up); the signer defaults to the node
+    // admin when the caller omits it.
+    std::string signer_id = info.Length() > 1 && !info[1].IsUndefined()
+        ? info[1].As<Napi::String>().Utf8Value() : admin_id_;
+    crabs_error_e rc = attribute_machine_revoke_user(am_, user_id.c_str(),
+                                                     signer_id.c_str());
     if (rc != CRABS_SUCCESS) throw crabs_error(env, rc, "revokeUser");
     return env.Undefined();
   }
@@ -794,6 +801,15 @@ private:
       op->raw()->hlc = crabs_hlc_next(&am_->base_state.hlc_state);
       strncpy(op->raw()->node_id, am_->base_state.hlc_state.last.node_id,
               CRABS_MAX_USER_ID - 1);
+    }
+
+    // R7-04: ops must carry the signer's current key_version, or verification
+    // fails closed with key_stale (same stamping crabs_wasm_sign_operation
+    // does for the WASM binding).
+    user_t* signer_user =
+        attribute_machine_find_user(am_, op->raw()->signer_id);
+    if (signer_user != NULL) {
+      op->raw()->signer_key_version = signer_user->key_version;
     }
 
     // Sign

@@ -530,7 +530,7 @@ TEST_F(VerifyAuthTest, ModeA_CollapsesUserExistenceAndStatus) {
   EXPECT_EQ(vr.error, CRABS_ERR_UNAUTHORIZED);
 
   // Suspended user → UNAUTHORIZED, not USER_SUSPENDED.
-  ASSERT_EQ(attribute_machine_suspend_user(am, "alice"), CRABS_SUCCESS);
+  ASSERT_EQ(attribute_machine_suspend_user(am, "alice", "admin"), CRABS_SUCCESS);
   vr = crypto_verify_operation_auth(
       mk, "role:admin", am, op_data, sizeof(op_data),
       signature, "alice", VERIFY_MODE_A);
@@ -736,7 +736,7 @@ TEST_F(VerifyAuthTest, RevokedUserRejected) {
   ASSERT_EQ(crabs_test_register_user_with_role(am, "alice", keypair->public_key,
                                               "role", "admin"), CRABS_SUCCESS);
 
-  ASSERT_EQ(attribute_machine_revoke_user(am, "alice"), CRABS_SUCCESS);
+  ASSERT_EQ(attribute_machine_revoke_user(am, "alice", "admin"), CRABS_SUCCESS);
 
   const uint8_t op_data[] = {0x01, 0x02, 0x03};
   uint8_t signature[CRABS_SIG_SIZE];

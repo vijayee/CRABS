@@ -464,7 +464,7 @@ TEST(TestKeyRing, RevokeLastKeyOnRevokedUserStaysRevoked) {
   _gen_pk_kr(pk);
   ASSERT_EQ(user_key_register(admin, "key1", ECDSA_SECP256K1, pk, 33, "primary"), CRABS_SUCCESS);
 
-  ASSERT_EQ(attribute_machine_revoke_user(am, "admin"), CRABS_SUCCESS);
+  ASSERT_EQ(attribute_machine_revoke_user(am, "admin", "admin"), CRABS_SUCCESS);
   EXPECT_EQ(admin->status, USER_REVOKED);
 
   ASSERT_EQ(user_key_revoke(admin, "key1"), CRABS_SUCCESS);

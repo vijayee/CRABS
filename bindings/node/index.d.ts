@@ -84,7 +84,7 @@ export interface Node {
   grantRole(targetUser: string, role: string, value: string, signerId: string): void;
   selfAssert(attribute: string, value: string, signerId: string): void;
   verifyIdentity(targetUser: string, attribute: string, value: string, signerId: string): void;
-  revokeUser(userId: string): void;
+  revokeUser(userId: string, signerId?: string): void;
   getUser(userId: string): UserInfo | undefined;
   getNodeKey(): NodeKey;
 

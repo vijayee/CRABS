@@ -174,7 +174,7 @@ TEST_F(TestAttributeMachine, TestGrantRoleSuspendedUser) {
   _gen_pk(user_pk);
   attribute_machine_register_user(am, "alice", user_pk, NULL);
 
-  attribute_machine_suspend_user(am, "alice");
+  attribute_machine_suspend_user(am, "alice", "admin");
 
   crabs_error_e result = attribute_machine_grant_role(am, "alice", "role", "editor", "admin");
   EXPECT_EQ(result, CRABS_ERR_USER_SUSPENDED);
@@ -281,7 +281,7 @@ TEST_F(TestAttributeMachine, TestSelfAssertSuspendedUser) {
   uint8_t user_pk[33];
   _gen_pk(user_pk);
   attribute_machine_register_user(am, "alice", user_pk, NULL);
-  attribute_machine_suspend_user(am, "alice");
+  attribute_machine_suspend_user(am, "alice", "admin");
 
   crabs_error_e result = attribute_machine_self_assert(am, "email", "test@test.com", "alice");
   EXPECT_EQ(result, CRABS_ERR_USER_SUSPENDED);
@@ -333,7 +333,7 @@ TEST_F(TestAttributeMachine, TestVerifyIdentitySuspendedUser) {
   uint8_t user_pk[33];
   _gen_pk(user_pk);
   attribute_machine_register_user(am, "alice", user_pk, NULL);
-  attribute_machine_suspend_user(am, "alice");
+  attribute_machine_suspend_user(am, "alice", "admin");
 
   crabs_error_e result = attribute_machine_verify_identity(am, "alice", "email", "test@test.com", "admin");
   EXPECT_EQ(result, CRABS_ERR_USER_SUSPENDED);
@@ -362,7 +362,7 @@ TEST_F(TestAttributeMachine, TestSuspendUser) {
   ASSERT_NE(alice, nullptr);
   EXPECT_EQ(alice->status, USER_ACTIVE);
 
-  crabs_error_e result = attribute_machine_suspend_user(am, "alice");
+  crabs_error_e result = attribute_machine_suspend_user(am, "alice", "admin");
   EXPECT_EQ(result, CRABS_SUCCESS);
 
   // Refresh pointer
@@ -372,8 +372,68 @@ TEST_F(TestAttributeMachine, TestSuspendUser) {
 }
 
 TEST_F(TestAttributeMachine, TestSuspendUserNotFound) {
-  crabs_error_e result = attribute_machine_suspend_user(am, "nonexistent");
+  crabs_error_e result = attribute_machine_suspend_user(am, "nonexistent", "admin");
   EXPECT_EQ(result, CRABS_ERR_USER_NOT_FOUND);
+}
+
+// Audit follow-up (module-level gates): revoke_role, suspend_user and
+// revoke_user previously performed NO signer check — any caller holding a
+// reference to the attribute machine could strip roles, suspend or
+// permanently revoke any account. All three are admin-gated now.
+TEST_F(TestAttributeMachine, TestRevokeRoleByNonAdminRejected) {
+  uint8_t user_pk[33];
+  _gen_pk(user_pk);
+  ASSERT_EQ(crabs_test_register_user_with_role(am, "bob", user_pk,
+                                               "role", "editor"), CRABS_SUCCESS);
+
+  EXPECT_EQ(attribute_machine_revoke_role(am, "bob", "role", "bob"),
+            CRABS_ERR_UNAUTHORIZED);
+
+  user_t* bob = attribute_machine_find_user(am, "bob");
+  ASSERT_NE(bob, nullptr);
+  EXPECT_TRUE(attribute_machine_user_has_role(bob, "role"));
+}
+
+TEST_F(TestAttributeMachine, TestSuspendUserByNonAdminRejected) {
+  uint8_t user_pk[33];
+  _gen_pk(user_pk);
+  ASSERT_EQ(attribute_machine_register_user(am, "bob", user_pk, NULL), CRABS_SUCCESS);
+
+  EXPECT_EQ(attribute_machine_suspend_user(am, "bob", "bob"),
+            CRABS_ERR_UNAUTHORIZED);
+
+  user_t* bob = attribute_machine_find_user(am, "bob");
+  ASSERT_NE(bob, nullptr);
+  EXPECT_EQ(bob->status, USER_ACTIVE);
+}
+
+TEST_F(TestAttributeMachine, TestRevokeUserByNonAdminRejected) {
+  uint8_t user_pk[33];
+  _gen_pk(user_pk);
+  ASSERT_EQ(attribute_machine_register_user(am, "bob", user_pk, NULL), CRABS_SUCCESS);
+
+  EXPECT_EQ(attribute_machine_revoke_user(am, "bob", "bob"),
+            CRABS_ERR_UNAUTHORIZED);
+
+  user_t* bob = attribute_machine_find_user(am, "bob");
+  ASSERT_NE(bob, nullptr);
+  EXPECT_EQ(bob->status, USER_ACTIVE);
+}
+
+TEST_F(TestAttributeMachine, TestAdminGateUnknownAndSuspendedSigner) {
+  uint8_t user_pk[33];
+  _gen_pk(user_pk);
+  ASSERT_EQ(attribute_machine_register_user(am, "bob", user_pk, NULL), CRABS_SUCCESS);
+
+  // Unknown signer → USER_NOT_FOUND (not silently authorized).
+  EXPECT_EQ(attribute_machine_revoke_user(am, "bob", "ghost"),
+            CRABS_ERR_USER_NOT_FOUND);
+
+  // A suspended admin loses the gate too (status is whitelisted, not just
+  // the attribute).
+  ASSERT_EQ(attribute_machine_suspend_user(am, "admin", "admin"), CRABS_SUCCESS);
+  EXPECT_EQ(attribute_machine_revoke_user(am, "bob", "admin"),
+            CRABS_ERR_USER_SUSPENDED);
 }
 
 // R8-C-4: revocation is terminal. suspend_user must not downgrade a REVOKED
@@ -383,9 +443,9 @@ TEST_F(TestAttributeMachine, TestSuspendRevokedUserIsTerminal) {
   uint8_t user_pk[33];
   _gen_pk(user_pk);
   ASSERT_EQ(attribute_machine_register_user(am, "alice", user_pk, NULL), CRABS_SUCCESS);
-  ASSERT_EQ(attribute_machine_revoke_user(am, "alice"), CRABS_SUCCESS);
+  ASSERT_EQ(attribute_machine_revoke_user(am, "alice", "admin"), CRABS_SUCCESS);
 
-  crabs_error_e result = attribute_machine_suspend_user(am, "alice");
+  crabs_error_e result = attribute_machine_suspend_user(am, "alice", "admin");
   EXPECT_NE(result, CRABS_SUCCESS);
 
   user_t* alice = attribute_machine_find_user(am, "alice");
@@ -406,7 +466,7 @@ TEST_F(TestAttributeMachine, TestActivateUser) {
   ASSERT_NE(alice, nullptr);
   uint64_t version_before_suspend = alice->key_version;
 
-  ASSERT_EQ(attribute_machine_suspend_user(am, "alice"), CRABS_SUCCESS);
+  ASSERT_EQ(attribute_machine_suspend_user(am, "alice", "admin"), CRABS_SUCCESS);
   alice = attribute_machine_find_user(am, "alice");
   ASSERT_NE(alice, nullptr);
   EXPECT_EQ(alice->status, USER_SUSPENDED);
@@ -429,7 +489,7 @@ TEST_F(TestAttributeMachine, TestActivateUserRequiresAdmin) {
   uint8_t user_pk[33];
   _gen_pk(user_pk);
   ASSERT_EQ(attribute_machine_register_user(am, "alice", user_pk, NULL), CRABS_SUCCESS);
-  ASSERT_EQ(attribute_machine_suspend_user(am, "alice"), CRABS_SUCCESS);
+  ASSERT_EQ(attribute_machine_suspend_user(am, "alice", "admin"), CRABS_SUCCESS);
 
   // bob has role:user, not role:admin — reactivation must be rejected.
   uint8_t bob_pk[33];
@@ -464,7 +524,7 @@ TEST_F(TestAttributeMachine, TestActivateRevokedUserRejected) {
   uint8_t user_pk[33];
   _gen_pk(user_pk);
   ASSERT_EQ(attribute_machine_register_user(am, "alice", user_pk, NULL), CRABS_SUCCESS);
-  ASSERT_EQ(attribute_machine_revoke_user(am, "alice"), CRABS_SUCCESS);
+  ASSERT_EQ(attribute_machine_revoke_user(am, "alice", "admin"), CRABS_SUCCESS);
 
   // Revocation is terminal (audit H-C): a REVOKED user cannot be reactivated.
   crabs_error_e result = attribute_machine_activate_user(am, "alice", "admin");
@@ -483,14 +543,14 @@ TEST_F(TestAttributeMachine, TestRevokeUser) {
   ASSERT_NE(alice, nullptr);
   EXPECT_EQ(alice->status, USER_ACTIVE);
 
-  EXPECT_EQ(attribute_machine_revoke_user(am, "alice"), CRABS_SUCCESS);
+  EXPECT_EQ(attribute_machine_revoke_user(am, "alice", "admin"), CRABS_SUCCESS);
   alice = attribute_machine_find_user(am, "alice");
   ASSERT_NE(alice, nullptr);
   EXPECT_EQ(alice->status, USER_REVOKED);
 }
 
 TEST_F(TestAttributeMachine, TestRevokeUserNotFound) {
-  EXPECT_EQ(attribute_machine_revoke_user(am, "nonexistent"), CRABS_ERR_USER_NOT_FOUND);
+  EXPECT_EQ(attribute_machine_revoke_user(am, "nonexistent", "admin"), CRABS_ERR_USER_NOT_FOUND);
 }
 
 // Regression for audit H-C: temp attributes with expires_at in the past are
@@ -620,7 +680,7 @@ TEST_F(TestAttributeMachine, TestIssueTemporarySkipsSuspendedUser) {
   uint8_t user_pk[33];
   _gen_pk(user_pk);
   attribute_machine_register_user(am, "alice", user_pk, "dept:worker");
-  attribute_machine_suspend_user(am, "alice");
+  attribute_machine_suspend_user(am, "alice", "admin");
 
   am->current_time_ms = 1000;
 
@@ -775,7 +835,7 @@ TEST_F(TestAttributeMachine, TestVersionIncrements) {
   attribute_machine_revoke_role(am, "alice", "email", "admin");
   EXPECT_EQ(am->base_state.version, initial_version + 5);
 
-  attribute_machine_suspend_user(am, "alice");
+  attribute_machine_suspend_user(am, "alice", "admin");
   EXPECT_EQ(am->base_state.version, initial_version + 6);
 }
 
@@ -873,7 +933,7 @@ TEST_F(TestAttributeMachine, TestRevokedUserRejectedByDirectAPIs) {
   ASSERT_EQ(attribute_machine_register_user(am, "alice", user_pk, "dept:eng"), CRABS_SUCCESS);
 
   // Revoke alice
-  ASSERT_EQ(attribute_machine_revoke_user(am, "alice"), CRABS_SUCCESS);
+  ASSERT_EQ(attribute_machine_revoke_user(am, "alice", "admin"), CRABS_SUCCESS);
   user_t* alice = attribute_machine_find_user(am, "alice");
   ASSERT_NE(alice, nullptr);
   EXPECT_EQ(alice->status, USER_REVOKED);
