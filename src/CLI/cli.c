@@ -108,6 +108,12 @@ cli_node_t* cli_node_create(void) {
 
 void cli_node_destroy(cli_node_t* node) {
   if (node == NULL) return;
+  if (node->state_sig_payload != NULL) {
+    free(node->state_sig_payload);
+    node->state_sig_payload = NULL;
+    node->state_sig_payload_len = 0;
+    node->state_sig_pending = false;
+  }
   if (node->attr_machine != NULL) {
     attribute_machine_destroy(node->attr_machine);
   } else if (node->state != NULL) {
@@ -198,6 +204,16 @@ cli_result_e cli_node_load(cli_node_t* node, const char* path) {
   if (node == NULL || path == NULL) return CLI_ERR_ARGS;
   if (node->initialized) return CLI_ERR_ARGS;
 
+  // A prior load attempt that failed after the signed parse would have left
+  // pending signature data behind; release it before repopulating.
+  if (node->state_sig_pending) {
+    free(node->state_sig_payload);
+    node->state_sig_payload = NULL;
+    node->state_sig_payload_len = 0;
+    memset(node->state_sig_signature, 0, CRABS_SIG_SIZE);
+    node->state_sig_pending = false;
+  }
+
   FILE* f = fopen(path, "rb");
   if (f == NULL) return CLI_ERR_IO;
 
@@ -210,15 +226,55 @@ cli_result_e cli_node_load(cli_node_t* node, const char* path) {
     return CLI_ERR_IO;
   }
 
-  uint8_t* data = get_memory((size_t)fsize);
-  if (fread(data, 1, (size_t)fsize, f) != (size_t)fsize) {
+  size_t file_len = (size_t)fsize;
+  uint8_t* data = get_memory(file_len);
+  if (fread(data, 1, file_len, f) != file_len) {
     free(data);
     fclose(f);
     return CLI_ERR_IO;
   }
   fclose(f);
 
-  state_t* loaded = crabs_deserialize_state(data, (size_t)fsize);
+  // Audit M-1: the SHA-256 inside a state blob is an integrity check, not
+  // authentication — an attacker who can write the file can recompute it.
+  // cli_node_save emits node-key-signed blobs (payload + ECDSA signature
+  // trailer), so try the signed parse first and keep the pending signature
+  // for cli_node_load_key to verify once the operator imports the trusted
+  // private key. Legacy unsigned blobs are still accepted (back-compat) with
+  // a loud warning, because the formats are distinguishable: an unsigned
+  // blob fails the checksum when parsed with the trailer stripped, and a
+  // signed blob fails it when parsed with the trailer included.
+  state_t* loaded = NULL;
+  if (file_len > CRABS_SIG_SIZE) {
+    size_t payload_len = file_len - CRABS_SIG_SIZE;
+    loaded = crabs_deserialize_state(data, payload_len);
+    if (loaded != NULL) {
+      uint8_t* payload_copy = get_memory(payload_len);
+      if (payload_copy == NULL) {
+        state_destroy(loaded);
+        free(data);
+        return CLI_ERR_EXEC;
+      }
+      memcpy(payload_copy, data, payload_len);
+      memcpy(node->state_sig_signature, data + payload_len, CRABS_SIG_SIZE);
+      node->state_sig_payload = payload_copy;
+      node->state_sig_payload_len = payload_len;
+      node->state_sig_pending = true;
+      fprintf(stderr,
+              "WARNING: state file carries a node-key signature that has NOT "
+              "been verified yet — run 'key import' with the node private key "
+              "to authenticate this snapshot before trusting it\n");
+    }
+  }
+  if (loaded == NULL) {
+    loaded = crabs_deserialize_state(data, file_len);
+    if (loaded != NULL) {
+      fprintf(stderr,
+              "WARNING: state file is unsigned — it carries no node-key "
+              "signature and is NOT authenticated; verify its provenance "
+              "before trusting it\n");
+    }
+  }
   free(data);
 
   if (loaded == NULL) return CLI_ERR_EXEC;
@@ -246,9 +302,11 @@ cli_result_e cli_node_load(cli_node_t* node, const char* path) {
 
 // Audit L-l: restore node-key custody after cli_node_load. The operator
 // persists the node private key out-of-band and imports it here so the node
-// can sign for the bootstrap admin again. The derived public key must match a
-// registered user; that user's id is used as the custody alias (so the CLI
-// signs with the right key for that user).
+// can sign for the bootstrap admin again. If the loaded snapshot carried a
+// node-key signature (audit M-1), the imported key must verify it before
+// custody is granted; a verified signature also identifies the key as the
+// snapshot's node key, so custody falls back to the bootstrap admin id when
+// the deserialized state has no matching registered user.
 cli_result_e cli_node_load_key(cli_node_t* node, const char* private_key_hex) {
   if (node == NULL || private_key_hex == NULL) return CLI_ERR_ARGS;
   if (!node->initialized || node->attr_machine == NULL) return CLI_ERR_NOT_INIT;
@@ -259,13 +317,45 @@ cli_result_e cli_node_load_key(cli_node_t* node, const char* private_key_hex) {
   uint8_t pub[33];
   if (crypto_ecdsa_derive_public_key(priv, pub) != CRABS_SUCCESS) return CLI_ERR_EXEC;
 
-  // Find the registered user whose public key matches the derived key.
+  // Audit M-1: a loaded snapshot carrying a node-key signature is only
+  // authenticated once the imported key verifies that signature. Fail closed
+  // on mismatch and leave the pending verification in place so the operator
+  // can retry with the correct key.
+  bool signature_verified = false;
+  if (node->state_sig_pending) {
+    if (!crypto_ecdsa_verify(pub, node->state_sig_payload,
+                             node->state_sig_payload_len,
+                             node->state_sig_signature)) {
+      OPENSSL_cleanse(priv, 32);
+      fprintf(stderr,
+              "ERROR: state snapshot signature verification FAILED — the "
+              "imported key did not sign this snapshot; refusing custody\n");
+      return CLI_ERR_EXEC;
+    }
+    signature_verified = true;
+    free(node->state_sig_payload);
+    node->state_sig_payload = NULL;
+    node->state_sig_payload_len = 0;
+    memset(node->state_sig_signature, 0, CRABS_SIG_SIZE);
+    node->state_sig_pending = false;
+    printf("State snapshot signature verified against the imported node key.\n");
+  }
+
+  // Find the registered user whose public key matches the derived key. A
+  // freshly loaded node has no restored user registry (the state format does
+  // not carry it), so for a snapshot whose signature the imported key just
+  // verified, custody the key under the snapshot's bootstrap admin — the
+  // signature proves the imported key is the node key that saved it.
   const char* custody_id = NULL;
   for (user_t* u = node->attr_machine->users; u != NULL; u = u->next) {
     if (memcmp(u->public_key, pub, 33) == 0) {
       custody_id = u->user_id;
       break;
     }
+  }
+  if (custody_id == NULL && signature_verified &&
+      node->attr_machine->base_state.config.bootstrap_admin[0] != '\0') {
+    custody_id = node->attr_machine->base_state.config.bootstrap_admin;
   }
   if (custody_id == NULL) return CLI_ERR_EXEC; // no matching user
 
@@ -286,7 +376,22 @@ cli_result_e cli_node_load_key(cli_node_t* node, const char* private_key_hex) {
 cli_result_e cli_node_save(cli_node_t* node, const char* path) {
   if (node == NULL || path == NULL || !node->initialized) return CLI_ERR_ARGS;
 
-  serialized_buffer_t* buf = crabs_serialize_state(&node->attr_machine->base_state);
+  // Audit M-1: do not persist a snapshot whose provenance is unverified —
+  // saving would re-sign it with the ephemeral load-time node key, which no
+  // operator holds. Import the node key first (cli_node_load_key).
+  if (node->state_sig_pending) {
+    fprintf(stderr,
+            "ERROR: refusing to save — the loaded state signature has not "
+            "been verified yet; run 'key import' with the node private key "
+            "first\n");
+    return CLI_ERR_EXEC;
+  }
+
+  // Audit M-1: sign the state blob with the node private key. The bare
+  // SHA-256 checksum written by the unsigned serializer is integrity only —
+  // an attacker who can write the file can recompute it.
+  serialized_buffer_t* buf =
+      crabs_serialize_state_signed(&node->attr_machine->base_state);
   if (buf == NULL) return CLI_ERR_EXEC;
 
   FILE* f = fopen(path, "wb");

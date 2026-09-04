@@ -45,6 +45,16 @@ typedef struct {
   // is node_key; other users' keys are added via cli_node_add_user_key.
   cli_user_key_t       keyring[CRABS_CLI_KEYRING_MAX];
   uint32_t             keyring_count;
+  // Audit M-1: pending state-blob signature verification. A loaded snapshot
+  // signed by the saving node's key cannot be verified at load time (no
+  // trusted public key exists until the operator imports the persisted
+  // private key), so cli_node_load keeps the signed payload + signature here
+  // and cli_node_load_key enforces the signature before granting custody.
+  // Saving is refused while verification is pending.
+  uint8_t*             state_sig_payload;   // owned copy of the signed payload
+  size_t               state_sig_payload_len;
+  uint8_t              state_sig_signature[CRABS_SIG_SIZE];
+  bool                 state_sig_pending;
   bool                 initialized;
 } cli_node_t;
 

@@ -3,10 +3,13 @@
 //
 
 #include <gtest/gtest.h>
+#include <vector>
 extern "C" {
 #include "../src/CLI/cli.h"
 #include "../src/CRABS/data_model.h"
+#include "../src/Serialization/serialization.h"
 #include "../src/CRDT/one_shot.h"
+#include <openssl/sha.h>
 }
 
 // ============================================================
@@ -448,6 +451,189 @@ TEST_F(TestCLI, LoadNullParams) {
 
 TEST_F(TestCLI, LoadNonexistentFile) {
   EXPECT_EQ(cli_node_load(node, "/tmp/nonexistent_crabs_file_12345"), CLI_ERR_IO);
+}
+
+// ============================================================
+// Signed state blob tests (audit M-1: the plain SHA-256 checksum is
+// integrity only — an attacker who can write the file can recompute it.
+// cli_node_save must emit node-key-signed blobs and cli_node_load /
+// cli_node_load_key must enforce the signature before custody).
+// ============================================================
+
+static bool test_read_file_bytes(const char* path, std::vector<uint8_t>& file_bytes) {
+  FILE* f = fopen(path, "rb");
+  if (f == NULL) return false;
+  fseek(f, 0, SEEK_END);
+  long file_size = ftell(f);
+  fseek(f, 0, SEEK_SET);
+  if (file_size <= 0) {
+    fclose(f);
+    return false;
+  }
+  file_bytes.resize((size_t)file_size);
+  size_t read_count = fread(file_bytes.data(), 1, file_bytes.size(), f);
+  fclose(f);
+  return read_count == file_bytes.size();
+}
+
+static bool test_write_file_bytes(const char* path, const std::vector<uint8_t>& file_bytes) {
+  FILE* f = fopen(path, "wb");
+  if (f == NULL) return false;
+  size_t written = fwrite(file_bytes.data(), 1, file_bytes.size(), f);
+  fclose(f);
+  return written == file_bytes.size();
+}
+
+TEST_F(TestCLI, SaveLoadSignedRoundTripAuthenticates) {
+  ASSERT_EQ(cli_node_init(node, "admin"), CLI_OK);
+  ASSERT_EQ(cli_cmd_item_add(node, "counter1", "counter"), CLI_OK);
+
+  // The operator persists the node private key out-of-band; capture it here
+  // the same way an operator would hold it.
+  char node_private_key_hex[65];
+  cli_bytes_to_hex(node->node_key->private_key, 32, node_private_key_hex);
+
+  const char* tmp_path = "/tmp/crabs_test_signed_state.bin";
+  ASSERT_EQ(cli_node_save(node, tmp_path), CLI_OK);
+
+  cli_node_t* loaded_node = cli_node_create();
+  ASSERT_NE(loaded_node, nullptr);
+  ASSERT_EQ(cli_node_load(loaded_node, tmp_path), CLI_OK);
+  EXPECT_TRUE(loaded_node->initialized);
+  // A signed snapshot is recognized but NOT trusted until the operator
+  // proves custody of the signing key.
+  EXPECT_TRUE(loaded_node->state_sig_pending);
+
+  // Custody restore must authenticate the snapshot signature.
+  EXPECT_EQ(cli_node_load_key(loaded_node, node_private_key_hex), CLI_OK);
+  EXPECT_FALSE(loaded_node->state_sig_pending);
+
+  remove(tmp_path);
+  cli_node_destroy(loaded_node);
+}
+
+TEST_F(TestCLI, LoadRejectsTamperedSignedState) {
+  ASSERT_EQ(cli_node_init(node, "admin"), CLI_OK);
+  ASSERT_EQ(cli_cmd_item_add(node, "counter1", "counter"), CLI_OK);
+
+  const char* tmp_path = "/tmp/crabs_test_tampered_state.bin";
+  ASSERT_EQ(cli_node_save(node, tmp_path), CLI_OK);
+
+  std::vector<uint8_t> file_bytes;
+  ASSERT_TRUE(test_read_file_bytes(tmp_path, file_bytes));
+  ASSERT_GT(file_bytes.size(), (size_t)CRABS_SIG_SIZE);
+
+  // Flip one payload byte in the middle of the blob (away from the trailing
+  // signature). The load must reject the blob outright.
+  file_bytes[file_bytes.size() / 2] ^= 0x01;
+  ASSERT_TRUE(test_write_file_bytes(tmp_path, file_bytes));
+
+  cli_node_t* loaded_node = cli_node_create();
+  ASSERT_NE(loaded_node, nullptr);
+  EXPECT_EQ(cli_node_load(loaded_node, tmp_path), CLI_ERR_EXEC);
+  EXPECT_FALSE(loaded_node->initialized);
+
+  remove(tmp_path);
+  cli_node_destroy(loaded_node);
+}
+
+TEST_F(TestCLI, KeyImportRejectsRechecksummedTamperedState) {
+  ASSERT_EQ(cli_node_init(node, "admin"), CLI_OK);
+  char node_private_key_hex[65];
+  cli_bytes_to_hex(node->node_key->private_key, 32, node_private_key_hex);
+  ASSERT_EQ(cli_cmd_item_add(node, "counter1", "counter"), CLI_OK);
+
+  const char* tmp_path = "/tmp/crabs_test_rechecksummed_state.bin";
+  ASSERT_EQ(cli_node_save(node, tmp_path), CLI_OK);
+
+  std::vector<uint8_t> file_bytes;
+  ASSERT_TRUE(test_read_file_bytes(tmp_path, file_bytes));
+  ASSERT_GT(file_bytes.size(), (size_t)CRABS_SIG_SIZE + CRABS_HASH_SIZE);
+
+  // An attacker with file-write access can recompute the SHA-256 integrity
+  // checksum, so flip a payload byte and repair the checksum. Only the
+  // node-key signature can catch this.
+  size_t payload_len = file_bytes.size() - CRABS_SIG_SIZE;
+  file_bytes[payload_len / 2] ^= 0x01;
+  std::vector<uint8_t> checksum(CRABS_HASH_SIZE);
+  SHA256(file_bytes.data(), payload_len - CRABS_HASH_SIZE, checksum.data());
+  memcpy(file_bytes.data() + payload_len - CRABS_HASH_SIZE, checksum.data(),
+         CRABS_HASH_SIZE);
+  ASSERT_TRUE(test_write_file_bytes(tmp_path, file_bytes));
+
+  cli_node_t* loaded_node = cli_node_create();
+  ASSERT_NE(loaded_node, nullptr);
+  // The blob parses (checksum repaired) and stays pending until key import.
+  ASSERT_EQ(cli_node_load(loaded_node, tmp_path), CLI_OK);
+  ASSERT_TRUE(loaded_node->state_sig_pending);
+
+  // The ECDSA signature over the payload rejects the tampered snapshot.
+  EXPECT_EQ(cli_node_load_key(loaded_node, node_private_key_hex), CLI_ERR_EXEC);
+  EXPECT_TRUE(loaded_node->state_sig_pending);
+
+  remove(tmp_path);
+  cli_node_destroy(loaded_node);
+}
+
+TEST_F(TestCLI, LoadLegacyUnsignedStateStillWorks) {
+  ASSERT_EQ(cli_node_init(node, "admin"), CLI_OK);
+  ASSERT_EQ(cli_cmd_item_add(node, "counter1", "counter"), CLI_OK);
+
+  // Legacy blobs written by older CLIs carry no signature trailer.
+  serialized_buffer_t* legacy_blob =
+      crabs_serialize_state(&node->attr_machine->base_state);
+  ASSERT_NE(legacy_blob, nullptr);
+  const char* tmp_path = "/tmp/crabs_test_legacy_state.bin";
+  std::vector<uint8_t> file_bytes(legacy_blob->data,
+                                  legacy_blob->data + legacy_blob->len);
+  serialized_buffer_destroy(legacy_blob);
+  ASSERT_TRUE(test_write_file_bytes(tmp_path, file_bytes));
+
+  cli_node_t* loaded_node = cli_node_create();
+  ASSERT_NE(loaded_node, nullptr);
+  EXPECT_EQ(cli_node_load(loaded_node, tmp_path), CLI_OK);
+  EXPECT_TRUE(loaded_node->initialized);
+  EXPECT_FALSE(loaded_node->state_sig_pending);
+
+  remove(tmp_path);
+  cli_node_destroy(loaded_node);
+}
+
+TEST_F(TestCLI, SaveRefusesUnverifiedLoadedState) {
+  ASSERT_EQ(cli_node_init(node, "admin"), CLI_OK);
+  char node_private_key_hex[65];
+  cli_bytes_to_hex(node->node_key->private_key, 32, node_private_key_hex);
+  ASSERT_EQ(cli_cmd_item_add(node, "counter1", "counter"), CLI_OK);
+
+  const char* tmp_path = "/tmp/crabs_test_resave_state.bin";
+  ASSERT_EQ(cli_node_save(node, tmp_path), CLI_OK);
+
+  cli_node_t* loaded_node = cli_node_create();
+  ASSERT_NE(loaded_node, nullptr);
+  ASSERT_EQ(cli_node_load(loaded_node, tmp_path), CLI_OK);
+  ASSERT_TRUE(loaded_node->state_sig_pending);
+
+  // Do not persist state whose provenance is unverified: the save would
+  // re-sign it with the ephemeral load-time key no one holds.
+  EXPECT_EQ(cli_node_save(loaded_node, "/tmp/crabs_test_unverified_out.bin"),
+            CLI_ERR_EXEC);
+
+  // Once custody is proven the snapshot is authenticated and re-saving works.
+  EXPECT_EQ(cli_node_load_key(loaded_node, node_private_key_hex), CLI_OK);
+  const char* resave_path = "/tmp/crabs_test_resaved_state.bin";
+  EXPECT_EQ(cli_node_save(loaded_node, resave_path), CLI_OK);
+
+  // The re-saved blob is signed by the imported key and loads again.
+  cli_node_t* reloaded_node = cli_node_create();
+  ASSERT_NE(reloaded_node, nullptr);
+  EXPECT_EQ(cli_node_load(reloaded_node, resave_path), CLI_OK);
+  EXPECT_TRUE(reloaded_node->state_sig_pending);
+  EXPECT_EQ(cli_node_load_key(reloaded_node, node_private_key_hex), CLI_OK);
+
+  remove(tmp_path);
+  remove(resave_path);
+  cli_node_destroy(loaded_node);
+  cli_node_destroy(reloaded_node);
 }
 
 // ============================================================
