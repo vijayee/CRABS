@@ -822,7 +822,13 @@ cli_result_e cli_cmd_op_define(cli_node_t* node, const char* op_type_name,
   op->resource_count = 1;
   op->resources = get_clear_memory(CRABS_MAX_USER_ID);
   strncpy(op->resources[0], op_type_name, CRABS_MAX_USER_ID - 1);
-  strncpy(op->signer_id, node->attr_machine->users ? node->attr_machine->users->user_id : "admin",
+  // Use the bootstrap admin as the signer (config.bootstrap_admin): users
+  // are prepended on registration, so users->user_id is the newest
+  // registered user. This path invokes the handler directly today (no
+  // pipeline authorization), but if it ever routes through
+  // state_machine_execute, only an admin would pass the
+  // __define_operation_type__ policy check.
+  strncpy(op->signer_id, node->attr_machine->base_state.config.bootstrap_admin,
           CRABS_MAX_USER_ID - 1);
 
   op->dedup.type = dtype;
