@@ -361,7 +361,8 @@ static void _free_value_list(char** values, uint32_t count) {
   free(values);
 }
 
-static bool _parse_value_list(parser_ctx_t* ctx, char*** values, uint32_t* count) {
+static bool _parse_value_list(parser_ctx_t* ctx, bool allow_string_elements,
+                              char*** values, uint32_t* count) {
   *values = NULL;
   *count = 0;
 
@@ -374,6 +375,18 @@ static bool _parse_value_list(parser_ctx_t* ctx, char*** values, uint32_t* count
   if (!_parse_primary(ctx, &elem)) {
     _free_value_list(*values, 0);
     *values = NULL;
+    return false;
+  }
+  // Audit fix (High, conf 9): in a numeric membership list (IN) a quoted
+  // string element would be resolved as a state path at evaluation time
+  // (missing path -> 0), so "x IN (\"a\")" matched any missing left side
+  // (0 == 0). IN rejects quoted strings; CONTAINS_ANY/CONTAINS_ALL keep
+  // accepting them because their elements are compared as strings against
+  // CRDT set members, never resolved as paths.
+  if (!allow_string_elements && elem.type == PRIMARY_STRING) {
+    _free_value_list(*values, 0);
+    *values = NULL;
+    ctx->has_error = true;
     return false;
   }
   (*values)[0] = platform_strdup(elem.path);
@@ -397,6 +410,13 @@ static bool _parse_value_list(parser_ctx_t* ctx, char*** values, uint32_t* count
       _free_value_list(*values, *count);
       *values = NULL;
       *count = 0;
+      return false;
+    }
+    if (!allow_string_elements && elem.type == PRIMARY_STRING) {
+      _free_value_list(*values, *count);
+      *values = NULL;
+      *count = 0;
+      ctx->has_error = true;
       return false;
     }
     (*values)[*count] = platform_strdup(elem.path);
@@ -454,8 +474,26 @@ static condition_node_t* _parse_comparison(parser_ctx_t* ctx) {
     }
     _parser_advance(ctx);
 
+    // Audit fix (High, conf 9): a quoted string is not a state path. It used
+    // to be stored into right_path (or left_path below) and resolved via
+    // condition_resolve_path, where a missing path yields 0 — so
+    // "x == \"active\"" evaluated as 0 == 0 (true with no state at all), and
+    // a rendered policy like "x == premium" made crypto_abe_eval_policy
+    // atoll() both sides to 0. String operands never had working comparison
+    // semantics, so they are rejected at parse time (fail closed) in both
+    // operand positions.
+    if (primary.type == PRIMARY_STRING) {
+      ctx->has_error = true;
+      return NULL;
+    }
+
     primary_t right;
     if (!_parse_primary(ctx, &right)) {
+      return NULL;
+    }
+
+    if (right.type == PRIMARY_STRING) {
+      ctx->has_error = true;
       return NULL;
     }
 
@@ -472,8 +510,6 @@ static condition_node_t* _parse_comparison(parser_ctx_t* ctx) {
       node->right_literal = 1;
     } else if (right.type == PRIMARY_FALSE) {
       node->right_literal = 0;
-    } else if (right.type == PRIMARY_STRING) {
-      strncpy(node->right_path, right.path, CRABS_MAX_POLICY_EXPR - 1);
     }
     return node;
   }
@@ -482,13 +518,34 @@ static condition_node_t* _parse_comparison(parser_ctx_t* ctx) {
   if (next.type == TOK_BETWEEN) {
     _parser_advance(ctx);
 
+    // Audit fix (High, conf 9): the BETWEEN bounds were silently dropped
+    // unless they were numbers (high bound) or a path/string mix (low bound),
+    // so "balance BETWEEN 0 AND maxval" degraded to "balance <= 0" and a
+    // quoted string low bound degraded to "balance >= 0". Both must be
+    // numeric (the low bound may be a state-path reference) or the parse
+    // fails (fail closed).
+    if (primary.type == PRIMARY_STRING) {
+      ctx->has_error = true;
+      return NULL;
+    }
+
     primary_t low;
     if (!_parse_primary(ctx, &low)) return NULL;
+
+    if (low.type != PRIMARY_NUMBER && low.type != PRIMARY_PATH) {
+      ctx->has_error = true;
+      return NULL;
+    }
 
     if (!_parser_expect(ctx, TOK_AND)) return NULL;
 
     primary_t high;
     if (!_parse_primary(ctx, &high)) return NULL;
+
+    if (high.type != PRIMARY_NUMBER) {
+      ctx->has_error = true;
+      return NULL;
+    }
 
     condition_node_t* node = get_clear_memory(sizeof(condition_node_t));
     node->type = NODE_COMPARISON;
@@ -516,9 +573,18 @@ static condition_node_t* _parse_comparison(parser_ctx_t* ctx) {
 
     if (_parser_peek(ctx).type == TOK_LPAREN) {
       // <path> IN (<value>, ...)
+      // Audit fix (High, conf 9): numeric membership needs a numeric left
+      // side; a quoted-string left operand would resolve as a missing path
+      // (0) and match a numeric element of 0. Quoted elements in the list
+      // are rejected by _parse_value_list below. Bare identifier elements
+      // stay allowed — they are path references, which is intended.
+      if (primary.type == PRIMARY_STRING) {
+        ctx->has_error = true;
+        return NULL;
+      }
       char** values = NULL;
       uint32_t count = 0;
-      if (!_parse_value_list(ctx, &values, &count)) return NULL;
+      if (!_parse_value_list(ctx, false, &values, &count)) return NULL;
 
       condition_node_t* node = get_clear_memory(sizeof(condition_node_t));
       node->type = NODE_COMPARISON;
@@ -568,7 +634,7 @@ static condition_node_t* _parse_comparison(parser_ctx_t* ctx) {
 
     char** values = NULL;
     uint32_t count = 0;
-    if (!_parse_value_list(ctx, &values, &count)) return NULL;
+    if (!_parse_value_list(ctx, true, &values, &count)) return NULL;
 
     condition_node_t* node = get_clear_memory(sizeof(condition_node_t));
     node->type = NODE_CONTAINS;
@@ -586,7 +652,7 @@ static condition_node_t* _parse_comparison(parser_ctx_t* ctx) {
 
     char** values = NULL;
     uint32_t count = 0;
-    if (!_parse_value_list(ctx, &values, &count)) return NULL;
+    if (!_parse_value_list(ctx, true, &values, &count)) return NULL;
 
     condition_node_t* node = get_clear_memory(sizeof(condition_node_t));
     node->type = NODE_CONTAINS;
@@ -628,7 +694,7 @@ static condition_node_t* _parse_comparison(parser_ctx_t* ctx) {
 
       char** values = NULL;
       uint32_t count = 0;
-      if (!_parse_value_list(ctx, &values, &count)) return NULL;
+      if (!_parse_value_list(ctx, true, &values, &count)) return NULL;
 
       condition_node_t* node = get_clear_memory(sizeof(condition_node_t));
       node->type = NODE_CONTAINS;
@@ -646,7 +712,7 @@ static condition_node_t* _parse_comparison(parser_ctx_t* ctx) {
 
       char** values = NULL;
       uint32_t count = 0;
-      if (!_parse_value_list(ctx, &values, &count)) return NULL;
+      if (!_parse_value_list(ctx, true, &values, &count)) return NULL;
 
       condition_node_t* node = get_clear_memory(sizeof(condition_node_t));
       node->type = NODE_CONTAINS;
@@ -1259,6 +1325,16 @@ policy_preprocess_result_t preprocess_policy(const char* policy, const state_t* 
   // Step 2: Parse the policy into an AST
   condition_node_t* ast = condition_parse(work_buf);
   if (ast == NULL) {
+    // Audit fix (High, conf 9): condition_parse now rejects quoted-string
+    // operands. A policy that still contains a quote cannot be a valid bare
+    // attribute token either (attribute tokens are "name:value" strings with
+    // no quotes), so it is unambiguous user error — fail closed instead of
+    // passing the raw expression through as an ABE token that would match
+    // nothing (deny) or, worse, be re-atoll()ed by a downstream evaluator.
+    if (strchr(work_buf, '"') != NULL) {
+      result.resolved_ok = false;
+      return result;
+    }
     // Not a condition expression — treat as a bare attribute policy. Keep the
     // full "name:value" token: _build_attr_string emits "name:value" tokens and
     // crypto_abe_eval_policy matches whole tokens, so "role:admin" matches

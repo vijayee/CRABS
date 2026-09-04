@@ -776,3 +776,128 @@ TEST_F(TestTrigger, TestOperationIsBuiltinTriggerOps) {
   EXPECT_TRUE(operation_is_builtin(CRABS_OP_ENABLE_TRIGGER));
   EXPECT_FALSE(operation_is_builtin("custom_op"));
 }
+// ============================================================
+// Audit fix (High): CHANGE_POLICY effects must not be able to strip
+// attribute gating from the target operation.
+//
+// A CONTAINS-only policy_expression (e.g. "a NOT IN b") preprocesses to an
+// EMPTY abe_policy with resolved_ok = true — preprocess_policy strips every
+// CONTAINS node before handing the remainder to the ABE evaluator. An empty
+// ABE policy authorizes by signature alone, so the trigger would silently
+// remove all attribute checks from policy_operation when it fires.
+// ============================================================
+
+TEST_F(TestTrigger, TestCreateTriggerOperationRejectsContainsOnlyPolicyExpression) {
+  operation_t* op = operation_create(CRABS_OP_CREATE_TRIGGER);
+  const char* payload = "trigger_id=weaken1;condition=views >= 100;effect_type=5;"
+                        "policy_operation=__read__;policy_expression=role NOT IN blacklist;"
+                        "cooldown_ms=1000;one_shot=0";
+  op->payload = (uint8_t*)strdup(payload);
+  op->payload_size = strlen(payload) + 1;
+  strncpy(op->signer_id, "admin", CRABS_MAX_USER_ID - 1);
+
+  crabs_error_e result = state_machine_op_create_trigger(state, op);
+  EXPECT_EQ(result, CRABS_ERR_INVALID_PARAM);
+  EXPECT_EQ(state->trigger_count, 0u);
+
+  operation_destroy(op);
+}
+
+TEST_F(TestTrigger, TestCreateTriggerOperationAllowsMixedPolicyExpression) {
+  // A CONTAINS clause combined with a real ABE constraint is fine: the
+  // preprocessed policy keeps the non-CONTAINS part ("role >= moderator"),
+  // so attribute gating is preserved.
+  operation_t* op = operation_create(CRABS_OP_CREATE_TRIGGER);
+  const char* payload = "trigger_id=mixed1;condition=views >= 100;effect_type=5;"
+                        "policy_operation=__read__;"
+                        "policy_expression=role >= moderator AND role NOT IN blacklist;"
+                        "cooldown_ms=1000;one_shot=0";
+  op->payload = (uint8_t*)strdup(payload);
+  op->payload_size = strlen(payload) + 1;
+  strncpy(op->signer_id, "admin", CRABS_MAX_USER_ID - 1);
+
+  crabs_error_e result = state_machine_op_create_trigger(state, op);
+  EXPECT_EQ(result, CRABS_SUCCESS);
+  ASSERT_EQ(state->trigger_count, 1u);
+  EXPECT_STREQ(state->triggers[0].trigger_id, "mixed1");
+
+  operation_destroy(op);
+}
+
+TEST_F(TestTrigger, TestCreateTriggerOperationRejectsUnparseableCondition) {
+  // A condition the parser rejects (quoted-string operand) must not be
+  // stored as a trigger that silently never fires — the create operation
+  // fails instead.
+  operation_t* op = operation_create(CRABS_OP_CREATE_TRIGGER);
+  const char* payload = "trigger_id=badcond1;condition=subscription == \"active\";effect_type=1";
+  op->payload = (uint8_t*)strdup(payload);
+  op->payload_size = strlen(payload) + 1;
+  strncpy(op->signer_id, "admin", CRABS_MAX_USER_ID - 1);
+
+  crabs_error_e result = state_machine_op_create_trigger(state, op);
+  EXPECT_EQ(result, CRABS_ERR_INVALID_PARAM);
+  EXPECT_EQ(state->trigger_count, 0u);
+
+  operation_destroy(op);
+}
+
+TEST_F(TestTrigger, TestChangePolicyRejectsContainsOnlyPolicyAtExecution) {
+  // Defense in depth: a trigger created via the direct trigger_create API
+  // (no creation-time validation) must not be able to apply a CONTAINS-only
+  // policy expression when it fires — the effect is skipped.
+  data_item_t* views = data_item_create("views", DATA_TYPE_COUNTER, CRDT_G_COUNTER);
+  g_counter_t* gc = g_counter_create();
+  g_counter_increment(gc, "nodeA", 100);
+  views->value = gc;
+  state_add_item(state, views);
+
+  trigger_effect_t effect;
+  memset(&effect, 0, sizeof(effect));
+  effect.type = TRIGGER_EFFECT_CHANGE_POLICY;
+  strncpy(effect.policy_operation, "__read__", CRABS_MAX_OP_NAME - 1);
+  strncpy(effect.policy_expression, "role NOT IN blacklist", CRABS_MAX_POLICY_EXPR - 1);
+  trigger_t* trigger = trigger_create("contains_only_policy", "Fires when views >= 50",
+    "views >= 50", &effect, 0, false, "admin");
+  ASSERT_NE(trigger, nullptr);
+  state->trigger_count = 1;
+  state->triggers = (trigger_t*)realloc(state->triggers, sizeof(trigger_t));
+  state->triggers[0] = *trigger;
+  free(trigger);
+
+  uint32_t fired = trigger_process_all(state, state->triggers, state->trigger_count, NULL, 1000);
+  EXPECT_EQ(fired, 0u); // effect skipped — empty ABE policy
+  // The target policy is NOT added: attribute gating cannot be stripped.
+  EXPECT_EQ(state_find_policy(state, "__read__"), nullptr);
+
+  // TearDown's state_destroy will free the trigger's AST.
+}
+
+TEST_F(TestTrigger, TestChangePolicyAllowsAbePolicyAtExecution) {
+  // A CHANGE_POLICY effect with a genuine ABE expression still applies.
+  data_item_t* views = data_item_create("views", DATA_TYPE_COUNTER, CRDT_G_COUNTER);
+  g_counter_t* gc = g_counter_create();
+  g_counter_increment(gc, "nodeA", 100);
+  views->value = gc;
+  state_add_item(state, views);
+
+  trigger_effect_t effect;
+  memset(&effect, 0, sizeof(effect));
+  effect.type = TRIGGER_EFFECT_CHANGE_POLICY;
+  strncpy(effect.policy_operation, "__read__", CRABS_MAX_OP_NAME - 1);
+  strncpy(effect.policy_expression, "role:member", CRABS_MAX_POLICY_EXPR - 1);
+  trigger_t* trigger = trigger_create("abe_policy", "Fires when views >= 50",
+    "views >= 50", &effect, 0, false, "admin");
+  ASSERT_NE(trigger, nullptr);
+  state->trigger_count = 1;
+  state->triggers = (trigger_t*)realloc(state->triggers, sizeof(trigger_t));
+  state->triggers[0] = *trigger;
+  free(trigger);
+
+  uint32_t fired = trigger_process_all(state, state->triggers, state->trigger_count, NULL, 1000);
+  EXPECT_EQ(fired, 1u);
+  const char* policy = state_find_policy(state, "__read__");
+  ASSERT_NE(policy, nullptr);
+  EXPECT_STREQ(policy, "role:member");
+
+  // TearDown's state_destroy will free the trigger's AST.
+}

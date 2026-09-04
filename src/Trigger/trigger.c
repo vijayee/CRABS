@@ -125,6 +125,16 @@ static crabs_error_e _execute_trigger_effect(state_t* state, trigger_t* trigger,
       if (operation_is_builtin(trigger->effect.policy_operation)) {
         return CRABS_ERR_UNAUTHORIZED;
       }
+      // Audit fix (High): defense in depth for triggers that bypass
+      // state_machine_op_create_trigger (direct trigger_create callers have
+      // no creation-time validation). A CONTAINS-only expression preprocesses
+      // to an empty ABE policy — applying it would leave the target op gated
+      // by signature alone. Skip the effect instead of applying it.
+      policy_preprocess_result_t pp =
+        preprocess_policy(trigger->effect.policy_expression, state, trigger->created_by);
+      if (pp.abe_policy[0] == '\0') {
+        return CRABS_ERR_INVALID_PARAM;
+      }
       crabs_error_e err = state_add_policy(state,
         trigger->effect.policy_operation,
         trigger->effect.policy_expression);
@@ -330,6 +340,24 @@ crabs_error_e state_machine_op_create_trigger(state_t* state, operation_t* op) {
     return CRABS_ERR_DUPLICATE_OPERATION;
   }
 
+  // Audit fix (High): a CHANGE_POLICY effect whose policy_expression is
+  // CONTAINS-only (e.g. "a NOT IN b") preprocesses to an EMPTY abe_policy
+  // with resolved_ok = true — preprocess_policy strips every CONTAINS node
+  // before handing the remainder to the ABE evaluator. An empty ABE policy
+  // authorizes the target operation by signature alone, so the trigger would
+  // silently strip all attribute gating from policy_operation when it fires.
+  // The empty policy_expression case below (audit H-E) is the degenerate
+  // form of the same problem; here we also reject any expression that
+  // preprocesses to an empty ABE policy. Validation happens at creation —
+  // the only state-aware site (trigger_create has no state_t) — using the
+  // same preprocessing the authorization path applies.
+  if (effect_type == TRIGGER_EFFECT_CHANGE_POLICY && policy_expression[0] != '\0') {
+    policy_preprocess_result_t pp = preprocess_policy(policy_expression, state, op->signer_id);
+    if (pp.abe_policy[0] == '\0') {
+      return CRABS_ERR_INVALID_PARAM;
+    }
+  }
+
   // Build the effect struct
   trigger_effect_t effect;
   memset(&effect, 0, sizeof(effect));
@@ -345,6 +373,15 @@ crabs_error_e state_machine_op_create_trigger(state_t* state, operation_t* op) {
   trigger_t* new_trigger = trigger_create(trigger_id, description, condition_expr,
                                            &effect, cooldown_ms, one_shot, op->signer_id);
   if (new_trigger == NULL) return CRABS_ERR_OOM;
+
+  // Audit fix (High): an unparseable condition would be stored with a NULL
+  // AST and silently never fire (trigger_process_all skips NULL ASTs). That
+  // is fail-closed for the effect but hides the authoring error from the
+  // operator, so reject the operation instead.
+  if (new_trigger->condition_ast == NULL) {
+    trigger_destroy(new_trigger);
+    return CRABS_ERR_INVALID_PARAM;
+  }
 
   // Set parsed AST and other fields
   new_trigger->expires_at = expires_at;

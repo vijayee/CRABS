@@ -718,3 +718,114 @@ TEST_F(TestCondition, TestDeepNestingRejected) {
   EXPECT_NE(mod, nullptr);
   condition_node_destroy(mod);
 }
+// ============================================================
+// Audit fix (High): quoted-string operands must fail closed at parse time
+//
+// Quoted strings were indistinguishable from state paths at every layer:
+// "x == \"active\"" resolved both sides as paths (missing -> 0 == 0 -> true),
+// _ast_to_string dropped the quotes so the ABE evaluator atoll()ed both
+// sides of "x == premium" (0 == 0), and IN-list string elements resolved as
+// paths (0 == 0). Since string operands never had working semantics, the
+// parser now rejects them (fail closed) instead of mis-evaluating them.
+// ============================================================
+
+TEST_F(TestCondition, TestParseRejectsQuotedComparisonRightOperand) {
+  // Right operand of a numeric comparison must be a number, a state path, or
+  // true/false — never a quoted string.
+  EXPECT_EQ(condition_parse("subscription == \"active\""), nullptr);
+  EXPECT_EQ(condition_parse("subscription != \"premium\""), nullptr);
+  EXPECT_EQ(condition_parse("views >= \"100\""), nullptr);
+  EXPECT_EQ(condition_parse("subscription == \"premium\" AND video_abc >= 5"), nullptr);
+}
+
+TEST_F(TestCondition, TestParseRejectsQuotedComparisonLeftOperand) {
+  // The grammar requires a path on the left of a comparison, but the parser
+  // also accepted a quoted string there (stored as a path, resolved as 0).
+  EXPECT_EQ(condition_parse("\"counter\" >= 5"), nullptr);
+  EXPECT_EQ(condition_parse("\"counter\" == \"other\""), nullptr);
+}
+
+TEST_F(TestCondition, TestParseRejectsQuotedInListElements) {
+  // IN-list elements are matched numerically (or as path references); a
+  // quoted element used to resolve as a missing path (0) and match a missing
+  // left side (0 == 0).
+  EXPECT_EQ(condition_parse("x IN (\"a\", \"b\")"), nullptr);
+  EXPECT_EQ(condition_parse("x IN (1, \"b\")"), nullptr);
+  EXPECT_EQ(condition_parse("\"a\" IN (\"b\", \"c\")"), nullptr);
+}
+
+TEST_F(TestCondition, TestParseAllowsBareIdentifiersInInList) {
+  // Bare identifiers in IN lists are path references (intended behavior) and
+  // remain parseable; only quoted strings are rejected.
+  condition_node_t* node = condition_parse("x IN (roles)");
+  ASSERT_NE(node, nullptr);
+  EXPECT_EQ(node->element_count, 1u);
+  EXPECT_STREQ(node->element_values[0], "roles");
+  condition_node_destroy(node);
+}
+
+TEST_F(TestCondition, TestParseAllowsQuotedStringsInContainsForms) {
+  // Quoted strings remain legitimate as CONTAINS element values — those are
+  // compared as strings against CRDT set members, never resolved as paths.
+  condition_node_t* node = condition_parse("course_enrolled CONTAINS \"alice\"");
+  ASSERT_NE(node, nullptr);
+  EXPECT_EQ(node->type, NODE_CONTAINS);
+  EXPECT_STREQ(node->element_values[0], "alice");
+  condition_node_destroy(node);
+
+  node = condition_parse("\"alice\" IN course_enrolled");
+  ASSERT_NE(node, nullptr);
+  EXPECT_EQ(node->type, NODE_CONTAINS);
+  EXPECT_STREQ(node->set_path, "course_enrolled");
+  condition_node_destroy(node);
+
+  node = condition_parse("course_enrolled CONTAINS_ANY (\"alice\", \"bob\")");
+  ASSERT_NE(node, nullptr);
+  EXPECT_EQ(node->element_count, 2u);
+  condition_node_destroy(node);
+}
+
+TEST_F(TestCondition, TestParseRejectsNonNumericBetweenBounds) {
+  // The BETWEEN high bound was silently dropped unless it was a number, so
+  // "balance BETWEEN 0 AND maxval" degraded to "balance <= 0". The low bound
+  // had the same bug for quoted strings. Non-numeric bounds now fail the
+  // parse instead of silently weakening the comparison.
+  EXPECT_EQ(condition_parse("balance BETWEEN 0 AND maxval"), nullptr);
+  EXPECT_EQ(condition_parse("balance BETWEEN 0 AND \"high\""), nullptr);
+  EXPECT_EQ(condition_parse("balance BETWEEN \"low\" AND 100"), nullptr);
+  EXPECT_EQ(condition_parse("balance BETWEEN maxlow AND maxhigh"), nullptr);
+
+  // A path low bound is a valid state reference and still parses; the high
+  // bound must still be numeric.
+  condition_node_t* node = condition_parse("balance BETWEEN lowpath AND 100");
+  ASSERT_NE(node, nullptr);
+  EXPECT_STREQ(node->right_path, "lowpath");
+  EXPECT_EQ(node->right_literal_2, 100);
+  condition_node_destroy(node);
+
+  // Numeric bounds still parse (also covered by TestParseBetween).
+  node = condition_parse("balance BETWEEN 0 AND 100");
+  ASSERT_NE(node, nullptr);
+  EXPECT_EQ(node->right_literal, 0);
+  EXPECT_EQ(node->right_literal_2, 100);
+  condition_node_destroy(node);
+}
+
+TEST_F(TestCondition, TestPreprocessPolicyQuotedStringFailsClosed) {
+  // A quoted-string policy used to preprocess to a quote-free numeric
+  // comparison that the ABE evaluator atoll()ed on both sides, so any two
+  // non-numeric values compared equal. condition_parse now rejects it; the
+  // bare-token fallback must then fail closed as well because a string
+  // containing a quote can never be a valid attribute token.
+  auto result = preprocess_policy("subscription == \"premium\"", state, "alice");
+  EXPECT_FALSE(result.resolved_ok);
+  EXPECT_STREQ(result.abe_policy, "");
+}
+
+TEST_F(TestCondition, TestPreprocessPolicyMixedContainsAndAbeKeepsAbePolicy) {
+  // CONTAINS-only preprocessing must not erase the ABE part of a mixed
+  // policy: the filtered AST keeps the non-CONTAINS comparison.
+  auto result = preprocess_policy("video_abc >= 5 AND course_enrolled NOT CONTAINS carol", state, "alice");
+  EXPECT_TRUE(result.resolved_ok);
+  EXPECT_STREQ(result.abe_policy, "video_abc >= 5");
+}
