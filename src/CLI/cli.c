@@ -458,8 +458,11 @@ cli_result_e cli_cmd_user_grant(cli_node_t* node, const char* user_id,
     val = colon + 1;
   }
 
-  // Use admin as signer (first registered user)
-  const char* signer_id = node->attr_machine->users ? node->attr_machine->users->user_id : user_id;
+  // R8-A-2: the grant signer must hold role:admin. Resolve the signer as the
+  // bootstrap admin (config.bootstrap_admin), NOT the head of the users list:
+  // users are prepended on registration, so users->user_id is the most
+  // recently registered user, who typically holds no privileges.
+  const char* signer_id = node->attr_machine->base_state.config.bootstrap_admin;
   crabs_error_e err = attribute_machine_grant_role(node->attr_machine, user_id,
                                                      name, val, signer_id);
   if (err != CRABS_SUCCESS) {
@@ -476,7 +479,9 @@ cli_result_e cli_cmd_user_revoke(cli_node_t* node, const char* user_id,
   if (node == NULL || !node->initialized) return CLI_ERR_NOT_INIT;
   if (user_id == NULL || role == NULL) return CLI_ERR_ARGS;
 
-  const char* signer_id = node->attr_machine->users ? node->attr_machine->users->user_id : user_id;
+  // Match grant_role: the bootstrap admin is the administrative signer
+  // (users are prepended, so users->user_id is the newest registered user).
+  const char* signer_id = node->attr_machine->base_state.config.bootstrap_admin;
   crabs_error_e err = attribute_machine_revoke_role(node->attr_machine, user_id,
                                                       role, signer_id);
   if (err != CRABS_SUCCESS) {
