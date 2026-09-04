@@ -325,6 +325,140 @@ TEST(OTSerialization, StateWithTreeRoundTrip) {
   serialized_buffer_destroy(buf);
 }
 
+// Audit finding: multi-root trees made state permanently unloadable. Nodes
+// with an empty parent_id are legal sibling roots (empty-parent insert,
+// reparent-to-root, merge cycle-break), but the deserializer never linked
+// them and the connectivity check rejected the whole item, so
+// crabs_deserialize_state returned NULL forever after.
+TEST(OTSerialization, StateWithMultiRootTreeRoundTrip) {
+  state_t* original = state_create();
+  original->version = 300;
+
+  data_item_t* item = crabs_register_ot_type(original, "tree1",
+    DATA_TYPE_OT_TREE, nullptr);
+  ASSERT_NE(item, nullptr);
+
+  crabs_ot_tree_t* tree = (crabs_ot_tree_t*)item->value;
+  crabs_ot_tree_insert_node(tree, nullptr, 0, "root1", nullptr, 0);
+  crabs_ot_tree_insert_node(tree, "root1", 0, "child1", nullptr, 0);
+  // Second sibling root via an empty-parent insert
+  crabs_ot_tree_insert_node(tree, nullptr, 0, "root2", nullptr, 0);
+
+  serialized_buffer_t* buf = crabs_serialize_state(original);
+  ASSERT_NE(buf, nullptr);
+
+  state_t* restored = crabs_deserialize_state(buf->data, buf->len);
+  ASSERT_NE(restored, nullptr);
+
+  data_item_t* r_item = state_find_item(restored, "tree1");
+  ASSERT_NE(r_item, nullptr);
+
+  crabs_ot_tree_t* r_tree = (crabs_ot_tree_t*)r_item->value;
+  EXPECT_EQ(crabs_ot_tree_node_count(r_tree), 3u);
+
+  // Both roots must sit on the root sibling chain, exactly as
+  // crabs_ot_tree_insert_node links them in memory.
+  crabs_tree_node_t* root = crabs_ot_tree_root(r_tree);
+  ASSERT_NE(root, nullptr);
+  EXPECT_STREQ(root->id, "root1");
+  ASSERT_NE(root->next_sibling, nullptr);
+  EXPECT_STREQ(root->next_sibling->id, "root2");
+  EXPECT_EQ(root->next_sibling->prev_sibling, root);
+  EXPECT_EQ(root->next_sibling->next_sibling, nullptr);
+  EXPECT_EQ(root->parent, nullptr);
+  EXPECT_EQ(root->parent_id[0], '\0');
+
+  // Declared-parent node must still link under its parent.
+  crabs_tree_node_t* child = crabs_ot_tree_find(r_tree, "child1");
+  ASSERT_NE(child, nullptr);
+  EXPECT_EQ(child->parent, root);
+
+  state_destroy(restored);
+  state_destroy(original);
+  serialized_buffer_destroy(buf);
+}
+
+// Same finding, reparent-to-root path: a child moved back to the root level
+// clears its parent_id and becomes a sibling root.
+TEST(OTSerialization, StateWithReparentedRootRoundTrip) {
+  state_t* original = state_create();
+  original->version = 300;
+
+  data_item_t* item = crabs_register_ot_type(original, "tree1",
+    DATA_TYPE_OT_TREE, nullptr);
+  ASSERT_NE(item, nullptr);
+
+  crabs_ot_tree_t* tree = (crabs_ot_tree_t*)item->value;
+  crabs_ot_tree_insert_node(tree, nullptr, 0, "root1", nullptr, 0);
+  crabs_ot_tree_insert_node(tree, "root1", 0, "child1", nullptr, 0);
+  // Move child1 back to the root level (empty new parent id)
+  ASSERT_NE(crabs_ot_tree_reparent(tree, "child1", "", 0), nullptr);
+
+  serialized_buffer_t* buf = crabs_serialize_state(original);
+  ASSERT_NE(buf, nullptr);
+
+  state_t* restored = crabs_deserialize_state(buf->data, buf->len);
+  ASSERT_NE(restored, nullptr);
+
+  data_item_t* r_item = state_find_item(restored, "tree1");
+  ASSERT_NE(r_item, nullptr);
+
+  crabs_ot_tree_t* r_tree = (crabs_ot_tree_t*)r_item->value;
+  EXPECT_EQ(crabs_ot_tree_node_count(r_tree), 2u);
+
+  crabs_tree_node_t* root = crabs_ot_tree_root(r_tree);
+  ASSERT_NE(root, nullptr);
+  EXPECT_STREQ(root->id, "root1");
+  ASSERT_NE(root->next_sibling, nullptr);
+  EXPECT_STREQ(root->next_sibling->id, "child1");
+  EXPECT_EQ(root->next_sibling->prev_sibling, root);
+  EXPECT_EQ(root->next_sibling->parent, nullptr);
+  EXPECT_EQ(root->next_sibling->parent_id[0], '\0');
+
+  state_destroy(restored);
+  state_destroy(original);
+  serialized_buffer_destroy(buf);
+}
+
+// A tree whose nodes are all deleted has no root after a merge (link rebuild
+// clears tree->root when nothing visible remains), so the blob serializes
+// with an empty root_id. It must still load — with a bounded acyclicity
+// check replacing the root-anchored connectivity walk.
+TEST(OTSerialization, StateWithRootlessDeletedTreeRoundTrip) {
+  state_t* original = state_create();
+  original->version = 300;
+
+  data_item_t* item = crabs_register_ot_type(original, "tree1",
+    DATA_TYPE_OT_TREE, nullptr);
+  ASSERT_NE(item, nullptr);
+
+  crabs_ot_tree_t* tree = (crabs_ot_tree_t*)item->value;
+  crabs_ot_tree_insert_node(tree, nullptr, 0, "root1", nullptr, 0);
+  crabs_ot_tree_insert_node(tree, "root1", 0, "child1", nullptr, 0);
+  ASSERT_NE(crabs_ot_tree_delete_node(tree, "root1"), nullptr);
+
+  // Merge with an empty tree to force the link rebuild that clears the root.
+  crabs_ot_tree_t* empty_tree = crabs_ot_tree_create();
+  ASSERT_NE(crabs_ot_tree_merge(tree, empty_tree), nullptr);
+  crabs_ot_tree_destroy(empty_tree);
+  ASSERT_EQ(crabs_ot_tree_root(tree), nullptr);
+
+  serialized_buffer_t* buf = crabs_serialize_state(original);
+  ASSERT_NE(buf, nullptr);
+
+  state_t* restored = crabs_deserialize_state(buf->data, buf->len);
+  ASSERT_NE(restored, nullptr);
+
+  data_item_t* r_item = state_find_item(restored, "tree1");
+  ASSERT_NE(r_item, nullptr);
+  crabs_ot_tree_t* r_tree = (crabs_ot_tree_t*)r_item->value;
+  EXPECT_EQ(crabs_ot_tree_node_count(r_tree), 2u);
+
+  state_destroy(restored);
+  state_destroy(original);
+  serialized_buffer_destroy(buf);
+}
+
 // R8-SER-4: a blob whose root_id matches no node must be rejected. The prior
 // code left tree->root NULL and skipped cycle detection, so a crafted blob
 // with a parent cycle passed deserialization and could hang downstream

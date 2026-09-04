@@ -332,6 +332,11 @@ crabs_span_t* crabs_ot_document_apply_style(
   return first_styled;
 }
 
+// Sane upper bound for a merged span. A single span holding 256 MiB of text
+// is already far beyond any legitimate document; larger requests are treated
+// as corrupt input rather than an allocation to honor.
+#define CRABS_OT_MERGE_SPANS_MAX_SIZE (256u * 1024u * 1024u)
+
 crabs_span_t* crabs_ot_document_merge_spans(
     crabs_ot_document_t* doc, uint64_t pos1, uint64_t pos2) {
   if (doc == NULL) return NULL;
@@ -341,8 +346,17 @@ crabs_span_t* crabs_ot_document_merge_spans(
   if (s1 == NULL || s2 == NULL) return NULL;
   if (s1 == s2) return s1;
 
+  // Audit finding: the sum was computed in uint32_t and could silently
+  // overflow, then allocate a tiny buffer and memcpy huge sizes into it
+  // (heap corruption). Compute in uint64_t and reject before allocating.
+  uint64_t merged_size = (uint64_t)s1->text_size + (uint64_t)s2->text_size;
+  if (merged_size > (uint64_t)UINT32_MAX ||
+      merged_size > (uint64_t)CRABS_OT_MERGE_SPANS_MAX_SIZE) {
+    return NULL;
+  }
+
   // Merge s2's text into s1
-  uint32_t new_size = s1->text_size + s2->text_size;
+  uint32_t new_size = (uint32_t)merged_size;
   uint8_t* new_text = get_memory(new_size);
   memcpy(new_text, s1->text, s1->text_size);
   memcpy(new_text + s1->text_size, s2->text, s2->text_size);

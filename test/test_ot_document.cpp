@@ -240,6 +240,70 @@ TEST(OTDocument, MergeSpansNull) {
   EXPECT_EQ(crabs_ot_document_merge_spans(NULL, 0, 1), nullptr);
 }
 
+// Audit finding: `new_size = s1->text_size + s2->text_size` was computed in
+// uint32_t and could silently overflow, then allocate a tiny buffer and
+// memcpy huge sizes into it (heap corruption). The guard must fire before
+// any allocation. Sizes are poked directly on real spans with small actual
+// buffers — nothing may be read or written once the guard rejects.
+TEST(OTDocument, MergeSpansUint32OverflowRejected) {
+  crabs_ot_document_t* doc = crabs_ot_document_create();
+  crabs_ot_op_id_t id1 = make_id("n1", 1, 100);
+  crabs_ot_op_id_t id2 = make_id("n1", 2, 101);
+  const uint8_t t1[] = {'A'}, t2[] = {'B'};
+
+  crabs_ot_document_insert_text(doc, 0, t1, 1, &id1);
+  crabs_ot_document_insert_text(doc, 1, t2, 1, &id2);
+
+  crabs_span_t* s1 = crabs_ot_document_head(doc);
+  crabs_span_t* s2 = crabs_ot_document_head(doc)->next;
+  ASSERT_NE(s1, nullptr);
+  ASSERT_NE(s2, nullptr);
+
+  // Two sizes that individually fit but sum to UINT32_MAX + 1.
+  const uint32_t huge_size = 0x80000000u;  // 2 GiB
+  s1->text_size = huge_size;
+  s2->text_size = huge_size;
+
+  uint8_t* text_before = s1->text;
+  EXPECT_EQ(crabs_ot_document_merge_spans(doc, 0, 1), nullptr);
+  // Guard fired before any allocation/free: buffers and links untouched.
+  EXPECT_EQ(s1->text, text_before);
+  EXPECT_EQ(s1->text[0], 'A');
+  EXPECT_EQ(s1->text_size, huge_size);
+  EXPECT_FALSE(s2->deleted);
+
+  crabs_ot_document_destroy(doc);
+}
+
+// A sum that fits in uint32_t but exceeds the sane merge cap is rejected too.
+TEST(OTDocument, MergeSpansOverCapRejected) {
+  crabs_ot_document_t* doc = crabs_ot_document_create();
+  crabs_ot_op_id_t id1 = make_id("n1", 1, 100);
+  crabs_ot_op_id_t id2 = make_id("n1", 2, 101);
+  const uint8_t t1[] = {'A'}, t2[] = {'B'};
+
+  crabs_ot_document_insert_text(doc, 0, t1, 1, &id1);
+  crabs_ot_document_insert_text(doc, 1, t2, 1, &id2);
+
+  crabs_span_t* s1 = crabs_ot_document_head(doc);
+  crabs_span_t* s2 = crabs_ot_document_head(doc)->next;
+  ASSERT_NE(s1, nullptr);
+  ASSERT_NE(s2, nullptr);
+
+  // 128 MiB + 1 each: sum is 256 MiB + 2, above the merge cap.
+  const uint32_t over_cap_size = (256u * 1024u * 1024u) / 2u + 1u;
+  s1->text_size = over_cap_size;
+  s2->text_size = over_cap_size;
+
+  uint8_t* text_before = s1->text;
+  EXPECT_EQ(crabs_ot_document_merge_spans(doc, 0, 1), nullptr);
+  EXPECT_EQ(s1->text, text_before);
+  EXPECT_EQ(s1->text[0], 'A');
+  EXPECT_FALSE(s2->deleted);
+
+  crabs_ot_document_destroy(doc);
+}
+
 // ============================================================
 // Split Span Tests
 // ============================================================

@@ -328,6 +328,21 @@ crabs_error_e crabs_transform_ot_op(crabs_ot_operation_t* op,
   return CRABS_SUCCESS;
 }
 
+// Audit finding (conf 8): replay protection. Returns true when an op with
+// the same id (node_id, sequence_num) is already recorded in the item's op
+// log — i.e. this exact op was applied before and must be skipped ENTIRELY:
+// transforming it against a log that already contains its own effects, and
+// re-applying it, would duplicate its effect (e.g. a doubled INSERT_TEXT).
+static bool _op_already_applied(const crabs_ot_data_item_t* ot_data,
+                                const crabs_ot_op_id_t* op_id) {
+  for (uint32_t log_index = 0; log_index < ot_data->op_log_count; log_index++) {
+    if (crabs_ot_op_id_equal(&ot_data->op_log[log_index].id, op_id)) {
+      return true;
+    }
+  }
+  return false;
+}
+
 // ============================================================
 // Apply OT Operation (v1.5 §8.2 step 7)
 // ============================================================
@@ -490,6 +505,13 @@ crabs_error_e crabs_execute_ot_operation(state_t* state, operation_t* op) {
         crabs_compaction_engine_record_op(
             (crabs_compaction_engine_t*)state->compaction_engine,
             ot_ops[i].id.node_id, ot_ops[i].id.sequence_num);
+      }
+
+      // Audit finding (conf 8): idempotent-apply. An op whose id is already
+      // in the log has already been applied — skip it entirely (no transform,
+      // no re-apply) but still count it as processed.
+      if (_op_already_applied(ot_data, &ot_ops[i].id)) {
+        continue;
       }
 
       // Transform against concurrent operations in the op log

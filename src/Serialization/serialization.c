@@ -598,54 +598,94 @@ static bool _deserialize_ot_type_state(read_buf_t* buf, data_item_t* item) {
         // NULL, which skips the cycle-detection walk below. Reject it so a
         // crafted blob with a parent cycle cannot pass deserialization.
         if (tree->root == NULL) return false;
+      }
 
-        // Link parent-child relationships
-        node = tree->node_pool;
-        while (node != NULL) {
-          if (node != tree->root && node->parent_id[0] != '\0') {
-            // Find parent
-            crabs_tree_node_t* parent = tree->node_pool;
-            while (parent != NULL) {
-              if (strcmp(parent->id, node->parent_id) == 0) {
-                node->parent = parent;
-                // Add to parent's children (as last child)
-                if (parent->first_child == NULL) {
-                  parent->first_child = node;
-                } else {
-                  crabs_tree_node_t* sibling = parent->first_child;
-                  while (sibling->next_sibling != NULL) {
-                    sibling = sibling->next_sibling;
-                  }
-                  sibling->next_sibling = node;
-                  node->prev_sibling = sibling;
-                }
-                break;
-              }
-              parent = parent->pool_next;
+      // Link parent-child relationships. Audit finding: nodes with an
+      // empty parent_id are legal additional roots (empty-parent insert,
+      // reparent-to-root, merge cycle-break). Link them into the root
+      // sibling chain exactly as crabs_ot_tree_insert_node and
+      // ot_tree.c:_rebuild_links do, instead of leaving them unlinked and
+      // failing the connectivity check below (which made the state
+      // permanently unloadable). When the blob declared no root_id, the
+      // first empty-parent node becomes the root.
+      crabs_tree_node_t* node = tree->node_pool;
+      while (node != NULL) {
+        if (node->parent_id[0] == '\0') {
+          if (tree->root == NULL) {
+            tree->root = node;
+          } else if (node != tree->root) {
+            // Additional root: append to the root sibling chain.
+            crabs_tree_node_t* last_root_sibling = tree->root;
+            while (last_root_sibling->next_sibling != NULL) {
+              last_root_sibling = last_root_sibling->next_sibling;
             }
+            last_root_sibling->next_sibling = node;
+            node->prev_sibling = last_root_sibling;
           }
-          node = node->pool_next;
+        } else {
+          // Find parent
+          crabs_tree_node_t* parent = tree->node_pool;
+          while (parent != NULL) {
+            if (strcmp(parent->id, node->parent_id) == 0) {
+              node->parent = parent;
+              // Add to parent's children (as last child)
+              if (parent->first_child == NULL) {
+                parent->first_child = node;
+              } else {
+                crabs_tree_node_t* sibling = parent->first_child;
+                while (sibling->next_sibling != NULL) {
+                  sibling = sibling->next_sibling;
+                }
+                sibling->next_sibling = node;
+                node->prev_sibling = sibling;
+              }
+              break;
+            }
+            parent = parent->pool_next;
+          }
         }
+        node = node->pool_next;
       }
 
       // Audit M-D: detect cycles and disconnected nodes from the parent links
-      // (e.g. A→B and B→A from a crafted blob). Walk each non-root node's
-      // parent chain bounded by node_count+1; it must reach root, else the
-      // blob is cyclic or disconnected and downstream recursive walkers would
-      // hang or overflow the stack.
+      // (e.g. A→B and B→A from a crafted blob). Walk each declared-parent
+      // node's parent chain bounded by node_count+1; it must reach root, else
+      // the blob is cyclic or disconnected and downstream recursive walkers
+      // would hang or overflow the stack. Empty-parent_id nodes were linked
+      // as sibling roots above, so they have no parent chain to check.
       if (tree->root != NULL) {
-        crabs_tree_node_t* n = tree->node_pool;
-        while (n != NULL) {
-          if (n != tree->root) {
+        crabs_tree_node_t* walk_node = tree->node_pool;
+        while (walk_node != NULL) {
+          if (walk_node->parent_id[0] != '\0') {
             uint32_t steps = 0;
-            crabs_tree_node_t* p = n->parent;
-            while (p != NULL && p != tree->root && steps <= node_count) {
-              p = p->parent;
+            crabs_tree_node_t* ancestor = walk_node->parent;
+            while (ancestor != NULL && ancestor != tree->root && steps <= node_count) {
+              ancestor = ancestor->parent;
               steps++;
             }
-            if (p != tree->root) return false; // cyclic or disconnected
+            if (ancestor != tree->root) return false; // cyclic or disconnected
           }
-          n = n->pool_next;
+          walk_node = walk_node->pool_next;
+        }
+      } else if (node_count > 0) {
+        // No root and no empty-parent_id node: every node declares a parent.
+        // This is reachable legitimately (a tree whose nodes are all deleted
+        // merges back with cleared links and no root), so it must load — but
+        // the reachability check above is skipped without a root. Bound-walk
+        // each declared-parent chain here and require it to terminate, so a
+        // crafted parent cycle (A→B, B→A) cannot pass deserialization.
+        crabs_tree_node_t* forest_node = tree->node_pool;
+        while (forest_node != NULL) {
+          if (forest_node->parent_id[0] != '\0') {
+            uint32_t steps = 0;
+            crabs_tree_node_t* ancestor = forest_node->parent;
+            while (ancestor != NULL && steps <= node_count) {
+              ancestor = ancestor->parent;
+              steps++;
+            }
+            if (ancestor != NULL) return false; // parent cycle
+          }
+          forest_node = forest_node->pool_next;
         }
       }
       break;

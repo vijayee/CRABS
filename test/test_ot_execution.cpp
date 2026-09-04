@@ -11,7 +11,9 @@ extern "C" {
 #include "../src/OT/ot_ordered_set.h"
 #include "../src/OT/ot_tree.h"
 #include "../src/OT/ot_document.h"
+#include "../src/OT/ot_types.h"
 #include "../src/StateMachine/state_machine.h"
+#include "../src/Util/allocator.h"
 }
 
 static crabs_ot_op_id_t make_id(const char* node, uint64_t seq, uint64_t ts) {
@@ -252,6 +254,106 @@ TEST(OTExecution, ExecuteOtOpNoOps) {
   crabs_error_e err = crabs_execute_ot_operation(state, &op);
   EXPECT_EQ(err, CRABS_ERR_NO_OT_OPS);
 
+  state_destroy(state);
+}
+
+// ============================================================
+// Execute Idempotency Tests
+// ============================================================
+
+// Build a wire-format payload carrying a single INSERT_TEXT op, matching the
+// layout parsed by crabs_extract_ot_ops.
+static uint32_t build_insert_text_payload(uint8_t* buffer,
+                                          uint32_t buffer_capacity,
+                                          const char* node_id,
+                                          uint64_t sequence_num,
+                                          uint64_t timestamp,
+                                          uint64_t insert_pos,
+                                          const uint8_t* text,
+                                          uint32_t text_size) {
+  uint32_t offset = 0;
+  const uint32_t op_count = 1;
+  const uint32_t op_type = (uint32_t)CRABS_OT_OP_INSERT_TEXT;
+  const uint32_t dep_count = 0;
+
+  auto write_u32 = [&](uint32_t value) {
+    buffer[offset++] = (uint8_t)(value & 0xFF);
+    buffer[offset++] = (uint8_t)((value >> 8) & 0xFF);
+    buffer[offset++] = (uint8_t)((value >> 16) & 0xFF);
+    buffer[offset++] = (uint8_t)((value >> 24) & 0xFF);
+  };
+  auto write_u64 = [&](uint64_t value) {
+    for (uint32_t byte_index = 0; byte_index < 8; byte_index++) {
+      buffer[offset++] = (uint8_t)((value >> (8 * byte_index)) & 0xFF);
+    }
+  };
+
+  uint32_t needed = 4 + 4 + CRABS_MAX_USER_ID + 8 * 5 + 4 + text_size + 4;
+  if (buffer_capacity < needed) return 0;
+
+  write_u32(op_count);
+  write_u32(op_type);
+  memset(buffer + offset, 0, CRABS_MAX_USER_ID);
+  strncpy((char*)(buffer + offset), node_id, CRABS_MAX_USER_ID - 1);
+  offset += CRABS_MAX_USER_ID;
+  write_u64(sequence_num);
+  write_u64(timestamp);
+  write_u64(insert_pos);   // visible_pos
+  write_u64(0);            // visible_pos_2
+  write_u64(0);            // priority
+  write_u32(text_size);    // payload_size
+  memcpy(buffer + offset, text, text_size);
+  offset += text_size;
+  write_u32(dep_count);
+  return offset;
+}
+
+// Audit finding (conf 8): replaying the same OT op batch applied every op a
+// second time — the executor never checked whether op.id already existed in
+// the item's op log, so a duplicated INSERT_TEXT message duplicated the text.
+TEST(OTExecution, ReplayedOperationIsIdempotent) {
+  state_t* state = state_create();
+  data_item_t* item = crabs_register_ot_type(state, "doc",
+    DATA_TYPE_OT_DOCUMENT, nullptr);
+  ASSERT_NE(item, nullptr);
+
+  const uint8_t text[] = {'A', 'B'};
+  uint8_t wire[512];
+  uint32_t wire_size = build_insert_text_payload(
+    wire, sizeof(wire), "n1", 1, 100, 0, text, sizeof(text));
+  ASSERT_GT(wire_size, 0u);
+
+  operation_t op;
+  memset(&op, 0, sizeof(op));
+  strncpy(op.type, CRABS_OP_EXECUTE_OT, CRABS_MAX_OP_NAME - 1);
+  op.payload = wire;
+  op.payload_size = wire_size;
+  op.resources = (char(*)[CRABS_MAX_USER_ID])get_clear_memory(CRABS_MAX_USER_ID);
+  ASSERT_NE(op.resources, nullptr);
+  strncpy(op.resources[0], "doc", CRABS_MAX_USER_ID - 1);
+  op.resource_count = 1;
+
+  crabs_error_e err = crabs_execute_ot_operation(state, &op);
+  EXPECT_EQ(err, CRABS_SUCCESS);
+
+  crabs_ot_document_t* doc = (crabs_ot_document_t*)item->value;
+  ASSERT_NE(doc, nullptr);
+  EXPECT_EQ(crabs_ot_document_char_count(doc), 2u);
+  EXPECT_EQ(crabs_ot_document_span_count(doc), 1u);
+  ASSERT_NE(item->ot_data, nullptr);
+  crabs_ot_data_item_t* ot_data = (crabs_ot_data_item_t*)item->ot_data;
+  EXPECT_EQ(ot_data->op_log_count, 1u);
+
+  // Replay the exact same op bytes.
+  err = crabs_execute_ot_operation(state, &op);
+  EXPECT_EQ(err, CRABS_SUCCESS);
+
+  // Document text unchanged (no duplicate span), op log unchanged.
+  EXPECT_EQ(crabs_ot_document_char_count(doc), 2u);
+  EXPECT_EQ(crabs_ot_document_span_count(doc), 1u);
+  EXPECT_EQ(ot_data->op_log_count, 1u);
+
+  free(op.resources);
   state_destroy(state);
 }
 
