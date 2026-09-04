@@ -1639,6 +1639,50 @@ TEST(HLCReplay, ReplayedHlcOpRejected) {
   crabs_test_env_destroy(&env);
 }
 
+// Audit follow-up: the log chain hash must fold in the ordering fields.
+// They decide state_signer_has_replay, so a compromised node that could
+// rewrite a historical entry's HLC or ordering_system without breaking the
+// tamper-evidence chain would silently change which replays are detected.
+// Two otherwise-identical ops differing only in their HLC timestamp must
+// therefore produce different chain hashes.
+TEST(HLCReplay, ChainHashDependsOnOrderingFields) {
+  uint8_t hash_first[CRABS_HASH_SIZE];
+  uint8_t hash_second[CRABS_HASH_SIZE];
+
+  const uint64_t clock_seconds[] = {1000000, 2000000};
+  uint8_t* hash_targets[] = {hash_first, hash_second};
+  for (uint32_t case_index = 0; case_index < 2; case_index++) {
+    crabs_test_env_t env;
+    crabs_test_env_init(&env);
+    state_t* state = env.state;
+
+    g_mock_time.seconds = clock_seconds[case_index];
+    g_mock_time.nanos = 0;
+    g_mock_time.valid = true;
+    crabs_ordering_config_t* ordering_config =
+        (crabs_ordering_config_t*)get_clear_memory(sizeof(crabs_ordering_config_t));
+    crabs_ordering_config_init_hlc(ordering_config, HLC_STRATEGY_BOUNDED);
+    state_set_ordering_config(state, ordering_config);
+    crabs_hlc_state_init(&state->hlc_state, "admin");
+    state->hlc_state.time_source_ops = &g_mock_ops;
+    state->hlc_state_initialized = true;
+
+    data_item_t* resource = data_item_create("res1", DATA_TYPE_RESOURCE, CRDT_PN_COUNTER);
+    state_add_item(state, resource);
+
+    operation_t* op = make_hlc_lock_op(&env, "res1");
+    EXPECT_EQ(state_machine_execute(state, op), CRABS_SUCCESS);
+    ASSERT_GT(state->log_count, 0u);
+    memcpy(hash_targets[case_index],
+           state->log[state->log_count - 1].state_hash, CRABS_HASH_SIZE);
+
+    operation_destroy(op);
+    crabs_test_env_destroy(&env);
+  }
+
+  EXPECT_NE(memcmp(hash_first, hash_second, CRABS_HASH_SIZE), 0);
+}
+
 // Audit finding: on a physical-time advance caused by a RECEIVED event, the
 // local counter must adopt the received counter (standard HLC receive),
 // not reset to 0 — otherwise the node's next same-second event sorts before

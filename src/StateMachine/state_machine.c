@@ -324,6 +324,18 @@ static void _compute_log_chain_hash(state_t* state, log_entry_t* entry) {
   EVP_DigestUpdate(ctx, entry->signer_id, strlen(entry->signer_id));
   EVP_DigestUpdate(ctx, &entry->lamport_time, sizeof(entry->lamport_time));
   EVP_DigestUpdate(ctx, entry->node_id, strlen(entry->node_id));
+  // Audit follow-up: fold in the ordering fields so two replicas applying
+  // the same ops in DIFFERENT orders produce different chain hashes —
+  // without these, the hash could not distinguish divergent orderings.
+  // Lamport entries carry a zeroed HLC (append_log guarantees it), so the
+  // digest is deterministic for them too. hlc.node_id is NUL-terminated by
+  // every creation path (crabs_hlc emit and the v1.6 serializer's
+  // _read_string16), and crabs_hlc_compare already relies on that.
+  EVP_DigestUpdate(ctx, &entry->ordering_system, sizeof(entry->ordering_system));
+  EVP_DigestUpdate(ctx, &entry->hlc.physical_seconds, sizeof(entry->hlc.physical_seconds));
+  EVP_DigestUpdate(ctx, &entry->hlc.physical_nanos, sizeof(entry->hlc.physical_nanos));
+  EVP_DigestUpdate(ctx, &entry->hlc.logical_counter, sizeof(entry->hlc.logical_counter));
+  EVP_DigestUpdate(ctx, entry->hlc.node_id, strlen(entry->hlc.node_id));
   unsigned int hlen = 0;
   EVP_DigestFinal_ex(ctx, entry->state_hash, &hlen);
   EVP_MD_CTX_free(ctx);
