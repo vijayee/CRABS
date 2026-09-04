@@ -752,3 +752,73 @@ TEST(TestKeyOps, SetDefaultKeyRejectsRevokedUser) {
   operation_destroy(op);
   destroy_test_state(state);
 }
+// ============================================================
+// Lazy Signature Scheme Registry (v1.3 keyring verification)
+// ============================================================
+// Regression: builds that never call crypto_sig_scheme_init() (WASM, CLI,
+// native library consumers — only the Node binding initializes the registry)
+// got NULL from crypto_sig_scheme_get for every scheme, so every keyring
+// (v1.3) signature verification failed closed with
+// CRABS_ERR_CRYPTOGRAPHIC_ERROR. The same keyring-signed op was accepted by a
+// Node replica and rejected by WASM replicas. The accessors now lazily install
+// the built-in ECDSA secp256k1 scheme, so verification must succeed without a
+// manual init call.
+TEST(TestKeyOps, VerifyKeyringOpWithoutExplicitRegistryInit) {
+  // Force the registry empty to prove the lazy path runs; test execution
+  // order must not matter. Deliberately NO crypto_sig_scheme_init() here.
+  crypto_sig_scheme_cleanup();
+
+  crabs_test_env_init(&g_env);
+  g_env_initialized = true;
+
+  // Register a keyring key for admin with a non-UNSPECIFIED scheme
+  // (user_key_register rejects SCHEME_UNSPECIFIED, so every keyring key has
+  // one — meaning every keyring verification routes through the registry).
+  ecdsa_keypair_t* keyring_kp = crypto_ecdsa_generate();
+  ASSERT_NE(keyring_kp, nullptr);
+  user_t* admin = attribute_machine_find_user(g_env.am, "admin");
+  ASSERT_NE(admin, nullptr);
+  ASSERT_EQ(user_key_register(admin, "lazy-key", ECDSA_SECP256K1,
+                              keyring_kp->public_key, 33, "lazy init regression"),
+            CRABS_SUCCESS);
+
+  // Sign an operation with the keyring key.
+  const char* payload_text = "keyring-signed operation";
+  operation_t* op = operation_create(CRABS_OP_LOCK);
+  ASSERT_NE(op, nullptr);
+  fill_uuid(op->uuid);
+  strncpy(op->signer_id, "admin", CRABS_MAX_USER_ID - 1);
+  op->lamport_time = ++g_key_ops_lamport;
+  op->signer_key_version = admin->key_version;
+  size_t payload_size = strlen(payload_text) + 1;
+  op->payload = (uint8_t*)calloc(payload_size, 1);
+  ASSERT_NE(op->payload, nullptr);
+  memcpy(op->payload, payload_text, payload_size);
+  op->payload_size = (uint32_t)payload_size;
+
+  serialized_buffer_t* ser = crabs_serialize_for_signing(op);
+  ASSERT_NE(ser, nullptr);
+  ASSERT_EQ(crypto_sign_operation(keyring_kp->private_key, ser->data, ser->len,
+                                  op->signature),
+            CRABS_SUCCESS);
+  serialized_buffer_destroy(ser);
+
+  // Verify through the crypto layer — this lookup must lazy-init the registry.
+  abe_master_key_t* master_key = crypto_abe_setup();
+  ASSERT_NE(master_key, nullptr);
+  serialized_buffer_t* ser_for_verify = crabs_serialize_for_signing(op);
+  ASSERT_NE(ser_for_verify, nullptr);
+  verify_result_t result = crypto_verify_operation_auth_v2(
+      master_key, "", g_env.am,
+      ser_for_verify->data, ser_for_verify->len,
+      op->signature, CRABS_SIG_SIZE,
+      "admin", "lazy-key", ECDSA_SECP256K1, VERIFY_MODE_A);
+  EXPECT_TRUE(result.authorized);
+  EXPECT_EQ(result.error, CRABS_SUCCESS);
+  serialized_buffer_destroy(ser_for_verify);
+
+  crypto_abe_master_key_destroy(master_key);
+  operation_destroy(op);
+  crypto_ecdsa_keypair_destroy(keyring_kp);
+  destroy_test_state(g_env.state);
+}

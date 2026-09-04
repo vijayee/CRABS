@@ -45,6 +45,54 @@ TEST(TestSigScheme, GetUnspecifiedReturnsNull) {
 }
 
 // ============================================================
+// Registry: Lazy Initialization
+// ============================================================
+// Regression: only the Node binding and the tests called
+// crypto_sig_scheme_init(), so WASM/CLI/native-lib builds had an empty
+// registry and every v1.3 keyring verification failed closed
+// (crypto_sig_scheme_get returned NULL for every scheme). The accessors must
+// lazily install the built-in ECDSA secp256k1 scheme on first use.
+
+TEST(TestSigScheme, LazyInitOnGetWithoutExplicitInit) {
+  // Start from a known-empty registry so this test exercises the lazy path
+  // regardless of test execution order. Deliberately NO init call here.
+  crypto_sig_scheme_cleanup();
+
+  const signature_vtable_t* vt = crypto_sig_scheme_get(ECDSA_SECP256K1);
+  ASSERT_NE(vt, nullptr);
+  EXPECT_EQ(vt->scheme_id, ECDSA_SECP256K1);
+  EXPECT_STREQ(vt->name, "ECDSA secp256k1");
+}
+
+TEST(TestSigScheme, LazyInitOnRegister) {
+  crypto_sig_scheme_cleanup();
+
+  signature_vtable_t custom = {};
+  custom.scheme_id = (signature_scheme_e)0x7C;
+  custom.generate_keypair = (sig_generate_keypair_fn)1;
+  custom.sign = (sig_sign_fn)1;
+  custom.verify = (sig_verify_fn)1;
+  EXPECT_EQ(crypto_sig_scheme_register(&custom), CRABS_SUCCESS);
+
+  // Registering without an explicit init must still leave the built-in scheme
+  // available for keyring verification.
+  const signature_vtable_t* builtin = crypto_sig_scheme_get(ECDSA_SECP256K1);
+  ASSERT_NE(builtin, nullptr);
+  EXPECT_EQ(builtin->scheme_id, ECDSA_SECP256K1);
+  EXPECT_NE(crypto_sig_scheme_get((signature_scheme_e)0x7C), nullptr);
+}
+
+TEST(TestSigScheme, DoubleInitIsIdempotent) {
+  crypto_sig_scheme_cleanup();
+  crypto_sig_scheme_init();
+  crypto_sig_scheme_init();
+  crypto_sig_scheme_init();
+  EXPECT_EQ(crypto_sig_scheme_count(), 1u);
+  const signature_vtable_t* vt = crypto_sig_scheme_get(ECDSA_SECP256K1);
+  ASSERT_NE(vt, nullptr);
+}
+
+// ============================================================
 // Registry: List & Count
 // ============================================================
 
@@ -280,8 +328,13 @@ TEST(TestSigScheme, CleanupResetsRegistry) {
   EXPECT_EQ(crypto_sig_scheme_count(), 1u);
 
   crypto_sig_scheme_cleanup();
-  EXPECT_EQ(crypto_sig_scheme_count(), 0u);
-  EXPECT_EQ(crypto_sig_scheme_get(ECDSA_SECP256K1), nullptr);
+  // With lazy init, the builtin scheme is re-seeded on the next registry
+  // access — cleanup clears custom registrations, and the builtin comes
+  // back automatically (keyring verification must never find an empty
+  // registry). Assert the new contract: count is back to 1 via lazy init,
+  // and custom schemes stay gone.
+  EXPECT_EQ(crypto_sig_scheme_count(), 1u);
+  EXPECT_NE(crypto_sig_scheme_get(ECDSA_SECP256K1), nullptr);
 }
 
 TEST(TestSigScheme, ReinitAfterCleanup) {

@@ -58,6 +58,9 @@ crabs_error_e crypto_sig_scheme_register(const signature_vtable_t* vtable) {
   if (vtable->generate_keypair == NULL) return CRABS_ERR_INVALID_PARAM;
   if (vtable->sign == NULL) return CRABS_ERR_INVALID_PARAM;
   if (vtable->verify == NULL) return CRABS_ERR_INVALID_PARAM;
+  // Lazy init: registering a custom scheme must not lose the builtin (same
+  // audit finding as crypto_sig_scheme_get). init() is idempotent.
+  crypto_sig_scheme_init();
 
   _ensure_registry_lock(); platform_mutex_lock(&_registry_lock);
   // Inline duplicate check (do NOT call crypto_sig_scheme_get here — it
@@ -86,6 +89,11 @@ crabs_error_e crypto_sig_scheme_register(const signature_vtable_t* vtable) {
 }
 
 const signature_vtable_t* crypto_sig_scheme_get(signature_scheme_e scheme_id) {
+  // Lazy init: the builtin ECDSA scheme must be available even when the
+  // embedder never called crypto_sig_scheme_init (audit finding: keyring
+  // verification failed closed in every build except the Node binding).
+  // init() is idempotent and takes the lock itself, so call it before we do.
+  crypto_sig_scheme_init();
   _ensure_registry_lock(); platform_mutex_lock(&_registry_lock);
   for (uint32_t i = 0; i < _registry_count; i++) {
     if (_registry[i] != NULL && _registry[i]->scheme_id == scheme_id) {
@@ -100,6 +108,7 @@ const signature_vtable_t* crypto_sig_scheme_get(signature_scheme_e scheme_id) {
 
 uint32_t crypto_sig_scheme_list(signature_scheme_e* out, uint32_t max_count) {
   if (out == NULL) return 0;
+  crypto_sig_scheme_init();
   _ensure_registry_lock(); platform_mutex_lock(&_registry_lock);
   uint32_t count = _registry_count < max_count ? _registry_count : max_count;
   for (uint32_t i = 0; i < count; i++) {
@@ -112,6 +121,7 @@ uint32_t crypto_sig_scheme_list(signature_scheme_e* out, uint32_t max_count) {
 }
 
 uint32_t crypto_sig_scheme_count(void) {
+  crypto_sig_scheme_init();
   _ensure_registry_lock(); platform_mutex_lock(&_registry_lock);
   uint32_t count = _registry_count;
   platform_mutex_unlock(&_registry_lock);

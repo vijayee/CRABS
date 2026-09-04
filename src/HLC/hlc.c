@@ -439,11 +439,14 @@ crabs_hlc_receive_result_e crabs_hlc_receive(crabs_hlc_state_t* state,
   // Step 3: Update local HLC (max rule)
   crabs_physical_time_t local = crabs_hlc_get_physical_time(state);
 
-  // Take max of local physical time and received time
+  // Take max of local physical time and received time, tracking which source
+  // produced the max (it decides counter adoption below).
+  bool max_from_received =
+      (received->physical_seconds > local.seconds ||
+       (received->physical_seconds == local.seconds &&
+        received->physical_nanos > local.nanos));
   uint64_t max_sec, max_ns;
-  if (received->physical_seconds > local.seconds ||
-      (received->physical_seconds == local.seconds &&
-       received->physical_nanos > local.nanos)) {
+  if (max_from_received) {
     max_sec = received->physical_seconds;
     max_ns = received->physical_nanos;
   } else {
@@ -455,10 +458,15 @@ crabs_hlc_receive_result_e crabs_hlc_receive(crabs_hlc_state_t* state,
   if (max_sec > state->last.physical_seconds ||
       (max_sec == state->last.physical_seconds &&
        max_ns > state->last.physical_nanos)) {
-    // Max is ahead of last — reset counter
+    // Max is ahead of last. Standard HLC receive (Kulkarni et al.): adopt the
+    // counter of the event that advanced the clock — the RECEIVED counter
+    // when the received message produced the max, 0 only when our own local
+    // clock advanced past both. Resetting unconditionally inverted
+    // causality: the node's next same-second event sorted before the
+    // received op it causally follows.
     state->last.physical_seconds = max_sec;
     state->last.physical_nanos = max_ns;
-    state->last.logical_counter = 0;
+    state->last.logical_counter = max_from_received ? received->logical_counter : 0;
   } else if (max_sec == state->last.physical_seconds &&
              max_ns == state->last.physical_nanos) {
     // Same time — take max of counters

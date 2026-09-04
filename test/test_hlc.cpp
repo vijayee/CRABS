@@ -1638,3 +1638,44 @@ TEST(HLCReplay, ReplayedHlcOpRejected) {
   operation_destroy(op);
   crabs_test_env_destroy(&env);
 }
+
+// Audit finding: on a physical-time advance caused by a RECEIVED event, the
+// local counter must adopt the received counter (standard HLC receive),
+// not reset to 0 — otherwise the node's next same-second event sorts before
+// the received op it causally follows.
+TEST(HLCReceive, AdvanceAdoptsReceivedCounter) {
+  crabs_hlc_state_t state = make_mock_state("alice", 36000, 0);
+  state.receive_strategy = HLC_STRATEGY_NAIVE;
+  state.last = {36000, 0, 0, "alice"};
+
+  // Receive an event strictly ahead of our last, carrying logical counter 5.
+  crabs_hlc_t received = {36001, 0, 5, "bob"};
+  crabs_hlc_receive(&state, &received);
+
+  EXPECT_EQ(state.last.physical_seconds, 36001u);
+  EXPECT_EQ(state.last.logical_counter, 5u);  // adopted, NOT reset to 0
+
+  // The next local event must sort AFTER the received op.
+  crabs_hlc_t next = crabs_hlc_next(&state);
+  EXPECT_EQ(next.physical_seconds, 36001u);
+  EXPECT_EQ(next.logical_counter, 6u);
+  EXPECT_GT(crabs_hlc_compare(&next, &received), 0);
+}
+
+TEST(HLCReceive, AdvanceFromLocalClockStillResetsCounter) {
+  // When our OWN clock advanced past both last and the received event, the
+  // counter legitimately resets — the received event is causally behind.
+  crabs_hlc_state_t state = make_mock_state("alice", 36000, 0);
+  state.receive_strategy = HLC_STRATEGY_NAIVE;
+  state.last = {36000, 0, 0, "alice"};
+
+  crabs_hlc_t older = {36000, 500000000, 9, "bob"};
+  crabs_hlc_receive(&state, &older);  // behind local mock clock (36000? see below)
+  // Advance the local clock past everything, then receive an older message.
+  g_mock_time.seconds = 36005;
+  crabs_hlc_t stale = {36001, 0, 7, "carol"};
+  crabs_hlc_receive(&state, &stale);
+
+  EXPECT_EQ(state.last.physical_seconds, 36005u);
+  EXPECT_EQ(state.last.logical_counter, 0u);  // local advance: reset is correct
+}
