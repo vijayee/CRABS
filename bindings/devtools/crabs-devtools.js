@@ -25,6 +25,14 @@
     verified: '#065f46', error: '#991b1b', unknown: '#374151',
   };
 
+  // Human-readable millisecond duration: sub-second stays in ms ("500ms",
+  // not a rounded "1s"), fractional seconds keep one decimal ("1.5s").
+  const formatDuration = (ms) => {
+    if (ms < 1000) return Math.max(1, Math.round(ms)) + 'ms';
+    const seconds = ms / 1000;
+    return (Number.isInteger(seconds) ? seconds : seconds.toFixed(1)) + 's';
+  };
+
   const STYLES = `
     :host { all: initial; }
     * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -424,16 +432,15 @@
           row.className = 'row';
           const left = document.createElement('span');
           const dueInMs = schedule.execute_at - Date.now();
-          const dueLabel = dueInMs <= 0
-            ? 'due'
-            : 'in ' + Math.max(1, Math.round(dueInMs / 1000)) + 's';
+          const dueLabel = dueInMs <= 0 ? 'due' : 'in ' + formatDuration(dueInMs);
           // Recurring cadence: interval 0 = one-shot (no label). repeat 0
           // with an interval means fire until cancelled or past end_at.
+          // Sub-second cadences stay in ms — rounding a 500ms interval to
+          // "every 1s" misrepresents the schedule.
           let cadenceLabel = '';
           if (schedule.interval > 0) {
-            const everySeconds = Math.round(schedule.interval / 1000);
-            cadenceLabel = ' · every ' + everySeconds + 's ' +
-              (schedule.repeat > 0 ? '× ' + schedule.repeat : '∞');
+            cadenceLabel = ' · every ' + formatDuration(schedule.interval) +
+              (schedule.repeat > 0 ? ' × ' + schedule.repeat : ' ∞');
           }
           left.textContent = '#' + schedule.id + ' · ' + schedule.submitter +
             ' · ' + dueLabel + cadenceLabel;
