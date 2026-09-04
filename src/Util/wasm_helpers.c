@@ -612,6 +612,18 @@ uint64_t crabs_wasm_schedule_id(const scheduled_operation_t* entry) {
 }
 
 EMSCRIPTEN_KEEPALIVE
+void crabs_wasm_set_schedule_occurrence_budget(attribute_machine_t* am,
+                                               uint32_t max_occurrences) {
+  if (!am) return;
+  scheduler_set_max_occurrences_per_tick(&am->base_state, max_occurrences);
+}
+
+EMSCRIPTEN_KEEPALIVE
+uint32_t crabs_wasm_schedule_occurrence_budget(attribute_machine_t* am) {
+  return am ? am->base_state.max_occurrences_per_tick : 0;
+}
+
+EMSCRIPTEN_KEEPALIVE
 uint64_t crabs_wasm_schedule_execute_at(const scheduled_operation_t* entry) {
   return entry ? entry->execute_at_ms : 0;
 }

@@ -278,6 +278,12 @@ attribute_machine_t* attribute_machine_create(const char* admin_id, const uint8_
   am->base_state.config.max_lock_extensions = CRABS_MAX_LOCK_EXTENDS;
   am->base_state.config.allow_force_unlock = true;
   strncpy(am->base_state.config.bootstrap_admin, admin_id, CRABS_MAX_USER_ID - 1);
+  // The embedded base_state is zero-cleared (get_clear_memory), so it never
+  // runs state_create's defaults — the per-tick occurrence budget must be
+  // seeded here too or the scheduler runs unbounded in bindings (the default
+  // field value 0 reads as "unlimited").
+  am->base_state.max_occurrences_per_tick =
+      CRABS_SCHEDULER_DEFAULT_MAX_OCCURRENCES_PER_TICK;
 
   am->users = NULL;
   am->user_count = 0;

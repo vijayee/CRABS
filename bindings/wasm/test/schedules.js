@@ -17,6 +17,10 @@ async function main() {
   node.registerUser('alice', key.publicKeyHex(), 'adult');
   node.grantRole('alice', 'role', 'member', 'admin');
   node.setPolicy('mint', 'role:member');
+  node.registerHandlerJs('mint', (state) => {
+    state.incrementCounter('tokens', 1, 'alice');
+    return 0;
+  });
 
   const inner = await Operation.create('mint');
   inner.signerId = 'alice';
@@ -69,6 +73,24 @@ async function main() {
   // series is exhausted and the row disappears.
   node.processSchedules(now + 3500);
   assert.strictEqual(node.pendingSchedules().length, 0);
+
+  // Occurrence budget: bounds the per-tick catch-up burst and carries the
+  // deferred slots over to the next tick.
+  const budgeted = await Operation.create('mint');
+  budgeted.signerId = 'alice';
+  budgeted.nodeId = 'alice';
+  node.sign(budgeted, key.privateKeyHex());
+  const budgetId = node.scheduleRecurring(budgeted, now + 1000, 1000, 3, 0);
+  node.setScheduleOccurrenceBudget(2);
+  assert.strictEqual(node.scheduleOccurrenceBudget(), 2);
+  node.processSchedules(now + 3500);
+  // Slots 1000 and 2000 fire; slot 3000 stays pending on its exact slot.
+  assert.strictEqual(node.pendingSchedules().length, 1);
+  assert.strictEqual(node.getCounter('tokens'), 6);  // 4 earlier fires + 2 budgeted
+  node.setScheduleOccurrenceBudget(0);  // unlimited: the deferred slot fires now
+  node.processSchedules(now + 3500);
+  assert.strictEqual(node.pendingSchedules().length, 0);
+  assert.strictEqual(node.getCounter('tokens'), 7);
 
   console.log('schedules smoke OK: id=' + scheduleId +
               ' recurring=' + recurringId);

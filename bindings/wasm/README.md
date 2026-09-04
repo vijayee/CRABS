@@ -35,8 +35,10 @@ async function main() {
   const aliceKey = await KeyPair.generate();
   console.log('Alice public key:', aliceKey.publicKeyHex());
 
-  // Register the user
-  await node.registerUser('alice', aliceKey.publicKeyHex(), 'role:member');
+  // Register the user. registerUser rejects privileged (role:) initial
+  // attributes — grant roles through the admin path instead.
+  await node.registerUser('alice', aliceKey.publicKeyHex(), 'adult');
+  node.grantRole('alice', 'role', 'member', 'admin');
 
   // Get the node's signing key
   const nodeKey = node.getNodeKey();
@@ -77,6 +79,17 @@ The API mirrors `crabs-node` (the N-API bindings). See `../node/index.d.ts` for 
 | Performance | Native speed | ~2-5x slower (WASM overhead) |
 | ABE keygen | ~2-5 seconds | ~5-15 seconds |
 | Binary size | Links against system libs | 1.7MB self-contained `.wasm` |
+
+## Trust boundary: admin authorization
+
+Every user-mutating operation — `grantRole`, `revokeRole`, `suspendUser`
+(where exposed), `revokeUser`, `activateUser` — is gated in C: the signer
+must be an ACTIVE user holding the `role:admin` attribute, and the gate runs
+at module level, not in the JS layer. The bootstrap admin created by
+`Node.create('admin', …)` holds `role:admin`; a suspended admin loses the
+gate. Key-compromise recovery (node-driven suspension during key rotation)
+bypasses the gate deliberately — the node acts with system authority there,
+not on behalf of a signing admin.
 
 ## Devtools build
 
@@ -133,8 +146,19 @@ first. Missed slots fire in order on the next tick (catch-up):
 node.scheduleRecurring(mintOp, Date.now() + 15_000, 15_000, 3, 0); // 3 fires
 ```
 
-Catch-up is unbounded by design: after long downtime with a small interval,
-the next tick fires every missed occurrence back-to-back. Occurrence identity
+Catch-up is bounded per tick: at most 64 scheduled occurrences materialize
+per `processSchedules` call (or per automatic tick on `execute`). Deferred
+slots carry over — they stay pending on their exact slots and fire on the
+next tick, so nothing is skipped or double-fired; catching up after long
+downtime takes as many ticks as the budget requires. Pass `0` to remove the
+cap (unbounded catch-up, the pre-budget behavior):
+
+```js
+node.setScheduleOccurrenceBudget(0);   // unbounded catch-up
+node.scheduleOccurrenceBudget();       // read the current cap
+```
+
+Occurrence identity
 is derived deterministically from the embedded operation and its slot time,
 so replicas converging on the same missed slots deduplicate via the audit
 log instead of double-firing.

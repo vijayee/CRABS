@@ -134,6 +134,9 @@ export interface Node {
                     repeatCount: number, endAtMs: number): bigint;
   cancelSchedule(scheduleId: bigint): void;
   processSchedules(nowMs?: number): void;
+  /** Per-tick ceiling on materialized scheduled occurrences (0 = unlimited). */
+  setScheduleOccurrenceBudget(maxPerTick: number): void;
+  scheduleOccurrenceBudget(): number;
   pendingSchedules(): Array<{ id: bigint; executeAt: bigint;
                               intervalMs: bigint; repeatCount: bigint;
                               endAt: bigint; submitter: string }>;

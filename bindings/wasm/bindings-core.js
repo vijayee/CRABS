@@ -601,6 +601,17 @@ class Node {
     wrapRc(this._M._crabs_wasm_process_schedules(this._am, BigInt(nowMs)), 'processSchedules');
   }
 
+  // Per-tick ceiling on materialized scheduled occurrences (0 = unlimited).
+  // Bounds the catch-up burst after long downtime; deferred slots carry over.
+  setScheduleOccurrenceBudget(maxPerTick) {
+    const M = this._M;
+    M._crabs_wasm_set_schedule_occurrence_budget(this._am, maxPerTick >>> 0);
+  }
+
+  scheduleOccurrenceBudget() {
+    return this._M._crabs_wasm_schedule_occurrence_budget(this._am);
+  }
+
   pendingSchedules() {
     const M = this._M;
     const schedules = [];
