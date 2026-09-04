@@ -149,9 +149,10 @@ Notes:
   the `__cancel_schedule__` policy can cancel any pending schedule id (admins
   retain full power).
 - `processSchedules(nowMs?)` trusts the JS-supplied clock (default
-  `Date.now()`). The automatic tick — which runs on every `execute` — always
-  uses the node's authenticated time source and materializes nothing without
-  one (fail-closed).
+  `Date.now()`). The WASM binding attaches no authenticated time source: all
+  timing — including the automatic tick that runs on every `execute` — runs
+  on the platform clock. Deployments needing authenticated time must attach a
+  time source (`state_set_time_source` is not yet exposed to JS).
 - Materialization failures (state drifted, invariant violated) are recorded
   durably as `__schedule_failed__` audit-log entries and never affect other
   operations. A schedule fires exactly once. Two nodes with skewed clocks may
