@@ -255,6 +255,9 @@ TEST(OTSerialization, StateWithOrderedSetRoundTrip) {
 
   crabs_ot_ordered_set_t* r_set = (crabs_ot_ordered_set_t*)r_item->value;
   EXPECT_EQ(crabs_ot_ordered_set_count(r_set), 1u);
+  ASSERT_NE(r_set->head, nullptr);
+  EXPECT_FALSE(r_set->head->has_anchor);
+  EXPECT_TRUE(crabs_ot_op_id_equal(&r_set->head->placement_id, &op.id));
 
   state_destroy(restored);
   state_destroy(original);

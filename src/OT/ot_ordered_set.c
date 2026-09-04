@@ -10,6 +10,31 @@
 #include <stdlib.h>
 #include <string.h>
 
+typedef struct {
+  crabs_ot_op_id_t id;
+  bool has_anchor;
+  crabs_ot_op_id_t anchor_id;
+  crabs_ot_op_id_t placement_id;
+} crabs_ordered_placement_t;
+
+static int _op_id_compare(const crabs_ot_op_id_t* a,
+                          const crabs_ot_op_id_t* b) {
+  int node = memcmp(a->node_id, b->node_id, CRABS_MAX_USER_ID);
+  if (node != 0) return node < 0 ? -1 : 1;
+  if (a->sequence_num < b->sequence_num) return -1;
+  if (a->sequence_num > b->sequence_num) return 1;
+  return 0;
+}
+
+static void _set_placement(crabs_ordered_element_t* elem,
+                           const crabs_ordered_element_t* anchor,
+                           const crabs_ot_op_id_t* placement_id) {
+  elem->has_anchor = anchor != NULL;
+  if (anchor != NULL) elem->anchor_id = anchor->id;
+  else memset(&elem->anchor_id, 0, sizeof(elem->anchor_id));
+  elem->placement_id = *placement_id;
+}
+
 // ============================================================
 // Element Lifecycle
 // ============================================================
@@ -19,6 +44,7 @@ crabs_ordered_element_t* crabs_ordered_element_create(
   crabs_ordered_element_t* elem = get_clear_memory(sizeof(crabs_ordered_element_t));
   if (id != NULL) {
     elem->id = *id;
+    elem->placement_id = *id;
   }
   if (value != NULL && value_size > 0) {
     elem->value = get_memory(value_size);
@@ -136,13 +162,190 @@ static void _insert_after(crabs_ot_ordered_set_t* set,
 }
 
 // Helper: unlink element (doesn't free)
-static void _unlink(crabs_ot_ordered_set_t* set, crabs_ordered_element_t* elem) {
-  if (elem->prev != NULL) elem->prev->next = elem->next;
-  else set->head = elem->next;
-  if (elem->next != NULL) elem->next->prev = elem->prev;
-  else set->tail = elem->prev;
-  set->count--;
-  if (!elem->deleted) set->visible_count--;
+static int _placement_index(const crabs_ordered_placement_t* placements,
+                            uint32_t count, const crabs_ot_op_id_t* id) {
+  for (uint32_t i = 0; i < count; i++) {
+    if (crabs_ot_op_id_equal(&placements[i].id, id)) return (int)i;
+  }
+  return -1;
+}
+
+static bool _placements_valid(const crabs_ordered_placement_t* placements,
+                              uint32_t count) {
+  if (count == 0) return true;
+  uint32_t* visits = get_clear_memory(count * sizeof(uint32_t));
+  for (uint32_t start = 0; start < count; start++) {
+    int current = (int)start;
+    while (placements[current].has_anchor) {
+      if (visits[current] == start + 1) {
+        free(visits);
+        return false;
+      }
+      visits[current] = start + 1;
+      current = _placement_index(placements, count,
+                                 &placements[current].anchor_id);
+      if (current < 0) {
+        free(visits);
+        return false;
+      }
+    }
+  }
+  free(visits);
+  return true;
+}
+
+static bool _merge_preflight(const crabs_ot_ordered_set_t* dest,
+                             const crabs_ot_ordered_set_t* src) {
+  if (src->count > UINT32_MAX - dest->count) return false;
+  uint32_t capacity = dest->count + src->count;
+  if (capacity == 0) return true;
+  crabs_ordered_placement_t* placements =
+    get_clear_memory(capacity * sizeof(crabs_ordered_placement_t));
+  uint32_t count = 0;
+
+  for (const crabs_ordered_element_t* e = dest->head; e != NULL; e = e->next) {
+    placements[count++] = (crabs_ordered_placement_t){
+      .id = e->id,
+      .has_anchor = e->has_anchor,
+      .anchor_id = e->anchor_id,
+      .placement_id = e->placement_id,
+    };
+  }
+
+  for (const crabs_ordered_element_t* e = src->head; e != NULL; e = e->next) {
+    int index = _placement_index(placements, count, &e->id);
+    if (index >= 0) {
+      const crabs_ordered_element_t* existing =
+        crabs_ot_ordered_set_find(dest, &e->id);
+      if (existing != NULL &&
+          (existing->value_size != e->value_size ||
+           (e->value_size > 0 &&
+            memcmp(existing->value, e->value, e->value_size) != 0))) {
+        free(placements);
+        return false;
+      }
+      int placement_order = _op_id_compare(
+        &e->placement_id, &placements[index].placement_id);
+      if (placement_order == 0 &&
+          (e->has_anchor != placements[index].has_anchor ||
+           (e->has_anchor &&
+            !crabs_ot_op_id_equal(&e->anchor_id,
+                                  &placements[index].anchor_id)))) {
+        free(placements);
+        return false;
+      }
+      if (placement_order > 0) {
+        placements[index].has_anchor = e->has_anchor;
+        placements[index].anchor_id = e->anchor_id;
+        placements[index].placement_id = e->placement_id;
+      }
+    } else {
+      placements[count++] = (crabs_ordered_placement_t){
+        .id = e->id,
+        .has_anchor = e->has_anchor,
+        .anchor_id = e->anchor_id,
+        .placement_id = e->placement_id,
+      };
+    }
+  }
+
+  bool valid = _placements_valid(placements, count);
+  free(placements);
+  return valid;
+}
+
+static int _element_order_compare(const crabs_ordered_element_t* a,
+                                  const crabs_ordered_element_t* b) {
+  int placement = _op_id_compare(&a->placement_id, &b->placement_id);
+  if (placement != 0) return placement;
+  return _op_id_compare(&a->id, &b->id);
+}
+
+static int _next_child(crabs_ordered_element_t** nodes, uint32_t count,
+                       const bool* emitted,
+                       const crabs_ordered_element_t* parent) {
+  int selected = -1;
+  for (uint32_t i = 0; i < count; i++) {
+    if (emitted[i]) continue;
+    bool child = parent == NULL
+      ? !nodes[i]->has_anchor
+      : nodes[i]->has_anchor &&
+        crabs_ot_op_id_equal(&nodes[i]->anchor_id, &parent->id);
+    if (!child) continue;
+    if (selected < 0 || _element_order_compare(nodes[i], nodes[selected]) > 0) {
+      selected = (int)i;
+    }
+  }
+  return selected;
+}
+
+static void _append_materialized(crabs_ot_ordered_set_t* set,
+                                 crabs_ordered_element_t* elem) {
+  elem->prev = set->tail;
+  elem->next = NULL;
+  if (set->tail != NULL) set->tail->next = elem;
+  else set->head = elem;
+  set->tail = elem;
+  set->count++;
+  if (!elem->deleted) set->visible_count++;
+}
+
+static bool _materialize(crabs_ot_ordered_set_t* set) {
+  uint32_t count = set->count;
+  if (count == 0) return true;
+  crabs_ordered_element_t** nodes =
+    get_memory(count * sizeof(crabs_ordered_element_t*));
+  bool* emitted = get_clear_memory(count * sizeof(bool));
+  int* stack = get_memory(count * sizeof(int));
+  crabs_ordered_placement_t* placements =
+    get_memory(count * sizeof(crabs_ordered_placement_t));
+
+  uint32_t index = 0;
+  for (crabs_ordered_element_t* e = set->head; e != NULL; e = e->next) {
+    nodes[index] = e;
+    placements[index] = (crabs_ordered_placement_t){
+      .id = e->id,
+      .has_anchor = e->has_anchor,
+      .anchor_id = e->anchor_id,
+      .placement_id = e->placement_id,
+    };
+    index++;
+  }
+  if (index != count || !_placements_valid(placements, count)) {
+    free(placements); free(stack); free(emitted); free(nodes);
+    return false;
+  }
+
+  set->head = NULL;
+  set->tail = NULL;
+  set->count = 0;
+  set->visible_count = 0;
+  uint32_t emitted_count = 0;
+
+  while (emitted_count < count) {
+    int root = _next_child(nodes, count, emitted, NULL);
+    if (root < 0) break;
+    int depth = 0;
+    emitted[root] = true;
+    emitted_count++;
+    _append_materialized(set, nodes[root]);
+    stack[depth++] = root;
+    while (depth > 0) {
+      int parent = stack[depth - 1];
+      int child = _next_child(nodes, count, emitted, nodes[parent]);
+      if (child < 0) {
+        depth--;
+        continue;
+      }
+      emitted[child] = true;
+      emitted_count++;
+      _append_materialized(set, nodes[child]);
+      stack[depth++] = child;
+    }
+  }
+
+  free(placements); free(stack); free(emitted); free(nodes);
+  return emitted_count == count;
 }
 
 // ============================================================
@@ -157,22 +360,28 @@ crabs_ordered_element_t* crabs_ot_ordered_set_apply_insert(
     &op->id, op->payload, op->payload_size);
   if (elem == NULL) return NULL;
 
+  crabs_ordered_element_t* after = NULL;
   // Use position map to find insertion point
   if (set->ot_data != NULL && set->ot_data->position_map != NULL) {
     uint64_t internal_pos = crabs_xi_inv(set->ot_data->position_map, op->visible_pos);
     crabs_ordered_element_t* at = _get_at_internal(set, internal_pos);
     if (at != NULL) {
-      _insert_after(set, at->prev, elem);
+      after = at->prev;
     } else {
-      _insert_after(set, set->tail, elem);
+      after = set->tail;
     }
+    _set_placement(elem, after, &op->id);
+    _insert_after(set, after, elem);
     set->ot_data->position_map = crabs_xi_one(set->ot_data->position_map, internal_pos);
   } else {
     // No position map: insert at visible position
     if (op->visible_pos == 0 || set->head == NULL) {
+      _set_placement(elem, NULL, &op->id);
       _insert_after(set, NULL, elem);
     } else {
-      crabs_ordered_element_t* after = crabs_ot_ordered_set_get(set, op->visible_pos - 1);
+      after = crabs_ot_ordered_set_get(set, op->visible_pos - 1);
+      if (after == NULL) after = set->tail;
+      _set_placement(elem, after, &op->id);
       _insert_after(set, after, elem);
     }
   }
@@ -255,6 +464,14 @@ crabs_ordered_element_t* crabs_ot_ordered_set_apply_move(
   }
   set->count++;
 
+  // A MOVE is a last-writer-wins update of the complete order known here.
+  crabs_ordered_element_t* anchor = NULL;
+  for (crabs_ordered_element_t* current = set->head;
+       current != NULL; current = current->next) {
+    _set_placement(current, anchor, &op->id);
+    anchor = current;
+  }
+
   return elem;
 }
 
@@ -298,6 +515,8 @@ crabs_ot_ordered_set_t* crabs_ot_ordered_set_merge(
     crabs_ot_ordered_set_t* dest, const crabs_ot_ordered_set_t* src) {
   if (dest == NULL || src == NULL) return dest;
 
+  if (!_merge_preflight(dest, src)) return NULL;
+
   // Merge position maps
   crabs_ot_ordered_set_merge_position_maps(dest, src);
 
@@ -309,6 +528,9 @@ crabs_ot_ordered_set_t* crabs_ot_ordered_set_merge(
       crabs_ordered_element_t* new_elem = crabs_ordered_element_create(
         &e->id, e->value, e->value_size);
       new_elem->deleted = e->deleted;
+      new_elem->has_anchor = e->has_anchor;
+      new_elem->anchor_id = e->anchor_id;
+      new_elem->placement_id = e->placement_id;
       _insert_after(dest, dest->tail, new_elem);
     } else {
       // Existing element — merge deletion state (deleted wins)
@@ -316,10 +538,15 @@ crabs_ot_ordered_set_t* crabs_ot_ordered_set_merge(
         found->deleted = true;
         dest->visible_count--;
       }
+      if (_op_id_compare(&e->placement_id, &found->placement_id) > 0) {
+        found->has_anchor = e->has_anchor;
+        found->anchor_id = e->anchor_id;
+        found->placement_id = e->placement_id;
+      }
     }
   }
 
-  return dest;
+  return _materialize(dest) ? dest : NULL;
 }
 
 void crabs_ot_ordered_set_merge_position_maps(

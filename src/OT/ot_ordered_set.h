@@ -35,6 +35,9 @@ typedef struct crabs_ordered_element {
   uint8_t*                    value;
   uint32_t                    value_size;
   bool                        deleted;
+  bool                        has_anchor;
+  crabs_ot_op_id_t            anchor_id;
+  crabs_ot_op_id_t            placement_id;
   struct crabs_ordered_element* prev;
   struct crabs_ordered_element* next;
 } crabs_ordered_element_t;

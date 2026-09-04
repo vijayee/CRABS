@@ -49,6 +49,9 @@ crabs_ot_ordered_set_t* crabs_extract_visible_ordered_set(
         crabs_ot_ordered_set_destroy(visible);
         return NULL;
       }
+      new_elem->has_anchor = visible->tail != NULL;
+      if (visible->tail != NULL) new_elem->anchor_id = visible->tail->id;
+      new_elem->placement_id = elem->placement_id;
       // Append to tail
       new_elem->prev = visible->tail;
       new_elem->next = NULL;

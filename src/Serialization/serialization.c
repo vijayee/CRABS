@@ -372,6 +372,9 @@ static void _serialize_ot_type_state(write_buf_t* buf, const data_item_t* item) 
         _serialize_ot_op_id(buf, &elem->id);
         _write_bytes32(buf, elem->value, elem->value_size);
         _write_uint8(buf, elem->deleted ? 1 : 0);
+        _write_uint8(buf, elem->has_anchor ? 1 : 0);
+        if (elem->has_anchor) _serialize_ot_op_id(buf, &elem->anchor_id);
+        _serialize_ot_op_id(buf, &elem->placement_id);
         elem = elem->next;
       }
       break;
@@ -424,7 +427,8 @@ static void _serialize_ot_type_state(write_buf_t* buf, const data_item_t* item) 
   }
 }
 
-static bool _deserialize_ot_type_state(read_buf_t* buf, data_item_t* item) {
+static bool _deserialize_ot_type_state(read_buf_t* buf, data_item_t* item,
+                                       uint32_t version) {
   switch (item->type) {
     case DATA_TYPE_OT_ORDERED_SET: {
       crabs_ot_ordered_set_t* set = (crabs_ot_ordered_set_t*)item->value;
@@ -451,6 +455,27 @@ static bool _deserialize_ot_type_state(read_buf_t* buf, data_item_t* item) {
         if (elem == NULL) return false;
 
         elem->deleted = (deleted != 0);
+
+        if (version >= 8) {
+          uint8_t has_anchor;
+          if (!_read_uint8(buf, &has_anchor)) {
+            crabs_ordered_element_destroy(elem);
+            return false;
+          }
+          elem->has_anchor = has_anchor != 0;
+          if (elem->has_anchor && !_deserialize_ot_op_id(buf, &elem->anchor_id)) {
+            crabs_ordered_element_destroy(elem);
+            return false;
+          }
+          if (!_deserialize_ot_op_id(buf, &elem->placement_id)) {
+            crabs_ordered_element_destroy(elem);
+            return false;
+          }
+        } else {
+          elem->has_anchor = tail != NULL;
+          if (tail != NULL) elem->anchor_id = tail->id;
+          elem->placement_id = elem->id;
+        }
 
         if (set->head == NULL) {
           set->head = elem;
@@ -1008,7 +1033,7 @@ static bool _deserialize_data_item(read_buf_t* buf, data_item_t* item, uint32_t 
 
   // For OT types, deserialize type-specific state (elements, spans, tree nodes)
   if (item->type >= DATA_TYPE_OT_ORDERED_SET && item->type <= DATA_TYPE_OT_ORDERED_MAP) {
-    if (!_deserialize_ot_type_state(buf, item)) return false;
+    if (!_deserialize_ot_type_state(buf, item, version)) return false;
   }
 
   // invariant_count

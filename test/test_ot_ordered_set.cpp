@@ -203,6 +203,7 @@ TEST(OTOrderedSet, MoveElement) {
   move_op.op_type = CRABS_OT_OP_MOVE;
   move_op.visible_pos = 0;
   move_op.visible_pos_2 = 2;
+  crabs_ot_op_id_init(&move_op.id, "n1", 4, 1001);
   crabs_ot_ordered_set_apply_move(set, &move_op);
 
   EXPECT_EQ(crabs_ot_ordered_set_count(set), 3u);
@@ -341,6 +342,54 @@ TEST(OTOrderedSet, MergeAddsElements) {
   op_payload_free(&op2);
   crabs_ot_ordered_set_destroy(dest);
   crabs_ot_ordered_set_destroy(src);
+}
+
+TEST(OTOrderedSet, MergeIsCommutativeForDistinctSingletons) {
+  crabs_ot_ordered_set_t* ab = crabs_ot_ordered_set_create();
+  crabs_ot_ordered_set_t* ba = crabs_ot_ordered_set_create();
+  crabs_ot_ordered_set_t* a = crabs_ot_ordered_set_create();
+  crabs_ot_ordered_set_t* b = crabs_ot_ordered_set_create();
+  uint8_t av[] = {0x01}, bv[] = {0x02};
+  crabs_ot_operation_t a1 = make_insert_op(0, "A", 1, av, 1);
+  crabs_ot_operation_t a2 = make_insert_op(0, "A", 1, av, 1);
+  crabs_ot_operation_t b1 = make_insert_op(0, "B", 1, bv, 1);
+  crabs_ot_operation_t b2 = make_insert_op(0, "B", 1, bv, 1);
+  crabs_ot_ordered_set_apply_insert(ab, &a1);
+  crabs_ot_ordered_set_apply_insert(a, &a2);
+  crabs_ot_ordered_set_apply_insert(ba, &b1);
+  crabs_ot_ordered_set_apply_insert(b, &b2);
+
+  ASSERT_EQ(crabs_ot_ordered_set_merge(ab, b), ab);
+  ASSERT_EQ(crabs_ot_ordered_set_merge(ba, a), ba);
+  ASSERT_NE(ab->head, nullptr);
+  ASSERT_NE(ba->head, nullptr);
+  ASSERT_NE(ab->head->next, nullptr);
+  ASSERT_NE(ba->head->next, nullptr);
+  EXPECT_TRUE(crabs_ot_op_id_equal(&ab->head->id, &ba->head->id));
+  EXPECT_TRUE(crabs_ot_op_id_equal(&ab->head->next->id, &ba->head->next->id));
+
+  op_payload_free(&a1); op_payload_free(&a2);
+  op_payload_free(&b1); op_payload_free(&b2);
+  crabs_ot_ordered_set_destroy(ab); crabs_ot_ordered_set_destroy(ba);
+  crabs_ot_ordered_set_destroy(a); crabs_ot_ordered_set_destroy(b);
+}
+
+TEST(OTOrderedSet, MergeRejectsConflictingPayloadWithoutMutation) {
+  crabs_ot_ordered_set_t* dest = crabs_ot_ordered_set_create();
+  crabs_ot_ordered_set_t* src = crabs_ot_ordered_set_create();
+  uint8_t one[] = {0x01}, two[] = {0x02};
+  crabs_ot_operation_t left = make_insert_op(0, "A", 1, one, 1);
+  crabs_ot_operation_t right = make_insert_op(0, "A", 1, two, 1);
+  crabs_ot_ordered_set_apply_insert(dest, &left);
+  crabs_ot_ordered_set_apply_insert(src, &right);
+
+  EXPECT_EQ(crabs_ot_ordered_set_merge(dest, src), nullptr);
+  ASSERT_NE(dest->head, nullptr);
+  EXPECT_EQ(dest->count, 1u);
+  EXPECT_EQ(dest->head->value[0], 0x01);
+
+  op_payload_free(&left); op_payload_free(&right);
+  crabs_ot_ordered_set_destroy(dest); crabs_ot_ordered_set_destroy(src);
 }
 
 TEST(OTOrderedSet, MergeDeletionWins) {
