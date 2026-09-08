@@ -7,6 +7,7 @@
 //
 
 #include "scheduler.h"
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include "../Util/allocator.h"
@@ -65,6 +66,19 @@ static uint64_t _append_schedule(state_t* state, uint64_t execute_at_ms,
     while (tail->next != NULL) tail = tail->next;
     tail->next = entry;
   }
+
+  // Submission mutates the durable pending set, so it reports a change like
+  // every other mutation path; the devtools Timeline shows the entry as soon
+  // as it is queued, before any slot materializes.
+  char schedule_preview[96];
+  snprintf(schedule_preview, sizeof(schedule_preview), "scheduled at %llu",
+           (unsigned long long)execute_at_ms);
+  state_notify_change(state, CRABS_CHANGE_SCHEDULE, op->type, op->uuid,
+                      submitter, NULL,
+                      op->resource_count > 0 && op->resources
+                          ? op->resources[0]
+                          : NULL,
+                      schedule_preview, CRABS_SUCCESS);
   return entry->schedule_id;
 }
 

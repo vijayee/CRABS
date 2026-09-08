@@ -1258,8 +1258,9 @@ TEST(SchedulerRecurring, FailureDoesNotTerminateSeries) {
   crabs_test_env_destroy(&env);
 }
 
-// Change notification: each materialized slot fires a SCHEDULE event;
-// budget-deferred slots fire nothing until they actually fire.
+// Change notification: the submission itself fires one SCHEDULE event, then
+// each materialized slot fires another; budget-deferred slots fire nothing
+// until they actually fire.
 TEST(SchedulerRecurring, ChangeHookFiresPerMaterializedSlot) {
   static int schedule_event_count;
   schedule_event_count = 0;
@@ -1289,7 +1290,9 @@ TEST(SchedulerRecurring, ChangeHookFiresPerMaterializedSlot) {
   operation_destroy(embedded);
 
   ASSERT_EQ(scheduler_process_due(state, 1000003000u), CRABS_SUCCESS);
-  EXPECT_EQ(schedule_event_count, 2);
+  // One event from the submission, one per materialized slot (the per-tick
+  // cap of 2 leaves the third slot for a later tick).
+  EXPECT_EQ(schedule_event_count, 3);
   state_set_change_hook(state, nullptr, nullptr);
   crabs_test_env_destroy(&env);
 }
