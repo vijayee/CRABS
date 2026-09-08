@@ -208,6 +208,10 @@ crabs_error_e scheduler_process_due(state_t* state, uint64_t now_ms) {
           memset(failure_uuid, 0, sizeof(failure_uuid));  // best effort only
         }
         state_machine_log_schedule_failure(state, failure_uuid, entry->submitter);
+        state_notify_change(state, CRABS_CHANGE_SCHEDULE, "__schedule_failed__",
+                            failure_uuid, entry->submitter, NULL, NULL,
+                            "schedule failed; durable failure recorded",
+                            CRABS_ERR_INTERNAL);
         free(entry->op_bytes);
         free(entry);
         continue;
@@ -252,6 +256,10 @@ crabs_error_e scheduler_process_due(state_t* state, uint64_t now_ms) {
         // blocks the signer's later ops (HLC sorts after lamport; lamport
         // signers already need lamport > their signed value).
         state_machine_log_schedule_failure(state, embedded->uuid, embedded->signer_id);
+        state_notify_change(state, CRABS_CHANGE_SCHEDULE, "__schedule_failed__",
+                            embedded->uuid, embedded->signer_id, NULL, NULL,
+                            "schedule failed; durable failure recorded",
+                            CRABS_ERR_INTERNAL);
       }
       operation_destroy(embedded);
       free(entry->op_bytes);
@@ -294,6 +302,10 @@ crabs_error_e scheduler_process_due(state_t* state, uint64_t now_ms) {
           memset(failure_uuid, 0, sizeof(failure_uuid));  // best effort only
         }
         state_machine_log_schedule_failure(state, failure_uuid, entry->submitter);
+        state_notify_change(state, CRABS_CHANGE_SCHEDULE, "__schedule_failed__",
+                            failure_uuid, entry->submitter, NULL, NULL,
+                            "schedule failed; durable failure recorded",
+                            CRABS_ERR_INTERNAL);
         bytes_corrupt = true;
         break;
       }
@@ -327,6 +339,10 @@ crabs_error_e scheduler_process_due(state_t* state, uint64_t now_ms) {
           // record keyed by the occurrence's uuid, cadence keeps advancing.
           state_machine_log_schedule_failure(state, occurrence->uuid,
                                              occurrence->signer_id);
+          state_notify_change(state, CRABS_CHANGE_SCHEDULE, "__schedule_failed__",
+                              occurrence->uuid, occurrence->signer_id, NULL,
+                              NULL, "schedule failed; durable failure recorded",
+                              CRABS_ERR_INTERNAL);
         }
         operation_destroy(occurrence);
         fires_this_tick++;

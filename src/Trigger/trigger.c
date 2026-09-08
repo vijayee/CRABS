@@ -101,6 +101,9 @@ static crabs_error_e _execute_trigger_effect(state_t* state, trigger_t* trigger,
         trigger->effect.duration_ms
       );
       if (err != CRABS_SUCCESS) return err;
+      state_notify_change(state, CRABS_CHANGE_TRIGGER, "issue_temporary", NULL,
+                          NULL, NULL, trigger->effect.issue_attribute,
+                          "trigger issued temporary attribute", CRABS_SUCCESS);
       break;
     }
 

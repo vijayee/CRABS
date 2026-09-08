@@ -1257,3 +1257,39 @@ TEST(SchedulerRecurring, FailureDoesNotTerminateSeries) {
   operation_destroy(embedded);
   crabs_test_env_destroy(&env);
 }
+
+// Change notification: each materialized slot fires a SCHEDULE event;
+// budget-deferred slots fire nothing until they actually fire.
+TEST(SchedulerRecurring, ChangeHookFiresPerMaterializedSlot) {
+  static int schedule_event_count;
+  schedule_event_count = 0;
+
+  crabs_test_env_t env;
+  crabs_test_env_init(&env);
+  register_schedule_test_policies(&env);
+  state_t* state = env.state;
+  state_set_time_source(state, &g_sched_mock_ops);
+  g_sched_mock_time.seconds = 1000000;
+  g_sched_mock_time.nanos = 0;
+  g_sched_mock_time.valid = true;
+
+  scheduler_set_max_occurrences_per_tick(state, 2);
+  state_set_change_hook(state, [](state_t* hook_state,
+                                  const crabs_change_event_t* event,
+                                  void* user_data) {
+    (void)hook_state; (void)user_data;
+    if (event->kind == CRABS_CHANGE_SCHEDULE) schedule_event_count++;
+  }, nullptr);
+
+  operation_t* embedded = make_counter_op("mint", "admin");
+  stamp_unique_uuid(embedded);
+  crabs_test_sign_op_with(state->attr_machine, env.admin_key, embedded);
+  ASSERT_NE(scheduler_schedule_recurring(
+      state, 1000001000, 1000, 3, 0, "admin", embedded), 0u);
+  operation_destroy(embedded);
+
+  ASSERT_EQ(scheduler_process_due(state, 1000003000u), CRABS_SUCCESS);
+  EXPECT_EQ(schedule_event_count, 2);
+  state_set_change_hook(state, nullptr, nullptr);
+  crabs_test_env_destroy(&env);
+}

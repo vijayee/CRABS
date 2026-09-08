@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 extern "C" {
 #include "../src/Attribute/attribute_machine.h"
+#include "../src/StateMachine/state_machine.h"
 #include "../src/Crypto/crypto.h"
 }
 #include "test_helpers.h"
@@ -1142,4 +1143,36 @@ TEST_F(TestAttributeMachine, TestRegisterUserRejectsBadAttrNameInInitialAttrs) {
   user_t* dave = attribute_machine_find_user(am, "dave");
   ASSERT_NE(dave, nullptr);
   EXPECT_EQ(dave->attribute_count, 3u);
+}
+
+// Change notification: attribute mutations fire CRABS_CHANGE_ATTRIBUTE.
+TEST_F(TestAttributeMachine, ChangeHookFiresOnAttributeMutations) {
+  static const crabs_change_event_t* captured_event;
+  static int captured_count;
+  captured_count = 0;
+  state_set_change_hook(&am->base_state, [](state_t* hook_state,
+                                            const crabs_change_event_t* event,
+                                            void* user_data) {
+    (void)hook_state; (void)user_data;
+    captured_event = event;   // read within this test only
+    captured_count++;
+  }, nullptr);
+
+  uint8_t user_pk[33];
+  _gen_pk(user_pk);
+  ASSERT_EQ(attribute_machine_register_user(am, "bob", user_pk, NULL), CRABS_SUCCESS);
+  EXPECT_EQ(captured_count, 1);
+  EXPECT_EQ(captured_event->kind, CRABS_CHANGE_ATTRIBUTE);
+  EXPECT_STREQ(captured_event->type, "register_user");
+  EXPECT_STREQ(captured_event->target, "bob");
+
+  ASSERT_EQ(attribute_machine_grant_role(am, "bob", "role", "member", "admin"), CRABS_SUCCESS);
+  EXPECT_EQ(captured_count, 2);
+  EXPECT_STREQ(captured_event->type, "grant_role");
+
+  ASSERT_EQ(attribute_machine_revoke_user(am, "bob", "admin"), CRABS_SUCCESS);
+  EXPECT_EQ(captured_count, 3);
+  EXPECT_STREQ(captured_event->type, "revoke_user");
+
+  state_set_change_hook(&am->base_state, nullptr, nullptr);
 }

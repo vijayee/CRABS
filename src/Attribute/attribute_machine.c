@@ -4,6 +4,7 @@
 
 #include "attribute_machine.h"
 #include "../Util/platform.h"
+#include "../StateMachine/state_machine.h"
 #include "../Trigger/trigger.h"
 #include "../Crypto/crypto.h"
 #include "../Condition/condition.h"
@@ -71,6 +72,11 @@ static bool _is_safe_user_id(const char* id) {
 // depend on).
 static bool _is_safe_attr_name(const char* name);
 static bool _is_safe_attr_value(const char* value);
+
+// Forward declaration: fires the state change hook for an attribute mutation
+// (defined after _check_signer_is_active_admin, below).
+static void _notify_attribute_change(attribute_machine_t* am, const char* action,
+                                     const char* target_user, const char* preview);
 
 // Parse pipe-separated attribute string like "role:admin|dept:eng"
 // into attribute_value_t entries. Each entry's value field stores
@@ -457,6 +463,7 @@ crabs_error_e attribute_machine_register_user(attribute_machine_t* am, const cha
   am->user_count++;
   am->base_state.version++;
 
+  _notify_attribute_change(am, "register_user", user_id, "user registered");
   return CRABS_SUCCESS;
 }
 
@@ -474,6 +481,15 @@ static crabs_error_e _check_signer_is_active_admin(attribute_machine_t* am,
     }
   }
   return CRABS_ERR_UNAUTHORIZED;
+}
+
+// Fire the state change hook (devtools change events) for an attribute
+// mutation. am->base_state carries the hook; preview is a short summary.
+static void _notify_attribute_change(attribute_machine_t* am, const char* action,
+                                     const char* target_user, const char* preview) {
+  state_notify_change(&am->base_state, CRABS_CHANGE_ATTRIBUTE, action, NULL,
+                      NULL, am->base_state.config.bootstrap_admin, target_user,
+                      preview, CRABS_SUCCESS);
 }
 
 crabs_error_e attribute_machine_grant_role(attribute_machine_t* am, const char* target_user,
@@ -518,6 +534,7 @@ crabs_error_e attribute_machine_grant_role(attribute_machine_t* am, const char* 
       strncpy(user->attributes[i].verified_by, signer_id, CRABS_MAX_USER_ID - 1);
       user->key_version++;
       am->base_state.version++;
+      _notify_attribute_change(am, "grant_role", target_user, formatted);
       return CRABS_SUCCESS;
     }
   }
@@ -538,6 +555,7 @@ crabs_error_e attribute_machine_grant_role(attribute_machine_t* am, const char* 
   user->key_version++;
   am->base_state.version++;
 
+  _notify_attribute_change(am, "grant_role", target_user, formatted);
   return CRABS_SUCCESS;
 }
 
@@ -589,6 +607,7 @@ crabs_error_e attribute_machine_self_assert(attribute_machine_t* am, const char*
       user->attributes[i].verified_by[0] = '\0';
       user->key_version++;
       am->base_state.version++;
+      _notify_attribute_change(am, "self_assert", signer_id, attribute);
       return CRABS_SUCCESS;
     }
   }
@@ -609,6 +628,7 @@ crabs_error_e attribute_machine_self_assert(attribute_machine_t* am, const char*
   user->key_version++;
   am->base_state.version++;
 
+  _notify_attribute_change(am, "self_assert", signer_id, attribute);
   return CRABS_SUCCESS;
 }
 
@@ -662,6 +682,7 @@ crabs_error_e attribute_machine_verify_identity(attribute_machine_t* am, const c
       user->attributes[i].verified_at = am->current_time_ms;
       user->key_version++;
       am->base_state.version++;
+      _notify_attribute_change(am, "verify_identity", target_user, attribute);
       return CRABS_SUCCESS;
     }
   }
@@ -682,6 +703,7 @@ crabs_error_e attribute_machine_verify_identity(attribute_machine_t* am, const c
   user->key_version++;
   am->base_state.version++;
 
+  _notify_attribute_change(am, "verify_identity", target_user, attribute);
   return CRABS_SUCCESS;
 }
 
@@ -729,6 +751,7 @@ crabs_error_e attribute_machine_revoke_role(attribute_machine_t* am, const char*
 
   user->key_version++;
   am->base_state.version++;
+  _notify_attribute_change(am, "revoke_role", target_user, role);
   return CRABS_SUCCESS;
 }
 
@@ -761,6 +784,7 @@ crabs_error_e attribute_machine_suspend_user_internal(attribute_machine_t* am,
   user->key_version++;
   am->base_state.version++;
 
+  _notify_attribute_change(am, "suspend_user", user_id, "key-rotation suspension");
   return CRABS_SUCCESS;
 }
 
@@ -791,6 +815,7 @@ crabs_error_e attribute_machine_activate_user(attribute_machine_t* am, const cha
   user->key_version++;
   am->base_state.version++;
 
+  _notify_attribute_change(am, "activate_user", target_user, "user activated");
   return CRABS_SUCCESS;
 }
 
@@ -813,6 +838,7 @@ crabs_error_e attribute_machine_revoke_user(attribute_machine_t* am, const char*
   user->key_version++;
   am->base_state.version++;
 
+  _notify_attribute_change(am, "revoke_user", user_id, "user revoked");
   return CRABS_SUCCESS;
 }
 
@@ -931,6 +957,9 @@ crabs_error_e attribute_machine_issue_temporary(attribute_machine_t* am, const c
     am->base_state.version++;
   }
 
+  // No single target user: the grant fans out to every active holder of
+  // `role`, so the role identifies the audience in the event's target field.
+  _notify_attribute_change(am, "issue_temporary", role, attribute);
   return CRABS_SUCCESS;
 }
 
