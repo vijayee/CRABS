@@ -108,6 +108,36 @@ protected:
       serialized_buffer_destroy(ser);
     }
   }
+
+  // Audit: a Mode B (anonymous) operation leaves signer_id empty and is
+  // signed with the caller's own key — the verifier must resolve the signer
+  // from the keyring. The key-version gates must run against that RESOLVED
+  // signer, not against the empty op->signer_id.
+  operation_t* make_anonymous_lock_op() {
+    operation_t* op = operation_create(CRABS_OP_LOCK);
+    memcpy(op->uuid, test_uuid, CRABS_UUID_SIZE);
+    op->resources = (char(*)[CRABS_MAX_USER_ID])malloc(sizeof(char[CRABS_MAX_USER_ID]));
+    strncpy(op->resources[0], "test_resource", CRABS_MAX_USER_ID - 1);
+    op->resource_count = 1;
+    op->required_state = (protocol_state_e*)malloc(sizeof(protocol_state_e));
+    op->required_state[0] = PROTOCOL_IDLE;
+    op->next_state = (protocol_state_e*)malloc(sizeof(protocol_state_e));
+    op->next_state[0] = PROTOCOL_LOCKED;
+    // signer_id intentionally left empty (Mode B).
+    user_t* signer = attribute_machine_find_user(am, "alice");
+    if (signer != NULL) op->signer_key_version = signer->key_version;
+    sign_operation(op);
+    return op;
+  }
+
+  policy_t* find_lock_policy() {
+    for (uint32_t policy_index = 0; policy_index < state->policy_count; policy_index++) {
+      if (strcmp(state->policies[policy_index].operation, CRABS_OP_LOCK) == 0) {
+        return &state->policies[policy_index];
+      }
+    }
+    return NULL;
+  }
 };
 
 // Audit: an op-carried dedup spec is signer-authored (condition, target and
@@ -602,6 +632,104 @@ TEST_F(TestStateMachine, SchemeConstraintRejectsUnspecified) {
   // UNSPECIFIED (zero-init). The allowlist must reject it.
   operation_t* op = make_lock_op();
   EXPECT_EQ(state_machine_execute(state, op), CRABS_ERR_UNAUTHORIZED);
+  operation_destroy(op);
+}
+
+// ============================================================
+// Audit: Mode B (anonymous-signer) operations must not skip the
+// key-version gates. The staleness check and the policy min_key_version
+// floor previously resolved the signer via op->signer_id, which is empty
+// for Mode B, so a lagging keyholder could sign anonymously and bypass a
+// forced-rotation floor with a still-ACTIVE key.
+// ============================================================
+
+TEST_F(TestStateMachine, ModeBOperationEnforcesMinKeyVersionFloor) {
+  // Alice is ACTIVE on key_version 1; the policy forces rotation to >= 5.
+  policy_t* policy = find_lock_policy();
+  ASSERT_NE(policy, nullptr);
+  policy->min_key_version = 5;
+
+  operation_t* op = make_anonymous_lock_op();
+  EXPECT_EQ(state_machine_execute(state, op), CRABS_ERR_KEY_STALE);
+  operation_destroy(op);
+}
+
+TEST_F(TestStateMachine, ModeBOperationEnforcesKeyStalenessCheck) {
+  // The anonymous op declares a key_version that no longer matches the
+  // resolved signer's current version — the staleness gate must fire.
+  user_t* alice = attribute_machine_find_user(am, "alice");
+  ASSERT_NE(alice, nullptr);
+  alice->key_version = 3;
+
+  operation_t* op = make_anonymous_lock_op();
+  op->signer_key_version = 1;  // Stale relative to alice's current version.
+  sign_operation(op);
+  EXPECT_EQ(state_machine_execute(state, op), CRABS_ERR_KEY_STALE);
+  operation_destroy(op);
+}
+
+TEST_F(TestStateMachine, ModeBKeyringSignedOperationEnforcesMinKeyVersionFloor) {
+  crypto_sig_scheme_init();
+  const signature_vtable_t* scheme_vtable = crypto_sig_scheme_get(ECDSA_SECP256K1);
+  ASSERT_NE(scheme_vtable, nullptr);
+  uint8_t public_key[33];
+  uint32_t public_key_len = sizeof(public_key);
+  uint8_t private_key[32];
+  uint32_t private_key_len = sizeof(private_key);
+  ASSERT_EQ(scheme_vtable->generate_keypair(public_key, &public_key_len,
+                                            private_key, &private_key_len),
+            CRABS_SUCCESS);
+
+  // The lagging keyholder registers their still-ACTIVE keyring key.
+  user_t* alice = attribute_machine_find_user(am, "alice");
+  ASSERT_NE(alice, nullptr);
+  ASSERT_EQ(user_key_register(alice, "lagging-key", ECDSA_SECP256K1,
+                              public_key, public_key_len, "primary"),
+            CRABS_SUCCESS);
+
+  policy_t* policy = find_lock_policy();
+  ASSERT_NE(policy, nullptr);
+  policy->min_key_version = 5;
+
+  operation_t* op = operation_create(CRABS_OP_LOCK);
+  memcpy(op->uuid, test_uuid, CRABS_UUID_SIZE);
+  op->resources = (char(*)[CRABS_MAX_USER_ID])malloc(sizeof(char[CRABS_MAX_USER_ID]));
+  strncpy(op->resources[0], "test_resource", CRABS_MAX_USER_ID - 1);
+  op->resource_count = 1;
+  op->required_state = (protocol_state_e*)malloc(sizeof(protocol_state_e));
+  op->required_state[0] = PROTOCOL_IDLE;
+  op->next_state = (protocol_state_e*)malloc(sizeof(protocol_state_e));
+  op->next_state[0] = PROTOCOL_LOCKED;
+  // Mode B: signer_id empty; the op carries the key identity that verifies.
+  op->sig_scheme = ECDSA_SECP256K1;
+  strncpy(op->key_id, "lagging-key", CRABS_MAX_KEY_ID - 1);
+  op->signer_key_version = alice->key_version;
+  op->lamport_time = ++lamport_counter;
+  serialized_buffer_t* ser = crabs_serialize_for_signing(op);
+  ASSERT_NE(ser, nullptr);
+  uint8_t signature[CRABS_SIG_SIZE];
+  uint32_t signature_len = sizeof(signature);
+  ASSERT_EQ(scheme_vtable->sign(private_key, private_key_len,
+                                ser->data, ser->len, signature, &signature_len),
+            CRABS_SUCCESS);
+  memcpy(op->signature, signature, CRABS_SIG_SIZE);
+  serialized_buffer_destroy(ser);
+
+  EXPECT_EQ(state_machine_execute(state, op), CRABS_ERR_KEY_STALE);
+  operation_destroy(op);
+  crypto_sig_scheme_cleanup();
+}
+
+// Mode A behavior must be preserved: a signer whose user record is below
+// the policy min_key_version floor is rejected even with a matching
+// declared key_version.
+TEST_F(TestStateMachine, ModeAOperationEnforcesMinKeyVersionFloor) {
+  policy_t* policy = find_lock_policy();
+  ASSERT_NE(policy, nullptr);
+  policy->min_key_version = 5;
+
+  operation_t* op = make_lock_op();
+  EXPECT_EQ(state_machine_execute(state, op), CRABS_ERR_KEY_STALE);
   operation_destroy(op);
 }
 

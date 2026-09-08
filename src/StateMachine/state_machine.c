@@ -609,9 +609,14 @@ static crabs_error_e _validate_received_hlc(state_t* state, const operation_t* o
 // unauthenticated caller gets a single CRABS_ERR_UNAUTHORIZED; an
 // authenticated caller still receives the specific protocol error below.
 // On success, *pp_out receives the preprocessed policy result (needed by
-// the co-signature check in step 6c).
+// the co-signature check in step 6c) and *resolved_signer_out receives the
+// signer whose key actually verified. For Mode A that is op->signer_id; for
+// Mode B (anonymous ops) it is the user the trial verification matched —
+// the key-version gates in steps 6/6b must run against this resolved
+// signer, because op->signer_id is empty there.
 static crabs_error_e _verify_operation_authorization(state_t* state, const operation_t* op,
-                                                     policy_preprocess_result_t* pp_out) {
+                                                     policy_preprocess_result_t* pp_out,
+                                                     char* resolved_signer_out) {
   if (state->attr_machine == NULL) {
     return CRABS_ERR_UNAUTHORIZED;
   }
@@ -660,6 +665,9 @@ static crabs_error_e _verify_operation_authorization(state_t* state, const opera
     return vr.error;
   }
 
+  strncpy(resolved_signer_out, vr.signer_id, CRABS_MAX_USER_ID - 1);
+  resolved_signer_out[CRABS_MAX_USER_ID - 1] = '\0';
+
   *pp_out = pp;
   return CRABS_SUCCESS;
 }
@@ -678,13 +686,17 @@ static crabs_error_e _check_transitions(state_t* state, const operation_t* op) {
 }
 
 // Step 6 helper: Key version verification (§10.4).
-static crabs_error_e _check_key_version(state_t* state, const operation_t* op) {
+// `signer_id` is the signer RESOLVED by step 3's verification (op->signer_id
+// for Mode A, the keyring-matched user for anonymous Mode B ops — audit:
+// resolving via op->signer_id silently skipped both gates for Mode B).
+static crabs_error_e _check_key_version(state_t* state, const operation_t* op,
+                                        const char* signer_id) {
   // R7-04: the check is mandatory when the signer has a nonzero key_version.
   // The prior `op->signer_key_version > 0` guard let a crafted op with
   // signer_key_version = 0 skip the staleness check entirely, so a replayed op
   // signed with a rotated-out key was accepted.
   if (state->attr_machine != NULL) {
-    user_t* signer = attribute_machine_find_user(state->attr_machine, op->signer_id);
+    user_t* signer = attribute_machine_find_user(state->attr_machine, signer_id);
     if (signer != NULL && signer->key_version > 0 &&
         signer->key_version != op->signer_key_version) {
       return CRABS_ERR_KEY_STALE;
@@ -694,7 +706,11 @@ static crabs_error_e _check_key_version(state_t* state, const operation_t* op) {
 }
 
 // Step 6b helper: Scheme constraint enforcement (v1.3 §7).
-static crabs_error_e _check_scheme_constraints(state_t* state, const operation_t* op) {
+// `signer_id` is the signer RESOLVED by step 3's verification (see
+// _check_key_version) so the min_key_version floor also applies to
+// anonymous Mode B operations.
+static crabs_error_e _check_scheme_constraints(state_t* state, const operation_t* op,
+                                               const char* signer_id) {
   // R7-04: the allowlist is enforced regardless of the op's declared scheme.
   // The prior `op->sig_scheme != SCHEME_UNSPECIFIED` guard let an op bypass
   // the allowlist by declaring the legacy path.
@@ -719,7 +735,7 @@ static crabs_error_e _check_scheme_constraints(state_t* state, const operation_t
       }
     }
     if (policy != NULL && policy->min_key_version > 0 && state->attr_machine != NULL) {
-      user_t* signer = attribute_machine_find_user(state->attr_machine, op->signer_id);
+      user_t* signer = attribute_machine_find_user(state->attr_machine, signer_id);
       if (signer != NULL && signer->key_version < policy->min_key_version) {
         return CRABS_ERR_KEY_STALE;
       }
@@ -809,8 +825,10 @@ static crabs_error_e state_machine_execute_internal(state_t* state, operation_t*
   // (state_machine_validate). Declared unconditionally so the co-signature
   // helper can take its address in either mode.
   policy_preprocess_result_t pp = {0};
+  char resolved_signer[CRABS_MAX_USER_ID];
+  resolved_signer[0] = '\0';
   if (!skip_authorization) {
-    crabs_error_e auth_rc = _verify_operation_authorization(state, op, &pp);
+    crabs_error_e auth_rc = _verify_operation_authorization(state, op, &pp, resolved_signer);
     if (auth_rc != CRABS_SUCCESS) {
       return auth_rc;
     }
@@ -926,12 +944,12 @@ static crabs_error_e state_machine_execute_internal(state_t* state, operation_t*
   // submission time via state_machine_validate, against the same signer and
   // key state the scheduled op carries.
   if (!skip_authorization) {
-    crabs_error_e key_version_rc = _check_key_version(state, op);
+    crabs_error_e key_version_rc = _check_key_version(state, op, resolved_signer);
     if (key_version_rc != CRABS_SUCCESS) {
       return key_version_rc;
     }
 
-    crabs_error_e scheme_rc = _check_scheme_constraints(state, op);
+    crabs_error_e scheme_rc = _check_scheme_constraints(state, op, resolved_signer);
     if (scheme_rc != CRABS_SUCCESS) {
       return scheme_rc;
     }
@@ -1127,7 +1145,9 @@ crabs_error_e state_machine_validate(state_t* state, const operation_t* op) {
   }
 
   policy_preprocess_result_t pp = {0};
-  crabs_error_e rc = _verify_operation_authorization(state, op, &pp);
+  char resolved_signer[CRABS_MAX_USER_ID];
+  resolved_signer[0] = '\0';
+  crabs_error_e rc = _verify_operation_authorization(state, op, &pp, resolved_signer);
   if (rc != CRABS_SUCCESS) return rc;
   // Audit A-4: validate a scheduled embedded op's HLC at submission time,
   // against the scheduling node's clock — this is the only chance, because
@@ -1137,9 +1157,9 @@ crabs_error_e state_machine_validate(state_t* state, const operation_t* op) {
   if (rc != CRABS_SUCCESS) return rc;
   rc = _check_transitions(state, op);
   if (rc != CRABS_SUCCESS) return rc;
-  rc = _check_key_version(state, op);
+  rc = _check_key_version(state, op, resolved_signer);
   if (rc != CRABS_SUCCESS) return rc;
-  rc = _check_scheme_constraints(state, op);
+  rc = _check_scheme_constraints(state, op, resolved_signer);
   if (rc != CRABS_SUCCESS) return rc;
   rc = _verify_co_signatures(state, op, &pp);
   if (rc != CRABS_SUCCESS) return rc;
