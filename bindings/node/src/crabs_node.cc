@@ -17,6 +17,7 @@
 #include <openssl/crypto.h>
 #include <string.h>
 #include <stdlib.h>
+#include <vector>
 
 extern "C" {
 #include "CRABS/data_model.h"
@@ -311,6 +312,24 @@ private:
 // Node — wraps attribute_machine_t + state_t + abe_master_key_t + node_key
 // ============================================================
 
+// Map a crabs_change_kind_e to the event name surfaced to JS listeners.
+static const char* _change_kind_name_napi(crabs_change_kind_e kind) {
+  switch (kind) {
+    case CRABS_CHANGE_OP:        return "op";
+    case CRABS_CHANGE_SCHEDULE:  return "schedule";
+    case CRABS_CHANGE_TRIGGER:   return "trigger";
+    case CRABS_CHANGE_ATTRIBUTE: return "attribute";
+    default:                     return "op";
+  }
+}
+
+// Forward declaration: the body is defined after the Node class so it can
+// call Node::EmitChange (the hook fires inside execute()/registerUser(), which
+// are always invoked from JS, so calling back into the same thread is safe).
+static void _node_change_hook_thunk(state_t* state,
+                                    const crabs_change_event_t* event,
+                                    void* user_data);
+
 class Node : public Napi::ObjectWrap<Node> {
 public:
   static Napi::Object Init(Napi::Env env, Napi::Object exports) {
@@ -343,6 +362,7 @@ public:
       InstanceMethod("flagValue", &Node::FlagValue),
       InstanceMethod("setPolicy", &Node::SetPolicy),
       InstanceMethod("execute", &Node::Execute),
+      InstanceMethod("on", &Node::On),
       InstanceMethod("sign", &Node::SignOp),
       InstanceMethod("createTrigger", &Node::CreateTrigger),
       InstanceMethod("encrypt", &Node::Encrypt),
@@ -398,11 +418,45 @@ public:
 
     // Init sig scheme registry
     crypto_sig_scheme_init();
+
+    // Route state-machine change events to JS listeners registered via on().
+    state_set_change_hook(&am_->base_state, _node_change_hook_thunk, this);
   }
 
   ~Node() {
+    for (auto& listener : change_listeners_) listener.Reset();
     if (node_key_) crypto_ecdsa_keypair_destroy(node_key_);
     if (am_) attribute_machine_destroy(am_);
+  }
+
+  // --- Change events (public: _node_change_hook_thunk calls into this) ---
+
+  // Deliver one C change event to every live 'change' listener. A throwing
+  // listener must never break the state machine, so exceptions are swallowed.
+  void EmitChange(const crabs_change_event_t* event) {
+    if (event == NULL) return;
+    Napi::Env env = Env();
+    Napi::Object obj = Napi::Object::New(env);
+    obj.Set("kind", Napi::String::New(env, _change_kind_name_napi(event->kind)));
+    obj.Set("type", Napi::String::New(env, event->type ? event->type : ""));
+    obj.Set("signer", event->signer_id ? Napi::String::New(env, event->signer_id)
+                                        : env.Null());
+    obj.Set("node", event->node_id ? Napi::String::New(env, event->node_id)
+                                    : env.Null());
+    obj.Set("target", event->target ? Napi::String::New(env, event->target)
+                                     : env.Null());
+    obj.Set("preview", Napi::String::New(env,
+                                          event->preview ? event->preview : ""));
+    obj.Set("result", Napi::Number::New(env, (double)event->result));
+    Napi::Value undefined_value = env.Undefined();
+    for (auto& listener : change_listeners_) {
+      if (listener.IsEmpty()) continue;
+      try {
+        listener.Call(undefined_value, {obj});
+      } catch (...) {
+        // A throwing listener must never break the state machine.
+      }
+    }
   }
 
 private:
@@ -410,6 +464,27 @@ private:
   attribute_machine_t* am_;
   std::string admin_id_;
   crabs_ordering_config_t ordering_config_;
+  std::vector<Napi::FunctionReference> change_listeners_;
+
+  // node.on('change', cb) returns an off() function that unregisters cb.
+  Napi::Value On(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 2 || !info[0].IsString() || !info[1].IsFunction())
+      throw Napi::TypeError::New(env, "Expected (eventName, listener)");
+    if (info[0].As<Napi::String>().Utf8Value() != "change")
+      return env.Undefined();
+    change_listeners_.push_back(
+        Napi::Persistent(info[1].As<Napi::Function>()));
+    size_t slot = change_listeners_.size() - 1;
+    auto* node_self = this;
+    return Napi::Function::New(env,
+        [node_self, slot](const Napi::CallbackInfo& off_info) {
+      (void)off_info;
+      if (slot < node_self->change_listeners_.size()) {
+        node_self->change_listeners_[slot].Reset();
+      }
+    });
+  }
 
   // --- User management ---
 
@@ -986,6 +1061,15 @@ private:
     return info.Env().Undefined();
   }
 };
+
+// C change-hook trampoline: forward-declared before Node so the constructor
+// can register it; defined here so it can reach Node::EmitChange.
+static void _node_change_hook_thunk(state_t* state,
+                                    const crabs_change_event_t* event,
+                                    void* user_data) {
+  (void)state;
+  static_cast<Node*>(user_data)->EmitChange(event);
+}
 
 // ============================================================
 // Module initialization

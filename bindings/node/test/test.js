@@ -108,5 +108,33 @@ const serialized = node.serialize();
 assert(Buffer.isBuffer(serialized), 'Serialize should return a Buffer');
 assert(serialized.length > 0, 'Serialized state should not be empty');
 
+// Test 16: change events fire on execute and registerUser; off() unsubscribes
+const changeEvents = [];
+const bobKey = KeyPair.generate();
+const carolKey = KeyPair.generate();
+const unsubscribeChange = node.on('change', (changeEvent) => changeEvents.push(changeEvent));
+
+const viewOp2 = new Operation('view');
+viewOp2.signerId = 'alice';
+node.sign(viewOp2, aliceKey);
+node.execute(viewOp2);
+const opChangeEvent = changeEvents.find(
+  (changeEvent) => changeEvent.kind === 'op' && changeEvent.type === 'view');
+assert(opChangeEvent !== undefined, 'execute should fire an op change event');
+assert(opChangeEvent.signer === 'alice', 'Op change event should name the signer');
+assert(opChangeEvent.result === 0, 'Op change event should report success');
+
+node.registerUser('bob', bobKey.publicKeyHex(), '');
+assert(changeEvents.some((changeEvent) => changeEvent.kind === 'attribute'),
+  'registerUser should fire an attribute change event');
+
+const eventCountBeforeUnsubscribe = changeEvents.length;
+unsubscribeChange();
+node.registerUser('carol', carolKey.publicKeyHex(), '');
+assert(changeEvents.length === eventCountBeforeUnsubscribe,
+  'unsubscribed listener must not fire');
+assert(node.getUser('carol') !== undefined,
+  'Mutations after unsubscribe should still apply');
+
 console.log(`\n${passed} passed, ${failed} failed`);
 process.exit(failed > 0 ? 1 : 0);

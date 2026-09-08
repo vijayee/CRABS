@@ -78,6 +78,16 @@ export interface NodeOptions {
   strategy?: 'naive' | 'bounded' | 'quorum' | 'strict' | 'trusted';
 }
 
+export interface CrabsChangeEvent {
+  kind: 'op' | 'schedule' | 'trigger' | 'attribute';
+  type: string;
+  signer: string | null;
+  node: string | null;
+  target: string | null;
+  preview: string;
+  result: number;  // crabs_error_e
+}
+
 export interface Node {
   // User management
   registerUser(userId: string, publicKeyHex: string, initialAttrs?: string): void;
@@ -85,6 +95,8 @@ export interface Node {
   selfAssert(attribute: string, value: string, signerId: string): void;
   verifyIdentity(targetUser: string, attribute: string, value: string, signerId: string): void;
   revokeUser(userId: string, signerId?: string): void;
+  /** Subscribe to state-change events ('change' only). Returns an off() function. */
+  on(eventName: 'change', listener: (event: CrabsChangeEvent) => void): () => void;
   getUser(userId: string): UserInfo | undefined;
   getNodeKey(): NodeKey;
 
