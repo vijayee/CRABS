@@ -11,6 +11,8 @@ extern "C" {
 #include "../src/Crypto/crypto.h"
 #include "../src/Attribute/attribute_machine.h"
 #include "../src/CRDT/crdt_merge.h"
+#include "../src/Trigger/trigger.h"
+#include "../src/OT/ot_ordered_set.h"
 #include <openssl/sha.h>
 }
 
@@ -1333,5 +1335,219 @@ TEST(TestSerialization, RoundTripPreservesORSet) {
 
   serialized_buffer_destroy(buf);
   state_destroy(restored);
+  state_destroy(state);
+}
+
+// Audit A-3 (HIGH): triggers were never serialized — save/load silently
+// dropped every trigger definition. v9 persists them; round-trip must
+// preserve every field of trigger_t (condition_ast is re-derived from the
+// condition string on load).
+TEST(TestSerialization, TriggerStateRoundTripPreservesAllFields) {
+  state_t* state = state_create();
+
+  trigger_effect_t effect;
+  memset(&effect, 0, sizeof(effect));
+  effect.type = TRIGGER_EFFECT_ISSUE_ATTRIBUTE;
+  strncpy(effect.issue_attribute, "role", CRABS_MAX_POLICY_EXPR - 1);
+  strncpy(effect.target_role, "moderator", CRABS_MAX_USER_ID - 1);
+  effect.duration_ms = 5000;
+  strncpy(effect.attribute_value, "elevated", CRABS_MAX_POLICY_EXPR - 1);
+  strncpy(effect.policy_operation, "__read__", CRABS_MAX_OP_NAME - 1);
+  strncpy(effect.policy_expression, "role >= moderator", CRABS_MAX_POLICY_EXPR - 1);
+
+  trigger_t* trigger = trigger_create("high_views", "Fires when views >= 50",
+                                      "views >= 50", &effect, 60000, true, "admin");
+  ASSERT_NE(trigger, nullptr);
+  ASSERT_NE(trigger->condition_ast, nullptr);
+
+  // Production shape: state-owned trigger array (see test_trigger.cpp setup)
+  state->trigger_count = 1;
+  state->triggers = (trigger_t*)realloc(state->triggers, sizeof(trigger_t));
+  ASSERT_NE(state->triggers, nullptr);
+  state->triggers[0] = *trigger;
+  free(trigger);
+  // Runtime-mutated fields that must also survive
+  state->triggers[0].last_triggered_at = 9999;
+  state->triggers[0].expires_at = 123456;
+  state->triggers[0].created_at = 777;
+  state->triggers[0].enabled = false;
+
+  serialized_buffer_t* buf = crabs_serialize_state(state);
+  ASSERT_NE(buf, nullptr);
+
+  state_t* restored = crabs_deserialize_state(buf->data, buf->len);
+  ASSERT_NE(restored, nullptr);
+  ASSERT_EQ(restored->trigger_count, 1u);
+
+  const trigger_t* restored_trigger = &restored->triggers[0];
+  EXPECT_STREQ(restored_trigger->trigger_id, "high_views");
+  EXPECT_STREQ(restored_trigger->description, "Fires when views >= 50");
+  EXPECT_STREQ(restored_trigger->condition, "views >= 50");
+  EXPECT_EQ(restored_trigger->effect.type, TRIGGER_EFFECT_ISSUE_ATTRIBUTE);
+  EXPECT_STREQ(restored_trigger->effect.issue_attribute, "role");
+  EXPECT_STREQ(restored_trigger->effect.target_role, "moderator");
+  EXPECT_EQ(restored_trigger->effect.duration_ms, (uint64_t)5000);
+  EXPECT_STREQ(restored_trigger->effect.attribute_value, "elevated");
+  EXPECT_STREQ(restored_trigger->effect.policy_operation, "__read__");
+  EXPECT_STREQ(restored_trigger->effect.policy_expression, "role >= moderator");
+  EXPECT_EQ(restored_trigger->cooldown_ms, (uint64_t)60000);
+  EXPECT_EQ(restored_trigger->last_triggered_at, (uint64_t)9999);
+  EXPECT_TRUE(restored_trigger->one_shot);
+  EXPECT_FALSE(restored_trigger->enabled);
+  EXPECT_EQ(restored_trigger->expires_at, (uint64_t)123456);
+  EXPECT_EQ(restored_trigger->created_at, (uint64_t)777);
+  EXPECT_STREQ(restored_trigger->created_by, "admin");
+  // The AST must be re-derived so the restored trigger can actually fire
+  EXPECT_NE(restored_trigger->condition_ast, nullptr);
+
+  serialized_buffer_destroy(buf);
+  state_destroy(restored);
+  state_destroy(state);
+}
+
+// v8 blobs predate the triggers section. The v9 reader must accept a v8 blob
+// and restore a state with zero triggers (no phantom entries, no parse drift).
+TEST(TestSerializationV2, TestV8BlobWithoutTriggerSectionRestoresZeroTriggers) {
+  std::vector<uint8_t> v8buf;
+  auto write_u8 = [&](uint8_t v) { v8buf.push_back(v); };
+  auto write_u32 = [&](uint32_t v) { for (uint32_t b = 0; b < 4; b++) v8buf.push_back((uint8_t)((v >> (b * 8)) & 0xFF)); };
+  auto write_u64 = [&](uint64_t v) { for (uint32_t b = 0; b < 8; b++) v8buf.push_back((uint8_t)((v >> (b * 8)) & 0xFF)); };
+  auto write_str16 = [&](const char* s) {
+    uint16_t slen = s ? (uint16_t)strlen(s) : 0;
+    v8buf.push_back((uint8_t)(slen & 0xFF));
+    v8buf.push_back((uint8_t)((slen >> 8) & 0xFF));
+    for (uint16_t ch = 0; ch < slen; ch++) v8buf.push_back((uint8_t)s[ch]);
+  };
+
+  // Magic "CRAB" + version 8
+  v8buf.push_back(0x43); v8buf.push_back(0x52);
+  v8buf.push_back(0x41); v8buf.push_back(0x42);
+  write_u32(8);
+  write_u64(3);   // state_version
+  write_u32(0);   // item_count
+  write_u32(0);   // policy_count
+  write_u32(0);   // log_count
+  // config (v2+ layout)
+  write_u64(5000);          // max_lock_duration_ms
+  write_u32(3);             // max_lock_extensions
+  write_u8(1);              // allow_force_unlock
+  write_str16("admin");     // bootstrap_admin
+  write_u8(0);              // sig_config.default_scheme
+  write_u32(0);             // sig_config.max_keys_per_user
+  write_u8(0);              // sig_config.key_rotation_enabled
+  write_u32(0);             // sig_config.co_sign_threshold
+  write_u8(0);              // sig_config.key_expiry_enabled
+  write_u64(0);             // sig_config.default_key_ttl_ms
+  write_u64(0);             // sig_config.max_key_age_ms
+  write_u8(0);              // vault_config.provider
+  write_str16("");          // vault_config.address
+  write_str16("");          // vault_config.auth_token
+  write_u8(0);              // vault_config.signing_delegated
+  write_u8(0);              // vault_config.rotation_delegated
+  // schedules (v6+)
+  write_u64(0);   // schedule_seq
+  write_u32(0);   // schedule_count
+  // v8 ends here — no triggers section
+
+  uint8_t v8hash[32];
+  SHA256(v8buf.data(), v8buf.size(), v8hash);
+  for (int i = 0; i < 32; i++) v8buf.push_back(v8hash[i]);
+
+  state_t* restored = crabs_deserialize_state(v8buf.data(), v8buf.size());
+  ASSERT_NE(restored, nullptr);
+  EXPECT_EQ(restored->version, (uint64_t)3);
+  EXPECT_EQ(restored->trigger_count, 0u);
+  EXPECT_EQ(restored->triggers, nullptr);
+
+  state_destroy(restored);
+}
+
+// Audit A-5 (MEDIUM): log_count had no remaining-bytes bound before the
+// log_count * sizeof(log_entry_t) allocation. The count is chosen just under
+// the CRABS_DESER_MAX_LOG cap so the remaining-bytes bound is what rejects
+// the blob (a count above the cap is already caught by the cap itself).
+TEST(TestSerialization, TestDeserialRejectsHugeLogCount) {
+  state_t* state = state_create();
+  serialized_buffer_t* buf = crabs_serialize_state(state);
+  ASSERT_NE(buf, nullptr);
+
+  // log_count lives at offset 4(magic) + 4(version) + 8(state_version)
+  //                                   + 4(item_count) + 4(policy_count) = 24
+  uint32_t huge_log_count = 999999; // just under CRABS_DESER_MAX_LOG
+  for (int byte_index = 0; byte_index < 4; byte_index++) {
+    buf->data[24 + byte_index] = (uint8_t)((huge_log_count >> (byte_index * 8)) & 0xFF);
+  }
+
+  // Recompute checksum so only the count bound can reject the blob
+  uint8_t hash[32];
+  SHA256(buf->data, buf->len - 32, hash);
+  memcpy(buf->data + buf->len - 32, hash, 32);
+
+  state_t* result = crabs_deserialize_state(buf->data, buf->len);
+  EXPECT_EQ(result, nullptr);
+
+  serialized_buffer_destroy(buf);
+  state_destroy(state);
+}
+
+// Audit finding (MEDIUM): the v8 ordered-set reader accepted duplicate
+// element ids, unlike the OT tree path which rejects them. Craft a valid
+// blob, overwrite the second element's id with the first element's id,
+// fix the checksum, and expect rejection.
+TEST(TestSerialization, TestDeserialRejectsDuplicateOrderedSetElementIds) {
+  state_t* state = state_create();
+  crabs_ot_ordered_set_t* set = crabs_ot_ordered_set_create();
+  ASSERT_NE(set, nullptr);
+
+  crabs_ot_op_id_t id1 = {"node1", 1, 1000};
+  crabs_ot_op_id_t id2 = {"node1", 2, 2000};
+  crabs_ot_operation_t op1 = {};
+  op1.id = id1;
+  op1.op_type = CRABS_OT_OP_INSERT;
+  op1.payload = (uint8_t*)"aaaa";
+  op1.payload_size = 4;
+  ASSERT_NE(crabs_ot_ordered_set_apply_insert(set, &op1), nullptr);
+  crabs_ot_operation_t op2 = {};
+  op2.id = id2;
+  op2.op_type = CRABS_OT_OP_INSERT;
+  op2.payload = (uint8_t*)"bbbb";
+  op2.payload_size = 4;
+  ASSERT_NE(crabs_ot_ordered_set_apply_insert(set, &op2), nullptr);
+
+  data_item_t* item = data_item_create("set1", (data_type_e)DATA_TYPE_OT_ORDERED_SET, CRDT_CUSTOM);
+  item->value = set;
+  item->ot_data = set->ot_data;
+  state_add_item(state, item);
+
+  // Sanity: the unmodified blob must round-trip
+  serialized_buffer_t* buf = crabs_serialize_state(state);
+  ASSERT_NE(buf, nullptr);
+  state_t* sane = crabs_deserialize_state(buf->data, buf->len);
+  ASSERT_NE(sane, nullptr);
+  state_destroy(sane);
+
+  // Each element's id (80 bytes: node_id[64] + seq(8) + ts(8)) immediately
+  // precedes its value bytes32 (4-byte length + payload). The last occurrence
+  // of each unique payload is the element value (earlier occurrences are the
+  // op_log payloads inside the ot_data blob). Overwrite element 2's id with
+  // element 1's id.
+  uint8_t* value_a = NULL;
+  uint8_t* value_b = NULL;
+  for (size_t scan = buf->len - 5; scan > 0; scan--) {
+    if (value_b == NULL && memcmp(buf->data + scan, "bbbb", 4) == 0) value_b = buf->data + scan;
+    if (value_a == NULL && memcmp(buf->data + scan, "aaaa", 4) == 0) value_a = buf->data + scan;
+  }
+  ASSERT_NE(value_a, nullptr);
+  ASSERT_NE(value_b, nullptr);
+  memcpy(value_b - 84, value_a - 84, 80);
+
+  uint8_t hash[32];
+  SHA256(buf->data, buf->len - 32, hash);
+  memcpy(buf->data + buf->len - 32, hash, 32);
+
+  state_t* result = crabs_deserialize_state(buf->data, buf->len);
+  EXPECT_EQ(result, nullptr);
+
+  serialized_buffer_destroy(buf);
   state_destroy(state);
 }

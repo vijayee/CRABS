@@ -10,6 +10,8 @@
 #include "../OT/ot_document.h"
 #include "../OT/ot_tree.h"
 #include "../OT/ot_transform.h"
+#include "../Trigger/trigger.h"
+#include "../Condition/condition.h"
 #include <string.h>
 #include <openssl/sha.h>
 
@@ -19,6 +21,13 @@
 #define CRABS_DESER_MAX_ITEMS   100000
 #define CRABS_DESER_MAX_POLICIES 10000
 #define CRABS_DESER_MAX_LOG     1000000
+// Audit A-3: bound the trigger array read from the wire the same way as the
+// other attacker-controlled counts.
+#define CRABS_DESER_MAX_TRIGGERS 100000
+// Minimum wire size of one trigger: nine string16s (empty = 2 bytes each),
+// the effect type byte, two bool8s, and five u64 timestamps. Used to bound
+// the trigger count against the remaining buffer.
+#define CRABS_DESER_MIN_TRIGGER_WIRE_BYTES 61
 // R8-SER-2/3: bound the OT tree node count so the O(n²) duplicate-id and
 // parent-lookup scans cannot be driven to a multi-minute CPU DoS by a crafted
 // blob (CRABS_DESER_MAX_LOG allows 1M nodes → ~10¹² strcmp calls).
@@ -442,6 +451,15 @@ static bool _deserialize_ot_type_state(read_buf_t* buf, data_item_t* item,
       for (uint32_t i = 0; i < count; i++) {
         crabs_ot_op_id_t id;
         if (!_deserialize_ot_op_id(buf, &id)) return false;
+
+        // Audit finding: reject duplicate element ids, matching the OT tree
+        // path. Id-keyed lookups (crabs_ot_ordered_set_find and the merges)
+        // become ambiguous when two elements share an id, and a crafted blob
+        // could alias one element onto another.
+        for (crabs_ordered_element_t* seen_element = set->head; seen_element != NULL;
+             seen_element = seen_element->next) {
+          if (crabs_ot_op_id_equal(&seen_element->id, &id)) return false;
+        }
 
         uint8_t* value = NULL;
         uint32_t value_size = 0;
@@ -1280,6 +1298,62 @@ static bool _deserialize_log_entry(read_buf_t* buf, log_entry_t* entry) {
 // ============================================================
 // State serialization (§13.1)
 // ============================================================
+
+// Audit A-3: triggers were never serialized, so save/load silently dropped
+// every trigger definition. v9 persists all trigger_t fields (the condition
+// AST is runtime state re-derived from the condition string on load).
+static void _serialize_trigger(write_buf_t* buf, const trigger_t* trigger) {
+  _write_string16(buf, trigger->trigger_id);
+  _write_string16(buf, trigger->description);
+  _write_string16(buf, trigger->condition);
+  _write_uint8(buf, (uint8_t)trigger->effect.type);
+  _write_string16(buf, trigger->effect.issue_attribute);
+  _write_string16(buf, trigger->effect.target_role);
+  _write_uint64_le(buf, trigger->effect.duration_ms);
+  _write_string16(buf, trigger->effect.attribute_value);
+  _write_string16(buf, trigger->effect.policy_operation);
+  _write_string16(buf, trigger->effect.policy_expression);
+  _write_uint64_le(buf, trigger->cooldown_ms);
+  _write_uint64_le(buf, trigger->last_triggered_at);
+  _write_bool8(buf, trigger->one_shot);
+  _write_bool8(buf, trigger->enabled);
+  _write_uint64_le(buf, trigger->expires_at);
+  _write_uint64_le(buf, trigger->created_at);
+  _write_string16(buf, trigger->created_by);
+}
+
+static bool _deserialize_trigger(read_buf_t* buf, trigger_t* trigger) {
+  if (!_read_string16(buf, trigger->trigger_id, CRABS_MAX_USER_ID)) return false;
+  if (!_read_string16(buf, trigger->description, CRABS_MAX_POLICY_EXPR)) return false;
+  if (!_read_string16(buf, trigger->condition, CRABS_MAX_POLICY_EXPR)) return false;
+  uint8_t effect_type;
+  if (!_read_uint8(buf, &effect_type)) return false;
+  trigger->effect.type = (trigger_effect_type_e)effect_type;
+  if (!_read_string16(buf, trigger->effect.issue_attribute, CRABS_MAX_POLICY_EXPR)) return false;
+  if (!_read_string16(buf, trigger->effect.target_role, CRABS_MAX_USER_ID)) return false;
+  if (!_read_uint64_le(buf, &trigger->effect.duration_ms)) return false;
+  if (!_read_string16(buf, trigger->effect.attribute_value, CRABS_MAX_POLICY_EXPR)) return false;
+  if (!_read_string16(buf, trigger->effect.policy_operation, CRABS_MAX_OP_NAME)) return false;
+  if (!_read_string16(buf, trigger->effect.policy_expression, CRABS_MAX_POLICY_EXPR)) return false;
+  if (!_read_uint64_le(buf, &trigger->cooldown_ms)) return false;
+  if (!_read_uint64_le(buf, &trigger->last_triggered_at)) return false;
+  uint8_t one_shot;
+  if (!_read_uint8(buf, &one_shot)) return false;
+  trigger->one_shot = (one_shot != 0);
+  uint8_t enabled;
+  if (!_read_uint8(buf, &enabled)) return false;
+  trigger->enabled = (enabled != 0);
+  if (!_read_uint64_le(buf, &trigger->expires_at)) return false;
+  if (!_read_uint64_le(buf, &trigger->created_at)) return false;
+  if (!_read_string16(buf, trigger->created_by, CRABS_MAX_USER_ID)) return false;
+  // Re-derive the AST so the restored trigger can fire. Fail closed when the
+  // condition does not parse — state_machine_op_create_trigger never stores
+  // such a trigger, so a blob carrying one is malformed.
+  trigger->condition_ast = condition_parse(trigger->condition);
+  if (trigger->condition_ast == NULL) return false;
+  return true;
+}
+
 serialized_buffer_t* crabs_serialize_state(const state_t* state) {
   if (state == NULL) return NULL;
 
@@ -1354,6 +1428,12 @@ serialized_buffer_t* crabs_serialize_state(const state_t* state) {
     _write_bytes(buf, schedule_entry->op_bytes, schedule_entry->op_len);
   }
 
+  // triggers (v9): persisted trigger definitions
+  _write_uint32_le(buf, state->trigger_count);
+  for (uint32_t trigger_index = 0; trigger_index < state->trigger_count; trigger_index++) {
+    _serialize_trigger(buf, &state->triggers[trigger_index]);
+  }
+
   // Checksum: SHA-256 of all preceding bytes.
   // NOTE: this is an INTEGRITY/CORRUPTION check, NOT authentication. An
   // attacker who can modify the blob can recompute this hash. Loading state
@@ -1423,7 +1503,15 @@ state_t* crabs_deserialize_state(const uint8_t* data, size_t len) {
   // log_count
   uint32_t log_count;
   if (!_read_uint32_le(&buf, &log_count)) goto fail;
-  if (log_count > CRABS_DESER_MAX_LOG) goto fail;
+  // Audit A-5: bound the allocation to the remaining buffer like the other
+  // counters (see pc_count below). A log entry occupies at least 64 wire
+  // bytes, so a count above remaining/64 cannot be satisfied by the blob;
+  // without this a few-byte blob could drive a multi-GB allocation (the
+  // aborting allocator turns it into a DoS).
+  if (log_count > CRABS_DESER_MAX_LOG ||
+      log_count > (buf.len - buf.offset) / 64) {
+    goto fail;
+  }
 
   // items
   data_item_t* tail = NULL;
@@ -1520,6 +1608,27 @@ state_t* crabs_deserialize_state(const uint8_t* data, size_t len) {
          schedule_entry != NULL; schedule_entry = schedule_entry->next) {
       if (state->schedule_seq < schedule_entry->schedule_id) {
         state->schedule_seq = schedule_entry->schedule_id;
+      }
+    }
+  }
+
+  // triggers (v9+): persisted trigger definitions. The section is absent in
+  // pre-v9 blobs, which restore with zero triggers.
+  if (version >= 9) {
+    uint32_t trigger_count;
+    if (!_read_uint32_le(&buf, &trigger_count)) goto fail;
+    // Audit A-3: bound the allocation to the remaining buffer. Each trigger
+    // occupies at least CRABS_DESER_MIN_TRIGGER_WIRE_BYTES wire bytes, so a
+    // count above remaining/min cannot be satisfied by the blob.
+    if (trigger_count > CRABS_DESER_MAX_TRIGGERS ||
+        trigger_count > (buf.len - buf.offset) / CRABS_DESER_MIN_TRIGGER_WIRE_BYTES) {
+      goto fail;
+    }
+    if (trigger_count > 0) {
+      state->triggers = get_clear_memory(trigger_count * sizeof(trigger_t));
+      state->trigger_count = trigger_count;
+      for (uint32_t trigger_index = 0; trigger_index < trigger_count; trigger_index++) {
+        if (!_deserialize_trigger(&buf, &state->triggers[trigger_index])) goto fail;
       }
     }
   }

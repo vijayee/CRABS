@@ -18,7 +18,7 @@
 // Magic bytes and format version (§13.1)
 // ============================================================
 #define CRABS_SERIAL_MAGIC      0x42415243  // "CRAB" in little-endian
-#define CRABS_SERIAL_VERSION    8           // v8: ordered-set placement metadata
+#define CRABS_SERIAL_VERSION    9           // v9: triggers persisted
 
 // ============================================================
 // Serialized buffer
