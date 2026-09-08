@@ -220,7 +220,9 @@ crabs_error_e scheduler_process_due(state_t* state, uint64_t now_ms) {
         }
         state_machine_log_schedule_failure(state, failure_uuid, entry->submitter);
         state_notify_change(state, CRABS_CHANGE_SCHEDULE, "__schedule_failed__",
-                            failure_uuid, entry->submitter, NULL, NULL,
+                            failure_uuid, entry->submitter, NULL, state->hlc_state_initialized
+                             ? state->hlc_state.last.node_id
+                             : state->config.bootstrap_admin,
                             "schedule failed; durable failure recorded",
                             CRABS_ERR_INTERNAL);
         free(entry->op_bytes);
@@ -261,7 +263,9 @@ crabs_error_e scheduler_process_due(state_t* state, uint64_t now_ms) {
         // signers already need lamport > their signed value).
         state_machine_log_schedule_failure(state, embedded->uuid, embedded->signer_id);
         state_notify_change(state, CRABS_CHANGE_SCHEDULE, "__schedule_failed__",
-                            embedded->uuid, embedded->signer_id, NULL, NULL,
+                            embedded->uuid, embedded->signer_id, NULL, state->hlc_state_initialized
+                             ? state->hlc_state.last.node_id
+                             : state->config.bootstrap_admin,
                             "schedule failed; durable failure recorded",
                             CRABS_ERR_INTERNAL);
       }
@@ -307,7 +311,9 @@ crabs_error_e scheduler_process_due(state_t* state, uint64_t now_ms) {
         }
         state_machine_log_schedule_failure(state, failure_uuid, entry->submitter);
         state_notify_change(state, CRABS_CHANGE_SCHEDULE, "__schedule_failed__",
-                            failure_uuid, entry->submitter, NULL, NULL,
+                            failure_uuid, entry->submitter, NULL, state->hlc_state_initialized
+                             ? state->hlc_state.last.node_id
+                             : state->config.bootstrap_admin,
                             "schedule failed; durable failure recorded",
                             CRABS_ERR_INTERNAL);
         bytes_corrupt = true;
@@ -340,7 +346,9 @@ crabs_error_e scheduler_process_due(state_t* state, uint64_t now_ms) {
                                              occurrence->signer_id);
           state_notify_change(state, CRABS_CHANGE_SCHEDULE, "__schedule_failed__",
                               occurrence->uuid, occurrence->signer_id, NULL,
-                              NULL, "schedule failed; durable failure recorded",
+                              state->hlc_state_initialized
+                             ? state->hlc_state.last.node_id
+                             : state->config.bootstrap_admin, "schedule failed; durable failure recorded",
                               CRABS_ERR_INTERNAL);
         }
         operation_destroy(occurrence);

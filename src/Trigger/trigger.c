@@ -102,7 +102,11 @@ static crabs_error_e _execute_trigger_effect(state_t* state, trigger_t* trigger,
       );
       if (err != CRABS_SUCCESS) return err;
       state_notify_change(state, CRABS_CHANGE_TRIGGER, "issue_temporary", NULL,
-                          NULL, NULL, trigger->effect.issue_attribute,
+                          NULL,
+                          state->hlc_state_initialized
+                              ? state->hlc_state.last.node_id
+                              : state->config.bootstrap_admin,
+                          trigger->effect.issue_attribute,
                           "trigger issued temporary attribute", CRABS_SUCCESS);
       break;
     }
