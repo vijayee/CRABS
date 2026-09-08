@@ -8,6 +8,7 @@
 #ifdef __EMSCRIPTEN__
 
 #include <emscripten.h>
+#include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
 
@@ -24,18 +25,105 @@
 
 #ifdef CRABS_ENABLE_DEVTOOLS
 #include "../Devtools/devtools.h"
+#endif
 
-// Change hook registered on every node's base state: every mutation the
-// state reports (executes, schedules, triggers, attribute changes) is
-// recorded into the devtools ring.
-static void _devtools_change_hook(state_t* state,
+// ============================================================
+// Change-event forwarding to JS
+// ============================================================
+// A single module-wide JS trampoline receives one JSON string per change
+// event. Registered once per module by any Node via
+// crabs_wasm_set_change_trampoline. The per-node hook forwards to the
+// devtools ring (dev builds) and to JS (all builds).
+
+static void (*s_js_change_trampoline)(const char* json) = NULL;
+
+// Serialize a string as a JSON string body (without quotes), escaping
+// backslashes and double quotes. Truncates to fit.
+static void _json_escape_into(const char* src, char* out, size_t out_size) {
+  size_t out_index = 0;
+  for (const char* p = (src != NULL) ? src : ""; *p != '\0'; p++) {
+    if (out_index + 2 >= out_size) break;
+    if (*p == '"' || *p == '\\') out[out_index++] = '\\';
+    out[out_index++] = *p;
+  }
+  out[out_index] = '\0';
+}
+
+// Serialize a change event as a JSON object string (malloc'd; caller frees).
+static char* _change_event_json(const crabs_change_event_t* event) {
+  char type_buf[CRABS_MAX_OP_NAME + 8];
+  char signer_buf[CRABS_MAX_USER_ID + 8];
+  char node_buf[CRABS_MAX_USER_ID + 8];
+  char target_buf[CRABS_MAX_USER_ID + 8];
+  char preview_buf[128];
+  _json_escape_into(event->type, type_buf, sizeof(type_buf));
+  _json_escape_into(event->signer_id, signer_buf, sizeof(signer_buf));
+  _json_escape_into(event->node_id, node_buf, sizeof(node_buf));
+  _json_escape_into(event->target, target_buf, sizeof(target_buf));
+  _json_escape_into(event->preview, preview_buf, sizeof(preview_buf));
+
+  char uuid_hex[CRABS_UUID_SIZE * 2 + 1];
+  uuid_hex[0] = '\0';
+  if (event->uuid != NULL) {
+    static const char hex_chars[] = "0123456789abcdef";
+    for (uint32_t uuid_byte_index = 0; uuid_byte_index < CRABS_UUID_SIZE;
+         uuid_byte_index++) {
+      uuid_hex[uuid_byte_index * 2] = hex_chars[event->uuid[uuid_byte_index] >> 4];
+      uuid_hex[uuid_byte_index * 2 + 1] =
+          hex_chars[event->uuid[uuid_byte_index] & 0x0F];
+    }
+    uuid_hex[CRABS_UUID_SIZE * 2] = '\0';
+  }
+
+  const char* kind_name = "op";
+  switch (event->kind) {
+    case CRABS_CHANGE_SCHEDULE:  kind_name = "schedule"; break;
+    case CRABS_CHANGE_TRIGGER:   kind_name = "trigger"; break;
+    case CRABS_CHANGE_ATTRIBUTE: kind_name = "attribute"; break;
+    default: break;
+  }
+
+  size_t needed = strlen(type_buf) + strlen(signer_buf) + strlen(node_buf) +
+                  strlen(target_buf) + strlen(preview_buf) + 160;
+  char* json = (char*)malloc(needed);
+  if (json == NULL) return NULL;
+  snprintf(json, needed,
+           "{\"kind\":\"%s\",\"type\":\"%s\",\"uuid\":\"%s\","
+           "\"signer\":\"%s\",\"node\":\"%s\",\"target\":\"%s\","
+           "\"preview\":\"%s\",\"result\":%u}",
+           kind_name, type_buf, uuid_hex, signer_buf, node_buf, target_buf,
+           preview_buf, (unsigned)event->result);
+  return json;
+}
+
+static void _forward_change_to_js(state_t* state,
                                   const crabs_change_event_t* event,
                                   void* user_data) {
-  (void)state;
-  (void)user_data;
-  devtools_record_change(state, event);
+  (void)state; (void)user_data;
+  if (s_js_change_trampoline == NULL || event == NULL) return;
+  char* json = _change_event_json(event);
+  if (json == NULL) return;
+  s_js_change_trampoline(json);
+  free(json);
 }
+
+// Per-node hook registered on every node's base state: every mutation the
+// state reports (executes, schedules, triggers, attribute changes) is
+// recorded into the devtools ring (dev builds) and forwarded to JS.
+static void _node_change_hook(state_t* state,
+                              const crabs_change_event_t* event,
+                              void* user_data) {
+  (void)state;
+#ifdef CRABS_ENABLE_DEVTOOLS
+  devtools_record_change(state, event);
 #endif
+  _forward_change_to_js(state, event, user_data);
+}
+
+EMSCRIPTEN_KEEPALIVE
+void crabs_wasm_set_change_trampoline(void (*trampoline)(const char* json)) {
+  s_js_change_trampoline = trampoline;
+}
 
 // ============================================================
 // Node lifecycle (HLC-enabled)
@@ -67,9 +155,7 @@ attribute_machine_t* crabs_wasm_node_create(const char* admin_id) {
   crabs_hlc_state_init(&am->base_state.hlc_state, admin_id);
   am->base_state.hlc_state_initialized = true;
 
-#ifdef CRABS_ENABLE_DEVTOOLS
-  state_set_change_hook(&am->base_state, _devtools_change_hook, am);
-#endif
+  state_set_change_hook(&am->base_state, _node_change_hook, am);
 
   crypto_ecdsa_keypair_destroy(node_key);
   return am;

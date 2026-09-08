@@ -115,6 +115,7 @@ BASE_EXPORTS='[
   "_crabs_wasm_schedule_first",
   "_crabs_wasm_schedule_next",
   "_crabs_wasm_schedule_id",
+  "_crabs_wasm_set_change_trampoline",
   "_crabs_wasm_set_schedule_occurrence_budget",
   "_crabs_wasm_schedule_occurrence_budget",
   "_crabs_wasm_schedule_execute_at",

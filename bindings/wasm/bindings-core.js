@@ -19,6 +19,46 @@ function createBindings(loadModule) {
   }
 
 // ============================================================
+// Change events
+// ============================================================
+
+// Module-wide change-event plumbing: one trampoline per WASM module,
+// dispatching to every Node's listeners (filtered by node id, which is the
+// bootstrap admin id stamped into op->node_id).
+const _changeListenerRegistry = new WeakMap();  // M -> array of {node, listener}
+
+function getChangeListeners(M) {
+  if (!_changeListenerRegistry.has(M)) {
+    _changeListenerRegistry.set(M, []);
+  }
+  return _changeListenerRegistry.get(M);
+}
+
+function ensureChangeTrampoline(M) {
+  const listeners = getChangeListeners(M);
+  if (listeners._trampoline) return;
+  const trampoline = M.addFunction((jsonPointer) => {
+    const text = jsonPointer ? M.UTF8ToString(jsonPointer) : '';
+    let event;
+    try {
+      event = JSON.parse(text);
+    } catch (parseError) {
+      return;  // malformed event: drop, never throw into C
+    }
+    for (const entry of listeners.slice()) {
+      if (entry.node != null && event.node !== entry.node) continue;
+      try {
+        entry.listener(event);
+      } catch (listenerError) {
+        console.warn('crabs: change listener failed', listenerError);
+      }
+    }
+  }, 'vi');
+  listeners._trampoline = trampoline;
+  M._crabs_wasm_set_change_trampoline(trampoline);
+}
+
+// ============================================================
 // Helpers
 // ============================================================
 
@@ -250,6 +290,22 @@ class Node {
     this._M = M;
     this._am = amPtr;
     this.adminId = null;
+  }
+
+  // Change events: 'change' listeners receive one event object per state
+  // mutation, pushed from the C change hook through a WASM trampoline.
+  on(eventName, listener) {
+    if (eventName !== 'change' || typeof listener !== 'function') return;
+    ensureChangeTrampoline(this._M);
+    getChangeListeners(this._M).push({ node: this.adminId, listener });
+  }
+
+  off(eventName, listener) {
+    if (eventName !== 'change') return;
+    const listeners = getChangeListeners(this._M);
+    const entry_index = listeners.findIndex(
+      (entry) => entry.listener === listener);
+    if (entry_index >= 0) listeners.splice(entry_index, 1);
   }
 
   static async create(adminId, options = {}) {

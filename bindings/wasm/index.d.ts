@@ -1,5 +1,16 @@
 // TypeScript definitions for crabs-wasm
 
+export interface CrabsChangeEvent {
+  kind: 'op' | 'schedule' | 'trigger' | 'attribute';
+  type: string;
+  uuid: string;
+  signer: string;
+  node: string;
+  target: string | null;
+  preview: string;
+  result: number;  // crabs_error_e
+}
+
 export interface KeyPair {
   publicKeyHex(): string;
   privateKeyHex(): string;
@@ -87,6 +98,10 @@ export interface Node {
   registerUser(userId: string, publicKeyHex: string, initialAttrs?: string): void;
   grantRole(targetUser: string, role: string, value: string, signerId: string): void;
   revokeUser(userId: string, signerId?: string): void;
+  /** Subscribe to state-change events ('change' only). */
+  on(eventName: 'change', listener: (event: CrabsChangeEvent) => void): void;
+  /** Remove a previously registered 'change' listener. */
+  off(eventName: 'change', listener: (event: CrabsChangeEvent) => void): void;
   getUser(userId: string): UserInfo | undefined;
 
   addCounter(name: string): void;
