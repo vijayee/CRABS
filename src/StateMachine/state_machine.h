@@ -80,7 +80,7 @@ typedef struct op_handler_entry_t {
 } op_handler_entry_t;
 
 // ============================================================
-// State Change Notification (devtools change events core)
+// State Change Notification (core; not devtools-gated)
 // ============================================================
 // Register a callback fired after every state-mutating completion: direct
 // execution (kind OP), scheduled materialization (kind SCHEDULE), trigger

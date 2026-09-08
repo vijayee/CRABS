@@ -706,38 +706,45 @@ TEST_F(TestStateMachine, AuditLogHashChainIsNonZeroAndChained) {
 // ============================================================
 
 // Stateless sink: a captureless lambda cannot reach local variables, so the
-// hook tests use a static struct. Place ABOVE the first test that uses it.
+// hook tests use a static struct. The event is borrowed only for the
+// duration of the hook call, so the hook copies it into static storage.
+// Place ABOVE the first test that uses it.
 struct ChangeSink {
-  static const crabs_change_event_t* last_event;
+  static crabs_change_event_t last_event_storage;
+  static bool has_event;
   static int call_count;
   static void hook(state_t*, const crabs_change_event_t* event, void* user_data) {
     (void)user_data;
-    ChangeSink::last_event = event;
+    ChangeSink::last_event_storage = *event;
+    ChangeSink::has_event = true;
     ChangeSink::call_count++;
   }
 };
-const crabs_change_event_t* ChangeSink::last_event = nullptr;
+crabs_change_event_t ChangeSink::last_event_storage;
+bool ChangeSink::has_event = false;
 int ChangeSink::call_count = 0;
 
 TEST_F(TestStateMachine, ChangeHookFiresOnExecuteSuccess) {
   state_set_change_hook(state, ChangeSink::hook, nullptr);
   ChangeSink::call_count = 0;
+  ChangeSink::has_event = false;
 
   operation_t* op = make_lock_op();
   ASSERT_EQ(state_machine_execute(state, op), CRABS_SUCCESS);
   operation_destroy(op);
 
   EXPECT_EQ(ChangeSink::call_count, 1);
-  ASSERT_NE(ChangeSink::last_event, nullptr);
-  EXPECT_STREQ(ChangeSink::last_event->type, "lock");
-  EXPECT_EQ(ChangeSink::last_event->kind, CRABS_CHANGE_OP);
-  EXPECT_EQ(ChangeSink::last_event->result, CRABS_SUCCESS);
+  ASSERT_TRUE(ChangeSink::has_event);
+  EXPECT_STREQ(ChangeSink::last_event_storage.type, "__lock__");
+  EXPECT_EQ(ChangeSink::last_event_storage.kind, CRABS_CHANGE_OP);
+  EXPECT_EQ(ChangeSink::last_event_storage.result, CRABS_SUCCESS);
   state_set_change_hook(state, nullptr, nullptr);
 }
 
 TEST_F(TestStateMachine, ChangeHookFiresOnExecuteFailure) {
   state_set_change_hook(state, ChangeSink::hook, nullptr);
   ChangeSink::call_count = 0;
+  ChangeSink::has_event = false;
 
   // Corrupt signature -> cryptographic failure; no state mutation, but the
   // event still fires (devtools parity with the old recorder).
@@ -747,13 +754,14 @@ TEST_F(TestStateMachine, ChangeHookFiresOnExecuteFailure) {
   operation_destroy(op);
 
   EXPECT_EQ(ChangeSink::call_count, 1);
-  EXPECT_NE(ChangeSink::last_event->result, CRABS_SUCCESS);
+  EXPECT_NE(ChangeSink::last_event_storage.result, CRABS_SUCCESS);
   state_set_change_hook(state, nullptr, nullptr);
 }
 
 TEST_F(TestStateMachine, ChangeHookIdempotentSkipFiresNothing) {
   state_set_change_hook(state, ChangeSink::hook, nullptr);
   ChangeSink::call_count = 0;
+  ChangeSink::has_event = false;
 
   operation_t* op = make_lock_op();
   ASSERT_EQ(state_machine_execute(state, op), CRABS_SUCCESS);
@@ -768,6 +776,8 @@ TEST_F(TestStateMachine, ChangeHookIdempotentSkipFiresNothing) {
 
 TEST_F(TestStateMachine, ChangeHookNullIsNoOp) {
   state_set_change_hook(state, nullptr, nullptr);  // must not crash
+  ChangeSink::call_count = 0;
+  ChangeSink::has_event = false;
   operation_t* op = make_lock_op();
   ASSERT_EQ(state_machine_execute(state, op), CRABS_SUCCESS);
   operation_destroy(op);
@@ -776,6 +786,7 @@ TEST_F(TestStateMachine, ChangeHookNullIsNoOp) {
 TEST_F(TestStateMachine, ChangeHookIsRuntimeStateNotSerialized) {
   state_set_change_hook(state, ChangeSink::hook, nullptr);
   ChangeSink::call_count = 0;
+  ChangeSink::has_event = false;
 
   serialized_buffer_t* blob = crabs_serialize_state(state);
   ASSERT_NE(blob, nullptr);
@@ -791,4 +802,37 @@ TEST_F(TestStateMachine, ChangeHookIsRuntimeStateNotSerialized) {
   EXPECT_EQ(restored->change_hook, nullptr);
   state_destroy(restored);
   state_set_change_hook(state, nullptr, nullptr);
+}
+
+// state_notify_change_for_op propagates every operation field, and a
+// non-NULL preview_override replaces the default.
+TEST_F(TestStateMachine, ChangeHookForOpPropagation) {
+  state_set_change_hook(state, ChangeSink::hook, nullptr);
+  ChangeSink::call_count = 0;
+  ChangeSink::has_event = false;
+
+  operation_t* op = make_lock_op();
+  state_notify_change_for_op(state, CRABS_CHANGE_OP, op, "preview text",
+                             CRABS_ERR_UNAUTHORIZED);
+
+  ASSERT_TRUE(ChangeSink::has_event);
+  EXPECT_EQ(ChangeSink::last_event_storage.kind, CRABS_CHANGE_OP);
+  EXPECT_STREQ(ChangeSink::last_event_storage.type, "__lock__");
+  EXPECT_EQ(ChangeSink::last_event_storage.uuid, op->uuid);
+  EXPECT_STREQ(ChangeSink::last_event_storage.signer_id, "alice");
+  EXPECT_STREQ(ChangeSink::last_event_storage.target, "test_resource");
+  EXPECT_STREQ(ChangeSink::last_event_storage.preview, "preview text");
+  EXPECT_EQ(ChangeSink::last_event_storage.result, CRABS_ERR_UNAUTHORIZED);
+  operation_destroy(op);
+  state_set_change_hook(state, nullptr, nullptr);
+}
+
+// state_notify_change with no hook registered is a no-op (direct call).
+TEST_F(TestStateMachine, ChangeNotifyWithoutHookIsNoOp) {
+  state_set_change_hook(state, nullptr, nullptr);
+  ChangeSink::call_count = 0;
+  ChangeSink::has_event = false;
+  state_notify_change(state, CRABS_CHANGE_OP, "lock", nullptr, "alice",
+                      "alice", "test_resource", "preview", CRABS_SUCCESS);
+  EXPECT_EQ(ChangeSink::call_count, 0);
 }
