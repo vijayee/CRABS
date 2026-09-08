@@ -5,7 +5,7 @@
 // 'dislike', 'subscribe', 'flag'); firing one of those ops goes through
 // state_machine_execute. Every mutation path fires a change event, and the
 // devtools panels subscribe to node.on('change'), so timeline, transitions,
-// and CRDT values all update without any manual refresh. A second browser
+// and state-tree values all update without any manual refresh. A second browser
 // tab acts as a peer: fired ops are relayed as serialized signed bytes over
 // BroadcastChannel and re-executed.
 //
@@ -110,8 +110,9 @@ async function scheduleMint(dev, node, actorId, signingKeypair) {
   mintOperation.nodeId = actorId;
   node.sign(mintOperation, signingKeypair);
   node.schedule(mintOperation, Date.now() + 60000);
-  // Scheduling fires a change event, so the panels show the new Schedules row
-  // in the Config tab without any manual refresh.
+  // Scheduling and materialization both fire change events, so the panels
+  // show the pending schedule (State tab overview line) as soon as it is
+  // submitted and the mint itself when it fires, without any manual refresh.
 }
 
 // Schedule a mint every 15 seconds, three times. The series fires in order
@@ -175,7 +176,7 @@ function startRelay(dev, node) {
   const bobNode = await setupNode(dev, 'bob-admin', 'bob', bobKeypair);
 
   // ABE-encrypt the demo contact once (the encrypting node acts as admin) and
-  // store the raw ciphertext bytes in both nodes' contact registers. The CRDT
+  // store the raw ciphertext bytes in both nodes' contact registers. The State
   // tab then shows "[encrypted: N bytes]" instead of the plaintext address.
   const encryptedContact = aliceNode.encrypt(
     new TextEncoder().encode('alice@example.com'), 'tos_investigator');

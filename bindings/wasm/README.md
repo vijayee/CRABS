@@ -135,8 +135,9 @@ By default `attach` renders the panel as a floating overlay appended to
   you show or hide layers, and payload previews summarize what each mutation
   touched.
 
-Every mutation (executed operations, schedule materialization, trigger
-effects, attribute grants) also fires a `'change'` event to JS listeners.
+Every mutation (executed operations, schedule submission and
+materialization, trigger effects, attribute grants) also fires a `'change'`
+event to JS listeners.
 `node.on('change', listener)` returns an unsubscribe function;
 `node.off('change', listener)` does the same by identity:
 
@@ -146,6 +147,11 @@ const unsubscribe = node.on('change', (event) => {
 });
 unsubscribe();  // when done
 ```
+
+Note: direct CRDT convenience calls that mutate without executing an
+operation (e.g. `addCounter`, `setPolicy`, and similar direct-write helpers)
+do not fire change events; executed operations, schedules, triggers, and
+attribute mutations do.
 
 Trust note: change events are observational — the callback must not mutate
 node state. Nested mutations raised inside a listener are deferred rather
