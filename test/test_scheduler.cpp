@@ -1296,3 +1296,48 @@ TEST(SchedulerRecurring, ChangeHookFiresPerMaterializedSlot) {
   state_set_change_hook(state, nullptr, nullptr);
   crabs_test_env_destroy(&env);
 }
+
+// Audit finding: the schedule SUBMISSION change event passed node_id NULL,
+// so it rendered as "node":"" and never matched any per-node listener filter
+// (and the per-node ring drain). The event must carry the same attribution
+// the scheduler's failure sites use: the node's HLC node id, or the
+// bootstrap admin on lamport-only nodes.
+TEST(SchedulerList, SubmissionChangeEventCarriesNodeId) {
+  crabs_test_env_t env;
+  crabs_test_env_init(&env);
+  state_t* state = env.state;
+
+  // HLC-initialized node: the submission event must carry the HLC node id.
+  crabs_hlc_state_init(&state->hlc_state, "admin-node");
+  state->hlc_state_initialized = true;
+
+  static char captured_node[CRABS_MAX_USER_ID];
+  static bool submission_event_seen;
+  captured_node[0] = '\0';
+  submission_event_seen = false;
+  state_set_change_hook(state, [](state_t* hook_state,
+                                  const crabs_change_event_t* event,
+                                  void* user_data) {
+    (void)hook_state; (void)user_data;
+    if (event->kind == CRABS_CHANGE_SCHEDULE && !submission_event_seen) {
+      submission_event_seen = true;
+      if (event->node_id != NULL) {
+        strncpy(captured_node, event->node_id, CRABS_MAX_USER_ID - 1);
+        captured_node[CRABS_MAX_USER_ID - 1] = '\0';
+      }
+    }
+  }, nullptr);
+
+  operation_t* op = make_counter_op("mint", "admin");
+  ASSERT_NE(scheduler_schedule(state, 9999999, "admin", op), 0u);
+  operation_destroy(op);
+
+  state_set_change_hook(state, nullptr, nullptr);
+
+  // The FIRST SCHEDULE-kind event is the submission (materialization events
+  // only fire on a later tick) — it must carry the node id, never NULL.
+  EXPECT_TRUE(submission_event_seen);
+  EXPECT_STREQ(captured_node, "admin-node");
+
+  crabs_test_env_destroy(&env);
+}

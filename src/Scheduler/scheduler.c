@@ -73,8 +73,15 @@ static uint64_t _append_schedule(state_t* state, uint64_t execute_at_ms,
   char schedule_preview[96];
   snprintf(schedule_preview, sizeof(schedule_preview), "scheduled at %llu",
            (unsigned long long)execute_at_ms);
+  // Audit finding: the submission event passed node_id NULL, rendering as
+  // "node":"" and never matching any per-node listener filter (or the
+  // per-node ring drain). Attribute it like the failure sites below: the
+  // node's HLC node id, or the bootstrap admin on lamport-only nodes.
   state_notify_change(state, CRABS_CHANGE_SCHEDULE, op->type, op->uuid,
-                      submitter, NULL,
+                      submitter,
+                      state->hlc_state_initialized
+                          ? state->hlc_state.last.node_id
+                          : state->config.bootstrap_admin,
                       op->resource_count > 0 && op->resources
                           ? op->resources[0]
                           : NULL,
