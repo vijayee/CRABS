@@ -37,15 +37,44 @@
 
 static void (*s_js_change_trampoline)(const char* json) = NULL;
 
+// Fixed literal overhead of the change-event JSON envelope: all the keys,
+// quotes, and the result field beyond the escaped string bodies (measured
+// ~68 bytes; margin included for kind-name growth).
+#define JSON_FIXED_OVERHEAD 160
+
 // Serialize a string as a JSON string body (without quotes), escaping
-// backslashes and double quotes. Truncates to fit.
+// backslashes, double quotes, and control characters (<0x20). Truncates to
+// fit; output is always NUL-terminated.
 static void _json_escape_into(const char* src, char* out, size_t out_size) {
   size_t out_index = 0;
-  for (const char* p = (src != NULL) ? src : ""; *p != '\0'; p++) {
-    if (out_index + 2 >= out_size) break;
-    if (*p == '"' || *p == '\\') out[out_index++] = '\\';
-    out[out_index++] = *p;
+  for (const char* cursor = (src != NULL) ? src : ""; *cursor != '\0'; cursor++) {
+    char escaped_pair[3];
+    switch (*cursor) {
+      case '"':  escaped_pair[0] = '\\'; escaped_pair[1] = '"';  break;
+      case '\\': escaped_pair[0] = '\\'; escaped_pair[1] = '\\'; break;
+      case '\n': escaped_pair[0] = '\\'; escaped_pair[1] = 'n';  break;
+      case '\r': escaped_pair[0] = '\\'; escaped_pair[1] = 'r';  break;
+      case '\t': escaped_pair[0] = '\\'; escaped_pair[1] = 't';  break;
+      default:
+        if ((unsigned char)*cursor < 0x20) {
+          // Other control chars: \u00XX (4 hex digits after a backslash-u).
+          if (out_index + 6 >= out_size) goto done;
+          static const char hex_chars[] = "0123456789abcdef";
+          out[out_index++] = '\\';
+          out[out_index++] = 'u';
+          out[out_index++] = '0';
+          out[out_index++] = '0';
+          out[out_index++] = hex_chars[((unsigned char)*cursor) >> 4];
+          out[out_index++] = hex_chars[((unsigned char)*cursor) & 0x0F];
+          continue;
+        }
+        escaped_pair[0] = *cursor; escaped_pair[1] = '\0'; break;
+    }
+    if (out_index + 3 >= out_size) break;
+    out[out_index++] = escaped_pair[0];
+    if (escaped_pair[1] != '\0') out[out_index++] = escaped_pair[1];
   }
+done:
   out[out_index] = '\0';
 }
 
@@ -84,7 +113,7 @@ static char* _change_event_json(const crabs_change_event_t* event) {
   }
 
   size_t needed = strlen(type_buf) + strlen(signer_buf) + strlen(node_buf) +
-                  strlen(target_buf) + strlen(preview_buf) + 160;
+                  strlen(target_buf) + strlen(preview_buf) + JSON_FIXED_OVERHEAD;
   char* json = (char*)malloc(needed);
   if (json == NULL) return NULL;
   snprintf(json, needed,

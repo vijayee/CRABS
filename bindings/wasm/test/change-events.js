@@ -27,11 +27,24 @@ async function main() {
   node.execute(op);
   node.incrementCounter('views', 1, 'alice');
 
-  assert.ok(events.length >= 2, 'expected change events from mutations');
-  assert.ok(events.some((event) => event.kind === 'op'),
-            'expected at least one op-kind event');
-  assert.ok(events.some((event) => event.kind === 'attribute'),
-            'attribute mutations (registerUser/grantRole) must fire events');
+  // Pinned exactly: registerUser and grantRole each fire one attribute event,
+  // the executed view op fires one op event; the counter increment and policy
+  // set emit no change events, so the sequence yields exactly these three.
+  const expectedEvents = [
+    { kind: 'attribute', type: 'register_user', target: 'alice' },
+    { kind: 'attribute', type: 'grant_role', target: 'alice' },
+    { kind: 'op', type: 'view', target: '' },
+  ];
+  assert.strictEqual(events.length, expectedEvents.length,
+                     `expected exactly ${expectedEvents.length} change events, got ${events.length}`);
+  expectedEvents.forEach((expected, index) => {
+    assert.strictEqual(events[index].kind, expected.kind,
+                       `event ${index} kind mismatch`);
+    assert.strictEqual(events[index].type, expected.type,
+                       `event ${index} type mismatch`);
+    assert.strictEqual(events[index].target, expected.target,
+                       `event ${index} target mismatch`);
+  });
   assert.ok(events.every((event) => event.node === 'admin'),
             'events must carry the node id');
 

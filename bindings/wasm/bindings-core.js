@@ -31,7 +31,22 @@ function getChangeListeners(M) {
   if (!_changeListenerRegistry.has(M)) {
     _changeListenerRegistry.set(M, []);
   }
-  return _changeListenerRegistry.get(M);
+  const listeners = _changeListenerRegistry.get(M);
+  if (!listeners._pending) listeners._pending = [];
+  return listeners;
+}
+
+// Deliver one event to every matching listener. Listener failures are
+// contained so one bad listener cannot starve the others.
+function dispatchChangeEvent(listeners, event) {
+  for (const entry of listeners.slice()) {
+    if (entry.node != null && event.node !== entry.node) continue;
+    try {
+      entry.listener(event);
+    } catch (listenerError) {
+      console.warn('crabs: change listener failed', listenerError);
+    }
+  }
 }
 
 function ensureChangeTrampoline(M) {
@@ -45,13 +60,18 @@ function ensureChangeTrampoline(M) {
     } catch (parseError) {
       return;  // malformed event: drop, never throw into C
     }
-    for (const entry of listeners.slice()) {
-      if (entry.node != null && event.node !== entry.node) continue;
-      try {
-        entry.listener(event);
-      } catch (listenerError) {
-        console.warn('crabs: change listener failed', listenerError);
+    if (listeners._dispatching) {
+      listeners._pending.push(event);   // nested: defer until outer dispatch drains
+      return;
+    }
+    listeners._dispatching = true;
+    try {
+      dispatchChangeEvent(listeners, event);
+      while (listeners._pending.length > 0) {
+        dispatchChangeEvent(listeners, listeners._pending.shift());
       }
+    } finally {
+      listeners._dispatching = false;
     }
   }, 'vi');
   listeners._trampoline = trampoline;
@@ -303,9 +323,9 @@ class Node {
   off(eventName, listener) {
     if (eventName !== 'change') return;
     const listeners = getChangeListeners(this._M);
-    const entry_index = listeners.findIndex(
-      (entry) => entry.listener === listener);
-    if (entry_index >= 0) listeners.splice(entry_index, 1);
+    const entryIndex = listeners.findIndex(
+      (entry) => entry.listener === listener && entry.node === this.adminId);
+    if (entryIndex >= 0) listeners.splice(entryIndex, 1);
   }
 
   static async create(adminId, options = {}) {
