@@ -65,9 +65,9 @@
     }
     .toggle.open { background: #1a56db; color: #ffffff; border: 1px solid #1a56db; }
     .toggle.collapsed { background: #ffffff; color: #1a56db; border: 1px solid #e5e7eb; }
-    // Overlay styling must live on the HOST: attach() adds the overlay
-    // class to the <crabs-devtools> element itself, so :host(.overlay) is
-    // what applies it. The inner .panel then fills the fixed-size host.
+    /* Overlay styling must live on the HOST: attach() adds the overlay
+       class to the <crabs-devtools> element itself, so :host(.overlay) is
+       what applies it. The inner .panel then fills the fixed-size host. */
     :host(.overlay) {
       position: fixed;
       top: 0; right: 0; bottom: 0;
