@@ -314,10 +314,19 @@ class Node {
 
   // Change events: 'change' listeners receive one event object per state
   // mutation, pushed from the C change hook through a WASM trampoline.
+  // on('change', listener) returns an unsubscribe function, matching the
+  // N-API binding (node.off('change', listener) also works).
   on(eventName, listener) {
     if (eventName !== 'change' || typeof listener !== 'function') return;
     ensureChangeTrampoline(this._M);
-    getChangeListeners(this._M).push({ node: this.adminId, listener });
+    const listeners = getChangeListeners(this._M);
+    listeners.push({ node: this.adminId, listener });
+    const node = this;
+    return () => {
+      const entryIndex = listeners.findIndex(
+        (entry) => entry.listener === listener && entry.node === node.adminId);
+      if (entryIndex >= 0) listeners.splice(entryIndex, 1);
+    };
   }
 
   off(eventName, listener) {

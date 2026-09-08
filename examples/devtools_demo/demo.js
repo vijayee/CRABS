@@ -3,9 +3,11 @@
 //
 // Each node registers JS handlers for custom op types ('view', 'like',
 // 'dislike', 'subscribe', 'flag'); firing one of those ops goes through
-// state_machine_execute, so the devtools timeline, transitions, and CRDT
-// values all update. A second browser tab acts as a peer: fired ops are
-// relayed as serialized signed bytes over BroadcastChannel and re-executed.
+// state_machine_execute. Every mutation path fires a change event, and the
+// devtools panels subscribe to node.on('change'), so timeline, transitions,
+// and CRDT values all update without any manual refresh. A second browser
+// tab acts as a peer: fired ops are relayed as serialized signed bytes over
+// BroadcastChannel and re-executed.
 //
 // Identity layout:
 //   - Each node bootstraps a distinct admin user ('alice-admin'/'bob-admin')
@@ -24,15 +26,6 @@
 'use strict';
 
 const CHANNEL_NAME = 'crabs-devtools-demo';
-
-// Devtools controllers, populated in main(); refreshPanels() re-renders them
-// after mutations that happen outside state_machine_execute (execute already
-// auto-refreshes the panel of the node it ran on).
-let panelControllers = [];
-
-function refreshPanels() {
-  for (const { controller } of panelControllers) controller.refresh();
-}
 
 // Fixed demo signing keys (secp256r1 scalars, generated once out-of-band).
 const DEMO_PRIVATE_KEYS = {
@@ -117,9 +110,8 @@ async function scheduleMint(dev, node, actorId, signingKeypair) {
   mintOperation.nodeId = actorId;
   node.sign(mintOperation, signingKeypair);
   node.schedule(mintOperation, Date.now() + 60000);
-  // Scheduling runs outside execute, so refresh the panels explicitly to show
-  // the new Schedules row in the Config tab.
-  refreshPanels();
+  // Scheduling fires a change event, so the panels show the new Schedules row
+  // in the Config tab without any manual refresh.
 }
 
 // Schedule a mint every 15 seconds, three times. The series fires in order
@@ -131,7 +123,6 @@ async function scheduleRecurringMint(dev, node, actorId, signingKeypair) {
   mintOperation.nodeId = actorId;
   node.sign(mintOperation, signingKeypair);
   node.scheduleRecurring(mintOperation, Date.now() + 15000, 15000, 3, 0);
-  refreshPanels();
 }
 
 async function fireOperation(dev, node, actorId, signingKeypair, opType) {
@@ -146,10 +137,9 @@ async function fireOperation(dev, node, actorId, signingKeypair, opType) {
     // already appear in the devtools timeline; keep them out of the console.
     console.info('execute rejected ' + opType + ': ' + executeError.message);
   }
-  // Trigger evaluation runs outside execute, so refresh the panels explicitly
-  // afterwards (e.g. three Flag ops fire the tos_threshold trigger).
+  // Trigger evaluation runs outside execute; its attribute issuances fire
+  // change events too (e.g. three Flag ops fire the tos_threshold trigger).
   node.evaluateTriggers();
-  refreshPanels();
   // Broadcast regardless of the local outcome: a peer that has not applied
   // this operation yet may still accept it.
   if (window.demoChannel) {
@@ -167,7 +157,6 @@ function startRelay(dev, node) {
       console.info('relay rejected ' + operation.type + ': ' + executeError.message);
     }
     node.evaluateTriggers();
-    refreshPanels();
   };
 }
 
@@ -193,10 +182,10 @@ function startRelay(dev, node) {
   aliceNode.setRegisterBytes('contact', encryptedContact, 'alice');
   bobNode.setRegisterBytes('contact', encryptedContact, 'bob');
 
-  panelControllers = [
-    attach(aliceNode, { nodeId: 'alice-admin', mount: document.getElementById('alice-panel') }),
-    attach(bobNode, { nodeId: 'bob-admin', mount: document.getElementById('bob-panel') }),
-  ];
+  // No mount target: both panels default to a floating overlay in the corner
+  // of the viewport (pass mount: <element> to embed one in the page).
+  attach(aliceNode, { nodeId: 'alice-admin' });
+  attach(bobNode, { nodeId: 'bob-admin' });
 
   const actions = [
     ['View (increment views)', (node, actorId, keypair) => fireOperation(dev, node, actorId, keypair, 'view')],

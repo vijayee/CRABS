@@ -19,13 +19,13 @@
     button:hover { background: #dbeafe; }
     button.bad { background: #fee2e2; color: #991b1b; }
     .hint { color: #6b7280; font-size: 12px; margin-bottom: 10px; }
-    crabs-devtools { display: block; }
   </style>
 </head>
 <body>
   <h1>CRABS Devtools Demo</h1>
   <p class="subtitle">
-    Two nodes (alice, bob) in this tab share one WASM module; each has its own panel.
+    Two nodes (alice, bob) in this tab share one WASM module; each has its own
+    devtools overlay panel (floating in the corner of the viewport).
     Open a second tab for "two tabs = two peers" mode (ops replicate via BroadcastChannel).
   </p>
   <p class="subtitle">Serve from the repository root, e.g. <code>python3 -m http.server 8000</code>, then open <code>/examples/devtools_demo/</code>.</p>
@@ -34,13 +34,11 @@
       <h2>Alice's node</h2>
       <div class="hint">Ops are HLC-ordered, so every operation from a signer is accepted in sequence. Dislike has no policy, so it is always rejected — rejections show up in the timeline too. Three Flag ops fire the tos_threshold trigger (Config tab shows FIRED). The contact register is ABE-encrypted, so the CRDT tab shows the encrypted marker, never the plaintext address. The "Schedule mint (+60s)" button queues a timed mint: the Config tab's Schedules section counts down, and after ~60s the mint materializes (Timeline + tokens counter) and the Schedules row disappears. The "Schedule 3 mints (every 15s)" button queues a recurring mint: the Schedules row shows "every 15s × 3", three mints materialize over ~45s, then the row disappears.</div>
       <div class="op-grid" id="alice-ops"></div>
-      <div id="alice-panel"></div>
     </div>
     <div class="node-col">
       <h2>Bob's node</h2>
       <div class="hint">Ops are HLC-ordered, so every operation from a signer is accepted in sequence. Dislike has no policy, so it is always rejected — rejections show up in the timeline too. Three Flag ops fire the tos_threshold trigger (Config tab shows FIRED). The contact register is ABE-encrypted, so the CRDT tab shows the encrypted marker, never the plaintext address. The "Schedule mint (+60s)" button queues a timed mint: the Config tab's Schedules section counts down, and after ~60s the mint materializes (Timeline + tokens counter) and the Schedules row disappears. The "Schedule 3 mints (every 15s)" button queues a recurring mint: the Schedules row shows "every 15s × 3", three mints materialize over ~45s, then the row disappears.</div>
       <div class="op-grid" id="bob-ops"></div>
-      <div id="bob-panel"></div>
     </div>
   </div>
   <script src="../../bindings/wasm/crabs.dev.js"></script>

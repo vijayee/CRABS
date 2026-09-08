@@ -120,6 +120,38 @@ the dev artifact.
 See `examples/devtools_demo/` for a working two-node demo (open the page in
 two tabs to watch operations replicate between peers over BroadcastChannel).
 
+### State inspector & change events
+
+By default `attach` renders the panel as a floating overlay appended to
+`document.body`; pass `mount: <element>` to embed it inside the page instead.
+
+- **State tab** — a tree of the node's full CRABS state (CRDT items, policies,
+  triggers, schedules, users) with diff badges marking what the latest change
+  event added, changed, or removed, an overview header (node id, version, HLC,
+  audit-log head, pending schedules), and an Export button that downloads the
+  snapshot as JSON.
+- **Timeline tab** — the live change-event stream. Every row carries a layer
+  pill (`op`, `schedule`, `trigger`, or `attribute`), filter checkboxes let
+  you show or hide layers, and payload previews summarize what each mutation
+  touched.
+
+Every mutation (executed operations, schedule materialization, trigger
+effects, attribute grants) also fires a `'change'` event to JS listeners.
+`node.on('change', listener)` returns an unsubscribe function;
+`node.off('change', listener)` does the same by identity:
+
+```js
+const unsubscribe = node.on('change', (event) => {
+  console.log(event.kind, event.type, event.target, event.result);
+});
+unsubscribe();  // when done
+```
+
+Trust note: change events are observational — the callback must not mutate
+node state. Nested mutations raised inside a listener are deferred rather
+than forbidden, but re-entrant mutation from a listener is a design smell;
+the events carry no credentials, so they cannot authorize anything.
+
 ## Timed transactions
 
 Operations whose effects apply at a future time. A signed operation is stored

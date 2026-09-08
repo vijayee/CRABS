@@ -98,8 +98,9 @@ export interface Node {
   registerUser(userId: string, publicKeyHex: string, initialAttrs?: string): void;
   grantRole(targetUser: string, role: string, value: string, signerId: string): void;
   revokeUser(userId: string, signerId?: string): void;
-  /** Subscribe to state-change events ('change' only). */
-  on(eventName: 'change', listener: (event: CrabsChangeEvent) => void): void;
+  /** Subscribe to state-change events ('change' only). Returns an
+   *  unsubscribe function that removes the listener again. */
+  on(eventName: 'change', listener: (event: CrabsChangeEvent) => void): () => void;
   /** Remove a previously registered 'change' listener. */
   off(eventName: 'change', listener: (event: CrabsChangeEvent) => void): void;
   getUser(userId: string): UserInfo | undefined;
