@@ -1147,14 +1147,24 @@ TEST_F(TestAttributeMachine, TestRegisterUserRejectsBadAttrNameInInitialAttrs) {
 
 // Change notification: attribute mutations fire CRABS_CHANGE_ATTRIBUTE.
 TEST_F(TestAttributeMachine, ChangeHookFiresOnAttributeMutations) {
-  static const crabs_change_event_t* captured_event;
+  static char captured_type[CRABS_MAX_OP_NAME];
+  static char captured_target[CRABS_MAX_USER_ID];
+  static int captured_kind;
   static int captured_count;
   captured_count = 0;
   state_set_change_hook(&am->base_state, [](state_t* hook_state,
                                             const crabs_change_event_t* event,
                                             void* user_data) {
     (void)hook_state; (void)user_data;
-    captured_event = event;   // read within this test only
+    captured_kind = (int)event->kind;
+    if (event->type != NULL) {
+      strncpy(captured_type, event->type, sizeof(captured_type) - 1);
+      captured_type[sizeof(captured_type) - 1] = '\0';
+    }
+    if (event->target != NULL) {
+      strncpy(captured_target, event->target, sizeof(captured_target) - 1);
+      captured_target[sizeof(captured_target) - 1] = '\0';
+    }
     captured_count++;
   }, nullptr);
 
@@ -1162,17 +1172,17 @@ TEST_F(TestAttributeMachine, ChangeHookFiresOnAttributeMutations) {
   _gen_pk(user_pk);
   ASSERT_EQ(attribute_machine_register_user(am, "bob", user_pk, NULL), CRABS_SUCCESS);
   EXPECT_EQ(captured_count, 1);
-  EXPECT_EQ(captured_event->kind, CRABS_CHANGE_ATTRIBUTE);
-  EXPECT_STREQ(captured_event->type, "register_user");
-  EXPECT_STREQ(captured_event->target, "bob");
+  EXPECT_EQ(captured_kind, (int)CRABS_CHANGE_ATTRIBUTE);
+  EXPECT_STREQ(captured_type, "register_user");
+  EXPECT_STREQ(captured_target, "bob");
 
   ASSERT_EQ(attribute_machine_grant_role(am, "bob", "role", "member", "admin"), CRABS_SUCCESS);
   EXPECT_EQ(captured_count, 2);
-  EXPECT_STREQ(captured_event->type, "grant_role");
+  EXPECT_STREQ(captured_type, "grant_role");
 
   ASSERT_EQ(attribute_machine_revoke_user(am, "bob", "admin"), CRABS_SUCCESS);
   EXPECT_EQ(captured_count, 3);
-  EXPECT_STREQ(captured_event->type, "revoke_user");
+  EXPECT_STREQ(captured_type, "revoke_user");
 
   state_set_change_hook(&am->base_state, nullptr, nullptr);
 }
