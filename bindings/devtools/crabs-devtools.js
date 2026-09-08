@@ -94,7 +94,10 @@
     }
     .toggle.open { background: #1a56db; color: #ffffff; border: 1px solid #1a56db; }
     .toggle.collapsed { background: #ffffff; color: #1a56db; border: 1px solid #e5e7eb; }
-    .panel.overlay {
+    // Overlay styling must live on the HOST: attach() adds the overlay
+    // class to the <crabs-devtools> element itself, so :host(.overlay) is
+    // what applies it. The inner .panel then fills the fixed-size host.
+    :host(.overlay) {
       position: fixed;
       top: 0; right: 0; bottom: 0;
       width: 380px;
@@ -103,8 +106,10 @@
       border-radius: 14px 0 0 14px;
       height: 100vh;
       box-shadow: -2px 0 14px rgba(0,0,0,.12);
+      display: block;
     }
-    .panel.overlay.collapsed { display: none; }
+    :host(.overlay) .panel { height: 100%; }
+    :host(.overlay.collapsed) .panel { display: none; }
     .pause {
       padding: 3px 10px; border-radius: 999px; cursor: pointer; user-select: none;
       border: 1px solid #e5e7eb; background: #ffffff; color: #1a56db;
@@ -158,6 +163,10 @@
     applyCollapsed() {
       if (!this.root || !this.toggleButton) return;
       this.root.style.display = this.collapsedState ? 'none' : '';
+      // Mirror the state on the host so :host(.overlay.collapsed) applies
+      // (and authors get a styling hook); in overlay mode the launcher
+      // button stays visible because only the inner .panel is hidden.
+      this.classList.toggle('collapsed', this.collapsedState);
       this.toggleButton.className =
         'toggle ' + (this.collapsedState ? 'collapsed' : 'open');
       this.toggleButton.setAttribute('aria-expanded', String(!this.collapsedState));
