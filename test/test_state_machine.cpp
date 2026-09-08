@@ -713,9 +713,29 @@ struct ChangeSink {
   static crabs_change_event_t last_event_storage;
   static bool has_event;
   static int call_count;
+  // The event's strings are borrowed and only valid for the duration of the
+  // hook call — copy the ones tests inspect after the call returns.
+  static char type_storage[CRABS_MAX_OP_NAME];
+  static char target_storage[CRABS_MAX_USER_ID];
+  static char preview_storage[256];
   static void hook(state_t*, const crabs_change_event_t* event, void* user_data) {
     (void)user_data;
     ChangeSink::last_event_storage = *event;
+    if (event->type != nullptr) {
+      strncpy(type_storage, event->type, CRABS_MAX_OP_NAME - 1);
+      type_storage[CRABS_MAX_OP_NAME - 1] = '\0';
+      ChangeSink::last_event_storage.type = type_storage;
+    }
+    if (event->target != nullptr) {
+      strncpy(target_storage, event->target, CRABS_MAX_USER_ID - 1);
+      target_storage[CRABS_MAX_USER_ID - 1] = '\0';
+      ChangeSink::last_event_storage.target = target_storage;
+    }
+    if (event->preview != nullptr) {
+      strncpy(preview_storage, event->preview, sizeof(preview_storage) - 1);
+      preview_storage[sizeof(preview_storage) - 1] = '\0';
+      ChangeSink::last_event_storage.preview = preview_storage;
+    }
     ChangeSink::has_event = true;
     ChangeSink::call_count++;
   }
@@ -723,6 +743,9 @@ struct ChangeSink {
 crabs_change_event_t ChangeSink::last_event_storage;
 bool ChangeSink::has_event = false;
 int ChangeSink::call_count = 0;
+char ChangeSink::type_storage[CRABS_MAX_OP_NAME];
+char ChangeSink::target_storage[CRABS_MAX_USER_ID];
+char ChangeSink::preview_storage[256];
 
 TEST_F(TestStateMachine, ChangeHookFiresOnExecuteSuccess) {
   state_set_change_hook(state, ChangeSink::hook, nullptr);
@@ -793,8 +816,10 @@ TEST_F(TestStateMachine, ChangeHookIsRuntimeStateNotSerialized) {
   state_t* restored = crabs_deserialize_state(blob->data, blob->len);
   serialized_buffer_destroy(blob);
   ASSERT_NE(restored, nullptr);
-
-  // The hook is runtime state: a restored state starts with NO hook.
+  // attr_machine is runtime state too (like the hook): production re-attaches
+  // it after loading, so mirror that here — otherwise authorization fails
+  // closed with CRABS_ERR_UNAUTHORIZED and the hook assertions are unreachable.
+  restored->attr_machine = am;
   operation_t* op = make_lock_op();
   ASSERT_EQ(state_machine_execute(restored, op), CRABS_SUCCESS);
   operation_destroy(op);
@@ -835,4 +860,21 @@ TEST_F(TestStateMachine, ChangeNotifyWithoutHookIsNoOp) {
   state_notify_change(state, CRABS_CHANGE_OP, "lock", nullptr, "alice",
                       "alice", "test_resource", "preview", CRABS_SUCCESS);
   EXPECT_EQ(ChangeSink::call_count, 0);
+}
+
+// The preview carried by the hook from state_machine_execute is
+// "<type> <first resource>" — it must mention both.
+TEST_F(TestStateMachine, ChangeHookPreviewCarriesTypeAndTarget) {
+  state_set_change_hook(state, ChangeSink::hook, nullptr);
+  ChangeSink::call_count = 0;
+  ChangeSink::has_event = false;
+
+  operation_t* op = make_lock_op();
+  ASSERT_EQ(state_machine_execute(state, op), CRABS_SUCCESS);
+  operation_destroy(op);
+
+  ASSERT_TRUE(ChangeSink::has_event);
+  EXPECT_NE(strstr(ChangeSink::last_event_storage.preview, "__lock__"), nullptr);
+  EXPECT_NE(strstr(ChangeSink::last_event_storage.preview, "test_resource"), nullptr);
+  state_set_change_hook(state, nullptr, nullptr);
 }

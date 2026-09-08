@@ -19,6 +19,7 @@
 #include "../Scheduler/scheduler.h"
 #include <string.h>
 #include <stdlib.h>
+#include <stdio.h>
 #include <time.h>
 #include <openssl/rand.h>
 #include <openssl/crypto.h>
@@ -67,6 +68,16 @@ void state_notify_change_for_op(state_t* state, crabs_change_kind_e kind,
   }
   state_notify_change(state, kind, op->type, op->uuid, op->signer_id,
                       op->node_id, target, preview_override, result);
+}
+
+// Human-readable "<type> <first resource>" for change events. Empty target
+// renders as just the type.
+static void _op_preview(const operation_t* op, char* out, size_t out_size) {
+  if (op == NULL) { out[0] = '\0'; return; }
+  const char* target = (op->resource_count > 0 && op->resources != NULL)
+                           ? op->resources[0] : "";
+  snprintf(out, out_size, "%s%s%s", op->type, target[0] != '\0' ? " " : "",
+           target);
 }
 
 // Forward declarations for handlers defined later in this file.
@@ -1016,11 +1027,26 @@ static crabs_error_e state_machine_execute_internal(state_t* state, operation_t*
 }
 
 crabs_error_e state_machine_execute(state_t* state, operation_t* op) {
-  return state_machine_execute_internal(state, op, false, true);
+  char preview[CRABS_MAX_OP_NAME + CRABS_MAX_USER_ID + 2];
+  _op_preview(op, preview, sizeof(preview));
+  crabs_error_e rc = state_machine_execute_internal(state, op, false, true);
+  // CRABS_ERR_ALREADY_EXECUTED is an idempotent skip: no mutation, no event.
+  if (rc != CRABS_ERR_ALREADY_EXECUTED) {
+    state_notify_change_for_op(state, CRABS_CHANGE_OP, op, preview, rc);
+  }
+  return rc;
 }
 
 crabs_error_e state_machine_execute_scheduled(state_t* state, operation_t* op) {
-  return state_machine_execute_internal(state, op, true, false);
+  char preview[CRABS_MAX_OP_NAME + CRABS_MAX_USER_ID + 16];
+  memcpy(preview, "scheduled ", strlen("scheduled "));
+  _op_preview(op, preview + strlen("scheduled "),
+              sizeof(preview) - strlen("scheduled "));
+  crabs_error_e rc = state_machine_execute_internal(state, op, true, false);
+  if (rc != CRABS_ERR_ALREADY_EXECUTED) {
+    state_notify_change_for_op(state, CRABS_CHANGE_SCHEDULE, op, preview, rc);
+  }
+  return rc;
 }
 
 crabs_error_e state_machine_validate(state_t* state, const operation_t* op) {
