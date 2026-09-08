@@ -388,6 +388,11 @@ typedef struct state_t {
   // re-entrant ticks (a materialized op's custom handler calling back into
   // state_machine_execute), which would otherwise recurse unboundedly.
   bool             scheduler_ticking;
+  // Runtime-only; never serialized. Guards trigger_process_all against
+  // re-entrant processing (a change hook fired inside the trigger loop
+  // executing an op that runs the state machine again), which would
+  // double-fire triggers whose last_triggered_at is not yet written.
+  bool             trigger_ticking;
 } state_t;
 
 // ============================================================

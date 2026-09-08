@@ -784,6 +784,213 @@ TEST_F(TestTrigger, TestIssueAttributeEffectNotifiesChangeHook) {
 }
 
 // ============================================================
+// Audit 9 (A-2/A-6): trigger re-entrancy and mid-loop mutation
+// ============================================================
+// The ISSUE_ATTRIBUTE change notification fires synchronously INSIDE the
+// trigger processing loop, before last_triggered_at is written. A hook that
+// executes ops during that notification can create/delete triggers, and
+// state_machine_op_create_trigger reallocs state->triggers — moving the array
+// the loop is iterating. The loop must therefore re-derive
+// state->triggers/state->trigger_count every iteration, re-find the fired
+// trigger by id after its effect runs, and defer nested trigger processing.
+
+// File-scope captures for the captureless-lambda change hooks below.
+static attribute_machine_t* reentrancy_hook_am = NULL;
+static int reentrancy_hook_call_count = 0;
+
+// A hook that mimics executing a __create_trigger__ op during trigger
+// processing: it appends a trigger to state->triggers exactly the way
+// state_machine_op_create_trigger does (trigger_count++ then realloc — the
+// realloc moves the array the outer loop is iterating).
+static void create_trigger_during_processing(state_t* observed_state,
+                                             const crabs_change_event_t* event,
+                                             void* user_data) {
+  (void)user_data;
+  if (event->kind != CRABS_CHANGE_TRIGGER) return;
+  reentrancy_hook_call_count++;
+  if (reentrancy_hook_call_count > 1) return; // only mutate on the first event
+
+  trigger_effect_t hook_effect;
+  memset(&hook_effect, 0, sizeof(hook_effect));
+  hook_effect.type = TRIGGER_EFFECT_ISSUE_ATTRIBUTE;
+  strncpy(hook_effect.issue_attribute, "hook_attr", CRABS_MAX_POLICY_EXPR - 1);
+  strncpy(hook_effect.target_role, "role", CRABS_MAX_USER_ID - 1);
+  hook_effect.duration_ms = 60000;
+  strncpy(hook_effect.attribute_value, "hook", CRABS_MAX_POLICY_EXPR - 1);
+
+  trigger_t* hook_trigger = trigger_create("hook_created", "Created by hook",
+    "views >= 999999", &hook_effect, 0, false, "admin");
+  ASSERT_NE(hook_trigger, nullptr);
+
+  uint32_t append_index = observed_state->trigger_count;
+  observed_state->trigger_count++;
+  trigger_t* grown_triggers = (trigger_t*)realloc(observed_state->triggers,
+    observed_state->trigger_count * sizeof(trigger_t));
+  ASSERT_NE(grown_triggers, nullptr);
+  observed_state->triggers = grown_triggers;
+  observed_state->triggers[append_index] = *hook_trigger;
+  free(hook_trigger);
+}
+
+static bool state_has_trigger_with_id(state_t* checked_state, const char* trigger_id) {
+  for (uint32_t i = 0; i < checked_state->trigger_count; i++) {
+    if (strcmp(checked_state->triggers[i].trigger_id, trigger_id) == 0) return true;
+  }
+  return false;
+}
+
+static uint32_t count_temp_attributes(user_t* user) {
+  uint32_t temp_attr_count = 0;
+  for (temp_attr_list_t* temp = user->temp_attrs; temp != NULL; temp = temp->next) {
+    temp_attr_count++;
+  }
+  return temp_attr_count;
+}
+
+// Shared setup for the re-entrancy tests: an attribute machine with a viewer
+// user, a views counter past the threshold, and a threshold trigger with an
+// ISSUE_ATTRIBUTE effect stored in the STATE-OWNED trigger array (the
+// production shape — state_machine.c passes state->triggers).
+static attribute_machine_t* setup_reentrancy_state(state_t** out_state) {
+  uint8_t admin_pk[33];
+  ecdsa_keypair_t* admin_kp = crypto_ecdsa_generate();
+  if (admin_kp == NULL) return NULL;
+  memcpy(admin_pk, admin_kp->public_key, 33);
+  crypto_ecdsa_keypair_destroy(admin_kp);
+  attribute_machine_t* am = attribute_machine_create("admin", admin_pk);
+  if (am == NULL) return NULL;
+
+  uint8_t user_pk[33];
+  ecdsa_keypair_t* kp = crypto_ecdsa_generate();
+  if (kp == NULL) {
+    attribute_machine_destroy(am);
+    return NULL;
+  }
+  memcpy(user_pk, kp->public_key, 33);
+  crypto_ecdsa_keypair_destroy(kp);
+  crabs_test_register_user_with_role(am, "alice", user_pk, "role", "viewer");
+
+  am->current_time_ms = 1000;
+
+  data_item_t* views = data_item_create("views", DATA_TYPE_COUNTER, CRDT_G_COUNTER);
+  g_counter_t* gc = g_counter_create();
+  g_counter_increment(gc, "nodeA", 100);
+  views->value = gc;
+  state_add_item(&am->base_state, views);
+
+  trigger_effect_t effect;
+  memset(&effect, 0, sizeof(effect));
+  effect.type = TRIGGER_EFFECT_ISSUE_ATTRIBUTE;
+  strncpy(effect.issue_attribute, "temp_access", CRABS_MAX_POLICY_EXPR - 1);
+  strncpy(effect.target_role, "role", CRABS_MAX_USER_ID - 1);
+  effect.duration_ms = 60000;
+  strncpy(effect.attribute_value, "granted", CRABS_MAX_POLICY_EXPR - 1);
+
+  trigger_t* trigger = trigger_create("issue_attr_trigger", "Issue temp attr",
+    "views >= 50", &effect, 0, false, "admin");
+  if (trigger == NULL) {
+    attribute_machine_destroy(am);
+    return NULL;
+  }
+  am->base_state.trigger_count = 1;
+  am->base_state.triggers =
+    (trigger_t*)realloc(am->base_state.triggers, sizeof(trigger_t));
+  am->base_state.triggers[0] = *trigger;
+  free(trigger);
+
+  *out_state = &am->base_state;
+  return am;
+}
+
+// Audit 9 A-2: a change hook that creates a trigger while the trigger loop is
+// running must not corrupt the loop. The loop re-finds triggers by id after
+// each effect, so the realloc inside the hook is survivable, and the fired
+// trigger's bookkeeping lands in the live (post-realloc) array.
+TEST_F(TestTrigger, HookCreateTriggerDuringProcessingDoesNotCorrupt) {
+  state_t* reentrancy_state = NULL;
+  attribute_machine_t* am = setup_reentrancy_state(&reentrancy_state);
+  ASSERT_NE(am, nullptr);
+  ASSERT_NE(reentrancy_state, nullptr);
+
+  reentrancy_hook_am = am;
+  reentrancy_hook_call_count = 0;
+  state_set_change_hook(reentrancy_state, create_trigger_during_processing, NULL);
+
+  uint32_t fired = trigger_process_all(reentrancy_state, reentrancy_state->triggers,
+                                       reentrancy_state->trigger_count, am, 1000);
+  EXPECT_EQ(fired, 1u);
+
+  // The fired trigger's bookkeeping must be readable in the LIVE array: the
+  // hook's realloc moved it, and without the re-find the write landed in
+  // freed memory.
+  ASSERT_EQ(reentrancy_state->trigger_count, 2u);
+  EXPECT_STREQ(reentrancy_state->triggers[0].trigger_id, "issue_attr_trigger");
+  EXPECT_EQ(reentrancy_state->triggers[0].last_triggered_at, 1000u);
+  EXPECT_EQ(reentrancy_state->triggers[0].enabled, true);
+
+  // The hook-created trigger persisted.
+  EXPECT_TRUE(state_has_trigger_with_id(reentrancy_state, "hook_created"));
+
+  // No double-fire: exactly one temporary attribute was issued for alice.
+  user_t* alice = attribute_machine_find_user(am, "alice");
+  ASSERT_NE(alice, nullptr);
+  EXPECT_EQ(count_temp_attributes(alice), 1u);
+
+  state_set_change_hook(reentrancy_state, NULL, NULL);
+  reentrancy_hook_am = NULL;
+  attribute_machine_destroy(am);
+}
+
+// Audit 9 A-6: a hook that re-enters trigger_process_all during processing
+// must be deferred — the nested call processes nothing (the same trigger
+// must not double-fire before the outer loop writes last_triggered_at).
+static int nested_fired_count = -1;
+static int nested_hook_call_count = 0;
+
+static void recurse_into_trigger_processing(state_t* observed_state,
+                                            const crabs_change_event_t* event,
+                                            void* user_data) {
+  (void)user_data;
+  if (event->kind != CRABS_CHANGE_TRIGGER) return;
+  nested_hook_call_count++;
+  if (nested_fired_count >= 0) return; // only recurse on the first event
+
+  nested_fired_count = (int)trigger_process_all(observed_state,
+    observed_state->triggers, observed_state->trigger_count,
+    reentrancy_hook_am, 1000);
+}
+
+TEST_F(TestTrigger, NestedProcessingIsDeferred) {
+  state_t* reentrancy_state = NULL;
+  attribute_machine_t* am = setup_reentrancy_state(&reentrancy_state);
+  ASSERT_NE(am, nullptr);
+  ASSERT_NE(reentrancy_state, nullptr);
+
+  reentrancy_hook_am = am;
+  nested_fired_count = -1;
+  nested_hook_call_count = 0;
+  state_set_change_hook(reentrancy_state, recurse_into_trigger_processing, NULL);
+
+  uint32_t fired = trigger_process_all(reentrancy_state, reentrancy_state->triggers,
+                                       reentrancy_state->trigger_count, am, 1000);
+  EXPECT_EQ(fired, 1u);
+
+  // The nested call was deferred: it processed nothing.
+  EXPECT_EQ(nested_fired_count, 0);
+  EXPECT_EQ(nested_hook_call_count, 1);
+
+  // No double-fire: exactly one temporary attribute was issued.
+  user_t* alice = attribute_machine_find_user(am, "alice");
+  ASSERT_NE(alice, nullptr);
+  EXPECT_EQ(count_temp_attributes(alice), 1u);
+  EXPECT_EQ(reentrancy_state->triggers[0].last_triggered_at, 1000u);
+
+  state_set_change_hook(reentrancy_state, NULL, NULL);
+  reentrancy_hook_am = NULL;
+  attribute_machine_destroy(am);
+}
+
+// ============================================================
 // Combined Condition + Trigger Tests
 // ============================================================
 

@@ -101,6 +101,9 @@ static crabs_error_e _execute_trigger_effect(state_t* state, trigger_t* trigger,
         trigger->effect.duration_ms
       );
       if (err != CRABS_SUCCESS) return err;
+      // This notification fires synchronously inside the trigger loop —
+      // hooks must not assume trigger storage is stable across this call
+      // (the loop re-finds triggers by id after each effect).
       state_notify_change(state, CRABS_CHANGE_TRIGGER, "issue_temporary", NULL,
                           NULL,
                           state->hlc_state_initialized
@@ -173,6 +176,13 @@ uint32_t trigger_process_all(state_t* state, trigger_t* triggers, uint32_t trigg
                               attribute_machine_t* am, uint64_t now_ms) {
   if (state == NULL || triggers == NULL) return 0;
 
+  // Audit 9 A-6: defer nested processing. A change hook fired inside the
+  // loop below can execute ops that run the state machine again; a nested
+  // trigger_process_all would re-fire the same trigger before the outer loop
+  // has written last_triggered_at (double-fire) and recurse unboundedly.
+  if (state->trigger_ticking) return 0;
+  state->trigger_ticking = true;
+
   uint32_t fired_count = 0;
 
   // Step 1: Prune expired temporary attributes
@@ -180,9 +190,25 @@ uint32_t trigger_process_all(state_t* state, trigger_t* triggers, uint32_t trigg
     attribute_machine_prune_expired_temporary(am);
   }
 
+  // Audit 9 A-2: when the caller passes the state-owned array (the
+  // production shape — state_machine.c passes state->triggers), the loop
+  // must NOT hold a captured triggers pointer across effect execution: an
+  // effect's change hook can create/delete triggers, and
+  // state_machine_op_create_trigger reallocs state->triggers, moving (and
+  // freeing) the array. Re-read state->triggers and state->trigger_count at
+  // the top of every iteration. Callers that pass a foreign (non-state)
+  // array keep iterating it directly — such arrays are not mutated by op
+  // handlers. The triggers/trigger_count parameters are therefore used for
+  // initial validation only in the state-owned case.
+  bool state_owned_array = (triggers == state->triggers);
+
   // Step 2: Process each trigger
-  for (uint32_t i = 0; i < trigger_count; i++) {
-    trigger_t* trigger = &triggers[i];
+  for (uint32_t i = 0; ; i++) {
+    trigger_t* current_triggers = state_owned_array ? state->triggers : triggers;
+    uint32_t current_count = state_owned_array ? state->trigger_count : trigger_count;
+    if (current_triggers == NULL || i >= current_count) break;
+
+    trigger_t* trigger = &current_triggers[i];
 
     // Skip if disabled
     if (!trigger->enabled) continue;
@@ -209,9 +235,32 @@ uint32_t trigger_process_all(state_t* state, trigger_t* triggers, uint32_t trigg
     bool condition_result = condition_evaluate(trigger->condition_ast, state);
     if (!condition_result) continue;
 
+    // Snapshot the id BEFORE executing the effect: the effect's change hook
+    // may realloc (or shrink) the state-owned array, invalidating `trigger`.
+    char trigger_id_snapshot[CRABS_MAX_USER_ID];
+    strncpy(trigger_id_snapshot, trigger->trigger_id, CRABS_MAX_USER_ID - 1);
+    trigger_id_snapshot[CRABS_MAX_USER_ID - 1] = '\0';
+
     // Condition is true: execute the effect
     crabs_error_e err = _execute_trigger_effect(state, trigger, am, now_ms);
     if (err != CRABS_SUCCESS) continue;
+
+    // Audit 9 A-2: the effect may have moved or freed the array the loop is
+    // iterating (hooks run synchronously inside it), so re-find the fired
+    // trigger by id in the fresh state->triggers before writing its
+    // bookkeeping. If it was deleted mid-effect, skip the write.
+    if (state_owned_array) {
+      int32_t found_index = -1;
+      for (uint32_t scan_index = 0; scan_index < state->trigger_count; scan_index++) {
+        if (state->triggers != NULL &&
+            strcmp(state->triggers[scan_index].trigger_id, trigger_id_snapshot) == 0) {
+          found_index = (int32_t)scan_index;
+          break;
+        }
+      }
+      if (found_index < 0) continue;
+      trigger = &state->triggers[found_index];
+    }
 
     // Update trigger state
     trigger->last_triggered_at = now_ms;
@@ -224,6 +273,7 @@ uint32_t trigger_process_all(state_t* state, trigger_t* triggers, uint32_t trigg
     fired_count++;
   }
 
+  state->trigger_ticking = false;
   return fired_count;
 }
 

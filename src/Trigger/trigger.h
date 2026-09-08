@@ -71,6 +71,13 @@ trigger_effect_t* trigger_effect_create_issue_attribute(const char* attr, const 
                                                           uint64_t duration, const char* value);
 
 // Processing (Amendment 1, §5.2)
+// Audit 9 A-2: when `triggers` is the state-owned array (state->triggers —
+// the production shape), the loop re-derives state->triggers/state->
+// trigger_count every iteration and re-finds each fired trigger by id, so
+// the triggers/trigger_count params are used for initial validation only.
+// Effects may fire change hooks synchronously; hooks may mutate the trigger
+// list (create/delete reallocs the array). Nested calls (a hook re-entering
+// trigger_process_all) are deferred via state->trigger_ticking.
 uint32_t       trigger_process_all(state_t* state, trigger_t* triggers, uint32_t trigger_count,
                                     attribute_machine_t* am, uint64_t now_ms);
 
