@@ -60,7 +60,53 @@ async function main() {
   node.destroy();
   key.destroy();
   console.log('change-events smoke OK: ' + events.length + ' events');
+
+  await runProdCheck();
   process.exit(0);
+}
+
+// The dev checks above run on crabs.dev.js, which has devtools compiled in;
+// change events are core (not devtools-gated), so the production build must
+// push them too. Force a fresh module load and repeat one op against the prod
+// artifact (index.js -> crabs.js, factory createCRABSModule).
+async function runProdCheck() {
+  try {
+    delete require.cache[require.resolve('../dev.js')];
+    for (const cachePath of Object.keys(require.cache)) {
+      if (cachePath.endsWith('crabs.dev.js')) delete require.cache[cachePath];
+    }
+
+    const { Node: ProdNode, KeyPair: ProdKeyPair, Operation: ProdOperation } =
+      require('..');
+
+    const prodNode = await ProdNode.create('admin', { ordering: 'hlc' });
+    const prodKey = await ProdKeyPair.generate();
+    const prodEvents = [];
+    prodNode.on('change', (event) => prodEvents.push(event));
+
+    prodNode.registerUser('alice', prodKey.publicKeyHex(), 'adult');
+    prodNode.grantRole('alice', 'role', 'member', 'admin');
+    prodNode.setPolicy('view', 'AND role:member adult');
+    const prodOp = await ProdOperation.create('view');
+    prodOp.signerId = 'alice';
+    prodOp.nodeId = 'alice';
+    prodNode.sign(prodOp, prodKey.privateKeyHex());
+    prodNode.execute(prodOp);
+
+    const opEvents = prodEvents.filter((event) => event.kind === 'op');
+    assert.strictEqual(opEvents.length, 1,
+                       `prod build must push one op event, got ${opEvents.length}`);
+    assert.strictEqual(opEvents[0].type, 'view',
+                       'prod build op event type mismatch');
+    assert.strictEqual(opEvents[0].node, 'admin',
+                       'prod build op event must carry the node id');
+
+    prodNode.destroy();
+    prodKey.destroy();
+    console.log('change-events prod OK: ' + prodEvents.length + ' events');
+  } catch (prodError) {
+    throw new Error('prod-build change events failed: ' + prodError.message);
+  }
 }
 
 main().catch((err) => { console.error(err); process.exit(1); });

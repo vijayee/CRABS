@@ -184,9 +184,12 @@ function createDevtoolsController(node, options) {
   // back to wrapping node.execute so user-driven executes still refresh.
   if (typeof node.on === 'function') {
     const changeListener = () => controller.refresh();
-    node.on('change', changeListener);
+    // Some emitters return an unsubscribe function instead of exposing off();
+    // capture it so close() can detach either way.
+    const unsubscribe = node.on('change', changeListener);
     controller.detachChange = () => {
-      if (typeof node.off === 'function') node.off('change', changeListener);
+      if (typeof unsubscribe === 'function') unsubscribe();
+      else if (typeof node.off === 'function') node.off('change', changeListener);
     };
   } else {
     const originalExecute = node.execute.bind(node);
