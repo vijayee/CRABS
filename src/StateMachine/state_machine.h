@@ -80,6 +80,34 @@ typedef struct op_handler_entry_t {
 } op_handler_entry_t;
 
 // ============================================================
+// State Change Notification (devtools change events core)
+// ============================================================
+// Register a callback fired after every state-mutating completion: direct
+// execution (kind OP), scheduled materialization (kind SCHEDULE), trigger
+// effects (kind TRIGGER), attribute-machine mutations (kind ATTRIBUTE).
+// Idempotent skips (CRABS_ERR_ALREADY_EXECUTED) do NOT fire. The hook must
+// not mutate state. Pass NULL to clear. Runtime state; not serialized.
+void state_set_change_hook(state_t* state, crabs_change_hook_fn hook,
+                           void* user_data);
+
+// Fire a change event manually (used by the attribute machine and trigger
+// engine, which mutate without going through state_machine_execute). Does
+// nothing when no hook is registered. All strings are borrowed for the
+// duration of the hook call only.
+void state_notify_change(state_t* state, crabs_change_kind_e kind,
+                         const char* type, const uint8_t* uuid,
+                         const char* signer_id, const char* node_id,
+                         const char* target, const char* preview,
+                         crabs_error_e result);
+
+// Convenience: build the event from an operation's fields. preview_override
+// replaces the default (NULL) preview when non-NULL.
+void state_notify_change_for_op(state_t* state, crabs_change_kind_e kind,
+                                const operation_t* op,
+                                const char* preview_override,
+                                crabs_error_e result);
+
+// ============================================================
 // Lock Response (§7.3.1)
 // ============================================================
 typedef struct {

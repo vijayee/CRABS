@@ -210,6 +210,33 @@ typedef struct {
 } machine_config_t;
 
 // ============================================================
+// State Change Notification (core; NOT devtools-gated)
+// ============================================================
+typedef struct state_t state_t;  // full definition below (State, §4.1)
+
+typedef enum {
+  CRABS_CHANGE_OP        = 0x01,  // executed operation (direct execution only)
+  CRABS_CHANGE_SCHEDULE  = 0x02,  // scheduled materialization (each fire)
+  CRABS_CHANGE_TRIGGER   = 0x03,  // trigger-fired mutation
+  CRABS_CHANGE_ATTRIBUTE = 0x04   // attribute-machine user mutation
+} crabs_change_kind_e;
+
+typedef struct {
+  crabs_change_kind_e kind;
+  const char*         type;        // op type / attribute action name
+  const uint8_t*      uuid;        // op uuid; NULL for attribute actions
+  const char*         signer_id;   // NULL when not applicable
+  const char*         node_id;     // NULL when not applicable
+  const char*         target;      // primary target item/user; NULL when none
+  const char*         preview;     // short human-readable payload summary
+  crabs_error_e       result;
+} crabs_change_event_t;
+
+typedef void (*crabs_change_hook_fn)(state_t* state,
+                                     const crabs_change_event_t* event,
+                                     void* user_data);
+
+// ============================================================
 // Dedup Specification (v1.4 §3)
 // ============================================================
 #define CRABS_MAX_DEDUP_PATH     128
@@ -320,6 +347,10 @@ typedef struct state_t {
   // materialized per tick, so a long offline catch-up cannot run unbounded in
   // one tick. 0 = unlimited. Set via scheduler_set_max_occurrences_per_tick.
   uint32_t        max_occurrences_per_tick;
+  // Change notification (core, not devtools-gated): invoked after every
+  // state-mutating completion. Runtime state; not serialized.
+  crabs_change_hook_fn change_hook;
+  void*                change_hook_user_data;
   attribute_machine_t* attr_machine;  // For key verification and policy evaluation
   uint8_t node_private_key[32];       // Node ECDSA private key for envelope signing (§11)
   uint8_t node_public_key[33];        // Node ECDSA public key

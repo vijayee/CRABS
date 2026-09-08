@@ -24,6 +24,51 @@
 #include <openssl/crypto.h>
 #include <openssl/evp.h>
 
+// ============================================================
+// State Change Notification
+// ============================================================
+
+void state_set_change_hook(state_t* state, crabs_change_hook_fn hook,
+                           void* user_data) {
+  if (state == NULL) return;
+  state->change_hook = hook;
+  state->change_hook_user_data = user_data;
+}
+
+void state_notify_change(state_t* state, crabs_change_kind_e kind,
+                         const char* type, const uint8_t* uuid,
+                         const char* signer_id, const char* node_id,
+                         const char* target, const char* preview,
+                         crabs_error_e result) {
+  if (state == NULL || state->change_hook == NULL) return;
+  crabs_change_event_t event;
+  memset(&event, 0, sizeof(event));
+  event.kind = kind;
+  event.type = type;
+  event.uuid = uuid;
+  event.signer_id = signer_id;
+  event.node_id = node_id;
+  event.target = target;
+  event.preview = preview;
+  event.result = result;
+  // Contract: the hook never mutates state and never fails the op. The
+  // borrowed strings are valid only for the duration of the call.
+  state->change_hook(state, &event, state->change_hook_user_data);
+}
+
+void state_notify_change_for_op(state_t* state, crabs_change_kind_e kind,
+                                const operation_t* op,
+                                const char* preview_override,
+                                crabs_error_e result) {
+  if (op == NULL) return;
+  const char* target = NULL;
+  if (op->resource_count > 0 && op->resources != NULL) {
+    target = op->resources[0];
+  }
+  state_notify_change(state, kind, op->type, op->uuid, op->signer_id,
+                      op->node_id, target, preview_override, result);
+}
+
 // Forward declarations for handlers defined later in this file.
 // These are not in the public header — reachable only via state_machine_execute.
 crabs_error_e state_machine_op_lock(state_t* s, operation_t* o, lock_response_t* r);

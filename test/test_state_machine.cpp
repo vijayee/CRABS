@@ -700,3 +700,95 @@ TEST_F(TestStateMachine, AuditLogHashChainIsNonZeroAndChained) {
 
   EXPECT_NE(memcmp(first, state->log[state->log_count - 1].state_hash, CRABS_HASH_SIZE), 0);
 }
+
+// ============================================================
+// State Change Notification (devtools change events core)
+// ============================================================
+
+// Stateless sink: a captureless lambda cannot reach local variables, so the
+// hook tests use a static struct. Place ABOVE the first test that uses it.
+struct ChangeSink {
+  static const crabs_change_event_t* last_event;
+  static int call_count;
+  static void hook(state_t*, const crabs_change_event_t* event, void* user_data) {
+    (void)user_data;
+    ChangeSink::last_event = event;
+    ChangeSink::call_count++;
+  }
+};
+const crabs_change_event_t* ChangeSink::last_event = nullptr;
+int ChangeSink::call_count = 0;
+
+TEST_F(TestStateMachine, ChangeHookFiresOnExecuteSuccess) {
+  state_set_change_hook(state, ChangeSink::hook, nullptr);
+  ChangeSink::call_count = 0;
+
+  operation_t* op = make_lock_op();
+  ASSERT_EQ(state_machine_execute(state, op), CRABS_SUCCESS);
+  operation_destroy(op);
+
+  EXPECT_EQ(ChangeSink::call_count, 1);
+  ASSERT_NE(ChangeSink::last_event, nullptr);
+  EXPECT_STREQ(ChangeSink::last_event->type, "lock");
+  EXPECT_EQ(ChangeSink::last_event->kind, CRABS_CHANGE_OP);
+  EXPECT_EQ(ChangeSink::last_event->result, CRABS_SUCCESS);
+  state_set_change_hook(state, nullptr, nullptr);
+}
+
+TEST_F(TestStateMachine, ChangeHookFiresOnExecuteFailure) {
+  state_set_change_hook(state, ChangeSink::hook, nullptr);
+  ChangeSink::call_count = 0;
+
+  // Corrupt signature -> cryptographic failure; no state mutation, but the
+  // event still fires (devtools parity with the old recorder).
+  operation_t* op = make_lock_op();
+  op->signature[0] = (uint8_t)(op->signature[0] ^ 0xFF);
+  EXPECT_NE(state_machine_execute(state, op), CRABS_SUCCESS);
+  operation_destroy(op);
+
+  EXPECT_EQ(ChangeSink::call_count, 1);
+  EXPECT_NE(ChangeSink::last_event->result, CRABS_SUCCESS);
+  state_set_change_hook(state, nullptr, nullptr);
+}
+
+TEST_F(TestStateMachine, ChangeHookIdempotentSkipFiresNothing) {
+  state_set_change_hook(state, ChangeSink::hook, nullptr);
+  ChangeSink::call_count = 0;
+
+  operation_t* op = make_lock_op();
+  ASSERT_EQ(state_machine_execute(state, op), CRABS_SUCCESS);
+  crabs_error_e replay = state_machine_execute(state, op);
+  operation_destroy(op);
+
+  // CRABS_ERR_ALREADY_EXECUTED is an idempotent skip: no mutation, no event.
+  EXPECT_EQ(replay, CRABS_ERR_ALREADY_EXECUTED);
+  EXPECT_EQ(ChangeSink::call_count, 1);
+  state_set_change_hook(state, nullptr, nullptr);
+}
+
+TEST_F(TestStateMachine, ChangeHookNullIsNoOp) {
+  state_set_change_hook(state, nullptr, nullptr);  // must not crash
+  operation_t* op = make_lock_op();
+  ASSERT_EQ(state_machine_execute(state, op), CRABS_SUCCESS);
+  operation_destroy(op);
+}
+
+TEST_F(TestStateMachine, ChangeHookIsRuntimeStateNotSerialized) {
+  state_set_change_hook(state, ChangeSink::hook, nullptr);
+  ChangeSink::call_count = 0;
+
+  serialized_buffer_t* blob = crabs_serialize_state(state);
+  ASSERT_NE(blob, nullptr);
+  state_t* restored = crabs_deserialize_state(blob->data, blob->len);
+  serialized_buffer_destroy(blob);
+  ASSERT_NE(restored, nullptr);
+
+  // The hook is runtime state: a restored state starts with NO hook.
+  operation_t* op = make_lock_op();
+  ASSERT_EQ(state_machine_execute(restored, op), CRABS_SUCCESS);
+  operation_destroy(op);
+  EXPECT_EQ(ChangeSink::call_count, 0);
+  EXPECT_EQ(restored->change_hook, nullptr);
+  state_destroy(restored);
+  state_set_change_hook(state, nullptr, nullptr);
+}
