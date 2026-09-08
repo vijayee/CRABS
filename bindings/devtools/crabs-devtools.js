@@ -104,6 +104,12 @@
       border: 1px solid #e5e7eb; background: #ffffff; color: #1e40af;
       font-size: 11px; font-weight: 600; font-family: inherit; cursor: pointer;
     }
+    .close {
+      padding: 3px 10px; border-radius: 999px; cursor: pointer; user-select: none;
+      border: 1px solid #e5e7eb; background: #ffffff; color: #6b7280;
+      font-size: 11px; font-weight: 600; font-family: inherit;
+    }
+    .close:hover { background: #fee2e2; color: #991b1b; }
     .pause, .export {
       padding: 3px 10px; border-radius: 999px; cursor: pointer; user-select: none;
       border: 1px solid #e5e7eb; background: #ffffff; color: #1a56db;
@@ -365,6 +371,15 @@
         });
         tabbar.appendChild(selector);
       }
+      const closeButton = document.createElement('button');
+      closeButton.className = 'close';
+      closeButton.textContent = '×';
+      closeButton.title = 'Hide panel (CRABS launcher re-opens it)';
+      closeButton.setAttribute('aria-label', 'Hide devtools panel');
+      closeButton.addEventListener('click', () => {
+        this.collapsed = true;
+      });
+      tabbar.appendChild(closeButton);
       const exportButton = document.createElement('button');
       exportButton.className = 'export';
       exportButton.textContent = 'Export';
