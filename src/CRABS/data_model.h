@@ -230,6 +230,9 @@ typedef struct {
   const char*         target;      // primary target item/user; NULL when none
   const char*         preview;     // short human-readable payload summary
   crabs_error_e       result;
+  uint64_t            lamport_time; // op ordering stamp; 0 for non-op kinds
+  bool                has_hlc;
+  crabs_hlc_t         hlc;          // valid when has_hlc
 } crabs_change_event_t;
 
 typedef void (*crabs_change_hook_fn)(state_t* state,

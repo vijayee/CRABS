@@ -12,9 +12,9 @@
 
 #define CRABS_DEVTOOLS_RING_SIZE 1024
 
-// Record one execute outcome into the global devtools ring buffer.
-// No-op unless the build defines CRABS_ENABLE_DEVTOOLS.
-void     devtools_record_event(state_t* state, const operation_t* op, crabs_error_e result);
+// Record a state change into the devtools ring. Layered recorder for the
+// state change hook (dev builds only).
+void     devtools_record_change(state_t* state, const crabs_change_event_t* event);
 
 // Drain the ring buffer as a JSON array string, oldest first. The buffer is
 // emptied. Caller owns the returned string.

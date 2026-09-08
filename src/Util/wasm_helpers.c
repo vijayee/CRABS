@@ -24,6 +24,17 @@
 
 #ifdef CRABS_ENABLE_DEVTOOLS
 #include "../Devtools/devtools.h"
+
+// Change hook registered on every node's base state: every mutation the
+// state reports (executes, schedules, triggers, attribute changes) is
+// recorded into the devtools ring.
+static void _devtools_change_hook(state_t* state,
+                                  const crabs_change_event_t* event,
+                                  void* user_data) {
+  (void)state;
+  (void)user_data;
+  devtools_record_change(state, event);
+}
 #endif
 
 // ============================================================
@@ -55,6 +66,10 @@ attribute_machine_t* crabs_wasm_node_create(const char* admin_id) {
 
   crabs_hlc_state_init(&am->base_state.hlc_state, admin_id);
   am->base_state.hlc_state_initialized = true;
+
+#ifdef CRABS_ENABLE_DEVTOOLS
+  state_set_change_hook(&am->base_state, _devtools_change_hook, am);
+#endif
 
   crypto_ecdsa_keypair_destroy(node_key);
   return am;
@@ -185,11 +200,7 @@ crabs_error_e crabs_wasm_sign_with_node_key(attribute_machine_t* am, operation_t
 EMSCRIPTEN_KEEPALIVE
 crabs_error_e crabs_wasm_execute(attribute_machine_t* am, operation_t* op) {
   if (!am || !op) return CRABS_ERR_INVALID_PARAM;
-  crabs_error_e result = state_machine_execute(&am->base_state, op);
-#ifdef CRABS_ENABLE_DEVTOOLS
-  devtools_record_event(&am->base_state, op, result);
-#endif
-  return result;
+  return state_machine_execute(&am->base_state, op);
 }
 
 // ============================================================

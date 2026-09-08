@@ -61,13 +61,29 @@ void state_notify_change_for_op(state_t* state, crabs_change_kind_e kind,
                                 const operation_t* op,
                                 const char* preview_override,
                                 crabs_error_e result) {
-  if (op == NULL) return;
+  if (state == NULL || state->change_hook == NULL || op == NULL) return;
   const char* target = NULL;
   if (op->resource_count > 0 && op->resources != NULL) {
     target = op->resources[0];
   }
-  state_notify_change(state, kind, op->type, op->uuid, op->signer_id,
-                      op->node_id, target, preview_override, result);
+  crabs_change_event_t event;
+  memset(&event, 0, sizeof(event));
+  event.kind = kind;
+  event.type = op->type;
+  event.uuid = op->uuid;
+  event.signer_id = op->signer_id;
+  event.node_id = op->node_id;
+  event.target = target;
+  event.preview = preview_override;
+  event.result = result;
+  event.lamport_time = op->lamport_time;
+  if (op->ordering_system == CRABS_ORDERING_HLC) {
+    event.has_hlc = true;
+    event.hlc = op->hlc;
+  }
+  // Contract: the hook never mutates state and never fails the op. The
+  // borrowed strings are valid only for the duration of the call.
+  state->change_hook(state, &event, state->change_hook_user_data);
 }
 
 // Human-readable "<type> <first resource>" for change events. Empty target

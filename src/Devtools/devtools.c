@@ -33,6 +33,8 @@ typedef struct {
   bool          has_hlc;
   crabs_hlc_t   hlc;
   char          target[CRABS_MAX_USER_ID];
+  char          layer[12];
+  char          preview[64];
   crabs_error_e result;
 } devtools_event_t;
 
@@ -51,25 +53,41 @@ static void _hex_encode_uuid(char* out, const uint8_t* uuid) {
   }
 }
 
-void devtools_record_event(state_t* state, const operation_t* op, crabs_error_e result) {
-  if (!op) return;
+static const char* _change_kind_name(crabs_change_kind_e kind) {
+  switch (kind) {
+    case CRABS_CHANGE_OP:        return "op";
+    case CRABS_CHANGE_SCHEDULE:  return "schedule";
+    case CRABS_CHANGE_TRIGGER:   return "trigger";
+    case CRABS_CHANGE_ATTRIBUTE: return "attribute";
+    default:                     return "op";
+  }
+}
 
-  devtools_event_t* event = &devtools_ring[devtools_ring_head];
-  memset(event, 0, sizeof(*event));
-  event->seq = ++devtools_event_seq;
-  strncpy(event->op_type, op->type, CRABS_MAX_OP_NAME - 1);
-  _hex_encode_uuid(event->uuid_hex, op->uuid);
-  strncpy(event->signer_id, op->signer_id, CRABS_MAX_USER_ID - 1);
-  strncpy(event->node_id, op->node_id, CRABS_MAX_USER_ID - 1);
-  event->lamport_time = op->lamport_time;
-  if (op->ordering_system == CRABS_ORDERING_HLC) {
-    event->has_hlc = true;
-    event->hlc = op->hlc;
+void devtools_record_change(state_t* state, const crabs_change_event_t* event) {
+  if (!event || !event->type) return;
+
+  devtools_event_t* slot = &devtools_ring[devtools_ring_head];
+  memset(slot, 0, sizeof(*slot));
+  slot->seq = ++devtools_event_seq;
+  strncpy(slot->op_type, event->type, CRABS_MAX_OP_NAME - 1);
+  if (event->uuid != NULL) {
+    _hex_encode_uuid(slot->uuid_hex, event->uuid);
   }
-  if (op->resource_count > 0 && op->resources) {
-    strncpy(event->target, op->resources[0], CRABS_MAX_USER_ID - 1);
+  strncpy(slot->signer_id, event->signer_id ? event->signer_id : "",
+          CRABS_MAX_USER_ID - 1);
+  strncpy(slot->node_id, event->node_id ? event->node_id : "",
+          CRABS_MAX_USER_ID - 1);
+  slot->lamport_time = event->lamport_time;
+  if (event->has_hlc) {
+    slot->has_hlc = true;
+    slot->hlc = event->hlc;
   }
-  event->result = result;
+  strncpy(slot->target, event->target ? event->target : "",
+          CRABS_MAX_USER_ID - 1);
+  strncpy(slot->layer, _change_kind_name(event->kind), sizeof(slot->layer) - 1);
+  strncpy(slot->preview, event->preview ? event->preview : "",
+          sizeof(slot->preview) - 1);
+  slot->result = event->result;
 
   devtools_ring_head = (devtools_ring_head + 1) % CRABS_DEVTOOLS_RING_SIZE;
   if (devtools_ring_used < CRABS_DEVTOOLS_RING_SIZE) {
@@ -208,6 +226,10 @@ static void _write_event_json(json_writer_t* writer, const devtools_event_t* eve
   }
   _json_writer_raw(writer, ",\"target\":");
   _json_writer_string(writer, event->target);
+  _json_writer_raw(writer, ",\"layer\":\"");
+  _json_writer_raw(writer, event->layer);
+  _json_writer_raw(writer, "\",\"preview\":");
+  _json_writer_string(writer, event->preview);
   _json_writer_raw(writer, ",\"result\":");
   _json_writer_string(writer, event->result == CRABS_SUCCESS ? "accepted" : "rejected");
   _json_writer_raw(writer, ",\"error_code\":");

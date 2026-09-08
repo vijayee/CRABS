@@ -35,11 +35,43 @@ static operation_t* make_operation(const char* type, const char* signer) {
   return op;
 }
 
+// Build the change event a state-mutating completion would carry and record
+// it through the layered recorder (the shape crabs_wasm_execute's hook sees).
+static void record_op_event(state_t* state, const operation_t* op,
+                            crabs_error_e result) {
+  crabs_change_event_t event;
+  memset(&event, 0, sizeof(event));
+  event.kind = CRABS_CHANGE_OP;
+  event.type = op->type;
+  event.uuid = op->uuid;
+  event.signer_id = op->signer_id;
+  event.node_id = op->node_id;
+  if (op->resource_count > 0 && op->resources != NULL) {
+    event.target = op->resources[0];
+  }
+  event.result = result;
+  event.lamport_time = op->lamport_time;
+  if (op->ordering_system == CRABS_ORDERING_HLC) {
+    event.has_hlc = true;
+    event.hlc = op->hlc;
+  }
+  devtools_record_change(state, &event);
+}
+
+// Registration shape crabs_wasm_node_create uses: every mutation the state
+// reports lands in the devtools ring.
+static void test_devtools_change_hook(state_t* state,
+                                      const crabs_change_event_t* event,
+                                      void* user_data) {
+  (void)user_data;
+  devtools_record_change(state, event);
+}
+
 TEST(DevtoolsEvents, RecordThenDrainProducesJsonArray) {
   state_t* state = make_state_with_g_counter();
   operation_t* op = make_operation("increment", "bob");
 
-  devtools_record_event(state, op, CRABS_SUCCESS);
+  record_op_event(state, op, CRABS_SUCCESS);
 
   char* json = devtools_events_json();
   ASSERT_NE(json, nullptr);
@@ -60,7 +92,7 @@ TEST(DevtoolsEvents, RecordThenDrainProducesJsonArray) {
 TEST(DevtoolsEvents, DrainEmptiesBuffer) {
   state_t* state = make_state_with_g_counter();
   operation_t* op = make_operation("increment", "bob");
-  devtools_record_event(state, op, CRABS_SUCCESS);
+  record_op_event(state, op, CRABS_SUCCESS);
 
   char* first = devtools_events_json();
   devtools_string_destroy(first);
@@ -78,7 +110,7 @@ TEST(DevtoolsEvents, RejectedOperationRecordsError) {
   state_t* state = make_state_with_g_counter();
   operation_t* op = make_operation("decrement", "mallory");
 
-  devtools_record_event(state, op, CRABS_ERR_UNAUTHORIZED);
+  record_op_event(state, op, CRABS_ERR_UNAUTHORIZED);
 
   char* json = devtools_events_json();
   std::string text = json;
@@ -96,7 +128,7 @@ TEST(DevtoolsEvents, RingWraparoundDropsOldest) {
   state_t* state = make_state_with_g_counter();
 
   operation_t* marker_op = make_operation("increment", "alice");
-  devtools_record_event(state, marker_op, CRABS_SUCCESS);
+  record_op_event(state, marker_op, CRABS_SUCCESS);
   operation_destroy(marker_op);
 
   char* marker_json = devtools_events_json();
@@ -110,7 +142,7 @@ TEST(DevtoolsEvents, RingWraparoundDropsOldest) {
 
   for (uint32_t op_index = 0; op_index < CRABS_DEVTOOLS_RING_SIZE + 5; op_index++) {
     operation_t* op = make_operation("increment", "alice");
-    devtools_record_event(state, op, CRABS_SUCCESS);
+    record_op_event(state, op, CRABS_SUCCESS);
     operation_destroy(op);
   }
 
@@ -133,7 +165,7 @@ TEST(DevtoolsEvents, RingWraparoundDropsOldest) {
 
 TEST(DevtoolsEvents, NullOperationIsIgnored) {
   state_t* state = make_state_with_g_counter();
-  devtools_record_event(state, nullptr, CRABS_SUCCESS);
+  devtools_record_change(state, nullptr);
   char* json = devtools_events_json();
   EXPECT_STREQ(json, "[]");
   devtools_string_destroy(json);
@@ -146,7 +178,7 @@ TEST(DevtoolsEvents, HlcEventEmitsHlcObject) {
   op->ordering_system = CRABS_ORDERING_HLC;
   op->hlc = {1, 2, 3, "node-b"};
 
-  devtools_record_event(state, op, CRABS_SUCCESS);
+  record_op_event(state, op, CRABS_SUCCESS);
 
   char* json = devtools_events_json();
   std::string text = json;
@@ -166,9 +198,9 @@ TEST(DevtoolsEvents, RingCountTracksUsedSlots) {
   operation_t* third = make_operation("increment", "dave");
 
   EXPECT_EQ(devtools_ring_count(), 0u);
-  devtools_record_event(state, first, CRABS_SUCCESS);
-  devtools_record_event(state, second, CRABS_SUCCESS);
-  devtools_record_event(state, third, CRABS_SUCCESS);
+  record_op_event(state, first, CRABS_SUCCESS);
+  record_op_event(state, second, CRABS_SUCCESS);
+  record_op_event(state, third, CRABS_SUCCESS);
   EXPECT_EQ(devtools_ring_count(), 3u);
 
   char* json = devtools_events_json();
@@ -179,6 +211,62 @@ TEST(DevtoolsEvents, RingCountTracksUsedSlots) {
   operation_destroy(second);
   operation_destroy(third);
   state_destroy(state);
+}
+
+// The recorder runs from the change hook: attribute mutations, which no
+// direct call site ever recorded, now land in the ring.
+TEST(DevtoolsEvents, RecordsAttributeMutationsViaChangeHook) {
+  crabs_test_env_t env;
+  crabs_test_env_init(&env);
+  // Attribute mutations fire on the attribute machine's own base_state, so
+  // the hook must be registered there (crabs_wasm_node_create registers it
+  // on the state the node actually uses). env.state gets it too so the
+  // execute/schedule paths fire in the same wiring.
+  state_set_change_hook(&env.am->base_state, test_devtools_change_hook, NULL);
+  state_set_change_hook(env.state, test_devtools_change_hook, NULL);
+
+  // Registration validates the key on secp256k1, so use a generated key.
+  ecdsa_keypair_t* user_key = crypto_ecdsa_generate();
+  ASSERT_NE(user_key, nullptr);
+  ASSERT_EQ(attribute_machine_register_user(env.am, "alice", user_key->public_key, NULL),
+            CRABS_SUCCESS);
+  crypto_ecdsa_keypair_destroy(user_key);
+
+  char* json = devtools_events_json();
+  ASSERT_NE(json, nullptr);
+  std::string text = json;
+  devtools_string_destroy(json);
+
+  EXPECT_NE(text.find("\"layer\":\"attribute\""), std::string::npos);
+  EXPECT_NE(text.find("\"op_type\":\"register_user\""), std::string::npos);
+  EXPECT_NE(text.find("\"preview\":\"user registered\""), std::string::npos);
+
+  crabs_test_env_destroy(&env);
+}
+
+TEST(DevtoolsEvents, RecordsScheduledFireWithScheduleLayer) {
+  crabs_test_env_t env;
+  crabs_test_env_init(&env);
+  state_set_change_hook(env.state, test_devtools_change_hook, NULL);
+
+  operation_t* embedded = operation_create("increment");
+  strncpy(embedded->signer_id, "admin", CRABS_MAX_USER_ID - 1);
+  uint64_t schedule_id = scheduler_schedule(env.state, 1000, "admin", embedded);
+  ASSERT_NE(schedule_id, 0u);
+
+  scheduler_process_due(env.state, 2000);
+
+  char* json = devtools_events_json();
+  ASSERT_NE(json, nullptr);
+  std::string text = json;
+  devtools_string_destroy(json);
+
+  EXPECT_NE(text.find("\"layer\":\"schedule\""), std::string::npos);
+  EXPECT_NE(text.find("\"preview\":\"scheduled increment\""),
+            std::string::npos);
+
+  operation_destroy(embedded);
+  crabs_test_env_destroy(&env);
 }
 
 static bool contains(const std::string& haystack, const std::string& needle) {
