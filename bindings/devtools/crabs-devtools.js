@@ -67,6 +67,7 @@
     .detail { background: #f3f4f6; border-radius: 8px; padding: 6px 8px; margin: 3px 0;
               font-family: ui-monospace, monospace; font-size: 11px; white-space: pre-wrap; }
     .toggle {
+      pointer-events: auto;
       position: fixed; bottom: 16px; right: 16px; z-index: 2147483647;
       width: 36px; height: 36px; border-radius: 999px;
       font: 700 9px/1 -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
@@ -84,14 +85,19 @@
       width: 380px;
       max-width: 100vw;
       z-index: 10000;
-      border-radius: 14px 0 0 14px;
       height: 100vh;
-      box-shadow: -2px 0 14px rgba(0,0,0,.12);
       display: block;
       overflow: hidden;
+      /* The host is an invisible fixed container: it paints NOTHING itself
+         (a shadow/radius here would leave a ghost ring after the panel
+         slides out) and never intercepts page clicks while collapsed. */
+      pointer-events: none;
     }
     :host(.overlay) .panel {
       height: 100%;
+      border-radius: 14px 0 0 14px;
+      box-shadow: -2px 0 14px rgba(0,0,0,.12);
+      pointer-events: auto;
       /* Slide in/out from the right edge on toggle (Vue DevTools style). */
       transition: transform .28s ease, box-shadow .28s ease;
     }
@@ -263,6 +269,9 @@
       if (this.controllers.length === 1) {
         this.activeController = entry;
       }
+      // Re-render immediately so the node selector appears the moment a
+      // second machine attaches (not only on the next change event).
+      if (this.root) this.render();
       return entry;
     }
 
