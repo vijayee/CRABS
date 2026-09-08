@@ -56,7 +56,10 @@ async function setupNode(dev, adminId, actorId, signingKeypair) {
   node.setPolicy('__create_trigger__', 'role:admin');
   node.setPolicy('noop', 'role:admin');
   node.registerUser(actorId, signingKeypair.publicKeyHex(), 'adult');
-  node.grantRole(actorId, 'role', 'member', 'admin');
+  // The signer must be the node's bootstrap admin (the admin gate requires
+  // an active role:admin signer) — the literal 'admin' only exists when the
+  // node was created with that id.
+  node.grantRole(actorId, 'role', 'member', node.adminId);
 
   node.createTrigger({
     triggerId: 'tos_threshold',
