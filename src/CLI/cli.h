@@ -55,6 +55,12 @@ typedef struct {
   size_t               state_sig_payload_len;
   uint8_t              state_sig_signature[CRABS_SIG_SIZE];
   bool                 state_sig_pending;
+  // Audit: an UNSIGNED snapshot carries no node-key signature, so its
+  // provenance is unauthenticated. cli_node_save refuses to re-sign it (the
+  // operator's key would end up on attacker-supplied state) until the
+  // operator runs 'state accept-unverified'.
+  bool                 loaded_unauthenticated;
+  bool                 unauth_warning_shown;
   bool                 initialized;
 } cli_node_t;
 
@@ -87,6 +93,10 @@ cli_result_e cli_cmd_state_show(cli_node_t* node);
 cli_result_e cli_cmd_state_items(cli_node_t* node);
 cli_result_e cli_cmd_state_policies(cli_node_t* node);
 cli_result_e cli_cmd_state_config(cli_node_t* node);
+// Audit: acknowledge an unauthenticated (unsigned) snapshot after load so
+// cli_node_save will accept it. No-op (with a notice) when the state is
+// already authenticated.
+cli_result_e cli_cmd_state_accept_unverified(cli_node_t* node);
 
 // ============================================================
 // User Management

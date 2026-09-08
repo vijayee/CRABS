@@ -637,6 +637,119 @@ TEST_F(TestCLI, SaveRefusesUnverifiedLoadedState) {
 }
 
 // ============================================================
+// Unauthenticated (unsigned) snapshot acknowledgment gate (audit: the
+// operator's node key must not end up signing attacker-supplied state —
+// save is refused until the operator explicitly acknowledges the
+// unauthenticated load).
+// ============================================================
+
+TEST_F(TestCLI, SaveRefusesUnacknowledgedUnsignedState) {
+  ASSERT_EQ(cli_node_init(node, "admin"), CLI_OK);
+  ASSERT_EQ(cli_cmd_item_add(node, "counter1", "counter"), CLI_OK);
+
+  // Legacy blobs written by older CLIs carry no signature trailer.
+  serialized_buffer_t* legacy_blob =
+      crabs_serialize_state(&node->attr_machine->base_state);
+  ASSERT_NE(legacy_blob, nullptr);
+  const char* tmp_path = "/tmp/crabs_test_unauth_state.bin";
+  std::vector<uint8_t> file_bytes(legacy_blob->data,
+                                  legacy_blob->data + legacy_blob->len);
+  serialized_buffer_destroy(legacy_blob);
+  ASSERT_TRUE(test_write_file_bytes(tmp_path, file_bytes));
+
+  cli_node_t* loaded_node = cli_node_create();
+  ASSERT_NE(loaded_node, nullptr);
+  ASSERT_EQ(cli_node_load(loaded_node, tmp_path), CLI_OK);
+  // The unsigned fallback must mark the snapshot unauthenticated.
+  EXPECT_TRUE(loaded_node->loaded_unauthenticated);
+
+  // Save must refuse — re-saving would put THIS node's signature on
+  // unauthenticated state (signature laundering).
+  const char* resave_path = "/tmp/crabs_test_unauth_resaved.bin";
+  EXPECT_EQ(cli_node_save(loaded_node, resave_path), CLI_ERR_EXEC);
+
+  // After an explicit acknowledgment the save is allowed.
+  EXPECT_EQ(cli_cmd_state_accept_unverified(loaded_node), CLI_OK);
+  EXPECT_FALSE(loaded_node->loaded_unauthenticated);
+  EXPECT_EQ(cli_node_save(loaded_node, resave_path), CLI_OK);
+
+  remove(tmp_path);
+  remove(resave_path);
+  cli_node_destroy(loaded_node);
+}
+
+TEST_F(TestCLI, SignedVerifiedLoadNeedsNoAcknowledgment) {
+  ASSERT_EQ(cli_node_init(node, "admin"), CLI_OK);
+  ASSERT_EQ(cli_cmd_item_add(node, "counter1", "counter"), CLI_OK);
+  char node_private_key_hex[65];
+  cli_bytes_to_hex(node->node_key->private_key, 32, node_private_key_hex);
+
+  const char* tmp_path = "/tmp/crabs_test_signed_gate_state.bin";
+  ASSERT_EQ(cli_node_save(node, tmp_path), CLI_OK);
+
+  cli_node_t* loaded_node = cli_node_create();
+  ASSERT_NE(loaded_node, nullptr);
+  ASSERT_EQ(cli_node_load(loaded_node, tmp_path), CLI_OK);
+  // A signed snapshot is pending verification, not unauthenticated.
+  EXPECT_TRUE(loaded_node->state_sig_pending);
+  EXPECT_FALSE(loaded_node->loaded_unauthenticated);
+
+  // Save is gated on signature verification (existing M-1 behavior), and
+  // once verified no acknowledgment is needed.
+  EXPECT_EQ(cli_node_save(loaded_node, "/tmp/crabs_test_signed_gate_out.bin"),
+            CLI_ERR_EXEC);
+  ASSERT_EQ(cli_node_load_key(loaded_node, node_private_key_hex), CLI_OK);
+  EXPECT_FALSE(loaded_node->loaded_unauthenticated);
+
+  const char* resave_path = "/tmp/crabs_test_signed_gate_resaved.bin";
+  EXPECT_EQ(cli_node_save(loaded_node, resave_path), CLI_OK);
+
+  remove(tmp_path);
+  remove(resave_path);
+  cli_node_destroy(loaded_node);
+}
+
+TEST_F(TestCLI, AcceptUnverifiedOnFreshNodeIsHarmless) {
+  ASSERT_EQ(cli_node_init(node, "admin"), CLI_OK);
+  EXPECT_FALSE(node->loaded_unauthenticated);
+  EXPECT_EQ(cli_cmd_state_accept_unverified(node), CLI_OK);
+  EXPECT_FALSE(node->loaded_unauthenticated);
+}
+
+TEST_F(TestCLI, DispatchStateAcceptUnverifiedClearsGate) {
+  ASSERT_EQ(cli_node_init(node, "admin"), CLI_OK);
+  ASSERT_EQ(cli_cmd_item_add(node, "counter1", "counter"), CLI_OK);
+
+  serialized_buffer_t* legacy_blob =
+      crabs_serialize_state(&node->attr_machine->base_state);
+  ASSERT_NE(legacy_blob, nullptr);
+  const char* tmp_path = "/tmp/crabs_test_dispatch_unauth.bin";
+  std::vector<uint8_t> file_bytes(legacy_blob->data,
+                                  legacy_blob->data + legacy_blob->len);
+  serialized_buffer_destroy(legacy_blob);
+  ASSERT_TRUE(test_write_file_bytes(tmp_path, file_bytes));
+
+  cli_node_t* loaded_node = cli_node_create();
+  ASSERT_NE(loaded_node, nullptr);
+  ASSERT_EQ(cli_node_load(loaded_node, tmp_path), CLI_OK);
+  ASSERT_TRUE(loaded_node->loaded_unauthenticated);
+
+  const char* save_argv[] = {"crabs", "save", "/tmp/crabs_test_dispatch_out.bin"};
+  EXPECT_EQ(cli_dispatch(loaded_node, 3, (char**)save_argv), CLI_ERR_EXEC);
+
+  const char* accept_argv[] = {"crabs", "state", "accept-unverified"};
+  EXPECT_EQ(cli_dispatch(loaded_node, 3, (char**)accept_argv), CLI_OK);
+  EXPECT_FALSE(loaded_node->loaded_unauthenticated);
+
+  const char* resave_argv[] = {"crabs", "save", "/tmp/crabs_test_dispatch_out.bin"};
+  EXPECT_EQ(cli_dispatch(loaded_node, 3, (char**)resave_argv), CLI_OK);
+
+  remove(tmp_path);
+  remove("/tmp/crabs_test_dispatch_out.bin");
+  cli_node_destroy(loaded_node);
+}
+
+// ============================================================
 // ONE_SHOT item type tests
 // ============================================================
 

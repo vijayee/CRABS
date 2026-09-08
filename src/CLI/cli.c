@@ -245,6 +245,9 @@ cli_result_e cli_node_load(cli_node_t* node, const char* path) {
   // blob fails the checksum when parsed with the trailer stripped, and a
   // signed blob fails it when parsed with the trailer included.
   state_t* loaded = NULL;
+  // Audit: each load re-evaluates snapshot authenticity from scratch.
+  node->loaded_unauthenticated = false;
+  node->unauth_warning_shown = false;
   if (file_len > CRABS_SIG_SIZE) {
     size_t payload_len = file_len - CRABS_SIG_SIZE;
     loaded = crabs_deserialize_state(data, payload_len);
@@ -269,10 +272,15 @@ cli_result_e cli_node_load(cli_node_t* node, const char* path) {
   if (loaded == NULL) {
     loaded = crabs_deserialize_state(data, file_len);
     if (loaded != NULL) {
+      // Audit: the fallback parsed an UNSIGNED blob. Its provenance is
+      // unauthenticated — mark the node so cli_node_save refuses to re-sign
+      // it until the operator acknowledges via 'state accept-unverified'.
+      node->loaded_unauthenticated = true;
       fprintf(stderr,
               "WARNING: state file is unsigned — it carries no node-key "
               "signature and is NOT authenticated; verify its provenance "
-              "before trusting it\n");
+              "before trusting it. Saving is disabled until you run "
+              "'state accept-unverified'\n");
     }
   }
   free(data);
@@ -387,6 +395,17 @@ cli_result_e cli_node_save(cli_node_t* node, const char* path) {
     return CLI_ERR_EXEC;
   }
 
+  // Audit: do not re-sign an UNSIGNED snapshot either — the operator's node
+  // key would end up authenticating attacker-supplied state (signature
+  // laundering). Require an explicit acknowledgment first.
+  if (node->loaded_unauthenticated) {
+    fprintf(stderr,
+            "ERROR: refusing to save — the loaded state is unauthenticated "
+            "(unsigned snapshot); run 'state accept-unverified' to "
+            "acknowledge it first\n");
+    return CLI_ERR_EXEC;
+  }
+
   // Audit M-1: sign the state blob with the node private key. The bare
   // SHA-256 checksum written by the unsigned serializer is integrity only —
   // an attacker who can write the file can recompute it.
@@ -481,6 +500,25 @@ cli_result_e cli_cmd_state_config(cli_node_t* node) {
   printf("  max_lock_extensions:  %u\n", cfg->max_lock_extensions);
   printf("  allow_force_unlock:   %s\n", cfg->allow_force_unlock ? "true" : "false");
   printf("  bootstrap_admin:     %s\n", cfg->bootstrap_admin[0] ? cfg->bootstrap_admin : "(not set)");
+  return CLI_OK;
+}
+
+// Audit: explicit operator acknowledgment of an unauthenticated (unsigned)
+// snapshot. This is the gate release for cli_node_save — the operator
+// accepts responsibility for the snapshot's provenance.
+cli_result_e cli_cmd_state_accept_unverified(cli_node_t* node) {
+  if (node == NULL || !node->initialized) return CLI_ERR_NOT_INIT;
+
+  if (!node->loaded_unauthenticated) {
+    printf("State is authenticated; nothing to acknowledge.\n");
+    return CLI_OK;
+  }
+
+  node->loaded_unauthenticated = false;
+  node->unauth_warning_shown = true;
+  printf("Acknowledged: the loaded state snapshot was UNSIGNED and its "
+         "provenance is UNVERIFIED — accepting it at the operator's "
+         "discretion; saving will now sign this state with the node key.\n");
   return CLI_OK;
 }
 
@@ -1045,6 +1083,41 @@ static void _print_state_usage(void) {
   printf("  state items            List data items\n");
   printf("  state policies         List policies\n");
   printf("  state config           Show machine configuration\n");
+  printf("  state accept-unverified  Acknowledge an unsigned (unauthenticated) snapshot\n");
+}
+
+// Audit: mutating an unauthenticated (unsigned) snapshot is risky but
+// recoverable without signature laundering — the hard gate is at save time
+// (cli_node_save refuses until 'state accept-unverified'). Warn once on the
+// first mutating command so the operator cannot miss the provenance problem.
+static void _warn_first_unauthenticated_mutation(cli_node_t* node, const char* cmd,
+                                                 const char* sub) {
+  if (node == NULL || !node->loaded_unauthenticated || node->unauth_warning_shown) {
+    return;
+  }
+
+  bool mutating = false;
+  if (strcmp(cmd, "item") == 0 && sub != NULL && strcmp(sub, "add") == 0) {
+    mutating = true;
+  } else if (strcmp(cmd, "policy") == 0 && sub != NULL && strcmp(sub, "add") == 0) {
+    mutating = true;
+  } else if (strcmp(cmd, "compact") == 0) {
+    mutating = true;
+  } else if (strcmp(cmd, "user") == 0 && sub != NULL && strcmp(sub, "list") != 0) {
+    mutating = true;
+  } else if (strcmp(cmd, "key") == 0 && sub != NULL &&
+             (strcmp(sub, "refresh") == 0 || strcmp(sub, "revoke") == 0)) {
+    mutating = true;
+  } else if (strcmp(cmd, "op") == 0 && sub != NULL &&
+             (strcmp(sub, "submit") == 0 || strcmp(sub, "define") == 0)) {
+    mutating = true;
+  }
+
+  if (!mutating) return;
+  node->unauth_warning_shown = true;
+  fprintf(stderr,
+          "WARNING: mutating state loaded from an UNSIGNED (unauthenticated) "
+          "snapshot — run 'state accept-unverified' to acknowledge it\n");
 }
 
 static void _print_user_usage(void) {
@@ -1152,6 +1225,10 @@ cli_result_e cli_dispatch(cli_node_t* node, int argc, char** argv) {
     return CLI_ERR_NOT_INIT;
   }
 
+  // Audit: warn once before the first mutating command on an unauthenticated
+  // snapshot (the hard gate is at save time).
+  _warn_first_unauthenticated_mutation(node, cmd, argc >= 3 ? argv[2] : NULL);
+
   if (strcmp(cmd, "state") == 0) {
     if (argc < 3) {
       _print_state_usage();
@@ -1162,6 +1239,8 @@ cli_result_e cli_dispatch(cli_node_t* node, int argc, char** argv) {
     if (strcmp(sub, "items") == 0)     return cli_cmd_state_items(node);
     if (strcmp(sub, "policies") == 0)  return cli_cmd_state_policies(node);
     if (strcmp(sub, "config") == 0)    return cli_cmd_state_config(node);
+    if (strcmp(sub, "accept-unverified") == 0)
+      return cli_cmd_state_accept_unverified(node);
     printf("Unknown state subcommand: %s\n", sub);
     _print_state_usage();
     return CLI_ERR_ARGS;
