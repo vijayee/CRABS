@@ -952,12 +952,19 @@ private:
     uint64_t cooldown = cfg.Has("cooldownMs") ? (uint64_t)cfg.Get("cooldownMs").As<Napi::Number>().DoubleValue() : 0;
     bool one_shot = cfg.Has("oneShot") ? cfg.Get("oneShot").As<Napi::Boolean>().Value() : false;
 
-    // Build payload string
+    // Build payload string. Audit 9 A-1: snprintf returns the WOULD-BE
+    // length on truncation, so accumulating it unchecked lets `pos` exceed
+    // sizeof(payload) and `sizeof(payload) - pos` underflow to a huge
+    // size_t — an out-of-bounds stack write driven by attacker-controlled
+    // JS strings. Clamp pos after every write.
     char payload[4096];
-    int pos = snprintf(payload, sizeof(payload),
+    int written = snprintf(payload, sizeof(payload),
       "trigger_id=%s;condition=%s;description=%s;effect_type=%d;cooldown_ms=%llu;one_shot=%d",
       trigger_id.c_str(), condition.c_str(), description.c_str(),
       effect_type_num, (unsigned long long)cooldown, one_shot ? 1 : 0);
+    if (written < 0) throw Napi::Error::New(env, "payload build failed");
+    size_t pos = (size_t)written;
+    if (pos >= sizeof(payload)) pos = sizeof(payload) - 1;
 
     // Add effect-specific fields
     if (effect_type_str == "issue_attribute") {
@@ -965,9 +972,12 @@ private:
       std::string role = cfg.Get("targetRole").As<Napi::String>().Utf8Value();
       std::string value = cfg.Get("attributeValue").As<Napi::String>().Utf8Value();
       uint64_t duration = cfg.Has("durationMs") ? (uint64_t)cfg.Get("durationMs").As<Napi::Number>().DoubleValue() : 0;
-      pos += snprintf(payload + pos, sizeof(payload) - pos,
+      written = snprintf(payload + pos, sizeof(payload) - pos,
         ";issue_attribute=%s;target_role=%s;attribute_value=%s;duration_ms=%llu",
         attr.c_str(), role.c_str(), value.c_str(), (unsigned long long)duration);
+      if (written < 0) throw Napi::Error::New(env, "payload build failed");
+      pos += (size_t)written;
+      if (pos >= sizeof(payload)) pos = sizeof(payload) - 1;
     }
 
     // Create and execute the __create_trigger__ operation

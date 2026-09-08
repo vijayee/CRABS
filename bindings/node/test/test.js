@@ -136,5 +136,26 @@ assert(changeEvents.length === eventCountBeforeUnsubscribe,
 assert(node.getUser('carol') !== undefined,
   'Mutations after unsubscribe should still apply');
 
+// Test 17: createTrigger with oversized fields must not corrupt the stack.
+// Audit 9 A-1: the payload builder accumulated snprintf return values, which
+// are the WOULD-BE length on truncation — unchecked, `pos` overruns the
+// payload buffer and `sizeof(payload) - pos` underflows to a huge size_t.
+// The id and condition below are far longer than the 4096-byte payload
+// combined; the call must truncate (or error) but never write out of bounds.
+try {
+  node.createTrigger({
+    triggerId: 'a'.repeat(3000),
+    condition: 'b'.repeat(3000) + ' >= 1',
+    effectType: 'issue_attribute',
+    issueAttribute: 'c'.repeat(3000),
+    targetRole: 'role',
+    attributeValue: 'd'.repeat(3000),
+  });
+  assert(true, 'createTrigger with oversized fields should not crash');
+} catch (e) {
+  // A rejection is acceptable too — the point is no out-of-bounds write.
+  assert(true, 'createTrigger with oversized fields rejected cleanly');
+}
+
 console.log(`\n${passed} passed, ${failed} failed`);
 process.exit(failed > 0 ? 1 : 0);
