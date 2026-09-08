@@ -20,6 +20,16 @@
   const BADGE_COLORS = { added: '#d1fae5', changed: '#fef3c7', removed: '#fee2e2' };
   const BADGE_TEXT = { added: '#065f46', changed: '#92400e', removed: '#991b1b' };
 
+  // Timeline layer pill colors: [background, text]. Unknown or missing layers
+  // fall back to gray with the 'op' label.
+  const LAYER_COLORS = {
+    op: ['#dbeafe', '#1e40af'],
+    schedule: ['#fef3c7', '#92400e'],
+    trigger: ['#d1fae5', '#065f46'],
+    attribute: ['#e5e7eb', '#374151'],
+  };
+  const LAYER_FALLBACK = { background: '#f3f4f6', color: '#374151', label: 'op' };
+
   const STYLES = `
     :host { all: initial; }
     * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -95,6 +105,18 @@
     }
     .tree-row:hover { background: #f3f4f6; }
     .tree-toggle { user-select: none; }
+    .layer-filter { display: flex; gap: 10px; align-items: center; margin-bottom: 6px; }
+    .layer-filter label {
+      display: inline-flex; align-items: center; gap: 4px;
+      font-size: 11px; color: #374151; cursor: pointer; user-select: none;
+    }
+    .layer-filter input { accent-color: #1a56db; margin: 0; }
+    .layer-filter .layer-filter-label { color: #9ca3af; cursor: default; }
+    .layer-pill {
+      display: inline-flex; align-items: center; border-radius: 999px;
+      font-size: 10px; line-height: 15px; padding: 0 6px; margin: 0 4px;
+      vertical-align: middle; white-space: nowrap;
+    }
   `;
 
   // Leaf formatting: strings verbatim (opaque payloads already arrive as
@@ -205,6 +227,9 @@
       // snap shut on every snapshot pull.
       this.expandedPaths = new Set(['', 'items']);
       this.filterText = '';
+      // Layer visibility persists per-panel across re-renders; all layers
+      // are shown until a checkbox is unchecked.
+      this.visibleLayers = new Set(Object.keys(LAYER_COLORS));
       this.paused = false;
       this.collapsedState = false;
     }
@@ -343,7 +368,46 @@
                       this.expandedPaths);
     }
 
+    // A row is visible iff its layer is checked AND the text filter matches.
+    // Unknown/missing layers count as 'op', matching the fallback pill.
+    eventVisible(event, needle) {
+      const layer = LAYER_COLORS[event.layer] ? event.layer : LAYER_FALLBACK.label;
+      if (!this.visibleLayers.has(layer)) return false;
+      if (!needle) return true;
+      return (event.op_type + ' ' + event.signer + ' ' +
+        event.target + ' ' + event.node).toLowerCase().includes(needle);
+    }
+
     renderTimeline(body) {
+      // Layer filter row: four checkboxes above the text filter. Toggling
+      // patches the existing rows in place (same rationale as the text
+      // filter — a re-render would destroy input focus and open details).
+      const layerFilter = document.createElement('div');
+      layerFilter.className = 'layer-filter';
+      const layerFilterLabel = document.createElement('label');
+      layerFilterLabel.className = 'layer-filter-label';
+      layerFilterLabel.textContent = 'layers:';
+      layerFilter.appendChild(layerFilterLabel);
+      for (const layer of Object.keys(LAYER_COLORS)) {
+        const layerOption = document.createElement('label');
+        const layerCheckbox = document.createElement('input');
+        layerCheckbox.type = 'checkbox';
+        layerCheckbox.checked = this.visibleLayers.has(layer);
+        layerCheckbox.addEventListener('change', () => {
+          if (layerCheckbox.checked) this.visibleLayers.add(layer);
+          else this.visibleLayers.delete(layer);
+          const needle = this.filterText.toLowerCase();
+          for (const row of timelineRows) {
+            row.style.display =
+              this.eventVisible(row._event, needle) ? '' : 'none';
+          }
+        });
+        layerOption.appendChild(layerCheckbox);
+        layerOption.appendChild(document.createTextNode(layer));
+        layerFilter.appendChild(layerOption);
+      }
+      body.appendChild(layerFilter);
+
       const toolbar = document.createElement('div');
       toolbar.className = 'toolbar';
       const filter = document.createElement('input');
@@ -356,10 +420,7 @@
         this.filterText = filter.value;
         const needle = this.filterText.toLowerCase();
         for (const row of timelineRows) {
-          const event = row._event;
-          const haystack = (event.op_type + ' ' + event.signer + ' ' +
-            event.target + ' ' + event.node).toLowerCase();
-          row.style.display = haystack.includes(needle) ? '' : 'none';
+          row.style.display = this.eventVisible(row._event, needle) ? '' : 'none';
         }
       });
       toolbar.appendChild(filter);
@@ -392,9 +453,23 @@
         const row = document.createElement('div');
         row._event = event;
         row.className = 'row ' + (event.result === 'accepted' ? 'accept' : 'reject');
+        // Rows hidden by the layer filter start hidden; toggling a checkbox
+        // only flips display, so the click/detail wiring stays intact.
+        if (!this.eventVisible(event, needle)) row.style.display = 'none';
         const left = document.createElement('span');
-        left.textContent = event.signer + ' · ' + event.op_type +
-          (event.target ? ' ' + event.target : '');
+        left.textContent = event.signer + ' ·';
+        const pill = document.createElement('span');
+        pill.className = 'layer-pill';
+        const layerColors = LAYER_COLORS[event.layer] || null;
+        pill.textContent = layerColors ? event.layer : LAYER_FALLBACK.label;
+        pill.style.background = layerColors ? layerColors[0] : LAYER_FALLBACK.background;
+        pill.style.color = layerColors ? layerColors[1] : LAYER_FALLBACK.color;
+        left.appendChild(pill);
+        const eventText = document.createElement('span');
+        eventText.textContent = ' ' + event.op_type +
+          (event.target ? ' ' + event.target : '') +
+          (event.preview ? ' · ' + event.preview : '');
+        left.appendChild(eventText);
         const right = document.createElement('span');
         right.className = event.result === 'accepted' ? 'ok' : 'bad';
         right.textContent = event.result === 'accepted'
