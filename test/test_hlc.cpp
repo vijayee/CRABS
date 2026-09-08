@@ -1723,3 +1723,152 @@ TEST(HLCReceive, AdvanceFromLocalClockStillResetsCounter) {
   EXPECT_EQ(state.last.physical_seconds, 36005u);
   EXPECT_EQ(state.last.logical_counter, 0u);  // local advance: reset is correct
 }
+
+// ============================================================
+// Audit A-4: wire HLC validation at execute
+//
+// crabs_hlc_receive (skew strategies + the R4-8 counter bound) never ran on
+// received ops: wire HLC flowed straight into ordering comparisons, the
+// R7-11 replay backstop and the chain hash. A signer could stamp
+// physical_seconds arbitrarily far in the future (self-DoS of its own
+// watermark) or push the node's logical counter toward saturation. These
+// tests pin the execute-path validation against the local clock, per the
+// node's receive strategy, without mutating the node's clock.
+// ============================================================
+
+// Helper shared by the wire-validation tests: builds the BOUNDED env the
+// HLCReplay tests use, then overrides the strategy. Returns nothing; the
+// caller owns env and must destroy it.
+static void init_hlc_replay_env(crabs_test_env_t* env,
+                                crabs_hlc_strategy_e strategy) {
+  crabs_test_env_init(env);
+  state_t* state = env->state;
+
+  g_mock_time.seconds = 1000000;
+  g_mock_time.nanos = 0;
+  g_mock_time.valid = true;
+  crabs_ordering_config_t* ordering_config =
+      (crabs_ordering_config_t*)get_clear_memory(sizeof(crabs_ordering_config_t));
+  crabs_ordering_config_init_hlc(ordering_config, strategy);
+  state_set_ordering_config(state, ordering_config);
+  crabs_hlc_state_init(&state->hlc_state, "admin");
+  state->hlc_state.time_source_ops = &g_mock_ops;
+  state->hlc_state_initialized = true;
+
+  data_item_t* resource = data_item_create("res1", DATA_TYPE_RESOURCE, CRDT_PN_COUNTER);
+  state_add_item(state, resource);
+}
+
+// Shift an already-signed op's HLC by whole seconds and re-sign, since the
+// signature covers the HLC fields.
+static void shift_op_hlc_and_sign(crabs_test_env_t* env, operation_t* op,
+                                  int64_t delta_seconds) {
+  op->hlc.physical_seconds =
+      (uint64_t)((int64_t)op->hlc.physical_seconds + delta_seconds);
+  sign_hlc_op(env, op);
+}
+
+// BOUNDED: an op stamped beyond max_skew_ms (default 5000) into the future
+// must be rejected at execute and must not reach the log.
+TEST(HLCReplay, BoundedStrategyRejectsFarFutureOp) {
+  crabs_test_env_t env;
+  init_hlc_replay_env(&env, HLC_STRATEGY_BOUNDED);
+  state_t* state = env.state;
+
+  operation_t* op = make_hlc_lock_op(&env, "res1");
+  shift_op_hlc_and_sign(&env, op, 6);  // +6000ms > 5000ms bound
+
+  EXPECT_EQ(state_machine_execute(state, op), CRABS_ERR_PROTOCOL_VIOLATION);
+  EXPECT_EQ(state->log_count, 0u);
+
+  operation_destroy(op);
+  crabs_test_env_destroy(&env);
+}
+
+// BOUNDED symmetric check: an op stamped beyond the window into the past is
+// equally rejected.
+TEST(HLCReplay, BoundedStrategyRejectsFarPastOp) {
+  crabs_test_env_t env;
+  init_hlc_replay_env(&env, HLC_STRATEGY_BOUNDED);
+  state_t* state = env.state;
+
+  operation_t* op = make_hlc_lock_op(&env, "res1");
+  shift_op_hlc_and_sign(&env, op, -6);  // -6000ms, outside the 5000ms window
+
+  EXPECT_EQ(state_machine_execute(state, op), CRABS_ERR_PROTOCOL_VIOLATION);
+  EXPECT_EQ(state->log_count, 0u);
+
+  operation_destroy(op);
+  crabs_test_env_destroy(&env);
+}
+
+// BOUNDED: an op within the window still executes — no regression for
+// legitimate ops stamped slightly ahead of the node's clock.
+TEST(HLCReplay, BoundedStrategyAcceptsInWindowOp) {
+  crabs_test_env_t env;
+  init_hlc_replay_env(&env, HLC_STRATEGY_BOUNDED);
+  state_t* state = env.state;
+
+  operation_t* op = make_hlc_lock_op(&env, "res1");
+  shift_op_hlc_and_sign(&env, op, 4);  // +4000ms, inside the 5000ms window
+
+  EXPECT_EQ(state_machine_execute(state, op), CRABS_SUCCESS);
+  EXPECT_EQ(state->log_count, 1u);
+
+  operation_destroy(op);
+  crabs_test_env_destroy(&env);
+}
+
+// STRICT: the existing receive semantics accept the message for ordering but
+// never adopt it into the local clock (ACCEPTED_STRICT) — so an in-window
+// op still executes under a STRICT-configured node.
+TEST(HLCReplay, StrictStrategyAcceptsInWindowOp) {
+  crabs_test_env_t env;
+  init_hlc_replay_env(&env, HLC_STRATEGY_STRICT);
+  state_t* state = env.state;
+
+  operation_t* op = make_hlc_lock_op(&env, "res1");
+  shift_op_hlc_and_sign(&env, op, 3);  // +3000ms, inside any sane window
+
+  EXPECT_EQ(state_machine_execute(state, op), CRABS_SUCCESS);
+  EXPECT_EQ(state->log_count, 1u);
+
+  operation_destroy(op);
+  crabs_test_env_destroy(&env);
+}
+
+// TRUSTED (and QUORUM) fail closed in crabs_hlc_receive — no authenticated
+// time source is implemented, so a TRUSTED-configured node must reject
+// received HLC ops rather than silently trusting them.
+TEST(HLCReplay, TrustedStrategyFailsClosed) {
+  crabs_test_env_t env;
+  init_hlc_replay_env(&env, HLC_STRATEGY_TRUSTED);
+  state_t* state = env.state;
+
+  operation_t* op = make_hlc_lock_op(&env, "res1");  // skew 0 — still rejected
+
+  EXPECT_EQ(state_machine_execute(state, op), CRABS_ERR_PROTOCOL_VIOLATION);
+  EXPECT_EQ(state->log_count, 0u);
+
+  operation_destroy(op);
+  crabs_test_env_destroy(&env);
+}
+
+// R4-8 through the wire path: an op carrying a logical counter at the
+// saturation threshold is rejected at execute even under NAIVE, which has no
+// skew bound at all.
+TEST(HLCReplay, ExtremeLogicalCounterRejectedAtExecute) {
+  crabs_test_env_t env;
+  init_hlc_replay_env(&env, HLC_STRATEGY_NAIVE);
+  state_t* state = env.state;
+
+  operation_t* op = make_hlc_lock_op(&env, "res1");
+  op->hlc.logical_counter = UINT64_MAX / 2;
+  sign_hlc_op(&env, op);
+
+  EXPECT_EQ(state_machine_execute(state, op), CRABS_ERR_PROTOCOL_VIOLATION);
+  EXPECT_EQ(state->log_count, 0u);
+
+  operation_destroy(op);
+  crabs_test_env_destroy(&env);
+}

@@ -564,6 +564,43 @@ static bool state_signer_has_replay(const state_t* state, const operation_t* op)
   return false;
 }
 
+// Audit A-4: validate a received op's wire HLC against the local clock per
+// the node's receive strategy, BEFORE any ordering comparison consumes it.
+// Without this, crabs_hlc_receive (the BOUNDED/STRICT/TRUSTED skew strategies
+// and the R4-8 counter bound) never ran on received ops: wire HLC flowed
+// straight into ordering comparisons, the R7-11 replay backstop and the chain
+// hash, letting a signer stamp physical_seconds arbitrarily far in the future
+// (self-DoS of its own watermark) or push the node's logical counter toward
+// saturation.
+//
+// Probe copy: crabs_hlc_receive mutates its state argument, so validate
+// against a copy — the real clock adopts nothing from ops. Strategy, skew
+// bound and strict mode come from the node's ordering config (hlc_state
+// itself carries BOUNDED defaults regardless of the configured strategy).
+// Rejections (BOUNDED out-of-window, QUORUM/TRUSTED fail-closed, R4-8
+// counter) fail the op; ACCEPTED_STRICT counts as acceptance — STRICT orders
+// by the received timestamp but never adopts it. When the node has no
+// initialized local clock (lamport-only node receiving an HLC op) there is
+// nothing to compare against and validation is skipped.
+static crabs_error_e _validate_received_hlc(state_t* state, const operation_t* op) {
+  crabs_ordering_config_t* config = state_get_ordering_config(state);
+  if (op->ordering_system != CRABS_ORDERING_HLC ||
+      !state->hlc_state_initialized ||
+      config == NULL || config->ordering_system != CRABS_ORDERING_HLC) {
+    return CRABS_SUCCESS;
+  }
+
+  crabs_hlc_state_t probe_state = state->hlc_state;
+  probe_state.receive_strategy = config->hlc.receive_strategy;
+  probe_state.max_skew_ms = config->hlc.max_skew_ms;
+  probe_state.strict_mode = config->hlc.strict_mode;
+  crabs_hlc_receive_result_e receive_rc = crabs_hlc_receive(&probe_state, &op->hlc);
+  if (receive_rc == CRABS_HLC_ACCEPTED || receive_rc == CRABS_HLC_ACCEPTED_STRICT) {
+    return CRABS_SUCCESS;
+  }
+  return CRABS_ERR_PROTOCOL_VIOLATION;
+}
+
 // Step 3 helper: Authorization (§10.3) — fail closed. Every operation
 // requires a registered policy and a valid signature.
 // Audit L-a: authorize BEFORE the protocol/lock/dedup checks (steps 4-6)
@@ -796,6 +833,19 @@ static crabs_error_e state_machine_execute_internal(state_t* state, operation_t*
     if (tx->vtable.accept != NULL) {
       crabs_error_e tx_result = tx->vtable.accept(tx, state, op);
       if (tx_result != CRABS_SUCCESS) return tx_result;
+    }
+  }
+
+  // Audit A-4: wire HLC skew/counter validation (see _validate_received_hlc).
+  // Runs BEFORE the ordering comparisons below consume op->hlc. Scheduled
+  // materializations skip it: their embedded ops were validated against the
+  // scheduling node's clock at submission time (state_machine_validate), and
+  // a recurring slot materialized later must not be judged against a moved
+  // clock.
+  if (!skip_authorization) {
+    crabs_error_e hlc_rc = _validate_received_hlc(state, op);
+    if (hlc_rc != CRABS_SUCCESS) {
+      return hlc_rc;
     }
   }
 
@@ -1078,6 +1128,12 @@ crabs_error_e state_machine_validate(state_t* state, const operation_t* op) {
 
   policy_preprocess_result_t pp = {0};
   crabs_error_e rc = _verify_operation_authorization(state, op, &pp);
+  if (rc != CRABS_SUCCESS) return rc;
+  // Audit A-4: validate a scheduled embedded op's HLC at submission time,
+  // against the scheduling node's clock — this is the only chance, because
+  // materialization re-runs without validation (execute_scheduled skips the
+  // skew check; a slot fired later must not be judged against a moved clock).
+  rc = _validate_received_hlc(state, op);
   if (rc != CRABS_SUCCESS) return rc;
   rc = _check_transitions(state, op);
   if (rc != CRABS_SUCCESS) return rc;

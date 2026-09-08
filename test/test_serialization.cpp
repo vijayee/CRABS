@@ -1551,3 +1551,92 @@ TEST(TestSerialization, TestDeserialRejectsDuplicateOrderedSetElementIds) {
   serialized_buffer_destroy(buf);
   state_destroy(state);
 }
+
+// ============================================================
+// Audit A-4: HLC nanos bound on the wire paths
+//
+// crabs_hlc_deserialize enforces physical_nanos < 1e9, but the op and
+// log-entry wire readers parsed raw uint64 fields without that bound. A
+// crafted op with nanos >= 1e9 would flow into crabs_hlc_next's comparisons
+// and freeze the node's clock if receive were ever wired. Both readers must
+// fail closed, matching crabs_hlc_deserialize.
+// ============================================================
+
+// Serialize-then-patch: find the HLC physical_seconds field in the wire blob
+// by its unique little-endian value; the nanos field follows it immediately.
+static size_t _find_le_u64(const serialized_buffer_t* blob, uint64_t value) {
+  uint8_t pattern[8];
+  for (int byte_index = 0; byte_index < 8; byte_index++) {
+    pattern[byte_index] = (uint8_t)(value >> (8 * byte_index));
+  }
+  for (size_t offset = 0; offset + 8 <= blob->len; offset++) {
+    if (memcmp(blob->data + offset, pattern, 8) == 0) return offset;
+  }
+  return (size_t)-1;
+}
+
+TEST(TestSerialization, TestHlcOpNanosOverflowRejectedOnWire) {
+  operation_t* original = operation_create(CRABS_OP_LOCK);
+  ASSERT_NE(original, nullptr);
+  original->ordering_system = CRABS_ORDERING_HLC;
+  // Distinctive seconds so the patch helper locates exactly one site.
+  original->hlc.physical_seconds = 0x1122334455667788ULL;
+  original->hlc.physical_nanos = 42;
+  original->hlc.logical_counter = 7;
+  strncpy(original->hlc.node_id, "node-hlc", CRABS_HLC_NODE_ID_SIZE - 1);
+  original->lamport_time = 0;
+
+  serialized_buffer_t* wire = crabs_serialize_operation(original);
+  ASSERT_NE(wire, nullptr);
+
+  // Sanity: the site is unique and a patched-but-valid nanos value
+  // round-trips.
+  size_t seconds_offset = _find_le_u64(wire, 0x1122334455667788ULL);
+  ASSERT_NE(seconds_offset, (size_t)-1);
+  size_t nanos_offset = seconds_offset + 8;
+  wire->data[nanos_offset] = 42;
+
+  operation_t* restored = crabs_deserialize_operation(wire->data, wire->len);
+  ASSERT_NE(restored, nullptr);
+  EXPECT_EQ(restored->hlc.physical_nanos, 42u);
+  operation_destroy(restored);
+
+  // Now patch nanos to exactly 1e9 — must fail the deserialize.
+  uint64_t overflow_nanos = 1000000000ULL;
+  for (int byte_index = 0; byte_index < 8; byte_index++) {
+    wire->data[nanos_offset + byte_index] =
+        (uint8_t)(overflow_nanos >> (8 * byte_index));
+  }
+  EXPECT_EQ(crabs_deserialize_operation(wire->data, wire->len), nullptr);
+
+  serialized_buffer_destroy(wire);
+  operation_destroy(original);
+}
+
+TEST(TestSerialization, TestLogEntryHlcNanosOverflowRejected) {
+  state_t* state = state_create();
+  ASSERT_NE(state, nullptr);
+
+  // Append an HLC log entry directly (the writer carries whatever is in
+  // memory; the reader must reject a nanos overflow just like the op path).
+  state->log_count = 1;
+  state->log = (log_entry_t*)malloc(sizeof(log_entry_t));
+  ASSERT_NE(state->log, nullptr);
+  memset(&state->log[0], 0, sizeof(log_entry_t));
+  state->log[0].version = 1;
+  state->log[0].ordering_system = CRABS_ORDERING_HLC;
+  state->log[0].hlc.physical_seconds = 1234567890;
+  state->log[0].hlc.physical_nanos = 1000000000;  // invalid: >= 1e9
+  state->log[0].hlc.logical_counter = 7;
+  strncpy(state->log[0].type, "__lock__", CRABS_MAX_OP_NAME - 1);
+  strncpy(state->log[0].signer_id, "alice", CRABS_MAX_USER_ID - 1);
+  strncpy(state->log[0].node_id, "node-hlc", CRABS_MAX_USER_ID - 1);
+  strncpy(state->log[0].hlc.node_id, "node-hlc", CRABS_HLC_NODE_ID_SIZE - 1);
+
+  serialized_buffer_t* wire = crabs_serialize_state(state);
+  ASSERT_NE(wire, nullptr);
+  EXPECT_EQ(crabs_deserialize_state(wire->data, wire->len), nullptr);
+
+  serialized_buffer_destroy(wire);
+  state_destroy(state);
+}

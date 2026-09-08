@@ -1288,6 +1288,10 @@ static bool _deserialize_log_entry(read_buf_t* buf, log_entry_t* entry) {
     if (entry->ordering_system == CRABS_ORDERING_HLC) {
       if (!_read_uint64_le(buf, &entry->hlc.physical_seconds)) return false;
       if (!_read_uint64_le(buf, &entry->hlc.physical_nanos)) return false;
+      // Audit A-4: enforce the same nanos bound crabs_hlc_deserialize does.
+      // A log entry with nanos >= 1e9 would poison the R7-11 replay backstop
+      // and the chain hash comparisons once HLC receive is wired.
+      if (entry->hlc.physical_nanos >= 1000000000ULL) return false;
       if (!_read_uint64_le(buf, &entry->hlc.logical_counter)) return false;
       if (!_read_string16(buf, entry->hlc.node_id, CRABS_HLC_NODE_ID_SIZE)) return false;
     }
@@ -1998,6 +2002,11 @@ operation_t* crabs_deserialize_operation(const uint8_t* data, size_t len) {
     if (op->ordering_system == CRABS_ORDERING_HLC) {
       if (!_read_uint64_le(&buf, &op->hlc.physical_seconds)) goto fail;
       if (!_read_uint64_le(&buf, &op->hlc.physical_nanos)) goto fail;
+      // Audit A-4: fail closed on nanos >= 1e9, matching
+      // crabs_hlc_deserialize. A nanos overflow on the wire would freeze
+      // crabs_hlc_next (the normalize carry never terminates in one step and
+      // the comparisons misorder) if the received HLC were ever adopted.
+      if (op->hlc.physical_nanos >= 1000000000ULL) goto fail;
       if (!_read_uint64_le(&buf, &op->hlc.logical_counter)) goto fail;
       if (!_read_string16(&buf, op->hlc.node_id, CRABS_HLC_NODE_ID_SIZE)) goto fail;
     }
