@@ -1866,7 +1866,8 @@ recovery_result_t* crypto_revoke_and_rotate(
   // user is REVOKED (terminal), suspend fails and we must roll back.
   // System-internal path: the NODE suspends the user during key rotation;
   // no signing admin is behind this action.
-  if (attribute_machine_suspend_user_internal(attr_machine, user_id) != CRABS_SUCCESS) {
+  if (attribute_machine_suspend_user_internal(attr_machine, user_id,
+      "key-rotation suspension") != CRABS_SUCCESS) {
     memcpy(user->public_key, old_public_key, 33);
     crypto_key_envelope_destroy(envelope);
     return NULL;

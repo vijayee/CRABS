@@ -140,9 +140,11 @@ crabs_error_e attribute_machine_suspend_user(attribute_machine_t* am, const char
 // (crypto_revoke_and_rotate): the NODE suspends the user while rotating
 // their key, with no signing user behind the action. Bypasses the admin
 // gate deliberately — use attribute_machine_suspend_user for all
-// operator-driven suspensions.
+// operator-driven suspensions. The caller supplies the change-event preview
+// ("user suspended" vs "key-rotation suspension").
 crabs_error_e attribute_machine_suspend_user_internal(attribute_machine_t* am,
-                                                        const char* user_id);
+                                                        const char* user_id,
+                                                        const char* preview);
 
 // R7-07: reactivate a SUSPENDED user after key-compromise recovery
 // (crypto_revoke_and_rotate). Admin-authorized: the signer must be an active

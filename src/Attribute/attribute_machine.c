@@ -765,12 +765,13 @@ crabs_error_e attribute_machine_suspend_user(attribute_machine_t* am, const char
   crabs_error_e signer_rc = _check_signer_is_active_admin(am, signer_id);
   if (signer_rc != CRABS_SUCCESS) return signer_rc;
 
-  return attribute_machine_suspend_user_internal(am, user_id);
+  return attribute_machine_suspend_user_internal(am, user_id, "user suspended");
 }
 
 crabs_error_e attribute_machine_suspend_user_internal(attribute_machine_t* am,
-                                                        const char* user_id) {
-  if (am == NULL || user_id == NULL) return CRABS_ERR_INVALID_PARAM;
+                                                        const char* user_id,
+                                                        const char* preview) {
+  if (am == NULL || user_id == NULL || preview == NULL) return CRABS_ERR_INVALID_PARAM;
 
   user_t* user = attribute_machine_find_user(am, user_id);
   if (user == NULL) return CRABS_ERR_USER_NOT_FOUND;
@@ -784,7 +785,7 @@ crabs_error_e attribute_machine_suspend_user_internal(attribute_machine_t* am,
   user->key_version++;
   am->base_state.version++;
 
-  _notify_attribute_change(am, "suspend_user", user_id, "key-rotation suspension");
+  _notify_attribute_change(am, "suspend_user", user_id, preview);
   return CRABS_SUCCESS;
 }
 
