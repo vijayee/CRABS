@@ -88,9 +88,22 @@
       height: 100vh;
       box-shadow: -2px 0 14px rgba(0,0,0,.12);
       display: block;
+      overflow: hidden;
     }
-    :host(.overlay) .panel { height: 100%; }
-    :host(.overlay.collapsed) .panel { display: none; }
+    :host(.overlay) .panel {
+      height: 100%;
+      /* Slide in/out from the right edge on toggle (Vue DevTools style). */
+      transition: transform .28s ease, box-shadow .28s ease;
+    }
+    :host(.overlay.collapsed) .panel {
+      transform: translateX(110%);
+      box-shadow: none;
+    }
+    .node-select {
+      margin-left: auto; padding: 3px 8px; border-radius: 999px;
+      border: 1px solid #e5e7eb; background: #ffffff; color: #1e40af;
+      font-size: 11px; font-weight: 600; font-family: inherit; cursor: pointer;
+    }
     .pause, .export {
       padding: 3px 10px; border-radius: 999px; cursor: pointer; user-select: none;
       border: 1px solid #e5e7eb; background: #ffffff; color: #1a56db;
@@ -232,6 +245,27 @@
       this.visibleLayers = new Set(Object.keys(LAYER_COLORS));
       this.paused = false;
       this.collapsedState = false;
+      // Multi-node support: several attach() calls can share one panel
+      // (Vue DevTools style). Each entry is { nodeId, controller, update }.
+      this.controllers = [];
+      this.activeController = null;
+    }
+
+    registerController(nodeId, controller) {
+      const entry = { nodeId, controller };
+      this.controllers.push(entry);
+      if (this.controllers.length === 1) {
+        this.activeController = entry;
+      }
+      return entry;
+    }
+
+    activateController(entry) {
+      if (this.activeController === entry) return;
+      this.activeController = entry;
+      // Switching nodes pulls a fresh snapshot immediately; the resulting
+      // onUpdate lands in update() for the now-active controller.
+      entry.controller.refresh();
     }
 
     get collapsed() { return this.collapsedState; }
@@ -263,7 +297,12 @@
 
     applyCollapsed() {
       if (!this.root || !this.toggleButton) return;
-      this.root.style.display = this.collapsedState ? 'none' : '';
+      // Overlay mode slides the panel out via :host(.overlay.collapsed)
+      // transform; only in-flow mode hides it outright (display:none would
+      // kill the slide transition).
+      if (!this.classList.contains('overlay')) {
+        this.root.style.display = this.collapsedState ? 'none' : '';
+      }
       // Mirror the state on the host so :host(.overlay.collapsed) applies
       // (and authors get a styling hook); in overlay mode the launcher
       // button stays visible because only the inner .panel is hidden.
@@ -305,6 +344,26 @@
           this.render();
         });
         tabbar.appendChild(button);
+      }
+      // Node selector: visible only when multiple state machines share
+      // this panel (Vue DevTools-style instance switching).
+      if (this.controllers.length > 1) {
+        const selector = document.createElement('select');
+        selector.className = 'node-select';
+        selector.setAttribute('aria-label', 'State machine to inspect');
+        for (const entry of this.controllers) {
+          const option = document.createElement('option');
+          option.value = entry.nodeId;
+          option.textContent = entry.nodeId;
+          if (entry === this.activeController) option.selected = true;
+          selector.appendChild(option);
+        }
+        selector.addEventListener('change', () => {
+          const selected = this.controllers.find(
+            (entry) => entry.nodeId === selector.value);
+          if (selected) this.activateController(selected);
+        });
+        tabbar.appendChild(selector);
       }
       const exportButton = document.createElement('button');
       exportButton.className = 'export';
@@ -499,6 +558,12 @@
     window.customElements.define('crabs-devtools', CrabsDevtools);
   }
 
+  // Shared-panel registries: one overlay panel per document, one in-flow
+  // panel per mount element. Additional attach() calls register additional
+  // state machines (a node selector appears) instead of stacking panels.
+  let sharedOverlayPanel = null;
+  const mountedPanels = new WeakMap();
+
   function attach(node, options = {}) {
     let createDevtoolsController;
     if (window.CRABSDevtoolsApi) {
@@ -513,21 +578,42 @@
         '(window.CRABSDevtoolsApi missing)');
     }
     const controller = createDevtoolsController(node, options);
-    const panel = document.createElement('crabs-devtools');
-    controller.onUpdate((data) => panel.update({
-      snapshot: data.snapshot,
-      allEvents: data.allEvents,
-      diffs: data.diffs,
-    }));
-    // mount === null → overlay mode: the panel becomes a fixed-position
-    // overlay appended to document.body. A provided mount keeps the panel
-    // in the normal document flow inside that container.
+    const nodeId = options.nodeId || node.adminId || null;
+
+    // mount === null → overlay mode: ONE fixed-position overlay panel per
+    // document is shared by every attach() call — additional state machines
+    // register into it and a node selector appears in the tab bar (Vue
+    // DevTools style). A provided mount keeps the panel in normal flow
+    // inside that container, one panel per mount element.
     const mount = options.mount || null;
     const overlayMode = mount === null;
-    const host = mount || document.body;
-    host.appendChild(panel);
-    if (overlayMode) panel.classList.add('overlay');
-    controller.refresh();
+    let panel = overlayMode ? sharedOverlayPanel : mountedPanels.get(mount);
+    const isNewPanel = !panel || !panel.isConnected;
+    if (isNewPanel) {
+      panel = document.createElement('crabs-devtools');
+      const host = mount || document.body;
+      host.appendChild(panel);
+      if (overlayMode) {
+        panel.classList.add('overlay');
+        sharedOverlayPanel = panel;
+      } else {
+        mountedPanels.set(mount, panel);
+      }
+    }
+    const entry = panel.registerController(nodeId, controller);
+    // Every controller pushes into the panel; the panel renders only the
+    // ACTIVE one. Dormant controllers keep refreshing in the background
+    // (their events and snapshots accumulate); selecting a node in the
+    // selector activates it and re-renders from its data.
+    controller.onUpdate((data) => {
+      if (panel.activeController !== entry) return;
+      panel.update({
+        snapshot: data.snapshot,
+        allEvents: data.allEvents,
+        diffs: data.diffs,
+      });
+    });
+    if (isNewPanel) controller.refresh();
     return { panel, controller };
   }
 

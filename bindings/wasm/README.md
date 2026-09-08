@@ -124,6 +124,12 @@ two tabs to watch operations replicate between peers over BroadcastChannel).
 
 By default `attach` renders the panel as a floating overlay appended to
 `document.body`; pass `mount: <element>` to embed it inside the page instead.
+The panel slides in and out from the right edge via the `CRABS` launcher
+button. Multiple `attach` calls share ONE overlay panel — each additional
+state machine registers into it and a node selector appears in the tab bar
+(dormant nodes keep accumulating events; switching re-renders from their
+data). `options.nodeId` (or the node's admin id) names the machine in the
+selector.
 
 - **State tab** — a tree of the node's full CRABS state (CRDT items, policies,
   triggers, schedules, users) with diff badges marking what the latest change
