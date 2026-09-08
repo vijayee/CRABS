@@ -16,22 +16,9 @@
 (function registerCrabsDevtools() {
   if (typeof window === 'undefined' || !window.customElements) return;
 
-  const STATE_COLORS = {
-    idle: '#e5e7eb', locked: '#fef3c7', modified: '#dbeafe',
-    verified: '#d1fae5', error: '#fee2e2', unknown: '#f3f4f6',
-  };
-  const STATE_TEXT = {
-    idle: '#374151', locked: '#92400e', modified: '#1e40af',
-    verified: '#065f46', error: '#991b1b', unknown: '#374151',
-  };
-
-  // Human-readable millisecond duration: sub-second stays in ms ("500ms",
-  // not a rounded "1s"), fractional seconds keep one decimal ("1.5s").
-  const formatDuration = (ms) => {
-    if (ms < 1000) return Math.max(1, Math.round(ms)) + 'ms';
-    const seconds = ms / 1000;
-    return (Number.isInteger(seconds) ? seconds : seconds.toFixed(1)) + 's';
-  };
+  // Diff badge highlighting for the State tab tree.
+  const BADGE_COLORS = { added: '#d1fae5', changed: '#fef3c7', removed: '#fee2e2' };
+  const BADGE_TEXT = { added: '#065f46', changed: '#92400e', removed: '#991b1b' };
 
   const STYLES = `
     :host { all: initial; }
@@ -52,15 +39,6 @@
     .tab:focus-visible { outline: 2px solid #1a56db; }
     .tab.active { background: #e8f0fe; color: #1a56db; font-weight: 600; }
     .body { flex: 1; overflow: auto; padding: 8px 12px; }
-    .badge {
-      display: inline-block; padding: 1px 8px; border-radius: 999px;
-      font-size: 10px; font-weight: 600;
-    }
-    .card {
-      background: #f9fafb; border-radius: 8px; padding: 6px 10px; margin-bottom: 6px;
-      cursor: pointer;
-    }
-    .card.selected { outline: 2px solid #1a56db; }
     .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; }
     .row { display: flex; justify-content: space-between; gap: 8px; padding: 4px 8px;
            border-radius: 8px; margin-bottom: 3px; }
@@ -69,10 +47,6 @@
     .ok { color: #059669; font-weight: 600; }
     .bad { color: #dc2626; font-weight: 600; }
     .muted { color: #9ca3af; }
-    pre.value { background: #f3f4f6; border-radius: 8px; padding: 6px 8px;
-                overflow-x: auto; font-family: ui-monospace, monospace; font-size: 11px; }
-    .warn { background: #fef9c3; color: #854d0e; padding: 2px 8px; border-radius: 999px;
-            font-size: 10px; font-weight: 600; }
     .error-banner { background: #fef2f2; color: #991b1b; border-radius: 8px;
                     padding: 6px 10px; margin-bottom: 6px; }
     input.filter {
@@ -82,9 +56,6 @@
     .toolbar { display: flex; gap: 6px; margin-bottom: 6px; }
     .detail { background: #f3f4f6; border-radius: 8px; padding: 6px 8px; margin: 3px 0;
               font-family: ui-monospace, monospace; font-size: 11px; white-space: pre-wrap; }
-    .fsm { display: flex; align-items: center; gap: 4px; margin-top: 6px; flex-wrap: wrap; }
-    .fsm .stop { padding: 1px 8px; border-radius: 999px; font-size: 10px; }
-    .fsm .arrow { color: #9ca3af; }
     .toggle {
       position: fixed; bottom: 16px; right: 16px; z-index: 2147483647;
       width: 36px; height: 36px; border-radius: 999px;
@@ -110,25 +81,130 @@
     }
     :host(.overlay) .panel { height: 100%; }
     :host(.overlay.collapsed) .panel { display: none; }
-    .pause {
+    .pause, .export {
       padding: 3px 10px; border-radius: 999px; cursor: pointer; user-select: none;
       border: 1px solid #e5e7eb; background: #ffffff; color: #1a56db;
       font-size: 11px; font-weight: 600; font-family: inherit;
     }
-    .pause:hover { background: #e8f0fe; }
+    .pause:hover, .export:hover { background: #e8f0fe; }
+    .export { margin-left: auto; }
     .paused-banner { color: #9ca3af; font-size: 11px; margin-bottom: 6px; }
+    .overview { color: #6b7280; padding: 8px 12px 0; font-size: 11px; }
+    .tree-row {
+      line-height: 20px; padding-right: 8px; border-radius: 6px;
+    }
+    .tree-row:hover { background: #f3f4f6; }
+    .tree-toggle { user-select: none; }
   `;
 
-  const ORDERED_STATES = ['idle', 'locked', 'modified', 'verified'];
+  // Leaf formatting: strings verbatim (opaque payloads already arrive as
+  // "[encrypted: N bytes]"), everything else JSON.
+  function formatLeaf(value) {
+    if (value === null) return 'null';
+    if (typeof value === 'string') return value;
+    return JSON.stringify(value);
+  }
+
+  // Render a snapshot subtree as an expandable tree. `diffs` maps dot-paths
+  // to 'added' | 'changed' | 'removed' for badge highlighting; `expandedPaths`
+  // is a per-panel Set of dot-paths that persists across re-renders.
+  function renderStateTree(container, snapshot, diffs, expandedPaths) {
+    container.innerHTML = '';
+    const lastKey = (path) => path.split('.').pop();
+    const appendBadge = (row, diff) => {
+      const badge = document.createElement('span');
+      badge.className = 'diff-badge';
+      badge.textContent = diff;
+      badge.style.background = BADGE_COLORS[diff] || '#f3f4f6';
+      badge.style.color = BADGE_TEXT[diff] || '#374151';
+      badge.style.borderRadius = '8px';
+      badge.style.padding = '0 6px';
+      badge.style.fontSize = '10px';
+      badge.style.marginLeft = '6px';
+      row.appendChild(badge);
+    };
+    const renderValue = (value, path, depth) => {
+      const row = document.createElement('div');
+      row.className = 'tree-row';
+      row.style.paddingLeft = (depth * 14) + 'px';
+      const isObject = value !== null && typeof value === 'object';
+      if (isObject && Object.keys(value).length > 0) {
+        const keys = Object.keys(value);
+        const toggle = document.createElement('span');
+        toggle.className = 'tree-toggle mono';
+        const expanded = expandedPaths.has(path);
+        toggle.textContent = (expanded ? '▾ ' : '▸ ') +
+          (path ? lastKey(path) : 'state') + ' (' + keys.length + ')';
+        toggle.style.cursor = 'pointer';
+        toggle.addEventListener('click', () => {
+          if (expandedPaths.has(path)) expandedPaths.delete(path);
+          else expandedPaths.add(path);
+          renderStateTree(container, snapshot, diffs, expandedPaths);
+        });
+        row.appendChild(toggle);
+        if (diffs[path]) appendBadge(row, diffs[path]);
+        // Timeline rows jump here by item name (Step 5): tag each item's
+        // row so focusItem can find and flash it.
+        if (/^items\.\d+$/.test(path) && value.name) {
+          row.setAttribute('data-item-name', value.name);
+        }
+        container.appendChild(row);
+        if (expanded) {
+          for (const key of keys) {
+            renderValue(value[key], path ? path + '.' + key : key, depth + 1);
+          }
+        }
+      } else {
+        const label = document.createElement('span');
+        label.className = 'mono';
+        label.textContent = (path ? lastKey(path) : 'state') + ': ' +
+          formatLeaf(value);
+        row.appendChild(label);
+        if (diffs[path]) appendBadge(row, diffs[path]);
+        container.appendChild(row);
+      }
+    };
+    renderValue(snapshot, '', 0);
+  }
+
+  // Compact one-line summary from the C snapshot writer's fields
+  // (src/Devtools/devtools.c _write_snapshot_json): node_id, version, hlc
+  // {physical, nanos, logical, node}, log_head {entries, state_hash},
+  // schedules[].
+  function overviewLine(snapshot) {
+    if (!snapshot || snapshot.error) return 'no snapshot yet';
+    const pending = (snapshot.schedules || []).length;
+    const head = (snapshot.log_head && snapshot.log_head.state_hash) || '';
+    const hlc = snapshot.hlc;
+    const hlcLabel = hlc ? hlc.physical + '·' + hlc.logical : '—';
+    return '#' + snapshot.node_id + ' · v' + snapshot.version +
+      ' · hlc ' + hlcLabel + ' · log ' + head.slice(0, 8) +
+      ' · ' + pending + ' pending';
+  }
+
+  // The controller diffs and this panel's tree must flatten the same shape,
+  // so deriveView is shared from devtools-api.js. Scripts load in order at
+  // attach() time, but resolve lazily here for safety.
+  function deriveView(snapshot) {
+    if (window.CRABSDevtoolsApi && window.CRABSDevtoolsApi.deriveView) {
+      return window.CRABSDevtoolsApi.deriveView(snapshot);
+    }
+    if (typeof require === 'function') {
+      return require('./devtools-api.js').deriveView(snapshot);
+    }
+    return snapshot;
+  }
 
   class CrabsDevtools extends HTMLElement {
     constructor() {
       super();
       this.attachShadow({ mode: 'open' });
-      this.activeTab = 'timeline';
-      this.data = { snapshot: null, allEvents: [] };
+      this.activeTab = 'state';
+      this.data = { snapshot: null, allEvents: [], diffs: {} };
+      // Expand/collapse state persists across refreshes so the tree does not
+      // snap shut on every snapshot pull.
+      this.expandedPaths = new Set(['', 'items']);
       this.filterText = '';
-      this.selectedItem = null;
       this.paused = false;
       this.collapsedState = false;
     }
@@ -177,6 +253,7 @@
       this.data = {
         snapshot: data.snapshot || this.data.snapshot,
         allEvents: data.allEvents || this.data.allEvents,
+        diffs: data.diffs || this.data.diffs,
       };
       // While paused the panel stays frozen on the pause-moment view; the
       // merged data is picked up by the next render (e.g. on resume).
@@ -186,9 +263,14 @@
     render() {
       if (!this.root) return;
       const snapshot = this.data.snapshot;
+      // Overview header: node id, version, hlc, log head, pending schedules.
+      const overview = document.createElement('div');
+      overview.className = 'overview mono';
+      overview.textContent = overviewLine(snapshot);
+      this.root.replaceChildren(overview);
       const tabbar = document.createElement('div');
       tabbar.className = 'tabbar';
-      for (const tab of ['states', 'timeline', 'crdt', 'config']) {
+      for (const tab of ['state', 'timeline']) {
         const button = document.createElement('button');
         button.className = 'tab' + (tab === this.activeTab ? ' active' : '');
         button.textContent = tab[0].toUpperCase() + tab.slice(1);
@@ -199,7 +281,23 @@
         });
         tabbar.appendChild(button);
       }
-      this.root.replaceChildren(tabbar);
+      const exportButton = document.createElement('button');
+      exportButton.className = 'export';
+      exportButton.textContent = 'Export';
+      exportButton.addEventListener('click', () => {
+        const blob = new Blob([JSON.stringify(this.data.snapshot, null, 2)],
+                              { type: 'application/json' });
+        const url = URL.createObjectURL(blob);
+        const link = document.createElement('a');
+        link.href = url;
+        link.download = 'crabs-snapshot-' +
+          ((this.data.snapshot && this.data.snapshot.node_id) || 'node') +
+          '.json';
+        link.click();
+        URL.revokeObjectURL(url);
+      });
+      tabbar.appendChild(exportButton);
+      this.root.appendChild(tabbar);
       const body = document.createElement('div');
       body.className = 'body';
       if (snapshot && snapshot.error) {
@@ -209,87 +307,40 @@
         body.appendChild(banner);
       }
       const renderer = {
-        states: () => this.renderStates(body),
+        state: () => this.renderState(body),
         timeline: () => this.renderTimeline(body),
-        crdt: () => this.renderCrdt(body),
-        config: () => this.renderConfig(body),
       }[this.activeTab];
       renderer();
       this.root.appendChild(body);
     }
 
-    stateBadge(state) {
-      const badge = document.createElement('span');
-      badge.className = 'badge';
-      badge.textContent = state;
-      badge.style.background = STATE_COLORS[state] || STATE_COLORS.unknown;
-      badge.style.color = STATE_TEXT[state] || STATE_TEXT.unknown;
-      return badge;
+    // Jump from a timeline row to the State tab and flash the item's row so
+    // the eye lands on it (expand state is only widened, never collapsed).
+    focusItem(itemName) {
+      this.activeTab = 'state';
+      this.expandedPaths.add('items');
+      this.expandedPaths.add('');
+      this.render();
+      const row = this.root.querySelector(
+        '[data-item-name="' + CSS.escape(itemName) + '"]');
+      if (!row) return;
+      row.style.transition = 'background-color 800ms ease-out';
+      row.style.backgroundColor = '#fef3c7';
+      setTimeout(() => { row.style.backgroundColor = 'transparent'; }, 60);
+      setTimeout(() => {
+        row.style.transition = '';
+        row.style.backgroundColor = '';
+      }, 900);
     }
 
-    renderStates(body) {
+    renderState(body) {
       const snapshot = this.data.snapshot;
-      if (!snapshot || !snapshot.items) {
+      if (!snapshot) {
         body.innerHTML = '<span class="muted">No snapshot yet.</span>';
         return;
       }
-      for (const item of snapshot.items) {
-        const card = document.createElement('div');
-        card.className = 'card' + (this.selectedItem === item.name ? ' selected' : '');
-        const title = document.createElement('div');
-        title.appendChild(document.createTextNode(item.name + ' '));
-        title.appendChild(this.stateBadge(item.protocol_state));
-        card.appendChild(title);
-        const meta = document.createElement('div');
-        meta.className = 'muted';
-        meta.textContent = item.crdt_type;
-        card.appendChild(meta);
-        if (this.selectedItem === item.name) {
-          const fsm = document.createElement('div');
-          fsm.className = 'fsm';
-          for (let stateIndex = 0; stateIndex < ORDERED_STATES.length; stateIndex++) {
-            if (stateIndex > 0) {
-              const arrow = document.createElement('span');
-              arrow.className = 'arrow';
-              arrow.textContent = '→';
-              fsm.appendChild(arrow);
-            }
-            const stop = document.createElement('span');
-            stop.className = 'stop';
-            stop.textContent = ORDERED_STATES[stateIndex];
-            if (ORDERED_STATES[stateIndex] === item.protocol_state) {
-              stop.style.background = '#e8f0fe';
-              stop.style.color = '#1a56db';
-              stop.style.fontWeight = '600';
-            } else {
-              stop.style.background = STATE_COLORS[ORDERED_STATES[stateIndex]];
-              stop.style.color = STATE_TEXT[ORDERED_STATES[stateIndex]];
-            }
-            fsm.appendChild(stop);
-          }
-          if (item.protocol_state === 'error') {
-            fsm.appendChild(document.createTextNode(' (off-ramp) '));
-            fsm.appendChild(this.stateBadge('error'));
-          }
-          const itemEvents = this.data.allEvents.filter(
-            (event) => event.target === item.name);
-          const fsmHistory = document.createElement('div');
-          fsmHistory.className = 'fsm-history';
-          for (const event of itemEvents.slice(-5).reverse()) {
-            const line = document.createElement('div');
-            line.className = 'muted';
-            line.textContent = event.op_type + ' ' +
-              (event.transition ? '(' + event.transition + ')' : '');
-            fsmHistory.appendChild(line);
-          }
-          fsm.after(fsmHistory);
-        }
-        card.addEventListener('click', () => {
-          this.selectedItem = this.selectedItem === item.name ? null : item.name;
-          this.render();
-        });
-        body.appendChild(card);
-      }
+      renderStateTree(body, deriveView(snapshot), this.data.diffs || {},
+                      this.expandedPaths);
     }
 
     renderTimeline(body) {
@@ -353,6 +404,9 @@
         row.appendChild(right);
         timelineRows.push(row);
         row.addEventListener('click', () => {
+          // A row with a target jumps to that item in the State tree and
+          // flashes it; rows without a target keep the JSON detail toggle.
+          if (event.target) { this.focusItem(event.target); return; }
           const existing = row.nextSibling;
           if (existing && existing.className === 'detail') { existing.remove(); return; }
           const detail = document.createElement('div');
@@ -364,115 +418,6 @@
       }
     }
 
-    renderCrdt(body) {
-      const snapshot = this.data.snapshot;
-      if (!snapshot || !snapshot.items) {
-        body.innerHTML = '<span class="muted">No snapshot yet.</span>';
-        return;
-      }
-      for (const item of snapshot.items) {
-        const card = document.createElement('div');
-        card.className = 'card';
-        const title = document.createElement('div');
-        title.appendChild(document.createTextNode(item.name + ' · '));
-        const type = document.createElement('span');
-        type.className = 'muted';
-        type.textContent = item.crdt_type;
-        title.appendChild(type);
-        card.appendChild(title);
-        const value = document.createElement('pre');
-        value.className = 'value';
-        value.textContent = JSON.stringify(item.value, null, 1);
-        card.appendChild(value);
-        body.appendChild(card);
-      }
-    }
-
-    renderConfig(body) {
-      const snapshot = this.data.snapshot;
-      if (!snapshot) {
-        body.innerHTML = '<span class="muted">No snapshot yet.</span>';
-        return;
-      }
-      for (const policy of snapshot.policies || []) {
-        const row = document.createElement('div');
-        row.className = 'row';
-        const left = document.createElement('b');
-        left.textContent = policy.operation;
-        const right = document.createElement('span');
-        right.textContent = policy.expression;
-        row.appendChild(left);
-        row.appendChild(right);
-        body.appendChild(row);
-      }
-      for (const trigger of snapshot.triggers || []) {
-        const row = document.createElement('div');
-        row.className = 'row';
-        const left = document.createElement('span');
-        left.textContent = trigger.id + ' · ' + trigger.condition;
-        const right = document.createElement('span');
-        if (trigger.fired) {
-          right.className = 'warn';
-          right.textContent = 'FIRED';
-        } else {
-          right.className = 'muted';
-          right.textContent = trigger.enabled ? 'armed' : 'disabled';
-        }
-        row.appendChild(left);
-        row.appendChild(right);
-        body.appendChild(row);
-      }
-      for (const user of snapshot.users || []) {
-        const row = document.createElement('div');
-        row.className = 'row';
-        const left = document.createElement('b');
-        left.textContent = user.id;
-        const right = document.createElement('span');
-        right.className = 'muted';
-        right.textContent = user.attrs.length + ' attrs · ' + user.keys + ' keys';
-        row.appendChild(left);
-        row.appendChild(right);
-        body.appendChild(row);
-      }
-      if (snapshot.log_head) {
-        const head = document.createElement('div');
-        head.className = 'muted mono';
-        head.textContent = 'log: ' + snapshot.log_head.entries + ' entries · head ' +
-          (snapshot.log_head.state_hash || '').slice(0, 12);
-        body.appendChild(head);
-      }
-      const schedules = snapshot.schedules || [];
-      if (schedules.length > 0) {
-        const schedulesHeading = document.createElement('div');
-        schedulesHeading.className = 'muted';
-        schedulesHeading.textContent = 'Schedules';
-        body.appendChild(schedulesHeading);
-        for (const schedule of schedules) {
-          const row = document.createElement('div');
-          row.className = 'row';
-          const left = document.createElement('span');
-          const dueInMs = schedule.execute_at - Date.now();
-          const dueLabel = dueInMs <= 0 ? 'due' : 'in ' + formatDuration(dueInMs);
-          // Recurring cadence: interval 0 = one-shot (no label). repeat 0
-          // with an interval means fire until cancelled or past end_at.
-          // Sub-second cadences stay in ms — rounding a 500ms interval to
-          // "every 1s" misrepresents the schedule.
-          let cadenceLabel = '';
-          if (schedule.interval > 0) {
-            cadenceLabel = ' · every ' + formatDuration(schedule.interval) +
-              (schedule.repeat > 0 ? ' × ' + schedule.repeat : ' ∞');
-          }
-          left.textContent = '#' + schedule.id + ' · ' + schedule.submitter +
-            ' · ' + dueLabel + cadenceLabel;
-          const right = document.createElement('span');
-          right.className = 'muted mono';
-          right.textContent = new Date(schedule.execute_at).toISOString().slice(11, 19);
-          row.appendChild(left);
-          row.appendChild(right);
-          body.appendChild(row);
-        }
-      }
-    }
   }
 
   if (!window.customElements.get('crabs-devtools')) {
@@ -497,6 +442,7 @@
     controller.onUpdate((data) => panel.update({
       snapshot: data.snapshot,
       allEvents: data.allEvents,
+      diffs: data.diffs,
     }));
     // mount === null → overlay mode: the panel becomes a fixed-position
     // overlay appended to document.body. A provided mount keeps the panel

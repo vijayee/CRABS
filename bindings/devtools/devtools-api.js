@@ -1,12 +1,51 @@
 //
 // devtools-api.js — plumbing between a crabs-wasm/dev Node and the
 // <crabs-devtools> panel: drains the C event ring, pulls state snapshots,
-// and derives per-item state transitions by diffing consecutive snapshots.
+// and diffs consecutive snapshots into a dot-path -> diff-kind map.
 //
 
 'use strict';
 
 const MAX_KEPT_EVENTS = 5000;
+
+// The panel's State tab renders this derived view of the snapshot (raw
+// internals like node_id/version/hlc live in the overview header instead).
+// Both diffFromPrevious() and the tree renderer flatten THIS shape, so
+// diff dot-paths (e.g. 'items.0.value') always match the rendered paths.
+function deriveView(snapshot) {
+  if (!snapshot) return null;
+  return {
+    items: snapshot.items || [],
+    policies: snapshot.policies || [],
+    triggers: snapshot.triggers || [],
+    users: snapshot.users || [],
+    schedules: snapshot.schedules || [],
+    log_head: snapshot.log_head || { entries: 0, state_hash: '' },
+  };
+}
+
+// Flatten a snapshot subtree into scalar leaves so plain === comparison
+// detects every change. Arrays recurse (matching how the tree renders them,
+// one row per index) but also record a length marker at the container path,
+// so a length change reads as 'changed' there instead of the container
+// itself falsely flipping 'removed'/'added'. Distinct-but-equal empty
+// containers collapse to their JSON form so they don't read as a change.
+function flattenSnapshot(value, prefix, into) {
+  if (value === null || typeof value !== 'object') {
+    into[prefix] = value;
+    return;
+  }
+  const keys = Object.keys(value);
+  if (Array.isArray(value)) {
+    into[prefix] = '[array:' + keys.length + ']';
+  } else if (keys.length === 0) {
+    into[prefix] = '{}';
+    return;
+  }
+  for (const key of keys) {
+    flattenSnapshot(value[key], prefix ? prefix + '.' + key : key, into);
+  }
+}
 
 function readWasmString(M, pointer) {
   if (!pointer) return null;
@@ -28,7 +67,7 @@ function createDevtoolsController(node, options) {
   const controller = {
     events: [],              // drained operation events (oldest first)
     listeners: [],           // callbacks fired on every refresh
-    previousItemStates: {},  // item name -> protocol state at last snapshot
+    diffs: {},               // dot-path -> 'added' | 'changed' | 'removed'
     lastSnapshot: null,
     closed: false,
 
@@ -60,52 +99,56 @@ function createDevtoolsController(node, options) {
       return batch;
     },
 
+    // Flat dot-path -> diff kind map over the whole snapshot (against the
+    // previous one). Only the previous snapshot is retained (bounded buffer;
+    // a later time-travel view builds on this). Paths key the derived view
+    // so they line up with the State tab tree ('items.0.value').
+    diffFromPrevious(next) {
+      const previous = this.lastSnapshot;
+      if (previous == null || next == null || next.error) return {};
+      const diffs = {};
+      const before = {};
+      const after = {};
+      flattenSnapshot(deriveView(previous), '', before);
+      flattenSnapshot(deriveView(next), '', after);
+      for (const path of Object.keys(after)) {
+        if (!(path in before)) diffs[path] = 'added';
+        else if (before[path] !== after[path]) diffs[path] = 'changed';
+      }
+      for (const path of Object.keys(before)) {
+        if (!(path in after)) diffs[path] = 'removed';
+      }
+      return diffs;
+    },
+
     pullSnapshot() {
       const pointer = M._crabs_wasm_devtools_snapshot(node._am);
       const text = readWasmString(M, pointer);
       if (!text) return null;
+      let snapshot;
       try {
-        return JSON.parse(text);
+        snapshot = JSON.parse(text);
       } catch (parseError) {
+        // A parse failure must not poison the diff baseline: keep the last
+        // good snapshot and the diffs that describe it.
         return { error: 'snapshot parse failed: ' + parseError.message };
       }
+      controller.diffs = controller.diffFromPrevious(snapshot);
+      controller.lastSnapshot = snapshot;
+      return snapshot;
     },
 
     refresh() {
       if (controller.closed) return null;
       const batch = controller.drainEvents();
       const snapshot = controller.pullSnapshot();
-
-      // Derive transitions: diff item states against the previous snapshot,
-      // then attribute each transition to the newest event targeting that item.
-      const transitions = {};
-      if (snapshot && snapshot.items) {
-        for (const item of snapshot.items) {
-          const before = controller.previousItemStates[item.name];
-          if (before && before !== item.protocol_state) {
-            transitions[item.name] = { from: before, to: item.protocol_state };
-          }
-          controller.previousItemStates[item.name] = item.protocol_state;
-        }
-      }
-      if (snapshot && snapshot.items) {
-        for (const item of snapshot.items) {
-          for (let eventIndex = batch.length - 1; eventIndex >= 0; eventIndex--) {
-            const event = batch[eventIndex];
-            if (event.target === item.name) {
-              const derived = transitions[item.name];
-              if (derived) {
-                event.transition = derived.from + '→' + derived.to;
-              }
-              break;
-            }
-          }
-        }
-      }
-
-      controller.lastSnapshot = snapshot;
       for (const listener of controller.listeners) {
-        listener({ snapshot, events: batch, allEvents: controller.events });
+        listener({
+          snapshot,
+          events: batch,
+          allEvents: controller.events,
+          diffs: controller.diffs,
+        });
       }
       return { snapshot, batch };
     },
@@ -121,6 +164,7 @@ function createDevtoolsController(node, options) {
     close() {
       controller.closed = true;
       controller.listeners.length = 0;
+      if (controller.detachChange) controller.detachChange();
       if (controller.detachExecute) controller.detachExecute();
     },
   };
@@ -132,33 +176,36 @@ function createDevtoolsController(node, options) {
     );
   }
 
-  // Seed the previous-state map so the first refresh does not report a
-  // transition for every item.
-  const initialSnapshot = controller.pullSnapshot();
-  if (initialSnapshot && initialSnapshot.items) {
-    for (const item of initialSnapshot.items) {
-      controller.previousItemStates[item.name] = item.protocol_state;
-    }
-    controller.lastSnapshot = initialSnapshot;
-  }
+  // Seed the diff baseline so the first refresh only reports what actually
+  // changed between construction and the first refresh.
+  controller.pullSnapshot();
 
-  // Wrap node.execute so every user-driven execute refreshes the panel.
-  const originalExecute = node.execute.bind(node);
-  node.execute = (operation) => {
-    try {
-      return originalExecute(operation);
-    } finally {
-      controller.refresh();
-    }
-  };
-  controller.detachExecute = () => { node.execute = originalExecute; };
+  // Refresh on the node's push change events when available; otherwise fall
+  // back to wrapping node.execute so user-driven executes still refresh.
+  if (typeof node.on === 'function') {
+    const changeListener = () => controller.refresh();
+    node.on('change', changeListener);
+    controller.detachChange = () => {
+      if (typeof node.off === 'function') node.off('change', changeListener);
+    };
+  } else {
+    const originalExecute = node.execute.bind(node);
+    node.execute = (operation) => {
+      try {
+        return originalExecute(operation);
+      } finally {
+        controller.refresh();
+      }
+    };
+    controller.detachExecute = () => { node.execute = originalExecute; };
+  }
 
   return controller;
 }
 
 if (typeof module === 'object' && module.exports) {
-  module.exports = { createDevtoolsController };
+  module.exports = { createDevtoolsController, deriveView };
 }
 if (typeof window !== 'undefined') {
-  window.CRABSDevtoolsApi = { createDevtoolsController };
+  window.CRABSDevtoolsApi = { createDevtoolsController, deriveView };
 }
