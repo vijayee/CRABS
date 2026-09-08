@@ -903,24 +903,14 @@ void condition_node_destroy(condition_node_t* node) {
 // Path resolution
 // ============================================================
 static data_item_t* _find_item_by_path(const state_t* state, const char* path) {
-  // Try full path first
-  data_item_t* item = state_find_item((state_t*)state, path);
-  if (item != NULL) return item;
-
-  // Try progressively shorter prefixes
-  char path_buf[CRABS_MAX_POLICY_EXPR];
-  strncpy(path_buf, path, CRABS_MAX_POLICY_EXPR - 1);
-  path_buf[CRABS_MAX_POLICY_EXPR - 1] = '\0';
-
-  char* dot = strrchr(path_buf, '.');
-  while (dot != NULL) {
-    *dot = '\0';
-    item = state_find_item((state_t*)state, path_buf);
-    if (item != NULL) return item;
-    dot = strrchr(path_buf, '.');
-  }
-
-  return NULL;
+  // Audit: resolve the FULL path only. The prior fallback stripped trailing
+  // ".segment" components and returned the prefix item, so a condition on the
+  // missing path "tenant.quota" silently resolved to an attacker-controlled
+  // sibling item named "tenant". An unresolvable path must return not-found
+  // and fall through to the caller's existing missing-value semantics
+  // (resolve -> 0, CONTAINS -> not-contained); it must never alias an
+  // unrelated item.
+  return state_find_item((state_t*)state, path);
 }
 
 int64_t condition_resolve_path(const state_t* state, const char* path) {

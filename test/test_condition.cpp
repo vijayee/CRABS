@@ -551,6 +551,40 @@ TEST_F(TestCondition, TestResolvePathNull) {
   EXPECT_EQ(value, 0);
 }
 
+// Audit: a multi-segment path must resolve the FULL path or be treated as
+// missing. The prior prefix fallback stripped trailing ".segment" components
+// and returned the prefix item, so a condition on the missing path
+// "tenant.quota" was satisfied by an attacker-controlled sibling item named
+// "tenant".
+TEST_F(TestCondition, MultiSegmentPathDoesNotResolveToPrefixItem) {
+  // Attacker-controlled sibling item: a huge counter named "tenant".
+  data_item_t* tenant = data_item_create("tenant", DATA_TYPE_COUNTER, CRDT_G_COUNTER);
+  g_counter_t* tenant_counter = g_counter_create();
+  g_counter_increment(tenant_counter, "nodeA", 999999);
+  tenant->value = tenant_counter;
+  ASSERT_EQ(state_add_item(state, tenant), CRABS_SUCCESS);
+
+  // No "tenant.quota" item exists — the path resolves as missing (0).
+  EXPECT_EQ(condition_resolve_path(state, "tenant.quota"), 0);
+
+  // And the condition must evaluate as if the path is missing.
+  condition_node_t* node = condition_parse("tenant.quota >= 100");
+  ASSERT_NE(node, nullptr);
+  EXPECT_FALSE(condition_evaluate(node, state));
+  condition_node_destroy(node);
+}
+
+// An item literally named with the full dotted path still resolves.
+TEST_F(TestCondition, MultiSegmentFullPathStillResolves) {
+  data_item_t* quota = data_item_create("tenant.quota", DATA_TYPE_COUNTER, CRDT_G_COUNTER);
+  g_counter_t* quota_counter = g_counter_create();
+  g_counter_increment(quota_counter, "nodeA", 42);
+  quota->value = quota_counter;
+  ASSERT_EQ(state_add_item(state, quota), CRABS_SUCCESS);
+
+  EXPECT_EQ(condition_resolve_path(state, "tenant.quota"), 42);
+}
+
 // ============================================================
 // Node Creation/Destroy Tests
 // ============================================================
