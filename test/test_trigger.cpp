@@ -692,6 +692,97 @@ TEST_F(TestTrigger, TestIssueAttributeEffect) {
   attribute_machine_destroy(am);
 }
 
+// File-scope captures for the change-hook test below. The hook is a
+// captureless lambda (plain function pointer), so observed events must be
+// copied out: the event strings are only valid during the hook call.
+static int change_hook_trigger_event_count = 0;
+static char change_hook_last_trigger_type[CRABS_MAX_POLICY_EXPR];
+
+static void record_trigger_change_events(state_t* observed_state,
+                                         const crabs_change_event_t* event,
+                                         void* user_data) {
+  (void)observed_state;
+  (void)user_data;
+  if (event->kind != CRABS_CHANGE_TRIGGER) {
+    return;
+  }
+  change_hook_trigger_event_count++;
+  if (event->type != NULL) {
+    strncpy(change_hook_last_trigger_type, event->type,
+            sizeof(change_hook_last_trigger_type) - 1);
+    change_hook_last_trigger_type[sizeof(change_hook_last_trigger_type) - 1] = '\0';
+  }
+}
+
+// The trigger engine must announce ISSUE_ATTRIBUTE effects on the state
+// change hook: a fired threshold trigger that successfully issues a
+// temporary attribute emits an event with kind CRABS_CHANGE_TRIGGER and
+// type "issue_temporary" (trigger.c, Amendment 1 §5.3).
+TEST_F(TestTrigger, TestIssueAttributeEffectNotifiesChangeHook) {
+  // Create an attribute machine with a user who has role "viewer"
+  uint8_t admin_pk[33];
+  ecdsa_keypair_t* admin_kp = crypto_ecdsa_generate();
+  ASSERT_NE(admin_kp, nullptr);
+  memcpy(admin_pk, admin_kp->public_key, 33);
+  crypto_ecdsa_keypair_destroy(admin_kp);
+  attribute_machine_t* am = attribute_machine_create("admin", admin_pk);
+  ASSERT_NE(am, nullptr);
+
+  // Register a user with viewer role
+  uint8_t user_pk[33];
+  ecdsa_keypair_t* kp = crypto_ecdsa_generate();
+  ASSERT_NE(kp, nullptr);
+  memcpy(user_pk, kp->public_key, 33);
+  crypto_ecdsa_keypair_destroy(kp);
+  crabs_test_register_user_with_role(am, "alice", user_pk, "role", "viewer");
+
+  // Set current time for temp attr expiry
+  am->current_time_ms = 1000;
+
+  // Add counter to the attribute machine's base_state so condition evaluation works
+  data_item_t* views = data_item_create("views", DATA_TYPE_COUNTER, CRDT_G_COUNTER);
+  g_counter_t* gc = g_counter_create();
+  g_counter_increment(gc, "nodeA", 100);
+  views->value = gc;
+  state_add_item(&am->base_state, views);
+
+  // Register the change hook on the state the trigger engine notifies
+  change_hook_trigger_event_count = 0;
+  change_hook_last_trigger_type[0] = '\0';
+  state_set_change_hook(&am->base_state, record_trigger_change_events, NULL);
+
+  // Create a trigger with ISSUE_ATTRIBUTE effect
+  trigger_effect_t effect;
+  memset(&effect, 0, sizeof(effect));
+  effect.type = TRIGGER_EFFECT_ISSUE_ATTRIBUTE;
+  strncpy(effect.issue_attribute, "temp_access", CRABS_MAX_POLICY_EXPR - 1);
+  // target_role should match the attribute name ("role" from "role:viewer")
+  strncpy(effect.target_role, "role", CRABS_MAX_USER_ID - 1);
+  effect.duration_ms = 60000;
+  strncpy(effect.attribute_value, "granted", CRABS_MAX_POLICY_EXPR - 1);
+
+  trigger_t* trigger = trigger_create("issue_attr_trigger", "Issue temp attr",
+    "views >= 50", &effect, 0, false, "admin");
+  ASSERT_NE(trigger, nullptr);
+
+  // Process triggers with attribute machine, using base_state for condition evaluation
+  uint32_t fired = trigger_process_all(&am->base_state, trigger, 1, am, 1000);
+  EXPECT_EQ(fired, 1u);
+
+  // The hook must have observed the trigger change event.
+  EXPECT_GE(change_hook_trigger_event_count, 1);
+  EXPECT_STREQ(change_hook_last_trigger_type, "issue_temporary");
+
+  // Check that alice got the temporary attribute
+  user_t* alice = attribute_machine_find_user(am, "alice");
+  ASSERT_NE(alice, nullptr);
+  EXPECT_NE(alice->temp_attrs, nullptr);
+
+  state_set_change_hook(&am->base_state, NULL, NULL);
+  trigger_destroy(trigger);
+  attribute_machine_destroy(am);
+}
+
 // ============================================================
 // Combined Condition + Trigger Tests
 // ============================================================
