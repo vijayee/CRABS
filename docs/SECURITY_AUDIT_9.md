@@ -56,11 +56,19 @@ Nested `trigger_process_all` invocations (op → trigger effect → hook → exe
 
 Sig-scheme registry (no shadowing path; builtin always occupies a slot; unregistered schemes fail closed); dedup spec authorization (op-carried specs rejected); lock-token CSPRNG + `CRYPTO_memcmp`; ECIES envelope validation both directions; signed CLI blobs verify before parse; v7→v8 ordered-set reconstruction; change-event JSON buffer math and control-char escaping; devtools `layer` JSON field (enum-only, not injectable); **no XSS in crabs-devtools.js** (all event/snapshot strings render via `textContent`, `focusItem` uses `CSS.escape`); scheduler budget carry-over, mid-loop cancel re-finds, `scheduler_ticking` guard; `_merge_preflight` catches cycles/self-anchors/dangling anchors; `_materialize` emission is deterministic.
 
-## Recommended remediation order
+## Remediation status (2026-09-08, same day as the audit)
 
-1. A-1 (stack overflow — one-line clamp), A-2/A-6 (trigger ticking guard + defer notify past bookkeeping)
-2. A-3 (serialize triggers, or explicit loader warning)
-3. A-4 (validate received HLC on the wire path)
-4. Scheduler submission `node_id`; A-5 log_count bound
-5. Mode B version checks; condition prefix fallback; CLI provenance gate
-6. Latent OT/CRDT items before the state-merge path ships to production callers
+Fixed on `feature/devtools-state-inspector`:
+- **A-1** snprintf clamp (`48b3b13`); **A-2/A-6** trigger re-find + `trigger_ticking` guard (`cd7b99a`)
+- **A-3** triggers persisted (serialization v9), **A-5** `log_count` remaining-bytes bound, duplicate OT element ids rejected (`a0e5fd5`)
+- **A-4** wire HLC validated (probe-copy strategy check at execute, `physical_nanos < 1e9` bound at op and log-entry deserialization; scheduled materialization exempt — embedded ops validated at submission) (`0d0e675`)
+- Scheduler submission events now carry the node identity (`7fd80b9`)
+- **Mode B** key-version gates enforced against the keyring-resolved signer (`605bdfd`)
+- **Condition** multi-segment paths resolve fully (prefix fallback removed) (`e3b2580`)
+- **CLI** save gated on `state accept-unverified` acknowledgment after unsigned loads (`77950d4`)
+
+Deferred (tracked, not fixed — see the lower-confidence list): key-expiry config enforcement (feature-sized),
+chain-hash verification (needs a version-aware recompute design), latent OT/CRDT merge-path items
+(apply_update LWW stamping, compaction anchor scheme, position-map refresh, crdt_merge type guard) — fix before
+the state-merge path gains production callers — and the minor JS polish items (off() lifetime, adminId
+reassignment, global-drain footgun, undefined-handler success, non-UTF-8 event drops).
