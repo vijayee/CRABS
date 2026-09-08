@@ -94,6 +94,17 @@
     }
     .toggle.open { background: #1a56db; color: #ffffff; border: 1px solid #1a56db; }
     .toggle.collapsed { background: #ffffff; color: #1a56db; border: 1px solid #e5e7eb; }
+    .panel.overlay {
+      position: fixed;
+      top: 0; right: 0; bottom: 0;
+      width: 380px;
+      max-width: 100vw;
+      z-index: 10000;
+      border-radius: 14px 0 0 14px;
+      height: 100vh;
+      box-shadow: -2px 0 14px rgba(0,0,0,.12);
+    }
+    .panel.overlay.collapsed { display: none; }
     .pause {
       padding: 3px 10px; border-radius: 999px; cursor: pointer; user-select: none;
       border: 1px solid #e5e7eb; background: #ffffff; color: #1a56db;
@@ -478,7 +489,14 @@
       snapshot: data.snapshot,
       allEvents: data.allEvents,
     }));
-    (options.mount || document.body).appendChild(panel);
+    // mount === null → overlay mode: the panel becomes a fixed-position
+    // overlay appended to document.body. A provided mount keeps the panel
+    // in the normal document flow inside that container.
+    const mount = options.mount || null;
+    const overlayMode = mount === null;
+    const host = mount || document.body;
+    host.appendChild(panel);
+    if (overlayMode) panel.classList.add('overlay');
     controller.refresh();
     return { panel, controller };
   }
