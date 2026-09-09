@@ -14,19 +14,33 @@ const MAX_KEPT_EVENTS = 5000;
 // diff dot-paths (e.g. 'items.0.value') always match the rendered paths.
 function deriveView(snapshot) {
   if (!snapshot) return null;
+  // Key sections by their natural identifier so the State tree shows names
+  // ('items.views', 'policies.lock') instead of array indices. The snapshot
+  // stores arrays, but every section's entries carry a unique key in a valid
+  // state (item names, op types, trigger/user/schedule ids); a malformed
+  // duplicate would overwrite — acceptable for an inspector.
+  const keyBy = (list, keyField) => {
+    const keyed = {};
+    for (const entry of (list || [])) {
+      const key = (entry != null && entry[keyField] != null)
+        ? String(entry[keyField]) : 'unknown';
+      keyed[key] = entry;
+    }
+    return keyed;
+  };
   return {
-    items: snapshot.items || [],
-    policies: snapshot.policies || [],
-    triggers: snapshot.triggers || [],
-    users: snapshot.users || [],
-    schedules: snapshot.schedules || [],
+    items: keyBy(snapshot.items, 'name'),
+    policies: keyBy(snapshot.policies, 'operation'),
+    triggers: keyBy(snapshot.triggers, 'id'),
+    users: keyBy(snapshot.users, 'id'),
+    schedules: keyBy(snapshot.schedules, 'id'),
     log_head: snapshot.log_head || { entries: 0, state_hash: '' },
   };
 }
 
 // Flatten a snapshot subtree into scalar leaves so plain === comparison
-// detects every change. Arrays recurse (matching how the tree renders them,
-// one row per index) but also record a length marker at the container path,
+// detects every change. Arrays recurse (one row per element) and also record
+// a length marker at the container path,
 // so a length change reads as 'changed' there instead of the container
 // itself falsely flipping 'removed'/'added'. Distinct-but-equal empty
 // containers collapse to their JSON form so they don't read as a change.
