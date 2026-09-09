@@ -134,7 +134,7 @@
       display: flex; align-items: center; gap: 7px;
       padding: 10px 12px 0;
     }
-    .brand-icon { width: 32px; height: 32px; display: block; }
+    .brand-icon { width: 64px; height: 64px; display: block; }
     .brand-name {
       font-weight: 700; font-size: 17px; color: #1a56db; letter-spacing: .04em;
     }
