@@ -134,11 +134,11 @@
       display: flex; align-items: center; gap: 7px;
       padding: 10px 12px 0;
     }
-    .brand-icon { width: 20px; height: 20px; display: block; }
+    .brand-icon { width: 28px; height: 28px; display: block; }
     .brand-name {
-      font-weight: 700; font-size: 12px; color: #1a56db; letter-spacing: .04em;
+      font-weight: 700; font-size: 17px; color: #1a56db; letter-spacing: .04em;
     }
-    .brand-tag { font-size: 10px; color: #9ca3af; font-weight: 500; }
+    .brand-tag { font-size: 14px; color: #9ca3af; font-weight: 500; }
     .overview { color: #6b7280; padding: 6px 12px 0; font-size: 11px; }
     .tree-row {
       line-height: 20px; padding-right: 8px; border-radius: 6px;
