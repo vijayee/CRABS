@@ -80,12 +80,8 @@
       letter-spacing: .04em; cursor: pointer; user-select: none;
       box-shadow: 0 2px 8px rgba(0,0,0,.12);
     }
-    /* Closed = slightly translucent, open = fully opaque (with the crab
-       logo from the project README as the icon). */
-    .toggle { opacity: .55; transition: opacity .2s ease; }
-    .toggle.open { opacity: 1; background: #1a56db; color: #ffffff; border: 1px solid #1a56db; }
-    .toggle.collapsed { opacity: .55; background: #ffffff; color: #1a56db; border: 1px solid #e5e7eb; }
-    .toggle-icon { width: 26px; height: 26px; display: block; }
+    .toggle.open { background: #1a56db; color: #ffffff; border: 1px solid #1a56db; }
+    .toggle.collapsed { background: #ffffff; color: #1a56db; border: 1px solid #e5e7eb; }
     /* Overlay styling must live on the HOST: attach() adds the overlay
        class to the <crabs-devtools> element itself, so :host(.overlay) is
        what applies it. The inner .panel then fills the fixed-size host. */
@@ -134,7 +130,16 @@
     .pause:hover, .export:hover { background: #e8f0fe; }
     .export { margin-left: auto; }
     .paused-banner { color: #9ca3af; font-size: 11px; margin-bottom: 6px; }
-    .overview { color: #6b7280; padding: 8px 12px 0; font-size: 11px; }
+    .brand {
+      display: flex; align-items: center; gap: 7px;
+      padding: 10px 12px 0;
+    }
+    .brand-icon { width: 20px; height: 20px; display: block; }
+    .brand-name {
+      font-weight: 700; font-size: 12px; color: #1a56db; letter-spacing: .04em;
+    }
+    .brand-tag { font-size: 10px; color: #9ca3af; font-weight: 500; }
+    .overview { color: #6b7280; padding: 6px 12px 0; font-size: 11px; }
     .tree-row {
       line-height: 20px; padding-right: 8px; border-radius: 6px;
     }
@@ -309,12 +314,7 @@
       root.className = 'panel';
       const toggle = document.createElement('button');
       toggle.className = 'toggle';
-      toggle.setAttribute('aria-label', 'Toggle CRABS devtools');
-      const toggleIcon = document.createElement('img');
-      toggleIcon.className = 'toggle-icon';
-      toggleIcon.src = CRABS_ICON_DATA_URI;
-      toggleIcon.alt = 'CRABS';
-      toggle.appendChild(toggleIcon);
+      toggle.textContent = 'CRABS';
       toggle.addEventListener('click', () => {
         this.collapsed = !this.collapsed;
       });
@@ -357,11 +357,26 @@
     render() {
       if (!this.root) return;
       const snapshot = this.data.snapshot;
+      // Branding: the Encryptstacean logo from the project README plus the
+      // CRABS wordmark, top-left of the panel.
+      const brand = document.createElement('div');
+      brand.className = 'brand';
+      const brandIcon = document.createElement('img');
+      brandIcon.className = 'brand-icon';
+      brandIcon.src = CRABS_ICON_DATA_URI;
+      brandIcon.alt = 'CRABS logo';
+      const brandName = document.createElement('span');
+      brandName.className = 'brand-name';
+      brandName.textContent = 'CRABS';
+      const brandTag = document.createElement('span');
+      brandTag.className = 'brand-tag';
+      brandTag.textContent = 'state machine inspector';
+      brand.append(brandIcon, brandName, brandTag);
       // Overview header: node id, version, hlc, log head, pending schedules.
       const overview = document.createElement('div');
       overview.className = 'overview mono';
       overview.textContent = overviewLine(snapshot);
-      this.root.replaceChildren(overview);
+      this.root.replaceChildren(brand, overview);
       const tabbar = document.createElement('div');
       tabbar.className = 'tabbar';
       for (const tab of ['state', 'timeline']) {
