@@ -271,7 +271,9 @@
       // are shown until a checkbox is unchecked.
       this.visibleLayers = new Set(Object.keys(LAYER_COLORS));
       this.paused = false;
-      this.collapsedState = false;
+      // Start collapsed: the CRABS launcher button opens the panel, so
+      // the devtools never cover the app until asked for.
+      this.collapsedState = true;
       // Multi-node support: several attach() calls can share one panel
       // (Vue DevTools style). Each entry is { nodeId, controller, update }.
       this.controllers = [];
@@ -329,9 +331,14 @@
       if (!this.root || !this.toggleButton) return;
       // Overlay mode slides the panel out via :host(.overlay.collapsed)
       // transform; only in-flow mode hides it outright (display:none would
-      // kill the slide transition).
+      // kill the slide transition). Overlay mode always clears the inline
+      // display — connectedCallback can run BEFORE attach() adds the
+      // overlay class (appendChild happens first), leaving a stale
+      // display:none that would override the slide.
       if (!this.classList.contains('overlay')) {
         this.root.style.display = this.collapsedState ? 'none' : '';
+      } else if (this.root.style.display === 'none') {
+        this.root.style.display = '';
       }
       // Mirror the state on the host so :host(.overlay.collapsed) applies
       // (and authors get a styling hook); in overlay mode the launcher
@@ -645,14 +652,16 @@
     const isNewPanel = !panel || !panel.isConnected;
     if (isNewPanel) {
       panel = document.createElement('crabs-devtools');
-      const host = mount || document.body;
-      host.appendChild(panel);
+      // Classify BEFORE appending: connectedCallback fires synchronously on
+      // append and reads the class to pick overlay vs in-flow collapse.
       if (overlayMode) {
         panel.classList.add('overlay');
         sharedOverlayPanel = panel;
       } else {
         mountedPanels.set(mount, panel);
       }
+      const host = mount || document.body;
+      host.appendChild(panel);
     }
     const entry = panel.registerController(nodeId, controller);
     // Every controller pushes into the panel; the panel renders only the
