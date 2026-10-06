@@ -865,6 +865,133 @@ abe_user_key_t* crypto_abe_user_key_deserialize(const abe_master_key_t* mk,
 }
 
 // ============================================================
+// Master Key Durability (§11.5)
+// ============================================================
+
+// oabe-c's oabe_secret_key_deserialize parses the MSK envelope but leaves the
+// alpha/beta master scalars unset (see the "placeholder" note in oabe_key.c),
+// which would leave a restored authority minting garbage keys. The scalars are
+// present in the serialized MSK (key_type + scheme bytes, then two packed ZP
+// elements), so parse them back out here and attach them to the restored
+// context's secret key.
+static bool _restore_msk_scalars(OABE_ContextCP* ctx, const OABE_ByteString* msk) {
+  if (!ctx || !msk || !ctx->secret_key) return false;
+  size_t offset = 2;                     // key_type byte + scheme byte
+  uint32_t alpha_len = 0;
+  uint32_t beta_len = 0;
+  if (oabe_bytestring_unpack32(msk, &offset, &alpha_len) != OABE_SUCCESS ||
+      offset + alpha_len + 4 > oabe_bytestring_get_size(msk)) {
+    return false;
+  }
+  offset += alpha_len;                   // skip the alpha element bytes
+  if (oabe_bytestring_unpack32(msk, &offset, &beta_len) != OABE_SUCCESS) {
+    return false;
+  }
+  const uint8_t* msk_data = oabe_bytestring_get_const_ptr(msk);
+  size_t header_len = 2 + 4 + alpha_len + 4;
+  if (header_len + beta_len > oabe_bytestring_get_size(msk)) return false;
+
+  OABE_ByteString* alpha_bytes = oabe_bytestring_new_from_data(msk_data + 6, alpha_len);
+  OABE_ByteString* beta_bytes = oabe_bytestring_new_from_data(msk_data + header_len, beta_len);
+  OABE_ZP* alpha_scalar = NULL;
+  OABE_ZP* beta_scalar = NULL;
+  if (!alpha_bytes || !beta_bytes ||
+      oabe_zp_deserialize(ctx->base.group, alpha_bytes, &alpha_scalar) != OABE_SUCCESS ||
+      oabe_zp_deserialize(ctx->base.group, beta_bytes, &beta_scalar) != OABE_SUCCESS) {
+    if (alpha_scalar) oabe_zp_free(alpha_scalar);
+    if (beta_scalar) oabe_zp_free(beta_scalar);
+    if (alpha_bytes) oabe_bytestring_free(alpha_bytes);
+    if (beta_bytes) oabe_bytestring_free(beta_bytes);
+    return false;
+  }
+  oabe_bytestring_free(alpha_bytes);
+  oabe_bytestring_free(beta_bytes);
+  ctx->secret_key->alpha = alpha_scalar;
+  ctx->secret_key->beta = beta_scalar;
+  return true;
+}
+
+size_t crypto_master_key_serialize(const abe_master_key_t* mk,
+                                     uint8_t* buf, size_t buf_len) {
+  if (!mk || !mk->public_params || !mk->master_secret) return 0;
+  size_t pp_len = oabe_bytestring_get_size(mk->public_params);
+  size_t ms_len = oabe_bytestring_get_size(mk->master_secret);
+  size_t total = 2 + 1 + 4 + pp_len + 4 + ms_len;
+  if (!buf) return total;               // size probe
+  if (buf_len < total) return 0;
+
+  size_t offset = 0;
+  buf[offset++] = 0x4D;                    // 'M'
+  buf[offset++] = 0x4B;                    // 'K'
+  buf[offset++] = CRABS_MSK_FORMAT_VERSION;
+  uint32_t pp_len32 = (uint32_t)pp_len;
+  uint32_t ms_len32 = (uint32_t)ms_len;
+  for (int byte_index = 0; byte_index < 4; byte_index++) {
+    buf[offset++] = (uint8_t)(pp_len32 >> (8 * byte_index));
+  }
+  for (int byte_index = 0; byte_index < 4; byte_index++) {
+    buf[offset++] = (uint8_t)(ms_len32 >> (8 * byte_index));
+  }
+  memcpy(buf + offset, oabe_bytestring_get_const_ptr(mk->public_params), pp_len);
+  offset += pp_len;
+  memcpy(buf + offset, oabe_bytestring_get_const_ptr(mk->master_secret), ms_len);
+  offset += ms_len;
+  return offset;
+}
+
+abe_master_key_t* crypto_master_key_deserialize(const uint8_t* buf, size_t len) {
+  if (!buf || len < 2 + 1 + 4 + 4) return NULL;
+  if (buf[0] != 0x4D || buf[1] != 0x4B || buf[2] != CRABS_MSK_FORMAT_VERSION) return NULL;
+  _ensure_oabe_init();
+  if (atomic_load(&_oabe_init_state) != 2) return NULL;
+
+  size_t offset = 3;
+  uint32_t pp_len = 0;
+  uint32_t ms_len = 0;
+  for (int byte_index = 0; byte_index < 4; byte_index++) {
+    pp_len |= (uint32_t)buf[offset++] << (8 * byte_index);
+  }
+  for (int byte_index = 0; byte_index < 4; byte_index++) {
+    ms_len |= (uint32_t)buf[offset++] << (8 * byte_index);
+  }
+  // Overflow-safe bounds: at this point len >= 11 and offset == 11, so both
+  // subtractions below are well-defined.
+  if ((size_t)pp_len > len - offset) return NULL;
+  if ((size_t)ms_len > len - offset - pp_len) return NULL;
+
+  abe_master_key_t* mk = get_clear_memory(sizeof(abe_master_key_t));
+  if (!mk) return NULL;
+  mk->ctx = oabe_context_cp_new();
+  if (!mk->ctx) { free(mk); return NULL; }
+
+  OABE_ByteString* params = oabe_bytestring_new_from_data(buf + offset, pp_len);
+  OABE_ByteString* secret = oabe_bytestring_new_from_data(buf + offset + pp_len, ms_len);
+  if (!params || !secret ||
+      oabe_context_cp_set_public_params(mk->ctx, params) != OABE_SUCCESS ||
+      oabe_context_cp_set_secret_key(mk->ctx, secret) != OABE_SUCCESS) {
+    if (params) oabe_bytestring_free(params);
+    if (secret) oabe_bytestring_free(secret);
+    oabe_context_cp_free(mk->ctx);
+    free(mk);
+    return NULL;
+  }
+  oabe_bytestring_free(params);
+  if (!_restore_msk_scalars(mk->ctx, secret)) {
+    oabe_bytestring_free(secret);
+    oabe_context_cp_free(mk->ctx);
+    free(mk);
+    return NULL;
+  }
+  oabe_bytestring_free(secret);
+  if (oabe_context_cp_get_public_params(mk->ctx, &mk->public_params) != OABE_SUCCESS ||
+      oabe_context_cp_get_secret_key(mk->ctx, &mk->master_secret) != OABE_SUCCESS) {
+    crypto_abe_master_key_destroy(mk);
+    return NULL;
+  }
+  return mk;
+}
+
+// ============================================================
 // ABE Encrypt — real CP-ABE (Waters '09) via OpenABE
 // ============================================================
 

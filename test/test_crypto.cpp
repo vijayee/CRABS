@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 #include <cstring>
+#include <vector>
 extern "C" {
 #include "../src/Crypto/crypto.h"
 #include "../src/Attribute/attribute_machine.h"
@@ -1068,4 +1069,55 @@ TEST_F(KeyEnvelopeTest, RevokeAndRotateInvalidKeyLeavesUserIntact) {
   EXPECT_EQ(alice->status, USER_ACTIVE);
   EXPECT_EQ(memcmp(alice->public_key, orig_pk, 33), 0);
   EXPECT_EQ(alice->key_version, orig_version);
+}
+
+// Durability Kernel (§11.5): the ABE authority must survive a restart
+// unchanged. The restored master key is a full authority — keygen against it
+// produces keys in the SAME domain as the original, so ciphertexts encrypted
+// under the restored authority decrypt with keys minted from it.
+TEST(TestDurability, MasterKeySerializeRoundTripPreservesAuthority) {
+  abe_master_key_t* original = crypto_abe_setup();
+  ASSERT_NE(original, nullptr);
+
+  size_t needed = crypto_master_key_serialize(original, nullptr, 0);
+  ASSERT_GT(needed, (size_t)0);
+
+  std::vector<uint8_t> blob(needed);
+  size_t written = crypto_master_key_serialize(original, blob.data(), blob.size());
+  ASSERT_EQ(written, needed);
+
+  crypto_abe_master_key_destroy(original);
+
+  abe_master_key_t* restored = crypto_master_key_deserialize(blob.data(), blob.size());
+  ASSERT_NE(restored, nullptr);
+
+  // The restored authority must mint keys in the SAME domain: keygen with the
+  // restored MSK decrypts ciphertexts encrypted under the restored authority.
+  // (keygen takes CRABS "name:value" attrs; encrypt takes the OpenABE
+  // identifier that crypto_abe_keygen's conversion produces.)
+  abe_user_key_t* sk = crypto_abe_keygen(restored, "role:admin");
+  ASSERT_NE(sk, nullptr);
+
+  const uint8_t msg[16] = {1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16};
+  abe_ciphertext_t* ct = crypto_abe_encrypt(restored, msg, sizeof(msg), "role_admin");
+  ASSERT_NE(ct, nullptr);
+
+  uint8_t* out = nullptr;
+  size_t out_len = 0;
+  crabs_error_e err = crypto_abe_decrypt(sk, ct, &out, &out_len);
+  ASSERT_EQ(err, CRABS_SUCCESS);
+  ASSERT_NE(out, nullptr);
+  ASSERT_EQ(out_len, sizeof(msg));
+  EXPECT_EQ(memcmp(out, msg, sizeof(msg)), 0);
+  free(out);
+
+  crypto_abe_ciphertext_destroy(ct);
+  crypto_abe_user_key_destroy(sk);
+  crypto_abe_master_key_destroy(restored);
+}
+
+TEST(TestDurability, MasterKeyDeserializeRejectsGarbage) {
+  EXPECT_EQ(crypto_master_key_deserialize(nullptr, 10), nullptr);
+  const uint8_t junk[16] = {0};
+  EXPECT_EQ(crypto_master_key_deserialize(junk, sizeof(junk)), nullptr);
 }

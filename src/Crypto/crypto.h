@@ -106,6 +106,21 @@ size_t crypto_abe_user_key_serialize(const abe_user_key_t* sk,
 abe_user_key_t* crypto_abe_user_key_deserialize(const abe_master_key_t* mk,
                                                    const uint8_t* buf, size_t len);
 
+// ============================================================
+// Master Key Durability (§11.5): serialize + restore the CP-ABE
+// authority (MPK + MSK) so a machine's authority survives restart.
+// Wire format: 'M','K' magic (2 bytes) + format_version 0x01 +
+// u32le public_params_len + public_params + u32le master_secret_len
+// + master_secret (lengths little-endian).
+// ============================================================
+#define CRABS_MSK_FORMAT_VERSION 0x01
+
+size_t crypto_master_key_serialize(const abe_master_key_t* mk,
+                                     uint8_t* buf, size_t buf_len);
+// Reconstruct a full authority (context + params + secret) from bytes.
+// Returns NULL on malformed input.
+abe_master_key_t* crypto_master_key_deserialize(const uint8_t* buf, size_t len);
+
 // Policy evaluation (AND/OR/attribute matching) — a lightweight string-based
 // check used by the authorization path; NOT a confidentiality mechanism.
 // Real attribute enforcement for the capability vault is provided by
