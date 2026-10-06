@@ -900,9 +900,36 @@ static bool _restore_msk_scalars(OABE_ContextCP* ctx, const OABE_ByteString* msk
       oabe_zp_deserialize(ctx->base.group, beta_bytes, &beta_scalar) != OABE_SUCCESS) {
     if (alpha_scalar) oabe_zp_free(alpha_scalar);
     if (beta_scalar) oabe_zp_free(beta_scalar);
-    if (alpha_bytes) oabe_bytestring_free(alpha_bytes);
-    if (beta_bytes) oabe_bytestring_free(beta_bytes);
+    // Same rationale as Audit N-17: cleanse the master scalars before the
+    // transient buffers holding them are freed.
+    if (alpha_bytes) {
+      const uint8_t* alpha_data = oabe_bytestring_get_const_ptr(alpha_bytes);
+      size_t alpha_data_len = oabe_bytestring_get_size(alpha_bytes);
+      if (alpha_data != NULL && alpha_data_len > 0) {
+        OPENSSL_cleanse((void*)alpha_data, alpha_data_len);
+      }
+      oabe_bytestring_free(alpha_bytes);
+    }
+    if (beta_bytes) {
+      const uint8_t* beta_data = oabe_bytestring_get_const_ptr(beta_bytes);
+      size_t beta_data_len = oabe_bytestring_get_size(beta_bytes);
+      if (beta_data != NULL && beta_data_len > 0) {
+        OPENSSL_cleanse((void*)beta_data, beta_data_len);
+      }
+      oabe_bytestring_free(beta_bytes);
+    }
     return false;
+  }
+  // Cleanse the transient master-scalar copies before freeing.
+  const uint8_t* alpha_data = oabe_bytestring_get_const_ptr(alpha_bytes);
+  size_t alpha_data_len = oabe_bytestring_get_size(alpha_bytes);
+  if (alpha_data != NULL && alpha_data_len > 0) {
+    OPENSSL_cleanse((void*)alpha_data, alpha_data_len);
+  }
+  const uint8_t* beta_data = oabe_bytestring_get_const_ptr(beta_bytes);
+  size_t beta_data_len = oabe_bytestring_get_size(beta_bytes);
+  if (beta_data != NULL && beta_data_len > 0) {
+    OPENSSL_cleanse((void*)beta_data, beta_data_len);
   }
   oabe_bytestring_free(alpha_bytes);
   oabe_bytestring_free(beta_bytes);
@@ -970,19 +997,40 @@ abe_master_key_t* crypto_master_key_deserialize(const uint8_t* buf, size_t len) 
       oabe_context_cp_set_public_params(mk->ctx, params) != OABE_SUCCESS ||
       oabe_context_cp_set_secret_key(mk->ctx, secret) != OABE_SUCCESS) {
     if (params) oabe_bytestring_free(params);
-    if (secret) oabe_bytestring_free(secret);
+    if (secret) {
+      // Same rationale as Audit N-17: the MSK is root trust material, and
+      // oabe_bytestring_free does not zero the buffer.
+      const uint8_t* secret_data = oabe_bytestring_get_const_ptr(secret);
+      size_t secret_data_len = oabe_bytestring_get_size(secret);
+      if (secret_data != NULL && secret_data_len > 0) {
+        OPENSSL_cleanse((void*)secret_data, secret_data_len);
+      }
+      oabe_bytestring_free(secret);
+    }
     oabe_context_cp_free(mk->ctx);
     free(mk);
     return NULL;
   }
   oabe_bytestring_free(params);
   if (!_restore_msk_scalars(mk->ctx, secret)) {
+    const uint8_t* secret_data = oabe_bytestring_get_const_ptr(secret);
+    size_t secret_data_len = oabe_bytestring_get_size(secret);
+    if (secret_data != NULL && secret_data_len > 0) {
+      OPENSSL_cleanse((void*)secret_data, secret_data_len);
+    }
     oabe_bytestring_free(secret);
     oabe_context_cp_free(mk->ctx);
     free(mk);
     return NULL;
   }
-  oabe_bytestring_free(secret);
+  {
+    const uint8_t* secret_data = oabe_bytestring_get_const_ptr(secret);
+    size_t secret_data_len = oabe_bytestring_get_size(secret);
+    if (secret_data != NULL && secret_data_len > 0) {
+      OPENSSL_cleanse((void*)secret_data, secret_data_len);
+    }
+    oabe_bytestring_free(secret);
+  }
   if (oabe_context_cp_get_public_params(mk->ctx, &mk->public_params) != OABE_SUCCESS ||
       oabe_context_cp_get_secret_key(mk->ctx, &mk->master_secret) != OABE_SUCCESS) {
     crypto_abe_master_key_destroy(mk);
