@@ -201,10 +201,15 @@ surfacing through the existing error enum.
   registry (ABE and ECDSA per-user keys), `op_type_defs` (fixes the existing
   gap where the dedup registry does not persist), `child_manifest[]`.
 - **MSK serialization**: new `master_key_serialize` / `master_key_deserialize`
-  in `crypto.c`. At rest, MSK blobs are encrypted via the existing vault
-  config; a machine with a vault configured persists the MSK on save;
-  without a vault, the serializer refuses to persist an MSK (fail loud,
-  never plaintext-MSK-on-disk).
+  in `crypto.c`. At rest, the MSK is sealed with AES-256-GCM under an
+  **operator-held seal key** (32 bytes, imported in memory only). The design
+  decision recorded here: no remote vault client (HashiCorp/AWS/HSM) exists in
+  the codebase today, so v10's at-rest provider is the operator seal key — the
+  vault config remains the seam through which a remote provider plugs in later.
+  Fail-loud rule unchanged: the CLI refuses to save a machine without a seal
+  key, and no code path ever writes an unsealed MSK to disk (the unkeyed
+  serializer omits the MSK section entirely, preserving v9's substrate-only
+  semantics for library-level callers).
 - **Child persistence**: each child is its own state file
   (`machine-<child_id>.crabs`); the parent holds only the manifest. On load,
   runtime rebuilds child handles and re-verifies genesis against the manifest
