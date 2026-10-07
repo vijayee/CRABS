@@ -1620,6 +1620,31 @@ TEST(TestCliDurability, MachineSpawnRefusesInvalidBlueprintFile) {
   remove(garbage_path);
 }
 
+// De-wonk (usage lie + dead dispatch arm): 'compact' is documented in every
+// usage table, but the dispatch accept chain rejected it as an unknown
+// command, and the command body read node->state — ALWAYS NULL since v10
+// (the live machine is attr_machine->base_state) — so even a reachable call
+// would have compacted nothing. Both are fixed: the accept chain recognizes
+// 'compact' and the command compacts the machine's live base_state.
+TEST(TestCliDurability, DispatchCompactRunsOnMachineState) {
+  cli_node_t* compact_node = cli_node_create();
+  ASSERT_NE(compact_node, nullptr);
+
+  // The accept chain now recognizes 'compact', so an UNINITIALIZED node
+  // fails the init gate (not the unknown-command argument gate it saw
+  // before the fix).
+  char* compact_argv[] = {(char*)"crabs", (char*)"compact"};
+  EXPECT_EQ(cli_dispatch(compact_node, 2, compact_argv), CLI_ERR_NOT_INIT);
+
+  ASSERT_EQ(cli_node_init(compact_node, "admin"), CLI_OK);
+  ASSERT_EQ(cli_cmd_item_add(compact_node, "votes", "set"), CLI_OK);
+  // The live machine state is the compaction target; a state with nothing
+  // to compact still completes with zero compacted items.
+  EXPECT_EQ(cli_dispatch(compact_node, 2, compact_argv), CLI_OK);
+
+  cli_node_destroy(compact_node);
+}
+
 // The longest even-length run of lowercase-hex characters captured from the
 // redirected stdout — the printed attestation wire (the command prints no
 // other hex string anywhere near that length).

@@ -1286,7 +1286,8 @@ cli_result_e cli_cmd_compact(cli_node_t* node) {
   crabs_compaction_engine_init(&engine, NULL);
   crabs_register_crdt_vtables(&engine.registry);
 
-  crabs_error_e err = crabs_op_compact_now(&engine, node->state);
+  crabs_error_e err = crabs_op_compact_now(
+      &engine, &node->attr_machine->base_state);
 
   if (err == CRABS_SUCCESS) {
     printf("Compaction completed. Items compacted: %llu, Skipped: %llu, Unsafe: %llu\n",
@@ -2044,7 +2045,7 @@ cli_result_e cli_dispatch(cli_node_t* node, int argc, char** argv) {
   if (strcmp(cmd, "state") != 0 && strcmp(cmd, "user") != 0 &&
       strcmp(cmd, "item") != 0 && strcmp(cmd, "policy") != 0 &&
       strcmp(cmd, "key") != 0 && strcmp(cmd, "op") != 0 &&
-      strcmp(cmd, "machine") != 0 &&
+      strcmp(cmd, "machine") != 0 && strcmp(cmd, "compact") != 0 &&
       strcmp(cmd, "seal-key") != 0 && strcmp(cmd, "load-sealed") != 0) {
     printf("Unknown command: %s\n", cmd);
     cli_print_usage(argv[0]);
