@@ -1709,6 +1709,18 @@ TEST(TestCliDurability, MachineAttestPrintsVerifiableWire) {
                                      (char*)"user-1", (char*)"tier:gold"};
   EXPECT_NE(cli_dispatch(author, 6, attest_ghost.data()), CLI_OK);
 
+  // revoke-attestation (op pipeline) stops issuing: the status flips and the
+  // next attest fails closed on the non-ACTIVE child.
+  std::vector<char*> revoke_argv = {(char*)"crabs_node", (char*)"machine",
+                                    (char*)"revoke-attestation",
+                                    (char*)"child-red"};
+  EXPECT_EQ(cli_dispatch(author, 4, revoke_argv.data()), CLI_OK);
+  const child_manifest_entry_t* revoked_entry = lineage_find_manifest_entry(
+      parent, "child-red");
+  ASSERT_NE(revoked_entry, nullptr);
+  EXPECT_EQ(revoked_entry->status, LINEAGE_ATTESTATION_REVOKED);
+  EXPECT_NE(cli_dispatch(author, 6, attest_argv.data()), CLI_OK);
+
   cli_node_destroy(author);
   remove(blueprint_path);
   remove(captured_path);

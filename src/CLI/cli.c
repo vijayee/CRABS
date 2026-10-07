@@ -1758,13 +1758,12 @@ static cli_result_e _machine_cmd_attest(cli_node_t* node, const char* child_id,
     printf("Error: attestation serialization failed.\n");
     return CLI_ERR_EXEC;
   }
-  char hex[((CRABS_ATTESTATION_WIRE_MAX) * 2) + 1];
+  char hex[CRABS_ATTESTATION_WIRE_MAX * 2 + 1];
   cli_bytes_to_hex(wire, wire_len, hex);
   printf("Attestation wire for %s (user %s, %zu bytes), hex:\n%s\n",
          child_id, user_id, wire_len, hex);
   return CLI_OK;
 }
-
 
 // ============================================================
 // Command Dispatch
@@ -1862,7 +1861,7 @@ static void _print_machine_usage(void) {
   printf("  machine children                       List the child manifest (mode, status, resident, ttl_ms)\n");
   printf("  machine dissolve <child_id>            Dissolve a non-sovereign child\n");
   printf("  machine withdraw <child_id>            Withdraw a sovereign child's genesis stake\n");
-  printf("  machine revoke-attestation <child_id>   Stop issuing attestations for a child\n");
+  printf("  machine revoke-attestation <child_id>  Stop issuing attestations for a child\n");
   printf("  machine attest <child_id> <user_id> <attributes>\n");
   printf("                                        Mint and print a parent-signed user attestation\n");
   printf("\n  Note: the lineage op handlers/policies must be installed on this\n");
