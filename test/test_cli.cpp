@@ -1786,3 +1786,245 @@ TEST(TestCliDurability, MachineAttestPrintsVerifiableWire) {
   remove(blueprint_path);
   remove(captured_path);
 }
+
+// ============================================================
+// Tombstone hand-off (lineage deferred fix 3): 'machine tombstone' prints
+// the parent's signed dissolution tombstone for a DISSOLVED child as hex
+// transport material (not an op — the wire crosses operator/process
+// boundaries out-of-band); 'machine accept-tombstone' delivers it to THIS
+// machine as a __receive_dissolution__ op through the standard pipeline.
+// ============================================================
+
+TEST(TestCliDurability, TombstoneCommandPrintsDissolvedChildWire) {
+  cli_node_t* author = cli_node_create();
+  ASSERT_EQ(cli_node_init(author, "parent-root"), CLI_OK);
+  lineage_install(&author->attr_machine->base_state);
+  state_t* parent = &author->attr_machine->base_state;
+
+  const char* blueprint_path = "/tmp/crabs-bp-tombstone.cbp";
+  ASSERT_TRUE(test_author_machine_blueprint(author, "child-red", "delegated",
+                                            blueprint_path));
+  std::vector<char*> spawn_argv = {(char*)"crabs_node", (char*)"machine",
+                                   (char*)"spawn", (char*)blueprint_path};
+  ASSERT_EQ(cli_dispatch(author, 4, spawn_argv.data()), CLI_OK);
+
+  std::vector<char*> tombstone_argv = {(char*)"crabs_node", (char*)"machine",
+                                       (char*)"tombstone", (char*)"child-red"};
+  // Honesty gate BEFORE the dissolve: signing a tombstone for an ACTIVE
+  // child would prove a lie, and an unknown child has no manifest entry.
+  EXPECT_NE(cli_dispatch(author, 4, tombstone_argv.data()), CLI_OK);
+  std::vector<char*> tombstone_ghost = {(char*)"crabs_node", (char*)"machine",
+                                        (char*)"tombstone",
+                                        (char*)"child-ghost"};
+  EXPECT_NE(cli_dispatch(author, 4, tombstone_ghost.data()), CLI_OK);
+  // A missing child_id is a usage error, not an execution failure.
+  std::vector<char*> tombstone_noargs = {(char*)"crabs_node", (char*)"machine",
+                                         (char*)"tombstone"};
+  EXPECT_EQ(cli_dispatch(author, 3, tombstone_noargs.data()), CLI_ERR_ARGS);
+
+  std::vector<char*> dissolve_argv = {(char*)"crabs_node", (char*)"machine",
+                                      (char*)"dissolve", (char*)"child-red"};
+  ASSERT_EQ(cli_dispatch(author, 4, dissolve_argv.data()), CLI_OK);
+  ASSERT_EQ(lineage_find_manifest_entry(parent, "child-red")->status,
+            LINEAGE_DISSOLVED);
+
+  // Capture the command's printed tombstone hex from stdout.
+  const char* captured_path = "/tmp/crabs-tombstone-captured.log";
+  FILE* captured_stream = fopen(captured_path, "w");
+  ASSERT_NE(captured_stream, nullptr);
+  FILE* saved_stdout = stdout;
+  stdout = captured_stream;
+  cli_result_e tombstone_result = cli_dispatch(author, 4, tombstone_argv.data());
+  fflush(captured_stream);
+  fclose(captured_stream);
+  stdout = saved_stdout;
+  ASSERT_EQ(tombstone_result, CLI_OK);
+
+  std::vector<uint8_t> captured_bytes;
+  ASSERT_TRUE(test_read_file_bytes(captured_path, captured_bytes));
+  std::string captured(captured_bytes.begin(), captured_bytes.end());
+
+  // The printed wire is canonical body (tag + string16 id) + the 64-byte
+  // parent ECDSA signature — exactly what __receive_dissolution__ transports.
+  std::vector<uint8_t> wire = test_extract_hex_wire(captured);
+  const size_t expected_wire_len = 3 + strlen("child-red") + CRABS_SIG_SIZE;
+  ASSERT_EQ(wire.size(), expected_wire_len);
+  EXPECT_EQ(wire[0], (uint8_t)LINEAGE_DISSOLVED);
+  EXPECT_EQ(wire[1], (uint8_t)strlen("child-red"));
+  EXPECT_EQ(wire[2], 0x00);
+  EXPECT_EQ(memcmp(wire.data() + 3, "child-red", strlen("child-red")), 0);
+  // The trailing signature verifies against the parent machine's node
+  // public key — it is authentic even though no manifest was needed.
+  EXPECT_TRUE(crypto_ecdsa_verify(author->node_key->public_key, wire.data(),
+                                  wire.size() - CRABS_SIG_SIZE,
+                                  wire.data() + wire.size() - CRABS_SIG_SIZE));
+
+  cli_node_destroy(author);
+  remove(blueprint_path);
+  remove(captured_path);
+}
+
+TEST(TestCliDurability, TombstoneAcceptCommandSeversLineageAndPersists) {
+  // Parent side: spawn child-red and persist the child's sealed snapshot
+  // BEFORE the dissolve — the file must carry the binding WITHOUT the
+  // dissolved flag — then dissolve and print the tombstone. Destroying the
+  // resident child afterwards means NO in-process state can leak the
+  // severance into the child operator's machine below: the tombstone is the
+  // only channel that carries the parent's decision across.
+  cli_node_t* author = cli_node_create();
+  ASSERT_EQ(cli_node_init(author, "parent-root"), CLI_OK);
+  lineage_install(&author->attr_machine->base_state);
+
+  char parent_priv_hex[65];
+  cli_bytes_to_hex(author->node_key->private_key, 32, parent_priv_hex);
+  parent_priv_hex[64] = '\0';
+
+  const char* blueprint_path = "/tmp/crabs-bp-tombstone-accept.cbp";
+  const char* child_path = "/tmp/crabs-child-tombstone.crabs";
+  const char* child_saved_path = "/tmp/crabs-child-tombstone-saved.crabs";
+  const char* tombstone_hex_path = "/tmp/crabs-tombstone-handoff.hex";
+  ASSERT_TRUE(test_author_machine_blueprint(author, "child-red", "delegated",
+                                            blueprint_path));
+  std::vector<char*> spawn_argv = {(char*)"crabs_node", (char*)"machine",
+                                   (char*)"spawn", (char*)blueprint_path};
+  ASSERT_EQ(cli_dispatch(author, 4, spawn_argv.data()), CLI_OK);
+
+  // The child operator has their OWN at-rest seal key (same fixed test key
+  // constant as the parent-side tests use for the parent).
+  const uint8_t child_seal_bytes[32] = {
+    1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,
+    17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32
+  };
+  char child_seal_hex[65];
+  cli_bytes_to_hex(child_seal_bytes, 32, child_seal_hex);
+  child_seal_hex[64] = '\0';
+
+  attribute_machine_t* resident_child = lineage_query_resident_child(
+      &author->attr_machine->base_state, "child-red");
+  ASSERT_NE(resident_child, nullptr);
+  // UNLESS provenance is acknowledged, an unsigned snapshot is what the
+  // child CLI node will load back with 'state accept-unverified' — the
+  // same operator flow the parent snapshot path exercises.
+  serialized_buffer_t* child_blob = crabs_serialize_state_sealed(
+      &resident_child->base_state, child_seal_bytes);
+  ASSERT_NE(child_blob, nullptr);
+  ASSERT_TRUE(test_write_file_bytes(child_path,
+                                    std::vector<uint8_t>(
+                                        child_blob->data,
+                                        child_blob->data + child_blob->len)));
+  const size_t child_blob_len = child_blob->len;
+  serialized_buffer_destroy(child_blob);
+
+  std::vector<char*> dissolve_argv = {(char*)"crabs_node", (char*)"machine",
+                                      (char*)"dissolve", (char*)"child-red"};
+  ASSERT_EQ(cli_dispatch(author, 4, dissolve_argv.data()), CLI_OK);
+
+  // Capture the printed tombstone hex (the child operator's hand-off file).
+  std::vector<char*> tombstone_argv = {(char*)"crabs_node", (char*)"machine",
+                                       (char*)"tombstone", (char*)"child-red"};
+  const char* captured_path = "/tmp/crabs-tombstone-accept-captured.log";
+  FILE* captured_stream = fopen(captured_path, "w");
+  ASSERT_NE(captured_stream, nullptr);
+  FILE* saved_stdout = stdout;
+  stdout = captured_stream;
+  ASSERT_EQ(cli_dispatch(author, 4, tombstone_argv.data()), CLI_OK);
+  fflush(captured_stream);
+  fclose(captured_stream);
+  stdout = saved_stdout;
+
+  std::vector<uint8_t> captured_bytes;
+  ASSERT_TRUE(test_read_file_bytes(captured_path, captured_bytes));
+  std::string captured(captured_bytes.begin(), captured_bytes.end());
+  std::vector<uint8_t> wire = test_extract_hex_wire(captured);
+  ASSERT_EQ(wire.size(), 3 + strlen("child-red") + CRABS_SIG_SIZE);
+  // Hand-off file: the printed hex plus a trailing newline — the accept
+  // command must parse the hex run dynamically (the tombstone is wider
+  // than any fixed 64-hex read) and tolerate the whitespace.
+  char hex_text_buffer[CRABS_DISSOLUTION_WIRE_MAX * 2 + 1];
+  cli_bytes_to_hex(wire.data(), wire.size(), hex_text_buffer);
+  std::string hex_line = std::string(hex_text_buffer) + "\n";
+  const char* tombstone_hex_bad_path = "/tmp/crabs-tombstone-tampered.hex";
+  const char* garbage_path = "/tmp/crabs-tombstone-garbage.hex";
+  ASSERT_TRUE(test_write_file_bytes(
+      tombstone_hex_path,
+      std::vector<uint8_t>(hex_line.begin(), hex_line.end())));
+
+  // Detach the child: destroy the resident copy so the flag below can only
+  // have come through the tombstone delivery.
+  attribute_machine_destroy(resident_child);
+  cli_node_destroy(author);
+
+  // Child side, separate machine: load the saved child file with the
+  // child's seal key, restore key custody (the genesis-registered child
+  // admin signs with the parent's node key material), then deliver the
+  // tombstone through the standard op pipeline.
+  cli_node_t* child_node = cli_node_create();
+  ASSERT_EQ(cli_node_load_sealed(child_node, child_path, child_seal_hex),
+            CLI_OK);
+  state_t* child_state = &child_node->attr_machine->base_state;
+  ASSERT_TRUE(child_state->lineage_parent_bound);
+  ASSERT_FALSE(child_state->lineage_parent_dissolved);
+  ASSERT_STREQ(child_state->lineage_self_id, "child-red");
+  ASSERT_EQ(cli_node_load_key(child_node, parent_priv_hex), CLI_OK);
+  ASSERT_NE(cli_node_get_user_key(child_node, "child-admin"), nullptr);
+
+  // The lineage op HANDLERS are runtime registrations — delivery is refused
+  // loudly until lineage_install on the (re)loaded machine.
+  std::vector<char*> accept_argv = {(char*)"crabs_node", (char*)"machine",
+                                    (char*)"accept-tombstone",
+                                    (char*)tombstone_hex_path};
+  EXPECT_EQ(cli_dispatch(child_node, 4, accept_argv.data()), CLI_ERR_EXEC);
+
+  lineage_install(child_state);
+  ASSERT_EQ(cli_dispatch(child_node, 4, accept_argv.data()), CLI_OK);
+  ASSERT_TRUE(child_state->lineage_parent_dissolved);
+
+  // Refusals: a re-delivery is already-performed (not a usage error), a
+  // missing file is I/O, garbage hex refuses, and one flipped signature
+  // nibble kills the parent's proof.
+  std::vector<char*> accept_missing = {(char*)"crabs_node", (char*)"machine",
+                                       (char*)"accept-tombstone",
+                                       (char*)"/tmp/crabs-no-such-tombstone.hex"};
+  EXPECT_EQ(cli_dispatch(child_node, 4, accept_missing.data()), CLI_ERR_IO);
+  ASSERT_TRUE(test_write_file_bytes(
+      garbage_path,
+      std::vector<uint8_t>({'n', 'o', 't', ' ', 'h', 'e', 'x', '!'})));
+  std::vector<char*> accept_garbage = {(char*)"crabs_node", (char*)"machine",
+                                       (char*)"accept-tombstone",
+                                       (char*)garbage_path};
+  EXPECT_NE(cli_dispatch(child_node, 4, accept_garbage.data()), CLI_OK);
+  std::string tampered_hex_line = hex_line.substr(0, hex_line.size() - 2);
+  tampered_hex_line += (hex_line[hex_line.size() - 2] == '0') ? "1\n" : "0\n";
+  ASSERT_TRUE(test_write_file_bytes(
+      tombstone_hex_bad_path,
+      std::vector<uint8_t>(tampered_hex_line.begin(), tampered_hex_line.end())));
+  std::vector<char*> accept_tampered = {(char*)"crabs_node", (char*)"machine",
+                                        (char*)"accept-tombstone",
+                                        (char*)tombstone_hex_bad_path};
+  EXPECT_NE(cli_dispatch(child_node, 4, accept_tampered.data()), CLI_OK);
+  EXPECT_TRUE(child_state->lineage_parent_dissolved);
+
+  // Persist through the standard operator gates: acknowledge the unsigned
+  // snapshot's provenance, then save — the severed flag must survive the
+  // sealed reload on its own (v12 dissolved-flag persistence).
+  char* accept_unverified_argv[] = {(char*)"crabs_node", (char*)"state",
+                                    (char*)"accept-unverified"};
+  EXPECT_EQ(cli_dispatch(child_node, 3, accept_unverified_argv), CLI_OK);
+  ASSERT_EQ(cli_node_save(child_node, child_saved_path), CLI_OK);
+  cli_node_destroy(child_node);
+
+  cli_node_t* child_reloaded = cli_node_create();
+  ASSERT_EQ(cli_node_load_sealed(child_reloaded, child_saved_path,
+                                 child_seal_hex), CLI_OK);
+  ASSERT_EQ(cli_node_load_key(child_reloaded, parent_priv_hex), CLI_OK);
+  ASSERT_TRUE(child_reloaded->attr_machine->base_state.lineage_parent_dissolved);
+
+  cli_node_destroy(child_reloaded);
+  remove(blueprint_path);
+  remove(child_path);
+  remove(child_saved_path);
+  remove(tombstone_hex_path);
+  remove(tombstone_hex_bad_path);
+  remove(garbage_path);
+  remove(captured_path);
+}

@@ -2110,6 +2110,23 @@ TEST(TestLineage, TombstoneDeliveryRefusesForgedMisaddressedAndUnbound) {
   release_handler_shell_op(to_stray);
   EXPECT_FALSE(stray->base_state.lineage_parent_dissolved);
 
+  // (4) Re-delivery pinned order: on an ALREADY-dissolved machine a
+  // wrong-machine tombstone stops at the dissolved guard — the refusal is
+  // the re-delivery (CRABS_ERR_ALREADY_PERFORMED), not the misaddressing
+  // (CRABS_ERR_INVALID_PARAM). The documented refusal ladder checks
+  // idempotency BEFORE the tombstone's child_id, so a re-delivery never
+  // spends parse work on tombstones it will refuse anyway.
+  receiver->base_state.lineage_parent_dissolved = true;
+  operation_t* redelivered_wrong = make_handler_shell_op(
+      CRABS_LINEAGE_OP_RECEIVE_DISSOLUTION, other_tombstone,
+      other_tombstone_len);
+  ASSERT_NE(redelivered_wrong, nullptr);
+  EXPECT_EQ(lineage_op_receive_dissolution(&receiver->base_state,
+                                           redelivered_wrong),
+            CRABS_ERR_ALREADY_PERFORMED);
+  release_handler_shell_op(redelivered_wrong);
+  EXPECT_TRUE(receiver->base_state.lineage_parent_dissolved);
+
   crypto_ecdsa_keypair_destroy(stray_key);
   attribute_machine_destroy(stray);
   attribute_machine_destroy(receiver);

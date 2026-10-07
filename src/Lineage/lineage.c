@@ -1480,10 +1480,12 @@ void lineage_install(state_t* state) {
 }
 
 // Canonical tombstone body: `u8 tag (= LINEAGE_DISSOLVED) + string16
-// child_id` (string length EXCLUDES the NUL). The single writer behind
-// lineage_sign_dissolution / lineage_dissolution_serialize /
-// lineage_op_receive_dissolution, so delivery bytes can never drift from
-// signing bytes. Worst case 3 + (CRABS_MAX_USER_ID - 1) = 66 bytes.
+// child_id` (string length EXCLUDES the NUL). Sole writer for the signing
+// surfaces — lineage_sign_dissolution signs it and
+// lineage_dissolution_serialize appends the signature to it; the delivery
+// op lineage_op_receive_dissolution only PARSES the same layout (it never
+// writes), so delivery bytes can never drift from signing bytes. Worst
+// case 3 + (CRABS_MAX_USER_ID - 1) = 66 bytes.
 static bool _lineage_tombstone_write_body(uint8_t* out, size_t cap,
                                           size_t* offset_out,
                                           const char* child_id) {

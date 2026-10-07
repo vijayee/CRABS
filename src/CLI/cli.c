@@ -8,6 +8,7 @@
 #include "../Compaction/compaction_engine.h"
 #include "../Compaction/crdt_compaction.h"
 #include <openssl/crypto.h>
+#include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1781,6 +1782,145 @@ static cli_result_e _machine_cmd_attest(cli_node_t* node, const char* child_id,
   return CLI_OK;
 }
 
+// 'machine tombstone': print the parent's signed dissolution tombstone for a
+// DISSOLVED child as hex transport material — NOT an op, exactly like
+// 'machine attest': the wire crosses operator/process boundaries
+// out-of-band, and re-issuing it is harmless (the child's delivery is
+// idempotent). The manifest is resolved here first so the honesty-gate
+// refusal names the real problem (a tombstone proves a dissolution — it is
+// never signed for a child that is not dissolved). NOTE: the signature is
+// made with the machine's CURRENT node key — on a reloaded machine the
+// operator must have re-imported the node key (cli_node_load_key) first, or
+// the child-side delivery will refuse the tombstone as a cryptographic
+// mismatch against the parent public key in the persisted binding.
+static cli_result_e _machine_cmd_tombstone(cli_node_t* node,
+                                           const char* child_id) {
+  if (node == NULL || !node->initialized || node->attr_machine == NULL)
+    return CLI_ERR_NOT_INIT;
+  if (child_id == NULL || child_id[0] == '\0') return CLI_ERR_ARGS;
+  if (strlen(child_id) >= CRABS_MAX_USER_ID) {
+    printf("Error: child_id must be shorter than %d characters.\n",
+           CRABS_MAX_USER_ID);
+    return CLI_ERR_ARGS;
+  }
+
+  const child_manifest_entry_t* manifest_entry = lineage_find_manifest_entry(
+      &node->attr_machine->base_state, child_id);
+  if (manifest_entry == NULL) {
+    printf("Error: no child manifest entry for %s.\n", child_id);
+    return CLI_ERR_EXEC;
+  }
+  if (manifest_entry->status != LINEAGE_DISSOLVED) {
+    printf("Error: %s is not dissolved (status %s) — a tombstone proves a "
+           "dissolution; run 'machine dissolve %s' first.\n",
+           child_id, lineage_status_name(manifest_entry->status), child_id);
+    return CLI_ERR_EXEC;
+  }
+
+  uint8_t wire[CRABS_DISSOLUTION_WIRE_MAX];
+  size_t wire_len = 0;
+  crabs_error_e err = lineage_dissolution_serialize(
+      &node->attr_machine->base_state, child_id, wire, sizeof(wire), &wire_len);
+  if (err != CRABS_SUCCESS) {
+    printf("Error: tombstone serialization failed: %s\n",
+           cli_error_string(err));
+    return CLI_ERR_EXEC;
+  }
+  char hex[CRABS_DISSOLUTION_WIRE_MAX * 2 + 1];
+  cli_bytes_to_hex(wire, wire_len, hex);
+  printf("Dissolution tombstone for %s (%zu bytes), hex:\n%s\n",
+         child_id, wire_len, hex);
+  return CLI_OK;
+}
+
+// 'machine accept-tombstone': the CHILD-side delivery command. Reads a
+// tombstone hex file (what 'machine tombstone' printed on the parent),
+// extracts the hex run (trailing newline tolerated), decodes it, and submits
+// the raw wire bytes as the payload of a __receive_dissolution__ op through
+// the standard pipeline (signed by this machine's bootstrap admin — the
+// child operator's authorized carriage). The op HANDLER, not the CLI,
+// verifies the parent's tombstone signature against the persisted parent
+// public key and flips the durable dissolved flag. The hex length is parsed
+// dynamically: a tombstone is 2 * (3 + strlen(child_id) + CRABS_SIG_SIZE)
+// hex chars — wider than any fixed read (the seal key's 64-char file idiom
+// would truncate it), and the file may carry whitespace.
+static cli_result_e _machine_cmd_accept_tombstone(cli_node_t* node,
+                                                  const char* path) {
+  if (node == NULL || !node->initialized || node->attr_machine == NULL)
+    return CLI_ERR_NOT_INIT;
+  if (path == NULL) return CLI_ERR_ARGS;
+
+  size_t file_len = 0;
+  uint8_t* file_data = _read_file_bytes(path, &file_len);
+  if (file_data == NULL) {
+    printf("Error: cannot read tombstone file %s.\n", path);
+    return CLI_ERR_IO;
+  }
+  // Work on a NUL-terminated copy so the hex run can be located with string
+  // walks; the copy is cleansed + freed right after decoding.
+  char* file_text = (char*)get_memory(file_len + 1);
+  if (file_text == NULL) {
+    free(file_data);
+    return CLI_ERR_EXEC;
+  }
+  memcpy(file_text, file_data, file_len);
+  file_text[file_len] = '\0';
+  free(file_data);
+
+  // The hex run is bounded by whitespace on both sides.
+  char* cursor = file_text;
+  while (*cursor != '\0' && isspace((unsigned char)*cursor)) cursor++;
+  char* hex_start = cursor;
+  while (*cursor != '\0' && !isspace((unsigned char)*cursor)) cursor++;
+  char* run_end = cursor;
+  // Everything AFTER the first run must be whitespace — a second hex run in
+  // the file would make the hand-off ambiguous, so refuse it.
+  for (char* tail = run_end; *tail != '\0'; tail++) {
+    if (!isspace((unsigned char)*tail)) {
+      printf("Error: %s holds more than one hex run — not a readable "
+             "tombstone file.\n", path);
+      OPENSSL_cleanse(file_text, file_len + 1);
+      free(file_text);
+      return CLI_ERR_EXEC;
+    }
+  }
+  *run_end = '\0';
+
+  size_t hex_len = strlen(hex_start);
+  size_t decoded_len = hex_len / 2;
+  // Size window mirrors the op handler's: one id character is the smallest
+  // honest tombstone (3 + 1 + CRABS_SIG_SIZE bytes), a safe id tops out at
+  // CRABS_DISSOLUTION_WIRE_MAX.
+  if (hex_len % 2 != 0 ||
+      decoded_len < 3 + 1 + CRABS_SIG_SIZE ||
+      decoded_len > (size_t)CRABS_DISSOLUTION_WIRE_MAX) {
+    printf("Error: %s does not hold a tombstone-sized hex image (%zu hex "
+           "characters).\n", path, hex_len);
+    OPENSSL_cleanse(file_text, file_len + 1);
+    free(file_text);
+    return CLI_ERR_EXEC;
+  }
+  uint8_t tombstone_wire[CRABS_DISSOLUTION_WIRE_MAX];
+  cli_result_e decode_result =
+      cli_hex_to_bytes(hex_start, tombstone_wire, decoded_len);
+  OPENSSL_cleanse(file_text, file_len + 1);
+  free(file_text);
+  if (decode_result != CLI_OK) {
+    printf("Error: %s does not hold valid hex tombstone bytes.\n", path);
+    return CLI_ERR_EXEC;
+  }
+
+  cli_result_e result = _machine_lifecycle_op_submit(
+      node, CRABS_LINEAGE_OP_RECEIVE_DISSOLUTION, tombstone_wire,
+      decoded_len, "accept-tombstone");
+  OPENSSL_cleanse(tombstone_wire, sizeof(tombstone_wire));
+  if (result == CLI_OK) {
+    printf("Dissolution tombstone accepted — the parent lineage of this "
+           "machine is severed.\n");
+  }
+  return result;
+}
+
 // ============================================================
 // Command Dispatch
 // ============================================================
@@ -1822,9 +1962,12 @@ static void _warn_first_unauthenticated_mutation(cli_node_t* node, const char* c
   } else if (strcmp(cmd, "machine") == 0 && sub != NULL &&
              (strcmp(sub, "spawn") == 0 || strcmp(sub, "dissolve") == 0 ||
               strcmp(sub, "withdraw") == 0 ||
-              strcmp(sub, "revoke-attestation") == 0)) {
+              strcmp(sub, "revoke-attestation") == 0 ||
+              strcmp(sub, "accept-tombstone") == 0)) {
     mutating = true;
   }
+  // 'machine attest' and 'machine tombstone' are deliberately NOT warnings:
+  // both only mint/print off-chain transport material and change no state.
 
   if (!mutating) return;
   node->unauth_warning_shown = true;
@@ -1880,6 +2023,8 @@ static void _print_machine_usage(void) {
   printf("  machine revoke-attestation <child_id>  Stop issuing attestations for a child\n");
   printf("  machine attest <child_id> <user_id> <attributes>\n");
   printf("                                        Mint and print a parent-signed user attestation\n");
+  printf("  machine tombstone <child_id>           Print the dissolution tombstone hex for a DISSOLVED child\n");
+  printf("  machine accept-tombstone <file>        Deliver a tombstone hex file: sever this machine's parent lineage\n");
   printf("\n  Note: the lineage op handlers/policies must be installed on this\n");
   printf("  machine first (lineage_install) — spawn and lifecycle ops fail otherwise.\n");
 }
@@ -2152,6 +2297,20 @@ cli_result_e cli_dispatch(cli_node_t* node, int argc, char** argv) {
         return CLI_ERR_ARGS;
       }
       return _machine_cmd_attest(node, argv[3], argv[4], argv[5]);
+    }
+    if (strcmp(machine_sub, "tombstone") == 0) {
+      if (argc < 4) {
+        printf("Usage: machine tombstone <child_id>\n");
+        return CLI_ERR_ARGS;
+      }
+      return _machine_cmd_tombstone(node, argv[3]);
+    }
+    if (strcmp(machine_sub, "accept-tombstone") == 0) {
+      if (argc < 4) {
+        printf("Usage: machine accept-tombstone <file>\n");
+        return CLI_ERR_ARGS;
+      }
+      return _machine_cmd_accept_tombstone(node, argv[3]);
     }
     printf("Unknown machine subcommand: %s\n", machine_sub);
     _print_machine_usage();
