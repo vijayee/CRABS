@@ -214,6 +214,83 @@ crabs_error_e lineage_spawn_machine(state_t* parent,
                                     attribute_machine_t** child_out);
 
 // ============================================================
+// Lineage ops: spawn / revoke attestation / dissolve / withdraw via the
+// operation pipeline
+// ============================================================
+
+// Custom op types a lineage-eligible machine registers (lineage_install).
+// All four are admin-gated user-defined operations — the state machine's
+// builtin chain stays untouched; handlers run POST-authorization, so the
+// handler bodies re-verify nothing about the caller.
+#define CRABS_LINEAGE_OP_SPAWN               "__spawn_machine__"
+#define CRABS_LINEAGE_OP_REVOKE_ATTESTATION  "__revoke_attestation__"
+#define CRABS_LINEAGE_OP_DISSOLVE            "__dissolve_machine__"
+#define CRABS_LINEAGE_OP_WITHDRAW_GENESIS    "__withdraw_genesis__"
+
+// Forward declaration: operation_t is full-defined in state_machine.h (which
+// itself includes this header). Pointer use only — safe on an incomplete type.
+typedef struct crabs_operation operation_t;
+
+// Convenience installer: registers the four op type definitions (DEDUP_NONE —
+// per-child replay guards are a protocol author's choice), the default
+// policies (all four "role:admin" — a protocol may override afterwards via
+// state_add_policy), and the four handlers. IDEMPOTENT: registration paths
+// update in place when already present, so calling it twice is a no-op —
+// call once after machine creation.
+void lineage_install(state_t* state);
+
+// Handler bodies (op-handler signature; dispatched by state_machine_execute
+// after the op's signature + policy authorization succeeded):
+//
+// lineage_op_spawn — payload is a full blueprint wire image
+// (blueprint_serialize); deserializes + validates it, spawns the child, and
+// registers it in the parent's runtime resident-children registry. Note the
+// spawned CHILD is still owned by whoever holds the returned pointer — via
+// the op pipeline the caller never sees it, so keep a reference (e.g. your
+// own registry) or destroy nothing.
+crabs_error_e lineage_op_spawn(state_t* state, operation_t* op);
+
+// payload = child_id (raw NUL-terminated string). Finds the manifest entry
+// and flips it to LINEAGE_ATTESTATION_REVOKED: the parent stops issuing
+// attestations for this child (crabs_issue_attestation refuses) WITHOUT
+// dissolving it — live attestations run out their TTL and dissolution stays
+// available. Unknown child → CRABS_ERR_RESOURCE_NOT_FOUND; already revoked →
+// CRABS_ERR_ALREADY_PERFORMED.
+crabs_error_e lineage_op_revoke_attestation(state_t* state, operation_t* op);
+
+// payload = child_id (raw string). Sovereign children CANNOT be dissolved
+// (CRABS_ERR_UNAUTHORIZED — the parent may only withdraw a genesis stake):
+// crabs.h has no NOT_PERMITTED enumerator, so trust-mode and lifecycle
+// refusals surface as CRABS_ERR_UNAUTHORIZED (lineage.c's established
+// nearest-error mapping). Sets the manifest entry DISSOLVED and, when the
+// child is resident in-process, sets child lineage_parent_dissolved = true —
+// every @parent/ endorsement on the child fails closed from that moment —
+// and drops the child from the runtime registry (the child itself is NOT
+// destroyed; it outlives the dissolve). Already dissolved →
+// CRABS_ERR_ALREADY_PERFORMED. After a restart the dissolution flag is gone:
+// delivering the tombstone as an op on the child is a later-plan concern.
+crabs_error_e lineage_op_dissolve(state_t* state, operation_t* op);
+
+// Off-chain dissolution proof: the parent machine's ECDSA signature over the
+// canonical tombstone bytes `u8 tag (= LINEAGE_DISSOLVED) + string16
+// child_id` — a third party can verify a child's lineage was severed without
+// the manifest being persisted anywhere. Honesty gate: the manifest entry
+// must exist and currently read DISSOLVED (signing a tombstone for a
+// non-dissolved child is a lie). Unknown child →
+// CRABS_ERR_RESOURCE_NOT_FOUND; not dissolved → CRABS_ERR_UNAUTHORIZED; no
+// node key / signing failure → CRABS_ERR_CRYPTOGRAPHIC_ERROR.
+crabs_error_e lineage_sign_dissolution(state_t* parent, const char* child_id,
+                                       uint8_t signature_out[CRABS_SIG_SIZE]);
+
+// payload = child_id (raw string). Sovereign ONLY: the parent recovers its
+// genesis stake by voiding the manifest entry (WITHDRAWN) — attestations for
+// a withdrawn child stop being issued and the lineage ends without a
+// dissolution. Non-sovereign → CRABS_ERR_UNAUTHORIZED (dissolve is a
+// different op); unknown child → CRABS_ERR_RESOURCE_NOT_FOUND; already
+// withdrawn → CRABS_ERR_ALREADY_PERFORMED.
+crabs_error_e lineage_op_withdraw_genesis(state_t* state, operation_t* op);
+
+// ============================================================
 // Attestations: issue / verify / wire transport
 // ============================================================
 

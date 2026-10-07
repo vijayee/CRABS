@@ -2045,7 +2045,9 @@ static state_t* _deserialize_state_internal(const uint8_t* data, size_t len,
           if (!_read_uint64_le(&buf, &manifest_entry->spawned_at)) goto fail;
           uint8_t entry_status;
           if (!_read_uint8(&buf, &entry_status)) goto fail;
-          if (entry_status > (uint8_t)LINEAGE_WITHDRAWN) goto fail;
+          // Wire-compatible enum extension: 0..3 (ATTESTATION_REVOKED added
+          // without a format bump — the status stays a u8).
+          if (entry_status > (uint8_t)LINEAGE_ATTESTATION_REVOKED) goto fail;
           manifest_entry->status = (lineage_status_e)entry_status;
         }
       }

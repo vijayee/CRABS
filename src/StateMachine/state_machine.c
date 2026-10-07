@@ -661,6 +661,13 @@ static crabs_error_e _verify_parent_endorsements(
     return CRABS_ERR_UNAUTHORIZED;
   }
 
+  // Dissolution severs the parent's endorsement authority INSTANTLY — every
+  // @parent/ endorsement fails closed even with a valid, unexpired
+  // attestation (lineage_op_dissolve sets this flag on the resident child).
+  if (state->lineage_parent_dissolved) {
+    return CRABS_ERR_UNAUTHORIZED;
+  }
+
   uint64_t now_ms;
   if (!state_get_time_ms(state, &now_ms)) {
     return CRABS_ERR_CRYPTOGRAPHIC_ERROR;

@@ -44,7 +44,9 @@ typedef struct {
 // ============================================================
 // Operation (§7.1 + v1.3 §4.2)
 // ============================================================
-typedef struct {
+// Tagged so lineage.h can forward-declare the name for its op handlers
+// (those declarations land before this header's own definition of the type).
+typedef struct crabs_operation {
   char     type[CRABS_MAX_OP_NAME];
   uint8_t  uuid[CRABS_UUID_SIZE];
   uint8_t* payload;

@@ -319,10 +319,19 @@ typedef enum {
   LINEAGE_SOVEREIGN      = 0x03
 } lineage_trust_mode_e;
 
+// Child lifecycle status (wire: u8; the v11 reader accepts 0..3).
+//   ACTIVE    — the parent issues attestations and may dissolve/withdraw.
+//   DISSOLVED — the parent severed the lineage (shared-root / delegated).
+//   WITHDRAWN — the parent withdrew its genesis stake (sovereign only).
+//   ATTESTATION_REVOKED — the parent stopped ISSUING attestations for the
+//                    child without dissolving it: existing attestations run
+//                    out their TTL, and dissolution remains available
+//                    (issuing a new one fails closed).
 typedef enum {
-  LINEAGE_ACTIVE    = 0x00,
-  LINEAGE_DISSOLVED = 0x01,
-  LINEAGE_WITHDRAWN = 0x02
+  LINEAGE_ACTIVE             = 0x00,
+  LINEAGE_DISSOLVED          = 0x01,
+  LINEAGE_WITHDRAWN          = 0x02,
+  LINEAGE_ATTESTATION_REVOKED = 0x03
 } lineage_status_e;
 
 // One entry of the parent's serialized child manifest.
@@ -418,6 +427,24 @@ typedef struct state_t {
   // together with the parent binding above; persists in the same v11
   // parent-binding block.
   char    lineage_self_id[CRABS_MAX_USER_ID];
+  // v1.7 (runtime ONLY, never serialized): set on a spawned child when its
+  // parent executes __dissolve_machine__ while the child is resident in the
+  // same process — every @parent/ endorsement fails closed from that moment.
+  // After a restart the flag is gone; delivering the parent's dissolution
+  // tombstone as an op on the child is a later-plan concern.
+  bool    lineage_parent_dissolved;
+  // v1.7 (runtime ONLY, never serialized): registry of children spawned and
+  // still resident in this process, so __dissolve_machine__ can reach the
+  // child's state directly. UNOWNED POINTERS — each entry is a child some
+  // caller built via lineage_spawn_machine and owns (destroys) itself; the
+  // state only frees the POINTER ARRAY. Slots are INDEX-ALIGNED with the
+  // manifest above (both arrays only append at the tail); dissolve NULLs its
+  // slot (the child may outlive the dissolve). Destroying a child
+  // out-of-band without a dissolve leaves a dangling entry — lineage
+  // lookups resolve child_id through the manifest and never dereference a
+  // slot that does not match.
+  attribute_machine_t** resident_children;
+  uint32_t              resident_child_count;
   // v1.5.2 §4: Compaction config (crabs_tombstone_config_t*). Externally owned
   // — the caller must free it after state_destroy.
   void* compaction_config;

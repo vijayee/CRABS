@@ -936,6 +936,63 @@ crabs_error_e lineage_blueprint_validate(const machine_blueprint_t* blueprint) {
 // Spawn: the three trust modes
 // ============================================================
 
+// Runtime resident-child registry (state_t fields, UNOWNED views). Slots are
+// index-ALIGNED with the manifest (both arrays only ever append at the tail
+// and dissolve merely NULLs the slot), so a lookup resolves child_id through
+// the manifest entry — the only owned data — and never dereferences a
+// pointer slot that could dangle (a child destroyed by its owner out-of-band
+// without a dissolve).
+static child_manifest_entry_t* _lineage_find_manifest_entry(
+    state_t* parent, const char* child_id) {
+  for (uint32_t child_index = 0; child_index < parent->child_count;
+       child_index++) {
+    if (strcmp(parent->children[child_index].child_id, child_id) == 0) {
+      return &parent->children[child_index];
+    }
+  }
+  return NULL;
+}
+
+static attribute_machine_t* _lineage_find_resident_child(
+    state_t* parent, const char* child_id) {
+  for (uint32_t child_index = 0; child_index < parent->child_count;
+       child_index++) {
+    if (strcmp(parent->children[child_index].child_id, child_id) == 0 &&
+        child_index < parent->resident_child_count) {
+      return parent->resident_children[child_index];
+    }
+  }
+  return NULL;
+}
+
+static void _lineage_drop_resident_child(state_t* parent,
+                                         const char* child_id) {
+  for (uint32_t child_index = 0;
+       child_index < parent->child_count &&
+       child_index < parent->resident_child_count;
+       child_index++) {
+    if (strcmp(parent->children[child_index].child_id, child_id) == 0) {
+      parent->resident_children[child_index] = NULL;
+      return;
+    }
+  }
+}
+
+// Spawn appends both arrays at the tail in the same order — manifest entry
+// at child_count, registry slot at resident_child_count — keeping the index
+// alignment the lookups above rely on.
+static crabs_error_e _lineage_register_resident_child(
+    state_t* parent, attribute_machine_t* child) {
+  attribute_machine_t** grown = realloc(
+      parent->resident_children,
+      (size_t)(parent->resident_child_count + 1) * sizeof(attribute_machine_t*));
+  if (grown == NULL) return CRABS_ERR_OOM;
+  parent->resident_children = grown;
+  parent->resident_children[parent->resident_child_count] = child;
+  parent->resident_child_count += 1;
+  return CRABS_SUCCESS;
+}
+
 // Apply the blueprint's items, policies, and op type definitions to the
 // freshly built child state. Validation ran BEFORE any child allocation, so
 // the only realistic failure here is a registry cap: the state's op type
@@ -1092,6 +1149,13 @@ crabs_error_e lineage_spawn_machine(state_t* parent,
                                    genesis_signature);
       }
       if (status == CRABS_SUCCESS) {
+        // Runtime resident-child registry FIRST (fail-safe): a registry
+        // failure here leaves the manifest unwritten and the child destroyed
+        // below — no residue. UNOWNED pointer: the registry holds nothing
+        // the caller does not own (see state_t.resident_children).
+        status = _lineage_register_resident_child(parent, child);
+      }
+      if (status == CRABS_SUCCESS) {
         // Manifest append LAST — every earlier failure destroyed the child
         // and left the parent untouched (no partial residue).
         child_manifest_entry_t* grown = realloc(
@@ -1099,6 +1163,10 @@ crabs_error_e lineage_spawn_machine(state_t* parent,
             (size_t)(parent->child_count + 1) * sizeof(child_manifest_entry_t));
         if (grown == NULL) {
           status = CRABS_ERR_OOM;
+          // Roll back the registry slot appended just above — the child is
+          // destroyed below and no residue may survive either array.
+          parent->resident_child_count -= 1;
+          parent->resident_children[parent->resident_child_count] = NULL;
         } else {
           parent->children = grown;
           child_manifest_entry_t* manifest_entry =
@@ -1122,7 +1190,7 @@ crabs_error_e lineage_spawn_machine(state_t* parent,
           parent->child_count += 1;
 
           state_notify_change(parent, CRABS_CHANGE_SPAWN,
-                              "__spawn_machine__", NULL, NULL, NULL,
+                              CRABS_LINEAGE_OP_SPAWN, NULL, NULL, NULL,
                               blueprint->child_id, "machine spawned", CRABS_SUCCESS);
           *child_out = child;
         }
@@ -1134,4 +1202,206 @@ crabs_error_e lineage_spawn_machine(state_t* parent,
     attribute_machine_destroy(child);
   }
   return status;
+}
+
+// ============================================================
+// Lineage ops: spawn / revoke attestation / dissolve / withdraw
+// ============================================================
+
+// Handlers run POST-authorization (dispatched by state_machine_execute after
+// the op's signature + policy check passed) — they re-verify nothing about
+// the caller. The parent manifest / trust-mode refusals use
+// CRABS_ERR_UNAUTHORIZED and CRABS_ERR_ALREADY_PERFORMED: crabs.h has no
+// dedicated NOT_PERMITTED enumerator (see lineage.h).
+
+// Revoke / dissolve / withdraw carry the same payload shape: the raw
+// child_id string (NUL-terminated, safe id charset). A payload that cannot
+// be a safe id is structural garbage → CRABS_ERR_INVALID_PARAM.
+static crabs_error_e _lineage_child_id_from_payload(const operation_t* op,
+                                                    char* child_id_out,
+                                                    size_t out_capacity) {
+  if (op == NULL || op->payload == NULL ||
+      out_capacity > CRABS_MAX_USER_ID) {
+    return CRABS_ERR_INVALID_PARAM;
+  }
+  // payload_size < out_capacity so the copy leaves room for the NUL.
+  if (op->payload_size == 0 || op->payload_size >= out_capacity) {
+    return CRABS_ERR_INVALID_PARAM;
+  }
+  if (memchr(op->payload, '\0', op->payload_size) != NULL) {
+    return CRABS_ERR_INVALID_PARAM;
+  }
+  memcpy(child_id_out, op->payload, op->payload_size);
+  child_id_out[op->payload_size] = '\0';
+  if (!attribute_machine_is_safe_user_id(child_id_out)) {
+    return CRABS_ERR_INVALID_PARAM;
+  }
+  return CRABS_SUCCESS;
+}
+
+crabs_error_e lineage_op_spawn(state_t* state, operation_t* op) {
+  if (state == NULL || op == NULL || op->payload == NULL ||
+      op->payload_size == 0) {
+    return CRABS_ERR_INVALID_PARAM;
+  }
+  // Malformed wire image or hash mismatch → the blueprint never parsed.
+  machine_blueprint_t* blueprint =
+      blueprint_deserialize(op->payload, op->payload_size);
+  if (blueprint == NULL) return CRABS_ERR_INVALID_PARAM;
+  attribute_machine_t* child = NULL;
+  crabs_error_e status = lineage_spawn_machine(state, blueprint, &child);
+  machine_blueprint_destroy(blueprint);
+  // Ownership note: the caller of the OP pipeline never sees `child` — spawn
+  // registered it in the runtime resident-children registry so a later
+  // dissolve can reach it (and protocol code may hold the pointer itself).
+  return status;
+}
+
+crabs_error_e lineage_op_revoke_attestation(state_t* state, operation_t* op) {
+  char child_id[CRABS_MAX_USER_ID];
+  crabs_error_e status = _lineage_child_id_from_payload(
+      op, child_id, sizeof(child_id));
+  if (status != CRABS_SUCCESS) return status;
+  if (state == NULL) return CRABS_ERR_INVALID_PARAM;
+
+  child_manifest_entry_t* manifest_entry =
+      _lineage_find_manifest_entry(state, child_id);
+  if (manifest_entry == NULL) return CRABS_ERR_RESOURCE_NOT_FOUND;
+  if (manifest_entry->status == LINEAGE_ATTESTATION_REVOKED) {
+    return CRABS_ERR_ALREADY_PERFORMED;
+  }
+  // Only an ACTIVE child has live attestations to stop issuing.
+  if (manifest_entry->status != LINEAGE_ACTIVE) {
+    return CRABS_ERR_UNAUTHORIZED;
+  }
+  manifest_entry->status = LINEAGE_ATTESTATION_REVOKED;
+  return CRABS_SUCCESS;
+}
+
+crabs_error_e lineage_op_dissolve(state_t* state, operation_t* op) {
+  char child_id[CRABS_MAX_USER_ID];
+  crabs_error_e status = _lineage_child_id_from_payload(
+      op, child_id, sizeof(child_id));
+  if (status != CRABS_SUCCESS) return status;
+  if (state == NULL) return CRABS_ERR_INVALID_PARAM;
+
+  child_manifest_entry_t* manifest_entry =
+      _lineage_find_manifest_entry(state, child_id);
+  if (manifest_entry == NULL) return CRABS_ERR_RESOURCE_NOT_FOUND;
+  if (manifest_entry->status == LINEAGE_DISSOLVED) {
+    return CRABS_ERR_ALREADY_PERFORMED;
+  }
+  // Sovereign children cannot be dissolved — the parent may only withdraw
+  // its genesis stake. Any non-ACTIVE entry is past its lifecycle too.
+  if (manifest_entry->mode == LINEAGE_SOVEREIGN ||
+      manifest_entry->status != LINEAGE_ACTIVE) {
+    return CRABS_ERR_UNAUTHORIZED;
+  }
+  manifest_entry->status = LINEAGE_DISSOLVED;
+
+  // In-process severance: the resident child (if any) loses every @parent/
+  // endorsement IMMEDIATELY — its auth pipeline fails closed on
+  // lineage_parent_dissolved — and it leaves the registry (the child itself
+  // is NOT destroyed; it outlives the dissolution).
+  attribute_machine_t* resident = _lineage_find_resident_child(state, child_id);
+  if (resident != NULL) {
+    resident->base_state.lineage_parent_dissolved = true;
+  }
+  _lineage_drop_resident_child(state, child_id);
+  return CRABS_SUCCESS;
+}
+
+crabs_error_e lineage_op_withdraw_genesis(state_t* state, operation_t* op) {
+  char child_id[CRABS_MAX_USER_ID];
+  crabs_error_e status = _lineage_child_id_from_payload(
+      op, child_id, sizeof(child_id));
+  if (status != CRABS_SUCCESS) return status;
+  if (state == NULL) return CRABS_ERR_INVALID_PARAM;
+
+  child_manifest_entry_t* manifest_entry =
+      _lineage_find_manifest_entry(state, child_id);
+  if (manifest_entry == NULL) return CRABS_ERR_RESOURCE_NOT_FOUND;
+  // Sovereign ONLY: the genesis stake recoverable by withdrawal exists only
+  // where the child self-mints (LINEAGE_SOVEREIGN). Non-sovereign children
+  // end through lineage_op_dissolve instead.
+  if (manifest_entry->mode != LINEAGE_SOVEREIGN) {
+    return CRABS_ERR_UNAUTHORIZED;
+  }
+  if (manifest_entry->status == LINEAGE_WITHDRAWN) {
+    return CRABS_ERR_ALREADY_PERFORMED;
+  }
+  if (manifest_entry->status != LINEAGE_ACTIVE) {
+    return CRABS_ERR_UNAUTHORIZED;
+  }
+  manifest_entry->status = LINEAGE_WITHDRAWN;
+  return CRABS_SUCCESS;
+}
+
+// Off-chain dissolution proof: ECDSA over the canonical tombstone
+// `u8 tag (= LINEAGE_DISSOLVED) + string16 child_id`. Verifiable by any
+// third party holding the parent's node public key — no manifest needed.
+// Worst case 1 + 2 + CRABS_MAX_USER_ID = 67 bytes.
+void lineage_install(state_t* state) {
+  if (state == NULL) return;
+  dedup_spec_t no_dedup;
+  memset(&no_dedup, 0, sizeof(no_dedup));
+  no_dedup.type = DEDUP_NONE;
+
+  // Idempotent by construction: every registration path updates in place
+  // when the name already exists (state_register_op_type_def /
+  // state_add_policy / state_machine_register_handler all do). Return values
+  // are deliberately ignored — registration only fails at the registry caps
+  // (CRABS_MAX_OP_HANDLERS / CRABS_MAX_OP_TYPE_DEFS), where a silently
+  // missing lineage handler simply makes the op unauthorized, and a
+  // protocol wanting hard guarantees registers the pieces itself.
+  state_register_op_type_def(state, CRABS_LINEAGE_OP_SPAWN, &no_dedup);
+  state_register_op_type_def(state, CRABS_LINEAGE_OP_REVOKE_ATTESTATION,
+                             &no_dedup);
+  state_register_op_type_def(state, CRABS_LINEAGE_OP_DISSOLVE, &no_dedup);
+  state_register_op_type_def(state, CRABS_LINEAGE_OP_WITHDRAW_GENESIS,
+                             &no_dedup);
+  state_add_policy(state, CRABS_LINEAGE_OP_SPAWN, "role:admin");
+  state_add_policy(state, CRABS_LINEAGE_OP_REVOKE_ATTESTATION, "role:admin");
+  state_add_policy(state, CRABS_LINEAGE_OP_DISSOLVE, "role:admin");
+  state_add_policy(state, CRABS_LINEAGE_OP_WITHDRAW_GENESIS, "role:admin");
+  state_machine_register_handler(state, CRABS_LINEAGE_OP_SPAWN,
+                                 lineage_op_spawn);
+  state_machine_register_handler(state, CRABS_LINEAGE_OP_REVOKE_ATTESTATION,
+                                 lineage_op_revoke_attestation);
+  state_machine_register_handler(state, CRABS_LINEAGE_OP_DISSOLVE,
+                                 lineage_op_dissolve);
+  state_machine_register_handler(state, CRABS_LINEAGE_OP_WITHDRAW_GENESIS,
+                                 lineage_op_withdraw_genesis);
+}
+
+crabs_error_e lineage_sign_dissolution(state_t* parent, const char* child_id,
+                                       uint8_t signature_out[CRABS_SIG_SIZE]) {
+  if (parent == NULL || child_id == NULL || signature_out == NULL) {
+    return CRABS_ERR_INVALID_PARAM;
+  }
+  if (!attribute_machine_is_safe_user_id(child_id)) {
+    return CRABS_ERR_INVALID_PARAM;
+  }
+  const child_manifest_entry_t* manifest_entry =
+      _lineage_find_manifest_entry(parent, child_id);
+  if (manifest_entry == NULL) return CRABS_ERR_RESOURCE_NOT_FOUND;
+  // Honesty gate: a tombstone proves a dissolution — never sign one for a
+  // child that is not dissolved.
+  if (manifest_entry->status != LINEAGE_DISSOLVED) {
+    return CRABS_ERR_UNAUTHORIZED;
+  }
+  if (!parent->node_key_valid) return CRABS_ERR_CRYPTOGRAPHIC_ERROR;
+
+  uint8_t tombstone[1 + 2 + CRABS_MAX_USER_ID];
+  size_t offset = 0;
+  tombstone[offset++] = (uint8_t)LINEAGE_DISSOLVED;
+  if (!_lineage_string16_write(tombstone, sizeof(tombstone), &offset,
+                               child_id, strlen(child_id) + 1)) {
+    return CRABS_ERR_INVALID_PARAM;
+  }
+  if (crypto_ecdsa_sign(parent->node_private_key, tombstone, offset,
+                        signature_out) != CRABS_SUCCESS) {
+    return CRABS_ERR_CRYPTOGRAPHIC_ERROR;
+  }
+  return CRABS_SUCCESS;
 }

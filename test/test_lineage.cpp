@@ -7,6 +7,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <openssl/sha.h>
 
 extern "C" {
 #include "../src/Lineage/lineage.h"
@@ -1258,6 +1259,407 @@ TEST(TestLineage, SpawnRejectsInvalidBlueprint) {
   EXPECT_EQ(child, nullptr);
   EXPECT_EQ(keyless->base_state.child_count, 0u);
   attribute_machine_destroy(keyless);
+
+  machine_blueprint_destroy(blueprint);
+  spawn_parent_destroy(&harness);
+}
+
+// ============================================================
+// Lineage status wire: enum extension stays v11-compatible
+// ============================================================
+
+// Direct-field fixture (same shape as test_serialization.cpp's
+// append_manifest_entry): the children array is owned by the state.
+static void append_manifest_entry_fixture(state_t* state, const char* child_id,
+                                          lineage_trust_mode_e mode,
+                                          lineage_status_e status) {
+  child_manifest_entry_t* grown = (child_manifest_entry_t*)realloc(
+      state->children,
+      (state->child_count + 1) * sizeof(child_manifest_entry_t));
+  ASSERT_NE(grown, nullptr);
+  state->children = grown;
+  child_manifest_entry_t* entry = &state->children[state->child_count];
+  memset(entry, 0, sizeof(*entry));
+  strncpy(entry->child_id, child_id, CRABS_MAX_USER_ID - 1);
+  entry->mode = mode;
+  entry->status = status;
+  entry->attestation_ttl_ms = 60000;
+  entry->spawned_at = 1700000000000;
+  state->child_count++;
+}
+
+TEST(TestLineage, ManifestStatusExtensionRoundTrips) {
+  // ATTESTATION_REVOKED was added to the u8 status wire WITHOUT a format
+  // bump — every status round trips through the v11 reader.
+  state_t* state = state_create();
+  ASSERT_NE(state, nullptr);
+  append_manifest_entry_fixture(state, "child-a", LINEAGE_SHARED_ROOT,
+                                LINEAGE_ACTIVE);
+  append_manifest_entry_fixture(state, "child-b", LINEAGE_DELEGATED_COPY,
+                                LINEAGE_DISSOLVED);
+  append_manifest_entry_fixture(state, "child-c", LINEAGE_DELEGATED_COPY,
+                                LINEAGE_ATTESTATION_REVOKED);
+  append_manifest_entry_fixture(state, "child-d", LINEAGE_SOVEREIGN,
+                                LINEAGE_WITHDRAWN);
+
+  serialized_buffer_t* buf = crabs_serialize_state(state);
+  ASSERT_NE(buf, nullptr);
+  state_t* restored = crabs_deserialize_state(buf->data, buf->len);
+  ASSERT_NE(restored, nullptr);
+  ASSERT_EQ(restored->child_count, 4u);
+  EXPECT_EQ(restored->children[0].status, LINEAGE_ACTIVE);
+  EXPECT_EQ(restored->children[1].status, LINEAGE_DISSOLVED);
+  EXPECT_EQ(restored->children[2].status, LINEAGE_ATTESTATION_REVOKED);
+  EXPECT_EQ(restored->children[3].status, LINEAGE_WITHDRAWN);
+  EXPECT_FALSE(restored->lineage_parent_dissolved);
+  EXPECT_EQ(restored->resident_children, nullptr);
+
+  serialized_buffer_destroy(buf);
+  state_destroy(state);
+  state_destroy(restored);
+}
+
+TEST(TestLineage, ManifestStatusOutOfRangeRejected) {
+  state_t* state = state_create();
+  ASSERT_NE(state, nullptr);
+  append_manifest_entry_fixture(state, "child-red", LINEAGE_SHARED_ROOT,
+                                LINEAGE_ACTIVE);
+  serialized_buffer_t* buf = crabs_serialize_state(state);
+  ASSERT_NE(buf, nullptr);
+  state_destroy(state);
+
+  // Status sits at needle + 125 in the v11 entry image (11-byte id needle;
+  // mode at +11, 32B hash, 64B sig, ttl, spawned_at, status).
+  const uint8_t needle[11] = {0x09, 0x00, 'c', 'h', 'i', 'l', 'd', '-', 'r', 'e', 'd'};
+  bool found = false;
+  for (size_t index = 0; index + 11 <= buf->len - CRABS_HASH_SIZE; index++) {
+    if (memcmp(buf->data + index, needle, 11) == 0) {
+      buf->data[index + 125] = 0x7F;
+      found = true;
+      break;
+    }
+  }
+  ASSERT_TRUE(found);
+  uint8_t recomputed_hash[CRABS_HASH_SIZE];
+  SHA256(buf->data, buf->len - CRABS_HASH_SIZE, recomputed_hash);
+  memcpy(buf->data + buf->len - CRABS_HASH_SIZE, recomputed_hash,
+         CRABS_HASH_SIZE);
+  EXPECT_EQ(crabs_deserialize_state(buf->data, buf->len), nullptr);
+
+  serialized_buffer_destroy(buf);
+}
+
+// ============================================================
+// Lineage ops: spawn / revoke / dissolve / withdraw via the pipeline
+// ============================================================
+
+// Sign a lineage op carrying a raw payload (blueprint wire image or child_id
+// string). The payload is owned by the op (operation_destroy frees it).
+static operation_t* make_signed_lineage_op(attribute_machine_t* registry,
+                                           ecdsa_keypair_t* signer_key,
+                                           const char* signer_id,
+                                           const char* op_type,
+                                           const void* payload,
+                                           size_t payload_size) {
+  operation_t* op = operation_create(op_type);
+  EXPECT_NE(op, nullptr);
+  if (op == NULL) return NULL;
+  op->payload = (uint8_t*)malloc(payload_size);
+  EXPECT_NE(op->payload, nullptr);
+  if (op->payload == NULL) {
+    operation_destroy(op);
+    return NULL;
+  }
+  memcpy(op->payload, payload, payload_size);
+  op->payload_size = (uint32_t)payload_size;
+  strncpy(op->signer_id, signer_id, CRABS_MAX_USER_ID - 1);
+  crabs_test_sign_op_with(registry, signer_key, op);
+  return op;
+}
+
+TEST(TestLineage, SpawnViaOp) {
+  spawn_parent_harness_t harness;
+  spawn_parent_setup(&harness);
+  state_t* parent = &harness.am->base_state;
+  ASSERT_EQ(attribute_machine_grant_role(harness.am, "alice", "role", "admin",
+                                         "parent-root"), CRABS_SUCCESS);
+
+  // Idempotent installer: a second call registers nothing new.
+  lineage_install(parent);
+  EXPECT_EQ(parent->op_handler_count, 4u);
+  lineage_install(parent);
+  EXPECT_EQ(parent->op_handler_count, 4u);
+  EXPECT_EQ(parent->op_type_def_count, 4u);
+  EXPECT_NE(state_find_policy(parent, CRABS_LINEAGE_OP_SPAWN), nullptr);
+
+  machine_blueprint_t* blueprint = make_valid_blueprint();
+  ASSERT_NE(blueprint, nullptr);
+  uint8_t wire[CRABS_BLUEPRINT_WIRE_MAX];
+  size_t wire_len = blueprint_serialize(blueprint, wire, sizeof(wire));
+  ASSERT_GT(wire_len, 0u);
+
+  operation_t* op = make_signed_lineage_op(harness.am, harness.alice_key,
+                                           "alice", CRABS_LINEAGE_OP_SPAWN,
+                                           wire, wire_len);
+  ASSERT_NE(op, nullptr);
+  EXPECT_EQ(state_machine_execute(parent, op), CRABS_SUCCESS);
+
+  // The child exists: manifest entry + runtime resident registry.
+  ASSERT_EQ(parent->child_count, 1u);
+  EXPECT_STREQ(parent->children[0].child_id, "child-red");
+  EXPECT_EQ(parent->children[0].status, LINEAGE_ACTIVE);
+  ASSERT_EQ(parent->resident_child_count, 1u);
+  EXPECT_NE(parent->resident_children[0], nullptr);
+  EXPECT_STREQ(parent->resident_children[0]->base_state.lineage_self_id,
+               "child-red");
+
+  operation_destroy(op);
+
+  // Without role:admin the same blueprint is denied at authorization.
+  spawn_parent_harness_t outsider;
+  memset(&outsider, 0, sizeof(outsider));
+  outsider.parent_key = crypto_ecdsa_generate();
+  ASSERT_NE(outsider.parent_key, nullptr);
+  outsider.am = attribute_machine_create("parent-root-2",
+                                         outsider.parent_key->public_key);
+  ASSERT_NE(outsider.am, nullptr);
+  outsider.am->base_state.attr_machine = outsider.am;
+  ASSERT_EQ(state_set_node_key(&outsider.am->base_state,
+                               outsider.parent_key->private_key,
+                               outsider.parent_key->public_key),
+            CRABS_SUCCESS);
+  outsider.alice_key = crypto_ecdsa_generate();
+  ASSERT_NE(outsider.alice_key, nullptr);
+  ASSERT_EQ(attribute_machine_register_user(outsider.am, "alice",
+                                            outsider.alice_key->public_key, ""),
+            CRABS_SUCCESS);
+  lineage_install(&outsider.am->base_state);
+  machine_blueprint_t* blueprint2 = make_valid_blueprint();
+  ASSERT_NE(blueprint2, nullptr);
+  uint8_t wire2[CRABS_BLUEPRINT_WIRE_MAX];
+  size_t wire2_len = blueprint_serialize(blueprint2, wire2, sizeof(wire2));
+  ASSERT_GT(wire2_len, 0u);
+  operation_t* denied = make_signed_lineage_op(
+      outsider.am, outsider.alice_key, "alice", CRABS_LINEAGE_OP_SPAWN,
+      wire2, wire2_len);
+  ASSERT_NE(denied, nullptr);
+  EXPECT_EQ(state_machine_execute(&outsider.am->base_state, denied),
+            CRABS_ERR_UNAUTHORIZED);
+  EXPECT_EQ(outsider.am->base_state.child_count, 0u);
+
+  operation_destroy(denied);
+  machine_blueprint_destroy(blueprint2);
+  crypto_ecdsa_keypair_destroy(outsider.parent_key);
+  crypto_ecdsa_keypair_destroy(outsider.alice_key);
+  attribute_machine_destroy(outsider.am);
+  machine_blueprint_destroy(blueprint);
+  spawn_parent_destroy(&harness);
+}
+
+TEST(TestLineage, RevokeAttestationViaOp) {
+  spawn_parent_harness_t harness;
+  spawn_parent_setup(&harness);
+  state_t* parent = &harness.am->base_state;
+  ASSERT_EQ(attribute_machine_grant_role(harness.am, "alice", "role", "admin",
+                                         "parent-root"), CRABS_SUCCESS);
+  lineage_install(parent);
+
+  machine_blueprint_t* blueprint = make_valid_blueprint();
+  ASSERT_NE(blueprint, nullptr);
+  attribute_machine_t* child = nullptr;
+  ASSERT_EQ(lineage_spawn_machine(parent, blueprint, &child), CRABS_SUCCESS);
+  attribute_machine_destroy(child);
+
+  // Revoke the child's attestation authority via the op.
+  operation_t* revoke = make_signed_lineage_op(
+      harness.am, harness.alice_key, "alice",
+      CRABS_LINEAGE_OP_REVOKE_ATTESTATION, "child-red", strlen("child-red"));
+  ASSERT_NE(revoke, nullptr);
+  EXPECT_EQ(state_machine_execute(parent, revoke), CRABS_SUCCESS);
+  EXPECT_EQ(parent->children[0].status, LINEAGE_ATTESTATION_REVOKED);
+  operation_destroy(revoke);
+
+  // Revoking twice is idempotent-rejected, not a re-write.
+  operation_t* again = make_signed_lineage_op(
+      harness.am, harness.alice_key, "alice",
+      CRABS_LINEAGE_OP_REVOKE_ATTESTATION, "child-red", strlen("child-red"));
+  ASSERT_NE(again, nullptr);
+  EXPECT_EQ(state_machine_execute(parent, again),
+            CRABS_ERR_ALREADY_PERFORMED);
+  operation_destroy(again);
+
+  // Unknown child.
+  operation_t* unknown = make_signed_lineage_op(
+      harness.am, harness.alice_key, "alice",
+      CRABS_LINEAGE_OP_REVOKE_ATTESTATION, "child-ghost",
+      strlen("child-ghost"));
+  ASSERT_NE(unknown, nullptr);
+  EXPECT_EQ(state_machine_execute(parent, unknown),
+            CRABS_ERR_RESOURCE_NOT_FOUND);
+  operation_destroy(unknown);
+
+  machine_blueprint_destroy(blueprint);
+  spawn_parent_destroy(&harness);
+}
+
+TEST(TestLineage, DissolveViaOpSeversResidentChildImmediately) {
+  spawn_parent_harness_t harness;
+  spawn_parent_setup(&harness);
+  state_t* parent = &harness.am->base_state;
+  ASSERT_EQ(attribute_machine_grant_role(harness.am, "alice", "role", "admin",
+                                         "parent-root"), CRABS_SUCCESS);
+  lineage_install(parent);
+
+  machine_blueprint_t* blueprint = make_valid_blueprint();
+  ASSERT_NE(blueprint, nullptr);
+  attribute_machine_t* child = nullptr;
+  ASSERT_EQ(lineage_spawn_machine(parent, blueprint, &child), CRABS_SUCCESS);
+  ASSERT_NE(child, nullptr);
+  EXPECT_FALSE(child->base_state.lineage_parent_dissolved);
+
+  operation_t* dissolve = make_signed_lineage_op(
+      harness.am, harness.alice_key, "alice", CRABS_LINEAGE_OP_DISSOLVE,
+      "child-red", strlen("child-red"));
+  ASSERT_NE(dissolve, nullptr);
+  EXPECT_EQ(state_machine_execute(parent, dissolve), CRABS_SUCCESS);
+  operation_destroy(dissolve);
+
+  // Manifest DISSOLVED; the resident child is severed INSTANTLY (its
+  // endorsement gate fails closed) and dropped from the registry (the
+  // pointer array keeps its size — the slot is NULL, the child object
+  // outlives the dissolve under its owner's control).
+  ASSERT_EQ(parent->child_count, 1u);
+  EXPECT_EQ(parent->children[0].status, LINEAGE_DISSOLVED);
+  EXPECT_TRUE(child->base_state.lineage_parent_dissolved);
+  ASSERT_EQ(parent->resident_child_count, 1u);
+  EXPECT_EQ(parent->resident_children[0], nullptr);
+
+  // Already dissolved.
+  operation_t* again = make_signed_lineage_op(
+      harness.am, harness.alice_key, "alice", CRABS_LINEAGE_OP_DISSOLVE,
+      "child-red", strlen("child-red"));
+  ASSERT_NE(again, nullptr);
+  EXPECT_EQ(state_machine_execute(parent, again),
+            CRABS_ERR_ALREADY_PERFORMED);
+  operation_destroy(again);
+
+  machine_blueprint_destroy(blueprint);
+  spawn_parent_destroy(&harness);
+}
+
+TEST(TestLineage, SovereignDissolveRefusedWithdrawSovereignOnly) {
+  spawn_parent_harness_t harness;
+  spawn_parent_setup(&harness);
+  state_t* parent = &harness.am->base_state;
+  ASSERT_EQ(attribute_machine_grant_role(harness.am, "alice", "role", "admin",
+                                         "parent-root"), CRABS_SUCCESS);
+  lineage_install(parent);
+
+  // Sovereign child.
+  machine_blueprint_t* sovereign = make_fresh_authority_blueprint(
+      "child-sov", LINEAGE_SOVEREIGN);
+  ASSERT_NE(sovereign, nullptr);
+  attribute_machine_t* child = nullptr;
+  ASSERT_EQ(lineage_spawn_machine(parent, sovereign, &child), CRABS_SUCCESS);
+
+  // Dissolve is refused for sovereigns; the status stays ACTIVE.
+  operation_t* dissolve = make_signed_lineage_op(
+      harness.am, harness.alice_key, "alice", CRABS_LINEAGE_OP_DISSOLVE,
+      "child-sov", strlen("child-sov"));
+  ASSERT_NE(dissolve, nullptr);
+  EXPECT_EQ(state_machine_execute(parent, dissolve),
+            CRABS_ERR_UNAUTHORIZED);
+  operation_destroy(dissolve);
+  EXPECT_EQ(parent->children[0].status, LINEAGE_ACTIVE);
+
+  // Withdraw belongs to sovereigns: it succeeds here.
+  operation_t* withdraw = make_signed_lineage_op(
+      harness.am, harness.alice_key, "alice",
+      CRABS_LINEAGE_OP_WITHDRAW_GENESIS, "child-sov", strlen("child-sov"));
+  ASSERT_NE(withdraw, nullptr);
+  EXPECT_EQ(state_machine_execute(parent, withdraw), CRABS_SUCCESS);
+  operation_destroy(withdraw);
+  EXPECT_EQ(parent->children[0].status, LINEAGE_WITHDRAWN);
+
+  // ...but a second withdraw is already-performed.
+  operation_t* again = make_signed_lineage_op(
+      harness.am, harness.alice_key, "alice",
+      CRABS_LINEAGE_OP_WITHDRAW_GENESIS, "child-sov", strlen("child-sov"));
+  ASSERT_NE(again, nullptr);
+  EXPECT_EQ(state_machine_execute(parent, again),
+            CRABS_ERR_ALREADY_PERFORMED);
+  operation_destroy(again);
+
+  // A non-sovereign child cannot be withdrawn — dissolve is a different op.
+  machine_blueprint_t* shared = make_valid_blueprint();
+  ASSERT_NE(shared, nullptr);
+  strncpy(shared->child_id, "child-shared", sizeof(shared->child_id) - 1);
+  attribute_machine_t* shared_child = nullptr;
+  ASSERT_EQ(lineage_spawn_machine(parent, shared, &shared_child),
+            CRABS_SUCCESS);
+  operation_t* withdraw_shared = make_signed_lineage_op(
+      harness.am, harness.alice_key, "alice",
+      CRABS_LINEAGE_OP_WITHDRAW_GENESIS, "child-shared",
+      strlen("child-shared"));
+  ASSERT_NE(withdraw_shared, nullptr);
+  EXPECT_EQ(state_machine_execute(parent, withdraw_shared),
+            CRABS_ERR_UNAUTHORIZED);
+  operation_destroy(withdraw_shared);
+  EXPECT_EQ(parent->children[1].status, LINEAGE_ACTIVE);
+
+  machine_blueprint_destroy(sovereign);
+  machine_blueprint_destroy(shared);
+  attribute_machine_destroy(child);
+  attribute_machine_destroy(shared_child);
+  spawn_parent_destroy(&harness);
+}
+
+TEST(TestLineage, DissolutionTombstoneSignsOnlyAfterDissolve) {
+  spawn_parent_harness_t harness;
+  spawn_parent_setup(&harness);
+  state_t* parent = &harness.am->base_state;
+
+  machine_blueprint_t* blueprint = make_valid_blueprint();
+  ASSERT_NE(blueprint, nullptr);
+  attribute_machine_t* child = nullptr;
+  ASSERT_EQ(lineage_spawn_machine(parent, blueprint, &child), CRABS_SUCCESS);
+
+  // A child that is not dissolved cannot be signed away — the tombstone
+  // would be a lie.
+  uint8_t tombstone[CRABS_SIG_SIZE];
+  EXPECT_EQ(lineage_sign_dissolution(parent, "child-red", tombstone),
+            CRABS_ERR_UNAUTHORIZED);
+  EXPECT_EQ(lineage_sign_dissolution(parent, "child-ghost", tombstone),
+            CRABS_ERR_RESOURCE_NOT_FOUND);
+  EXPECT_EQ(lineage_sign_dissolution(parent, "a<b", tombstone),
+            CRABS_ERR_INVALID_PARAM);
+
+  // Dissolve directly through the handler (it runs post-authorization, so
+  // an unsigned op shell is enough for a direct call), then the tombstone
+  // signs and verifies against the parent's node public key over the
+  // canonical tombstone bytes `u8 tag + string16 child_id`.
+  operation_t* dissolve_op = operation_create(CRABS_LINEAGE_OP_DISSOLVE);
+  ASSERT_NE(dissolve_op, nullptr);
+  EXPECT_EQ(lineage_op_dissolve(parent, dissolve_op),
+            CRABS_ERR_INVALID_PARAM);  // no payload
+  dissolve_op->payload = (uint8_t*)"child-red";
+  dissolve_op->payload_size = (uint32_t)strlen("child-red");
+  EXPECT_EQ(lineage_op_dissolve(parent, dissolve_op), CRABS_SUCCESS);
+  EXPECT_EQ(parent->children[0].status, LINEAGE_DISSOLVED);
+  EXPECT_TRUE(child->base_state.lineage_parent_dissolved);
+  dissolve_op->payload = NULL;
+  operation_destroy(dissolve_op);
+
+  EXPECT_EQ(lineage_sign_dissolution(parent, "child-red", tombstone),
+            CRABS_SUCCESS);
+  uint8_t canonical_tombstone[1 + 2 + 9];
+  canonical_tombstone[0] = (uint8_t)LINEAGE_DISSOLVED;
+  canonical_tombstone[1] = 9;
+  canonical_tombstone[2] = 0;
+  memcpy(canonical_tombstone + 3, "child-red", 9);
+  EXPECT_TRUE(crypto_ecdsa_verify(harness.parent_key->public_key,
+                                  canonical_tombstone,
+                                  sizeof(canonical_tombstone), tombstone));
 
   machine_blueprint_destroy(blueprint);
   spawn_parent_destroy(&harness);

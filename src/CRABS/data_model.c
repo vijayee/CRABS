@@ -151,6 +151,9 @@ void state_destroy(state_t* state) {
   // Lineage child manifest: heap array owned by this state (spawn appends,
   // deserialization restores) — free it wholesale.
   if (state->children != NULL) free(state->children);
+  // Lineage resident-child registry: runtime-only UNOWNED views (each child
+  // is owned by whoever spawned/holds it) — free the pointer array only.
+  if (state->resident_children != NULL) free(state->resident_children);
   if (state->triggers != NULL) {
     for (uint32_t i = 0; i < state->trigger_count; i++) {
       if (state->triggers[i].condition_ast != NULL) {
