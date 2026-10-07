@@ -3789,3 +3789,115 @@ TEST(TestLineage, ParentKeyUpdateRejectsTamperedRecord) {
   machine_blueprint_destroy(blueprint);
   spawn_parent_destroy(&harness);
 }
+
+// ============================================================
+// Genesis provenance verification (A10-L1)
+// ============================================================
+//
+// lineage_spawn_machine signs the child's canonical unkeyed genesis
+// serialization with the parent's node key and persists the blob's SHA-256
+// (genesis_snapshot_hash) plus the signature (genesis_attestation_signature)
+// in the manifest, but NOT the blob itself. Because crypto_ecdsa_sign signs
+// SHA-256(body) directly as the 32-byte ECDSA digest, the stored hash IS the
+// digest, so lineage_verify_child_provenance can fully check the manifest:
+// the signature must verify under the parent's current node public key over
+// digest genesis_snapshot_hash.
+
+TEST(GenesisProvenance, VerifiesFreshSpawnSuccess) {
+  spawn_parent_harness_t harness;
+  spawn_parent_setup(&harness);
+  state_t* parent = &harness.am->base_state;
+
+  // Shared-root spawn.
+  machine_blueprint_t* blueprint = make_valid_blueprint();
+  ASSERT_NE(blueprint, nullptr);
+  attribute_machine_t* child = nullptr;
+  ASSERT_EQ(lineage_spawn_machine(parent, blueprint, &child), CRABS_SUCCESS);
+  ASSERT_NE(child, nullptr);
+  EXPECT_EQ(lineage_verify_child_provenance(parent, "child-red"),
+            CRABS_SUCCESS);
+
+  // Delegated spawn: provenance is digest-bound, so the fresh random
+  // authority minted here changes nothing about verifiability.
+  machine_blueprint_t* delegated_blueprint =
+      make_fresh_authority_blueprint("child-del", LINEAGE_DELEGATED_COPY);
+  ASSERT_NE(delegated_blueprint, nullptr);
+  attribute_machine_t* delegated_child = nullptr;
+  ASSERT_EQ(lineage_spawn_machine(parent, delegated_blueprint,
+                                  &delegated_child),
+            CRABS_SUCCESS);
+  ASSERT_NE(delegated_child, nullptr);
+  EXPECT_EQ(lineage_verify_child_provenance(parent, "child-del"),
+            CRABS_SUCCESS);
+
+  attribute_machine_destroy(delegated_child);
+  attribute_machine_destroy(child);
+  machine_blueprint_destroy(delegated_blueprint);
+  machine_blueprint_destroy(blueprint);
+  spawn_parent_destroy(&harness);
+}
+
+TEST(GenesisProvenance, FailsOnTamperedManifest) {
+  spawn_parent_harness_t harness;
+  spawn_parent_setup(&harness);
+  state_t* parent = &harness.am->base_state;
+  machine_blueprint_t* blueprint = make_valid_blueprint();
+  ASSERT_NE(blueprint, nullptr);
+  attribute_machine_t* child = nullptr;
+  ASSERT_EQ(lineage_spawn_machine(parent, blueprint, &child), CRABS_SUCCESS);
+  ASSERT_NE(child, nullptr);
+
+  child_manifest_entry_t* manifest_entry =
+      lineage_find_manifest_entry(parent, "child-red");
+  ASSERT_NE(manifest_entry, nullptr);
+  const uint8_t original_hash_byte = manifest_entry->genesis_snapshot_hash[0];
+  const uint8_t original_sig_byte =
+      manifest_entry->genesis_attestation_signature[CRABS_SIG_SIZE - 1];
+
+  // A corrupted stored hash no longer matches the digest the signature
+  // covers → cryptographic failure.
+  manifest_entry->genesis_snapshot_hash[0] ^= 0xFF;
+  EXPECT_EQ(lineage_verify_child_provenance(parent, "child-red"),
+            CRABS_ERR_CRYPTOGRAPHIC_ERROR);
+  manifest_entry->genesis_snapshot_hash[0] = original_hash_byte;
+  EXPECT_EQ(lineage_verify_child_provenance(parent, "child-red"),
+            CRABS_SUCCESS);
+
+  // A corrupted attestation signature fails the same way.
+  manifest_entry->genesis_attestation_signature[CRABS_SIG_SIZE - 1] ^= 0xFF;
+  EXPECT_EQ(lineage_verify_child_provenance(parent, "child-red"),
+            CRABS_ERR_CRYPTOGRAPHIC_ERROR);
+  manifest_entry->genesis_attestation_signature[CRABS_SIG_SIZE - 1] =
+      original_sig_byte;
+  EXPECT_EQ(lineage_verify_child_provenance(parent, "child-red"),
+            CRABS_SUCCESS);
+
+  attribute_machine_destroy(child);
+  machine_blueprint_destroy(blueprint);
+  spawn_parent_destroy(&harness);
+}
+
+TEST(GenesisProvenance, UnknownChildNotFound) {
+  spawn_parent_harness_t harness;
+  spawn_parent_setup(&harness);
+  state_t* parent = &harness.am->base_state;
+  machine_blueprint_t* blueprint = make_valid_blueprint();
+  ASSERT_NE(blueprint, nullptr);
+  attribute_machine_t* child = nullptr;
+  ASSERT_EQ(lineage_spawn_machine(parent, blueprint, &child), CRABS_SUCCESS);
+  ASSERT_NE(child, nullptr);
+
+  // An id no manifest entry carries is a lookup miss, not a proof failure.
+  EXPECT_EQ(lineage_verify_child_provenance(parent, "no-such-child"),
+            CRABS_ERR_RESOURCE_NOT_FOUND);
+
+  // Bad inputs fail at the gate.
+  EXPECT_EQ(lineage_verify_child_provenance(NULL, "child-red"),
+            CRABS_ERR_INVALID_PARAM);
+  EXPECT_EQ(lineage_verify_child_provenance(parent, NULL),
+            CRABS_ERR_INVALID_PARAM);
+
+  attribute_machine_destroy(child);
+  machine_blueprint_destroy(blueprint);
+  spawn_parent_destroy(&harness);
+}

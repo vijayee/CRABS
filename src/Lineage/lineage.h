@@ -357,6 +357,46 @@ uint32_t lineage_query_children(const state_t* state,
 child_manifest_entry_t* lineage_find_manifest_entry(const state_t* state,
                                                     const char* child_id);
 
+// A10-L1: re-verify a manifest child's genesis provenance.
+//
+// Exactly what is verified: at spawn, lineage_spawn_machine serialized the
+// fresh child state canonically WITHOUT the sealed-MSK section, took
+// SHA-256 of those bytes into child_manifest_entry_t.genesis_snapshot_hash,
+// and ECDSA-signed the SAME bytes with the parent's node key into
+// genesis_attestation_signature. The genesis blob itself is neither
+// persisted nor reconstructible parent-side (delegated/sovereign genesis
+// mints fresh random authority parameters via crypto_abe_setup; shared-root
+// genesis embeds the parent's user registry as it stood at that moment).
+// But crypto_ecdsa_sign signs SHA-256(body) directly as the 32-byte ECDSA
+// digest, so the stored hash IS the digest the signature covers — the
+// manifest is fully self-checkable: this verifier confirms the attestation
+// signature verifies under the parent state's CURRENT node public key over
+// digest == genesis_snapshot_hash. That cryptographically binds the entry's
+// hash ↔ signature ↔ the parent's key, so tampering with either stored
+// field is detected. (child_id itself is bound only by manifest row
+// placement — it appears inside the unavailable blob, not the digest — so
+// splicing a (hash, sig) pair onto a different child_id row would verify;
+// spawn's id-uniqueness and the parent's custody of its manifest are the
+// guards there.)
+//
+// Limits (documented, not silent): the genesis BODY preimage is unavailable,
+// so this proves the parent attested this hash at spawn, not that the hash
+// matches a body the caller can inspect. And because the parent retains only
+// its current node key, a parent that rotated its node key after a spawn can
+// no longer re-verify THAT child's provenance parent-side (the child's own
+// lineage_key_chain entry [0] still pins the spawn key for child-side
+// checks); such entries surface as cryptographic failures, not as "unknown".
+//
+// Results:
+//   CRABS_SUCCESS                 — signature verifies over the stored hash
+//   CRABS_ERR_INVALID_PARAM       — NULL parent_state or child_id
+//   CRABS_ERR_RESOURCE_NOT_FOUND  — no manifest entry names child_id
+//   CRABS_ERR_CRYPTOGRAPHIC_ERROR — parent has no valid node key, or the
+//                                   signature does not verify (tampering or
+//                                   post-rotation spawn key)
+crabs_error_e lineage_verify_child_provenance(const state_t* parent_state,
+                                              const char* child_id);
+
 // Human-readable names for the lineage enums — the single source for every
 // surface that renders lineage data humanly (CLI `machine children`, wasm
 // devtools, the devtools snapshot JSON). Values outside the enum return

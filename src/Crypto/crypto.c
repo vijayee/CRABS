@@ -424,19 +424,12 @@ crabs_error_e crypto_ecdsa_sign(const uint8_t private_key[32],
 // ============================================================
 // ECDSA Verification
 // ============================================================
-bool crypto_ecdsa_verify(const uint8_t public_key[33],
-                          const uint8_t* message, size_t message_len,
-                          const uint8_t signature[CRABS_SIG_SIZE]) {
-  if (!public_key || !message || !signature) {
-    return false;
-  }
 
-  // Hash the message with SHA-256
-  uint8_t digest[CRABS_HASH_SIZE];
-  if (crypto_sha256(message, message_len, digest) != CRABS_SUCCESS) {
-    return false;
-  }
-
+// Shared body of the two verify entry points: everything after the digest is
+// in hand (key construction, low-S enforcement, DER conversion, ECDSA_verify).
+static bool _ecdsa_verify_prepared_digest(const uint8_t public_key[33],
+                                          const uint8_t digest[CRABS_HASH_SIZE],
+                                          const uint8_t signature[CRABS_SIG_SIZE]) {
   // Create EC_KEY from public key
   EC_KEY* eckey = _eckey_from_public(public_key);
   if (!eckey) {
@@ -479,6 +472,31 @@ bool crypto_ecdsa_verify(const uint8_t public_key[33],
   OPENSSL_free(der_sig);
   EC_KEY_free(eckey);
   return rc == 1;
+}
+
+bool crypto_ecdsa_verify(const uint8_t public_key[33],
+                          const uint8_t* message, size_t message_len,
+                          const uint8_t signature[CRABS_SIG_SIZE]) {
+  if (!public_key || !message || !signature) {
+    return false;
+  }
+
+  // Hash the message with SHA-256
+  uint8_t digest[CRABS_HASH_SIZE];
+  if (crypto_sha256(message, message_len, digest) != CRABS_SUCCESS) {
+    return false;
+  }
+
+  return _ecdsa_verify_prepared_digest(public_key, digest, signature);
+}
+
+bool crypto_ecdsa_verify_digest(const uint8_t public_key[33],
+                                 const uint8_t digest[CRABS_HASH_SIZE],
+                                 const uint8_t signature[CRABS_SIG_SIZE]) {
+  if (!public_key || !digest || !signature) {
+    return false;
+  }
+  return _ecdsa_verify_prepared_digest(public_key, digest, signature);
 }
 
 // ============================================================

@@ -1498,6 +1498,34 @@ child_manifest_entry_t* lineage_find_manifest_entry(const state_t* state,
   return NULL;
 }
 
+crabs_error_e lineage_verify_child_provenance(const state_t* parent_state,
+                                              const char* child_id) {
+  if (parent_state == NULL || child_id == NULL) {
+    return CRABS_ERR_INVALID_PARAM;
+  }
+  const child_manifest_entry_t* manifest_entry =
+      lineage_find_manifest_entry(parent_state, child_id);
+  if (manifest_entry == NULL) {
+    return CRABS_ERR_RESOURCE_NOT_FOUND;
+  }
+  // A parent without a node key never spawned — a manifest entry it cannot
+  // have authored is treated as corrupt, not merely unverifiable (spawn
+  // itself refuses keyless parents, so reaching this means the key material
+  // or the entry was tampered after the fact).
+  if (!parent_state->node_key_valid) {
+    return CRABS_ERR_CRYPTOGRAPHIC_ERROR;
+  }
+  // The stored hash IS the ECDSA digest (see the header contract): the
+  // digest-level verify proves the parent's node key attested exactly this
+  // genesis hash at spawn, without needing the (unrecoverable) blob.
+  return crypto_ecdsa_verify_digest(
+             parent_state->node_public_key,
+             manifest_entry->genesis_snapshot_hash,
+             manifest_entry->genesis_attestation_signature)
+             ? CRABS_SUCCESS
+             : CRABS_ERR_CRYPTOGRAPHIC_ERROR;
+}
+
 // ============================================================
 // Enum name helpers (single source for CLI / wasm / devtools)
 // ============================================================

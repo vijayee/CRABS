@@ -45,6 +45,19 @@ bool crypto_ecdsa_verify(const uint8_t public_key[33],
                           const uint8_t* message, size_t message_len,
                           const uint8_t signature[CRABS_SIG_SIZE]);
 
+// A10-L1: verify a signature against a PRE-COMPUTED 32-byte SHA-256 digest
+// instead of the message. crypto_ecdsa_sign signs SHA-256(message) directly
+// as the ECDSA digest, so a caller that retains the message's hash but not
+// the message itself (lineage genesis provenance, where the manifest stores
+// genesis_snapshot_hash == SHA-256(genesis blob) but not the blob) can still
+// verify the attestation: the signature binds to exactly that hash. Does NOT
+// prove the digest's preimage is any particular body — only that the key
+// signed a message whose SHA-256 is this digest. Same low-S enforcement as
+// crypto_ecdsa_verify.
+bool crypto_ecdsa_verify_digest(const uint8_t public_key[33],
+                                 const uint8_t digest[CRABS_HASH_SIZE],
+                                 const uint8_t signature[CRABS_SIG_SIZE]);
+
 // ============================================================
 // SHA-256 Hash
 // ============================================================

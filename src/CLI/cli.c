@@ -1694,17 +1694,23 @@ static cli_result_e _machine_cmd_children(cli_node_t* node) {
     printf("No children manifested on this machine.\n");
     return CLI_OK;
   }
-  printf("%-16s %-14s %-20s %-9s %s\n", "child_id", "mode", "status",
-         "resident", "ttl_ms");
+  printf("%-16s %-14s %-20s %-9s %-10s %s\n", "child_id", "mode", "status",
+         "resident", "provenance", "ttl_ms");
   for (uint32_t entry_index = 0; entry_index < count; entry_index++) {
     bool resident = lineage_query_resident_child(
         &node->attr_machine->base_state,
         entries[entry_index].child_id) != NULL;
-    printf("%-16s %-14s %-20s %-9s %llu\n",
+    // A10-L1: re-verify the genesis attestation against the node's current
+    // key — every manifest byte is checkable (the stored hash is the ECDSA
+    // digest), so only ok/failed occur; see lineage_verify_child_provenance.
+    crabs_error_e provenance = lineage_verify_child_provenance(
+        &node->attr_machine->base_state, entries[entry_index].child_id);
+    printf("%-16s %-14s %-20s %-9s %-10s %llu\n",
            entries[entry_index].child_id,
            lineage_mode_name(entries[entry_index].mode),
            lineage_status_name(entries[entry_index].status),
            resident ? "yes" : "no",
+           provenance == CRABS_SUCCESS ? "ok" : "failed",
            (unsigned long long)entries[entry_index].attestation_ttl_ms);
   }
   return CLI_OK;
@@ -2019,7 +2025,7 @@ static void _print_machine_usage(void) {
   printf("  machine blueprint validate <file.cbp>  Validate a saved blueprint file\n");
   printf("  machine blueprint drop                 Discard the current draft\n");
   printf("  machine spawn <file.cbp>               Spawn a child machine from a saved blueprint file\n");
-  printf("  machine children                       List the child manifest (mode, status, resident, ttl_ms)\n");
+  printf("  machine children                       List the child manifest (mode, status, resident, provenance, ttl_ms)\n");
   printf("  machine dissolve <child_id>            Dissolve a non-sovereign child\n");
   printf("  machine withdraw <child_id>            Withdraw a sovereign child's genesis stake\n");
   printf("  machine revoke-attestation <child_id>  Stop issuing attestations for a child\n");
