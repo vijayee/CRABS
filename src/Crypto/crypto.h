@@ -57,9 +57,11 @@ crabs_error_e crypto_sha256(const uint8_t* data, size_t len,
 // ============================================================
 #define CRABS_SEAL_OVERHEAD 28   // 12-byte IV + 16-byte GCM tag
 
+// In: *sealed_len = buffer capacity. Out: *sealed_len = sealed blob length.
 crabs_error_e crypto_seal(const uint8_t key[32],
                             const uint8_t* plain, size_t plain_len,
                             uint8_t* sealed, size_t* sealed_len);
+// In: plain_cap = plaintext capacity. Out: *plain_len = written length.
 crabs_error_e crypto_unseal(const uint8_t key[32],
                               const uint8_t* sealed, size_t sealed_len,
                               uint8_t* plain, size_t plain_cap,

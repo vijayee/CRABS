@@ -1704,6 +1704,8 @@ crabs_error_e crypto_seal(const uint8_t key[32],
                             uint8_t* sealed, size_t* sealed_len) {
   if (!key || (!plain && plain_len != 0) || !sealed || !sealed_len)
     return CRABS_ERR_INVALID_PARAM;
+  if (plain_len > SIZE_MAX - CRABS_SEAL_OVERHEAD)
+    return CRABS_ERR_INVALID_PARAM;
   if (*sealed_len < plain_len + CRABS_SEAL_OVERHEAD)
     return CRABS_ERR_INVALID_PARAM;
 

@@ -1172,3 +1172,74 @@ TEST(TestDurability, SealUnsealRoundTrip) {
   EXPECT_EQ(crypto_unseal(wrong_key, sealed, sealed_len, out, sizeof(out), &out_len),
             CRABS_ERR_UNAUTHORIZED);
 }
+
+// Validation paths only reachable through bad caller arguments: undersized
+// buffers, undersized capacities, and NULL pointers must be rejected before
+// any crypto work happens.
+TEST(TestDurability, SealRejectsBadArguments) {
+  uint8_t seal_key[32];
+  uint8_t plain[8] = {0};
+  uint8_t sealed[256];
+  size_t sealed_len = sizeof(sealed);
+  ASSERT_EQ(crypto_random_bytes(seal_key, sizeof(seal_key)), CRABS_SUCCESS);
+
+  // Buffer too small for ciphertext + IV + tag.
+  size_t small_capacity = 8 + CRABS_SEAL_OVERHEAD - 1;
+  EXPECT_NE(crypto_seal(seal_key, plain, sizeof(plain), sealed, &small_capacity),
+            CRABS_SUCCESS);
+
+  // NULL arguments.
+  ASSERT_EQ(crypto_seal(NULL, plain, sizeof(plain), sealed, &sealed_len),
+            CRABS_ERR_INVALID_PARAM);
+  ASSERT_EQ(crypto_seal(seal_key, NULL, sizeof(plain), sealed, &sealed_len),
+            CRABS_ERR_INVALID_PARAM);
+  ASSERT_EQ(crypto_seal(seal_key, plain, sizeof(plain), NULL, &sealed_len),
+            CRABS_ERR_INVALID_PARAM);
+  ASSERT_EQ(crypto_seal(seal_key, plain, sizeof(plain), sealed, NULL),
+            CRABS_ERR_INVALID_PARAM);
+}
+
+TEST(TestDurability, UnsealRejectsBadArguments) {
+  uint8_t seal_key[32];
+  uint8_t plain[64];
+  size_t plain_len = 0;
+  ASSERT_EQ(crypto_random_bytes(seal_key, sizeof(seal_key)), CRABS_SUCCESS);
+
+  // Shorter than IV + tag overhead.
+  uint8_t short_blob[20] = {0};
+  EXPECT_NE(crypto_unseal(seal_key, short_blob, sizeof(short_blob),
+                          plain, sizeof(plain), &plain_len), CRABS_SUCCESS);
+
+  // Capacity too small for the contained plaintext.
+  uint8_t sealed_full[128];
+  size_t sealed_len = sizeof(sealed_full);
+  const uint8_t payload[64] = {0};
+  ASSERT_EQ(crypto_seal(seal_key, payload, sizeof(payload),
+                        sealed_full, &sealed_len), CRABS_SUCCESS);
+  EXPECT_NE(crypto_unseal(seal_key, sealed_full, sealed_len,
+                          plain, sizeof(plain) - 1, &plain_len), CRABS_SUCCESS);
+
+  // NULL arguments.
+  ASSERT_EQ(crypto_unseal(NULL, sealed_full, sealed_len, plain,
+                          sizeof(plain), &plain_len), CRABS_ERR_INVALID_PARAM);
+  ASSERT_EQ(crypto_unseal(seal_key, NULL, sealed_len, plain,
+                          sizeof(plain), &plain_len), CRABS_ERR_INVALID_PARAM);
+  ASSERT_EQ(crypto_unseal(seal_key, sealed_full, sealed_len, NULL,
+                          sizeof(plain), &plain_len), CRABS_ERR_INVALID_PARAM);
+  ASSERT_EQ(crypto_unseal(seal_key, sealed_full, sealed_len, plain,
+                          sizeof(plain), NULL), CRABS_ERR_INVALID_PARAM);
+}
+
+TEST(TestDurability, SealUnsealZeroLengthPlaintext) {
+  uint8_t seal_key[32];
+  ASSERT_EQ(crypto_random_bytes(seal_key, sizeof(seal_key)), CRABS_SUCCESS);
+  uint8_t sealed[CRABS_SEAL_OVERHEAD];
+  size_t sealed_len = sizeof(sealed);
+  ASSERT_EQ(crypto_seal(seal_key, NULL, 0, sealed, &sealed_len), CRABS_SUCCESS);
+  ASSERT_EQ(sealed_len, (size_t)CRABS_SEAL_OVERHEAD);
+  uint8_t plain[8];
+  size_t plain_len = 0;
+  ASSERT_EQ(crypto_unseal(seal_key, sealed, sealed_len, plain,
+                          sizeof(plain), &plain_len), CRABS_SUCCESS);
+  ASSERT_EQ(plain_len, (size_t)0);
+}
