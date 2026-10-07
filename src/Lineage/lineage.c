@@ -33,7 +33,7 @@ static bool _lineage_policy_expression_is_valid(const char* expression);
 //   u8 format_version; string16 parent_id; string16 child_id;
 //   string16 user_id; string16 attributes; u64le not_before; u64le expires_at
 // string16 = u16le byte length + bytes WITHOUT the trailing NUL.
-// Worst case: 1 + 2*(63+1)*3 + 2*(255+1) + 8 + 8 = 470 bytes.
+// Worst case: 1 + (2+63)*3 + (2+255) + 8 + 8 = 469 bytes.
 #define CRABS_ATTESTATION_BODY_MAX 512
 
 static bool _lineage_field_is_safe(const char* field, size_t capacity) {
