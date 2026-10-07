@@ -516,8 +516,9 @@ op_handler_fn state_machine_find_handler(const state_t* state, const char* op_ty
 // R7-01: get the current physical time in ms from the state's HLC time source.
 // Returns false when no authenticated time is available (fail-closed for
 // expiry decisions). When no time source is configured, falls back to the
-// system clock (backward compatible).
-static bool state_get_time_ms(const state_t* state, uint64_t* now_ms) {
+// system clock (backward compatible). Public since v1.7 — lineage spawn
+// stamps the manifest's spawned_at from the parent's authenticated time.
+bool state_get_time_ms(const state_t* state, uint64_t* now_ms) {
   if (state == NULL || now_ms == NULL) return false;
   crabs_physical_time_t phys = crabs_hlc_get_physical_time(&((state_t*)state)->hlc_state);
   if (!phys.valid) return false;

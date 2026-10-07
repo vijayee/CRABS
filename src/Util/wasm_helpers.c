@@ -109,6 +109,7 @@ static char* _change_event_json(const crabs_change_event_t* event) {
     case CRABS_CHANGE_SCHEDULE:  kind_name = "schedule"; break;
     case CRABS_CHANGE_TRIGGER:   kind_name = "trigger"; break;
     case CRABS_CHANGE_ATTRIBUTE: kind_name = "attribute"; break;
+    case CRABS_CHANGE_SPAWN:     kind_name = "spawn"; break;
     default: break;
   }
 

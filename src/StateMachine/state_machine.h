@@ -218,6 +218,12 @@ int            crabs_operation_compare(const operation_t* a, const operation_t* 
 // Otherwise falls back to wall-clock millisecond comparison using now_ms.
 bool           state_machine_lock_expired(state_t* state, const lock_state_t* lock, uint64_t now_ms);
 
+// Current time in ms from the state's authenticated HLC time source
+// (system-clock fallback when no source is configured, R7-01). Machines
+// never read the wall clock directly — lineage spawn stamps the manifest's
+// spawned_at from the parent's authenticated time through this helper.
+bool           state_get_time_ms(const state_t* state, uint64_t* now_ms);
+
 // Misc
 void           state_machine_generate_lock_token(uint8_t token[CRABS_LOCK_TOKEN_SIZE]);
 bool           invariant_check(invariant_t* inv, void* value, data_type_e type);

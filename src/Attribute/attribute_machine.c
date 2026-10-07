@@ -413,7 +413,11 @@ void attribute_machine_destroy(attribute_machine_t* am) {
     crabs_tx_manager_t* tx = (crabs_tx_manager_t*)am->base_state.tx_manager;
     if (tx->vtable.destroy != NULL) tx->vtable.destroy(tx);
   }
-  if (am->base_state.abe_mk != NULL) crypto_abe_master_key_destroy(am->base_state.abe_mk);
+  // Borrowed MSK (spawned shared-root child): the parent's live authority
+  // stays owned by the parent — skip the destroy here.
+  if (am->base_state.abe_mk != NULL && !am->base_state.abe_mk_borrowed) {
+    crypto_abe_master_key_destroy(am->base_state.abe_mk);
+  }
   if (am->base_state.node_key_valid) OPENSSL_cleanse(am->base_state.node_private_key, 32);
   if (am->base_state.triggers != NULL) {
     for (uint32_t i = 0; i < am->base_state.trigger_count; i++) {

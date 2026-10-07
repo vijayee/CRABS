@@ -114,6 +114,68 @@ crabs_error_e blueprint_add_op_type_def(machine_blueprint_t* blueprint,
 crabs_error_e lineage_blueprint_validate(const machine_blueprint_t* blueprint);
 
 // ============================================================
+// Spawn: instantiate a child machine from a validated blueprint
+// ============================================================
+
+// Instantiate a child machine per the blueprint's trust mode:
+//   SHARED_ROOT    — the child runs on the PARENT's authority: its
+//                    base_state.attr_machine points at the parent's attribute
+//                    machine (one user registry) and its base_state.abe_mk is
+//                    the parent's live MSK (borrowed — destroying the child
+//                    never touches the parent's authority; the parent is the
+//                    ONE owner). Nothing is re-enrolled: the child's
+//                    config.bootstrap_admin records the blueprint's id
+//                    (possibly empty; no user row is created — the shared
+//                    registry already carries whoever it carries).
+//   DELEGATED_COPY — a fresh CP-ABE authority is minted for the child via
+//                    attribute_machine_create (§8.3 genesis: the bootstrap
+//                    admin is registered IN the child's fresh registry with
+//                    role:admin). The MSK is the child's own.
+//   SOVEREIGN      — identical construction to DELEGATED_COPY; the only
+//                    difference is recorded in the parent's manifest entry
+//                    (LINEAGE_SOVEREIGN): the parent may only WITHDRAW its
+//                    genesis stake (never dissolve) — enforced by Task 8's
+//                    lineage ops.
+//
+// Genesis provenance: the parent's node key signs the canonical UNKEYED
+// serialization of the child state (crabs_serialize_state — the genesis
+// carries no sealed MSK section: provenance is not authority-at-rest). The
+// blob's SHA-256 and the parent's ECDSA signature (over the genesis bytes
+// EXPLICITLY — the child has no node key of its own yet; whoever loads the
+// child sets one later) are stored in the parent's manifest entry, which is
+// appended ONLY after the child is fully built — every earlier failure leaves
+// no manifest residue.
+//
+// Parent binding on the child: lineage_parent_bound = true, lineage_self_id =
+// blueprint->child_id, lineage_parent_public_key = the parent's node public
+// key, and lineage_parent_id = parent->config.bootstrap_admin — in v1 a
+// machine's identity IS its bootstrap_admin id (single-node machines), which
+// is the same parent_id string attestations carry (spec §lineage_parent_id).
+//
+// Child op policies are the blueprint author's responsibility — spawn NEVER
+// imposes custody guards (e.g. a "custody:<child_id>" token): that policy
+// choice belongs to protocol authors.
+//
+// Error mapping (crabs.h has no policy/limit-specific enumerator):
+//   structural garbage (invalid blueprint / no shared authority)
+//                            → CRABS_ERR_INVALID_PARAM
+//   manifest ceiling reached → CRABS_ERR_OOM (follows the op-handler
+//                            registry's capacity precedent,
+//                            state_machine_register_handler)
+//   duplicate child_id (in parent->children or == parent->lineage_self_id)
+//                            → CRABS_ERR_DUPLICATE_OPERATION
+//   parent cannot sign (no node key / sign or hash failure)
+//                            → CRABS_ERR_CRYPTOGRAPHIC_ERROR
+//   genesis serialization failure → CRABS_ERR_SERIALIZATION_ERROR
+//
+// child_out receives a heap attribute_machine_t whose state is
+// &child->base_state. Ownership: the caller destroys it via
+// attribute_machine_destroy.
+crabs_error_e lineage_spawn_machine(state_t* parent,
+                                    const machine_blueprint_t* blueprint,
+                                    attribute_machine_t** child_out);
+
+// ============================================================
 // Attestations: issue / verify / wire transport
 // ============================================================
 

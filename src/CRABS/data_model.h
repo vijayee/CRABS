@@ -218,7 +218,8 @@ typedef enum {
   CRABS_CHANGE_OP        = 0x01,  // executed operation (direct execution only)
   CRABS_CHANGE_SCHEDULE  = 0x02,  // scheduled materialization (each fire)
   CRABS_CHANGE_TRIGGER   = 0x03,  // trigger-fired mutation
-  CRABS_CHANGE_ATTRIBUTE = 0x04   // attribute-machine user mutation
+  CRABS_CHANGE_ATTRIBUTE = 0x04,  // attribute-machine user mutation
+  CRABS_CHANGE_SPAWN     = 0x05   // machine spawned from a blueprint (lineage)
 } crabs_change_kind_e;
 
 typedef struct {
@@ -430,6 +431,13 @@ typedef struct state_t {
   void* ordering_config;
   // ABE master key — generated once at state creation, used for all ABE operations
   void* abe_mk;
+  // Runtime-only; never serialized. true when abe_mk is a BORROWED pointer —
+  // a spawned shared-root child runs on the parent's live authority (its
+  // attr_machine is the parent's attribute machine too, so there is exactly
+  // one user registry and one MSK for the pair). Both destroy paths skip
+  // crypto_abe_master_key_destroy when this is set, so destroying the child
+  // leaves the parent's authority intact (ONE owner per machine: the parent).
+  bool abe_mk_borrowed;
   // v1.6 Amd6: persistent per-node HLC state (audit M-10). Reused across lock
   // acquisitions so the logical counter advances and clock-regression
   // protection holds across calls (previously each lock built a fresh HLC

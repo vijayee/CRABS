@@ -59,6 +59,7 @@ static const char* _change_kind_name(crabs_change_kind_e kind) {
     case CRABS_CHANGE_SCHEDULE:  return "schedule";
     case CRABS_CHANGE_TRIGGER:   return "trigger";
     case CRABS_CHANGE_ATTRIBUTE: return "attribute";
+    case CRABS_CHANGE_SPAWN:     return "spawn";
     default:                     return "op";
   }
 }

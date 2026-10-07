@@ -14,6 +14,8 @@
 #include "../Attribute/attribute_machine.h"
 #include "../Condition/condition.h"
 #include "../Crypto/crypto.h"
+#include "../Serialization/serialization.h"
+#include "../StateMachine/state_machine.h"
 #include "../Util/allocator.h"
 #include <ctype.h>
 #include <stdio.h>
@@ -605,4 +607,208 @@ crabs_error_e lineage_blueprint_validate(const machine_blueprint_t* blueprint) {
     }
   }
   return CRABS_SUCCESS;
+}
+
+// ============================================================
+// Spawn: the three trust modes
+// ============================================================
+
+// Apply the blueprint's items, policies, and op type definitions to the
+// freshly built child state. Validation ran BEFORE any child allocation, so
+// the only realistic failure here is a registry cap: the state's op type
+// registry is the blueprint cap's own floor (CRABS_MAX_BLUEPRINT_OP_TYPE_DEFS
+// <= CRABS_MAX_OP_TYPE_DEFS) and duplicate item names were checked across the
+// whole blueprint — the child starts empty.
+static crabs_error_e _spawn_apply_blueprint(state_t* child_state,
+                                            const machine_blueprint_t* blueprint) {
+  for (uint32_t item_index = 0; item_index < blueprint->item_count;
+       item_index++) {
+    const blueprint_item_t* item = &blueprint->items[item_index];
+    // Genesis items are valueless shells: the blueprint carries name, type,
+    // and CRDT strategy only (initial value is the empty CRDT, materialized
+    // by the first authorized mutation).
+    data_item_t* created = data_item_create(item->name, item->type,
+                                            item->crdt_type);
+    if (created == NULL) return CRABS_ERR_OOM;
+    crabs_error_e status = state_add_item(child_state, created);
+    if (status != CRABS_SUCCESS) {
+      data_item_destroy(created);
+      return status;
+    }
+  }
+  for (uint32_t policy_index = 0; policy_index < blueprint->policy_count;
+       policy_index++) {
+    const blueprint_policy_t* policy = &blueprint->policies[policy_index];
+    crabs_error_e status = state_add_policy(child_state, policy->operation,
+                                            policy->expression);
+    if (status != CRABS_SUCCESS) return status;
+  }
+  for (uint32_t def_index = 0; def_index < blueprint->op_type_def_count;
+       def_index++) {
+    const blueprint_op_type_def_t* definition =
+        &blueprint->op_type_defs[def_index];
+    crabs_error_e status = state_register_op_type_def(
+        child_state, definition->op_type, &definition->dedup);
+    if (status != CRABS_SUCCESS) return status;
+  }
+  return CRABS_SUCCESS;
+}
+
+crabs_error_e lineage_spawn_machine(state_t* parent,
+                                    const machine_blueprint_t* blueprint,
+                                    attribute_machine_t** child_out) {
+  if (parent == NULL || blueprint == NULL || child_out == NULL) {
+    return CRABS_ERR_INVALID_PARAM;
+  }
+  *child_out = NULL;
+
+  crabs_error_e status = lineage_blueprint_validate(blueprint);
+  if (status != CRABS_SUCCESS) return status;
+
+  // Genesis provenance is a parent ECDSA signature — a machine that cannot
+  // sign cannot mint.
+  if (!parent->node_key_valid) {
+    return CRABS_ERR_CRYPTOGRAPHIC_ERROR;
+  }
+
+  // The manifest ceiling bounds the serialized manifest and the spawn
+  // lookup cost. crabs.h carries no dedicated limit enumerator; CRABS_ERR_OOM
+  // follows the per-state registry precedent (state_machine_register_handler
+  // returns CRABS_ERR_OOM at CRABS_MAX_OP_HANDLERS).
+  if (parent->child_count >= CRABS_MAX_CHILD_MACHINES) {
+    return CRABS_ERR_OOM;
+  }
+
+  // child_id uniqueness: among the parent's live children AND against the
+  // parent's OWN machine id (a child may itself mint — its lineage_self_id
+  // occupies the same machine-name space; a machine that was never spawned
+  // has no lineage_self_id yet, and its identity is the root machine's id,
+  // config.bootstrap_admin).
+  for (uint32_t child_index = 0; child_index < parent->child_count;
+       child_index++) {
+    if (strcmp(parent->children[child_index].child_id,
+               blueprint->child_id) == 0) {
+      return CRABS_ERR_DUPLICATE_OPERATION;
+    }
+  }
+  if ((parent->lineage_self_id[0] != '\0' &&
+       strcmp(parent->lineage_self_id, blueprint->child_id) == 0) ||
+      (parent->config.bootstrap_admin[0] != '\0' &&
+       strcmp(parent->config.bootstrap_admin, blueprint->child_id) == 0)) {
+    return CRABS_ERR_DUPLICATE_OPERATION;
+  }
+
+  attribute_machine_t* child;
+  state_t* child_state;
+  if (blueprint->trust_mode == LINEAGE_SHARED_ROOT) {
+    // Shared root: the child BORROWS the parent's authority — one attribute
+    // machine (one user registry) and one MSK serve both states. Nothing is
+    // re-enrolled; the genesis-equivalent step would be meaningless here.
+    if (parent->attr_machine == NULL || parent->abe_mk == NULL) {
+      return CRABS_ERR_INVALID_PARAM;
+    }
+    child = get_clear_memory(sizeof(*child));
+    child_state = &child->base_state;
+    // Embedded base_state never runs state_create's defaults — seed the
+    // same defaults attribute_machine_create seeds for its machines.
+    child_state->config.max_lock_duration_ms = CRABS_DEFAULT_LOCK_MS;
+    child_state->config.max_lock_extensions = CRABS_MAX_LOCK_EXTENDS;
+    child_state->config.allow_force_unlock = true;
+    child_state->max_occurrences_per_tick =
+        CRABS_SCHEDULER_DEFAULT_MAX_OCCURRENCES_PER_TICK;
+    strncpy(child_state->config.bootstrap_admin, blueprint->bootstrap_admin,
+            CRABS_MAX_USER_ID - 1);
+    child_state->attr_machine = parent->attr_machine;
+    child_state->abe_mk = parent->abe_mk;
+    child_state->abe_mk_borrowed = true;
+  } else {
+    // DELEGATED_COPY / SOVEREIGN: a fresh authority is minted via the
+    // genesis-equivalent construction (§8.3 — attribute_machine_create
+    // registers the bootstrap admin with role:admin under `admin_pk`). The
+    // admin's key is the PARENT's node public key: the machine that mints
+    // the child vouches for its genesis admin, and only it holds the
+    // matching private key at this point (the child's own node key is set
+    // later, by whoever loads it).
+    child = attribute_machine_create(blueprint->bootstrap_admin,
+                                     parent->node_public_key);
+    if (child == NULL) return CRABS_ERR_OOM;
+    child_state = &child->base_state;
+    // The child's auth pipeline resolves users through ITS OWN registry.
+    child_state->attr_machine = child;
+  }
+
+  // Genesis bytes must carry the parent binding (v11 persists it in the same
+  // parent-binding block), so the binding is stamped BEFORE the snapshot.
+  child_state->lineage_parent_bound = true;
+  strncpy(child_state->lineage_parent_id, parent->config.bootstrap_admin,
+          CRABS_MAX_USER_ID - 1);
+  memcpy(child_state->lineage_parent_public_key, parent->node_public_key, 33);
+  strncpy(child_state->lineage_self_id, blueprint->child_id,
+          CRABS_MAX_USER_ID - 1);
+
+  status = _spawn_apply_blueprint(child_state, blueprint);
+  if (status == CRABS_SUCCESS) {
+    // Genesis snapshot: the canonical UNKEYED serialization (no sealed MSK
+    // section — provenance is not authority-at-rest). The serializer embeds
+    // the user registry the child's authority resolves through — for a
+    // shared-root child that is the SHARED registry image, for a delegated
+    // child the fresh genesis admin. Signed EXPLICITLY with the parent's
+    // node key: the child shell has no node key of its own, so the
+    // signed-serializer would fail closed.
+    serialized_buffer_t* genesis_blob = crabs_serialize_state(child_state);
+    if (genesis_blob == NULL) {
+      status = CRABS_ERR_SERIALIZATION_ERROR;
+    } else {
+      uint8_t genesis_hash[CRABS_HASH_SIZE];
+      uint8_t genesis_signature[CRABS_SIG_SIZE];
+      status = crypto_sha256(genesis_blob->data, genesis_blob->len,
+                             genesis_hash);
+      if (status == CRABS_SUCCESS) {
+        status = crypto_ecdsa_sign(parent->node_private_key,
+                                   genesis_blob->data, genesis_blob->len,
+                                   genesis_signature);
+      }
+      if (status == CRABS_SUCCESS) {
+        // Manifest append LAST — every earlier failure destroyed the child
+        // and left the parent untouched (no partial residue).
+        child_manifest_entry_t* grown = realloc(
+            parent->children,
+            (size_t)(parent->child_count + 1) * sizeof(child_manifest_entry_t));
+        if (grown == NULL) {
+          status = CRABS_ERR_OOM;
+        } else {
+          parent->children = grown;
+          child_manifest_entry_t* manifest_entry =
+              &parent->children[parent->child_count];
+          memset(manifest_entry, 0, sizeof(*manifest_entry));
+          strncpy(manifest_entry->child_id, blueprint->child_id,
+                  CRABS_MAX_USER_ID - 1);
+          manifest_entry->mode = blueprint->trust_mode;
+          memcpy(manifest_entry->genesis_snapshot_hash, genesis_hash,
+                 CRABS_HASH_SIZE);
+          memcpy(manifest_entry->genesis_attestation_signature,
+                 genesis_signature, CRABS_SIG_SIZE);
+          manifest_entry->attestation_ttl_ms = blueprint->attestation_ttl_ms;
+          // The parent never reads the wall clock itself — spawn stamps the
+          // manifest with the parent's authenticated time (state_get_time_ms;
+          // 0 when no time is available rather than a spoofable local read).
+          if (!state_get_time_ms(parent, &manifest_entry->spawned_at)) {
+            manifest_entry->spawned_at = 0;
+          }
+          manifest_entry->status = LINEAGE_ACTIVE;
+          parent->child_count += 1;
+
+          state_notify_change(parent, CRABS_CHANGE_SPAWN,
+                              "__spawn_machine__", NULL, NULL, NULL,
+                              blueprint->child_id, "machine spawned", CRABS_SUCCESS);
+          *child_out = child;
+        }
+      }
+      serialized_buffer_destroy(genesis_blob);
+    }
+  }
+  if (status != CRABS_SUCCESS) {
+    attribute_machine_destroy(child);
+  }
+  return status;
 }

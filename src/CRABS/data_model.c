@@ -116,7 +116,9 @@ void state_destroy(state_t* state) {
   if (state->last_refresh_envelope != NULL) {
     crypto_key_envelope_destroy(state->last_refresh_envelope);
   }
-  if (state->abe_mk != NULL) {
+  // Borrowed MSK (spawned shared-root child): the parent's live authority
+  // stays owned by the parent — skip the destroy here.
+  if (state->abe_mk != NULL && !state->abe_mk_borrowed) {
     crypto_abe_master_key_destroy(state->abe_mk);
   }
   // Release the user registry ONLY when the attached attribute machine is

@@ -759,3 +759,396 @@ TEST(TestLineage, UnsignedModeBOpRejectedOnEndorsementPolicy) {
   operation_destroy(op);
   endorsement_harness_destroy(&harness);
 }
+
+// ============================================================
+// Spawn: the three trust modes
+// ============================================================
+
+// A parent machine shaped the way the CLI wires its nodes: a heap attribute
+// machine whose genesis admin holds the node key's public key, the node key
+// set on the embedded state, and the state's attr_machine self-reference.
+typedef struct {
+  attribute_machine_t* am;
+  ecdsa_keypair_t*     parent_key;
+  ecdsa_keypair_t*     alice_key;
+} spawn_parent_harness_t;
+
+static void spawn_parent_setup(spawn_parent_harness_t* harness) {
+  memset(harness, 0, sizeof(*harness));
+  harness->parent_key = crypto_ecdsa_generate();
+  ASSERT_NE(harness->parent_key, nullptr);
+  harness->am = attribute_machine_create("parent-root",
+                                         harness->parent_key->public_key);
+  ASSERT_NE(harness->am, nullptr);
+  ASSERT_EQ(state_set_node_key(&harness->am->base_state,
+                               harness->parent_key->private_key,
+                               harness->parent_key->public_key),
+            CRABS_SUCCESS);
+  harness->am->base_state.attr_machine = harness->am;
+  harness->alice_key = crypto_ecdsa_generate();
+  ASSERT_NE(harness->alice_key, nullptr);
+  // Registered with NO attributes: the deny-then-grant shared-root test needs
+  // a signer that initially lacks the custody attribute the child policy
+  // demands.
+  ASSERT_EQ(attribute_machine_register_user(harness->am, "alice",
+                                            harness->alice_key->public_key, ""),
+            CRABS_SUCCESS);
+}
+
+static void spawn_parent_destroy(spawn_parent_harness_t* harness) {
+  if (harness->am != NULL) attribute_machine_destroy(harness->am);
+  crypto_ecdsa_keypair_destroy(harness->parent_key);
+  crypto_ecdsa_keypair_destroy(harness->alice_key);
+}
+
+// A delegated/sovereign blueprint: fresh authority, bootstrap admin
+// "child-admin", op "increment" under "role:admin" — the child's own genesis
+// admin must be able to authorize it.
+static machine_blueprint_t* make_fresh_authority_blueprint(
+    const char* child_id, lineage_trust_mode_e mode) {
+  machine_blueprint_t* blueprint = machine_blueprint_create();
+  EXPECT_NE(blueprint, nullptr);
+  strncpy(blueprint->child_id, child_id, sizeof(blueprint->child_id) - 1);
+  blueprint->trust_mode = mode;
+  strncpy(blueprint->bootstrap_admin, "child-admin",
+          sizeof(blueprint->bootstrap_admin) - 1);
+  blueprint->attestation_ttl_ms = 60000;
+  EXPECT_EQ(blueprint_add_item(blueprint, "counter", DATA_TYPE_COUNTER,
+                               CRDT_G_COUNTER), CRABS_SUCCESS);
+  EXPECT_EQ(blueprint_add_policy(blueprint, "increment", "role:admin"),
+            CRABS_SUCCESS);
+  dedup_spec_t dedup;
+  memset(&dedup, 0, sizeof(dedup));
+  dedup.type = DEDUP_NONE;
+  EXPECT_EQ(blueprint_add_op_type_def(blueprint, "increment", &dedup),
+            CRABS_SUCCESS);
+  EXPECT_EQ(lineage_blueprint_validate(blueprint), CRABS_SUCCESS);
+  return blueprint;
+}
+
+static operation_t* make_signed_increment_op(attribute_machine_t* registry,
+                                             ecdsa_keypair_t* signer_key,
+                                             const char* signer_id) {
+  operation_t* op = operation_create("increment");
+  EXPECT_NE(op, nullptr);
+  if (op == NULL) return NULL;
+  strncpy(op->signer_id, signer_id, CRABS_MAX_USER_ID - 1);
+  crabs_test_sign_op_with(registry, signer_key, op);
+  return op;
+}
+
+TEST(TestLineage, SpawnSharedRootSharesParentAuthority) {
+  spawn_parent_harness_t harness;
+  spawn_parent_setup(&harness);
+  state_t* parent = &harness.am->base_state;
+  machine_blueprint_t* blueprint = make_valid_blueprint();
+  ASSERT_NE(blueprint, nullptr);
+
+  // Capture the spawn change event.
+  static crabs_change_event_t captured_events[4];
+  static uint32_t captured_event_count;
+  captured_event_count = 0;
+  state_set_change_hook(parent, [](state_t*, const crabs_change_event_t* event,
+                                   void*) {
+    if (captured_event_count < 4) captured_events[captured_event_count++] = *event;
+  }, nullptr);
+
+  attribute_machine_t* child = nullptr;
+  ASSERT_EQ(lineage_spawn_machine(parent, blueprint, &child), CRABS_SUCCESS);
+  ASSERT_NE(child, nullptr);
+
+  // Same authority: attribute machine pointer AND the live MSK.
+  EXPECT_EQ(child->base_state.attr_machine, harness.am);
+  EXPECT_EQ(child->base_state.abe_mk, harness.am->base_state.abe_mk);
+  EXPECT_TRUE(child->base_state.abe_mk_borrowed);
+  // Nothing was re-enrolled: the child owns no registry of its own.
+  EXPECT_EQ(child->user_count, 0u);
+
+  // Blueprint applied to the child state.
+  EXPECT_NE(state_find_item(&child->base_state, "counter"), nullptr);
+  EXPECT_STREQ(state_find_policy(&child->base_state, "increment"),
+               "custody:child-red");
+  EXPECT_NE(state_find_op_type_def(&child->base_state, "increment"), nullptr);
+  EXPECT_STRNE(child->base_state.config.bootstrap_admin, "");
+
+  // Parent binding + identity.
+  EXPECT_TRUE(child->base_state.lineage_parent_bound);
+  EXPECT_STREQ(child->base_state.lineage_parent_id, "parent-root");
+  EXPECT_STREQ(child->base_state.lineage_self_id, "child-red");
+  EXPECT_EQ(memcmp(child->base_state.lineage_parent_public_key,
+                   harness.parent_key->public_key, 33), 0);
+
+  // Manifest entry appended: child_id, mode, ACTIVE, ttl, spawned_at.
+  state_t* parent_state = parent;
+  ASSERT_EQ(parent_state->child_count, 1u);
+  const child_manifest_entry_t* manifest_entry = &parent_state->children[0];
+  EXPECT_STREQ(manifest_entry->child_id, "child-red");
+  EXPECT_EQ(manifest_entry->mode, LINEAGE_SHARED_ROOT);
+  EXPECT_EQ(manifest_entry->status, LINEAGE_ACTIVE);
+  EXPECT_EQ(manifest_entry->attestation_ttl_ms, 60000u);
+  EXPECT_GT(manifest_entry->spawned_at, 0u);
+
+  // Genesis snapshot: the manifest hash is the SHA-256 of the child's
+  // unkeyed serialization (recomputed here), signed by the parent's node key.
+  serialized_buffer_t* genesis = crabs_serialize_state(&child->base_state);
+  ASSERT_NE(genesis, nullptr);
+  uint8_t recomputed_hash[CRABS_HASH_SIZE];
+  ASSERT_EQ(crypto_sha256(genesis->data, genesis->len, recomputed_hash),
+            CRABS_SUCCESS);
+  EXPECT_EQ(memcmp(recomputed_hash, manifest_entry->genesis_snapshot_hash,
+                   CRABS_HASH_SIZE), 0);
+  EXPECT_TRUE(crypto_ecdsa_verify(harness.parent_key->public_key,
+                                  genesis->data, genesis->len,
+                                  manifest_entry->genesis_attestation_signature));
+  serialized_buffer_destroy(genesis);
+
+  // Change event: kind SPAWN, type __spawn_machine__, no uuid/signer.
+  ASSERT_EQ(captured_event_count, 1u);
+  EXPECT_EQ(captured_events[0].kind, CRABS_CHANGE_SPAWN);
+  EXPECT_STREQ(captured_events[0].type, "__spawn_machine__");
+  EXPECT_EQ(captured_events[0].uuid, nullptr);
+  EXPECT_EQ(captured_events[0].signer_id, nullptr);
+  EXPECT_STREQ(captured_events[0].target, "child-red");
+  EXPECT_EQ(captured_events[0].result, CRABS_SUCCESS);
+
+  // Deny-then-grant: alice (parent registry, shared authority) has no
+  // custody attribute — the child op is denied.
+  operation_t* denied = make_signed_increment_op(harness.am,
+                                                 harness.alice_key, "alice");
+  ASSERT_NE(denied, nullptr);
+  EXPECT_EQ(state_machine_execute(&child->base_state, denied),
+            CRABS_ERR_UNAUTHORIZED);
+  operation_destroy(denied);
+
+  // The parent grants custody:child-red ON THE SHARED registry — the op
+  // now authorizes through the child's policy.
+  EXPECT_EQ(attribute_machine_grant_role(harness.am, "alice", "custody",
+                                         "child-red", "parent-root"),
+            CRABS_SUCCESS);
+  operation_t* granted = make_signed_increment_op(harness.am,
+                                                  harness.alice_key, "alice");
+  ASSERT_NE(granted, nullptr);
+  EXPECT_EQ(state_machine_execute(&child->base_state, granted), CRABS_SUCCESS);
+  operation_destroy(granted);
+
+  attribute_machine_destroy(child);
+  machine_blueprint_destroy(blueprint);
+  spawn_parent_destroy(&harness);
+}
+
+TEST(TestLineage, SpawnDelegatedCopyMintsFreshAuthority) {
+  spawn_parent_harness_t harness;
+  spawn_parent_setup(&harness);
+  state_t* parent = &harness.am->base_state;
+  machine_blueprint_t* blueprint =
+      make_fresh_authority_blueprint("child-delegated", LINEAGE_DELEGATED_COPY);
+  ASSERT_NE(blueprint, nullptr);
+
+  attribute_machine_t* child = nullptr;
+  ASSERT_EQ(lineage_spawn_machine(parent, blueprint, &child), CRABS_SUCCESS);
+  ASSERT_NE(child, nullptr);
+
+  // Fresh authority: own attribute machine AND own MSK.
+  EXPECT_NE(child->base_state.attr_machine, harness.am);
+  EXPECT_EQ(child->base_state.attr_machine, child);
+  ASSERT_NE(child->base_state.abe_mk, nullptr);
+  EXPECT_NE(child->base_state.abe_mk, harness.am->base_state.abe_mk);
+  EXPECT_FALSE(child->base_state.abe_mk_borrowed);
+
+  // The child's genesis admin exists IN THE CHILD's registry with role:admin.
+  EXPECT_EQ(child->user_count, 1u);
+  user_t* child_admin =
+      attribute_machine_find_user(child, "child-admin");
+  ASSERT_NE(child_admin, nullptr);
+  EXPECT_TRUE(attribute_machine_user_has_role(child_admin, "role"));
+  EXPECT_STREQ(child->base_state.config.bootstrap_admin, "child-admin");
+
+  // Manifest entry present, mode recorded.
+  ASSERT_EQ(parent->child_count, 1u);
+  EXPECT_EQ(parent->children[0].mode, LINEAGE_DELEGATED_COPY);
+  EXPECT_EQ(parent->children[0].status, LINEAGE_ACTIVE);
+  EXPECT_TRUE(child->base_state.lineage_parent_bound);
+
+  // The fresh domain works: the child's OWN genesis admin authorizes a child
+  // op (policy "role:admin"). The genesis admin's registered key is the
+  // parent's node public key — the machine that minted the child vouches for
+  // its bootstrap admin.
+  operation_t* op = make_signed_increment_op(child, harness.parent_key,
+                                             "child-admin");
+  ASSERT_NE(op, nullptr);
+  EXPECT_EQ(state_machine_execute(&child->base_state, op), CRABS_SUCCESS);
+  operation_destroy(op);
+
+  attribute_machine_destroy(child);
+  machine_blueprint_destroy(blueprint);
+  spawn_parent_destroy(&harness);
+}
+
+TEST(TestLineage, SpawnSovereignGeneratesOwnMsk) {
+  // Sovereign children are constructed exactly like delegated copies — the
+  // difference lives in the manifest mode, which Task 8's dissolve op will
+  // reject (parent may only WITHDRAW a sovereign child, never dissolve it).
+  spawn_parent_harness_t harness;
+  spawn_parent_setup(&harness);
+  state_t* parent = &harness.am->base_state;
+  machine_blueprint_t* blueprint =
+      make_fresh_authority_blueprint("child-sov", LINEAGE_SOVEREIGN);
+  ASSERT_NE(blueprint, nullptr);
+
+  attribute_machine_t* child = nullptr;
+  ASSERT_EQ(lineage_spawn_machine(parent, blueprint, &child), CRABS_SUCCESS);
+  ASSERT_NE(child, nullptr);
+
+  EXPECT_NE(child->base_state.attr_machine, harness.am);
+  ASSERT_NE(child->base_state.abe_mk, nullptr);
+  EXPECT_NE(child->base_state.abe_mk, harness.am->base_state.abe_mk);
+  user_t* child_admin = attribute_machine_find_user(child, "child-admin");
+  ASSERT_NE(child_admin, nullptr);
+  EXPECT_TRUE(attribute_machine_user_has_role(child_admin, "role"));
+
+  ASSERT_EQ(parent->child_count, 1u);
+  EXPECT_EQ(parent->children[0].mode, LINEAGE_SOVEREIGN);
+  EXPECT_EQ(parent->children[0].status, LINEAGE_ACTIVE);
+
+  operation_t* op = make_signed_increment_op(child, harness.parent_key,
+                                             "child-admin");
+  ASSERT_NE(op, nullptr);
+  EXPECT_EQ(state_machine_execute(&child->base_state, op), CRABS_SUCCESS);
+  operation_destroy(op);
+
+  attribute_machine_destroy(child);
+  machine_blueprint_destroy(blueprint);
+  spawn_parent_destroy(&harness);
+}
+
+TEST(TestLineage, SpawnRejectsOverLimitChildren) {
+  spawn_parent_harness_t harness;
+  spawn_parent_setup(&harness);
+  state_t* parent = &harness.am->base_state;
+
+  for (uint32_t child_index = 0; child_index < CRABS_MAX_CHILD_MACHINES;
+       child_index++) {
+    char child_name[CRABS_MAX_USER_ID];
+    snprintf(child_name, sizeof(child_name), "child-%02u", child_index);
+    machine_blueprint_t* blueprint = make_valid_blueprint();
+    ASSERT_NE(blueprint, nullptr) << child_name;
+    strncpy(blueprint->child_id, child_name, sizeof(blueprint->child_id) - 1);
+    attribute_machine_t* child = nullptr;
+    ASSERT_EQ(lineage_spawn_machine(parent, blueprint, &child),
+              CRABS_SUCCESS) << child_name;
+    attribute_machine_destroy(child);
+    machine_blueprint_destroy(blueprint);
+  }
+  ASSERT_EQ(parent->child_count, (uint32_t)CRABS_MAX_CHILD_MACHINES);
+
+  // One more than the ceiling: rejected, no partial manifest residue.
+  machine_blueprint_t* overflow = make_valid_blueprint();
+  ASSERT_NE(overflow, nullptr);
+  strncpy(overflow->child_id, "child-overflow", sizeof(overflow->child_id) - 1);
+  attribute_machine_t* rejected_child = nullptr;
+  EXPECT_EQ(lineage_spawn_machine(parent, overflow, &rejected_child),
+            CRABS_ERR_OOM);
+  EXPECT_EQ(rejected_child, nullptr);
+  EXPECT_EQ(parent->child_count, (uint32_t)CRABS_MAX_CHILD_MACHINES);
+  machine_blueprint_destroy(overflow);
+  spawn_parent_destroy(&harness);
+}
+
+TEST(TestLineage, SpawnRejectsDuplicateChildId) {
+  spawn_parent_harness_t harness;
+  spawn_parent_setup(&harness);
+  state_t* parent = &harness.am->base_state;
+  machine_blueprint_t* blueprint = make_valid_blueprint();
+  ASSERT_NE(blueprint, nullptr);
+
+  attribute_machine_t* child = nullptr;
+  ASSERT_EQ(lineage_spawn_machine(parent, blueprint, &child), CRABS_SUCCESS);
+  ASSERT_NE(child, nullptr);
+  ASSERT_EQ(parent->child_count, 1u);
+
+  // The same child_id again is rejected — even with identical content.
+  attribute_machine_t* duplicate = nullptr;
+  EXPECT_EQ(lineage_spawn_machine(parent, blueprint, &duplicate),
+            CRABS_ERR_DUPLICATE_OPERATION);
+  EXPECT_EQ(duplicate, nullptr);
+  EXPECT_EQ(parent->child_count, 1u);
+
+  // A ROOT parent's own machine id is its config.bootstrap_admin — a child
+  // may not take the parent's identity name either.
+  machine_blueprint_t* parent_aliased = make_valid_blueprint();
+  ASSERT_NE(parent_aliased, nullptr);
+  strncpy(parent_aliased->child_id, "parent-root",
+          sizeof(parent_aliased->child_id) - 1);
+  attribute_machine_t* aliased = nullptr;
+  EXPECT_EQ(lineage_spawn_machine(parent, parent_aliased, &aliased),
+            CRABS_ERR_DUPLICATE_OPERATION);
+  EXPECT_EQ(aliased, nullptr);
+  EXPECT_EQ(parent->child_count, 1u);
+  machine_blueprint_destroy(parent_aliased);
+
+  // The spawned child may itself mint — its own lineage_self_id occupies the
+  // same machine-name space, so a grandchild must not reuse it.
+  ecdsa_keypair_t* child_key = crypto_ecdsa_generate();
+  ASSERT_NE(child_key, nullptr);
+  ASSERT_EQ(state_set_node_key(&child->base_state, child_key->private_key,
+                               child_key->public_key), CRABS_SUCCESS);
+  machine_blueprint_t* grandchild = make_valid_blueprint();
+  ASSERT_NE(grandchild, nullptr);
+  strncpy(grandchild->child_id, "child-red",
+          sizeof(grandchild->child_id) - 1);
+  attribute_machine_t* rejected = nullptr;
+  EXPECT_EQ(lineage_spawn_machine(&child->base_state, grandchild, &rejected),
+            CRABS_ERR_DUPLICATE_OPERATION);
+  EXPECT_EQ(rejected, nullptr);
+  EXPECT_EQ(child->base_state.child_count, 0u);
+
+  crypto_ecdsa_keypair_destroy(child_key);
+  machine_blueprint_destroy(grandchild);
+  machine_blueprint_destroy(blueprint);
+  attribute_machine_destroy(child);
+  spawn_parent_destroy(&harness);
+}
+
+TEST(TestLineage, SpawnRejectsInvalidBlueprint) {
+  // Rejects: nullptr arguments, an invalid blueprint, a keyless parent — and
+  // every rejection leaves NO manifest residue and no child allocation.
+  spawn_parent_harness_t harness;
+  spawn_parent_setup(&harness);
+  state_t* parent = &harness.am->base_state;
+  machine_blueprint_t* blueprint = make_valid_blueprint();
+  ASSERT_NE(blueprint, nullptr);
+
+  attribute_machine_t* child = nullptr;
+  EXPECT_EQ(lineage_spawn_machine(nullptr, blueprint, &child),
+            CRABS_ERR_INVALID_PARAM);
+  EXPECT_EQ(lineage_spawn_machine(parent, nullptr, &child),
+            CRABS_ERR_INVALID_PARAM);
+  EXPECT_EQ(lineage_spawn_machine(parent, blueprint, nullptr),
+            CRABS_ERR_INVALID_PARAM);
+  EXPECT_EQ(parent->child_count, 0u);
+
+  blueprint->trust_mode = (lineage_trust_mode_e)0x7F;
+  EXPECT_EQ(lineage_spawn_machine(parent, blueprint, &child),
+            CRABS_ERR_INVALID_PARAM);
+  EXPECT_EQ(child, nullptr);
+  EXPECT_EQ(parent->child_count, 0u);
+  blueprint->trust_mode = LINEAGE_SHARED_ROOT;
+
+  // A parent machine that cannot sign genesis provenance cannot mint.
+  uint8_t phantom_pk[33];
+  memset(phantom_pk, 0xAB, sizeof(phantom_pk));
+  phantom_pk[0] = 0x02;
+  attribute_machine_t* keyless = attribute_machine_create("keyless-root",
+                                                          phantom_pk);
+  ASSERT_NE(keyless, nullptr);
+  keyless->base_state.attr_machine = keyless;
+  EXPECT_FALSE(keyless->base_state.node_key_valid);
+  EXPECT_EQ(lineage_spawn_machine(&keyless->base_state, blueprint, &child),
+            CRABS_ERR_CRYPTOGRAPHIC_ERROR);
+  EXPECT_EQ(child, nullptr);
+  EXPECT_EQ(keyless->base_state.child_count, 0u);
+  attribute_machine_destroy(keyless);
+
+  machine_blueprint_destroy(blueprint);
+  spawn_parent_destroy(&harness);
+}
