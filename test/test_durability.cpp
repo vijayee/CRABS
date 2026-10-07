@@ -33,6 +33,19 @@ static void _import_test_seal_key(cli_node_t* node, char seal_hex[65]) {
   ASSERT_EQ(cli_node_set_seal_key(node, seal_hex), CLI_OK);
 }
 
+// Engine change: a zero-resource custom op whose policy authorizes it but
+// that has no registered handler fails CRABS_ERR_RESOURCE_NOT_FOUND instead
+// of silently succeeding. The fixture ops below ("heartbeat", "increment")
+// only exercise the durability/authority path, so each state that executes
+// them gets this real (trivial) op body — handlers are runtime-only, exactly
+// like the op type defs' runtime siblings, and must be (re-)registered on
+// every state that will execute the op, including a reloaded one.
+static crabs_error_e trivial_no_op_handler(state_t* state, operation_t* op) {
+  (void)state;
+  (void)op;
+  return CRABS_SUCCESS;
+}
+
 TEST(TestDurability, FullMachineSurvivesRestartAndKeepsAuthority) {
   // ------------------------------------------------------------------
   // 1. Live machine through the CLI layer with seal-key custody.
@@ -73,6 +86,9 @@ TEST(TestDurability, FullMachineSurvivesRestartAndKeepsAuthority) {
             CRABS_SUCCESS);
   ASSERT_EQ(state_add_policy(live, "heartbeat", "role:writer OR role:admin"),
             CRABS_SUCCESS);
+  // The op body is runtime-only: register it on the live machine.
+  ASSERT_EQ(state_machine_register_handler(live, "heartbeat",
+            trivial_no_op_handler), CRABS_SUCCESS);
 
   // ------------------------------------------------------------------
   // 4. Execute "heartbeat" as the writer: sign with the custodied key and
@@ -145,6 +161,13 @@ TEST(TestDurability, FullMachineSurvivesRestartAndKeepsAuthority) {
   *restored_writer_key = writer_key_snapshot;
   ASSERT_EQ(cli_node_add_user_key(reloaded, "writer", restored_writer_key),
             CLI_OK);
+
+  // Re-register the runtime-only op body on the reloaded machine: handlers do
+  // not survive the snapshot, so "heartbeat" would otherwise fail loudly
+  // even though its policy and dedup registry were both restored.
+  state_t* reloaded_state = &reloaded->attr_machine->base_state;
+  ASSERT_EQ(state_machine_register_handler(reloaded_state, "heartbeat",
+            trivial_no_op_handler), CRABS_SUCCESS);
 
   operation_t* op2 = operation_create("heartbeat");
   ASSERT_NE(op2, nullptr);
@@ -454,6 +477,11 @@ TEST(TestDurability, LineageSurvivesRestartWithManifestSignatureVerified) {
   // unseal round trip.
   EXPECT_TRUE(authority_restored);
   ASSERT_NE(restored_child->abe_mk, nullptr);
+
+  // Handlers are runtime-only and did not survive the snapshot: give the
+  // reloaded child's "increment" op its trivial body back before executing.
+  ASSERT_EQ(state_machine_register_handler(restored_child, "increment",
+            trivial_no_op_handler), CRABS_SUCCESS);
 
   // The parent binding is intact on the reloaded child.
   EXPECT_TRUE(restored_child->lineage_parent_bound);

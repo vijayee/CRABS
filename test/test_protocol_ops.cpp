@@ -332,12 +332,13 @@ TEST_F(TestProtocolOps, LockNonResourceTypeMismatch) {
 // Custom (Non-Builtin) Operation Rejection
 // ============================================================
 
-// Audit F-5: application-defined (non-builtin) operations are now accepted
-// rather than rejected. They have no C handler; their effect is the dedup
-// state mutation (if any) plus the protocol transition on their resources.
-// A custom op with no resources and a registered (empty) policy is a no-op
-// that succeeds and is recorded in the log.
-TEST_F(TestProtocolOps, CustomOperationAcceptedNoResources) {
+// Audit F-5: application-defined (non-builtin) operations are accepted once
+// a policy authorizes them; their effect comes from either a registered
+// handler or the resources they declare. A declared-but-unimplemented custom
+// op — a (empty) policy passes authorization but nothing else can act on
+// the op — fails loudly with RESOURCE_NOT_FOUND instead of silently logging
+// an empty successful operation.
+TEST_F(TestProtocolOps, CustomOperationWithoutHandlerAndWithoutResourcesFailsLoudly) {
   state_add_policy(state, "custom_transfer", "");
 
   operation_t* op = operation_create("custom_transfer");
@@ -347,7 +348,7 @@ TEST_F(TestProtocolOps, CustomOperationAcceptedNoResources) {
   sign_op(op);
 
   crabs_error_e rc = state_machine_execute(state, op);
-  EXPECT_EQ(rc, CRABS_SUCCESS);
+  EXPECT_EQ(rc, CRABS_ERR_RESOURCE_NOT_FOUND);
   operation_destroy(op);
 }
 

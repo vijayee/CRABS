@@ -234,10 +234,26 @@ static const uint64_t SCHEDULE_FUTURE_MS = 4000000000000ull;
 // The env registers policies only for the builtin ops it knows about; the
 // schedule ops and the custom embedded op type used below need explicit
 // policies so the fail-closed authorization step passes for admin.
+// Trivial real op body for the fixture's zero-resource "mint" filler ops —
+// the durable effect those tests check is the scheduler's, not the op's.
+static crabs_error_e mint_no_op_handler(state_t* state, operation_t* op) {
+  (void)state;
+  (void)op;
+  return CRABS_SUCCESS;
+}
+
 static void register_schedule_test_policies(crabs_test_env_t* env) {
   state_add_policy(env->state, CRABS_OP_SCHEDULE, "role:admin");
   state_add_policy(env->state, CRABS_OP_CANCEL_SCHEDULE, "role:admin");
   state_add_policy(env->state, "mint", "role:admin");
+  // Engine change: a zero-resource custom op with an authorizing policy but
+  // no registered handler fails CRABS_ERR_RESOURCE_NOT_FOUND instead of
+  // silently succeeding, so every "mint" op below gets this real (trivial)
+  // op body and materialization actually materializes again. The failure-path
+  // tests do NOT use this route — they fail a scheduled __lock__ with real
+  // state drift, which still fails (the __lock__ has its own builtin body).
+  ASSERT_EQ(state_machine_register_handler(env->state, "mint",
+            mint_no_op_handler), CRABS_SUCCESS);
 }
 
 static void store_u64_le(uint8_t* out, uint64_t value) {

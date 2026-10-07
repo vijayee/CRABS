@@ -838,6 +838,35 @@ static operation_t* make_signed_increment_op(attribute_machine_t* registry,
   return op;
 }
 
+// Engine change: a zero-resource custom op whose policy authorizes it but
+// that has no registered handler fails CRABS_ERR_RESOURCE_NOT_FOUND instead
+// of silently succeeding. The child fixtures' zero-resource ops ("increment",
+// "render") exist only to exercise the authorization and endorsement gates,
+// so each spawned child that executes them gets this real (trivial) op body.
+// The gates the tests assert on all run in the execute pipeline BEFORE the
+// handler is reached, so denial paths are unaffected.
+static crabs_error_e increment_no_op_handler(state_t* state, operation_t* op) {
+  (void)state;
+  (void)op;
+  return CRABS_SUCCESS;
+}
+
+static crabs_error_e render_no_op_handler(state_t* state, operation_t* op) {
+  (void)state;
+  (void)op;
+  return CRABS_SUCCESS;
+}
+
+static void register_child_increment_handler(attribute_machine_t* child) {
+  ASSERT_EQ(state_machine_register_handler(&child->base_state, "increment",
+            increment_no_op_handler), CRABS_SUCCESS);
+}
+
+static void register_child_render_handler(attribute_machine_t* child) {
+  ASSERT_EQ(state_machine_register_handler(&child->base_state, "render",
+            render_no_op_handler), CRABS_SUCCESS);
+}
+
 TEST(TestLineage, SpawnSharedRootSharesParentAuthority) {
   spawn_parent_harness_t harness;
   spawn_parent_setup(&harness);
@@ -857,6 +886,7 @@ TEST(TestLineage, SpawnSharedRootSharesParentAuthority) {
   attribute_machine_t* child = nullptr;
   ASSERT_EQ(lineage_spawn_machine(parent, blueprint, &child), CRABS_SUCCESS);
   ASSERT_NE(child, nullptr);
+  register_child_increment_handler(child);
 
   // Same authority: attribute machine pointer AND the live MSK.
   EXPECT_EQ(child->base_state.attr_machine, harness.am);
@@ -953,6 +983,7 @@ TEST(TestLineage, SpawnDelegatedCopyMintsFreshAuthority) {
   attribute_machine_t* child = nullptr;
   ASSERT_EQ(lineage_spawn_machine(parent, blueprint, &child), CRABS_SUCCESS);
   ASSERT_NE(child, nullptr);
+  register_child_increment_handler(child);
 
   // Fresh authority: own attribute machine AND own MSK.
   EXPECT_NE(child->base_state.attr_machine, harness.am);
@@ -1004,6 +1035,7 @@ TEST(TestLineage, SpawnSovereignGeneratesOwnMsk) {
   attribute_machine_t* child = nullptr;
   ASSERT_EQ(lineage_spawn_machine(parent, blueprint, &child), CRABS_SUCCESS);
   ASSERT_NE(child, nullptr);
+  register_child_increment_handler(child);
 
   EXPECT_NE(child->base_state.attr_machine, harness.am);
   ASSERT_NE(child->base_state.abe_mk, nullptr);
@@ -2198,6 +2230,7 @@ TEST(TestLineage, DelegatedChildLosesEndorsementAfterAttestationExpiry) {
   attribute_machine_t* child = nullptr;
   ASSERT_EQ(lineage_spawn_machine(parent, blueprint, &child), CRABS_SUCCESS);
   state_set_time_source(&child->base_state, &g_test_clock_ops);
+  register_child_render_handler(child);
 
   // The manifest ttl flows into the wrapper's expiry: expires = T0 + 60000.
   attestation_t attestation;
@@ -2252,6 +2285,7 @@ TEST(TestLineage, SharedRootChildStopsInstantlyOnParentRevoke) {
   ASSERT_NE(blueprint, nullptr);
   attribute_machine_t* child = nullptr;
   ASSERT_EQ(lineage_spawn_machine(parent, blueprint, &child), CRABS_SUCCESS);
+  register_child_increment_handler(child);
 
   // No custodial attribute yet — denied.
   operation_t* denied = make_signed_increment_op(harness.am,
@@ -2297,6 +2331,7 @@ TEST(TestLineage, DissolveVoidsEndorsementsImmediately) {
   attribute_machine_t* child = nullptr;
   ASSERT_EQ(lineage_spawn_machine(parent, blueprint, &child), CRABS_SUCCESS);
   state_set_time_source(&child->base_state, &g_test_clock_ops);
+  register_child_render_handler(child);
 
   attestation_t attestation;
   ASSERT_EQ(crabs_issue_attestation(parent, &attestation, "child-delegated",
