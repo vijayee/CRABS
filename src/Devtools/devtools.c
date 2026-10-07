@@ -12,6 +12,7 @@
 #include "../CRDT/crdt_merge.h"
 #include "../CRDT/one_shot.h"
 #include "../HLC/hlc.h"
+#include "../Lineage/lineage.h"
 #include "../Trigger/trigger.h"
 #include "../Scheduler/scheduler.h"
 #include "../Util/allocator.h"
@@ -591,6 +592,27 @@ static void _write_schedules_json(json_writer_t* writer, const state_t* state) {
   _json_writer_raw(writer, "]");
 }
 
+static void _write_lineage_json(json_writer_t* writer, const state_t* state) {
+  _json_writer_raw(writer, "\"children\":[");
+  for (uint32_t child_index = 0; child_index < state->child_count; child_index++) {
+    if (child_index > 0) _json_writer_raw(writer, ",");
+    const child_manifest_entry_t* manifest_entry =
+        &state->children[child_index];
+    _json_writer_raw(writer, "{\"child_id\":");
+    _json_writer_string(writer, manifest_entry->child_id);
+    _json_writer_raw(writer, ",\"mode\":");
+    _json_writer_string(writer, lineage_mode_name(manifest_entry->mode));
+    _json_writer_raw(writer, ",\"status\":");
+    _json_writer_string(writer, lineage_status_name(manifest_entry->status));
+    _json_writer_raw(writer, ",\"spawned_at\":");
+    _json_writer_uint(writer, manifest_entry->spawned_at);
+    _json_writer_raw(writer, ",\"attestation_ttl_ms\":");
+    _json_writer_uint(writer, manifest_entry->attestation_ttl_ms);
+    _json_writer_raw(writer, "}");
+  }
+  _json_writer_raw(writer, "]");
+}
+
 char* devtools_snapshot_json(const state_t* state) {
   if (!state) return NULL;
 
@@ -629,6 +651,8 @@ char* devtools_snapshot_json(const state_t* state) {
   _write_log_head_json(&writer, state);
   _json_writer_raw(&writer, ",");
   _write_schedules_json(&writer, state);
+  _json_writer_raw(&writer, ",");
+  _write_lineage_json(&writer, state);
   _json_writer_raw(&writer, "}");
   return writer.data;
 }

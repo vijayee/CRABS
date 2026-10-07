@@ -10,6 +10,7 @@
 
 extern "C" {
 #include "Devtools/devtools.h"
+#include "Lineage/lineage.h"
 #include "CRABS/data_model.h"
 #include "StateMachine/state_machine.h"
 #include "Trigger/trigger.h"
@@ -419,4 +420,80 @@ TEST(DevtoolsSnapshot, RecurringSchedulesSection) {
 
   operation_destroy(embedded);
   crabs_test_env_destroy(&env);
+}
+
+// ============================================================
+// DevtoolsSnapshot: lineage (children manifest) section
+// ============================================================
+
+// A shared-root blueprint that satisfies every validation rule (same shape as
+// test_lineage.cpp's make_valid_blueprint).
+static machine_blueprint_t* make_shared_root_blueprint(void) {
+  machine_blueprint_t* blueprint = machine_blueprint_create();
+  EXPECT_NE(blueprint, nullptr);
+  strncpy(blueprint->child_id, "child-red", sizeof(blueprint->child_id) - 1);
+  blueprint->trust_mode = LINEAGE_SHARED_ROOT;
+  strncpy(blueprint->bootstrap_admin, "parent-admin",
+          sizeof(blueprint->bootstrap_admin) - 1);
+  blueprint->attestation_ttl_ms = 60000;
+
+  EXPECT_EQ(blueprint_add_item(blueprint, "counter", DATA_TYPE_COUNTER,
+                               CRDT_G_COUNTER), CRABS_SUCCESS);
+  EXPECT_EQ(blueprint_add_policy(blueprint, "increment",
+                                 "custody:child-red"), CRABS_SUCCESS);
+
+  dedup_spec_t dedup;
+  memset(&dedup, 0, sizeof(dedup));
+  dedup.type = DEDUP_NONE;
+  EXPECT_EQ(blueprint_add_op_type_def(blueprint, "increment", &dedup),
+            CRABS_SUCCESS);
+
+  EXPECT_EQ(lineage_blueprint_validate(blueprint), CRABS_SUCCESS);
+  return blueprint;
+}
+
+TEST(DevtoolsSnapshot, SnapshotCarriesLineageSection) {
+  // Spawn parent wired the way test_lineage.cpp's spawn_parent_setup does it:
+  // heap attribute machine, node key on the embedded state, self-reference.
+  ecdsa_keypair_t* parent_key = crypto_ecdsa_generate();
+  ASSERT_NE(parent_key, nullptr);
+  attribute_machine_t* parent_machine =
+      attribute_machine_create("parent-root", parent_key->public_key);
+  ASSERT_NE(parent_machine, nullptr);
+  ASSERT_EQ(state_set_node_key(&parent_machine->base_state,
+                               parent_key->private_key,
+                               parent_key->public_key), CRABS_SUCCESS);
+  parent_machine->base_state.attr_machine = parent_machine;
+
+  machine_blueprint_t* blueprint = make_shared_root_blueprint();
+  ASSERT_NE(blueprint, nullptr);
+  attribute_machine_t* child = nullptr;
+  ASSERT_EQ(lineage_spawn_machine(&parent_machine->base_state, blueprint,
+                                  &child), CRABS_SUCCESS);
+  ASSERT_NE(child, nullptr);
+
+  char* json = devtools_snapshot_json(&parent_machine->base_state);
+  ASSERT_NE(json, nullptr);
+  std::string text = json;
+  devtools_string_destroy(json);
+
+  EXPECT_TRUE(contains(text, "\"children\":"));
+  EXPECT_TRUE(contains(text, "\"child_id\":\"child-red\""));
+  EXPECT_TRUE(contains(text, "\"mode\":\"shared_root\""));
+  EXPECT_TRUE(contains(text, "\"status\":\"active\""));
+  EXPECT_TRUE(contains(text, "\"spawned_at\":"));
+  EXPECT_TRUE(contains(text, "\"attestation_ttl_ms\":60000"));
+
+  // A machine with an empty manifest renders an empty array (here: the just
+  // spawned child, which has spawned nothing of its own).
+  char* child_json = devtools_snapshot_json(&child->base_state);
+  ASSERT_NE(child_json, nullptr);
+  std::string child_text = child_json;
+  devtools_string_destroy(child_json);
+  EXPECT_TRUE(contains(child_text, "\"children\":[]"));
+
+  attribute_machine_destroy(child);
+  machine_blueprint_destroy(blueprint);
+  attribute_machine_destroy(parent_machine);
+  crypto_ecdsa_keypair_destroy(parent_key);
 }
