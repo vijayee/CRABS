@@ -2080,3 +2080,37 @@ TEST(TestLineage, RevokedChildCannotReceiveNewAttestations) {
   attribute_machine_destroy(child);
   spawn_parent_destroy(&harness);
 }
+
+// ============================================================
+// Manifest entry accessor
+// ============================================================
+
+TEST(TestLineage, FindManifestEntryResolvesById) {
+  spawn_parent_harness_t harness;
+  spawn_parent_setup(&harness);
+  state_t* parent = &harness.am->base_state;
+  machine_blueprint_t* blueprint = make_valid_blueprint();
+  ASSERT_NE(blueprint, nullptr);
+
+  attribute_machine_t* child = nullptr;
+  ASSERT_EQ(lineage_spawn_machine(parent, blueprint, &child), CRABS_SUCCESS);
+  ASSERT_NE(child, nullptr);
+
+  // Hit: the entry resolves by id and carries the mode the blueprint named.
+  child_manifest_entry_t* entry =
+      lineage_find_manifest_entry(parent, "child-red");
+  ASSERT_NE(entry, nullptr);
+  EXPECT_EQ(entry->mode, blueprint->trust_mode);
+  EXPECT_STREQ(entry->child_id, "child-red");
+
+  // Miss: an id absent from the manifest yields NULL, not garbage.
+  EXPECT_EQ(lineage_find_manifest_entry(parent, "child-ghost"), nullptr);
+
+  // Null-safe: a NULL state (and NULL id) returns NULL, no crash.
+  EXPECT_EQ(lineage_find_manifest_entry(nullptr, "child-red"), nullptr);
+  EXPECT_EQ(lineage_find_manifest_entry(parent, nullptr), nullptr);
+
+  attribute_machine_destroy(child);
+  machine_blueprint_destroy(blueprint);
+  spawn_parent_destroy(&harness);
+}

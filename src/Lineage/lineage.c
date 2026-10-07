@@ -1289,6 +1289,20 @@ uint32_t lineage_query_children(const state_t* state,
   return state->child_count;
 }
 
+child_manifest_entry_t* lineage_find_manifest_entry(const state_t* state,
+                                                    const char* child_id) {
+  if (state == NULL || child_id == NULL) return NULL;
+  // Borrowed pointer into the state-owned manifest array; entries of every
+  // status resolve — the caller interprets the status byte.
+  for (uint32_t child_index = 0; child_index < state->child_count;
+       child_index++) {
+    if (strcmp(state->children[child_index].child_id, child_id) == 0) {
+      return &state->children[child_index];
+    }
+  }
+  return NULL;
+}
+
 crabs_error_e lineage_op_spawn(state_t* state, operation_t* op) {
   if (state == NULL || op == NULL || op->payload == NULL ||
       op->payload_size == 0) {

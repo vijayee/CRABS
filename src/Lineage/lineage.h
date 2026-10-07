@@ -231,6 +231,12 @@ attribute_machine_t* lineage_query_resident_child(const state_t* state,
 uint32_t lineage_query_children(const state_t* state,
                                 const child_manifest_entry_t** out_entries);
 
+// Borrowed pointer to the manifest entry for child_id, or NULL. O(n) over the
+// (small, capped) manifest; entries of every status resolve (callers
+// interpret the status byte). Returns NULL on NULL inputs.
+child_manifest_entry_t* lineage_find_manifest_entry(const state_t* state,
+                                                    const char* child_id);
+
 // ============================================================
 // Lineage ops: spawn / revoke attestation / dissolve / withdraw via the
 // operation pipeline
