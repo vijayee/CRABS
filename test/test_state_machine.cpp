@@ -733,6 +733,50 @@ TEST_F(TestStateMachine, ModeAOperationEnforcesMinKeyVersionFloor) {
   operation_destroy(op);
 }
 
+// Audit A10-M2: In Mode B (anonymous signer) the primary signer leaves
+// op->signer_id empty and is resolved by the authorization step into the
+// keyring-matched user. Per v1.3 §4.2 co-signers must be distinct from the
+// primary signer, so the resolved signer must not also occupy a co-signer
+// slot — otherwise one party satisfies a threshold of 2 alone.
+TEST_F(TestStateMachine, ModeBPrimarySignerCannotDoubleAsCoSigner) {
+  state->config.sig_config.co_sign_threshold = 2;
+
+  // Register a second, genuinely distinct admin (bob) with a real key.
+  ecdsa_keypair_t* bob_key = crypto_ecdsa_generate();
+  ASSERT_NE(bob_key, nullptr);
+  ASSERT_EQ(crabs_test_register_user_with_role(am, "bob", bob_key->public_key,
+                                               "role", "admin"),
+            CRABS_SUCCESS);
+
+  // Mode B: signer_id empty, signed by alice — she is the resolved primary
+  // signer after step 3's trial verification.
+  operation_t* op = make_anonymous_lock_op();
+
+  // Co-signer slot 0: alice again, doubling her resolved primary role.
+  // Co-signer slot 1: bob, a valid second signer.
+  op->co_signers = (co_signature_t*)calloc(2, sizeof(co_signature_t));
+  ASSERT_NE(op->co_signers, nullptr);
+  serialized_buffer_t* co_ser = crabs_serialize_for_signing(op);
+  ASSERT_NE(co_ser, nullptr);
+  strncpy(op->co_signers[0].signer_id, "alice", CRABS_MAX_USER_ID - 1);
+  ASSERT_EQ(crypto_ecdsa_sign(alice_key->private_key, co_ser->data, co_ser->len,
+                              op->co_signers[0].signature),
+            CRABS_SUCCESS);
+  op->co_signers[0].signature_len = CRABS_SIG_SIZE;
+  strncpy(op->co_signers[1].signer_id, "bob", CRABS_MAX_USER_ID - 1);
+  ASSERT_EQ(crypto_ecdsa_sign(bob_key->private_key, co_ser->data, co_ser->len,
+                              op->co_signers[1].signature),
+            CRABS_SUCCESS);
+  op->co_signers[1].signature_len = CRABS_SIG_SIZE;
+  serialized_buffer_destroy(co_ser);
+  op->co_signer_count = 2;
+
+  EXPECT_EQ(state_machine_execute(state, op), CRABS_ERR_DUPLICATE_OPERATION);
+
+  operation_destroy(op);
+  crypto_ecdsa_keypair_destroy(bob_key);
+}
+
 TEST_F(TestStateMachine, TestRefreshKey) {
   // Record alice's key_version before refresh
   user_t* alice = attribute_machine_find_user(am, "alice");

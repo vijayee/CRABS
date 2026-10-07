@@ -895,9 +895,13 @@ static crabs_error_e _check_scheme_constraints(state_t* state, const operation_t
 // the primary signer. When a threshold is configured, it is enforced
 // unconditionally (no fail-open bypass). `pp` is the preprocessed policy from
 // step 3 — co-signatures verify against the same ABE policy as the primary
-// signer.
+// signer. `resolved_signer` is the signer RESOLVED by step 3 (op->signer_id
+// for Mode A, the keyring-matched user for anonymous Mode B ops) — audit
+// A10-M2: without it, a Mode B proposer could also occupy a co-signer slot,
+// defeating the threshold.
 static crabs_error_e _verify_co_signatures(state_t* state, const operation_t* op,
-                                           const policy_preprocess_result_t* pp) {
+                                           const policy_preprocess_result_t* pp,
+                                           const char* resolved_signer) {
   if (op->co_signer_count > 0) {
     serialized_buffer_t* co_ser = crabs_serialize_for_signing(op);
     if (co_ser == NULL) return CRABS_ERR_SERIALIZATION_ERROR;
@@ -908,8 +912,13 @@ static crabs_error_e _verify_co_signatures(state_t* state, const operation_t* op
         serialized_buffer_destroy(co_ser);
         return CRABS_ERR_INVALID_PARAM;
       }
-      // Distinctness: no co-signer may duplicate another or the primary signer.
-      if (strcmp(cs->signer_id, op->signer_id) == 0) {
+      // Distinctness: no co-signer may duplicate another or the primary
+      // signer. The primary signer is checked under both names: op->signer_id
+      // (Mode A) and the resolved keyring match (Mode B, where op->signer_id
+      // is empty).
+      if (strcmp(cs->signer_id, op->signer_id) == 0 ||
+          (resolved_signer != NULL && resolved_signer[0] != '\0' &&
+           strcmp(cs->signer_id, resolved_signer) == 0)) {
         serialized_buffer_destroy(co_ser);
         return CRABS_ERR_DUPLICATE_OPERATION;
       }
@@ -1099,7 +1108,8 @@ static crabs_error_e state_machine_execute_internal(state_t* state, operation_t*
       return scheme_rc;
     }
 
-    crabs_error_e co_signature_rc = _verify_co_signatures(state, op, &pp);
+    crabs_error_e co_signature_rc = _verify_co_signatures(state, op, &pp,
+                                                          resolved_signer);
     if (co_signature_rc != CRABS_SUCCESS) {
       return co_signature_rc;
     }
@@ -1313,7 +1323,7 @@ crabs_error_e state_machine_validate(state_t* state, const operation_t* op) {
   if (rc != CRABS_SUCCESS) return rc;
   rc = _check_scheme_constraints(state, op, resolved_signer);
   if (rc != CRABS_SUCCESS) return rc;
-  rc = _verify_co_signatures(state, op, &pp);
+  rc = _verify_co_signatures(state, op, &pp, resolved_signer);
   if (rc != CRABS_SUCCESS) return rc;
   return CRABS_SUCCESS;
 }
