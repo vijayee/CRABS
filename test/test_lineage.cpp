@@ -902,12 +902,18 @@ TEST(TestLineage, SpawnSharedRootSharesParentAuthority) {
                                   manifest_entry->genesis_attestation_signature));
   serialized_buffer_destroy(genesis);
 
-  // Change event: kind SPAWN, type __spawn_machine__, no uuid/signer.
+  // Change event: kind SPAWN, type __spawn_machine__, no uuid/signer, but
+  // attributed to the parent's node identity (per-node devtools drains and
+  // node.on('change') dispatch both filter on the node field).
   ASSERT_EQ(captured_event_count, 1u);
   EXPECT_EQ(captured_events[0].kind, CRABS_CHANGE_SPAWN);
   EXPECT_STREQ(captured_events[0].type, "__spawn_machine__");
   EXPECT_EQ(captured_events[0].uuid, nullptr);
   EXPECT_EQ(captured_events[0].signer_id, nullptr);
+  EXPECT_NE(captured_events[0].node_id, nullptr);
+  // The harness's parent state has no HLC initializer, so the node identity
+  // falls back to the bootstrap admin.
+  EXPECT_STREQ(captured_events[0].node_id, "parent-root");
   EXPECT_STREQ(captured_events[0].target, "child-red");
   EXPECT_EQ(captured_events[0].result, CRABS_SUCCESS);
 
@@ -1569,11 +1575,13 @@ TEST(TestLineage, RevokeAttestationViaOp) {
   ASSERT_NE(revoke, nullptr);
   EXPECT_EQ(state_machine_execute(parent, revoke), CRABS_SUCCESS);
   EXPECT_EQ(parent->children[0].status, LINEAGE_ATTESTATION_REVOKED);
-  // Change event: kind LINEAGE, the revoke op type, target = child.
+  // Change event: kind LINEAGE, the revoke op type, target = child, and
+  // attributed to the executing op (signer/node/uuid) — per-node devtools
+  // drains and node.on('change') dispatch both filter on the node field.
   ASSERT_EQ(captured_event_count, 1u);
   EXPECT_EQ(captured_events[0].kind, CRABS_CHANGE_LINEAGE);
   EXPECT_STREQ(captured_events[0].type, "__revoke_attestation__");
-  EXPECT_EQ(captured_events[0].uuid, nullptr);
+  EXPECT_NE(captured_events[0].uuid, nullptr);
   EXPECT_STREQ(captured_events[0].target, "child-red");
   EXPECT_STREQ(captured_events[0].preview, "attestation issuing revoked");
   EXPECT_EQ(captured_events[0].result, CRABS_SUCCESS);
@@ -1642,11 +1650,13 @@ TEST(TestLineage, DissolveViaOpSeversResidentChildImmediately) {
       "child-red", strlen("child-red"));
   ASSERT_NE(dissolve, nullptr);
   EXPECT_EQ(state_machine_execute(parent, dissolve), CRABS_SUCCESS);
-  // Change event: kind LINEAGE, the dissolve op type, target = child.
+  // Change event: kind LINEAGE, the dissolve op type, target = child, and
+  // attributed to the executing op (signer/node/uuid) — per-node devtools
+  // drains and node.on('change') dispatch both filter on the node field.
   ASSERT_EQ(captured_event_count, 1u);
   EXPECT_EQ(captured_events[0].kind, CRABS_CHANGE_LINEAGE);
   EXPECT_STREQ(captured_events[0].type, "__dissolve_machine__");
-  EXPECT_EQ(captured_events[0].uuid, nullptr);
+  EXPECT_NE(captured_events[0].uuid, nullptr);
   EXPECT_STREQ(captured_events[0].target, "child-red");
   EXPECT_STREQ(captured_events[0].preview, "dissolved");
   EXPECT_EQ(captured_events[0].result, CRABS_SUCCESS);
@@ -1727,11 +1737,13 @@ TEST(TestLineage, SovereignDissolveRefusedWithdrawSovereignOnly) {
       CRABS_LINEAGE_OP_WITHDRAW_GENESIS, "child-sov", strlen("child-sov"));
   ASSERT_NE(withdraw, nullptr);
   EXPECT_EQ(state_machine_execute(parent, withdraw), CRABS_SUCCESS);
-  // Change event: kind LINEAGE, the withdraw op type, target = child.
+  // Change event: kind LINEAGE, the withdraw op type, target = child, and
+  // attributed to the executing op (signer/node/uuid) — per-node devtools
+  // drains and node.on('change') dispatch both filter on the node field.
   ASSERT_EQ(captured_event_count, 1u);
   EXPECT_EQ(captured_events[0].kind, CRABS_CHANGE_LINEAGE);
   EXPECT_STREQ(captured_events[0].type, "__withdraw_genesis__");
-  EXPECT_EQ(captured_events[0].uuid, nullptr);
+  EXPECT_NE(captured_events[0].uuid, nullptr);
   EXPECT_STREQ(captured_events[0].target, "child-sov");
   EXPECT_STREQ(captured_events[0].preview, "genesis attested chain withdrawn");
   EXPECT_EQ(captured_events[0].result, CRABS_SUCCESS);

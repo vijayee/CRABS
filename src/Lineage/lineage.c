@@ -1198,9 +1198,17 @@ crabs_error_e lineage_spawn_machine(state_t* parent,
           manifest_entry->status = LINEAGE_ACTIVE;
           parent->child_count += 1;
 
+          // Attribute the spawn to the parent's node identity (same HLC-id
+          // idiom as the scheduler's change events): per-node devtools
+          // drains and node.on('change') dispatch both filter by the node
+          // field, so an un-attributed spawn event reaches no observer.
+          const char* parent_node_id = parent->hlc_state_initialized
+              ? parent->hlc_state.last.node_id
+              : parent->config.bootstrap_admin;
           state_notify_change(parent, CRABS_CHANGE_SPAWN,
-                              CRABS_LINEAGE_OP_SPAWN, NULL, NULL, NULL,
-                              blueprint->child_id, "machine spawned", CRABS_SUCCESS);
+                              CRABS_LINEAGE_OP_SPAWN, NULL, NULL,
+                              parent_node_id, blueprint->child_id,
+                              "machine spawned", CRABS_SUCCESS);
           *child_out = child;
         }
       }
@@ -1352,9 +1360,13 @@ crabs_error_e lineage_op_revoke_attestation(state_t* state, operation_t* op) {
     return CRABS_ERR_UNAUTHORIZED;
   }
   manifest_entry->status = LINEAGE_ATTESTATION_REVOKED;
+  // Attribute via the op (signer/node/uuid) like the other lineage lifecycle
+  // events — per-node devtools drains and node.on('change') dispatch both
+  // filter by the node field.
   state_notify_change(state, CRABS_CHANGE_LINEAGE,
-                      CRABS_LINEAGE_OP_REVOKE_ATTESTATION, NULL, NULL, NULL,
-                      child_id, "attestation issuing revoked", CRABS_SUCCESS);
+                      CRABS_LINEAGE_OP_REVOKE_ATTESTATION, op->uuid,
+                      op->signer_id, op->node_id, child_id,
+                      "attestation issuing revoked", CRABS_SUCCESS);
   return CRABS_SUCCESS;
 }
 
@@ -1389,7 +1401,8 @@ crabs_error_e lineage_op_dissolve(state_t* state, operation_t* op) {
   }
   _lineage_drop_resident_child(state, child_id);
   state_notify_change(state, CRABS_CHANGE_LINEAGE, CRABS_LINEAGE_OP_DISSOLVE,
-                      NULL, NULL, NULL, child_id, "dissolved", CRABS_SUCCESS);
+                      op->uuid, op->signer_id, op->node_id, child_id,
+                      "dissolved", CRABS_SUCCESS);
   return CRABS_SUCCESS;
 }
 
@@ -1417,8 +1430,9 @@ crabs_error_e lineage_op_withdraw_genesis(state_t* state, operation_t* op) {
   }
   manifest_entry->status = LINEAGE_WITHDRAWN;
   state_notify_change(state, CRABS_CHANGE_LINEAGE,
-                      CRABS_LINEAGE_OP_WITHDRAW_GENESIS, NULL, NULL, NULL,
-                      child_id, "genesis attested chain withdrawn",
+                      CRABS_LINEAGE_OP_WITHDRAW_GENESIS, op->uuid,
+                      op->signer_id, op->node_id, child_id,
+                      "genesis attested chain withdrawn",
                       CRABS_SUCCESS);
   return CRABS_SUCCESS;
 }

@@ -608,6 +608,14 @@ static void _write_lineage_json(json_writer_t* writer, const state_t* state) {
     _json_writer_uint(writer, manifest_entry->spawned_at);
     _json_writer_raw(writer, ",\"attestation_ttl_ms\":");
     _json_writer_uint(writer, manifest_entry->attestation_ttl_ms);
+    // Residency answers lineage_query_resident_child: true only while the
+    // parent still holds this child in-process (spawned here, not dissolved
+    // and not dropped by its owner out-of-band) — the panel renders the
+    // [resident]/[off-process] marker from it.
+    _json_writer_raw(writer, ",\"resident\":");
+    _json_writer_raw(writer, lineage_query_resident_child(
+                         state, manifest_entry->child_id) != NULL
+                         ? "true" : "false");
     _json_writer_raw(writer, "}");
   }
   _json_writer_raw(writer, "]");

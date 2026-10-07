@@ -34,6 +34,9 @@ function deriveView(snapshot) {
     triggers: keyBy(snapshot.triggers, 'id'),
     users: keyBy(snapshot.users, 'id'),
     schedules: keyBy(snapshot.schedules, 'id'),
+    // Spawned child machines (lineage manifest), keyed by child_id so the
+    // State tree's lineage section lists children by id, not array index.
+    children: keyBy(snapshot.children ?? [], 'child_id'),
     log_head: snapshot.log_head || { entries: 0, state_hash: '' },
   };
 }

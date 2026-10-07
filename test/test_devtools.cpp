@@ -483,6 +483,9 @@ TEST(DevtoolsSnapshot, SnapshotCarriesLineageSection) {
   EXPECT_TRUE(contains(text, "\"status\":\"active\""));
   EXPECT_TRUE(contains(text, "\"spawned_at\":"));
   EXPECT_TRUE(contains(text, "\"attestation_ttl_ms\":60000"));
+  // The child spawned in-process is still held by the parent's
+  // resident-children registry, so the snapshot marks it resident.
+  EXPECT_TRUE(contains(text, "\"resident\":true"));
 
   // A machine with an empty manifest renders an empty array (here: the just
   // spawned child, which has spawned nothing of its own).

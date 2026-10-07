@@ -20,15 +20,36 @@
   const BADGE_COLORS = { added: '#d1fae5', changed: '#fef3c7', removed: '#fee2e2' };
   const BADGE_TEXT = { added: '#065f46', changed: '#92400e', removed: '#991b1b' };
 
-  // Timeline layer pill colors: [background, text]. Unknown or missing layers
-  // fall back to gray with the 'op' label.
+  // Timeline layer pill colors: [background, text]. Unknown or missing
+  // layers fall back to gray with the 'op' label. 'spawn' (violet) marks
+  // lineage spawn ops; 'lineage' (teal) marks attest/dissolve/withdraw
+  // lineage lifecycle events.
   const LAYER_COLORS = {
     op: ['#dbeafe', '#1e40af'],
     schedule: ['#fef3c7', '#92400e'],
     trigger: ['#d1fae5', '#065f46'],
     attribute: ['#e5e7eb', '#374151'],
+    spawn: ['#ede9fe', '#5b21b6'],
+    lineage: ['#ccfbf1', '#0f766e'],
   };
   const LAYER_FALLBACK = { background: '#f3f4f6', color: '#374151', label: 'op' };
+
+  // Lineage mode/status pill colors for the State tab's lineage section:
+  // [background, text], same light-theme pastel family as the layer pills
+  // above (Tailwind 100-level fills with 800/700-level text). Unknown values
+  // fall back to the shared gray.
+  const LINEAGE_MODE_COLORS = {
+    shared_root: ['#e0e7ff', '#3730a3'],
+    delegated_copy: ['#ede9fe', '#5b21b6'],
+    sovereign: ['#ccfbf1', '#0f766e'],
+  };
+  const LINEAGE_STATUS_COLORS = {
+    active: ['#d1fae5', '#065f46'],
+    attestation_revoked: ['#fef3c7', '#92400e'],
+    dissolved: ['#fee2e2', '#991b1b'],
+    withdrawn: ['#e5e7eb', '#374151'],
+  };
+  const LINEAGE_PILL_FALLBACK = ['#f3f4f6', '#374151'];
 
   // Toggle icon: the Encryptstacean logo from the project README,
   // downscaled to 72px and inlined as a data URI so the devtools stay
@@ -167,6 +188,20 @@
     return JSON.stringify(value);
   }
 
+  // Human attestation-TTL hint, exact below a second, then m/h with the
+  // simple unit ladder and one decimal in days (e.g. '800ms', '45s',
+  // '5m', '2h', '1.5d'). Returns '' for anything non-numeric so a
+  // malformed entry renders without a hint instead of lying (e.g. 'NaNm').
+  function formatDurationHint(ttlMs) {
+    if (typeof ttlMs !== 'number' || !(ttlMs >= 0)) return '';
+    if (ttlMs < 1000) return ttlMs + 'ms';
+    const seconds = ttlMs / 1000;
+    if (seconds < 60) return Math.floor(seconds) + 's';
+    if (seconds < 3600) return Math.floor(seconds / 60) + 'm';
+    if (seconds < 86400) return Math.floor(seconds / 3600) + 'h';
+    return (seconds / 86400).toFixed(1) + 'd';
+  }
+
   // Render a snapshot subtree as an expandable tree. `diffs` maps dot-paths
   // to 'added' | 'changed' | 'removed' for badge highlighting; `expandedPaths`
   // is a per-panel Set of dot-paths that persists across re-renders.
@@ -185,7 +220,94 @@
       badge.style.marginLeft = '6px';
       row.appendChild(badge);
     };
+    // Mode/status pills in the lineage section reuse the timeline's pill
+    // idiom ('layer-pill' class) with the lineage palettes above.
+    const appendPill = (row, label, colors) => {
+      const pill = document.createElement('span');
+      pill.className = 'layer-pill';
+      pill.textContent = String(label);
+      const [background, textColor] = colors || LINEAGE_PILL_FALLBACK;
+      pill.style.background = background;
+      pill.style.color = textColor;
+      row.appendChild(pill);
+    };
+    // One lineage child's row: child_id, residency marker, attestation TTL
+    // hint, mode + status pills, and a diff badge when any field under the
+    // child changed (or was added) in the latest snapshot.
+    const renderLineageRow = (childId, child, depth) => {
+      const row = document.createElement('div');
+      row.className = 'tree-row';
+      row.style.paddingLeft = (depth * 14) + 'px';
+      const identifier = document.createElement('span');
+      identifier.className = 'mono';
+      identifier.textContent = childId;
+      row.appendChild(identifier);
+      // Residency comes from the C snapshot (lineage_query_resident_child):
+      // true only while the parent still holds the child in this process.
+      const residency = document.createElement('span');
+      residency.className = 'mono';
+      residency.style.color = '#9ca3af';
+      residency.textContent = child.resident === true
+        ? ' [resident]' : ' [off-process]';
+      row.appendChild(residency);
+      const ttlHint = formatDurationHint(child.attestation_ttl_ms);
+      if (ttlHint) {
+        const ttl = document.createElement('span');
+        ttl.className = 'mono';
+        ttl.style.color = '#9ca3af';
+        ttl.textContent = ' · ttl ' + ttlHint;
+        row.appendChild(ttl);
+      }
+      appendPill(row, child.mode, LINEAGE_MODE_COLORS[child.mode]);
+      appendPill(row, child.status, LINEAGE_STATUS_COLORS[child.status]);
+      const changedPath = Object.keys(diffs).find(
+        (diffPath) => diffPath.indexOf('children.' + childId + '.') === 0);
+      if (changedPath) appendBadge(row, diffs[changedPath]);
+      container.appendChild(row);
+    };
+
+    // The Lineage section: keyed child-machine manifest from the snapshot
+    // ('lineage (' + N + ')' header, matching the other section headers).
+    const renderLineageSection = (childrenByKey, depth) => {
+      const childIds = Object.keys(childrenByKey);
+      const row = document.createElement('div');
+      row.className = 'tree-row';
+      row.style.paddingLeft = (depth * 14) + 'px';
+      if (childIds.length === 0) {
+        const label = document.createElement('span');
+        label.className = 'mono muted';
+        label.textContent = 'lineage: none';
+        row.appendChild(label);
+        container.appendChild(row);
+        return;
+      }
+      const toggle = document.createElement('span');
+      toggle.className = 'tree-toggle mono';
+      const expanded = expandedPaths.has('children');
+      toggle.textContent = (expanded ? '▾ ' : '▸ ') +
+        'lineage (' + childIds.length + ')';
+      toggle.style.cursor = 'pointer';
+      toggle.addEventListener('click', () => {
+        if (expandedPaths.has('children')) expandedPaths.delete('children');
+        else expandedPaths.add('children');
+        renderStateTree(container, snapshot, diffs, expandedPaths);
+      });
+      row.appendChild(toggle);
+      container.appendChild(row);
+      if (expanded) {
+        for (const childId of childIds) {
+          renderLineageRow(childId, childrenByKey[childId], depth + 1);
+        }
+      }
+    };
+
     const renderValue = (value, path, depth) => {
+      // The children manifest gets a dedicated lineage section (pills,
+      // residency) instead of the generic field-per-row tree.
+      if (path === 'children') {
+        renderLineageSection(value, depth);
+        return;
+      }
       const row = document.createElement('div');
       row.className = 'tree-row';
       row.style.paddingLeft = (depth * 14) + 'px';
@@ -265,7 +387,7 @@
       this.data = { snapshot: null, allEvents: [], diffs: {} };
       // Expand/collapse state persists across refreshes so the tree does not
       // snap shut on every snapshot pull.
-      this.expandedPaths = new Set(['', 'items']);
+      this.expandedPaths = new Set(['', 'items', 'children']);
       this.filterText = '';
       // Layer visibility persists per-panel across re-renders; all layers
       // are shown until a checkbox is unchecked.
@@ -499,7 +621,7 @@
     }
 
     renderTimeline(body) {
-      // Layer filter row: four checkboxes above the text filter. Toggling
+      // Layer filter row: one checkbox per layer above the text filter. Toggling
       // patches the existing rows in place (same rationale as the text
       // filter — a re-render would destroy input focus and open details).
       const layerFilter = document.createElement('div');
