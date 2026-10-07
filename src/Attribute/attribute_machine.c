@@ -417,6 +417,14 @@ void attribute_machine_destroy(attribute_machine_t* am) {
   // state_destroy's teardown so independently owned machines (this path)
   // release it too.
   if (am->base_state.children != NULL) free(am->base_state.children);
+  // A10-M6 parent key chain + stashed last transition: state-owned heap —
+  // mirror state_destroy's teardown.
+  if (am->base_state.lineage_key_chain != NULL) {
+    free(am->base_state.lineage_key_chain);
+  }
+  if (am->base_state.lineage_last_key_transition != NULL) {
+    free(am->base_state.lineage_last_key_transition);
+  }
   // Lineage resident-child registry: runtime-only UNOWNED views (each child
   // is owned by whoever spawned/holds it) — free the pointer array only.
   // A10-6: this machine is the registry OWNER and is dying FIRST — NULL each

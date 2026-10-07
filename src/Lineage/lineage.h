@@ -161,8 +161,81 @@ size_t blueprint_serialize(machine_blueprint_t* blueprint,
 machine_blueprint_t* blueprint_deserialize(const uint8_t* buf, size_t len);
 
 // ============================================================
+// Parent key chain (A10-M6): a child accepts a BOUNDED chain of parent node
+// keys for attestations/tombstones; a signed transition record advances it
+// forward-only when the parent rotates its node key.
+// ============================================================
+
+// Key transition record. Canonical body (the signed material):
+//   tag(3) = 'P','K','T'  +  u64le new_key_version  +  new_pk(33)
+//   +  old_pk(33)  +  child_id (string16 — the CHILD machine this record
+//   targets; the accepting machine requires it to equal its lineage_self_id)
+// Full record = body + signature(64) over the body, made with the old_pk
+// private key (continuity proof: only the superseded key may retire itself).
+// string16 = u16le byte length + bytes WITHOUT the trailing NUL.
+#define LINEAGE_KEY_TRANSITION_BODY_MAX (3 + 8 + 33 + 33 + 2 + CRABS_MAX_USER_ID)
+#define LINEAGE_KEY_TRANSITION_WIRE_MAX \
+  (LINEAGE_KEY_TRANSITION_BODY_MAX + CRABS_SIG_SIZE)
+
+// Chain bounds. A bounded history caps verification cost and (v13) blob size;
+// overflow is REFUSED rather than silently truncating the spawn pin.
+#define CRABS_MAX_LINEAGE_KEY_CHAIN 8
+// Key version of the spawn pin (chain entry [0]) — every state starts its
+// (implicit) current node key at this generation; rotations advance it.
+#define CRABS_LINEAGE_KEY_VERSION_START 1
+
+// Parent side: build + sign a key transition with the CURRENT node key and
+// stash it as lineage_last_key_transition for re-emission. Bumps the state's
+// lineage_key_version (0, the spawn generation, counts as
+// CRABS_LINEAGE_KEY_VERSION_START) and binds the record to the new value.
+// The record's child_id is filled with this machine's v1 lineage identity
+// (config.bootstrap_admin). NOTE on targeting: the single-record stash +
+// child_id == lineage_self_id acceptance gate means a stashed record is
+// honoured by exactly the machines whose lineage_self_id equals that
+// identity; per-child emission is the __parent_key_update__ op's concern
+// (child accept is the authority on admission — see below).
+// Does NOT install the new key — the caller pairs this with
+// state_set_node_key AFTER this call.
+// transition_out is caller-owned (get_clear_memory); NULL on any failure
+// with no state mutation (validate first, mutate last).
+crabs_error_e lineage_key_rotate(state_t* parent_state,
+                                 const uint8_t new_private_key[32],
+                                 const uint8_t new_public_key[33],
+                                 uint64_t now_ms,
+                                 uint8_t** transition_out,
+                                 size_t* transition_len);
+
+// Child side: ingest a transition record (wire bytes; see the layout above).
+// Refusals (fail-closed, no partial mutation):
+//   - NULL inputs, malformed/truncated record, trailing garbage, wrong tag,
+//     non-canonical child_id, or a child_id != lineage_self_id
+//       → CRABS_ERR_INVALID_PARAM
+//   - machine not bound to a parent, or lineage dissolved
+//       → CRABS_ERR_UNAUTHORIZED
+//   - old_pk matches no chain entry (no continuity proof), or the signature
+//     fails under that entry → CRABS_ERR_CRYPTOGRAPHIC_ERROR
+//   - new_key_version != (max chain version) + 1 (rollback, replay, or gap),
+//     or new_pk equals an existing chain key → CRABS_ERR_INVALID_PARAM
+//   - chain already holds CRABS_MAX_LINEAGE_KEY_CHAIN entries, or OOM growing
+//       → CRABS_ERR_OOM
+// On success appends {new_key_version, new_pk} to lineage_key_chain.
+crabs_error_e lineage_child_accept_key_transition(state_t* child_state,
+                                                  const uint8_t* record,
+                                                  size_t record_len);
+
+// Chain-wide verification: true iff sig verifies over msg under ANY current
+// chain entry. Used by the endorsement + tombstone paths so attestations and
+// tombstones signed under any accepted parent key — including the pre-
+// rotation spawn pin — keep verifying (backward compatible). A machine with
+// an empty chain (never bound, or bound pre-chain-stamping) fails closed.
+bool lineage_verify_by_parent_key(state_t* state, const uint8_t* msg,
+                                  size_t msg_len,
+                                  const uint8_t sig[CRABS_SIG_SIZE]);
+
+// ============================================================
 // Spawn: instantiate a child machine from a validated blueprint
 // ============================================================
+
 
 // Instantiate a child machine per the blueprint's trust mode:
 //   SHARED_ROOT    — the child runs on the PARENT's authority: its

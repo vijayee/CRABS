@@ -2867,3 +2867,496 @@ TEST(TestLineage, StatusNameCoversEveryEnumValue) {
                "attestation_revoked");
   EXPECT_STREQ(lineage_status_name((lineage_status_e)0x2A), "unknown");
 }
+
+// ============================================================
+// Parent key chain (A10-M6): rotate / accept / verify
+// ============================================================
+//
+// The transition record's child_id is the id of the machine it targets. The
+// rotate API emits the rotating machine's v1 lineage identity
+// (config.bootstrap_admin — the same string children persist as
+// lineage_parent_id and attestations carry as parent_id), while acceptance
+// compares the field against the receiving machine's lineage_self_id; the
+// API-level fixtures below wire the two to the same id, exactly as the
+// task's hand-built child states permit (spawn stamps the real chain in the
+// v13 wire task).
+
+typedef struct {
+  state_t*         parent_state;   // rotating machine (signer), node key k1
+  state_t*         child_state;    // bound child, chain [(1, k1.public)]
+  ecdsa_keypair_t* k1;
+  ecdsa_keypair_t* k2;
+  ecdsa_keypair_t* foreign;
+} keychain_harness_t;
+
+// Build a bound child state with chain[0] = {CRABS_LINEAGE_KEY_VERSION_START,
+// spawn_pin_public_key} by hand (spawn will stamp this at spawn time in the
+// wire-format task; the API-level tests only need the chain shape).
+static void keychain_bind_child(state_t* child_state,
+                                const uint8_t spawn_pin_public_key[33]) {
+  memcpy(child_state->lineage_parent_public_key, spawn_pin_public_key, 33);
+  strncpy(child_state->lineage_parent_id, "child-red",
+          sizeof(child_state->lineage_parent_id) - 1);
+  strncpy(child_state->lineage_self_id, "child-red",
+          sizeof(child_state->lineage_self_id) - 1);
+  child_state->lineage_parent_bound = true;
+  child_state->lineage_key_chain = (lineage_key_chain_entry_t*)calloc(
+      1, sizeof(lineage_key_chain_entry_t));
+  ASSERT_NE(child_state->lineage_key_chain, nullptr);
+  child_state->lineage_key_chain[0].key_version =
+      CRABS_LINEAGE_KEY_VERSION_START;
+  memcpy(child_state->lineage_key_chain[0].public_key, spawn_pin_public_key,
+         33);
+  child_state->lineage_key_chain_count = 1;
+}
+
+static void keychain_harness_setup(keychain_harness_t* harness) {
+  memset(harness, 0, sizeof(*harness));
+  harness->k1 = crypto_ecdsa_generate();
+  harness->k2 = crypto_ecdsa_generate();
+  harness->foreign = crypto_ecdsa_generate();
+  ASSERT_NE(harness->k1, nullptr);
+  ASSERT_NE(harness->k2, nullptr);
+  ASSERT_NE(harness->foreign, nullptr);
+
+  harness->parent_state = state_create();
+  ASSERT_NE(harness->parent_state, nullptr);
+  ASSERT_EQ(state_set_node_key(harness->parent_state,
+                               harness->k1->private_key,
+                               harness->k1->public_key), CRABS_SUCCESS);
+  // The rotate record names this id in its child_id field (see the section
+  // comment above).
+  strncpy(harness->parent_state->config.bootstrap_admin, "child-red",
+          sizeof(harness->parent_state->config.bootstrap_admin) - 1);
+
+  harness->child_state = state_create();
+  ASSERT_NE(harness->child_state, nullptr);
+  keychain_bind_child(harness->child_state, harness->k1->public_key);
+}
+
+static void keychain_harness_destroy(keychain_harness_t* harness) {
+  state_destroy(harness->parent_state);
+  state_destroy(harness->child_state);
+  crypto_ecdsa_keypair_destroy(harness->k1);
+  crypto_ecdsa_keypair_destroy(harness->k2);
+  crypto_ecdsa_keypair_destroy(harness->foreign);
+}
+
+// Hand-craft a key transition record (wire image: canonical body + a
+// signature over the body made with signing_private_key). Lets the rejection
+// tests produce structurally valid-but-wrong records the rotate API could
+// never emit (bad version continuity, wrong target, forged signer).
+static size_t keychain_make_record(uint64_t new_key_version,
+                                   const uint8_t new_public_key[33],
+                                   const uint8_t old_public_key[33],
+                                   const char* child_id,
+                                   const uint8_t signing_private_key[32],
+                                   uint8_t* out, size_t out_capacity) {
+  size_t offset = 0;
+  out[offset++] = 'P';
+  out[offset++] = 'K';
+  out[offset++] = 'T';
+  for (int byte_index = 0; byte_index < 8; byte_index++) {
+    out[offset + byte_index] = (uint8_t)(new_key_version >> (byte_index * 8));
+  }
+  offset += 8;
+  memcpy(out + offset, new_public_key, 33);
+  offset += 33;
+  memcpy(out + offset, old_public_key, 33);
+  offset += 33;
+  uint16_t id_len = (uint16_t)strlen(child_id);
+  out[offset++] = (uint8_t)(id_len & 0xFF);
+  out[offset++] = (uint8_t)(id_len >> 8);
+  memcpy(out + offset, child_id, id_len);
+  offset += id_len;
+  EXPECT_LE(offset + CRABS_SIG_SIZE, out_capacity);
+  EXPECT_EQ(crypto_ecdsa_sign(signing_private_key, out, offset, out + offset),
+            CRABS_SUCCESS);
+  return offset + CRABS_SIG_SIZE;
+}
+
+TEST(TestLineage, KeyChainStateFieldsStartEmpty) {
+  state_t* state = state_create();
+  ASSERT_NE(state, nullptr);
+  EXPECT_EQ(state->lineage_key_chain, nullptr);
+  EXPECT_EQ(state->lineage_key_chain_count, 0u);
+  EXPECT_EQ(state->lineage_key_version, 0u);
+  EXPECT_EQ(state->lineage_last_key_transition, nullptr);
+  EXPECT_EQ(state->lineage_last_key_transition_len, 0u);
+  state_destroy(state);
+}
+
+TEST(TestLineage, KeyChainStateDestroyReleasesChainFields) {
+  state_t* state = state_create();
+  ASSERT_NE(state, nullptr);
+  state->lineage_key_chain = (lineage_key_chain_entry_t*)calloc(
+      2, sizeof(lineage_key_chain_entry_t));
+  state->lineage_key_chain_count = 2;
+  state->lineage_last_key_transition =
+      (uint8_t*)calloc(1, LINEAGE_KEY_TRANSITION_WIRE_MAX);
+  state->lineage_last_key_transition_len = 12;
+  state_destroy(state);  // no leak / no crash
+}
+
+TEST(TestLineage, KeyChainRotateAppendsAndStashes) {
+  keychain_harness_t harness;
+  keychain_harness_setup(&harness);
+
+  uint8_t* record = nullptr;
+  size_t record_len = 0;
+  ASSERT_EQ(lineage_key_rotate(harness.parent_state,
+                               harness.k2->private_key, harness.k2->public_key,
+                               1700000000000ULL, &record, &record_len),
+            CRABS_SUCCESS);
+  ASSERT_NE(record, nullptr);
+  ASSERT_GT(record_len, (size_t)CRABS_SIG_SIZE);
+  EXPECT_LE(record_len, (size_t)LINEAGE_KEY_TRANSITION_WIRE_MAX);
+
+  // Parent-side state: the version bumped past the (implicit) spawn
+  // generation and the signed record is stashed for re-emission.
+  EXPECT_EQ(harness.parent_state->lineage_key_version,
+            (uint64_t)CRABS_LINEAGE_KEY_VERSION_START + 1);
+  ASSERT_EQ(harness.parent_state->lineage_last_key_transition_len,
+            (uint32_t)record_len);
+  ASSERT_NE(harness.parent_state->lineage_last_key_transition, nullptr);
+  EXPECT_EQ(memcmp(harness.parent_state->lineage_last_key_transition, record,
+                   record_len), 0);
+
+  // The recorded old_pk is the pre-rotation node key, and the record's own
+  // signature verifies under it over the record's body prefix.
+  const size_t body_len = record_len - CRABS_SIG_SIZE;
+  const uint8_t* old_pk = record + 3 + 8 + 33;
+  EXPECT_EQ(memcmp(old_pk, harness.k1->public_key, 33), 0);
+  EXPECT_TRUE(crypto_ecdsa_verify(old_pk, record, body_len,
+                                  record + body_len));
+
+  // Child accepts: the chain advances forward-only to versions {1, 2} and
+  // entry [0] stays the spawn pin.
+  EXPECT_EQ(lineage_child_accept_key_transition(harness.child_state, record,
+                                                record_len),
+            CRABS_SUCCESS);
+  ASSERT_EQ(harness.child_state->lineage_key_chain_count, 2u);
+  EXPECT_EQ(harness.child_state->lineage_key_chain[0].key_version,
+            (uint64_t)CRABS_LINEAGE_KEY_VERSION_START);
+  EXPECT_EQ(memcmp(harness.child_state->lineage_key_chain[0].public_key,
+                   harness.k1->public_key, 33), 0);
+  EXPECT_EQ(harness.child_state->lineage_key_chain[1].key_version, 2u);
+  EXPECT_EQ(memcmp(harness.child_state->lineage_key_chain[1].public_key,
+                   harness.k2->public_key, 33), 0);
+
+  free(record);
+  keychain_harness_destroy(&harness);
+}
+
+TEST(TestLineage, KeyChainRotateRefusesBadInputs) {
+  keychain_harness_t harness;
+  keychain_harness_setup(&harness);
+
+  uint8_t* record = nullptr;
+  size_t record_len = 0;
+  EXPECT_EQ(lineage_key_rotate(nullptr, harness.k2->private_key,
+                               harness.k2->public_key, 0, &record, &record_len),
+            CRABS_ERR_INVALID_PARAM);
+  EXPECT_EQ(lineage_key_rotate(harness.parent_state, nullptr,
+                               harness.k2->public_key, 0, &record, &record_len),
+            CRABS_ERR_INVALID_PARAM);
+  EXPECT_EQ(lineage_key_rotate(harness.parent_state, harness.k2->private_key,
+                               nullptr, 0, &record, &record_len),
+            CRABS_ERR_INVALID_PARAM);
+  EXPECT_EQ(lineage_key_rotate(harness.parent_state, harness.k2->private_key,
+                               harness.k2->public_key, 0, nullptr,
+                               &record_len),
+            CRABS_ERR_INVALID_PARAM);
+  EXPECT_EQ(lineage_key_rotate(harness.parent_state, harness.k2->private_key,
+                               harness.k2->public_key, 0, &record, nullptr),
+            CRABS_ERR_INVALID_PARAM);
+
+  // A keyless machine cannot sign a transition.
+  state_t* keyless = state_create();
+  ASSERT_NE(keyless, nullptr);
+  EXPECT_EQ(lineage_key_rotate(keyless, harness.k2->private_key,
+                               harness.k2->public_key, 0, &record, &record_len),
+            CRABS_ERR_CRYPTOGRAPHIC_ERROR);
+  state_destroy(keyless);
+
+  // private/public mismatch: recording a key the caller cannot wield would
+  // brick later transitions, so rotate fails before any mutation.
+  EXPECT_EQ(lineage_key_rotate(harness.parent_state, harness.k1->private_key,
+                               harness.k2->public_key, 0, &record, &record_len),
+            CRABS_ERR_INVALID_PARAM);
+  // Rotating to the CURRENT key is not a rotation (forward-only).
+  EXPECT_EQ(lineage_key_rotate(harness.parent_state, harness.k1->private_key,
+                               harness.k1->public_key, 0, &record, &record_len),
+            CRABS_ERR_INVALID_PARAM);
+
+  // Every refusal above left the parent untouched.
+  EXPECT_EQ(harness.parent_state->lineage_key_version, 0u);
+  EXPECT_EQ(harness.parent_state->lineage_last_key_transition, nullptr);
+  EXPECT_EQ(record, nullptr);
+  keychain_harness_destroy(&harness);
+}
+
+TEST(TestLineage, KeyChainRollbackAndGapRejected) {
+  keychain_harness_t harness;
+  keychain_harness_setup(&harness);
+
+  ecdsa_keypair_t* k3 = crypto_ecdsa_generate();
+  ASSERT_NE(k3, nullptr);
+  uint8_t record[LINEAGE_KEY_TRANSITION_WIRE_MAX];
+
+  // Replay: the spawn pin's own generation is already the chain maximum.
+  size_t replay_len = keychain_make_record(
+      CRABS_LINEAGE_KEY_VERSION_START, k3->public_key,
+      harness.k1->public_key, "child-red", harness.k1->private_key,
+      record, sizeof(record));
+  EXPECT_EQ(lineage_child_accept_key_transition(harness.child_state, record,
+                                                replay_len),
+            CRABS_ERR_INVALID_PARAM);
+
+  // Gap: version 3 when the chain maximum is 1 (versions must advance by
+  // exactly one).
+  size_t gap_len = keychain_make_record(3, k3->public_key,
+                                        harness.k1->public_key, "child-red",
+                                        harness.k1->private_key,
+                                        record, sizeof(record));
+  EXPECT_EQ(lineage_child_accept_key_transition(harness.child_state, record,
+                                                gap_len),
+            CRABS_ERR_INVALID_PARAM);
+
+  // Key already known: a fresh version naming an existing chain key.
+  size_t known_len = keychain_make_record(2, harness.k1->public_key,
+                                          harness.k1->public_key, "child-red",
+                                          harness.k1->private_key,
+                                          record, sizeof(record));
+  EXPECT_EQ(lineage_child_accept_key_transition(harness.child_state, record,
+                                                known_len),
+            CRABS_ERR_INVALID_PARAM);
+
+  // Wrong target: a validly-signed record naming a DIFFERENT child.
+  size_t wrong_child_len = keychain_make_record(
+      2, harness.k2->public_key, harness.k1->public_key, "child-blue",
+      harness.k1->private_key, record, sizeof(record));
+  EXPECT_EQ(lineage_child_accept_key_transition(harness.child_state, record,
+                                                wrong_child_len),
+            CRABS_ERR_INVALID_PARAM);
+
+  // Wrong tag.
+  size_t bad_tag_len = keychain_make_record(
+      2, harness.k2->public_key, harness.k1->public_key, "child-red",
+      harness.k1->private_key, record, sizeof(record));
+  record[0] = 'X';
+  EXPECT_EQ(lineage_child_accept_key_transition(harness.child_state, record,
+                                                bad_tag_len),
+            CRABS_ERR_INVALID_PARAM);
+  record[0] = 'P';
+
+  // Continuity proof: old_pk names no chain entry, so nothing can verify the
+  // signature (forged by a foreign key).
+  size_t forged_len = keychain_make_record(
+      2, harness.k2->public_key, harness.foreign->public_key, "child-red",
+      harness.foreign->private_key, record, sizeof(record));
+  EXPECT_EQ(lineage_child_accept_key_transition(harness.child_state, record,
+                                                forged_len),
+            CRABS_ERR_CRYPTOGRAPHIC_ERROR);
+
+  // A genuine record signed by the chain key is accepted — establishing that
+  // the refusals above were about the record, not the machinery.
+  size_t good_len = keychain_make_record(
+      2, harness.k2->public_key, harness.k1->public_key, "child-red",
+      harness.k1->private_key, record, sizeof(record));
+  ASSERT_EQ(lineage_child_accept_key_transition(harness.child_state, record,
+                                                good_len),
+            CRABS_SUCCESS);
+  ASSERT_EQ(harness.child_state->lineage_key_chain_count, 2u);
+
+  // Re-delivery of the same record is a rollback (version 2 == max now).
+  EXPECT_EQ(lineage_child_accept_key_transition(harness.child_state, record,
+                                                good_len),
+            CRABS_ERR_INVALID_PARAM);
+
+  crypto_ecdsa_keypair_destroy(k3);
+  keychain_harness_destroy(&harness);
+}
+
+TEST(TestLineage, KeyChainAcceptRefusesUnboundOrDissolvedChild) {
+  keychain_harness_t harness;
+  keychain_harness_setup(&harness);
+
+  uint8_t record[LINEAGE_KEY_TRANSITION_WIRE_MAX];
+  size_t record_len = keychain_make_record(
+      2, harness.k2->public_key, harness.k1->public_key, "child-red",
+      harness.k1->private_key, record, sizeof(record));
+
+  // Unbound: no chain exists to advance.
+  state_t* unbound = state_create();
+  ASSERT_NE(unbound, nullptr);
+  EXPECT_EQ(lineage_child_accept_key_transition(unbound, record, record_len),
+            CRABS_ERR_UNAUTHORIZED);
+  state_destroy(unbound);
+
+  // Dissolved: the lineage is severed — no new parent key may rotate in.
+  harness.child_state->lineage_parent_dissolved = true;
+  EXPECT_EQ(lineage_child_accept_key_transition(harness.child_state, record,
+                                                record_len),
+            CRABS_ERR_UNAUTHORIZED);
+  harness.child_state->lineage_parent_dissolved = false;
+
+  // Malformed sizes and NULLs refuse without touching the chain.
+  EXPECT_EQ(lineage_child_accept_key_transition(nullptr, record, record_len),
+            CRABS_ERR_INVALID_PARAM);
+  EXPECT_EQ(lineage_child_accept_key_transition(harness.child_state, nullptr,
+                                                record_len),
+            CRABS_ERR_INVALID_PARAM);
+  EXPECT_EQ(lineage_child_accept_key_transition(harness.child_state, record,
+                                                16),
+            CRABS_ERR_INVALID_PARAM);
+  EXPECT_EQ(lineage_child_accept_key_transition(
+                harness.child_state, record,
+                LINEAGE_KEY_TRANSITION_WIRE_MAX + 1),
+            CRABS_ERR_INVALID_PARAM);
+  ASSERT_EQ(harness.child_state->lineage_key_chain_count, 1u);
+
+  keychain_harness_destroy(&harness);
+}
+
+TEST(TestLineage, KeyChainCapacityRefusesNinthEntry) {
+  state_t* parent = state_create();
+  ASSERT_NE(parent, nullptr);
+  state_t* child = state_create();
+  ASSERT_NE(child, nullptr);
+
+  ecdsa_keypair_t* keys[CRABS_MAX_LINEAGE_KEY_CHAIN + 1] = {nullptr};
+  for (size_t key_index = 0;
+       key_index <= (size_t)CRABS_MAX_LINEAGE_KEY_CHAIN; key_index++) {
+    keys[key_index] = crypto_ecdsa_generate();
+    ASSERT_NE(keys[key_index], nullptr);
+  }
+
+  // chain[0] = the spawn pin under k1.
+  ASSERT_EQ(state_set_node_key(parent, keys[0]->private_key,
+                             keys[0]->public_key), CRABS_SUCCESS);
+  strncpy(parent->config.bootstrap_admin, "child-red",
+          sizeof(parent->config.bootstrap_admin) - 1);
+  keychain_bind_child(child, keys[0]->public_key);
+
+  // Rotations 1..7 fill the chain to its cap (entries: k1..k8).
+  for (size_t rotation = 1; rotation < (size_t)CRABS_MAX_LINEAGE_KEY_CHAIN;
+       rotation++) {
+    uint8_t* record = nullptr;
+    size_t record_len = 0;
+    ASSERT_EQ(lineage_key_rotate(parent, keys[rotation]->private_key,
+                                 keys[rotation]->public_key, 0, &record,
+                                 &record_len),
+              CRABS_SUCCESS) << rotation;
+    ASSERT_EQ(lineage_child_accept_key_transition(child, record, record_len),
+              CRABS_SUCCESS) << rotation;
+    free(record);
+    // Rotate never installs the new key — the caller pairs it (mirrors the
+    // documented caller contract).
+    ASSERT_EQ(state_set_node_key(parent, keys[rotation]->private_key,
+                                 keys[rotation]->public_key), CRABS_SUCCESS);
+  }
+  ASSERT_EQ(child->lineage_key_chain_count,
+            (uint32_t)CRABS_MAX_LINEAGE_KEY_CHAIN);
+  EXPECT_EQ(parent->lineage_key_version,
+            (uint64_t)CRABS_MAX_LINEAGE_KEY_CHAIN);
+
+  // The 8th rotation (a 9th chain entry) overflows the bounded history — the
+  // child refuses rather than truncating the spawn pin. keys[8] has never
+  // entered the chain, so the record itself is otherwise fully valid.
+  uint8_t* record = nullptr;
+  size_t record_len = 0;
+  ASSERT_EQ(lineage_key_rotate(parent,
+                               keys[CRABS_MAX_LINEAGE_KEY_CHAIN]->private_key,
+                               keys[CRABS_MAX_LINEAGE_KEY_CHAIN]->public_key,
+                               0, &record, &record_len),
+            CRABS_SUCCESS);
+  EXPECT_EQ(lineage_child_accept_key_transition(child, record, record_len),
+            CRABS_ERR_OOM);
+
+  // The refusal mutated nothing: the chain still ends at k8 / version 8.
+  EXPECT_EQ(child->lineage_key_chain_count,
+            (uint32_t)CRABS_MAX_LINEAGE_KEY_CHAIN);
+  EXPECT_EQ(child->lineage_key_chain[CRABS_MAX_LINEAGE_KEY_CHAIN - 1]
+                .key_version,
+            (uint64_t)CRABS_MAX_LINEAGE_KEY_CHAIN);
+  EXPECT_EQ(memcmp(child->lineage_key_chain[CRABS_MAX_LINEAGE_KEY_CHAIN - 1]
+                       .public_key,
+                   keys[CRABS_MAX_LINEAGE_KEY_CHAIN - 1]->public_key, 33), 0);
+
+  free(record);
+  for (size_t key_index = 0;
+       key_index <= (size_t)CRABS_MAX_LINEAGE_KEY_CHAIN; key_index++) {
+    crypto_ecdsa_keypair_destroy(keys[key_index]);
+  }
+  state_destroy(child);
+  state_destroy(parent);
+}
+
+TEST(TestLineage, KeyChainVerifyByAnyChainKey) {
+  keychain_harness_t harness;
+  keychain_harness_setup(&harness);
+
+  const char* message = "tombstone or endorsement material";
+  uint8_t signature_by_k1[CRABS_SIG_SIZE];
+  uint8_t signature_by_k2[CRABS_SIG_SIZE];
+  uint8_t signature_by_foreign[CRABS_SIG_SIZE];
+  ASSERT_EQ(crypto_ecdsa_sign(harness.k1->private_key,
+                              (const uint8_t*)message, strlen(message),
+                              signature_by_k1), CRABS_SUCCESS);
+  ASSERT_EQ(crypto_ecdsa_sign(harness.k2->private_key,
+                              (const uint8_t*)message, strlen(message),
+                              signature_by_k2), CRABS_SUCCESS);
+  ASSERT_EQ(crypto_ecdsa_sign(harness.foreign->private_key,
+                              (const uint8_t*)message, strlen(message),
+                              signature_by_foreign), CRABS_SUCCESS);
+
+  // Chain holds only k1 for now: k1 verifies, k2 and foreign do not.
+  EXPECT_TRUE(lineage_verify_by_parent_key(harness.child_state,
+                                           (const uint8_t*)message,
+                                           strlen(message), signature_by_k1));
+  EXPECT_FALSE(lineage_verify_by_parent_key(harness.child_state,
+                                            (const uint8_t*)message,
+                                            strlen(message), signature_by_k2));
+
+  // Advance the chain: both the spawn pin and the rotated key verify — old
+  // attestations keep working, new ones land.
+  uint8_t record[LINEAGE_KEY_TRANSITION_WIRE_MAX];
+  size_t record_len = keychain_make_record(
+      2, harness.k2->public_key, harness.k1->public_key, "child-red",
+      harness.k1->private_key, record, sizeof(record));
+  ASSERT_EQ(lineage_child_accept_key_transition(harness.child_state, record,
+                                                record_len),
+            CRABS_SUCCESS);
+  EXPECT_TRUE(lineage_verify_by_parent_key(harness.child_state,
+                                           (const uint8_t*)message,
+                                           strlen(message), signature_by_k1));
+  EXPECT_TRUE(lineage_verify_by_parent_key(harness.child_state,
+                                           (const uint8_t*)message,
+                                           strlen(message), signature_by_k2));
+  EXPECT_FALSE(lineage_verify_by_parent_key(harness.child_state,
+                                            (const uint8_t*)message,
+                                            strlen(message),
+                                            signature_by_foreign));
+
+  // A never-bound machine carries no chain and fails closed.
+  state_t* unbound = state_create();
+  ASSERT_NE(unbound, nullptr);
+  EXPECT_FALSE(lineage_verify_by_parent_key(unbound, (const uint8_t*)message,
+                                            strlen(message),
+                                            signature_by_k1));
+  state_destroy(unbound);
+
+  // NULL-safety.
+  EXPECT_FALSE(lineage_verify_by_parent_key(nullptr, (const uint8_t*)message,
+                                            strlen(message),
+                                            signature_by_k1));
+  EXPECT_FALSE(lineage_verify_by_parent_key(harness.child_state, nullptr,
+                                            strlen(message),
+                                            signature_by_k1));
+  EXPECT_FALSE(lineage_verify_by_parent_key(harness.child_state,
+                                            (const uint8_t*)message,
+                                            strlen(message), nullptr));
+
+  keychain_harness_destroy(&harness);
+}

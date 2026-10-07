@@ -106,6 +106,14 @@ state_t* state_create(void) {
   state->config.allow_force_unlock = true;
   state->config.bootstrap_admin[0] = '\0';
   state->abe_mk = crypto_abe_setup();
+  // A10-M6 parent key chain fields: get_clear_memory already zeroed them; the
+  // assignments below pin that contract explicitly (a chain is ALWAYS NULL/0
+  // until spawn binds or a transition lands — serialized in the v13 block).
+  state->lineage_key_chain = NULL;
+  state->lineage_key_chain_count = 0;
+  state->lineage_key_version = 0;
+  state->lineage_last_key_transition = NULL;
+  state->lineage_last_key_transition_len = 0;
   return state;
 }
 
@@ -152,6 +160,12 @@ void state_destroy(state_t* state) {
   // Lineage child manifest: heap array owned by this state (spawn appends,
   // deserialization restores) — free it wholesale.
   if (state->children != NULL) free(state->children);
+  // A10-M6 parent key chain + stashed last transition: state-owned heap
+  // (accept appends the chain, rotate stashes the record).
+  if (state->lineage_key_chain != NULL) free(state->lineage_key_chain);
+  if (state->lineage_last_key_transition != NULL) {
+    free(state->lineage_last_key_transition);
+  }
   // Lineage resident-child registry: runtime-only UNOWNED views (each child
   // is owned by whoever spawned/holds it) — free the pointer array only.
   // A10-6: this state is the registry OWNER dying first — detach every

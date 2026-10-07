@@ -1816,3 +1816,255 @@ crabs_error_e crabs_issue_attestation(state_t* parent,
                             user_id, attributes, now_ms,
                             now_ms + manifest_entry->attestation_ttl_ms);
 }
+
+// ============================================================
+// Parent key chain (A10-M6): rotate / accept / chain-wide verify
+// ============================================================
+
+// Canonical key transition body writer — the SINGLE writer shared by signing
+// (lineage_key_rotate) and verification re-canonicalization, so signed bytes
+// and verified bytes can never drift (lineage.h documents the layout):
+//   'P','K','T' + u64le new_key_version + new_pk(33) + old_pk(33)
+//   + string16 child_id
+// Returns bytes written, or 0 when cap is too small or child_id is not
+// NUL-terminated (strlen + 1 fails closed like the tombstone writer).
+static size_t _lineage_key_transition_write_body(uint64_t new_key_version,
+                                                 const uint8_t new_pk[33],
+                                                 const uint8_t old_pk[33],
+                                                 const char* child_id,
+                                                 uint8_t* out, size_t cap) {
+  size_t offset = 0;
+  if (cap < 3 + 8 + 33 + 33 + 2) return 0;
+  out[offset++] = 'P';
+  out[offset++] = 'K';
+  out[offset++] = 'T';
+  _lineage_u64le_write(out + offset, new_key_version);
+  offset += 8;
+  memcpy(out + offset, new_pk, 33);
+  offset += 33;
+  memcpy(out + offset, old_pk, 33);
+  offset += 33;
+  if (!_lineage_string16_write(out, cap, &offset, child_id,
+                               strlen(child_id) + 1)) {
+    return 0;
+  }
+  return offset;
+}
+
+crabs_error_e lineage_key_rotate(state_t* parent_state,
+                                 const uint8_t new_private_key[32],
+                                 const uint8_t new_public_key[33],
+                                 uint64_t now_ms,
+                                 uint8_t** transition_out,
+                                 size_t* transition_len) {
+  // now_ms is carried for API symmetry with the other lineage signing
+  // surfaces; the transition record carries no validity window (the chain's
+  // forward-only version is its ordering).
+  (void)now_ms;
+  if (parent_state == NULL || new_private_key == NULL ||
+      new_public_key == NULL || transition_out == NULL ||
+      transition_len == NULL) {
+    return CRABS_ERR_INVALID_PARAM;
+  }
+  *transition_out = NULL;
+  *transition_len = 0;
+
+  // Validate first, mutate LAST: every refusal below leaves the lineage
+  // version and the stashed transition untouched.
+  if (!parent_state->node_key_valid ||
+      !crypto_ecdsa_validate_public_key(parent_state->node_public_key)) {
+    return CRABS_ERR_CRYPTOGRAPHIC_ERROR;
+  }
+  if (!crypto_ecdsa_validate_public_key(new_public_key)) {
+    return CRABS_ERR_INVALID_PARAM;
+  }
+  // The private half must match the advertised new public key — stashing a
+  // transition toward a key the caller cannot wield would brick the next
+  // rotation and every tombstone the new key should have signed.
+  uint8_t derived_public_key[33];
+  if (crypto_ecdsa_derive_public_key(new_private_key, derived_public_key)
+          != CRABS_SUCCESS ||
+      memcmp(derived_public_key, new_public_key, 33) != 0) {
+    return CRABS_ERR_INVALID_PARAM;
+  }
+  // Forward-only: "rotating" to the CURRENT key is not a rotation (the chain
+  // side would refuse it as a known key anyway; refuse before signing).
+  if (memcmp(new_public_key, parent_state->node_public_key, 33) == 0) {
+    return CRABS_ERR_INVALID_PARAM;
+  }
+
+  // Version semantics: an unversioned machine key IS the spawn generation
+  // (CRABS_LINEAGE_KEY_VERSION_START) — chain entry [0] on every child —
+  // so the first rotation lands at START + 1.
+  uint64_t current_key_version = parent_state->lineage_key_version != 0
+      ? parent_state->lineage_key_version
+      : (uint64_t)CRABS_LINEAGE_KEY_VERSION_START;
+  if (current_key_version == UINT64_MAX) return CRABS_ERR_INVALID_PARAM;
+  uint64_t new_key_version = current_key_version + 1;
+
+  // The record names the machine in the lineage namespace by its v1 identity.
+  const char* target_id = parent_state->config.bootstrap_admin;
+  uint8_t body[LINEAGE_KEY_TRANSITION_BODY_MAX];
+  size_t body_len = _lineage_key_transition_write_body(
+      new_key_version, new_public_key, parent_state->node_public_key,
+      target_id, body, sizeof(body));
+  if (body_len == 0) return CRABS_ERR_INVALID_PARAM;
+
+  size_t record_len = body_len + CRABS_SIG_SIZE;
+  uint8_t* record = get_clear_memory(record_len);
+  if (record == NULL) return CRABS_ERR_OOM;
+  memcpy(record, body, body_len);
+  if (crypto_sign_operation(parent_state->node_private_key, body, body_len,
+                            record + body_len) != CRABS_SUCCESS) {
+    free(record);
+    return CRABS_ERR_CRYPTOGRAPHIC_ERROR;
+  }
+  // Stash a second copy for re-emission; the stash swap and the version bump
+  // are the ONLY mutations, and both fallible steps above (allocation,
+  // signing) preceded them.
+  uint8_t* stashed = get_clear_memory(record_len);
+  if (stashed == NULL) {
+    free(record);
+    return CRABS_ERR_OOM;
+  }
+  memcpy(stashed, record, record_len);
+  if (parent_state->lineage_last_key_transition != NULL) {
+    free(parent_state->lineage_last_key_transition);
+  }
+  parent_state->lineage_last_key_transition = stashed;
+  parent_state->lineage_last_key_transition_len = (uint32_t)record_len;
+  parent_state->lineage_key_version = new_key_version;
+  *transition_out = record;
+  *transition_len = record_len;
+  return CRABS_SUCCESS;
+}
+
+crabs_error_e lineage_child_accept_key_transition(state_t* child_state,
+                                                  const uint8_t* record,
+                                                  size_t record_len) {
+  if (child_state == NULL || record == NULL) return CRABS_ERR_INVALID_PARAM;
+  // Size window: the smallest honest record carries an empty child_id
+  // (body 79 bytes) plus the signature; the cap keeps a hostile payload from
+  // making the parser walk unbounded bytes.
+  if (record_len < 3 + 8 + 33 + 33 + 2 + CRABS_SIG_SIZE ||
+      record_len > LINEAGE_KEY_TRANSITION_WIRE_MAX) {
+    return CRABS_ERR_INVALID_PARAM;
+  }
+  // Lifecycle gates (cheapest first): an unbound machine has no chain to
+  // advance, and a dissolved lineage accepts NO new parent key — severance
+  // must not be quietly re-armed by a later rotation.
+  if (!child_state->lineage_parent_bound) {
+    return CRABS_ERR_UNAUTHORIZED;
+  }
+  if (child_state->lineage_parent_dissolved) {
+    return CRABS_ERR_UNAUTHORIZED;
+  }
+
+  size_t body_len = record_len - CRABS_SIG_SIZE;
+  const uint8_t* signature = record + body_len;
+  if (record[0] != 'P' || record[1] != 'K' || record[2] != 'T') {
+    return CRABS_ERR_INVALID_PARAM;
+  }
+  size_t offset = 3;
+  uint64_t new_key_version = 0;
+  if (!_lineage_u64le_read(record, body_len, &offset, &new_key_version)) {
+    return CRABS_ERR_INVALID_PARAM;
+  }
+  const uint8_t* new_public_key = record + offset;
+  offset += 33;
+  const uint8_t* old_public_key = record + offset;
+  offset += 33;
+  char record_child_id[CRABS_MAX_USER_ID];
+  // Full-consumption parse: trailing garbage could smuggle aliasing bytes
+  // past the signature surface.
+  if (!_lineage_string16_read(record, body_len, &offset, record_child_id,
+                              sizeof(record_child_id)) ||
+      offset != body_len) {
+    return CRABS_ERR_INVALID_PARAM;
+  }
+  // The record targets exactly one machine — refuse records naming another
+  // before spending verification work (mirrors the tombstone child_id gate).
+  if (strcmp(record_child_id, child_state->lineage_self_id) != 0) {
+    return CRABS_ERR_INVALID_PARAM;
+  }
+  // Never install an off-curve key into the verification surface.
+  if (!crypto_ecdsa_validate_public_key(new_public_key)) {
+    return CRABS_ERR_INVALID_PARAM;
+  }
+
+  // Forward-only, gapless version continuity: new == (max chain version) + 1.
+  // A zero version can never satisfy it (also catches the UINT64_MAX wrap).
+  uint64_t max_key_version = (uint64_t)CRABS_LINEAGE_KEY_VERSION_START - 1;
+  for (uint32_t chain_index = 0;
+       chain_index < child_state->lineage_key_chain_count; chain_index++) {
+    if (child_state->lineage_key_chain[chain_index].key_version >
+        max_key_version) {
+      max_key_version =
+          child_state->lineage_key_chain[chain_index].key_version;
+    }
+  }
+  if (new_key_version == 0 || new_key_version != max_key_version + 1) {
+    return CRABS_ERR_INVALID_PARAM;
+  }
+  // The incoming key must be NEW — no chain key may appear twice (a replay
+  // with a bumped version would otherwise alias an existing signer).
+  for (uint32_t chain_index = 0;
+       chain_index < child_state->lineage_key_chain_count; chain_index++) {
+    if (memcmp(child_state->lineage_key_chain[chain_index].public_key,
+               new_public_key, 33) == 0) {
+      return CRABS_ERR_INVALID_PARAM;
+    }
+  }
+  // Bounded history: refuse overflow instead of truncating the spawn pin.
+  if (child_state->lineage_key_chain_count >= CRABS_MAX_LINEAGE_KEY_CHAIN) {
+    return CRABS_ERR_OOM;
+  }
+
+  // Continuity proof: the transition is authorized by the private half of
+  // the chain entry it retires — the exact old_pk entry, not "any chain key".
+  const lineage_key_chain_entry_t* retired_entry = NULL;
+  for (uint32_t chain_index = 0;
+       chain_index < child_state->lineage_key_chain_count; chain_index++) {
+    if (memcmp(child_state->lineage_key_chain[chain_index].public_key,
+               old_public_key, 33) == 0) {
+      retired_entry = &child_state->lineage_key_chain[chain_index];
+      break;
+    }
+  }
+  if (retired_entry == NULL) return CRABS_ERR_CRYPTOGRAPHIC_ERROR;
+  if (!crypto_verify_operation(retired_entry->public_key, record, body_len,
+                               signature)) {
+    return CRABS_ERR_CRYPTOGRAPHIC_ERROR;
+  }
+
+  // Append with realloc semantics: on failure the old array is untouched and
+  // still owned by the state (no rollback needed — this is the only mutation).
+  lineage_key_chain_entry_t* grown = realloc(
+      child_state->lineage_key_chain,
+      (size_t)(child_state->lineage_key_chain_count + 1) *
+          sizeof(lineage_key_chain_entry_t));
+  if (grown == NULL) return CRABS_ERR_OOM;
+  grown[child_state->lineage_key_chain_count].key_version = new_key_version;
+  memcpy(grown[child_state->lineage_key_chain_count].public_key,
+         new_public_key, 33);
+  child_state->lineage_key_chain = grown;
+  child_state->lineage_key_chain_count += 1;
+  return CRABS_SUCCESS;
+}
+
+bool lineage_verify_by_parent_key(state_t* state, const uint8_t* msg,
+                                  size_t msg_len,
+                                  const uint8_t sig[CRABS_SIG_SIZE]) {
+  if (state == NULL || msg == NULL || sig == NULL) return false;
+  // Any current chain entry is an accepted parent authority — the spawn pin
+  // keeps verifying old attestations after a rotation, and each rotated key
+  // joins the surface. An empty chain (never bound) fails closed.
+  for (uint32_t chain_index = 0;
+       chain_index < state->lineage_key_chain_count; chain_index++) {
+    if (crypto_ecdsa_verify(state->lineage_key_chain[chain_index].public_key,
+                            msg, msg_len, sig)) {
+      return true;
+    }
+  }
+  return false;
+}

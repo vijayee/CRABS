@@ -346,6 +346,18 @@ typedef struct {
   lineage_status_e     status;
 } child_manifest_entry_t;
 
+// A10-M6: one entry of a machine's bounded parent key chain — a parent node
+// public key plus its version in the lineage key namespace. Entry [0] is the
+// spawn pin (== state_t.lineage_parent_public_key); a signed transition
+// record (see lineage.h) advances the chain forward-only when the parent
+// rotates its node key. Lives here (not lineage.h) because state_t embeds a
+// pointer to it and data_model.h cannot include lineage.h (lineage.h
+// includes data_model.h).
+typedef struct {
+  uint64_t key_version;
+  uint8_t  public_key[33];
+} lineage_key_chain_entry_t;
+
 // ============================================================
 // Log Entry (§7.4 step 9)
 // ============================================================
@@ -422,6 +434,23 @@ typedef struct state_t {
   char    lineage_parent_id[CRABS_MAX_USER_ID];
   uint8_t lineage_parent_public_key[33];
   bool    lineage_parent_bound;
+  // A10-M6 (v13, runtime + wire): bounded chain of node keys this machine
+  // accepts for parent attestations/tombstones. Entry [0] is the spawn pin
+  // (== lineage_parent_public_key); forward-only via __parent_key_update__.
+  // Heap array owned by the state — freed by state_destroy /
+  // attribute_machine_destroy. Cap CRABS_MAX_LINEAGE_KEY_CHAIN (lineage.h).
+  lineage_key_chain_entry_t* lineage_key_chain;
+  uint32_t                   lineage_key_chain_count;
+  // A10-M6 parent-side: this machine's node key version in the lineage
+  // namespace. 0 until the first lineage_key_rotate; the unversioned key a
+  // state starts with is generation CRABS_LINEAGE_KEY_VERSION_START.
+  uint64_t                   lineage_key_version;
+  // A10-M6 parent-side: last signed key transition — re-emitted to children
+  // as __parent_key_update__ after a restart (the old private key is gone by
+  // then, so the record must survive on its own). State-owned heap; wire cap
+  // LINEAGE_KEY_TRANSITION_WIRE_MAX (lineage.h).
+  uint8_t*                   lineage_last_key_transition;
+  uint32_t                   lineage_last_key_transition_len;
   // v1.7: THIS machine's own id when spawned — the child_id an attestation
   // resolved against this machine must name. Empty for a root (never-spawned)
   // machine, which cannot resolve endorsements at all. Set at spawn time
