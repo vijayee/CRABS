@@ -1467,6 +1467,68 @@ TEST(TestLineage, SpawnViaOp) {
   spawn_parent_destroy(&harness);
 }
 
+TEST(TestLineage, QueryResidentChildAccessor) {
+  spawn_parent_harness_t harness;
+  spawn_parent_setup(&harness);
+  state_t* parent = &harness.am->base_state;
+  ASSERT_EQ(attribute_machine_grant_role(harness.am, "alice", "role", "admin",
+                                         "parent-root"), CRABS_SUCCESS);
+  lineage_install(parent);
+
+  // Direct spawn path: the accessor agrees EXACTLY with the pointer the
+  // caller already owns.
+  machine_blueprint_t* direct = make_valid_blueprint();
+  ASSERT_NE(direct, nullptr);
+  attribute_machine_t* child_direct = nullptr;
+  ASSERT_EQ(lineage_spawn_machine(parent, direct, &child_direct),
+            CRABS_SUCCESS);
+  ASSERT_NE(child_direct, nullptr);
+  EXPECT_EQ(lineage_query_resident_child(parent, "child-red"), child_direct);
+
+  // Op-spawned second child: the op pipeline never returns the pointer, so
+  // the accessor is the only way back to the resident child.
+  machine_blueprint_t* op_blueprint = make_valid_blueprint();
+  ASSERT_NE(op_blueprint, nullptr);
+  strncpy(op_blueprint->child_id, "child-blue",
+          sizeof(op_blueprint->child_id) - 1);
+  uint8_t wire[CRABS_BLUEPRINT_WIRE_MAX];
+  size_t wire_len = blueprint_serialize(op_blueprint, wire, sizeof(wire));
+  ASSERT_GT(wire_len, 0u);
+  operation_t* op = make_signed_lineage_op(harness.am, harness.alice_key,
+                                           "alice", CRABS_LINEAGE_OP_SPAWN,
+                                           wire, wire_len);
+  ASSERT_NE(op, nullptr);
+  EXPECT_EQ(state_machine_execute(parent, op), CRABS_SUCCESS);
+  operation_destroy(op);
+
+  ASSERT_EQ(parent->resident_child_count, 2u);
+  attribute_machine_t* child_op = lineage_query_resident_child(parent,
+                                                               "child-blue");
+  ASSERT_NE(child_op, nullptr);
+  EXPECT_EQ(child_op, parent->resident_children[1]);
+  EXPECT_STREQ(child_op->base_state.lineage_self_id, "child-blue");
+
+  // Unknown id answers NULL.
+  EXPECT_EQ(lineage_query_resident_child(parent, "child-ghost"), nullptr);
+
+  // Dissolve clears the registry slot: a subsequent query answers NULL.
+  operation_t* dissolve = make_signed_lineage_op(
+      harness.am, harness.alice_key, "alice", CRABS_LINEAGE_OP_DISSOLVE,
+      "child-blue", strlen("child-blue"));
+  ASSERT_NE(dissolve, nullptr);
+  EXPECT_EQ(state_machine_execute(parent, dissolve), CRABS_SUCCESS);
+  operation_destroy(dissolve);
+  EXPECT_EQ(lineage_query_resident_child(parent, "child-blue"), nullptr);
+  // The direct-path child was never dissolved: still resolvable.
+  EXPECT_EQ(lineage_query_resident_child(parent, "child-red"), child_direct);
+
+  attribute_machine_destroy(child_direct);
+  attribute_machine_destroy(child_op);
+  machine_blueprint_destroy(direct);
+  machine_blueprint_destroy(op_blueprint);
+  spawn_parent_destroy(&harness);
+}
+
 TEST(TestLineage, RevokeAttestationViaOp) {
   spawn_parent_harness_t harness;
   spawn_parent_setup(&harness);

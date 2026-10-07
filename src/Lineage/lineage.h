@@ -215,6 +215,13 @@ crabs_error_e lineage_spawn_machine(state_t* parent,
                                     const machine_blueprint_t* blueprint,
                                     attribute_machine_t** child_out);
 
+// Borrowed lookup of a child machine this machine spawned and still holds
+// resident (spawned in this process). Returns NULL when unknown, dissolved
+// (slot cleared), or not present. The pointer stays owned by the child's
+// creator — borrow only.
+attribute_machine_t* lineage_query_resident_child(const state_t* state,
+                                                  const char* child_id);
+
 // ============================================================
 // Lineage ops: spawn / revoke attestation / dissolve / withdraw via the
 // operation pipeline

@@ -589,7 +589,6 @@ machine_blueprint_t* blueprint_deserialize(const uint8_t* buf, size_t len) {
   }
 
   // Every field consumed EXACTLY the body; the hash closes the image.
-  // Every field consumed EXACTLY the body; the hash closes the image.
   parsed = parsed && offset == body_len + 4;
   if (parsed) {
     memcpy(stored_hash, buf + offset, CRABS_HASH_SIZE);
@@ -1256,6 +1255,28 @@ static crabs_error_e _lineage_child_id_from_payload(const operation_t* op,
   return CRABS_SUCCESS;
 }
 
+attribute_machine_t* lineage_query_resident_child(const state_t* state,
+                                                  const char* child_id) {
+  if (state == NULL || child_id == NULL) return NULL;
+  // Resolve the child_id through the manifest entry — the only owned data.
+  // The registry slots are index-ALIGNED with the manifest (see the spawn
+  // helpers above), so the winning manifest index addresses the registry
+  // slot directly; a NULL slot means the child dissolved (or was dropped by
+  // its owner out-of-band) and answers NULL.
+  for (uint32_t child_index = 0; child_index < state->child_count;
+       child_index++) {
+    if (strcmp(state->children[child_index].child_id, child_id) != 0) {
+      continue;
+    }
+    if (child_index >= state->resident_child_count ||
+        state->resident_children == NULL) {
+      return NULL;
+    }
+    return state->resident_children[child_index];
+  }
+  return NULL;
+}
+
 crabs_error_e lineage_op_spawn(state_t* state, operation_t* op) {
   if (state == NULL || op == NULL || op->payload == NULL ||
       op->payload_size == 0) {
@@ -1354,10 +1375,6 @@ crabs_error_e lineage_op_withdraw_genesis(state_t* state, operation_t* op) {
   return CRABS_SUCCESS;
 }
 
-// Off-chain dissolution proof: ECDSA over the canonical tombstone
-// `u8 tag (= LINEAGE_DISSOLVED) + string16 child_id`. Verifiable by any
-// third party holding the parent's node public key — no manifest needed.
-// Worst case 1 + 2 + CRABS_MAX_USER_ID = 67 bytes.
 void lineage_install(state_t* state) {
   if (state == NULL) return;
   dedup_spec_t no_dedup;
@@ -1391,6 +1408,10 @@ void lineage_install(state_t* state) {
                                  lineage_op_withdraw_genesis);
 }
 
+// Off-chain dissolution proof: ECDSA over the canonical tombstone
+// `u8 tag (= LINEAGE_DISSOLVED) + string16 child_id`. Verifiable by any
+// third party holding the parent's node public key — no manifest needed.
+// Worst case 1 + 2 + CRABS_MAX_USER_ID = 67 bytes.
 crabs_error_e lineage_sign_dissolution(state_t* parent, const char* child_id,
                                        uint8_t signature_out[CRABS_SIG_SIZE]) {
   if (parent == NULL || child_id == NULL || signature_out == NULL) {
