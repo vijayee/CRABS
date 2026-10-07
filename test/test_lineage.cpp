@@ -1313,7 +1313,8 @@ TEST(TestLineage, SpawnRejectsInvalidBlueprint) {
 }
 
 // ============================================================
-// Lineage status wire: enum extension stays v11-compatible
+// Lineage status wire: enum extension needs no format bump (the manifest
+// entry layout is unchanged from v11 through v12)
 // ============================================================
 
 // Direct-field fixture (same shape as test_serialization.cpp's
@@ -1337,8 +1338,9 @@ static void append_manifest_entry_fixture(state_t* state, const char* child_id,
 }
 
 TEST(TestLineage, ManifestStatusExtensionRoundTrips) {
-  // ATTESTATION_REVOKED was added to the u8 status wire WITHOUT a format
-  // bump — every status round trips through the v11 reader.
+  // ATTESTATION_REVOKED was added to the u8 status wire WITHOUT a layout
+  // bump — every status round trips (readers gate the manifest section on
+  // version >= 11, and v12 changed only the parent-binding tail).
   state_t* state = state_create();
   ASSERT_NE(state, nullptr);
   append_manifest_entry_fixture(state, "child-a", LINEAGE_SHARED_ROOT,
@@ -1376,7 +1378,8 @@ TEST(TestLineage, ManifestStatusOutOfRangeRejected) {
   ASSERT_NE(buf, nullptr);
   state_destroy(state);
 
-  // Status sits at needle + 125 in the v11 entry image (11-byte id needle;
+  // Status sits at needle + 125 in the manifest entry image (layout
+  // unchanged since v11; 11-byte id needle;
   // mode at +11, 32B hash, 64B sig, ttl, spawned_at, status).
   const uint8_t needle[11] = {0x09, 0x00, 'c', 'h', 'i', 'l', 'd', '-', 'r', 'e', 'd'};
   bool found = false;

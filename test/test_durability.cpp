@@ -756,8 +756,9 @@ TEST(TestDurability, LineageSurfacesEndToEnd) {
   // 8. The lifecycle CONTINUES across the restart through dispatch. First
   //    the fail-closed contract: a reloaded machine registers op types and
   //    policies durably, but the C op HANDLERS are runtime registrations —
-  //    without lineage_install the pipeline would log the dissolve as a
-  //    silent no-op success, so the CLI refuses the command loudly instead.
+  //    without lineage_install the dissolve has no implementation (the
+  //    engine fails a handler-less zero-resource op with
+  //    RESOURCE_NOT_FOUND), so the CLI refuses the command loudly first.
   // ------------------------------------------------------------------
   char* dissolve_argv[] = {(char*)"crabs_node", (char*)"machine",
                            (char*)"dissolve", (char*)"child-red"};

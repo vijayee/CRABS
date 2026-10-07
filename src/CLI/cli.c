@@ -1615,10 +1615,12 @@ static cli_result_e _machine_blueprint_cmd_validate(cli_node_t* node,
 // operator-facing subcommand word used in error messages.
 // The op's HANDLER is a runtime registration (lineage_install) and the op's
 // policy/type-definition are durable state, so a reloaded machine that was
-// not re-installed in this process would pass authorization and then run the
-// op with NO handler — state_machine_execute logs it as a silent no-op
-// success while the manifest never changes. Gate the command on the handler
-// being present instead of letting the pipeline round-trip a no-op.
+// not re-installed in this process would pass authorization and then hit the
+// engine's declared-but-unimplemented refusal (the lineage ops carry no
+// resources, so the engine fails a handler-less one with
+// CRABS_ERR_RESOURCE_NOT_FOUND). Gate the command on the handler being
+// present anyway: the refusal names lineage_install and what to do about it
+// instead of surfacing a generic not-found from deep inside the engine.
 static cli_result_e _machine_lifecycle_op_submit(cli_node_t* node,
                                                  const char* op_type,
                                                  const uint8_t* payload,

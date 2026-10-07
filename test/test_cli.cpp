@@ -1645,13 +1645,14 @@ TEST(TestCliDurability, DispatchCompactRunsOnMachineState) {
   cli_node_destroy(compact_node);
 }
 
-// De-wonk (silent no-op on a reloaded machine): the lineage op HANDLERS are
-// runtime registrations (lineage_install), while the lineage policies and op
-// type definitions are durable state — a reloaded machine that was not
-// re-installed passes op authorization, finds NO handler, and the pipeline
-// logs the lifecycle op as a successful no-op while the manifest never
-// changes. The machine lifecycle commands must refuse loudly instead of
-// letting that happen.
+// De-wonk (unimplemented lineage ops on a reloaded machine): the lineage op
+// HANDLERS are runtime registrations (lineage_install), while the lineage
+// policies and op type definitions are durable state — a reloaded machine
+// that was not re-installed passes op authorization and finds NO handler.
+// The engine now fails such a declared-but-unimplemented, zero-resource op
+// loudly with RESOURCE_NOT_FOUND; the machine lifecycle commands still gate
+// on the handler first so the refusal names the missing lineage_install
+// instead of a generic not-found from deep inside the engine.
 TEST(TestCliDurability, MachineLifecycleRefusesWithoutInstalledHandlers) {
   cli_node_t* node = cli_node_create();
   ASSERT_EQ(cli_node_init(node, "admin"), CLI_OK);
