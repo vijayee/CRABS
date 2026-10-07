@@ -123,6 +123,10 @@ CLI output conventions: follow cli_cmd_user_list formatting.
   - `machine children` — `lineage_query_children` + `lineage_query_resident_child` per entry; print `child_id  mode  status  resident  ttl_ms` lines (human strings for mode/status via small static helpers — add `_lineage_mode_name`/`_lineage_status_name` to lineage.{h,c} as public `lineage_mode_name`/`lineage_status_name` so wasm/devtools reuse them instead of triplicating).
   - `machine dissolve <child_id>` / `machine withdraw <child_id>` / `machine revoke-attestation <child_id>` — op pipeline like spawn (payload = child_id bytes; handlers in lineage accept the payload format — VERIFY the payload format lineage_op_dissolve consumes (Task 8 chose a format; read lineage.c `lineage_op_dissolve`'s payload parsing and construct matching bytes)).
   - `machine attest <child_id> <user_id> <attrs>` — `crabs_issue_attestation(now_ms from state_get_time_ms)` → hex-print the attestation wire for transport.
+  - **v2 note (review finding, informational):** attest is a direct API call (no op/policy check) — correct for v1 where the CLI operator holds
+    full node-key custody, but on a future multi-admin operator story any local operator can attest for an ACTIVE child without a lineage policy
+    check. Consider op-pipelining attest (or a policy gate inside `crabs_issue_attestation`) in v2 if operator identities become distinct from
+    the machine's authority.
 - [ ] **Step 2: Failing tests**:
   - `MachineSpawnThroughCliLifecycle`: blueprint build → spawn → `machine children` asserts the printed entry exists (capture stdout? follow the existing cli test capturing convention — check how test_cli.cpp asserts print output; if it only checks return codes, assert via `lineage_query_children` after the dispatch);
     dissolve → status flips; attest returns CLI_OK and the wire re-verifies via `attestation_deserialize` + `attestation_verify` with the node pub.
