@@ -1033,6 +1033,27 @@ TEST(TestCliDurability, SealKeyImportRejectsBadHex) {
   cli_node_destroy(node);
 }
 
+TEST(TestCliDurability, KeyReimportFailureKeepsPreviousKey) {
+  cli_node_t* node = cli_node_create();
+  ASSERT_NE(node, nullptr);
+  ASSERT_EQ(cli_node_init(node, "admin"), CLI_OK);
+  ASSERT_TRUE(_apply_test_seal_key(node));
+
+  // A failed re-import must leave the PREVIOUS key intact and valid.
+  // cli_hex_to_bytes decodes incrementally, so a partial decode must never
+  // touch the node's key storage.
+  EXPECT_EQ(cli_node_set_seal_key(node,
+            "zzzzffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"),
+            CLI_ERR_ARGS);
+  EXPECT_TRUE(node->seal_key_valid);
+  const uint8_t expected[32] = {
+    1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,
+    17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32
+  };
+  EXPECT_EQ(memcmp(node->seal_key, expected, sizeof(expected)), 0);
+  cli_node_destroy(node);
+}
+
 TEST(TestCliDurability, LoadSealedRejectsBadKeyHexBeforeReading) {
   cli_node_t* node = cli_node_create();
   ASSERT_NE(node, nullptr);

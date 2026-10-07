@@ -128,6 +128,7 @@ void cli_node_destroy(cli_node_t* node) {
     }
   }
   if (node->node_key != NULL) crypto_ecdsa_keypair_destroy(node->node_key);
+  OPENSSL_cleanse(node->seal_key, sizeof(node->seal_key));
   free(node);
 }
 
@@ -408,9 +409,16 @@ cli_result_e cli_node_set_seal_key(cli_node_t* node, const char* key_hex) {
     fprintf(stderr, "ERROR: seal key must be 64 hex chars (32 bytes)\n");
     return CLI_ERR_ARGS;
   }
-  if (cli_hex_to_bytes(key_hex, node->seal_key, 32) != CLI_OK) {
+  // Decode into a scratch buffer first: cli_hex_to_bytes writes
+  // incrementally, so decoding straight into node->seal_key would mix old
+  // and new bytes on a failed re-import while seal_key_valid stays true.
+  uint8_t scratch[32];
+  if (cli_hex_to_bytes(key_hex, scratch, 32) != CLI_OK) {
+    OPENSSL_cleanse(scratch, sizeof(scratch));
     return CLI_ERR_ARGS;
   }
+  memcpy(node->seal_key, scratch, sizeof(node->seal_key));
+  OPENSSL_cleanse(scratch, sizeof(scratch));
   node->seal_key_valid = true;
   return CLI_OK;
 }

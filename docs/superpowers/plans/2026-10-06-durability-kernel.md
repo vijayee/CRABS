@@ -1572,6 +1572,18 @@ git commit -m "docs: trust boundaries for v10 sealed durability"
 
 ---
 
+## Follow-ups surfaced during execution
+
+- Silent authority drift: `_deserialize_state_internal` keeps a fresh MSK
+  when the seal key is absent/wrong (substrate compatibility path), so
+  `cli_node_load_sealed` returns OK even when the MSK was NOT restored. The
+  deserializer needs a restoration-result flag (e.g. an out-param or a
+  documented return enum) so the CLI can warn "authority not restored" —
+  Plan 2 should thread it or a wrapper struct.
+- `cli_node_save` composes sealed blob + ECDSA trailer inline (~20 lines
+  mirroring `crabs_serialize_state_signed`); Plan 2 should add
+  `crabs_serialize_state_sealed_signed` to serialization.c to centralize.
+
 ## Plan Handoff
 
 **Spec coverage check** — Plan 1 covers the spec's Serialization & durability

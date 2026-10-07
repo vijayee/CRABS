@@ -38,6 +38,9 @@ typedef struct {
 typedef struct {
   state_t*             state;
   attribute_machine_t*  attr_machine;
+  // Always NULL since v10: the single live ABE authority lives on
+  // attr_machine->base_state.abe_mk. Kept as a field so destroy paths and
+  // bindings signatures don't churn until Plan 2 (lineage) reshapes them.
   abe_master_key_t*    abe_mk;
   ecdsa_keypair_t*     node_key;
   // Per-user ECDSA key custody (audit M-17): operations are signed with the
