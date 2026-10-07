@@ -207,3 +207,7 @@ states directly; follow its fixture idiom.)
 - Light theme only (project standing rule); text glyphs over emoji.
 - Node bindings need NO plan work — lineage.c compiles in via GLOB_RECURSE and the change-kind stringifiers were updated in Plan 2 (verify `CRABS_CHANGE_LINEAGE` arm exists in `_change_kind_name_napi` as a Task 7 check).
 - .wasm packaging binaries ARE tracked artifacts — the wasm task's commit includes exactly the two .wasm files when regenerated.
+
+## Follow-ups
+
+- **Regenerate the shipped .wasm artifacts.** The two tracked binaries (`bindings/wasm/crabs.wasm`, `bindings/wasm/crabs.dev.wasm`) were built at `17897fb`, before the behavior-identical refactor in `f6c65c5` (wasm manifest lookup routed through `lineage_find_manifest_entry`). They are semantically current — the refactor changed only the C call path inside `crabs_wasm_lineage_find_manifest_entry` — but they do not carry its machine code. Regenerate with `./build_wasm.sh` (needs the wasm OpenSSL build, `OPENSSL_SRC`) at the next artifact refresh and commit the pair together, per the tracked-artifact rule above.
