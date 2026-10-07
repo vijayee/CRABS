@@ -1405,3 +1405,31 @@ crabs_error_e lineage_sign_dissolution(state_t* parent, const char* child_id,
   }
   return CRABS_SUCCESS;
 }
+
+// Manifest-backed attestation issuance convenience (see lineage.h).
+crabs_error_e crabs_issue_attestation(state_t* parent,
+                                      attestation_t* attestation_out,
+                                      const char* child_id,
+                                      const char* user_id,
+                                      const char* attributes,
+                                      uint64_t now_ms) {
+  if (parent == NULL || attestation_out == NULL) return CRABS_ERR_INVALID_PARAM;
+  const child_manifest_entry_t* manifest_entry =
+      _lineage_find_manifest_entry(parent, child_id);
+  if (manifest_entry == NULL) return CRABS_ERR_RESOURCE_NOT_FOUND;
+  // Only an ACTIVE child carries live attestation authority — a revoked,
+  // dissolved, or withdrawn lineage stops issuing (existing attestations
+  // from before the change run out their remaining TTL on their own).
+  if (manifest_entry->status != LINEAGE_ACTIVE) {
+    return CRABS_ERR_UNAUTHORIZED;
+  }
+  // Saturate-check the ttl addition: a wrap would mint an attestation with
+  // a PAST expiry (silent zero-window) instead of failing.
+  if (manifest_entry->attestation_ttl_ms > UINT64_MAX - now_ms) {
+    return CRABS_ERR_INVALID_PARAM;
+  }
+  return attestation_create(parent, attestation_out,
+                            parent->config.bootstrap_admin, child_id,
+                            user_id, attributes, now_ms,
+                            now_ms + manifest_entry->attestation_ttl_ms);
+}

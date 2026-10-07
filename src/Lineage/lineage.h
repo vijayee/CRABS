@@ -326,4 +326,21 @@ attestation_t* attestation_deserialize(const uint8_t* buf, size_t len);
 
 void attestation_destroy(attestation_t* attestation);
 
+// Convenience wrapper: issue an attestation for a child the parent
+// MANIFESTS. The child's manifest entry must exist and be LINEAGE_ACTIVE —
+// a child whose attestation authority was revoked (or dissolved/withdrawn)
+// refuses new attestations with CRABS_ERR_UNAUTHORIZED (crabs.h has no
+// NOT_PERMITTED enumerator), unknown child_id → CRABS_ERR_RESOURCE_NOT_FOUND.
+// The expiry comes from the entry's recorded attestation_ttl_ms:
+// expires_at = now_ms + ttl (a now_ms + ttl overflow refuses with
+// CRABS_ERR_INVALID_PARAM). parent_id is the parent's own machine identity
+// (config.bootstrap_admin); signing uses the parent's node key exactly like
+// attestation_create.
+crabs_error_e crabs_issue_attestation(state_t* parent,
+                                      attestation_t* attestation_out,
+                                      const char* child_id,
+                                      const char* user_id,
+                                      const char* attributes,
+                                      uint64_t now_ms);
+
 #endif // CRABS_LINEAGE_H

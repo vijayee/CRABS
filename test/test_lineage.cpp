@@ -1664,3 +1664,262 @@ TEST(TestLineage, DissolutionTombstoneSignsOnlyAfterDissolve) {
   machine_blueprint_destroy(blueprint);
   spawn_parent_destroy(&harness);
 }
+
+// ============================================================
+// Revocation timing: the custody payoff
+// ============================================================
+
+// Controllable machine clock (state_set_time_source + state_get_time_ms
+// read through it) shared by every state in a test so issuance and expiry
+// verification run on the SAME timeline.
+static uint64_t g_test_clock_ms;
+static crabs_physical_time_t test_clock_get_time(void* context) {
+  (void)context;
+  crabs_physical_time_t physical;
+  physical.seconds = g_test_clock_ms / 1000;
+  physical.nanos = (g_test_clock_ms % 1000) * 1000000ULL;
+  physical.valid = true;
+  return physical;
+}
+static bool test_clock_is_available(void* context) {
+  (void)context;
+  return true;
+}
+static crabs_time_source_ops_t g_test_clock_ops = {
+  test_clock_get_time, test_clock_is_available, NULL
+};
+
+// A delegated blueprint whose child op "render" resolves ONLY through a
+// parent endorsement: `@parent/role:writer`. The endorsement is AND-composed
+// with the (empty) local remainder — this is the strongest v1 coupling.
+static machine_blueprint_t* make_endorsed_delegated_blueprint(
+    const char* child_id) {
+  machine_blueprint_t* blueprint = machine_blueprint_create();
+  EXPECT_NE(blueprint, nullptr);
+  strncpy(blueprint->child_id, child_id, sizeof(blueprint->child_id) - 1);
+  blueprint->trust_mode = LINEAGE_DELEGATED_COPY;
+  strncpy(blueprint->bootstrap_admin, "child-admin",
+          sizeof(blueprint->bootstrap_admin) - 1);
+  blueprint->attestation_ttl_ms = 60000;
+  EXPECT_EQ(blueprint_add_item(blueprint, "canvas", DATA_TYPE_REGISTER,
+                               CRDT_LWW_REG), CRABS_SUCCESS);
+  EXPECT_EQ(blueprint_add_policy(blueprint, "render",
+                                 "@parent/role:writer"), CRABS_SUCCESS);
+  dedup_spec_t dedup;
+  memset(&dedup, 0, sizeof(dedup));
+  dedup.type = DEDUP_NONE;
+  EXPECT_EQ(blueprint_add_op_type_def(blueprint, "render", &dedup),
+            CRABS_SUCCESS);
+  EXPECT_EQ(lineage_blueprint_validate(blueprint), CRABS_SUCCESS);
+  return blueprint;
+}
+
+TEST(TestLineage, DelegatedChildLosesEndorsementAfterAttestationExpiry) {
+  spawn_parent_harness_t harness;
+  spawn_parent_setup(&harness);
+  state_t* parent = &harness.am->base_state;
+  g_test_clock_ms = 1700000000000ULL;  // fixed test epoch T0
+  state_set_time_source(parent, &g_test_clock_ops);
+
+  machine_blueprint_t* blueprint =
+      make_endorsed_delegated_blueprint("child-delegated");
+  ASSERT_NE(blueprint, nullptr);
+  attribute_machine_t* child = nullptr;
+  ASSERT_EQ(lineage_spawn_machine(parent, blueprint, &child), CRABS_SUCCESS);
+  state_set_time_source(&child->base_state, &g_test_clock_ops);
+
+  // The manifest ttl flows into the wrapper's expiry: expires = T0 + 60000.
+  attestation_t attestation;
+  ASSERT_EQ(crabs_issue_attestation(parent, &attestation, "child-delegated",
+                                    "child-admin", "role:writer",
+                                    g_test_clock_ms), CRABS_SUCCESS);
+  EXPECT_EQ(attestation.expires_at, g_test_clock_ms + 60000u);
+
+  // Inside the window: the endorsement resolves and the op authorizes. The
+  // child-admin's registered key is the parent's node public key, so the
+  // parent keypair signs; the op carries the attestation AFTER signing (the
+  // signing image excludes attestations — Task 7's established idiom).
+  operation_t* op = operation_create("render");
+  ASSERT_NE(op, nullptr);
+  strncpy(op->signer_id, "child-admin", CRABS_MAX_USER_ID - 1);
+  crabs_test_sign_op_with(child, harness.parent_key, op);
+  attach_attestation(op, &attestation);
+  EXPECT_EQ(state_machine_execute(&child->base_state, op), CRABS_SUCCESS);
+
+  // Advance the machine clock one millisecond past expiry: SAME op,
+  // SAME signature, SAME attestation — the endorsement no longer resolves.
+  g_test_clock_ms += 60001;
+  EXPECT_EQ(state_machine_execute(&child->base_state, op),
+            CRABS_ERR_UNAUTHORIZED);
+
+  // Re-issue on the advanced clock (a fresh, still-live window) — the
+  // endorsement authorizes again.
+  attestation_t renewed;
+  ASSERT_EQ(crabs_issue_attestation(parent, &renewed, "child-delegated",
+                                    "child-admin", "role:writer",
+                                    g_test_clock_ms), CRABS_SUCCESS);
+  operation_t* op2 = operation_create("render");
+  ASSERT_NE(op2, nullptr);
+  strncpy(op2->signer_id, "child-admin", CRABS_MAX_USER_ID - 1);
+  crabs_test_sign_op_with(child, harness.parent_key, op2);
+  attach_attestation(op2, &renewed);
+  EXPECT_EQ(state_machine_execute(&child->base_state, op2), CRABS_SUCCESS);
+
+  operation_destroy(op);
+  operation_destroy(op2);
+  machine_blueprint_destroy(blueprint);
+  attribute_machine_destroy(child);
+  spawn_parent_destroy(&harness);
+}
+
+TEST(TestLineage, SharedRootChildStopsInstantlyOnParentRevoke) {
+  spawn_parent_harness_t harness;
+  spawn_parent_setup(&harness);
+  state_t* parent = &harness.am->base_state;  // shared registry authority
+
+  machine_blueprint_t* blueprint = make_valid_blueprint();  // custody:child-red
+  ASSERT_NE(blueprint, nullptr);
+  attribute_machine_t* child = nullptr;
+  ASSERT_EQ(lineage_spawn_machine(parent, blueprint, &child), CRABS_SUCCESS);
+
+  // No custodial attribute yet — denied.
+  operation_t* denied = make_signed_increment_op(harness.am,
+                                                 harness.alice_key, "alice");
+  ASSERT_NE(denied, nullptr);
+  EXPECT_EQ(state_machine_execute(&child->base_state, denied),
+            CRABS_ERR_UNAUTHORIZED);
+
+  // The parent grants (and then REVOKES) custody — no attestation is
+  // involved anywhere: the shared registry is the single source of truth.
+  ASSERT_EQ(attribute_machine_grant_role(harness.am, "alice", "custody",
+                                         "child-red", "parent-root"),
+            CRABS_SUCCESS);
+  operation_t* granted = make_signed_increment_op(harness.am,
+                                                  harness.alice_key, "alice");
+  ASSERT_NE(granted, nullptr);
+  EXPECT_EQ(state_machine_execute(&child->base_state, granted),
+            CRABS_SUCCESS);
+
+  ASSERT_EQ(attribute_machine_revoke_role(harness.am, "alice", "custody",
+                                          "parent-root"), CRABS_SUCCESS);
+  // SAME op, signed seconds earlier: denied IMMEDIATELY on revoke.
+  EXPECT_EQ(state_machine_execute(&child->base_state, granted),
+            CRABS_ERR_UNAUTHORIZED);
+
+  operation_destroy(denied);
+  operation_destroy(granted);
+  machine_blueprint_destroy(blueprint);
+  attribute_machine_destroy(child);
+  spawn_parent_destroy(&harness);
+}
+
+TEST(TestLineage, DissolveVoidsEndorsementsImmediately) {
+  spawn_parent_harness_t harness;
+  spawn_parent_setup(&harness);
+  state_t* parent = &harness.am->base_state;
+  g_test_clock_ms = 1700000000000ULL;
+  state_set_time_source(parent, &g_test_clock_ops);
+
+  machine_blueprint_t* blueprint =
+      make_endorsed_delegated_blueprint("child-delegated");
+  ASSERT_NE(blueprint, nullptr);
+  attribute_machine_t* child = nullptr;
+  ASSERT_EQ(lineage_spawn_machine(parent, blueprint, &child), CRABS_SUCCESS);
+  state_set_time_source(&child->base_state, &g_test_clock_ops);
+
+  attestation_t attestation;
+  ASSERT_EQ(crabs_issue_attestation(parent, &attestation, "child-delegated",
+                                    "child-admin", "role:writer",
+                                    g_test_clock_ms), CRABS_SUCCESS);
+  operation_t* op = operation_create("render");
+  ASSERT_NE(op, nullptr);
+  strncpy(op->signer_id, "child-admin", CRABS_MAX_USER_ID - 1);
+  crabs_test_sign_op_with(child, harness.parent_key, op);
+  attach_attestation(op, &attestation);
+  EXPECT_EQ(state_machine_execute(&child->base_state, op), CRABS_SUCCESS);
+
+  // Dissolve THROUGH the handler: the child (resident in-process) is
+  // severed, and the endorsement gate fails closed from that moment.
+  operation_t* dissolve_op = operation_create(CRABS_LINEAGE_OP_DISSOLVE);
+  ASSERT_NE(dissolve_op, nullptr);
+  dissolve_op->payload = (uint8_t*)"child-delegated";
+  dissolve_op->payload_size = (uint32_t)strlen("child-delegated");
+  EXPECT_EQ(lineage_op_dissolve(parent, dissolve_op), CRABS_SUCCESS);
+  EXPECT_TRUE(child->base_state.lineage_parent_dissolved);
+  dissolve_op->payload = NULL;
+  operation_destroy(dissolve_op);
+
+  // A VALID, unexpired attestation (issued BEFORE the dissolve) still
+  // cannot cross the severed lineage — dissolution voids endorsements
+  // outright. New attestations cannot even be minted: the wrapper refuses a
+  // non-ACTIVE lineage.
+  attestation_t renewed;
+  EXPECT_EQ(crabs_issue_attestation(parent, &renewed, "child-delegated",
+                                    "child-admin", "role:writer",
+                                    g_test_clock_ms),
+            CRABS_ERR_UNAUTHORIZED);
+  operation_t* op2 = operation_create("render");
+  ASSERT_NE(op2, nullptr);
+  strncpy(op2->signer_id, "child-admin", CRABS_MAX_USER_ID - 1);
+  crabs_test_sign_op_with(child, harness.parent_key, op2);
+  attach_attestation(op2, &attestation);
+  EXPECT_EQ(state_machine_execute(&child->base_state, op2),
+            CRABS_ERR_UNAUTHORIZED);
+
+  operation_destroy(op);
+  operation_destroy(op2);
+  machine_blueprint_destroy(blueprint);
+  attribute_machine_destroy(child);
+  spawn_parent_destroy(&harness);
+}
+
+TEST(TestLineage, RevokedChildCannotReceiveNewAttestations) {
+  spawn_parent_harness_t harness;
+  spawn_parent_setup(&harness);
+  state_t* parent = &harness.am->base_state;
+
+  machine_blueprint_t* blueprint = make_valid_blueprint();
+  ASSERT_NE(blueprint, nullptr);
+  attribute_machine_t* child = nullptr;
+  ASSERT_EQ(lineage_spawn_machine(parent, blueprint, &child), CRABS_SUCCESS);
+
+  // ACTIVE: the wrapper issues with the manifest ttl.
+  g_test_clock_ms = 1700000000000ULL;
+  attestation_t attestation;
+  ASSERT_EQ(crabs_issue_attestation(parent, &attestation, "child-red",
+                                    "alice", "custody:child-red",
+                                    g_test_clock_ms), CRABS_SUCCESS);
+  EXPECT_STREQ(attestation.parent_id, "parent-root");
+  EXPECT_EQ(attestation.expires_at, g_test_clock_ms + 60000u);
+
+  // Unknown child.
+  EXPECT_EQ(crabs_issue_attestation(parent, &attestation, "child-ghost",
+                                    "alice", "custody:child-red",
+                                    g_test_clock_ms),
+            CRABS_ERR_RESOURCE_NOT_FOUND);
+
+  // After the parent revokes the child's attestation authority, new
+  // attestations are refused without dissolving the lineage.
+  operation_t* revoke_op = operation_create(CRABS_LINEAGE_OP_REVOKE_ATTESTATION);
+  ASSERT_NE(revoke_op, nullptr);
+  revoke_op->payload = (uint8_t*)"child-red";
+  revoke_op->payload_size = (uint32_t)strlen("child-red");
+  EXPECT_EQ(lineage_op_revoke_attestation(parent, revoke_op), CRABS_SUCCESS);
+  EXPECT_EQ(parent->children[0].status, LINEAGE_ATTESTATION_REVOKED);
+  revoke_op->payload = NULL;
+  operation_destroy(revoke_op);
+
+  EXPECT_EQ(crabs_issue_attestation(parent, &attestation, "child-red",
+                                    "alice", "custody:child-red",
+                                    g_test_clock_ms),
+            CRABS_ERR_UNAUTHORIZED);
+
+  // The issued-before-revoke attestation still verifies inside its window —
+  // revocation stops ISSUING, it does not forge-void what was signed.
+  EXPECT_TRUE(attestation_verify(parent->node_public_key, "child-red",
+                                 &attestation, g_test_clock_ms));
+
+  machine_blueprint_destroy(blueprint);
+  attribute_machine_destroy(child);
+  spawn_parent_destroy(&harness);
+}
