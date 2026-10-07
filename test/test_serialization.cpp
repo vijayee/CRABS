@@ -632,6 +632,63 @@ TEST(TestSerialization, TestDeserializeCorruptData) {
   state_destroy(state);
 }
 
+// A10-L6: the state deserializer must reject blobs whose payload carries
+// trailing un-consumed bytes after the last parsed section and before the
+// checksum (a crafted blob could otherwise satisfy a dual parse). The op
+// deserializer already enforces full consumption (R7-L-6).
+TEST(StateDeserialize, RejectsTrailingBytes) {
+  state_t* state = state_create();
+  state->version = 42;
+
+  data_item_t* item = data_item_create("counter1", DATA_TYPE_COUNTER, CRDT_G_COUNTER);
+  int64_t* val = (int64_t*)malloc(sizeof(int64_t));
+  *val = 12345;
+  item->value = val;
+  state_add_item(state, item);
+
+  serialized_buffer_t* buf = crabs_serialize_state(state);
+  ASSERT_NE(buf, nullptr);
+
+  // Sanity: the unmodified blob round-trips.
+  state_t* restored = crabs_deserialize_state(buf->data, buf->len);
+  ASSERT_NE(restored, nullptr);
+  state_destroy(restored);
+
+  // The checksum is the final CRABS_HASH_SIZE bytes over everything before it.
+  const size_t payload_len = buf->len - CRABS_HASH_SIZE;
+
+  // Payload-level trailing bytes: 16 junk bytes inserted between the last
+  // section and the checksum, with the checksum recomputed so the blob is
+  // otherwise self-consistent. Must be rejected.
+  {
+    std::vector<uint8_t> crafted(buf->len + 16);
+    memcpy(crafted.data(), buf->data, payload_len);
+    memset(crafted.data() + payload_len, 0xA5, 16);
+    uint8_t recomputed_hash[CRABS_HASH_SIZE];
+    SHA256(crafted.data(), payload_len + 16, recomputed_hash);
+    memcpy(crafted.data() + payload_len + 16, recomputed_hash, CRABS_HASH_SIZE);
+
+    state_t* result = crabs_deserialize_state(crafted.data(), crafted.size());
+    EXPECT_EQ(result, nullptr);
+    if (result != nullptr) state_destroy(result);
+  }
+
+  // Junk appended after the checksum: the checksum region no longer matches,
+  // so this is rejected at checksum verification (belt-and-braces check).
+  {
+    std::vector<uint8_t> crafted(buf->len + 16);
+    memcpy(crafted.data(), buf->data, buf->len);
+    memset(crafted.data() + buf->len, 0xA5, 16);
+
+    state_t* result = crabs_deserialize_state(crafted.data(), crafted.size());
+    EXPECT_EQ(result, nullptr);
+    if (result != nullptr) state_destroy(result);
+  }
+
+  serialized_buffer_destroy(buf);
+  state_destroy(state);
+}
+
 TEST(TestSerialization, TestDeserializeOperationCorruptData) {
   operation_t* op = operation_create(CRABS_OP_LOCK);
   strncpy(op->signer_id, "alice", CRABS_MAX_USER_ID - 1);

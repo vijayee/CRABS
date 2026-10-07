@@ -2140,6 +2140,14 @@ static state_t* _deserialize_state_internal(const uint8_t* data, size_t len,
     }
   }
 
+  // A10-L6: require the payload to be fully consumed — every section must end
+  // exactly where the checksum begins (the op deserializer precedent, R7-L-6).
+  // Trailing bytes mean corruption or a crafted dual-parse blob. All version-
+  // gated sections are consumed to the same end for every accepted version, and
+  // the sealed path consumes the MSK section identically with or without a seal
+  // key, so this invariant holds for every legitimate blob.
+  if (buf.offset != buf.len - CRABS_HASH_SIZE) goto fail;
+
   return state;
 
 fail:
