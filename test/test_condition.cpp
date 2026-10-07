@@ -863,3 +863,79 @@ TEST_F(TestCondition, TestPreprocessPolicyMixedContainsAndAbeKeepsAbePolicy) {
   EXPECT_TRUE(result.resolved_ok);
   EXPECT_STREQ(result.abe_policy, "video_abc >= 5");
 }
+
+// ============================================================
+// @parent/ Endorsement Token Tests (v1.7 §attestation bridge)
+// ============================================================
+
+TEST_F(TestCondition, TestPreprocessParentEndorsementOnly) {
+  // A policy consisting only of an endorsement token produces no local ABE
+  // requirement; the endorsement is resolved by the auth pipeline.
+  auto result = preprocess_policy("@parent/role:writer", state, "alice");
+  EXPECT_TRUE(result.resolved_ok);
+  EXPECT_EQ(result.parent_endorsement_count, 1u);
+  EXPECT_STREQ(result.parent_endorsements[0], "role:writer");
+  EXPECT_STREQ(result.abe_policy, "");
+}
+
+TEST_F(TestCondition, TestPreprocessParentEndorsementLeadingOperand) {
+  // The endorsement is the leading operand: extraction consumes the boolean
+  // operator that would otherwise dangle (v1 semantics — the endorsement
+  // list is AND-composed with the remaining local policy).
+  auto result = preprocess_policy("@parent/role:writer OR role:admin", state, "alice");
+  EXPECT_TRUE(result.resolved_ok);
+  EXPECT_EQ(result.parent_endorsement_count, 1u);
+  EXPECT_STREQ(result.parent_endorsements[0], "role:writer");
+  EXPECT_STREQ(result.abe_policy, "role:admin");
+}
+
+TEST_F(TestCondition, TestPreprocessParentEndorsementTrailingOperand) {
+  // Endorsement after the local policy: the preceding operator is consumed.
+  auto result = preprocess_policy("role:admin AND @parent/role:writer", state, "alice");
+  EXPECT_TRUE(result.resolved_ok);
+  EXPECT_EQ(result.parent_endorsement_count, 1u);
+  EXPECT_STREQ(result.parent_endorsements[0], "role:writer");
+  EXPECT_STREQ(result.abe_policy, "role:admin");
+}
+
+TEST_F(TestCondition, TestPreprocessParentThreeTokens) {
+  auto result = preprocess_policy(
+      "@parent/role:writer AND @parent/dept:red OR @parent/custody:video",
+      state, "alice");
+  EXPECT_TRUE(result.resolved_ok);
+  EXPECT_EQ(result.parent_endorsement_count, 3u);
+  EXPECT_STREQ(result.parent_endorsements[0], "role:writer");
+  EXPECT_STREQ(result.parent_endorsements[1], "dept:red");
+  EXPECT_STREQ(result.parent_endorsements[2], "custody:video");
+  EXPECT_STREQ(result.abe_policy, "");
+}
+
+TEST_F(TestCondition, TestPreprocessParentEndorsementMixedWithConditionGrammar) {
+  auto result = preprocess_policy("video_abc >= 5 AND @parent/role:writer",
+                                  state, "alice");
+  EXPECT_TRUE(result.resolved_ok);
+  EXPECT_EQ(result.parent_endorsement_count, 1u);
+  EXPECT_STREQ(result.parent_endorsements[0], "role:writer");
+  EXPECT_STREQ(result.abe_policy, "video_abc >= 5");
+}
+
+TEST_F(TestCondition, TestPreprocessParentMalformedTokensFailClosed) {
+  const char* malformed[] = {
+    "@parent/",                     // empty attribute at end of input
+    "@parent/        ",             // empty attribute before whitespace
+    "role:admin AND @parent/",      // empty attribute mid-policy
+    "@parent/ro@le:writer",         // nested '@' terminates the run
+    "@parent/@parent/role:writer",  // nested '@' immediately
+    "endorse@parent/role:writer",   // '@' not starting the token prefix
+    "(@parent/role:writer OR role:admin)",  // composition inside parens —
+                                            // out of scope in v1 (fail closed)
+    "@parent/role:writer AND @parent/a:1 AND @parent/b:2 AND @parent/c:3 "
+    "AND @parent/d:4 AND @parent/e:5 AND @parent/f:6 AND @parent/g:7 "
+    "AND @parent/h:8 AND @parent/j:9"       // 9 tokens > the 8-slot cap
+  };
+  for (const char* expression : malformed) {
+    auto result = preprocess_policy(expression, state, "alice");
+    EXPECT_FALSE(result.resolved_ok) << expression;
+    EXPECT_STREQ(result.abe_policy, "") << expression;
+  }
+}

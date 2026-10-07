@@ -77,11 +77,23 @@ condition_node_t*  condition_node_create_contains(const char* set_path, contains
                                                     bool negated, char** values, uint32_t count);
 
 // ============================================================
-// Policy Pre-processing (Amendment 2 §5)
+// Policy Pre-processing (Amendment 2 §5 + v1.7 §attestation bridge)
 // ============================================================
+
+// Per-policy cap on `@parent/` endorsement tokens. More than this many in a
+// single expression fails preprocessing (fail closed).
+#define CRABS_MAX_PARENT_ENDORSEMENTS 8
+
 typedef struct {
   char  abe_policy[CRABS_MAX_POLICY_EXPR];
   bool  resolved_ok;
+  // v1.7: every `@parent/<attr>` token extracted out of `abe_policy` by
+  // preprocess_policy, stored as the bare attribute (`role:writer`) so it can
+  // be matched directly against an attestation's attributes. The endorsement
+  // list is AND-composed with the local ABE policy and verified in the auth
+  // pipeline (state_machine.c), not by the ABE evaluator.
+  char     parent_endorsements[CRABS_MAX_PARENT_ENDORSEMENTS][CRABS_MAX_POLICY_EXPR];
+  uint32_t parent_endorsement_count;
 } policy_preprocess_result_t;
 
 policy_preprocess_result_t preprocess_policy(const char* policy, const state_t* state, const char* signer_id);

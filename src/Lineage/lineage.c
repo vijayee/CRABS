@@ -428,17 +428,23 @@ static bool _blueprint_id_field_is_safe(const char* field, size_t capacity) {
 
 // Structural validity shared by blueprint_add_policy and
 // lineage_blueprint_validate. The authorization pipeline (condition.c
-// preprocess_policy) accepts two expression families:
+// preprocess_policy) accepts three expression families:
 //   1. full condition grammar expressions (AND/OR/NOT/CONTAINS/comparisons);
 //   2. bare attribute tokens — the "name:value" family condition_parse
 //      rejects because ':' is not in the condition identifier charset, and
 //      which preprocess_policy then passes through verbatim as the ABE
-//      policy.
-// To validate the boolean structure of BOTH with one call, every bare
-// attribute token is rewritten into a placeholder comparison "aN == aN"
-// before condition_parse. Quoted operands are rejected up front, mirroring
-// preprocess_policy's fail-closed rule. An empty expression is valid (an op
-// with no auth requirement — state_add_policy accepts the same).
+//      policy;
+//   3. `@parent/<attr>` endorsement tokens (v1.7 §attestation bridge) —
+//      resolved out of the expression by preprocess_policy and verified in
+//      the auth pipeline against the op's attestations. Valid only at
+//      parenthesis depth 0 and with a well-formed attribute part, mirroring
+//      preprocess_policy's fail-closed rules.
+// To validate the boolean structure of ALL with one call, every bare
+// attribute token — and every well-formed endorsement token — is rewritten
+// into a placeholder comparison "aN == aN" before condition_parse. Quoted
+// operands are rejected up front, mirroring preprocess_policy's fail-closed
+// rule. An empty expression is valid (an op with no auth requirement —
+// state_add_policy accepts the same).
 static bool _lineage_policy_expression_is_valid(const char* expression) {
   if (expression == NULL) return false;
   if (expression[0] == '\0') return true;
@@ -451,8 +457,45 @@ static bool _lineage_policy_expression_is_valid(const char* expression) {
   char transformed[CRABS_MAX_POLICY_EXPR * 8];
   size_t write_pos = 0;
   int token_index = 0;
+  int paren_depth = 0;
   const char* cursor = expression;
   while (*cursor != '\0') {
+    if (*cursor == '(') {
+      paren_depth++;
+    } else if (*cursor == ')') {
+      if (paren_depth > 0) paren_depth--;
+    }
+    // Endorsement token: literal "@parent/" prefix at depth 0, non-empty
+    // attribute run of the bare-attribute charset, no nested '@'. Rewritten
+    // into the same placeholder comparison a colon token becomes, so the
+    // boolean structure around it is still checked by condition_parse.
+    if (*cursor == '@') {
+      // An '@' glued to a preceding word is malformed (bare attribute tokens
+      // never contain '@') — mirrors preprocess_policy's rule.
+      if (paren_depth > 0 ||
+          (cursor != expression && _char_in_identifier(cursor[-1]))) {
+        return false;
+      }
+      if (strncmp(cursor, "@parent/", 8) != 0) return false;
+      const char* attr_start = cursor + 8;
+      const char* attr_end = attr_start;
+      // The run stops at any non-identifier char; '@' is not one, so a
+      // nested '@' terminates the run and is rejected below.
+      while (_char_in_identifier(*attr_end)) {
+        attr_end++;
+      }
+      if (attr_end == attr_start || *attr_end == '@') return false;
+      int written = snprintf(transformed + write_pos,
+                             sizeof(transformed) - write_pos,
+                             "attr%d == attr%d ", token_index, token_index);
+      if (written < 0 || (size_t)written >= sizeof(transformed) - write_pos) {
+        return false;
+      }
+      write_pos += (size_t)written;
+      token_index++;
+      cursor = attr_end;
+      continue;
+    }
     if (_char_starts_identifier(*cursor)) {
       const char* run_start = cursor;
       bool has_colon = false;

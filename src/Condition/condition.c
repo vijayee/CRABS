@@ -1293,6 +1293,190 @@ static bool _resolve_user_id_placeholder(char* str, const char* signer_id) {
   return true;
 }
 
+// Characters allowed inside the attribute part of a `@parent/<attr>` token.
+// Mirrors the bare-attribute token family used by blueprint validation
+// (attribute_machine identifiers plus ':' and '.') — deliberately excluding
+// '@' and '/', so a nested '@' terminates the attribute run and is caught by
+// the malformed checks in _extract_parent_endorsements.
+static bool _char_in_endorsement_attr(char c) {
+  return isalnum((unsigned char)c) || c == '_' || c == '-' || c == ':' ||
+         c == '.';
+}
+
+// True when `s` begins with a canonical UPPERCASE boolean operator followed
+// by whitespace or end of input. Only the uppercase forms count: the ABE
+// evaluator's grammar is uppercase-only (condition.c's keyword lookup is
+// case-insensitive, but a lowercase "or" could not soundly separate the
+// endorsement from the remaining policy downstream), so consuming a
+// lowercase operator would silently change the evaluated expression.
+static bool _word_is_boolean_operator(const char* s) {
+  const char* and_word = "AND";
+  const char* or_word = "OR";
+  if (strncmp(s, and_word, 3) == 0 &&
+      (!s[3] || isspace((unsigned char)s[3]))) {
+    return true;
+  }
+  if (strncmp(s, or_word, 2) == 0 &&
+      (!s[2] || isspace((unsigned char)s[2]))) {
+    return true;
+  }
+  return false;
+}
+
+// Collapse every whitespace run in `s` to a single space and trim the ends,
+// in place. Policies never carry literal multi-space meaning, and token
+// extraction can leave irregular spacing behind.
+static void _collapse_whitespace(char* s) {
+  size_t read_index = 0;
+  size_t write_index = 0;
+  size_t length = strlen(s);
+  while (read_index < length) {
+    if (isspace((unsigned char)s[read_index])) {
+      while (read_index < length &&
+             isspace((unsigned char)s[read_index])) {
+        read_index++;
+      }
+      // A run only becomes a separator space when content follows it.
+      if (s[read_index] != '\0' && write_index > 0) {
+        s[write_index++] = ' ';
+      }
+      continue;
+    }
+    s[write_index++] = s[read_index++];
+  }
+  s[write_index] = '\0';
+}
+
+// Extract every `@parent/<attr>` token out of `input` into
+// `result->parent_endorsements` (stored as the bare attribute, e.g.
+// "role:writer"), writing the endorsement-free remainder into `remaining`.
+// The removal consumes one adjacent boolean operator so the remainder keeps
+// parsing: an operator following the token (it was the leading operand), or
+// — when no operator follows — one preceding it (it was the trailing
+// operand). Only tokens at parenthesis depth 0 are legal; boolean
+// composition over endorsements is out of scope for v1 and fails closed.
+//
+// Returns false on malformed input (leaving the caller to fail closed):
+//   - an '@' that does not start a literal "@parent/" token (nested '@');
+//   - an "@parent/" whose attribute run is empty;
+//   - an attribute run terminated by another '@' (nested '@');
+//   - more than CRABS_MAX_PARENT_ENDORSEMENTS tokens in one expression;
+//   - an endorsement token inside parentheses.
+// This scanner runs BEFORE condition_parse: the condition lexer has no token
+// classes for '@' or '/', so endorsements must be resolved at the string
+// layer.
+static bool _extract_parent_endorsements(
+    const char* input,
+    policy_preprocess_result_t* result,
+    char* remaining) {
+  size_t read_pos = 0;
+  size_t write_pos = 0;
+  int paren_depth = 0;
+
+  while (input[read_pos] != '\0') {
+    char c = input[read_pos];
+
+    if (c == '(') {
+      paren_depth++;
+      remaining[write_pos++] = c;
+      read_pos++;
+      continue;
+    }
+    if (c == ')') {
+      if (paren_depth > 0) paren_depth--;
+      remaining[write_pos++] = c;
+      read_pos++;
+      continue;
+    }
+    if (c != '@') {
+      remaining[write_pos++] = c;
+      read_pos++;
+      continue;
+    }
+
+    // Endorsement token: the '@' must start the literal prefix "@parent/"
+    // and the attribute run after the '/' must be non-empty. An '@' glued to
+    // a preceding word ("endorse@parent/…") is malformed — bare attribute
+    // tokens never contain '@' — and fails closed.
+    if (read_pos > 0 && _char_in_endorsement_attr(input[read_pos - 1])) {
+      return false;
+    }
+    if (strncmp(input + read_pos, "@parent/", 8) != 0) {
+      return false;
+    }
+    if (paren_depth > 0) {
+      return false;
+    }
+    size_t attr_start = read_pos + 8;
+    size_t attr_end = attr_start;
+    while (_char_in_endorsement_attr(input[attr_end])) {
+      attr_end++;
+    }
+    if (attr_end == attr_start || input[attr_end] == '@') {
+      return false;
+    }
+    size_t attr_len = attr_end - attr_start;
+    if (result->parent_endorsement_count >= CRABS_MAX_PARENT_ENDORSEMENTS ||
+        attr_len >= CRABS_MAX_POLICY_EXPR) {
+      return false;
+    }
+    char* endorsement_slot =
+        result->parent_endorsements[result->parent_endorsement_count];
+    memcpy(endorsement_slot, input + attr_start, attr_len);
+    endorsement_slot[attr_len] = '\0';
+    result->parent_endorsement_count++;
+    read_pos = attr_end;
+
+    // Consume one adjacent boolean operator so the remainder does not carry
+    // a dangling operand-less operator. Prefer the operator following the
+    // token (leading-operand shape); otherwise trim the operator preceding
+    // it (trailing-operand shape).
+    const char* cursor = input + read_pos;
+    while (isspace((unsigned char)*cursor)) cursor++;
+    if (_word_is_boolean_operator(cursor)) {
+      // Skip the token's trailing whitespace and the operator word...
+      read_pos = (size_t)(cursor - input);
+      while (input[read_pos] != '\0' && !isspace((unsigned char)input[read_pos])) {
+        read_pos++;
+      }
+      // NOTE: a lowercase operator ("or", "And") is left in place here and
+      // fails downstream (condition grammar tolerates it, the ABE evaluator
+      // does not) — fail closed rather than guessing.
+    } else {
+      // No following operator: trim a preceding one from `remaining` —
+      // scan back over whitespace, expecting the canonical operator word.
+      size_t write_pos_with_space = write_pos;
+      while (write_pos > 0 && isspace((unsigned char)remaining[write_pos - 1])) {
+        write_pos--;
+      }
+      bool whitespace_before_token = write_pos_with_space > write_pos;
+      const size_t and_word_len = 3;  // "AND"
+      const size_t or_word_len = 2;   // "OR"
+      // The operator word only counts when it stands alone: whitespace must
+      // separate it from what came before, or it must start the policy (or
+      // follow a paren). "adminAND" in a bare-token policy is ONE identifier
+      // — trimming its "AND" suffix would rewrite the policy's meaning.
+      if (write_pos >= and_word_len &&
+          strncmp(remaining + write_pos - and_word_len, "AND", and_word_len) == 0 &&
+          (whitespace_before_token || write_pos == and_word_len ||
+           remaining[write_pos - and_word_len - 1] == '(' )) {
+        write_pos -= and_word_len;
+      } else if (write_pos >= or_word_len &&
+                 strncmp(remaining + write_pos - or_word_len, "OR", or_word_len) == 0 &&
+                 (whitespace_before_token || write_pos == or_word_len ||
+                  remaining[write_pos - or_word_len - 1] == '(' )) {
+        write_pos -= or_word_len;
+      }
+      // When the operator is glued to another word ("role:adminAND") or
+      // lowercase, it stays and the expression fails downstream — fail
+      // closed rather than guessing at intended structure.
+    }
+  }
+
+  remaining[write_pos] = '\0';
+  return true;
+}
+
 policy_preprocess_result_t preprocess_policy(const char* policy, const state_t* state, const char* signer_id) {
   policy_preprocess_result_t result;
   memset(&result, 0, sizeof(result));
@@ -1312,8 +1496,20 @@ policy_preprocess_result_t preprocess_policy(const char* policy, const state_t* 
     return result;
   }
 
+  // Step 1b: v1.7 — extract @parent/ endorsement tokens. The condition
+  // lexer has no token classes for '@' or '/', and the OpenABE grammar
+  // cannot carry endorsement tokens, so they are resolved at the string
+  // layer and verified later in the auth pipeline against the op's
+  // attestations. Malformed endorsements fail preprocessing closed.
+  char stripped_buf[CRABS_MAX_POLICY_EXPR];
+  if (!_extract_parent_endorsements(work_buf, &result, stripped_buf)) {
+    result.resolved_ok = false;
+    return result;
+  }
+  _collapse_whitespace(stripped_buf);
+
   // Step 2: Parse the policy into an AST
-  condition_node_t* ast = condition_parse(work_buf);
+  condition_node_t* ast = condition_parse(stripped_buf);
   if (ast == NULL) {
     // Audit fix (High, conf 9): condition_parse now rejects quoted-string
     // operands. A policy that still contains a quote cannot be a valid bare
@@ -1321,7 +1517,7 @@ policy_preprocess_result_t preprocess_policy(const char* policy, const state_t* 
     // no quotes), so it is unambiguous user error — fail closed instead of
     // passing the raw expression through as an ABE token that would match
     // nothing (deny) or, worse, be re-atoll()ed by a downstream evaluator.
-    if (strchr(work_buf, '"') != NULL) {
+    if (strchr(stripped_buf, '"') != NULL) {
       result.resolved_ok = false;
       return result;
     }
@@ -1331,7 +1527,7 @@ policy_preprocess_result_t preprocess_policy(const char* policy, const state_t* 
     // "role:admin" exactly. Stripping the name prefix here (the old behavior)
     // made "role:admin" and "dept:admin" collide and let a self-asserted
     // "clearance:admin" satisfy a "role:admin" policy (audit F-1).
-    strncpy(result.abe_policy, work_buf, CRABS_MAX_POLICY_EXPR - 1);
+    strncpy(result.abe_policy, stripped_buf, CRABS_MAX_POLICY_EXPR - 1);
     result.abe_policy[CRABS_MAX_POLICY_EXPR - 1] = '\0';
     result.resolved_ok = true;
     return result;

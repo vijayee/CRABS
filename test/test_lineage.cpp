@@ -131,6 +131,44 @@ TEST(TestLineage, RejectsMalformedPolicy) {
   }
 }
 
+TEST(TestLineage, EndorsementPolicyExpressionsValidate) {
+  // v1.7 §attestation bridge: blueprint policies may carry @parent/<attr>
+  // endorsement tokens (spawned children resolve them against their parent
+  // binding). The validator mirrors preprocess_policy's grammar: the token
+  // must be well-formed and sit at parenthesis depth 0.
+  machine_blueprint_t* valid = make_valid_blueprint();
+  ASSERT_NE(valid, nullptr);
+  memset(valid->policies[0].expression, 0,
+         sizeof(valid->policies[0].expression));
+  strncpy(valid->policies[0].expression, "@parent/role:writer",
+          sizeof(valid->policies[0].expression) - 1);
+  EXPECT_EQ(lineage_blueprint_validate(valid), CRABS_SUCCESS);
+
+  strncpy(valid->policies[0].expression, "@parent/role:writer AND custody:child-red",
+          sizeof(valid->policies[0].expression) - 1);
+  EXPECT_EQ(lineage_blueprint_validate(valid), CRABS_SUCCESS);
+  machine_blueprint_destroy(valid);
+
+  machine_blueprint_t* malformed = make_valid_blueprint();
+  ASSERT_NE(malformed, nullptr);
+  memset(malformed->policies[0].expression, 0,
+         sizeof(malformed->policies[0].expression));
+  const char* bad_expressions[] = {
+    "@parent/",                              // empty attribute
+    "@parent/ro@le:writer",                  // nested '@'
+    "@parent/a:1 AND @parent/",              // empty attribute mid-policy
+    "(role:admin OR @parent/a:1)"            // endorsement inside parens —
+                                             // composition out of scope in v1
+  };
+  for (const char* expression : bad_expressions) {
+    strncpy(malformed->policies[0].expression, expression,
+            sizeof(malformed->policies[0].expression) - 1);
+    EXPECT_EQ(lineage_blueprint_validate(malformed),
+              CRABS_ERR_UNAUTHORIZED) << expression;
+  }
+  machine_blueprint_destroy(malformed);
+}
+
 TEST(TestLineage, DuplicateItemNamesAreRejected) {
   machine_blueprint_t* blueprint = make_valid_blueprint();
   ASSERT_NE(blueprint, nullptr);
