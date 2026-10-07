@@ -1374,6 +1374,25 @@ TEST(TestLineage, BlueprintValidateRejectsOutOfRangeCrdtType) {
   machine_blueprint_destroy(blueprint);
 }
 
+// A hand-built struct with count>0 but a NULL section array must be rejected
+// by lineage_blueprint_validate, not dereferenced (de-wonk follow-up: the
+// deserializer can never produce this shape, only a direct caller can).
+TEST(TestLineage, BlueprintValidateRejectsCountWithoutArray) {
+  machine_blueprint_t* blueprint = make_valid_blueprint();
+  ASSERT_NE(blueprint, nullptr);
+
+  blueprint->items = nullptr;  // count stays 1 from the fixture
+  EXPECT_EQ(lineage_blueprint_validate(blueprint), CRABS_ERR_INVALID_PARAM);
+  machine_blueprint_destroy(blueprint);
+
+  machine_blueprint_t* blueprint2 = make_valid_blueprint();
+  ASSERT_NE(blueprint2, nullptr);
+  blueprint2->policies = nullptr;
+  blueprint2->op_type_defs = nullptr;
+  EXPECT_EQ(lineage_blueprint_validate(blueprint2), CRABS_ERR_INVALID_PARAM);
+  machine_blueprint_destroy(blueprint2);
+}
+
 TEST(TestLineage, BlueprintStampHashRejectsInvalidStruct) {
   EXPECT_EQ(machine_blueprint_stamp_hash(nullptr), CRABS_ERR_INVALID_PARAM);
 

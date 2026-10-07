@@ -627,9 +627,10 @@ machine_blueprint_t* blueprint_deserialize(const uint8_t* buf, size_t len) {
   for (uint32_t item_index = 0; parsed && item_index < item_count;
        item_index++) {
     blueprint_item_t* item = &blueprint->items[item_index];
-    // The two enum bytes are whitelisted BEFORE the offset advances or the
-    // item fields are cast/assigned — an out-of-range byte leaves no partial
-    // mutation in the item slot (A10-L2).
+    // The two enum bytes are whitelisted BEFORE the offset advances past them
+    // or the type fields are cast/assigned — and any earlier stop on a bad
+    // byte leaves parsed=false, so the partially read blueprint is destroyed
+    // below with no partial state escaping (A10-L2).
     parsed = _lineage_string16_read(buf, len, &offset, item->name,
                                     sizeof(item->name)) &&
              offset + 2 <= len &&
@@ -997,6 +998,15 @@ crabs_error_e lineage_blueprint_validate(const machine_blueprint_t* blueprint) {
   if (blueprint->item_count > CRABS_MAX_BLUEPRINT_ITEMS ||
       blueprint->policy_count > CRABS_MAX_BLUEPRINT_POLICIES ||
       blueprint->op_type_def_count > CRABS_MAX_BLUEPRINT_OP_TYPE_DEFS) {
+    return CRABS_ERR_INVALID_PARAM;
+  }
+  // A hand-built struct with count>0 but a NULL section array must fail
+  // closed here rather than dereference below — the deserializer can never
+  // produce this shape; only a direct caller can (mirrors the writer's
+  // guard in _blueprint_write_body).
+  if ((blueprint->item_count > 0 && blueprint->items == NULL) ||
+      (blueprint->policy_count > 0 && blueprint->policies == NULL) ||
+      (blueprint->op_type_def_count > 0 && blueprint->op_type_defs == NULL)) {
     return CRABS_ERR_INVALID_PARAM;
   }
   for (uint32_t item_index = 0; item_index < blueprint->item_count;
