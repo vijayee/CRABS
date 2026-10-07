@@ -129,6 +129,32 @@ async function scheduleRecurringMint(dev, node, actorId, signingKeypair) {
   node.scheduleRecurring(mintOperation, Date.now() + 15000, 15000, 3, 0);
 }
 
+// Mint a child machine via the lineage surface: register the lineage ops,
+// author a shared-root blueprint (one counter item + one policy) and spawn
+// in-process. The child shows up in the panel's lineage section with
+// mode/status pills, the 1h attestation TTL hint, and the [resident]
+// marker (the parent holds it until the wasm module is unloaded).
+async function spawnChildMachine(dev, node) {
+  // The bootstrap admin id doubles as the child's bootstrap admin (shared-root
+  // children borrow the parent's authority).
+  node.lineageInstall();
+  const blueprint = await dev.Blueprint.create(
+    'demo-child', dev.TRUST_MODE.SHARED_ROOT, node.adminId, 3600000);
+  try {
+    blueprint.addItem('child_views', dev.DATA_TYPE.COUNTER,
+                      dev.CRDT_TYPE.G_COUNTER);
+    blueprint.addPolicy('increment', 'role:member');
+    node.lineageSpawn(blueprint);
+  } catch (spawnError) {
+    console.info('spawn rejected: ' + spawnError.message +
+      ' | children=' + node.childCount() +
+      ' index=' + node.childIndex('demo-child') +
+      ' adminId=' + node.adminId);
+  } finally {
+    blueprint.destroy();
+  }
+}
+
 async function fireOperation(dev, node, actorId, signingKeypair, opType) {
   const operation = await dev.Operation.create(opType);
   operation.signerId = actorId;
@@ -166,8 +192,13 @@ function startRelay(dev, node) {
 
 (async function main() {
   // bindings-core.js (loaded as a plain <script>) exposes the factory; the
-  // dev glue (crabs.dev.js) exposes window.createCRABSModuleDev.
-  const dev = window.CRABSWasmCore(() => window.createCRABSModuleDev());
+  // dev glue (crabs.dev.js) exposes window.createCRABSModuleDev. The .wasm
+  // binary itself is cache-busted too: without it a rebuilt artifact keeps
+  // serving the previous module from the browser cache.
+  const WASM_CACHE_BUST = '?v=18';
+  const dev = window.CRABSWasmCore(() => window.createCRABSModuleDev({
+    locateFile: (basePath) => '../../bindings/wasm/' + basePath + WASM_CACHE_BUST,
+  }));
   // crabs-devtools.js exposes attach() on window.CRABSDevtools; the
   // controller plumbing it consumes lives on window.CRABSDevtoolsApi.
   const { attach } = window.CRABSDevtools;
@@ -199,6 +230,7 @@ function startRelay(dev, node) {
     ['Flag', (node, actorId, keypair) => fireOperation(dev, node, actorId, keypair, 'flag')],
     ['Schedule mint (+60s)', (node, actorId, keypair) => scheduleMint(dev, node, actorId, keypair)],
     ['Schedule 3 mints (every 15s)', (node, actorId, keypair) => scheduleRecurringMint(dev, node, actorId, keypair)],
+    ['Spawn child machine', (node) => spawnChildMachine(dev, node)],
   ];
 
   for (const [gridId, node, actorId, keypair] of [
@@ -216,4 +248,8 @@ function startRelay(dev, node) {
   }
 
   startRelay(dev, aliceNode);
+
+  // Debug handle: lets the console (and browser automation) mint machines
+  // against the live demo nodes, e.g. inspect the child manifest directly.
+  window.__crabsDemo = { dev, nodes: { alice: aliceNode, bob: bobNode } };
 })();

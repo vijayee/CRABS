@@ -33,20 +33,20 @@
   <div class="nodes">
     <div class="node-col">
       <h2>Alice's node</h2>
-      <div class="hint">Ops are HLC-ordered, so every operation from a signer is accepted in sequence. Dislike has no policy, so it is always rejected — rejections show up in the timeline too. Three Flag ops fire the tos_threshold trigger. The State tab is the full state tree (counters, sets, registers, triggers) with diff badges on whatever just changed, and its overview line counts pending schedules; the contact register is ABE-encrypted, so it shows the encrypted marker, never the plaintext address. The Timeline lists every event with layer pills you can filter (op, schedule, trigger, attribute). The "Schedule mint (+60s)" button queues a timed mint: the pending count ticks up as soon as it is submitted, and after ~60s the mint materializes (Timeline + tokens counter) and the count drops back. The "Schedule 3 mints (every 15s)" button queues a recurring mint: three mints materialize over ~45s on the Timeline's schedule layer, then the pending count returns to zero.</div>
+      <div class="hint">Ops are HLC-ordered, so every operation from a signer is accepted in sequence. Dislike has no policy, so it is always rejected — rejections show up in the timeline too. Three Flag ops fire the tos_threshold trigger. The State tab is the full state tree (counters, sets, registers, triggers) with diff badges on whatever just changed, and its overview line counts pending schedules; the contact register is ABE-encrypted, so it shows the encrypted marker, never the plaintext address. The Timeline lists every event with layer pills you can filter (op, schedule, trigger, attribute, spawn, lineage). The "Schedule mint (+60s)" button queues a timed mint: the pending count ticks up as soon as it is submitted, and after ~60s the mint materializes (Timeline + tokens counter) and the count drops back. The "Schedule 3 mints (every 15s)" button queues a recurring mint: three mints materialize over ~45s on the Timeline's schedule layer, then the pending count returns to zero. The "Spawn child machine" button mints a child state machine via the lineage surface: the State tab's lineage section lists it with mode/status pills, the 1h attestation TTL hint, and the [resident] process marker, and the Timeline shows the spawn event on the spawn layer.</div>
       <div class="op-grid" id="alice-ops"></div>
     </div>
     <div class="node-col">
       <h2>Bob's node</h2>
-      <div class="hint">Ops are HLC-ordered, so every operation from a signer is accepted in sequence. Dislike has no policy, so it is always rejected — rejections show up in the timeline too. Three Flag ops fire the tos_threshold trigger. The State tab is the full state tree (counters, sets, registers, triggers) with diff badges on whatever just changed, and its overview line counts pending schedules; the contact register is ABE-encrypted, so it shows the encrypted marker, never the plaintext address. The Timeline lists every event with layer pills you can filter (op, schedule, trigger, attribute). The "Schedule mint (+60s)" button queues a timed mint: the pending count ticks up as soon as it is submitted, and after ~60s the mint materializes (Timeline + tokens counter) and the count drops back. The "Schedule 3 mints (every 15s)" button queues a recurring mint: three mints materialize over ~45s on the Timeline's schedule layer, then the pending count returns to zero.</div>
+      <div class="hint">Ops are HLC-ordered, so every operation from a signer is accepted in sequence. Dislike has no policy, so it is always rejected — rejections show up in the timeline too. Three Flag ops fire the tos_threshold trigger. The State tab is the full state tree (counters, sets, registers, triggers) with diff badges on whatever just changed, and its overview line counts pending schedules; the contact register is ABE-encrypted, so it shows the encrypted marker, never the plaintext address. The Timeline lists every event with layer pills you can filter (op, schedule, trigger, attribute, spawn, lineage). The "Schedule mint (+60s)" button queues a timed mint: the pending count ticks up as soon as it is submitted, and after ~60s the mint materializes (Timeline + tokens counter) and the count drops back. The "Schedule 3 mints (every 15s)" button queues a recurring mint: three mints materialize over ~45s on the Timeline's schedule layer, then the pending count returns to zero. The "Spawn child machine" button mints a child state machine via the lineage surface: the State tab's lineage section lists it with mode/status pills, the 1h attestation TTL hint, and the [resident] process marker, and the Timeline shows the spawn event on the spawn layer.</div>
       <div class="op-grid" id="bob-ops"></div>
     </div>
   </div>
   <!-- Query-string version bumps defeat stale browser caches during development. -->
-  <script src="../../bindings/wasm/crabs.dev.js?v=17"></script>
-  <script src="../../bindings/wasm/bindings-core.js?v=17"></script>
-  <script src="../../bindings/devtools/devtools-api.js?v=17"></script>
-  <script src="../../bindings/devtools/crabs-devtools.js?v=17"></script>
-  <script src="demo.js?v=17"></script>
+  <script src="../../bindings/wasm/crabs.dev.js?v=18"></script>
+  <script src="../../bindings/wasm/bindings-core.js?v=18"></script>
+  <script src="../../bindings/devtools/devtools-api.js?v=18"></script>
+  <script src="../../bindings/devtools/crabs-devtools.js?v=18"></script>
+  <script src="demo.js?v=18"></script>
 </body>
 </html>
