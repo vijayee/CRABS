@@ -1017,6 +1017,62 @@ cli_result_e cli_cmd_key_revoke(cli_node_t* node, const char* user_id,
 // Operation Submission
 // ============================================================
 
+// R7-11 watermark stamp: the next strictly-increasing Lamport time for the
+// signer = their maximum logged Lamport time + 1. Without this an op left at
+// lamport 0 is refused as a replay after the signer's very first op (every
+// logged entry is then NOT strictly older than the next). Callers that set
+// op->lamport_time themselves are never overwritten.
+static uint64_t _op_next_lamport_time(state_t* state, const char* signer_id) {
+  uint64_t watermark = 0;
+  for (uint64_t entry_index = state->log_count; entry_index > 0;
+       entry_index--) {
+    const log_entry_t* entry = &state->log[entry_index - 1];
+    if (strcmp(entry->signer_id, signer_id) != 0) continue;
+    if (entry->ordering_system == CRABS_ORDERING_LAMPORT &&
+        entry->lamport_time > watermark) {
+      watermark = entry->lamport_time;
+    }
+  }
+  return watermark + 1;
+}
+
+// Shared op-submission tail: sign the prepared op with the signer's own
+// custodied key (audit M-17: the CLI signs under op->signer_id, never the
+// node key for everyone) and execute it on the machine. The caller fills in
+// type, uuid, payload and signer_id first; on failure the caller destroys
+// the op and surfaces cli_error_string(err).
+static crabs_error_e _op_sign_and_execute(cli_node_t* node, operation_t* op) {
+  if (node == NULL || !node->initialized || op == NULL) {
+    return CRABS_ERR_INVALID_PARAM;
+  }
+
+  // If the CLI holds no key for the signer, the op is left unsigned and
+  // execution will reject it (fail-closed).
+  if (op->signer_id[0] != '\0' && node->attr_machine->base_state.node_key_valid) {
+    if (op->lamport_time == 0) {
+      op->lamport_time = _op_next_lamport_time(&node->attr_machine->base_state,
+                                               op->signer_id);
+    }
+    user_t* user = attribute_machine_find_user(node->attr_machine, op->signer_id);
+    if (user != NULL) {
+      ecdsa_keypair_t* signer_key = cli_node_get_user_key(node, op->signer_id);
+      if (signer_key != NULL) {
+        // signer_key_version is part of the signed canonical form, so it must
+        // be set BEFORE serializing for signing.
+        op->signer_key_version = user->key_version;
+        serialized_buffer_t* sig_data = crabs_serialize_for_signing(op);
+        if (sig_data != NULL) {
+          crypto_ecdsa_sign(signer_key->private_key,
+                            sig_data->data, sig_data->len, op->signature);
+          serialized_buffer_destroy(sig_data);
+        }
+      }
+    }
+  }
+
+  return state_machine_execute(&node->attr_machine->base_state, op);
+}
+
 cli_result_e cli_cmd_op_submit(cli_node_t* node, const char* type,
                                  const char* payload_hex, const char* signer_id) {
   if (node == NULL || !node->initialized) return CLI_ERR_NOT_INIT;
@@ -1093,31 +1149,9 @@ cli_result_e cli_cmd_op_submit(cli_node_t* node, const char* type,
     }
   }
 
-  // Sign the operation with the signer's own custodied key (audit M-17:
-  // previously every op was signed with the node key regardless of signer_id,
-  // so the CLI could not actually act as a non-admin user and would forge
-  // admin signatures for anyone). If the CLI holds no key for the signer, the
-  // op is left unsigned and execution will reject it (fail-closed).
-  if (op->signer_id[0] != '\0' && node->attr_machine->base_state.node_key_valid) {
-    user_t* user = attribute_machine_find_user(node->attr_machine, op->signer_id);
-    if (user != NULL) {
-      ecdsa_keypair_t* signer_key = cli_node_get_user_key(node, op->signer_id);
-      if (signer_key != NULL) {
-        // signer_key_version is part of the signed canonical form, so it must
-        // be set BEFORE serializing for signing.
-        op->signer_key_version = user->key_version;
-        serialized_buffer_t* sig_data = crabs_serialize_for_signing(op);
-        if (sig_data != NULL) {
-          crypto_ecdsa_sign(signer_key->private_key,
-                            sig_data->data, sig_data->len, op->signature);
-          serialized_buffer_destroy(sig_data);
-        }
-      }
-    }
-  }
-
-  // Execute the operation
-  crabs_error_e err = state_machine_execute(&node->attr_machine->base_state, op);
+  // Sign the operation with the signer's own custodied key (audit M-17)
+  // and execute it.
+  crabs_error_e err = _op_sign_and_execute(node, op);
   if (err != CRABS_SUCCESS) {
     operation_destroy(op);
     printf("Error: Operation '%s' failed: %s\n", type, cli_error_string(err));
@@ -1563,6 +1597,122 @@ static cli_result_e _machine_blueprint_cmd_validate(cli_node_t* node,
 }
 
 // ============================================================
+// Machine Lifecycle (lineage v1.7)
+// ============================================================
+//
+// Every mutating command is a REAL operation through the pipeline, exactly
+// like 'op submit': the op carries the bootstrap admin as signer, is signed
+// with that admin's custodied key, and is dispatched by
+// state_machine_execute — the lineage op handler runs only after the op's
+// signature and the installed policy (role:admin from lineage_install) both
+// pass. The policies and handlers are NOT registered by the CLI: the
+// spawning protocol must have called lineage_install on this machine.
+
+// Build a bootstrap-admin-signed lineage op with `payload` (copied) and run
+// it through the pipeline via _op_sign_and_execute. `command_name` is the
+// operator-facing subcommand word used in error messages.
+static cli_result_e _machine_lifecycle_op_submit(cli_node_t* node,
+                                                 const char* op_type,
+                                                 const uint8_t* payload,
+                                                 size_t payload_size,
+                                                 const char* command_name) {
+  operation_t* op = operation_create(op_type);
+  if (op == NULL) {
+    printf("Error: Failed to build the %s operation.\n", command_name);
+    return CLI_ERR_EXEC;
+  }
+  crypto_random_bytes(op->uuid, CRABS_UUID_SIZE);
+  if (payload != NULL && payload_size > 0) {
+    op->payload = get_clear_memory(payload_size);
+    memcpy(op->payload, payload, payload_size);
+    op->payload_size = (uint32_t)payload_size;
+  }
+  strncpy(op->signer_id, node->attr_machine->base_state.config.bootstrap_admin,
+          CRABS_MAX_USER_ID - 1);
+
+  crabs_error_e err = _op_sign_and_execute(node, op);
+  operation_destroy(op);
+  if (err != CRABS_SUCCESS) {
+    printf("Error: machine %s failed: %s\n", command_name,
+           cli_error_string(err));
+    return CLI_ERR_EXEC;
+  }
+  return CLI_OK;
+}
+
+static cli_result_e _machine_cmd_spawn(cli_node_t* node, const char* path) {
+  if (node == NULL || !node->initialized || node->attr_machine == NULL)
+    return CLI_ERR_NOT_INIT;
+  if (path == NULL) return CLI_ERR_ARGS;
+
+  size_t file_len = 0;
+  uint8_t* data = _read_file_bytes(path, &file_len);
+  if (data == NULL) return CLI_ERR_IO;
+  // The raw blueprint wire image is the op payload — the
+  // __spawn_machine__ handler deserializes + hash-verifies it and refuses
+  // anything malformed (parse failures surface as CLI_ERR_EXEC).
+  cli_result_e result = _machine_lifecycle_op_submit(
+      node, CRABS_LINEAGE_OP_SPAWN, data, file_len, "spawn");
+  free(data);
+  if (result != CLI_OK) return result;
+
+  const child_manifest_entry_t* entries = NULL;
+  uint32_t count = lineage_query_children(&node->attr_machine->base_state,
+                                          &entries);
+  printf("Machine spawned from %s. Child manifest now holds %u children.\n",
+         path, count);
+  return CLI_OK;
+}
+
+static cli_result_e _machine_cmd_children(cli_node_t* node) {
+  if (node == NULL || !node->initialized || node->attr_machine == NULL)
+    return CLI_ERR_NOT_INIT;
+
+  const child_manifest_entry_t* entries = NULL;
+  uint32_t count = lineage_query_children(&node->attr_machine->base_state,
+                                          &entries);
+  if (count == 0) {
+    printf("No children manifested on this machine.\n");
+    return CLI_OK;
+  }
+  printf("%-16s %-14s %-20s %-9s %s\n", "child_id", "mode", "status",
+         "resident", "ttl_ms");
+  for (uint32_t entry_index = 0; entry_index < count; entry_index++) {
+    bool resident = lineage_query_resident_child(
+        &node->attr_machine->base_state,
+        entries[entry_index].child_id) != NULL;
+    printf("%-16s %-14s %-20s %-9s %llu\n",
+           entries[entry_index].child_id,
+           lineage_mode_name(entries[entry_index].mode),
+           lineage_status_name(entries[entry_index].status),
+           resident ? "yes" : "no",
+           (unsigned long long)entries[entry_index].attestation_ttl_ms);
+  }
+  return CLI_OK;
+}
+
+// Shared body of dissolve / withdraw / revoke-attestation: the three ops
+// carry the same payload shape — the raw child_id string bytes (no NUL; the
+// handler's reader mirrors this exactly). An overlong id is refused at the
+// argument level rather than silently truncating to a different child.
+static cli_result_e _machine_cmd_child_targeted_op(
+    cli_node_t* node, const char* command_name, const char* op_type,
+    const char* child_id) {
+  if (node == NULL || !node->initialized || node->attr_machine == NULL)
+    return CLI_ERR_NOT_INIT;
+  if (child_id == NULL || child_id[0] == '\0') return CLI_ERR_ARGS;
+  if (strlen(child_id) >= CRABS_MAX_USER_ID) {
+    printf("Error: child_id must be shorter than %d characters.\n",
+           CRABS_MAX_USER_ID);
+    return CLI_ERR_ARGS;
+  }
+  return _machine_lifecycle_op_submit(node, op_type,
+                                      (const uint8_t*)child_id,
+                                      strlen(child_id), command_name);
+}
+
+
+// ============================================================
 // Command Dispatch
 // ============================================================
 
@@ -1599,6 +1749,11 @@ static void _warn_first_unauthenticated_mutation(cli_node_t* node, const char* c
     mutating = true;
   } else if (strcmp(cmd, "op") == 0 && sub != NULL &&
              (strcmp(sub, "submit") == 0 || strcmp(sub, "define") == 0)) {
+    mutating = true;
+  } else if (strcmp(cmd, "machine") == 0 && sub != NULL &&
+             (strcmp(sub, "spawn") == 0 || strcmp(sub, "dissolve") == 0 ||
+              strcmp(sub, "withdraw") == 0 ||
+              strcmp(sub, "revoke-attestation") == 0)) {
     mutating = true;
   }
 
@@ -1646,9 +1801,84 @@ static void _print_machine_usage(void) {
   printf("  machine blueprint policy <operation> <expression>      Append an authorization policy\n");
   printf("  machine blueprint dedup <op_type> <dedup_type> [tracker_path|flag_path|condition] [rejection_message]\n");
   printf("                                       Append an operation type definition\n");
-  printf("  machine blueprint save <file.cbp>    Validate and write the draft to a blueprint file\n");
+  printf("  machine blueprint save <file.cbp>      Validate and write the draft to a blueprint file\n");
   printf("  machine blueprint validate <file.cbp>  Validate a saved blueprint file\n");
-  printf("  machine blueprint drop               Discard the current draft\n");
+  printf("  machine blueprint drop                 Discard the current draft\n");
+  printf("  machine spawn <file.cbp>               Spawn a child machine from a saved blueprint file\n");
+  printf("  machine children                       List the child manifest (mode, status, resident, ttl_ms)\n");
+  printf("  machine dissolve <child_id>            Dissolve a non-sovereign child\n");
+  printf("  machine withdraw <child_id>            Withdraw a sovereign child's genesis stake\n");
+  printf("  machine revoke-attestation <child_id>   Stop issuing attestations for a child\n");
+  printf("\n  Note: the lineage op handlers/policies must be installed on this\n");
+  printf("  machine first (lineage_install) — spawn and lifecycle ops fail otherwise.\n");
+}
+
+// The 'machine blueprint' subcommand dispatch (split out of cli_dispatch to
+// keep the machine block readable). Same contract as before: the matched
+// subcommand's result, or CLI_ERR_ARGS with usage on unknown/short args.
+static cli_result_e _dispatch_machine_blueprint(cli_node_t* node, int argc,
+                                                char** argv) {
+  const char* sub = argv[3];
+  if (strcmp(sub, "new") == 0) {
+    if (argc < 8) {
+      printf("Usage: machine blueprint new <child_id> "
+             "<shared|delegated|sovereign> <bootstrap_admin> "
+             "<attestation_ttl_ms>\n");
+      return CLI_ERR_ARGS;
+    }
+    return _machine_blueprint_cmd_new(node, argv[4], argv[5], argv[6],
+                                      argv[7]);
+  }
+  if (strcmp(sub, "item") == 0) {
+    if (argc < 7) {
+      printf("Usage: machine blueprint item <name> <data_type> <crdt_type>\n");
+      return CLI_ERR_ARGS;
+    }
+    return _machine_blueprint_cmd_item(node, argv[4], argv[5], argv[6]);
+  }
+  if (strcmp(sub, "policy") == 0) {
+    if (argc < 6) {
+      printf("Usage: machine blueprint policy <operation> <expression>\n");
+      return CLI_ERR_ARGS;
+    }
+    return _machine_blueprint_cmd_policy(node, argv[4], argv[5]);
+  }
+  if (strcmp(sub, "dedup") == 0) {
+    if (argc < 6) {
+      printf("Usage: machine blueprint dedup <op_type> <dedup_type> "
+             "[tracker_path|flag_path|condition] [rejection_message]\n");
+      printf("  dedup_type: none|per_user|global|custom\n");
+      printf("  For per_user: ... dedup <op_type> per_user <tracker_path>\n");
+      printf("  For global:   ... dedup <op_type> global <flag_path>\n");
+      printf("  For custom:   ... dedup <op_type> custom <condition>\n");
+      printf("  For none:     ... dedup <op_type> none\n");
+      return CLI_ERR_ARGS;
+    }
+    return _machine_blueprint_cmd_dedup(node, argv[4], argv[5],
+                                        argc > 6 ? argv[6] : NULL,
+                                        argc > 7 ? argv[7] : NULL);
+  }
+  if (strcmp(sub, "save") == 0) {
+    if (argc < 5) {
+      printf("Usage: machine blueprint save <file.cbp>\n");
+      return CLI_ERR_ARGS;
+    }
+    return _machine_blueprint_cmd_save(node, argv[4]);
+  }
+  if (strcmp(sub, "validate") == 0) {
+    if (argc < 5) {
+      printf("Usage: machine blueprint validate <file.cbp>\n");
+      return CLI_ERR_ARGS;
+    }
+    return _machine_blueprint_cmd_validate(node, argv[4]);
+  }
+  if (strcmp(sub, "drop") == 0) {
+    cli_node_blueprint_clear(node);
+    return CLI_OK;
+  }
+  printf("Unknown machine blueprint subcommand: %s\n", sub);
+  _print_machine_usage();
+  return CLI_ERR_ARGS;
 }
 
 void cli_print_usage(const char* prog) {
@@ -1795,72 +2025,56 @@ cli_result_e cli_dispatch(cli_node_t* node, int argc, char** argv) {
   }
 
   if (strcmp(cmd, "machine") == 0) {
-    if (argc < 4 || strcmp(argv[2], "blueprint") != 0) {
-      if (argc >= 3 && strcmp(argv[2], "blueprint") != 0) {
-        printf("Unknown machine subcommand: %s\n", argv[2]);
-      }
+    if (argc < 3) {
       _print_machine_usage();
       return CLI_ERR_ARGS;
     }
-    const char* sub = argv[3];
-    if (strcmp(sub, "new") == 0) {
-      if (argc < 8) {
-        printf("Usage: machine blueprint new <child_id> "
-               "<shared|delegated|sovereign> <bootstrap_admin> "
-               "<attestation_ttl_ms>\n");
+    const char* machine_sub = argv[2];
+    if (strcmp(machine_sub, "blueprint") == 0) {
+      if (argc < 4) {
+        _print_machine_usage();
         return CLI_ERR_ARGS;
       }
-      return _machine_blueprint_cmd_new(node, argv[4], argv[5], argv[6],
-                                        argv[7]);
+      return _dispatch_machine_blueprint(node, argc, argv);
     }
-    if (strcmp(sub, "item") == 0) {
-      if (argc < 7) {
-        printf("Usage: machine blueprint item <name> <data_type> <crdt_type>\n");
+    if (strcmp(machine_sub, "spawn") == 0) {
+      if (argc < 4) {
+        printf("Usage: machine spawn <file.cbp>\n");
         return CLI_ERR_ARGS;
       }
-      return _machine_blueprint_cmd_item(node, argv[4], argv[5], argv[6]);
+      return _machine_cmd_spawn(node, argv[3]);
     }
-    if (strcmp(sub, "policy") == 0) {
-      if (argc < 6) {
-        printf("Usage: machine blueprint policy <operation> <expression>\n");
+    if (strcmp(machine_sub, "children") == 0) {
+      return _machine_cmd_children(node);
+    }
+    if (strcmp(machine_sub, "dissolve") == 0) {
+      if (argc < 4) {
+        printf("Usage: machine dissolve <child_id>\n");
         return CLI_ERR_ARGS;
       }
-      return _machine_blueprint_cmd_policy(node, argv[4], argv[5]);
+      return _machine_cmd_child_targeted_op(node, machine_sub,
+                                            CRABS_LINEAGE_OP_DISSOLVE,
+                                            argv[3]);
     }
-    if (strcmp(sub, "dedup") == 0) {
-      if (argc < 6) {
-        printf("Usage: machine blueprint dedup <op_type> <dedup_type> "
-               "[tracker_path|flag_path|condition] [rejection_message]\n");
-        printf("  dedup_type: none|per_user|global|custom\n");
-        printf("  For per_user: ... dedup <op_type> per_user <tracker_path>\n");
-        printf("  For global:   ... dedup <op_type> global <flag_path>\n");
-        printf("  For custom:   ... dedup <op_type> custom <condition>\n");
-        printf("  For none:     ... dedup <op_type> none\n");
+    if (strcmp(machine_sub, "withdraw") == 0) {
+      if (argc < 4) {
+        printf("Usage: machine withdraw <child_id>\n");
         return CLI_ERR_ARGS;
       }
-      return _machine_blueprint_cmd_dedup(node, argv[4], argv[5],
-                                          argc > 6 ? argv[6] : NULL,
-                                          argc > 7 ? argv[7] : NULL);
+      return _machine_cmd_child_targeted_op(node, machine_sub,
+                                            CRABS_LINEAGE_OP_WITHDRAW_GENESIS,
+                                            argv[3]);
     }
-    if (strcmp(sub, "save") == 0) {
-      if (argc < 5) {
-        printf("Usage: machine blueprint save <file.cbp>\n");
+    if (strcmp(machine_sub, "revoke-attestation") == 0) {
+      if (argc < 4) {
+        printf("Usage: machine revoke-attestation <child_id>\n");
         return CLI_ERR_ARGS;
       }
-      return _machine_blueprint_cmd_save(node, argv[4]);
+      return _machine_cmd_child_targeted_op(node, machine_sub,
+                                            CRABS_LINEAGE_OP_REVOKE_ATTESTATION,
+                                            argv[3]);
     }
-    if (strcmp(sub, "validate") == 0) {
-      if (argc < 5) {
-        printf("Usage: machine blueprint validate <file.cbp>\n");
-        return CLI_ERR_ARGS;
-      }
-      return _machine_blueprint_cmd_validate(node, argv[4]);
-    }
-    if (strcmp(sub, "drop") == 0) {
-      cli_node_blueprint_clear(node);
-      return CLI_OK;
-    }
-    printf("Unknown machine blueprint subcommand: %s\n", sub);
+    printf("Unknown machine subcommand: %s\n", machine_sub);
     _print_machine_usage();
     return CLI_ERR_ARGS;
   }

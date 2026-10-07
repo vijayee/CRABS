@@ -1460,3 +1460,161 @@ TEST(TestCliDurability, MachineBlueprintDropAndReplace) {
   EXPECT_EQ(cli_dispatch(other, 3, unknown_argv), CLI_ERR_ARGS);
   cli_node_destroy(other);
 }
+
+// ============================================================
+// Machine lifecycle (lineage v1.7): spawn / children / dissolve /
+// withdraw / revoke-attestation — every mutating command goes through the
+// operation pipeline ("__spawn_machine__", "__dissolve_machine__", ...)
+// with the bootstrap admin as the signer.
+// ============================================================
+
+// Author + save a minimal valid blueprint for <child_id> in <mode_word> via
+// dispatch — the same draft cycle MachineBlueprintBuildCycle exercises.
+// Returns false on the first failed dispatch.
+static bool test_author_machine_blueprint(cli_node_t* node,
+                                          const char* child_id,
+                                          const char* mode_word,
+                                          const char* save_path) {
+  std::vector<char*> new_argv = {(char*)"crabs_node", (char*)"machine",
+                                 (char*)"blueprint", (char*)"new",
+                                 (char*)child_id, (char*)mode_word,
+                                 (char*)"child-admin", (char*)"3600000"};
+  if (cli_dispatch(node, (int)new_argv.size(), new_argv.data()) != CLI_OK) {
+    return false;
+  }
+  std::vector<char*> item_argv = {(char*)"crabs_node", (char*)"machine",
+                                  (char*)"blueprint", (char*)"item",
+                                  (char*)"counter1", (char*)"counter",
+                                  (char*)"g_counter"};
+  if (cli_dispatch(node, (int)item_argv.size(), item_argv.data()) != CLI_OK) {
+    return false;
+  }
+  std::vector<char*> save_argv = {(char*)"crabs_node", (char*)"machine",
+                                  (char*)"blueprint", (char*)"save",
+                                  (char*)save_path};
+  return cli_dispatch(node, (int)save_argv.size(), save_argv.data()) == CLI_OK;
+}
+
+TEST(TestCliDurability, MachineSpawnThroughCliLifecycle) {
+  cli_node_t* author = cli_node_create();
+  ASSERT_EQ(cli_node_init(author, "admin"), CLI_OK);
+  // The CLI never installs lineage policies itself: the spawning protocol
+  // registers the lineage op policies + handlers (lineage_install) in the
+  // library/demo path, exactly as the wasm surface will.
+  lineage_install(&author->attr_machine->base_state);
+
+  const char* blueprint_path = "/tmp/crabs-bp-lifecycle.cbp";
+  ASSERT_TRUE(test_author_machine_blueprint(author, "child-red", "delegated",
+                                            blueprint_path));
+
+  state_t* parent = &author->attr_machine->base_state;
+
+  // Spawn: blueprint file → __spawn_machine__ op → manifest entry + child.
+  std::vector<char*> spawn_argv = {(char*)"crabs_node", (char*)"machine",
+                                   (char*)"spawn", (char*)blueprint_path};
+  EXPECT_EQ(cli_dispatch(author, 4, spawn_argv.data()), CLI_OK);
+
+  const child_manifest_entry_t* entries = nullptr;
+  ASSERT_EQ(lineage_query_children(parent, &entries), 1u);
+  EXPECT_STREQ(entries[0].child_id, "child-red");
+  EXPECT_EQ(entries[0].mode, LINEAGE_DELEGATED_COPY);
+  EXPECT_EQ(entries[0].status, LINEAGE_ACTIVE);
+  EXPECT_NE(lineage_query_resident_child(parent, "child-red"), nullptr);
+
+  // `machine children` is a plain query (no op) — dispatch OK.
+  std::vector<char*> children_argv = {(char*)"crabs_node", (char*)"machine",
+                                      (char*)"children"};
+  EXPECT_EQ(cli_dispatch(author, 3, children_argv.data()), CLI_OK);
+  // A second spawn of the same child is refused (duplicate id).
+  EXPECT_NE(cli_dispatch(author, 4, spawn_argv.data()), CLI_OK);
+
+  // Dissolve: __dissolve_machine__ op → status flips, resident slot clears.
+  std::vector<char*> dissolve_argv = {(char*)"crabs_node", (char*)"machine",
+                                      (char*)"dissolve", (char*)"child-red"};
+  EXPECT_EQ(cli_dispatch(author, 4, dissolve_argv.data()), CLI_OK);
+  const child_manifest_entry_t* dissolved = lineage_find_manifest_entry(
+      parent, "child-red");
+  ASSERT_NE(dissolved, nullptr);
+  EXPECT_EQ(dissolved->status, LINEAGE_DISSOLVED);
+  EXPECT_EQ(lineage_query_resident_child(parent, "child-red"), nullptr);
+
+  // Dissolving twice (and an unknown child) is refused.
+  EXPECT_NE(cli_dispatch(author, 4, dissolve_argv.data()), CLI_OK);
+  std::vector<char*> dissolve_ghost = {(char*)"crabs_node", (char*)"machine",
+                                       (char*)"dissolve", (char*)"child-ghost"};
+  EXPECT_NE(cli_dispatch(author, 4, dissolve_ghost.data()), CLI_OK);
+
+  cli_node_destroy(author);
+  remove(blueprint_path);
+}
+
+TEST(TestCliDurability, MachineSovereignDissolveFailsThroughCli) {
+  cli_node_t* author = cli_node_create();
+  ASSERT_EQ(cli_node_init(author, "admin"), CLI_OK);
+  lineage_install(&author->attr_machine->base_state);
+
+  const char* blueprint_path = "/tmp/crabs-bp-sovereign.cbp";
+  ASSERT_TRUE(test_author_machine_blueprint(author, "child-sov", "sovereign",
+                                            blueprint_path));
+
+  state_t* parent = &author->attr_machine->base_state;
+  std::vector<char*> spawn_argv = {(char*)"crabs_node", (char*)"machine",
+                                   (char*)"spawn", (char*)blueprint_path};
+  EXPECT_EQ(cli_dispatch(author, 4, spawn_argv.data()), CLI_OK);
+  const child_manifest_entry_t* spawn_entry = lineage_find_manifest_entry(
+      parent, "child-sov");
+  ASSERT_NE(spawn_entry, nullptr);
+  EXPECT_EQ(spawn_entry->mode, LINEAGE_SOVEREIGN);
+  EXPECT_EQ(spawn_entry->status, LINEAGE_ACTIVE);
+
+  // Sovereign children refuse dissolution (the parent may only withdraw).
+  std::vector<char*> dissolve_argv = {(char*)"crabs_node", (char*)"machine",
+                                      (char*)"dissolve", (char*)"child-sov"};
+  EXPECT_NE(cli_dispatch(author, 4, dissolve_argv.data()), CLI_OK);
+  EXPECT_EQ(spawn_entry->status, LINEAGE_ACTIVE);
+
+  // Withdraw genesis: __withdraw_genesis__ op → WITHDRAWN.
+  std::vector<char*> withdraw_argv = {(char*)"crabs_node", (char*)"machine",
+                                      (char*)"withdraw", (char*)"child-sov"};
+  EXPECT_EQ(cli_dispatch(author, 4, withdraw_argv.data()), CLI_OK);
+  EXPECT_EQ(spawn_entry->status, LINEAGE_WITHDRAWN);
+
+  // A withdrawn child is out of its lifecycle: both further ops refuse.
+  EXPECT_NE(cli_dispatch(author, 4, withdraw_argv.data()), CLI_OK);
+  std::vector<char*> revoke_argv = {(char*)"crabs_node", (char*)"machine",
+                                    (char*)"revoke-attestation",
+                                    (char*)"child-sov"};
+  EXPECT_NE(cli_dispatch(author, 4, revoke_argv.data()), CLI_OK);
+
+  cli_node_destroy(author);
+  remove(blueprint_path);
+}
+
+TEST(TestCliDurability, MachineSpawnRefusesInvalidBlueprintFile) {
+  cli_node_t* author = cli_node_create();
+  ASSERT_EQ(cli_node_init(author, "admin"), CLI_OK);
+  lineage_install(&author->attr_machine->base_state);
+
+  // A missing file is an I/O error.
+  std::vector<char*> missing_argv = {(char*)"crabs_node", (char*)"machine",
+                                     (char*)"spawn",
+                                     (char*)"/tmp/crabs-no-such-bp.cbp"};
+  EXPECT_EQ(cli_dispatch(author, 4, missing_argv.data()), CLI_ERR_IO);
+
+  // Bytes that do not parse as a blueprint wire image reach the op pipeline
+  // and the handler refuses them.
+  const char* garbage_path = "/tmp/crabs-bp-lifecycle-garbage.cbp";
+  ASSERT_TRUE(test_write_file_bytes(garbage_path,
+                                    {0x99, 0xEC, 0x00, 0x01, 0x22}));
+  std::vector<char*> garbage_argv = {(char*)"crabs_node", (char*)"machine",
+                                     (char*)"spawn", (char*)garbage_path};
+  EXPECT_NE(cli_dispatch(author, 4, garbage_argv.data()), CLI_OK);
+
+  // No manifest residue from either refusal.
+  const child_manifest_entry_t* entries = nullptr;
+  EXPECT_EQ(lineage_query_children(&author->attr_machine->base_state,
+                                   &entries), 0u);
+
+  cli_node_destroy(author);
+  remove(garbage_path);
+}
