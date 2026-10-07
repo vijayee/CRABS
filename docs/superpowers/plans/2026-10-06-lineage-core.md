@@ -421,7 +421,9 @@ TEST(TestLineage, AttestationSignVerifyRoundTrip) {
   position (booked in v10 as u32 child_count) becomes `u32 child_count + entries
   { string16 child_id; u8 mode; 32B hash; 64B signature; u64 ttl; u64 spawned_at;
   u8 status }` followed by the parent-binding block
-  `u8 bound; if 1: string16 parent_id + 33B pubkey` — v11 reader accepts v10
+  `u8 bound; if 1: string16 parent_id + 33B parent pubkey + string16
+  lineage_self_id` (the child's own machine id — added to `state_t` in Task 5
+  and REQUIRED so attestation child_id checks survive restart) — v11 reader accepts v10
   blobs by gating both blocks on `version >= 11`. Reader caps:
   `count > CRABS_MAX_CHILD_MACHINES` → fail; mode values outside the enum →
   fail; bound flag > 1 → fail. data_model.c `state_destroy` frees
