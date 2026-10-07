@@ -179,6 +179,7 @@ async function main() {
 
   blueprint.destroy();
   reloaded.destroy();
+  dissolverKey.destroy();
 }
 
 main().catch(error => { console.error(error); process.exit(1); });
