@@ -110,6 +110,11 @@ typedef struct attribute_machine_t {
 // ============================================================
 attribute_machine_t* attribute_machine_create(const char* admin_id, const uint8_t admin_pk[33]);
 void                  attribute_machine_destroy(attribute_machine_t* am);
+// Teardown for a SINGLE user record: frees its keyring and temporary
+// attribute list, then the record itself. The shared body of
+// attribute_users_destroy_all; also used by the v10 deserializer's
+// per-entry failure cleanup (serialization.c).
+void                  user_destroy(user_t* user);
 void                  attribute_users_destroy_all(attribute_machine_t* am);
 
 // ============================================================

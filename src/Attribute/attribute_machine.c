@@ -6,6 +6,7 @@
 #include "../Util/platform.h"
 #include "../StateMachine/state_machine.h"
 #include "../Trigger/trigger.h"
+#include "../Scheduler/scheduler.h"
 #include "../Crypto/crypto.h"
 #include "../Condition/condition.h"
 #include "../Util/allocator.h"
@@ -334,6 +335,26 @@ attribute_machine_t* attribute_machine_create(const char* admin_id, const uint8_
   return am;
 }
 
+// Teardown for a single user record: temporary attributes, keyring, record.
+// Shared by attribute_users_destroy_all and the v10 deserializer's per-entry
+// failure cleanup.
+void user_destroy(user_t* user) {
+  if (user == NULL) return;
+
+  // Free temporary attributes linked list
+  temp_attr_list_t* temp = user->temp_attrs;
+  while (temp != NULL) {
+    temp_attr_list_t* next_temp = temp->next;
+    free(temp);
+    temp = next_temp;
+  }
+
+  // Free keyring linked list
+  user_key_destroy_all(user);
+
+  free(user);
+}
+
 // Shared teardown for the user registry (v10 durability): frees every user
 // along the linked list together with its keyring and temporary attributes,
 // then clears am->users and am->user_count so the machine reports an empty
@@ -344,19 +365,7 @@ void attribute_users_destroy_all(attribute_machine_t* am) {
   user_t* user = am->users;
   while (user != NULL) {
     user_t* next_user = user->next;
-
-    // Free temporary attributes linked list
-    temp_attr_list_t* temp = user->temp_attrs;
-    while (temp != NULL) {
-      temp_attr_list_t* next_temp = temp->next;
-      free(temp);
-      temp = next_temp;
-    }
-
-    // Free keyring linked list
-    user_key_destroy_all(user);
-
-    free(user);
+    user_destroy(user);
     user = next_user;
   }
   am->users = NULL;
@@ -383,6 +392,11 @@ void attribute_machine_destroy(attribute_machine_t* am) {
 
   if (am->base_state.policies != NULL) free(am->base_state.policies);
   if (am->base_state.log != NULL) free(am->base_state.log);
+  // Scheduler entries (pending timed transactions) are state-owned heap
+  // records; v10 snapshots restore them, so this teardown must mirror
+  // state_destroy's lifecycle or every loaded-and-destroyed CLI node leaks
+  // its restored schedules.
+  scheduler_destroy_all(&am->base_state);
   if (am->base_state.op_type_defs != NULL) free(am->base_state.op_type_defs);
   if (am->base_state.op_handlers != NULL) free(am->base_state.op_handlers);
   if (am->base_state.tx_manager != NULL) {

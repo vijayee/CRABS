@@ -891,6 +891,9 @@ static bool _restore_msk_scalars(OABE_ContextCP* ctx, const OABE_ByteString* msk
   size_t header_len = 2 + 4 + alpha_len + 4;
   if (header_len + beta_len > oabe_bytestring_get_size(msk)) return false;
 
+  // Alpha starts right after key_type(1) + scheme(1) + alpha_len(4) = 6 bytes;
+  // beta starts after 2 + 4 + alpha_len + 4 (the second length prefix) —
+  // both mirror oabe_secret_key_deserialize's parse order.
   OABE_ByteString* alpha_bytes = oabe_bytestring_new_from_data(msk_data + 6, alpha_len);
   OABE_ByteString* beta_bytes = oabe_bytestring_new_from_data(msk_data + header_len, beta_len);
   OABE_ZP* alpha_scalar = NULL;

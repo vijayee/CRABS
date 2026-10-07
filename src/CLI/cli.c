@@ -146,7 +146,11 @@ cli_result_e cli_node_init(cli_node_t* node, const char* admin_id) {
 
   // Create attribute machine with admin
   node->attr_machine = attribute_machine_create(admin_id, node->node_key->public_key);
-  if (node->attr_machine == NULL) return CLI_ERR_EXEC;
+  if (node->attr_machine == NULL) {
+    crypto_ecdsa_keypair_destroy(node->node_key);
+    node->node_key = NULL;
+    return CLI_ERR_EXEC;
+  }
 
   // Wire up back-pointer so state_machine_execute can find the attribute machine
   node->attr_machine->base_state.attr_machine = node->attr_machine;
@@ -291,6 +295,13 @@ cli_result_e cli_node_load(cli_node_t* node, const char* path) {
   if (loaded == NULL) return CLI_ERR_EXEC;
 
   node->node_key = crypto_ecdsa_generate();
+  if (node->node_key == NULL) {
+    // Keygen failure must not proceed to a NULL dereference in
+    // state_set_node_key below, and the loaded state (shell or bare) still
+    // owns its items/registry — release it here.
+    state_destroy(loaded);
+    return CLI_ERR_EXEC;
+  }
 
   // v10: when the blob carried a user registry, the deserializer returns an
   // attribute-machine SHELL (base_state is the first member of
@@ -389,7 +400,10 @@ cli_result_e cli_node_load_key(cli_node_t* node, const char* private_key_hex) {
   // Replace the node key with the imported one.
   if (node->node_key != NULL) crypto_ecdsa_keypair_destroy(node->node_key);
   node->node_key = get_clear_memory(sizeof(ecdsa_keypair_t));
-  if (node->node_key == NULL) return CLI_ERR_EXEC;
+  if (node->node_key == NULL) {
+    OPENSSL_cleanse(priv, 32);
+    return CLI_ERR_EXEC;
+  }
   memcpy(node->node_key->private_key, priv, 32);
   memcpy(node->node_key->public_key, pub, 33);
 

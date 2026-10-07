@@ -1711,13 +1711,9 @@ static bool _deserialize_user(read_buf_t* buf, attribute_machine_t* machine) {
   machine->user_count++;
   return true;
 fail:
-  user_key_destroy_all(user);
-  temp_attr_list_t* temp_next;
-  for (temp_attr_list_t* temp = user->temp_attrs; temp != NULL; temp = temp_next) {
-    temp_next = temp->next;
-    free(temp);
-  }
-  free(user);
+  // Same teardown the registry uses on destroy — the entry is NOT spliced
+  // into the machine's list yet on this path, so release it in isolation.
+  user_destroy(user);
   return false;
 }
 

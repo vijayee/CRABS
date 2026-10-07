@@ -12,6 +12,7 @@ extern "C" {
 #include "../src/CLI/cli.h"
 #include "../src/Crypto/crypto.h"
 #include "../src/StateMachine/state_machine.h"
+#include "../src/Scheduler/scheduler.h"
 }
 #include "test_helpers.h"
 
@@ -169,4 +170,46 @@ TEST(TestDurability, FullMachineSurvivesRestartAndKeepsAuthority) {
 
   cli_node_destroy(reloaded);
   remove("/tmp/crabs-integration.crabs");
+}
+
+// A pending timed transaction (schedules, v6 section) must survive the sealed
+// save/load cycle AND be released exactly once by the CLI destroy path — the
+// loaded state's schedules are owned by the attribute-machine teardown.
+TEST(TestDurability, RestoredScheduleSurvivesRestartAndDestroy) {
+  cli_node_t* node = cli_node_create();
+  ASSERT_NE(node, nullptr);
+  ASSERT_EQ(cli_node_init(node, "admin"), CLI_OK);
+
+  char seal_hex[65];
+  _import_test_seal_key(node, seal_hex);
+
+  state_t* live = &node->attr_machine->base_state;
+  operation_t* op = operation_create("heartbeat");
+  ASSERT_NE(op, nullptr);
+  memset(op->uuid, 0xB1, CRABS_UUID_SIZE);
+  strncpy(op->signer_id, "admin", CRABS_MAX_USER_ID - 1);
+  const uint64_t far_future_execute_at_ms = 9000000000000ULL;
+  uint64_t schedule_id =
+      scheduler_schedule(live, far_future_execute_at_ms, "admin", op);
+  ASSERT_NE(schedule_id, 0u);
+  operation_destroy(op);
+
+  ASSERT_EQ(cli_node_save(node, "/tmp/crabs-schedule.crabs"), CLI_OK);
+  cli_node_destroy(node);
+
+  cli_node_t* reloaded = cli_node_create();
+  ASSERT_NE(reloaded, nullptr);
+  ASSERT_EQ(cli_node_load_sealed(reloaded, "/tmp/crabs-schedule.crabs",
+            seal_hex), CLI_OK);
+
+  state_t* restored = &reloaded->attr_machine->base_state;
+  const scheduled_operation_t* restored_schedule = restored->scheduled_operations;
+  ASSERT_NE(restored_schedule, nullptr);
+  EXPECT_EQ(restored_schedule->schedule_id, schedule_id);
+  EXPECT_EQ(restored_schedule->execute_at_ms, far_future_execute_at_ms);
+  EXPECT_STREQ(restored_schedule->submitter, "admin");
+  EXPECT_EQ(restored->scheduled_operations->next, nullptr);
+
+  cli_node_destroy(reloaded);
+  remove("/tmp/crabs-schedule.crabs");
 }
