@@ -1835,7 +1835,7 @@ static size_t _lineage_key_transition_write_body(uint64_t new_key_version,
                                                  uint64_t created_at,
                                                  uint8_t* out, size_t cap) {
   size_t offset = 0;
-  if (cap < 3 + 8 + 33 + 33 + 2 + 8) return 0;
+  if (cap < LINEAGE_KEY_TRANSITION_BODY_MIN) return 0;
   out[offset++] = 'P';
   out[offset++] = 'K';
   out[offset++] = 'T';
@@ -1947,9 +1947,10 @@ crabs_error_e lineage_child_accept_key_transition(state_t* child_state,
                                                   size_t record_len) {
   if (child_state == NULL || record == NULL) return CRABS_ERR_INVALID_PARAM;
   // Size window: the smallest honest record carries an empty parent_id and a
-  // zero created_at (body 87 bytes) plus the signature; the cap keeps a
-  // hostile payload from making the parser walk unbounded bytes.
-  if (record_len < 3 + 8 + 33 + 33 + 2 + 8 + CRABS_SIG_SIZE ||
+  // zero created_at (LINEAGE_KEY_TRANSITION_BODY_MIN body) plus the signature;
+  // the cap keeps a hostile payload from making the parser walk unbounded
+  // bytes.
+  if (record_len < LINEAGE_KEY_TRANSITION_BODY_MIN + CRABS_SIG_SIZE ||
       record_len > LINEAGE_KEY_TRANSITION_WIRE_MAX) {
     return CRABS_ERR_INVALID_PARAM;
   }
@@ -2063,7 +2064,7 @@ crabs_error_e lineage_child_accept_key_transition(state_t* child_state,
   return CRABS_SUCCESS;
 }
 
-bool lineage_verify_by_parent_key(state_t* state, const uint8_t* msg,
+bool lineage_verify_by_parent_key(const state_t* state, const uint8_t* msg,
                                   size_t msg_len,
                                   const uint8_t sig[CRABS_SIG_SIZE]) {
   if (state == NULL || msg == NULL || sig == NULL) return false;

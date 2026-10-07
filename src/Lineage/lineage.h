@@ -184,6 +184,11 @@ machine_blueprint_t* blueprint_deserialize(const uint8_t* buf, size_t len);
 // record per spawned child. Per-child idempotency comes from the accept
 // gates: once a child has accepted a record, the version-forward-only and
 // pk-already-known checks refuse re-acceptance of the same record.
+// Minimum body size: an empty parent_id (string16 contributes ONLY the
+// 2-byte u16le length prefix; an empty string writes 0 content bytes) and a
+// zero created_at. Used by the canonical-body writer's capacity check and by
+// the accept gate's smallest-honest-record floor.
+#define LINEAGE_KEY_TRANSITION_BODY_MIN (3 + 8 + 33 + 33 + 2 + 8)
 #define LINEAGE_KEY_TRANSITION_BODY_MAX \
   (3 + 8 + 33 + 33 + 2 + CRABS_MAX_USER_ID + 8)
 #define LINEAGE_KEY_TRANSITION_WIRE_MAX \
@@ -242,7 +247,7 @@ crabs_error_e lineage_child_accept_key_transition(state_t* child_state,
 // tombstones signed under any accepted parent key — including the pre-
 // rotation spawn pin — keep verifying (backward compatible). A machine with
 // an empty chain (never bound, or bound pre-chain-stamping) fails closed.
-bool lineage_verify_by_parent_key(state_t* state, const uint8_t* msg,
+bool lineage_verify_by_parent_key(const state_t* state, const uint8_t* msg,
                                   size_t msg_len,
                                   const uint8_t sig[CRABS_SIG_SIZE]);
 

@@ -3319,6 +3319,43 @@ TEST(TestLineage, KeyChainRollbackAndGapRejected) {
   keychain_harness_destroy(&harness);
 }
 
+// Continuity-proof forgery path: the record's old_pk field names the chain's
+// spawn pin (k1.public — retired_entry IS found), so the chain lookup
+// succeeds, but the signature was made by a foreign/never-registered private
+// key. Verification against the pinned k1.public fails, refusing the record
+// with CRABS_ERR_CRYPTOGRAPHIC_ERROR and leaving the chain byte-identical.
+// (The sibling case in KeyChainRollbackAndGapRejected — old_pk matches NO
+// chain entry — exercises the earlier retired_entry == NULL refusal; this one
+// isolates the verify-under-known-old_key failure.)
+TEST(TestLineage, KeyChainForgedSignatureUnderKnownOldKey) {
+  keychain_harness_t harness;
+  keychain_harness_setup(&harness);
+
+  uint8_t record[LINEAGE_KEY_TRANSITION_WIRE_MAX];
+  size_t forged_len = keychain_make_record(
+      2, harness.k2->public_key, harness.k1->public_key, "parent-red",
+      harness.foreign->private_key, record, sizeof(record));
+
+  // Snapshot the chain so the refusal can be proven to be mutation-free.
+  const uint32_t chain_count_before =
+      harness.child_state->lineage_key_chain_count;
+  ASSERT_EQ(chain_count_before, 1u);
+  lineage_key_chain_entry_t chain_before[CRABS_MAX_LINEAGE_KEY_CHAIN];
+  memcpy(chain_before, harness.child_state->lineage_key_chain,
+         chain_count_before * sizeof(lineage_key_chain_entry_t));
+
+  EXPECT_EQ(lineage_child_accept_key_transition(harness.child_state, record,
+                                                forged_len),
+            CRABS_ERR_CRYPTOGRAPHIC_ERROR);
+
+  EXPECT_EQ(harness.child_state->lineage_key_chain_count, chain_count_before);
+  EXPECT_EQ(memcmp(harness.child_state->lineage_key_chain, chain_before,
+                   chain_count_before * sizeof(lineage_key_chain_entry_t)),
+            0);
+
+  keychain_harness_destroy(&harness);
+}
+
 TEST(TestLineage, KeyChainAcceptRefusesUnboundOrDissolvedChild) {
   keychain_harness_t harness;
   keychain_harness_setup(&harness);
