@@ -1,7 +1,9 @@
 //
-// Lineage (v1.7: machines mint machines) — blueprint data types + validation.
-// Spawn execution, attestations, and lineage ops land with later tasks; this
-// header is the serializable data layer every other lineage module builds on.
+// Lineage (v1.7: machines mint machines) — blueprint data types + validation,
+// wire serialization with hash verification, spawn (three trust modes),
+// attestations, and the lineage ops (__spawn_machine__ /
+// __revoke_attestation__ / __dissolve_machine__ / __withdraw_genesis__)
+// registered on a machine by lineage_install.
 //
 
 #ifndef CRABS_LINEAGE_H
@@ -132,9 +134,9 @@ crabs_error_e lineage_blueprint_validate(const machine_blueprint_t* blueprint);
 // writer — the same layout attestation signing uses). Returns
 // CRABS_ERR_INVALID_PARAM when a fixed-capacity string field is unterminated
 // (no reproducible canonical body) or the writer overflows its cap.
-// blueprint_serialize calls this internally, so a serialized image always
-// carries a hash matching its body; direct callers keep hand-built
-// blueprints honest before persisting or signing them.
+// blueprint_serialize computes the same hash over the exact bytes it writes,
+// so a serialized image always carries a matching hash; direct callers use
+// this to keep hand-built blueprints honest before persisting or signing.
 crabs_error_e machine_blueprint_stamp_hash(machine_blueprint_t* blueprint);
 
 // Wire image: u32le total length (body + hash, EXCLUDING the prefix itself)

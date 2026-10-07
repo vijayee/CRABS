@@ -342,6 +342,18 @@ static size_t _blueprint_write_body(const machine_blueprint_t* blueprint,
                                     uint8_t* out, size_t cap) {
   size_t offset = 0;
   if (cap < 1) return 0;
+  // A hand-built struct may carry an out-of-range count or a NULL array —
+  // the writer fails closed instead of dereferencing them.
+  if (blueprint->item_count > CRABS_MAX_BLUEPRINT_ITEMS ||
+      blueprint->policy_count > CRABS_MAX_BLUEPRINT_POLICIES ||
+      blueprint->op_type_def_count > CRABS_MAX_BLUEPRINT_OP_TYPE_DEFS) {
+    return 0;
+  }
+  if ((blueprint->item_count > 0 && blueprint->items == NULL) ||
+      (blueprint->policy_count > 0 && blueprint->policies == NULL) ||
+      (blueprint->op_type_def_count > 0 && blueprint->op_type_defs == NULL)) {
+    return 0;
+  }
   out[offset++] = (uint8_t)blueprint->trust_mode;
   if (!_lineage_string16_write(out, cap, &offset, blueprint->child_id,
                                sizeof(blueprint->child_id)) ||
@@ -409,10 +421,15 @@ crabs_error_e machine_blueprint_stamp_hash(machine_blueprint_t* blueprint) {
 size_t blueprint_serialize(machine_blueprint_t* blueprint,
                            uint8_t* out_buf, size_t buf_len) {
   if (blueprint == NULL || out_buf == NULL) return 0;
-  if (machine_blueprint_stamp_hash(blueprint) != CRABS_SUCCESS) return 0;
   uint8_t body[CRABS_BLUEPRINT_BODY_MAX];
   size_t body_len = _blueprint_write_body(blueprint, body, sizeof(body));
   if (body_len == 0) return 0;
+  // One body write serves both the image and the stamped hash — the hash is
+  // always over the exact bytes serialized.
+  if (crypto_sha256(body, body_len, blueprint->blueprint_hash) !=
+      CRABS_SUCCESS) {
+    return 0;
+  }
   uint32_t total_len = (uint32_t)(body_len + CRABS_HASH_SIZE);
   if (buf_len < 4 + total_len) return 0;
   _lineage_u32le_write(out_buf, total_len);

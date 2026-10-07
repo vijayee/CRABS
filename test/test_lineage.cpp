@@ -1217,6 +1217,17 @@ TEST(TestLineage, BlueprintStampHashRejectsInvalidStruct) {
   memset(unterminated->child_id, 'a', sizeof(unterminated->child_id));
   EXPECT_EQ(machine_blueprint_stamp_hash(unterminated),
             CRABS_ERR_INVALID_PARAM);
+
+  // Garbage counts / count-without-array on a hand-built struct fail closed
+  // instead of dereferencing (the writer never trusts the counts).
+  machine_blueprint_t* garbage = machine_blueprint_create();
+  ASSERT_NE(garbage, nullptr);
+  garbage->item_count = 0xFFFFFFFF;
+  EXPECT_EQ(machine_blueprint_stamp_hash(garbage), CRABS_ERR_INVALID_PARAM);
+  garbage->item_count = 0;
+  garbage->policy_count = 3;
+  EXPECT_EQ(machine_blueprint_stamp_hash(garbage), CRABS_ERR_INVALID_PARAM);
+  machine_blueprint_destroy(garbage);
   machine_blueprint_destroy(unterminated);
 }
 
