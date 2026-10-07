@@ -42,6 +42,7 @@ if (!nativeModule) {
 }
 
 // Re-export the native classes
-const { Node, KeyPair, Operation } = nativeModule;
+const { Node, KeyPair, Operation, Blueprint, TRUST_MODE, DATA_TYPE, CRDT_TYPE } =
+    nativeModule;
 
-module.exports = { Node, KeyPair, Operation };
+module.exports = { Node, KeyPair, Operation, Blueprint, TRUST_MODE, DATA_TYPE, CRDT_TYPE };

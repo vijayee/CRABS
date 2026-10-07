@@ -105,6 +105,20 @@ Use `new Node('admin', { ordering: 'lamport' })` for the original Lamport clock 
 - `op.sign(keyPair)` — sign the operation with a KeyPair
 - `op.signWithPrivateKey(privateKeyHex)` — sign with a raw private key hex string
 
+### `Blueprint`
+
+A serializable machine definition a parent instantiates via `node.lineageSpawn(blueprint)` (or ships between processes as a `__spawn_machine__` op payload). JS owns the blueprint — release it with `destroy()`.
+
+- `Blueprint.create(childId, trustMode, bootstrapAdmin, ttlMs)` → `Blueprint` — build a fresh blueprint. `trustMode` is `'shared_root'` / `'delegated_copy'` / `'sovereign'` (short words `'shared'` / `'delegated'` accepted) or a `TRUST_MODE` number; `ttlMs` bounds every attestation the parent later issues for this child
+- `Blueprint.deserialize(wire)` → `Blueprint` — parse a wire image; the embedded hash is verified and the blueprint structurally validated
+- `blueprint.addItem(name, dataType, crdtType)` — append a replicated data item (`DATA_TYPE` / `CRDT_TYPE` words or numbers)
+- `blueprint.addPolicy(operation, expression)` — append an authorization policy
+- `blueprint.stampHash()` — recompute the blueprint's SHA-256 over its canonical body
+- `blueprint.serialize()` → `Buffer` — wire image (u32le length + canonical body + 32-byte hash); stamps the hash first
+- `blueprint.destroy()` — release the underlying C blueprint
+
+The enum tables `TRUST_MODE`, `DATA_TYPE`, `CRDT_TYPE` are exported alongside the classes.
+
 ### `Node`
 
 - `new Node(adminId, options?)` — create a CRABS node with the given admin user
@@ -180,6 +194,25 @@ Use `new Node('admin', { ordering: 'lamport' })` for the original Lamport clock 
 - `node.getHLC()` → `HLC | undefined` — get the current HLC timestamp
 - `node.setTime(nowMs)` — inject the wall clock (for testing temp attribute expiry)
 - `node.pruneExpiredTempAttrs()` — prune expired temporary attributes
+
+#### Lineage (v1.7: machines mint machines)
+
+- `node.lineageInstall()` — register the five `__lineage__` op types, their default `role:admin` policies and handlers. Idempotent; call once after machine creation
+- `node.lineageSpawn(blueprint)` → `Node` — instantiate a child machine. The returned Node **borrows** the spawned machine: this node owns it (destroyed when the parent node is collected) and the child wrapper keeps the parent alive
+- `node.lineageChildren()` → `[{ childId, mode, status, spawnedAtMs, attestationTtlMs }]` — borrowed view over the child manifest
+- `node.lineageResidentChild(childId)` → `Node | null` — the still-resident in-process spawned child (fresh wrapper over the same machine), or `null` when unknown/dissolved. Machines spawned through the ops pipeline are owned by C's resident-children registry
+- `node.lineageAttest(childId, userId, attributes?)` → `Buffer` — parent-signed, TTL-bounded attribute grant (attestation wire image). Requires an authenticated time source (`setTime`) and an `active` manifest entry
+- `node.lineageTombstone(childId)` → `Buffer` — off-chain dissolution proof (`u8 LINEAGE_DISSOLVED tag + string16 childId` + 64-byte parent ECDSA — the exact bytes a `__receive_dissolution__` op transports). Honesty-gate refusals surface as typed errors (`resource_not_found` / `unauthorized` / `cryptographic_error`)
+
+Dissolution/dissolve/withdraw/revoke-attestation travel through the normal `Operation` + `node.execute()` pipeline after `lineageInstall()`; `__receive_dissolution__` runs the same way on the child machine.
+
+## Testing
+
+```bash
+npm run build   # cmake-js build (also runs on install); the .node lands in build/Release/
+npm test        # node test/test.js — basic surface smoke
+node lineage_smoke.mjs   # v1.7 lineage flow: blueprint → spawn → children → attest → dissolve → tombstone
+```
 
 ## License
 

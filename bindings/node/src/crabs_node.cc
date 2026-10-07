@@ -7,10 +7,20 @@
 // Classes:
 //   KeyPair   — ECDSA secp256k1 keypair (generate, sign, verify)
 //   Operation — a signed state-machine operation
+//   Blueprint — a serializable machine definition (lineage: machines mint
+//               machines); JS owns the blueprint, release it with destroy()
 //   Node      — a CRABS node (attribute machine + state + ABE master key)
 //
 // The Node class supports both Lamport and HLC (Hybrid Logical Clock)
 // ordering. Use `new Node('admin', { ordering: 'hlc' })` for HLC mode.
+//
+// Lineage (v1.7): Node.lineageSpawn(blueprint) instantiates a child machine
+// and hands JS a Node wrapper around it. Ownership mirrors the wasm binding's
+// resident-registry statement: the child wrapper BORROWS the machine — the
+// parent Node owns every machine it spawned (destroyed when the parent is
+// collected) and C's resident-children registry keeps borrowed slots until
+// dissolve. The child wrapper holds a reference to its parent object, so the
+// borrowed pointer stays valid for the wrapper's whole lifetime.
 //
 
 #include <napi.h>
@@ -29,6 +39,7 @@ extern "C" {
 #include "HLC/hlc.h"
 #include "CRDT/crdt_merge.h"
 #include "CRDT/one_shot.h"
+#include "Lineage/lineage.h"
 #include "Util/platform.h"
 }
 
@@ -99,6 +110,125 @@ static Napi::Error crabs_error(Napi::Env env, crabs_error_e err, const char* ctx
   return Napi::Error::New(env, full);
 }
 
+// Persistent per-class constructor references. Static factories
+// (KeyPair.generate, Blueprint.create/deserialize) and Node's borrowed-child
+// wrapper mint instances through these — the single env instance-data slot
+// carries them all.
+struct NodeAddonInstanceData {
+  Napi::FunctionReference key_pair_ctor;
+  Napi::FunctionReference blueprint_ctor;
+  Napi::FunctionReference node_ctor;
+};
+
+// Adoption packet carried through a Napi::External so the Node constructor
+// can wrap a machine it did NOT create (a spawned resident child) without
+// changing the JS construction signature. The External finalizer frees it.
+struct NodeAdoption {
+  attribute_machine_t* am;
+};
+
+static std::string to_lower_ascii(const std::string& value) {
+  std::string lowered = value;
+  for (char& ch : lowered) {
+    if (ch >= 'A' && ch <= 'Z') ch = (char)(ch - 'A' + 'a');
+  }
+  return lowered;
+}
+
+// trustMode — string word or the wire number (mirrors the wasm bindings'
+// TRUST_MODE table). Returns false for anything outside the enum.
+static bool lineage_trust_mode_from_js(const Napi::Value& value,
+                                       lineage_trust_mode_e* out) {
+  if (value.IsNumber()) {
+    auto trust_number = value.As<Napi::Number>().DoubleValue();
+    if (trust_number == (double)LINEAGE_SHARED_ROOT) { *out = LINEAGE_SHARED_ROOT; return true; }
+    if (trust_number == (double)LINEAGE_DELEGATED_COPY) { *out = LINEAGE_DELEGATED_COPY; return true; }
+    if (trust_number == (double)LINEAGE_SOVEREIGN) { *out = LINEAGE_SOVEREIGN; return true; }
+    return false;
+  }
+  if (value.IsString()) {
+    std::string word = to_lower_ascii(value.As<Napi::String>().Utf8Value());
+    if (word == "shared_root" || word == "shared") { *out = LINEAGE_SHARED_ROOT; return true; }
+    if (word == "delegated_copy" || word == "delegated") { *out = LINEAGE_DELEGATED_COPY; return true; }
+    if (word == "sovereign") { *out = LINEAGE_SOVEREIGN; return true; }
+  }
+  return false;
+}
+
+// data_type_e from a JS string word or wire number. Covers the full
+// data_model.h enum, mirroring the wasm DATA_TYPE table's naming.
+static bool data_type_from_js(const Napi::Value& value, data_type_e* out) {
+  if (value.IsNumber()) {
+    auto type_number = value.As<Napi::Number>().DoubleValue();
+    if (type_number == (double)DATA_TYPE_COUNTER) { *out = DATA_TYPE_COUNTER; return true; }
+    if (type_number == (double)DATA_TYPE_PN_COUNTER) { *out = DATA_TYPE_PN_COUNTER; return true; }
+    if (type_number == (double)DATA_TYPE_SET) { *out = DATA_TYPE_SET; return true; }
+    if (type_number == (double)DATA_TYPE_2P_SET) { *out = DATA_TYPE_2P_SET; return true; }
+    if (type_number == (double)DATA_TYPE_REGISTER) { *out = DATA_TYPE_REGISTER; return true; }
+    if (type_number == (double)DATA_TYPE_DOCUMENT) { *out = DATA_TYPE_DOCUMENT; return true; }
+    if (type_number == (double)DATA_TYPE_RESOURCE) { *out = DATA_TYPE_RESOURCE; return true; }
+    if (type_number == (double)DATA_TYPE_ONE_SHOT_SET) { *out = DATA_TYPE_ONE_SHOT_SET; return true; }
+    if (type_number == (double)DATA_TYPE_ONE_SHOT_FLAG) { *out = DATA_TYPE_ONE_SHOT_FLAG; return true; }
+    if (type_number == (double)DATA_TYPE_OT_ORDERED_SET) { *out = DATA_TYPE_OT_ORDERED_SET; return true; }
+    if (type_number == (double)DATA_TYPE_OT_DOCUMENT) { *out = DATA_TYPE_OT_DOCUMENT; return true; }
+    if (type_number == (double)DATA_TYPE_OT_TABLE) { *out = DATA_TYPE_OT_TABLE; return true; }
+    if (type_number == (double)DATA_TYPE_OT_TREE) { *out = DATA_TYPE_OT_TREE; return true; }
+    if (type_number == (double)DATA_TYPE_OT_ORDERED_MAP) { *out = DATA_TYPE_OT_ORDERED_MAP; return true; }
+    if (type_number == (double)DATA_TYPE_CUSTOM) { *out = DATA_TYPE_CUSTOM; return true; }
+    return false;
+  }
+  if (value.IsString()) {
+    std::string word = to_lower_ascii(value.As<Napi::String>().Utf8Value());
+    if (word == "counter") { *out = DATA_TYPE_COUNTER; return true; }
+    if (word == "pn_counter") { *out = DATA_TYPE_PN_COUNTER; return true; }
+    if (word == "set") { *out = DATA_TYPE_SET; return true; }
+    if (word == "2p_set") { *out = DATA_TYPE_2P_SET; return true; }
+    if (word == "register") { *out = DATA_TYPE_REGISTER; return true; }
+    if (word == "document") { *out = DATA_TYPE_DOCUMENT; return true; }
+    if (word == "resource") { *out = DATA_TYPE_RESOURCE; return true; }
+    if (word == "one_shot_set") { *out = DATA_TYPE_ONE_SHOT_SET; return true; }
+    if (word == "one_shot_flag") { *out = DATA_TYPE_ONE_SHOT_FLAG; return true; }
+    if (word == "ot_ordered_set") { *out = DATA_TYPE_OT_ORDERED_SET; return true; }
+    if (word == "ot_document") { *out = DATA_TYPE_OT_DOCUMENT; return true; }
+    if (word == "ot_table") { *out = DATA_TYPE_OT_TABLE; return true; }
+    if (word == "ot_tree") { *out = DATA_TYPE_OT_TREE; return true; }
+    if (word == "ot_ordered_map") { *out = DATA_TYPE_OT_ORDERED_MAP; return true; }
+    if (word == "custom") { *out = DATA_TYPE_CUSTOM; return true; }
+  }
+  return false;
+}
+
+// crdt_type_e from a JS string word or wire number (mirrors the wasm
+// CRDT_TYPE table).
+static bool crdt_type_from_js(const Napi::Value& value, crdt_type_e* out) {
+  if (value.IsNumber()) {
+    auto crdt_number = value.As<Napi::Number>().DoubleValue();
+    if (crdt_number == (double)CRDT_G_COUNTER) { *out = CRDT_G_COUNTER; return true; }
+    if (crdt_number == (double)CRDT_PN_COUNTER) { *out = CRDT_PN_COUNTER; return true; }
+    if (crdt_number == (double)CRDT_OR_SET) { *out = CRDT_OR_SET; return true; }
+    if (crdt_number == (double)CRDT_2P_SET) { *out = CRDT_2P_SET; return true; }
+    if (crdt_number == (double)CRDT_LWW_REG) { *out = CRDT_LWW_REG; return true; }
+    if (crdt_number == (double)CRDT_RGA) { *out = CRDT_RGA; return true; }
+    if (crdt_number == (double)CRDT_ONE_SHOT_SET) { *out = CRDT_ONE_SHOT_SET; return true; }
+    if (crdt_number == (double)CRDT_ONE_SHOT_FLAG) { *out = CRDT_ONE_SHOT_FLAG; return true; }
+    if (crdt_number == (double)CRDT_CUSTOM) { *out = CRDT_CUSTOM; return true; }
+    return false;
+  }
+  if (value.IsString()) {
+    std::string word = to_lower_ascii(value.As<Napi::String>().Utf8Value());
+    if (word == "g_counter") { *out = CRDT_G_COUNTER; return true; }
+    if (word == "pn_counter") { *out = CRDT_PN_COUNTER; return true; }
+    if (word == "or_set") { *out = CRDT_OR_SET; return true; }
+    if (word == "2p_set") { *out = CRDT_2P_SET; return true; }
+    if (word == "lww_reg") { *out = CRDT_LWW_REG; return true; }
+    if (word == "rga") { *out = CRDT_RGA; return true; }
+    if (word == "one_shot_set") { *out = CRDT_ONE_SHOT_SET; return true; }
+    if (word == "one_shot_flag") { *out = CRDT_ONE_SHOT_FLAG; return true; }
+    if (word == "custom") { *out = CRDT_CUSTOM; return true; }
+  }
+  return false;
+}
+
 // ============================================================
 // KeyPair — wraps ecdsa_keypair_t
 // ============================================================
@@ -113,9 +243,10 @@ public:
       StaticMethod("fromPrivateHex", &KeyPair::FromPrivateHex),
       StaticMethod("derivePublicHex", &KeyPair::DerivePublicHex),
     });
-    Napi::FunctionReference* constructor = new Napi::FunctionReference();
-    *constructor = Napi::Persistent(func);
-    env.SetInstanceData(constructor);
+    // Stored in the shared NodeAddonInstanceData set up by the module Init —
+    // static factories mint instances through it.
+    auto* inst = env.GetInstanceData<NodeAddonInstanceData>();
+    inst->key_pair_ctor = Napi::Persistent(func);
     exports.Set("KeyPair", func);
     return exports;
   }
@@ -143,8 +274,8 @@ private:
 
   static Napi::Value Generate(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
-    auto* inst = env.GetInstanceData<Napi::FunctionReference>();
-    Napi::Object obj = inst->New({});
+    auto* inst = env.GetInstanceData<NodeAddonInstanceData>();
+    Napi::Object obj = inst->key_pair_ctor.New({});
     KeyPair* kp = KeyPair::Unwrap(obj);
     kp->kp_ = crypto_ecdsa_generate();
     if (!kp->kp_) throw crabs_error(env, CRABS_ERR_CRYPTOGRAPHIC_ERROR, "KeyPair.generate");
@@ -156,8 +287,8 @@ private:
     if (info.Length() < 1 || !info[0].IsString())
       throw Napi::TypeError::New(env, "Expected private key hex string");
     std::string hex = info[0].As<Napi::String>().Utf8Value();
-    auto* inst = env.GetInstanceData<Napi::FunctionReference>();
-    Napi::Object obj = inst->New({});
+    auto* inst = env.GetInstanceData<NodeAddonInstanceData>();
+    Napi::Object obj = inst->key_pair_ctor.New({});
     KeyPair* kp = KeyPair::Unwrap(obj);
     kp->kp_ = (ecdsa_keypair_t*)calloc(1, sizeof(ecdsa_keypair_t));
     if (!hex_decode(hex, kp->kp_->private_key, 32))
@@ -183,6 +314,179 @@ private:
     crabs_error_e rc = crypto_ecdsa_derive_public_key(priv, pub);
     if (rc != CRABS_SUCCESS) throw crabs_error(env, rc, "derivePublicHex");
     return Napi::String::New(env, hex_encode(pub, 33));
+  }
+};
+
+// ============================================================
+// Blueprint — wraps machine_blueprint_t (Lineage v1.7)
+// ============================================================
+
+// JS wrapper over the C machine_blueprint_t. JS OWNS the blueprint: it must
+// be released via destroy() (or dropped — the destructor releases it too).
+// The MACHINE the blueprint spawns is different — the parent Node keeps
+// spawned child machines alive (see Node.lineageSpawn); JS only ever borrows
+// those.
+class Blueprint : public Napi::ObjectWrap<Blueprint> {
+public:
+  static Napi::Object Init(Napi::Env env, Napi::Object exports) {
+    Napi::Function func = DefineClass(env, "Blueprint", {
+      StaticMethod("create", &Blueprint::Create),
+      StaticMethod("deserialize", &Blueprint::Deserialize),
+      InstanceMethod("addItem", &Blueprint::AddItem),
+      InstanceMethod("addPolicy", &Blueprint::AddPolicy),
+      InstanceMethod("stampHash", &Blueprint::StampHash),
+      InstanceMethod("serialize", &Blueprint::Serialize),
+      InstanceMethod("destroy", &Blueprint::Destroy),
+    });
+    auto* inst = env.GetInstanceData<NodeAddonInstanceData>();
+    inst->blueprint_ctor = Napi::Persistent(func);
+    exports.Set("Blueprint", func);
+    return exports;
+  }
+
+  // Two construction paths on one constructor:
+  //   new Blueprint(childId, trustMode, bootstrapAdmin, ttlMs) — a fresh
+  //   empty blueprint (the static create() delegates here).
+  //   new Blueprint(wireBuffer) — parse a wire image as produced by
+  //   serialize(); the embedded hash is verified and the blueprint is
+  //   structurally validated (the static deserialize() delegates here).
+  Blueprint(const Napi::CallbackInfo& info) : Napi::ObjectWrap<Blueprint>(info) {
+    Napi::Env env = info.Env();
+    bp_ = nullptr;
+
+    if (info.Length() >= 1 && info[0].IsBuffer()) {
+      auto wire = info[0].As<Napi::Buffer<uint8_t>>();
+      bp_ = blueprint_deserialize(wire.Data(), wire.Length());
+      if (bp_ == nullptr)
+        throw Napi::Error::New(env,
+            "Blueprint wire image malformed (hash or structure check failed)");
+      // Deserialization verifies the hash + bounds; the full structural
+      // validation (id safety, admin presence per trust mode, policy
+      // expressions) runs here too so a wire image that parses but is not
+      // spawnable fails fast at the door.
+      crabs_error_e rc = lineage_blueprint_validate(bp_);
+      if (rc != CRABS_SUCCESS) {
+        machine_blueprint_destroy(bp_);
+        bp_ = nullptr;
+        throw crabs_error(env, rc, "Blueprint.deserialize");
+      }
+      return;
+    }
+
+    if (info.Length() < 4 || !info[0].IsString() || !info[2].IsString())
+      throw Napi::TypeError::New(env,
+          "Expected (childId, trustMode, bootstrapAdmin, ttlMs) or a wire Buffer");
+    std::string child_id = info[0].As<Napi::String>().Utf8Value();
+    std::string bootstrap_admin = info[2].As<Napi::String>().Utf8Value();
+    lineage_trust_mode_e trust_mode;
+    if (!lineage_trust_mode_from_js(info[1], &trust_mode))
+      throw Napi::TypeError::New(env,
+          "trustMode must be 'shared_root' | 'delegated_copy' | 'sovereign' "
+          "or the matching TRUST_MODE number");
+    if (!info[3].IsNumber())
+      throw Napi::TypeError::New(env, "ttlMs must be a number");
+    uint64_t attestation_ttl_ms =
+        (uint64_t)info[3].As<Napi::Number>().DoubleValue();
+
+    bp_ = machine_blueprint_create();
+    if (bp_ == nullptr) throw Napi::Error::New(env, "Failed to allocate blueprint");
+    strncpy(bp_->child_id, child_id.c_str(), CRABS_MAX_USER_ID - 1);
+    bp_->child_id[CRABS_MAX_USER_ID - 1] = '\0';
+    strncpy(bp_->bootstrap_admin, bootstrap_admin.c_str(), CRABS_MAX_USER_ID - 1);
+    bp_->bootstrap_admin[CRABS_MAX_USER_ID - 1] = '\0';
+    bp_->trust_mode = trust_mode;
+    bp_->attestation_ttl_ms = attestation_ttl_ms;
+  }
+
+  ~Blueprint() {
+    if (bp_) machine_blueprint_destroy(bp_);
+  }
+
+  machine_blueprint_t* raw() { return bp_; }
+
+private:
+  machine_blueprint_t* bp_;
+
+  void EnsureAlive(Napi::Env env) {
+    if (bp_ == nullptr) throw Napi::Error::New(env, "blueprint already destroyed");
+  }
+
+  static Napi::Value Create(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 4)
+      throw Napi::TypeError::New(env,
+          "Expected (childId, trustMode, bootstrapAdmin, ttlMs)");
+    auto* inst = env.GetInstanceData<NodeAddonInstanceData>();
+    return inst->blueprint_ctor.New({info[0], info[1], info[2], info[3]});
+  }
+
+  static Napi::Value Deserialize(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 1 || !info[0].IsBuffer())
+      throw Napi::TypeError::New(env, "Expected a blueprint wire Buffer");
+    auto* inst = env.GetInstanceData<NodeAddonInstanceData>();
+    return inst->blueprint_ctor.New({info[0]});
+  }
+
+  Napi::Value AddItem(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    EnsureAlive(env);
+    if (info.Length() < 3 || !info[0].IsString())
+      throw Napi::TypeError::New(env, "Expected (name, dataType, crdtType)");
+    std::string name = info[0].As<Napi::String>().Utf8Value();
+    data_type_e data_type;
+    crdt_type_e crdt_type;
+    if (!data_type_from_js(info[1], &data_type))
+      throw Napi::TypeError::New(env,
+          "dataType must be a DATA_TYPE word ('counter', 'set', ...) or number");
+    if (!crdt_type_from_js(info[2], &crdt_type))
+      throw Napi::TypeError::New(env,
+          "crdtType must be a CRDT_TYPE word ('g_counter', 'or_set', ...) or number");
+    crabs_error_e rc = blueprint_add_item(bp_, name.c_str(), data_type, crdt_type);
+    if (rc != CRABS_SUCCESS) throw crabs_error(env, rc, "Blueprint.addItem");
+    return env.Undefined();
+  }
+
+  Napi::Value AddPolicy(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    EnsureAlive(env);
+    if (info.Length() < 2 || !info[0].IsString() || !info[1].IsString())
+      throw Napi::TypeError::New(env, "Expected (operation, expression)");
+    std::string operation = info[0].As<Napi::String>().Utf8Value();
+    std::string expression = info[1].As<Napi::String>().Utf8Value();
+    crabs_error_e rc = blueprint_add_policy(bp_, operation.c_str(),
+                                            expression.c_str());
+    if (rc != CRABS_SUCCESS) throw crabs_error(env, rc, "Blueprint.addPolicy");
+    return env.Undefined();
+  }
+
+  Napi::Value StampHash(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    EnsureAlive(env);
+    crabs_error_e rc = machine_blueprint_stamp_hash(bp_);
+    if (rc != CRABS_SUCCESS) throw crabs_error(env, rc, "Blueprint.stampHash");
+    return env.Undefined();
+  }
+
+  // Wire image (u32le total length + canonical body + 32-byte blueprint
+  // hash). Stamps the hash first — this is exactly the payload a
+  // __spawn_machine__ op carries, so blueprints can be shipped between
+  // processes.
+  Napi::Value Serialize(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    EnsureAlive(env);
+    std::vector<uint8_t> wire(CRABS_BLUEPRINT_WIRE_MAX);
+    size_t written = blueprint_serialize(bp_, wire.data(), wire.size());
+    if (written == 0)
+      throw crabs_error(env, CRABS_ERR_SERIALIZATION_ERROR, "Blueprint.serialize");
+    return Napi::Buffer<uint8_t>::Copy(env, wire.data(), written);
+  }
+
+  void Destroy(const Napi::CallbackInfo& info) {
+    if (bp_) {
+      machine_blueprint_destroy(bp_);
+      bp_ = nullptr;
+    }
   }
 };
 
@@ -372,13 +676,38 @@ public:
       InstanceMethod("getHLC", &Node::GetHLC),
       InstanceMethod("setTime", &Node::SetTime),
       InstanceMethod("pruneExpiredTempAttrs", &Node::PruneExpiredTempAttrs),
+      // Lineage (v1.7: machines mint machines)
+      InstanceMethod("lineageInstall", &Node::LineageInstall),
+      InstanceMethod("lineageSpawn", &Node::LineageSpawn),
+      InstanceMethod("lineageChildren", &Node::LineageChildren),
+      InstanceMethod("lineageResidentChild", &Node::LineageResidentChild),
+      InstanceMethod("lineageAttest", &Node::LineageAttest),
+      InstanceMethod("lineageTombstone", &Node::LineageTombstone),
     });
+    auto* inst = env.GetInstanceData<NodeAddonInstanceData>();
+    inst->node_ctor = Napi::Persistent(func);
     exports.Set("Node", func);
     return exports;
   }
 
   Node(const Napi::CallbackInfo& info) : Napi::ObjectWrap<Node>(info) {
     Napi::Env env = info.Env();
+
+    // Borrowed-child construction (internal only): a Napi::External adoption
+    // packet wraps a machine this wrapper did NOT create — see WrapMachine
+    // for the ownership statement.
+    if (info.Length() >= 1 && info[0].IsExternal()) {
+      auto adoption_packet = info[0].As<Napi::External<NodeAdoption>>();
+      am_ = adoption_packet.Data()->am;
+      adopted_ = true;
+      node_key_ = nullptr;  // the child carries no own node key yet
+      admin_id_ = am_->base_state.config.bootstrap_admin;
+      // No HLC init, and no change-hook registration: this wrapper did not
+      // create the machine, and its lifetime is not tied to the machine's —
+      // a hook user_data pointing back at this wrapper could dangle.
+      return;
+    }
+
     if (info.Length() < 1 || !info[0].IsString())
       throw Napi::TypeError::New(env, "Expected admin user ID string");
 
@@ -428,7 +757,14 @@ public:
   ~Node() {
     for (auto& listener : change_listeners_) listener.Reset();
     if (node_key_) crypto_ecdsa_keypair_destroy(node_key_);
-    if (am_) attribute_machine_destroy(am_);
+    // Ownership statement (mirrors the wasm binding's resident-registry one):
+    // a wrapper around a machine it did not create NEVER destroys the machine.
+    // The parent owns every machine it spawned directly (spawned_machines_,
+    // destroyed here); machines spawned through the ops pipeline are owned by
+    // C's resident-children registry for the life of the parent machine.
+    if (am_ && !adopted_) attribute_machine_destroy(am_);
+    for (attribute_machine_t* spawned_machine : spawned_machines_)
+      attribute_machine_destroy(spawned_machine);
   }
 
   // --- Change events (public: _node_change_hook_thunk calls into this) ---
@@ -467,6 +803,36 @@ private:
   std::string admin_id_;
   crabs_ordering_config_t ordering_config_;
   std::vector<Napi::FunctionReference> change_listeners_;
+  // Machines this wrapper spawned directly — created via
+  // attribute-registry ownership, destroyed in the destructor. Borrowed
+  // wrappers (adopted_) are absent from and independent of this list.
+  std::vector<attribute_machine_t*> spawned_machines_;
+  // True when this wrapper wraps a machine it did NOT create (a spawned
+  // resident child); the destructor then leaves the machine's lifetime to
+  // its owner.
+  bool adopted_ = false;
+  // A borrowed child wrapper keeps a reference to its parent object so the
+  // parent (and with it the borrowed machine pointer) stays alive.
+  Napi::ObjectReference parent_keepalive_;
+
+  // Shared construction path for wrapping a borrowed child machine. The
+  // adoption packet is freed by the External's finalizer (GC time), so the
+  // constructor must not free it.
+  static Napi::Object WrapMachine(Napi::Env env, attribute_machine_t* machine,
+                                  Napi::Object parent_obj) {
+    auto* inst = env.GetInstanceData<NodeAddonInstanceData>();
+    NodeAdoption* packet = new NodeAdoption{machine};
+    Napi::Object child_obj = inst->node_ctor.New(
+        {Napi::External<NodeAdoption>::New(
+            env, packet, [](Napi::Env env, NodeAdoption* adoption_packet) {
+              delete adoption_packet;
+            })});
+    Node* child_wrapper = Node::Unwrap(child_obj);
+    // Keepalive: the parent cannot be collected while any child wrapper
+    // referencing it is alive, which is what keeps `machine` valid here.
+    child_wrapper->parent_keepalive_ = Napi::Persistent(parent_obj);
+    return child_obj;
+  }
 
   // node.on('change', cb) returns an off() function that unregisters cb.
   Napi::Value On(const Napi::CallbackInfo& info) {
@@ -607,7 +973,12 @@ private:
   }
 
   Napi::Value GetNodeKey(const Napi::CallbackInfo& info) {
-    // Return an object with the node's public/private key hex
+    // Return an object with the node's public/private key hex.
+    // A borrowed child wrapper has no own node key — spawn does not mint one;
+    // whoever later loads the machine sets it.
+    if (node_key_ == nullptr)
+      throw Napi::Error::New(info.Env(),
+          "getNodeKey: this machine carries no own node key");
     Napi::Object obj = Napi::Object::New(info.Env());
     obj.Set("publicKeyHex", Napi::String::New(info.Env(), hex_encode(node_key_->public_key, 33)));
     obj.Set("privateKeyHex", Napi::String::New(info.Env(), hex_encode(node_key_->private_key, 32)));
@@ -1072,6 +1443,131 @@ private:
     attribute_machine_prune_expired_temporary(am_);
     return info.Env().Undefined();
   }
+
+  // --- Lineage (v1.7: machines mint machines) ---
+
+  // Register the five __lineage__ op types, their default role:admin policies
+  // and their handlers on this machine. Idempotent in C; call once after
+  // machine creation. Also the route a spawned child takes to become able to
+  // submit __receive_dissolution__.
+  void LineageInstall(const Napi::CallbackInfo& info) {
+    lineage_install(&am_->base_state);
+  }
+
+  // Instantiate a child machine from a validated blueprint. The returned
+  // Node BORROWS the spawned machine — this wrapper owns it (destroyed when
+  // this wrapper is collected), mirroring the wasm binding's
+  // resident-registry ownership statement.
+  Napi::Value LineageSpawn(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 1 || !info[0].IsObject())
+      throw Napi::TypeError::New(env, "Expected Blueprint");
+    Blueprint* blueprint_wrapper = Blueprint::Unwrap(info[0].As<Napi::Object>());
+    machine_blueprint_t* blueprint = blueprint_wrapper->raw();
+    if (blueprint == nullptr)
+      throw Napi::Error::New(env, "lineageSpawn: blueprint already destroyed");
+    attribute_machine_t* spawned_machine = NULL;
+    crabs_error_e rc = lineage_spawn_machine(&am_->base_state, blueprint,
+                                             &spawned_machine);
+    if (rc != CRABS_SUCCESS) throw crabs_error(env, rc, "lineageSpawn");
+    spawned_machines_.push_back(spawned_machine);
+    return WrapMachine(env, spawned_machine, info.This().As<Napi::Object>());
+  }
+
+  // Borrowed view over the child manifest:
+  // [{ childId, mode, status, spawnedAtMs, attestationTtlMs }, ...] — mode
+  // and status rendered with the C single-source name helpers (the same
+  // strings the CLI and wasm devtools show).
+  Napi::Value LineageChildren(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    const child_manifest_entry_t* entries = NULL;
+    uint32_t entry_count = lineage_query_children(&am_->base_state, &entries);
+    Napi::Array child_array = Napi::Array::New(env, entry_count);
+    for (uint32_t entry_index = 0; entry_index < entry_count; entry_index++) {
+      const child_manifest_entry_t* entry = &entries[entry_index];
+      Napi::Object child_entry = Napi::Object::New(env);
+      child_entry.Set("childId", Napi::String::New(env, entry->child_id));
+      child_entry.Set("mode", Napi::String::New(env,
+                                                 lineage_mode_name(entry->mode)));
+      child_entry.Set("status", Napi::String::New(env,
+                                                   lineage_status_name(entry->status)));
+      child_entry.Set("spawnedAtMs",
+                      Napi::Number::New(env, (double)entry->spawned_at));
+      child_entry.Set("attestationTtlMs",
+                      Napi::Number::New(env, (double)entry->attestation_ttl_ms));
+      child_array.Set(entry_index, child_entry);
+    }
+    return child_array;
+  }
+
+  // The machine this parent spawned and still holds resident in-process, or
+  // null when unknown / dissolved (the dissolve op drops the registry slot).
+  // The wrapper BORROWS the machine — the parent keeps it alive.
+  Napi::Value LineageResidentChild(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 1 || !info[0].IsString())
+      throw Napi::TypeError::New(env, "Expected childId string");
+    std::string child_id = info[0].As<Napi::String>().Utf8Value();
+    attribute_machine_t* resident_machine =
+        lineage_query_resident_child(&am_->base_state, child_id.c_str());
+    if (resident_machine == NULL) return env.Null();
+    return WrapMachine(env, resident_machine, info.This().As<Napi::Object>());
+  }
+
+  // Parent-signed, TTL-bounded attribute grant for a manifestable child.
+  // Returns the attestation WIRE image (u32le length + canonical body +
+  // signature) as a Buffer. The parent's own machine identity signs (the
+  // node key); `now_ms` comes from the machine's authenticated time source
+  // (setTime or an attached time-source).
+  Napi::Value LineageAttest(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 2 || !info[0].IsString() || !info[1].IsString())
+      throw Napi::TypeError::New(env, "Expected (childId, userId[, attributes])");
+    std::string child_id = info[0].As<Napi::String>().Utf8Value();
+    std::string user_id = info[1].As<Napi::String>().Utf8Value();
+    std::string attributes = info.Length() > 2 && info[2].IsString()
+        ? info[2].As<Napi::String>().Utf8Value() : std::string("");
+    uint64_t now_ms = 0;
+    if (!state_get_time_ms(&am_->base_state, &now_ms))
+      throw Napi::Error::New(env,
+          "lineageAttest: machine has no authenticated time source — call setTime first");
+    attestation_t attestation;
+    memset(&attestation, 0, sizeof(attestation));
+    crabs_error_e rc = crabs_issue_attestation(&am_->base_state, &attestation,
+                                               child_id.c_str(), user_id.c_str(),
+                                               attributes.c_str(), now_ms);
+    if (rc != CRABS_SUCCESS) throw crabs_error(env, rc, "lineageAttest");
+    uint8_t wire[CRABS_ATTESTATION_WIRE_MAX];
+    size_t wire_len = attestation_serialize(&attestation, wire, sizeof(wire));
+    // attestation_destroy free()s its argument — it is only for heap
+    // attestations from attestation_deserialize. `attestation` here is a
+    // stack struct crabs_issue_attestation filled inline (signature is a
+    // fixed array), so there is nothing to release.
+    if (wire_len == 0)
+      throw crabs_error(env, CRABS_ERR_SERIALIZATION_ERROR, "lineageAttest");
+    return Napi::Buffer<uint8_t>::Copy(env, wire, wire_len);
+  }
+
+  // Off-chain dissolution proof for an already-DISSOLVED child: canonical
+  // tombstone body (`u8 LINEAGE_DISSOLVED tag + string16 childId`) + the
+  // 64-byte parent ECDSA — the exact bytes a __receive_dissolution__ op
+  // transports. The honesty gate (never sign a tombstone for a live child)
+  // maps to typed errors: resource_not_found for an unknown child,
+  // unauthorized for a not-yet-dissolved one, cryptographic_error when the
+  // node key is missing or signing fails.
+  Napi::Value LineageTombstone(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 1 || !info[0].IsString())
+      throw Napi::TypeError::New(env, "Expected childId string");
+    std::string child_id = info[0].As<Napi::String>().Utf8Value();
+    uint8_t wire[CRABS_DISSOLUTION_WIRE_MAX];
+    size_t wire_len = 0;
+    crabs_error_e rc = lineage_dissolution_serialize(&am_->base_state,
+                                                     child_id.c_str(), wire,
+                                                     sizeof(wire), &wire_len);
+    if (rc != CRABS_SUCCESS) throw crabs_error(env, rc, "lineageTombstone");
+    return Napi::Buffer<uint8_t>::Copy(env, wire, wire_len);
+  }
 };
 
 // C change-hook trampoline: forward-declared before Node so the constructor
@@ -1088,9 +1584,43 @@ static void _node_change_hook_thunk(state_t* state,
 // ============================================================
 
 Napi::Object Init(Napi::Env env, Napi::Object exports) {
+  // Shared instance data (persistent per-class constructor references) must
+  // exist before the class inits store into it.
+  env.SetInstanceData(new NodeAddonInstanceData());
   KeyPair::Init(env, exports);
+  Blueprint::Init(env, exports);
   Operation::Init(env, exports);
   Node::Init(env, exports);
+
+  // Enum constant tables, mirroring the wasm bindings' tables — the same
+  // naming blueprint fields take in wire form.
+  Napi::Object trust_mode = Napi::Object::New(env);
+  trust_mode.Set("SHARED_ROOT", (double)LINEAGE_SHARED_ROOT);
+  trust_mode.Set("DELEGATED_COPY", (double)LINEAGE_DELEGATED_COPY);
+  trust_mode.Set("SOVEREIGN", (double)LINEAGE_SOVEREIGN);
+  exports.Set("TRUST_MODE", trust_mode);
+
+  Napi::Object data_type = Napi::Object::New(env);
+  data_type.Set("COUNTER", (double)DATA_TYPE_COUNTER);
+  data_type.Set("PN_COUNTER", (double)DATA_TYPE_PN_COUNTER);
+  data_type.Set("SET", (double)DATA_TYPE_SET);
+  data_type.Set("REGISTER", (double)DATA_TYPE_REGISTER);
+  data_type.Set("RESOURCE", (double)DATA_TYPE_RESOURCE);
+  data_type.Set("ONE_SHOT_SET", (double)DATA_TYPE_ONE_SHOT_SET);
+  data_type.Set("ONE_SHOT_FLAG", (double)DATA_TYPE_ONE_SHOT_FLAG);
+  data_type.Set("CUSTOM", (double)DATA_TYPE_CUSTOM);
+  exports.Set("DATA_TYPE", data_type);
+
+  Napi::Object crdt_type = Napi::Object::New(env);
+  crdt_type.Set("G_COUNTER", (double)CRDT_G_COUNTER);
+  crdt_type.Set("PN_COUNTER", (double)CRDT_PN_COUNTER);
+  crdt_type.Set("OR_SET", (double)CRDT_OR_SET);
+  crdt_type.Set("LWW_REG", (double)CRDT_LWW_REG);
+  crdt_type.Set("ONE_SHOT_SET", (double)CRDT_ONE_SHOT_SET);
+  crdt_type.Set("ONE_SHOT_FLAG", (double)CRDT_ONE_SHOT_FLAG);
+  crdt_type.Set("CUSTOM", (double)CRDT_CUSTOM);
+  exports.Set("CRDT_TYPE", crdt_type);
+
   return exports;
 }
 

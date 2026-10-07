@@ -48,6 +48,52 @@ export interface NodeKey {
   privateKeyHex: string;
 }
 
+// ============================================================
+// Lineage (v1.7: machines mint machines)
+// ============================================================
+
+/** Trust mode for a spawned child: string word or the wire number. */
+export type TrustMode =
+  | 'shared_root' | 'shared'
+  | 'delegated_copy' | 'delegated'
+  | 'sovereign'
+  | number;
+
+/**
+ * A serializable machine definition a parent instantiates via
+ * Node.lineageSpawn (or ships between processes as a __spawn_machine__
+ * op payload). JS owns the blueprint; release it with destroy().
+ */
+export interface Blueprint {
+  /** Append a replicated data item to the child's definition. */
+  addItem(name: string, dataType: string | number, crdtType: string | number): void;
+  /** Append an authorization policy: operation type + condition expression. */
+  addPolicy(operation: string, expression: string): void;
+  /** Recompute the blueprint's SHA-256 over its canonical body. */
+  stampHash(): void;
+  /** Wire image: u32le length + canonical body + 32-byte blueprint hash. */
+  serialize(): Buffer;
+  /** Release the underlying C blueprint. */
+  destroy(): void;
+}
+
+export interface BlueprintStatic {
+  new (childId: string, trustMode: TrustMode, bootstrapAdmin: string, ttlMs: number): Blueprint;
+  new (wire: Buffer): Blueprint;
+  create(childId: string, trustMode: TrustMode, bootstrapAdmin: string, ttlMs: number): Blueprint;
+  /** Parse a wire image; verifies the embedded hash + structural validation. */
+  deserialize(wire: Buffer): Blueprint;
+}
+
+/** One entry of the parent's (borrowed) child manifest view. */
+export interface ChildManifestEntry {
+  childId: string;
+  mode: 'shared_root' | 'delegated_copy' | 'sovereign' | 'unknown';
+  status: 'active' | 'dissolved' | 'withdrawn' | 'attestation_revoked' | 'unknown';
+  spawnedAtMs: number;
+  attestationTtlMs: number;
+}
+
 export interface HLC {
   seconds: number;
   nanos: number;
@@ -145,6 +191,33 @@ export interface Node {
   getHLC(): HLC | undefined;
   setTime(nowMs: number): void;
   pruneExpiredTempAttrs(): void;
+
+  // Lineage (v1.7: machines mint machines)
+  /** Register the five __lineage__ op types, policies and handlers. Idempotent. */
+  lineageInstall(): void;
+  /**
+   * Instantiate a child machine from a blueprint. The returned Node BORROWS
+   * the spawned machine — this Node owns it (destroyed when the parent is
+   * collected); the wrapper keeps the parent alive.
+   */
+  lineageSpawn(blueprint: Blueprint): Node;
+  /** Borrowed view over the child manifest. */
+  lineageChildren(): ChildManifestEntry[];
+  /** The still-resident in-process spawned child, or null when unknown/dissolved. */
+  lineageResidentChild(childId: string): Node | null;
+  /**
+   * Parent-signed, TTL-bounded attribute grant — returns the attestation
+   * wire image (u32le length + canonical body + signature). Requires an
+   * authenticated time source (setTime) and an ACTIVE manifest entry.
+   */
+  lineageAttest(childId: string, userId: string, attributes?: string): Buffer;
+  /**
+   * Off-chain dissolution proof for an already-DISSOLVED child: canonical
+   * tombstone body + 64-byte parent ECDSA — the exact bytes a
+   * __receive_dissolution__ op transports. Honesty-gate refusals surface as
+   * typed errors (resource_not_found / unauthorized / cryptographic_error).
+   */
+  lineageTombstone(childId: string): Buffer;
 }
 
 export interface NodeStatic {
@@ -153,4 +226,32 @@ export interface NodeStatic {
 
 export const KeyPair: KeyPairStatic;
 export const Operation: OperationStatic;
+export const Blueprint: BlueprintStatic;
 export const Node: NodeStatic;
+
+export const TRUST_MODE: {
+  SHARED_ROOT: number;
+  DELEGATED_COPY: number;
+  SOVEREIGN: number;
+};
+
+export const DATA_TYPE: {
+  COUNTER: number;
+  PN_COUNTER: number;
+  SET: number;
+  REGISTER: number;
+  RESOURCE: number;
+  ONE_SHOT_SET: number;
+  ONE_SHOT_FLAG: number;
+  CUSTOM: number;
+};
+
+export const CRDT_TYPE: {
+  G_COUNTER: number;
+  PN_COUNTER: number;
+  OR_SET: number;
+  LWW_REG: number;
+  ONE_SHOT_SET: number;
+  ONE_SHOT_FLAG: number;
+  CUSTOM: number;
+};

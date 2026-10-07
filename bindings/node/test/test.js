@@ -4,7 +4,7 @@
 
 'use strict';
 
-const { Node, KeyPair, Operation } = require('..');
+const { Node, KeyPair, Operation, Blueprint } = require('..');
 
 let passed = 0;
 let failed = 0;
@@ -58,13 +58,22 @@ node.setPolicy('view', 'role:member');
 node.setPolicy('like', 'role:member');
 node.setPolicy('subscribe', 'role:member');
 
-// Test 8: Execute a signed operation (use node.sign to stamp HLC before signing)
+// Test 8: Execute a signed operation (use node.sign to stamp HLC before signing).
+// Landed C contract (declared-but-unimplemented ops): a non-builtin op with
+// a policy but NO handler and NO resources fails closed with
+// resource_not_found — no successful empty operations are logged. The view
+// effect is simulated directly with incrementCounter.
 const viewOp = new Operation('view');
 viewOp.signerId = 'alice';
 node.sign(viewOp, aliceKey);
-node.execute(viewOp);
-// The 'view' op is a non-builtin — it passes authorization but has no
-// handler. Increment the counter directly to simulate the view effect.
+let handlerlessRefused = false;
+try {
+  node.execute(viewOp);
+} catch (handlerlessRefusal) {
+  handlerlessRefused = handlerlessRefusal.message.includes('resource_not_found');
+}
+assert(handlerlessRefused,
+  'Handlerless view op should fail closed with resource_not_found');
 node.incrementCounter('views', 1, 'alice');
 assert(node.getCounter('views') === 1, 'Views should be 1 after one view');
 
@@ -114,14 +123,24 @@ const bobKey = KeyPair.generate();
 const carolKey = KeyPair.generate();
 const unsubscribeChange = node.on('change', (changeEvent) => changeEvents.push(changeEvent));
 
-const viewOp2 = new Operation('view');
-viewOp2.signerId = 'alice';
-node.sign(viewOp2, aliceKey);
-node.execute(viewOp2);
+// Driver for the 'op'-kind event: a successful EXECUTE. The 'view' op fails
+// closed per the landed declared-but-unimplemented contract (test 8), so the
+// driver is a lineage op with a handler: __spawn_machine__ carrying a
+// blueprint wire payload, signed/stamped via node.sign and executed by the
+// node's admin (role:admin, the lineage default policy).
+node.lineageInstall();
+const spawnBlueprint = new Blueprint('test-child', 'delegated_copy', 'child-admin', 60000);
+spawnBlueprint.addItem('flag_a', 'one_shot_flag', 'one_shot_flag');
+const spawnOp = new Operation('__spawn_machine__');
+spawnOp.signerId = 'admin';
+spawnOp.nodeId = 'admin';
+spawnOp.payload = spawnBlueprint.serialize();
+node.sign(spawnOp, node.getNodeKey().privateKeyHex);
+node.execute(spawnOp);
 const opChangeEvent = changeEvents.find(
-  (changeEvent) => changeEvent.kind === 'op' && changeEvent.type === 'view');
+  (changeEvent) => changeEvent.kind === 'op' && changeEvent.type === '__spawn_machine__');
 assert(opChangeEvent !== undefined, 'execute should fire an op change event');
-assert(opChangeEvent.signer === 'alice', 'Op change event should name the signer');
+assert(opChangeEvent.signer === 'admin', 'Op change event should name the signer');
 assert(opChangeEvent.result === 0, 'Op change event should report success');
 
 node.registerUser('bob', bobKey.publicKeyHex(), '');
