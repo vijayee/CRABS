@@ -2,8 +2,8 @@
 // Lineage (v1.7: machines mint machines) — blueprint data types + validation,
 // wire serialization with hash verification, spawn (three trust modes),
 // attestations, and the lineage ops (__spawn_machine__ /
-// __revoke_attestation__ / __dissolve_machine__ / __withdraw_genesis__)
-// registered on a machine by lineage_install.
+// __revoke_attestation__ / __dissolve_machine__ / __withdraw_genesis__ /
+// __receive_dissolution__) registered on a machine by lineage_install.
 //
 
 #ifndef CRABS_LINEAGE_H
@@ -250,22 +250,23 @@ const char* lineage_status_name(lineage_status_e status);
 // ============================================================
 
 // Custom op types a lineage-eligible machine registers (lineage_install).
-// All four are admin-gated user-defined operations — the state machine's
+// All five are admin-gated user-defined operations — the state machine's
 // builtin chain stays untouched; handlers run POST-authorization, so the
 // handler bodies re-verify nothing about the caller.
 #define CRABS_LINEAGE_OP_SPAWN               "__spawn_machine__"
 #define CRABS_LINEAGE_OP_REVOKE_ATTESTATION  "__revoke_attestation__"
 #define CRABS_LINEAGE_OP_DISSOLVE            "__dissolve_machine__"
 #define CRABS_LINEAGE_OP_WITHDRAW_GENESIS    "__withdraw_genesis__"
+#define CRABS_LINEAGE_OP_RECEIVE_DISSOLUTION "__receive_dissolution__"
 
 // Forward declaration: operation_t is full-defined in state_machine.h (which
 // itself includes this header). Pointer use only — safe on an incomplete type.
 typedef struct crabs_operation operation_t;
 
-// Convenience installer: registers the four op type definitions (DEDUP_NONE —
+// Convenience installer: registers the five op type definitions (DEDUP_NONE —
 // per-child replay guards are a protocol author's choice), the default
-// policies (all four "role:admin" — a protocol may override afterwards via
-// state_add_policy), and the four handlers. IDEMPOTENT: registration paths
+// policies (all five "role:admin" — a protocol may override afterwards via
+// state_add_policy), and the five handlers. IDEMPOTENT: registration paths
 // update in place when already present, so calling it twice is a no-op —
 // call once after machine creation.
 void lineage_install(state_t* state);
@@ -298,8 +299,9 @@ crabs_error_e lineage_op_revoke_attestation(state_t* state, operation_t* op);
 // every @parent/ endorsement on the child fails closed from that moment —
 // and drops the child from the runtime registry (the child itself is NOT
 // destroyed; it outlives the dissolve). Already dissolved →
-// CRABS_ERR_ALREADY_PERFORMED. After a restart the dissolution flag is gone:
-// delivering the tombstone as an op on the child is a later-plan concern.
+// CRABS_ERR_ALREADY_PERFORMED. A dissolved but distant child learns about
+// the severance by receiving the tombstone through __receive_dissolution__
+// (see lineage_op_receive_dissolution).
 crabs_error_e lineage_op_dissolve(state_t* state, operation_t* op);
 
 // Off-chain dissolution proof: the parent machine's ECDSA signature over the
@@ -312,6 +314,45 @@ crabs_error_e lineage_op_dissolve(state_t* state, operation_t* op);
 // node key / signing failure → CRABS_ERR_CRYPTOGRAPHIC_ERROR.
 crabs_error_e lineage_sign_dissolution(state_t* parent, const char* child_id,
                                        uint8_t signature_out[CRABS_SIG_SIZE]);
+
+// Tombstone WIRE image: canonical body (`u8 tag (= LINEAGE_DISSOLVED) +
+// string16 child_id`, string length EXCLUDES the NUL) + the 64-byte parent
+// ECDSA signature appended — 3 + strlen(child_id) + CRABS_SIG_SIZE bytes, no
+// length prefix (the op pipeline already transports payload_size). Worst
+// case 3 + (CRABS_MAX_USER_ID - 1) + CRABS_SIG_SIZE (a safe id keeps room
+// for its NUL), which CRABS_DISSOLUTION_WIRE_MAX bounds. This is the exact
+// byte sequence a __receive_dissolution__ op transports and verifies, so
+// delivery bytes can never drift from signing bytes. Writes *out_len and
+// returns CRABS_SUCCESS; the error surface and honesty gate are
+// lineage_sign_dissolution's exactly (manifest entry must currently read
+// DISSOLVED); a buffer smaller than the wire is CRABS_ERR_INVALID_PARAM.
+#define CRABS_DISSOLUTION_WIRE_MAX \
+  (3 + (CRABS_MAX_USER_ID - 1) + CRABS_SIG_SIZE)
+crabs_error_e lineage_dissolution_serialize(state_t* parent,
+                                            const char* child_id,
+                                            uint8_t* out_buf, size_t buf_len,
+                                            size_t* out_len);
+
+// payload = tombstone wire (lineage_dissolution_serialize's output). Runs on
+// the CHILD: flips lineage_parent_dissolved to true durably after the
+// embedded tombstone proves the parent's decision. Refuses: missing/malformed
+// payload or a tombstone naming a different machine → CRABS_ERR_INVALID_PARAM
+// (a validly-signed tombstone for ANOTHER machine is refused the same way —
+// the child_id check runs before verification cost); an unbound machine (no
+// parent binding → no parent public key to verify against) →
+// CRABS_ERR_UNAUTHORIZED; a failing signature → CRABS_ERR_CRYPTOGRAPHIC_ERROR;
+// a re-delivery on an already-dissolved machine → CRABS_ERR_ALREADY_PERFORMED.
+//
+// AUTHENTICITY MODEL — two independent proofs, neither sufficient alone: the
+// op pipeline already verified the submitting child admin's signature against
+// the "role:admin" policy, which authorizes CARRIAGE of the payload but says
+// nothing about its content; the tombstone's ECDSA over the canonical body
+// against the persisted lineage_parent_public_key is the ONLY proof that the
+// PARENT machine actually severed the lineage. The op's attestations play no
+// part — a child admin carrying a forged parent "decision" must fail on the
+// parent signature, and a raw-but-unroutable parent signature needs the
+// authorized op carrier to reach the child machine at all.
+crabs_error_e lineage_op_receive_dissolution(state_t* state, operation_t* op);
 
 // payload = child_id (raw string). Sovereign ONLY: the parent recovers its
 // genesis stake by voiding the manifest entry (WITHDRAWN) — attestations for

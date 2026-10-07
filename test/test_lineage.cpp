@@ -1400,12 +1400,13 @@ TEST(TestLineage, SpawnViaOp) {
   ASSERT_EQ(attribute_machine_grant_role(harness.am, "alice", "role", "admin",
                                          "parent-root"), CRABS_SUCCESS);
 
-  // Idempotent installer: a second call registers nothing new.
+  // Idempotent installer: a second call registers nothing new (five lineage
+  // ops since __receive_dissolution__ joined).
   lineage_install(parent);
-  EXPECT_EQ(parent->op_handler_count, 4u);
+  EXPECT_EQ(parent->op_handler_count, 5u);
   lineage_install(parent);
-  EXPECT_EQ(parent->op_handler_count, 4u);
-  EXPECT_EQ(parent->op_type_def_count, 4u);
+  EXPECT_EQ(parent->op_handler_count, 5u);
+  EXPECT_EQ(parent->op_type_def_count, 5u);
   EXPECT_NE(state_find_policy(parent, CRABS_LINEAGE_OP_SPAWN), nullptr);
 
   machine_blueprint_t* blueprint = make_valid_blueprint();
@@ -1831,6 +1832,290 @@ TEST(TestLineage, DissolutionTombstoneSignsOnlyAfterDissolve) {
                                   sizeof(canonical_tombstone), tombstone));
 
   machine_blueprint_destroy(blueprint);
+  spawn_parent_destroy(&harness);
+}
+
+// ============================================================
+// Dissolution tombstone delivery: __receive_dissolution__ on the child
+// ============================================================
+
+// Attach a stack tombstone wire to an op shell for DIRECT handler calls.
+// Handlers run post-authorization, so an unsigned shell is enough (same
+// idiom as DissolutionTombstoneSignsOnlyAfterDissolve); the payload pointer
+// is cleared before destroy so operation_destroy never frees test-owned
+// memory.
+static operation_t* make_handler_shell_op(const char* op_type,
+                                          const uint8_t* payload,
+                                          size_t payload_size) {
+  operation_t* op = operation_create(op_type);
+  EXPECT_NE(op, nullptr);
+  if (op == NULL) return NULL;
+  op->payload = (uint8_t*)payload;
+  op->payload_size = (uint32_t)payload_size;
+  return op;
+}
+
+static void release_handler_shell_op(operation_t* op) {
+  if (op == NULL) return;
+  op->payload = NULL;
+  op->payload_size = 0;
+  operation_destroy(op);
+}
+
+TEST(TestLineage, TombstoneDeliveryOpSetsAndPersistsDissolveState) {
+  spawn_parent_harness_t harness;
+  spawn_parent_setup(&harness);
+  state_t* parent = &harness.am->base_state;
+
+  // Delegated child: its genesis admin ("child-admin", registered with the
+  // parent's node public key) is the child-side operator who will carry the
+  // tombstone in through the op pipeline.
+  machine_blueprint_t* blueprint =
+      make_fresh_authority_blueprint("child-delegated", LINEAGE_DELEGATED_COPY);
+  ASSERT_NE(blueprint, nullptr);
+  attribute_machine_t* child = nullptr;
+  ASSERT_EQ(lineage_spawn_machine(parent, blueprint, &child), CRABS_SUCCESS);
+  ASSERT_NE(child, nullptr);
+
+  // Parent side: the dissolve op runs under the installer's role:admin gated
+  // __dissolve_machine__.
+  lineage_install(parent);
+
+  // The child machine holds its own node key; the seal key seals the state's
+  // ABE master key across the persistence round trip.
+  ecdsa_keypair_t* child_key = crypto_ecdsa_generate();
+  ASSERT_NE(child_key, nullptr);
+  ASSERT_EQ(state_set_node_key(&child->base_state, child_key->private_key,
+                               child_key->public_key), CRABS_SUCCESS);
+  uint8_t seal_key[32];
+  ASSERT_EQ(crypto_random_bytes(seal_key, sizeof(seal_key)), CRABS_SUCCESS);
+
+  // The installer on the CHILD registers the delivery op: five lineage ops,
+  // the delivery op gated "role:admin" like its four siblings. The blueprint
+  // already contributed one op type definition ("increment").
+  lineage_install(&child->base_state);
+  EXPECT_EQ(child->base_state.op_handler_count, 5u);
+  EXPECT_EQ(child->base_state.op_type_def_count, 6u);
+  EXPECT_NE(state_find_policy(&child->base_state,
+                              CRABS_LINEAGE_OP_RECEIVE_DISSOLUTION), nullptr);
+  EXPECT_NE(state_find_op_type_def(&child->base_state,
+                                   CRABS_LINEAGE_OP_RECEIVE_DISSOLUTION),
+            nullptr);
+  EXPECT_FALSE(child->base_state.lineage_parent_dissolved);
+
+  // Dissolve the child parent-side through the pipeline (alice is admin).
+  ASSERT_EQ(attribute_machine_grant_role(harness.am, "alice", "role", "admin",
+                                         "parent-root"), CRABS_SUCCESS);
+  operation_t* dissolve = make_signed_lineage_op(
+      harness.am, harness.alice_key, "alice", CRABS_LINEAGE_OP_DISSOLVE,
+      "child-delegated", strlen("child-delegated"));
+  ASSERT_NE(dissolve, nullptr);
+  EXPECT_EQ(state_machine_execute(parent, dissolve), CRABS_SUCCESS);
+  operation_destroy(dissolve);
+  EXPECT_EQ(parent->children[0].status, LINEAGE_DISSOLVED);
+  // In-process severance already flipped the resident child's flag.
+  EXPECT_TRUE(child->base_state.lineage_parent_dissolved);
+
+  // Simulate the child OPERATOR'S node, which never saw the parent's
+  // in-process severance (cross-process by design): the tombstone op is the
+  // ONLY channel that carries the parent's decision there.
+  child->base_state.lineage_parent_dissolved = false;
+
+  // Tombstone wire: the shared writer produces the exact bytes
+  // `lineage_sign_dissolution` signs over — canonical body + signature.
+  uint8_t tombstone[CRABS_DISSOLUTION_WIRE_MAX];
+  size_t tombstone_len = 0;
+  ASSERT_EQ(lineage_dissolution_serialize(parent, "child-delegated", tombstone,
+                                          sizeof(tombstone), &tombstone_len),
+            CRABS_SUCCESS);
+  ASSERT_EQ(tombstone_len,
+            (size_t)(3 + strlen("child-delegated") + CRABS_SIG_SIZE));
+  // Wire layout: u8 tag + u16le string length + child_id + 64B signature.
+  EXPECT_EQ(tombstone[0], (uint8_t)LINEAGE_DISSOLVED);
+  EXPECT_EQ(tombstone[1], (uint8_t)strlen("child-delegated"));
+  EXPECT_EQ(tombstone[2], 0x00);
+  EXPECT_EQ(memcmp(tombstone + 3, "child-delegated",
+                   strlen("child-delegated")), 0);
+  EXPECT_TRUE(crypto_ecdsa_verify(harness.parent_key->public_key, tombstone,
+                                  tombstone_len - CRABS_SIG_SIZE,
+                                  tombstone + tombstone_len - CRABS_SIG_SIZE));
+
+  // Capture the delivered change event.
+  static crabs_change_event_t captured_events[4];
+  static char captured_targets[4][CRABS_MAX_USER_ID];
+  static uint32_t captured_event_count;
+  captured_event_count = 0;
+  state_set_change_hook(&child->base_state,
+                        [](state_t*, const crabs_change_event_t* event, void*) {
+    if (event->kind != CRABS_CHANGE_LINEAGE) return;
+    if (captured_event_count >= 4) return;
+    captured_events[captured_event_count] = *event;
+    strncpy(captured_targets[captured_event_count],
+            event->target ? event->target : "", CRABS_MAX_USER_ID - 1);
+    captured_events[captured_event_count].target =
+        captured_targets[captured_event_count];
+    captured_event_count += 1;
+  }, nullptr);
+
+  // Deliver as the CHILD ADMIN through the full pipeline.
+  operation_t* delivery = make_signed_lineage_op(
+      child, harness.parent_key, "child-admin",
+      CRABS_LINEAGE_OP_RECEIVE_DISSOLUTION, tombstone, tombstone_len);
+  ASSERT_NE(delivery, nullptr);
+  EXPECT_EQ(state_machine_execute(&child->base_state, delivery),
+            CRABS_SUCCESS);
+  operation_destroy(delivery);
+  EXPECT_TRUE(child->base_state.lineage_parent_dissolved);
+
+  // Change event: kind LINEAGE, delivery op type, target = this machine,
+  // attributed to the executing op.
+  ASSERT_EQ(captured_event_count, 1u);
+  EXPECT_EQ(captured_events[0].kind, CRABS_CHANGE_LINEAGE);
+  EXPECT_STREQ(captured_events[0].type, "__receive_dissolution__");
+  EXPECT_STREQ(captured_events[0].target, "child-delegated");
+  EXPECT_STREQ(captured_events[0].preview, "dissolution received");
+  EXPECT_EQ(captured_events[0].result, CRABS_SUCCESS);
+
+  // Re-delivery is already-performed, not a re-severance.
+  operation_t* redelivery = make_signed_lineage_op(
+      child, harness.parent_key, "child-admin",
+      CRABS_LINEAGE_OP_RECEIVE_DISSOLUTION, tombstone, tombstone_len);
+  ASSERT_NE(redelivery, nullptr);
+  EXPECT_EQ(state_machine_execute(&child->base_state, redelivery),
+            CRABS_ERR_ALREADY_PERFORMED);
+  operation_destroy(redelivery);
+
+  // Persistence: the delivered dissolution survives the sealed round trip
+  // (Task 1's v12 binding-tail byte consumed through the real save/load).
+  serialized_buffer_t* snapshot =
+      crabs_serialize_state_sealed(&child->base_state, seal_key);
+  ASSERT_NE(snapshot, nullptr);
+  bool authority_restored = false;
+  bool msk_section_present = false;
+  state_t* restored = crabs_deserialize_state_keys_reported(
+      snapshot->data, snapshot->len, seal_key, &authority_restored,
+      &msk_section_present);
+  ASSERT_NE(restored, nullptr);
+  EXPECT_TRUE(authority_restored);
+  EXPECT_TRUE(msk_section_present);
+  EXPECT_TRUE(restored->lineage_parent_dissolved);
+  EXPECT_TRUE(restored->lineage_parent_bound);
+  EXPECT_STREQ(restored->lineage_self_id, "child-delegated");
+
+  serialized_buffer_destroy(snapshot);
+  state_destroy(restored);
+  crypto_ecdsa_keypair_destroy(child_key);
+  machine_blueprint_destroy(blueprint);
+  spawn_parent_destroy(&harness);
+}
+
+TEST(TestLineage, TombstoneDeliveryRefusesForgedMisaddressedAndUnbound) {
+  spawn_parent_harness_t harness;
+  spawn_parent_setup(&harness);
+  state_t* parent = &harness.am->base_state;
+
+  // The receiver child stays LIVE through this test: a tombstone for a
+  // non-dissolved child can never exist, so its refusals must come from
+  // structural/authenticity failures, not the already-dissolved guard. A
+  // second child provides a genuinely dissolved, honestly-signed tombstone
+  // that is misaddressed to the receiver.
+  machine_blueprint_t* receiver_blueprint =
+      make_fresh_authority_blueprint("child-delegated", LINEAGE_DELEGATED_COPY);
+  ASSERT_NE(receiver_blueprint, nullptr);
+  attribute_machine_t* receiver = nullptr;
+  ASSERT_EQ(lineage_spawn_machine(parent, receiver_blueprint, &receiver),
+            CRABS_SUCCESS);
+  ASSERT_NE(receiver, nullptr);
+  machine_blueprint_t* other_blueprint =
+      make_fresh_authority_blueprint("child-other", LINEAGE_DELEGATED_COPY);
+  ASSERT_NE(other_blueprint, nullptr);
+  attribute_machine_t* other = nullptr;
+  ASSERT_EQ(lineage_spawn_machine(parent, other_blueprint, &other),
+            CRABS_SUCCESS);
+  ASSERT_NE(other, nullptr);
+  EXPECT_EQ(parent->child_count, 2u);
+
+  // Dissolve both through the direct handler (post-auth idiom).
+  operation_t* dissolve_receiver = make_handler_shell_op(
+      CRABS_LINEAGE_OP_DISSOLVE,
+      (const uint8_t*)"child-delegated", strlen("child-delegated"));
+  ASSERT_NE(dissolve_receiver, nullptr);
+  EXPECT_EQ(lineage_op_dissolve(parent, dissolve_receiver), CRABS_SUCCESS);
+  release_handler_shell_op(dissolve_receiver);
+  operation_t* dissolve_other = make_handler_shell_op(
+      CRABS_LINEAGE_OP_DISSOLVE, (const uint8_t*)"child-other",
+      strlen("child-other"));
+  ASSERT_NE(dissolve_other, nullptr);
+  EXPECT_EQ(lineage_op_dissolve(parent, dissolve_other), CRABS_SUCCESS);
+  release_handler_shell_op(dissolve_other);
+
+  // Honestly-signed tombstones for both children.
+  uint8_t self_tombstone[CRABS_DISSOLUTION_WIRE_MAX];
+  size_t self_tombstone_len = 0;
+  ASSERT_EQ(lineage_dissolution_serialize(parent, "child-delegated",
+                                          self_tombstone,
+                                          sizeof(self_tombstone),
+                                          &self_tombstone_len), CRABS_SUCCESS);
+  uint8_t other_tombstone[CRABS_DISSOLUTION_WIRE_MAX];
+  size_t other_tombstone_len = 0;
+  ASSERT_EQ(lineage_dissolution_serialize(parent, "child-other",
+                                          other_tombstone,
+                                          sizeof(other_tombstone),
+                                          &other_tombstone_len), CRABS_SUCCESS);
+
+  // Simulate the child operator's node again: the in-process severance is
+  // not observable there, so the receiver accepts delivery candidates.
+  receiver->base_state.lineage_parent_dissolved = false;
+
+  // (1) Tampered signature: one flipped signature bit and the parent's
+  // proof is gone — refused, flag stays false.
+  uint8_t tampered[CRABS_DISSOLUTION_WIRE_MAX];
+  memcpy(tampered, self_tombstone, self_tombstone_len);
+  tampered[self_tombstone_len - 1] ^= 0x01;
+  operation_t* forged = make_handler_shell_op(
+      CRABS_LINEAGE_OP_RECEIVE_DISSOLUTION, tampered, self_tombstone_len);
+  ASSERT_NE(forged, nullptr);
+  EXPECT_EQ(lineage_op_receive_dissolution(&receiver->base_state, forged),
+            CRABS_ERR_CRYPTOGRAPHIC_ERROR);
+  release_handler_shell_op(forged);
+  EXPECT_FALSE(receiver->base_state.lineage_parent_dissolved);
+
+  // (2) Misaddressed tombstone: honestly signed by the parent, but it names
+  // a different machine — refused before any state changes.
+  operation_t* misaddressed = make_handler_shell_op(
+      CRABS_LINEAGE_OP_RECEIVE_DISSOLUTION, other_tombstone,
+      other_tombstone_len);
+  ASSERT_NE(misaddressed, nullptr);
+  EXPECT_EQ(lineage_op_receive_dissolution(&receiver->base_state,
+                                           misaddressed),
+            CRABS_ERR_INVALID_PARAM);
+  release_handler_shell_op(misaddressed);
+  EXPECT_FALSE(receiver->base_state.lineage_parent_dissolved);
+
+  // (3) Unbound machine: never spawned, so it carries no parent public key
+  // — nothing can be verified against, delivery refused outright.
+  ecdsa_keypair_t* stray_key = crypto_ecdsa_generate();
+  ASSERT_NE(stray_key, nullptr);
+  attribute_machine_t* stray =
+      attribute_machine_create("stray-root", stray_key->public_key);
+  ASSERT_NE(stray, nullptr);
+  stray->base_state.attr_machine = stray;
+  lineage_install(&stray->base_state);
+  operation_t* to_stray = make_handler_shell_op(
+      CRABS_LINEAGE_OP_RECEIVE_DISSOLUTION, self_tombstone,
+      self_tombstone_len);
+  ASSERT_NE(to_stray, nullptr);
+  EXPECT_EQ(lineage_op_receive_dissolution(&stray->base_state, to_stray),
+            CRABS_ERR_UNAUTHORIZED);
+  release_handler_shell_op(to_stray);
+  EXPECT_FALSE(stray->base_state.lineage_parent_dissolved);
+
+  crypto_ecdsa_keypair_destroy(stray_key);
+  attribute_machine_destroy(stray);
+  attribute_machine_destroy(receiver);
+  attribute_machine_destroy(other);
+  machine_blueprint_destroy(receiver_blueprint);
+  machine_blueprint_destroy(other_blueprint);
   spawn_parent_destroy(&harness);
 }
 

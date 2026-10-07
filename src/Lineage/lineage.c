@@ -1,6 +1,9 @@
 //
 // Lineage (v1.7: machines mint machines) — blueprint data layer:
-// create/destroy, append helpers, and full structural validation.
+// create/destroy, append helpers, and full structural validation, plus the
+// lineage ops (__spawn_machine__ / __revoke_attestation__ /
+// __dissolve_machine__ / __withdraw_genesis__ / __receive_dissolution__)
+// registered on a machine by lineage_install.
 //
 // Error mapping (crabs.h has no policy-specific enumerator, so the nearest
 // real ones carry the semantics):
@@ -1222,7 +1225,8 @@ crabs_error_e lineage_spawn_machine(state_t* parent,
 }
 
 // ============================================================
-// Lineage ops: spawn / revoke attestation / dissolve / withdraw
+// Lineage ops: spawn / revoke attestation / dissolve / withdraw /
+// receive dissolution
 // ============================================================
 
 // Handlers run POST-authorization (dispatched by state_machine_execute after
@@ -1456,10 +1460,13 @@ void lineage_install(state_t* state) {
   state_register_op_type_def(state, CRABS_LINEAGE_OP_DISSOLVE, &no_dedup);
   state_register_op_type_def(state, CRABS_LINEAGE_OP_WITHDRAW_GENESIS,
                              &no_dedup);
+  state_register_op_type_def(state, CRABS_LINEAGE_OP_RECEIVE_DISSOLUTION,
+                             &no_dedup);
   state_add_policy(state, CRABS_LINEAGE_OP_SPAWN, "role:admin");
   state_add_policy(state, CRABS_LINEAGE_OP_REVOKE_ATTESTATION, "role:admin");
   state_add_policy(state, CRABS_LINEAGE_OP_DISSOLVE, "role:admin");
   state_add_policy(state, CRABS_LINEAGE_OP_WITHDRAW_GENESIS, "role:admin");
+  state_add_policy(state, CRABS_LINEAGE_OP_RECEIVE_DISSOLUTION, "role:admin");
   state_machine_register_handler(state, CRABS_LINEAGE_OP_SPAWN,
                                  lineage_op_spawn);
   state_machine_register_handler(state, CRABS_LINEAGE_OP_REVOKE_ATTESTATION,
@@ -1468,6 +1475,47 @@ void lineage_install(state_t* state) {
                                  lineage_op_dissolve);
   state_machine_register_handler(state, CRABS_LINEAGE_OP_WITHDRAW_GENESIS,
                                  lineage_op_withdraw_genesis);
+  state_machine_register_handler(state, CRABS_LINEAGE_OP_RECEIVE_DISSOLUTION,
+                                 lineage_op_receive_dissolution);
+}
+
+// Canonical tombstone body: `u8 tag (= LINEAGE_DISSOLVED) + string16
+// child_id` (string length EXCLUDES the NUL). The single writer behind
+// lineage_sign_dissolution / lineage_dissolution_serialize /
+// lineage_op_receive_dissolution, so delivery bytes can never drift from
+// signing bytes. Worst case 3 + (CRABS_MAX_USER_ID - 1) = 66 bytes.
+static bool _lineage_tombstone_write_body(uint8_t* out, size_t cap,
+                                          size_t* offset_out,
+                                          const char* child_id) {
+  size_t offset = 0;
+  if (cap < 1) return false;
+  out[offset++] = (uint8_t)LINEAGE_DISSOLVED;
+  // strlen + 1 is the string's real capacity here — the writer asserts the
+  // field is NUL-terminated within it; the emitted length excludes the NUL.
+  if (!_lineage_string16_write(out, cap, &offset, child_id,
+                               strlen(child_id) + 1)) {
+    return false;
+  }
+  *offset_out = offset;
+  return true;
+}
+
+// Honest-tombstone gate shared by the signing surfaces: resolve the manifest
+// entry, enforce the honesty gate (a tombstone proves a dissolution — never
+// sign one for a child that is not dissolved), and require a usable node key.
+static crabs_error_e _lineage_dissolved_entry(state_t* parent,
+                                              const char* child_id) {
+  if (!attribute_machine_is_safe_user_id(child_id)) {
+    return CRABS_ERR_INVALID_PARAM;
+  }
+  const child_manifest_entry_t* manifest_entry =
+      lineage_find_manifest_entry(parent, child_id);
+  if (manifest_entry == NULL) return CRABS_ERR_RESOURCE_NOT_FOUND;
+  if (manifest_entry->status != LINEAGE_DISSOLVED) {
+    return CRABS_ERR_UNAUTHORIZED;
+  }
+  if (!parent->node_key_valid) return CRABS_ERR_CRYPTOGRAPHIC_ERROR;
+  return CRABS_SUCCESS;
 }
 
 // Off-chain dissolution proof: ECDSA over the canonical tombstone
@@ -1479,30 +1527,106 @@ crabs_error_e lineage_sign_dissolution(state_t* parent, const char* child_id,
   if (parent == NULL || child_id == NULL || signature_out == NULL) {
     return CRABS_ERR_INVALID_PARAM;
   }
-  if (!attribute_machine_is_safe_user_id(child_id)) {
-    return CRABS_ERR_INVALID_PARAM;
-  }
-  const child_manifest_entry_t* manifest_entry =
-      lineage_find_manifest_entry(parent, child_id);
-  if (manifest_entry == NULL) return CRABS_ERR_RESOURCE_NOT_FOUND;
-  // Honesty gate: a tombstone proves a dissolution — never sign one for a
-  // child that is not dissolved.
-  if (manifest_entry->status != LINEAGE_DISSOLVED) {
-    return CRABS_ERR_UNAUTHORIZED;
-  }
-  if (!parent->node_key_valid) return CRABS_ERR_CRYPTOGRAPHIC_ERROR;
+  crabs_error_e status = _lineage_dissolved_entry(parent, child_id);
+  if (status != CRABS_SUCCESS) return status;
 
   uint8_t tombstone[1 + 2 + CRABS_MAX_USER_ID];
-  size_t offset = 0;
-  tombstone[offset++] = (uint8_t)LINEAGE_DISSOLVED;
-  if (!_lineage_string16_write(tombstone, sizeof(tombstone), &offset,
-                               child_id, strlen(child_id) + 1)) {
+  size_t tombstone_len = 0;
+  if (!_lineage_tombstone_write_body(tombstone, sizeof(tombstone),
+                                     &tombstone_len, child_id)) {
     return CRABS_ERR_INVALID_PARAM;
   }
-  if (crypto_ecdsa_sign(parent->node_private_key, tombstone, offset,
+  if (crypto_ecdsa_sign(parent->node_private_key, tombstone, tombstone_len,
                         signature_out) != CRABS_SUCCESS) {
     return CRABS_ERR_CRYPTOGRAPHIC_ERROR;
   }
+  return CRABS_SUCCESS;
+}
+
+// Tombstone wire image for transport (see lineage.h): canonical body +
+// signature appended, no length prefix.
+crabs_error_e lineage_dissolution_serialize(state_t* parent,
+                                            const char* child_id,
+                                            uint8_t* out_buf, size_t buf_len,
+                                            size_t* out_len) {
+  if (parent == NULL || child_id == NULL || out_buf == NULL ||
+      out_len == NULL) {
+    return CRABS_ERR_INVALID_PARAM;
+  }
+  crabs_error_e status = _lineage_dissolved_entry(parent, child_id);
+  if (status != CRABS_SUCCESS) return status;
+
+  size_t body_len = 0;
+  if (!_lineage_tombstone_write_body(out_buf, buf_len, &body_len, child_id) ||
+      buf_len - body_len < CRABS_SIG_SIZE) {
+    return CRABS_ERR_INVALID_PARAM;
+  }
+  if (crypto_ecdsa_sign(parent->node_private_key, out_buf, body_len,
+                        out_buf + body_len) != CRABS_SUCCESS) {
+    return CRABS_ERR_CRYPTOGRAPHIC_ERROR;
+  }
+  *out_len = body_len + CRABS_SIG_SIZE;
+  return CRABS_SUCCESS;
+}
+
+// Tombstone delivery on the child (see lineage.h for the authenticity model
+// and the full refusal table). The payload is the wire image the parent's
+// lineage_dissolution_serialize produced; the trailing CRABS_SIG_SIZE bytes
+// are the signature over the body prefix.
+crabs_error_e lineage_op_receive_dissolution(state_t* state, operation_t* op) {
+  if (state == NULL || op == NULL || op->payload == NULL) {
+    return CRABS_ERR_INVALID_PARAM;
+  }
+  // Size window: a 1-character id is the smallest honest tombstone
+  // (3 + 1 + CRABS_SIG_SIZE); a safe id tops out at CRABS_MAX_USER_ID - 1
+  // characters (it must keep room for its NUL).
+  size_t tombstone_min = 3 + 1 + CRABS_SIG_SIZE;
+  size_t tombstone_max = 3 + (CRABS_MAX_USER_ID - 1) + CRABS_SIG_SIZE;
+  if (op->payload_size < tombstone_min || op->payload_size > tombstone_max) {
+    return CRABS_ERR_INVALID_PARAM;
+  }
+  // An unbound machine carries no parent binding — and therefore no parent
+  // public key to verify the tombstone against. Refuse outright.
+  if (!state->lineage_parent_bound) {
+    return CRABS_ERR_UNAUTHORIZED;
+  }
+  // Idempotency: a re-delivery cannot re-sever or undo anything.
+  if (state->lineage_parent_dissolved) {
+    return CRABS_ERR_ALREADY_PERFORMED;
+  }
+
+  size_t body_len = op->payload_size - CRABS_SIG_SIZE;
+  const uint8_t* signature = op->payload + body_len;
+
+  // Parse the tombstone's subject before spending verification work: the tag
+  // must name a dissolution and the child_id must name THIS machine.
+  if (op->payload[0] != (uint8_t)LINEAGE_DISSOLVED) {
+    return CRABS_ERR_INVALID_PARAM;
+  }
+  size_t offset = 1;
+  char tombstone_child_id[CRABS_MAX_USER_ID];
+  if (!_lineage_string16_read(op->payload, body_len, &offset,
+                              tombstone_child_id, sizeof(tombstone_child_id)) ||
+      offset != body_len) {
+    return CRABS_ERR_INVALID_PARAM;
+  }
+  if (strcmp(tombstone_child_id, state->lineage_self_id) != 0) {
+    return CRABS_ERR_INVALID_PARAM;
+  }
+
+  // Authenticity rests on the tombstone's own parent signature — NOT on the
+  // op's signature or attestations: the pipeline already authorized the
+  // child admin (carriage), this ECDSA proves the parent decided (content).
+  if (!crypto_ecdsa_verify(state->lineage_parent_public_key, op->payload,
+                           body_len, signature)) {
+    return CRABS_ERR_CRYPTOGRAPHIC_ERROR;
+  }
+
+  state->lineage_parent_dissolved = true;
+  state_notify_change(state, CRABS_CHANGE_LINEAGE,
+                      CRABS_LINEAGE_OP_RECEIVE_DISSOLUTION, op->uuid,
+                      op->signer_id, op->node_id, tombstone_child_id,
+                      "dissolution received", CRABS_SUCCESS);
   return CRABS_SUCCESS;
 }
 
