@@ -54,6 +54,15 @@ protected:
     mod_queue->value = mq_set;
     state_add_item(state, mod_queue);
 
+    // Add an OR-Set member containing a DOUBLE SPACE, so a test can observe
+    // whether policy preprocessing rewrites whitespace inside quoted string
+    // literals (it must not — literals are compared verbatim).
+    data_item_t* spaced_members = data_item_create("spaced_members", DATA_TYPE_SET, CRDT_OR_SET);
+    or_set_t* spaced_set = or_set_create();
+    or_set_add(spaced_set, "a  b", "nodeA:1");
+    spaced_members->value = spaced_set;
+    state_add_item(state, spaced_members);
+
     // Add a counter for BETWEEN tests
     data_item_t* likes = data_item_create("likes", DATA_TYPE_COUNTER, CRDT_G_COUNTER);
     g_counter_t* likes_gc = g_counter_create();
@@ -917,6 +926,18 @@ TEST_F(TestCondition, TestPreprocessParentEndorsementMixedWithConditionGrammar) 
   EXPECT_EQ(result.parent_endorsement_count, 1u);
   EXPECT_STREQ(result.parent_endorsements[0], "role:writer");
   EXPECT_STREQ(result.abe_policy, "video_abc >= 5");
+}
+
+TEST_F(TestCondition, TestPreprocessParentQuotedLiteralWhitespacePreserved) {
+  // Endorsement extraction collapses whitespace in the remainder — but not
+  // inside a quoted string literal: the literal is compared verbatim against
+  // CRDT set members ("a  b" carries a double space), and rewriting it would
+  // silently break the CONTAINS match (resolved_ok false → denied op).
+  auto result = preprocess_policy(
+      "@parent/role:writer AND spaced_members CONTAINS \"a  b\"",
+      state, "alice");
+  EXPECT_TRUE(result.resolved_ok);
+  EXPECT_EQ(result.parent_endorsement_count, 1u);
 }
 
 TEST_F(TestCondition, TestPreprocessParentMalformedTokensFailClosed) {

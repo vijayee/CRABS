@@ -1324,14 +1324,21 @@ static bool _word_is_boolean_operator(const char* s) {
 }
 
 // Collapse every whitespace run in `s` to a single space and trim the ends,
-// in place. Policies never carry literal multi-space meaning, and token
-// extraction can leave irregular spacing behind.
+// in place. Whitespace inside a quoted string literal is PRESERVED — string
+// literals in CONTAINS value lists are compared verbatim against CRDT set
+// members, so rewriting them could silently change which elements match.
 static void _collapse_whitespace(char* s) {
   size_t read_index = 0;
   size_t write_index = 0;
   size_t length = strlen(s);
+  bool inside_string_literal = false;
   while (read_index < length) {
-    if (isspace((unsigned char)s[read_index])) {
+    if (s[read_index] == '"') {
+      inside_string_literal = !inside_string_literal;
+      s[write_index++] = s[read_index++];
+      continue;
+    }
+    if (!inside_string_literal && isspace((unsigned char)s[read_index])) {
       while (read_index < length &&
              isspace((unsigned char)s[read_index])) {
         read_index++;
