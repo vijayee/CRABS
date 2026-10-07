@@ -14,6 +14,9 @@ extern "C" {
 #include "../src/CRABS/crabs.h"
 #include "../src/Attribute/attribute_machine.h"
 #include "../src/Crypto/crypto.h"
+#include "../src/StateMachine/state_machine.h"
+#include "../src/Serialization/serialization.h"
+#include "test_helpers.h"
 }
 
 // ============================================================
@@ -508,4 +511,251 @@ TEST(TestLineage, ManifestEntryTypeLayout) {
   EXPECT_STREQ(entry.child_id, "child-red");
   EXPECT_EQ(entry.mode, LINEAGE_DELEGATED_COPY);
   EXPECT_EQ(entry.status, LINEAGE_ACTIVE);
+}
+// ============================================================
+// Authorization pipeline: @parent/ endorsement enforcement
+// ============================================================
+
+#include <ctime>
+
+// A child machine (NOT spawned — spawn lands later) with:
+//   - an attribute machine whose user "alice" has a legacy ECDSA key;
+//   - the policy "@parent/role:writer" on __check_dedup__ (auth-only op:
+//     state_machine_validate exercises the full authorization pipeline).
+// The correct parent key and an impostor key are pre-generated so each test
+// can bind/fabricate attestations independently.
+typedef struct {
+  state_t*            child_state;
+  attribute_machine_t* am;
+  ecdsa_keypair_t*    alice_key;
+  ecdsa_keypair_t*    parent_key;
+  ecdsa_keypair_t*    impostor_key;
+} endorsement_harness_t;
+
+static void endorsement_harness_setup(endorsement_harness_t* harness) {
+  memset(harness, 0, sizeof(*harness));
+  harness->child_state = state_create();
+  ASSERT_NE(harness->child_state, nullptr);
+  harness->alice_key = crypto_ecdsa_generate();
+  ASSERT_NE(harness->alice_key, nullptr);
+  uint8_t admin_pk[33];
+  memset(admin_pk, 0xAA, 33);
+  admin_pk[0] = 0x02;
+  harness->am = attribute_machine_create("admin", admin_pk);
+  ASSERT_NE(harness->am, nullptr);
+  ASSERT_EQ(crabs_test_register_user_with_role(
+      harness->am, "alice", harness->alice_key->public_key, "role", "admin"),
+      CRABS_SUCCESS);
+  harness->child_state->attr_machine = harness->am;
+  ASSERT_EQ(state_add_policy(harness->child_state, CRABS_OP_CHECK_DEDUP,
+                             "@parent/role:writer"), CRABS_SUCCESS);
+  harness->parent_key = crypto_ecdsa_generate();
+  ASSERT_NE(harness->parent_key, nullptr);
+  harness->impostor_key = crypto_ecdsa_generate();
+  ASSERT_NE(harness->impostor_key, nullptr);
+}
+
+static void endorsement_harness_destroy(endorsement_harness_t* harness) {
+  harness->child_state->attr_machine = NULL;
+  state_destroy(harness->child_state);
+  attribute_machine_destroy(harness->am);
+  crypto_ecdsa_keypair_destroy(harness->alice_key);
+  crypto_ecdsa_keypair_destroy(harness->parent_key);
+  crypto_ecdsa_keypair_destroy(harness->impostor_key);
+}
+
+// Bind the child state to a parent: public key + self id + bound flag. This
+// is the in-memory shape spawn will produce (spawn itself is a later task).
+static void bind_child_to_parent(state_t* child_state,
+                                 const ecdsa_keypair_t* parent_key,
+                                 const char* parent_id,
+                                 const char* child_id) {
+  memcpy(child_state->lineage_parent_public_key, parent_key->public_key, 33);
+  strncpy(child_state->lineage_parent_id, parent_id,
+          sizeof(child_state->lineage_parent_id) - 1);
+  strncpy(child_state->lineage_self_id, child_id,
+          sizeof(child_state->lineage_self_id) - 1);
+  child_state->lineage_parent_bound = true;
+}
+
+// Attestation signed by whatever key the harness state carries.
+static void issue_attestation(ecdsa_keypair_t* signing_key,
+                              const char* child_id, const char* user_id,
+                              const char* attributes,
+                              attestation_t* attestation_out) {
+  state_t* signing_state = state_create();
+  ASSERT_NE(signing_state, nullptr);
+  ASSERT_EQ(state_set_node_key(signing_state, signing_key->private_key,
+                               signing_key->public_key), CRABS_SUCCESS);
+  // The pipeline reads the machine's own authenticated clock; with no time
+  // source configured it falls back to the system clock — use a wide,
+  // system-anchored window so the test does not depend on clock granularity.
+  uint64_t now_ms = (uint64_t)time(NULL) * 1000ULL;
+  ASSERT_EQ(attestation_create(signing_state, attestation_out, "parent-root",
+                               child_id, user_id, attributes,
+                               now_ms - 60000, now_ms + 3600000),
+            CRABS_SUCCESS);
+  state_destroy(signing_state);
+}
+
+static operation_t* make_signed_dedup_check_op(endorsement_harness_t* harness) {
+  operation_t* op = operation_create(CRABS_OP_CHECK_DEDUP);
+  memset(op->uuid, 0x42, CRABS_UUID_SIZE);
+  strncpy(op->signer_id, "alice", CRABS_MAX_USER_ID - 1);
+  user_t* signer = attribute_machine_find_user(harness->am, "alice");
+  if (signer != NULL) op->signer_key_version = signer->key_version;
+  op->lamport_time = 1;
+  serialized_buffer_t* ser = crabs_serialize_for_signing(op);
+  EXPECT_NE(ser, nullptr);
+  if (ser == NULL) {
+    operation_destroy(op);
+    return NULL;
+  }
+  EXPECT_EQ(crypto_sign_operation(harness->alice_key->private_key,
+                                  ser->data, ser->len, op->signature),
+            CRABS_SUCCESS);
+  serialized_buffer_destroy(ser);
+  return op;
+}
+
+static void attach_attestation(operation_t* op, const attestation_t* att) {
+  op->attestations = (attestation_t*)malloc(sizeof(attestation_t));
+  ASSERT_NE(op->attestations, nullptr);
+  op->attestations[0] = *att;
+  op->attestation_count = 1;
+}
+
+TEST(TestLineage, UnboundMachineFailsClosedOnEndorsementPolicy) {
+  // A machine that was never spawned has no parent binding — an endorsement
+  // policy can neither fail open nor be satisfied by any attestation.
+  endorsement_harness_t harness;
+  endorsement_harness_setup(&harness);
+  operation_t* op = make_signed_dedup_check_op(&harness);
+  attestation_t attestation;
+  issue_attestation(harness.parent_key, "child-red", "alice",
+                    "role:writer", &attestation);
+  attach_attestation(op, &attestation);
+
+  EXPECT_EQ(state_machine_validate(harness.child_state, op),
+            CRABS_ERR_UNAUTHORIZED);
+
+  operation_destroy(op);
+  endorsement_harness_destroy(&harness);
+}
+
+TEST(TestLineage, AttestationSignedByWrongParentFailsClosed) {
+  endorsement_harness_t harness;
+  endorsement_harness_setup(&harness);
+  bind_child_to_parent(harness.child_state, harness.parent_key,
+                       "parent-root", "child-red");
+  operation_t* op = make_signed_dedup_check_op(&harness);
+
+  // Fabricated: signed by a key that is NOT the machine's parent.
+  attestation_t forged;
+  issue_attestation(harness.impostor_key, "child-red", "alice",
+                    "role:writer", &forged);
+  attach_attestation(op, &forged);
+  EXPECT_EQ(state_machine_validate(harness.child_state, op),
+            CRABS_ERR_UNAUTHORIZED);
+
+  // Right parent key but naming a DIFFERENT child.
+  operation_t* wrong_child_op = make_signed_dedup_check_op(&harness);
+  attestation_t wrong_child;
+  issue_attestation(harness.parent_key, "child-blue", "alice",
+                    "role:writer", &wrong_child);
+  attach_attestation(wrong_child_op, &wrong_child);
+  EXPECT_EQ(state_machine_validate(harness.child_state, wrong_child_op),
+            CRABS_ERR_UNAUTHORIZED);
+
+  operation_destroy(op);
+  operation_destroy(wrong_child_op);
+  endorsement_harness_destroy(&harness);
+}
+
+TEST(TestLineage, AttestationForWrongUserOrAttributesFailsClosed) {
+  endorsement_harness_t harness;
+  endorsement_harness_setup(&harness);
+  bind_child_to_parent(harness.child_state, harness.parent_key,
+                       "parent-root", "child-red");
+
+  // Attestation names a different user than the op's signer.
+  operation_t* wrong_user_op = make_signed_dedup_check_op(&harness);
+  attestation_t wrong_user;
+  issue_attestation(harness.parent_key, "child-red", "bob", "role:writer",
+                    &wrong_user);
+  attach_attestation(wrong_user_op, &wrong_user);
+  EXPECT_EQ(state_machine_validate(harness.child_state, wrong_user_op),
+            CRABS_ERR_UNAUTHORIZED);
+  operation_destroy(wrong_user_op);
+
+  // Attestation for the right user but an attribute list that does not
+  // cover the endorsement.
+  operation_t* unrelated_attrs_op = make_signed_dedup_check_op(&harness);
+  attestation_t unrelated_attrs;
+  issue_attestation(harness.parent_key, "child-red", "alice", "role:reader",
+                    &unrelated_attrs);
+  attach_attestation(unrelated_attrs_op, &unrelated_attrs);
+  EXPECT_EQ(state_machine_validate(harness.child_state, unrelated_attrs_op),
+            CRABS_ERR_UNAUTHORIZED);
+  operation_destroy(unrelated_attrs_op);
+
+  // No attestation at all.
+  operation_t* no_attestation_op = make_signed_dedup_check_op(&harness);
+  EXPECT_EQ(state_machine_validate(harness.child_state, no_attestation_op),
+            CRABS_ERR_UNAUTHORIZED);
+  operation_destroy(no_attestation_op);
+
+  endorsement_harness_destroy(&harness);
+}
+
+TEST(TestLineage, MatchingAttestationAuthorizesEndorsementPolicy) {
+  endorsement_harness_t harness;
+  endorsement_harness_setup(&harness);
+  bind_child_to_parent(harness.child_state, harness.parent_key,
+                       "parent-root", "child-red");
+  operation_t* op = make_signed_dedup_check_op(&harness);
+
+  attestation_t attestation;
+  issue_attestation(harness.parent_key, "child-red", "alice", "role:writer",
+                    &attestation);
+  attach_attestation(op, &attestation);
+  EXPECT_EQ(state_machine_validate(harness.child_state, op), CRABS_SUCCESS);
+
+  // A comma-separated attribute list covers the endorsement when it
+  // CONTAINS the exact attribute among several.
+  operation_t* covered_among_many = make_signed_dedup_check_op(&harness);
+  attestation_t multi;
+  issue_attestation(harness.parent_key, "child-red", "alice",
+                    "dept:red,role:writer,custody:video", &multi);
+  attach_attestation(covered_among_many, &multi);
+  EXPECT_EQ(state_machine_validate(harness.child_state, covered_among_many),
+            CRABS_SUCCESS);
+
+  operation_destroy(op);
+  operation_destroy(covered_among_many);
+  endorsement_harness_destroy(&harness);
+}
+
+TEST(TestLineage, UnsignedModeBOpRejectedOnEndorsementPolicy) {
+  // Mode B (anonymous op, empty signer_id) cannot resolve an attested user:
+  // trial verification only identifies the signers of registered users, and
+  // the endorsement pipeline requires an attestation naming the resolved
+  // signer. Fail closed BEFORE any signature work.
+  endorsement_harness_t harness;
+  endorsement_harness_setup(&harness);
+  bind_child_to_parent(harness.child_state, harness.parent_key,
+                       "parent-root", "child-red");
+
+  operation_t* op = operation_create(CRABS_OP_CHECK_DEDUP);
+  memset(op->uuid, 0x42, CRABS_UUID_SIZE);
+  ASSERT_NE(op, nullptr);
+  attestation_t attestation;
+  issue_attestation(harness.parent_key, "child-red", "alice", "role:writer",
+                    &attestation);
+  attach_attestation(op, &attestation);
+  EXPECT_EQ(state_machine_validate(harness.child_state, op),
+            CRABS_ERR_UNAUTHORIZED);
+
+  operation_destroy(op);
+  endorsement_harness_destroy(&harness);
 }

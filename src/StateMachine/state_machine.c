@@ -9,6 +9,7 @@
 #include "../Crypto/sig_scheme.h"
 #include "../Attribute/attribute_machine.h"
 #include "../Condition/condition.h"
+#include "../Lineage/lineage.h"
 #include "../Serialization/serialization.h"
 #include "../Dedup/dedup.h"
 #include "../OT/ot_execution.h"
@@ -20,6 +21,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
+#include <ctype.h>
 #include <time.h>
 #include <openssl/rand.h>
 #include <openssl/crypto.h>
@@ -615,6 +617,96 @@ static crabs_error_e _validate_received_hlc(state_t* state, const operation_t* o
 // Mode B (anonymous ops) it is the user the trial verification matched —
 // the key-version gates in steps 6/6b must run against this resolved
 // signer, because op->signer_id is empty there.
+// v1.7 §attestation bridge: does the attestation's comma-separated
+// attributes list contain the endorsement attribute EXACTLY? Direct string
+// membership only — v1 evaluates no boolean logic over attested attributes
+// (attribute "dept:red" attested ⇔ endorsement "@parent/dept:red" matched).
+static bool _attestation_covers(const attestation_t* attestation,
+                                const char* endorsement) {
+  if (attestation == NULL || endorsement[0] == '\0') return false;
+  size_t endorsement_len = strlen(endorsement);
+
+  const char* list_cursor = attestation->attributes;
+  while (*list_cursor != '\0') {
+    const char* element_end = strchr(list_cursor, ',');
+    size_t element_len = (element_end != NULL)
+        ? (size_t)(element_end - list_cursor) : strlen(list_cursor);
+    // Trim the element's surrounding whitespace before comparing.
+    while (element_len > 0 && isspace((unsigned char)list_cursor[0])) {
+      list_cursor++;
+      element_len--;
+    }
+    while (element_len > 0 &&
+           isspace((unsigned char)list_cursor[element_len - 1])) {
+      element_len--;
+    }
+    if (element_len == endorsement_len &&
+        strncmp(list_cursor, endorsement, element_len) == 0) {
+      return true;
+    }
+    if (element_end == NULL) break;
+    list_cursor = element_end + 1;
+  }
+  return false;
+}
+
+// v1.7 §attestation bridge: resolve the @parent/ endorsements extracted
+// from the policy against the attestations the op carries. Runs only AFTER
+// the op's own signature verified (the signer is resolved). Fail closed:
+//   - a machine with no parent binding (never spawned) cannot satisfy ANY
+//     endorsement — endorsement policies deny on an unbound machine even
+//     when the op carries attestations;
+//   - each endorsement needs ONE attestation that verifies against the
+//     machine's parent public key, names THIS machine
+//     (child_id == lineage_self_id), sits inside its validity window, names
+//     the RESOLVED signer as its attested user, and whose attested
+//     attributes cover the endorsement exactly;
+//   - Mode B (anonymous ops, empty signer_id) never gets this far: trial
+//     verification cannot bind an attestation to a resolved user, so an
+//     endorsement-bearing policy is rejected before signature work.
+// Every missing/invalid/unverified condition collapses to
+// CRABS_ERR_UNAUTHORIZED — no fail-open path.
+static crabs_error_e _verify_parent_endorsements(
+    state_t* state, const operation_t* op,
+    const policy_preprocess_result_t* pp, const char* resolved_signer) {
+  if (!state->lineage_parent_bound) {
+    return CRABS_ERR_UNAUTHORIZED;
+  }
+
+  uint64_t now_ms;
+  if (!state_get_time_ms(state, &now_ms)) {
+    return CRABS_ERR_CRYPTOGRAPHIC_ERROR;
+  }
+
+  for (uint32_t endorsement_index = 0;
+       endorsement_index < pp->parent_endorsement_count; endorsement_index++) {
+    const char* endorsement =
+        pp->parent_endorsements[endorsement_index];
+    bool satisfied = false;
+    for (uint32_t attestation_index = 0;
+         attestation_index < op->attestation_count; attestation_index++) {
+      const attestation_t* attestation =
+          &op->attestations[attestation_index];
+      if (!attestation_verify(state->lineage_parent_public_key,
+                              state->lineage_self_id, attestation, now_ms)) {
+        continue;
+      }
+      if (strcmp(attestation->user_id, resolved_signer) != 0) {
+        continue;
+      }
+      if (!_attestation_covers(attestation, endorsement)) {
+        continue;
+      }
+      satisfied = true;
+      break;
+    }
+    if (!satisfied) {
+      return CRABS_ERR_UNAUTHORIZED;
+    }
+  }
+  return CRABS_SUCCESS;
+}
+
 static crabs_error_e _verify_operation_authorization(state_t* state, const operation_t* op,
                                                      policy_preprocess_result_t* pp_out,
                                                      char* resolved_signer_out) {
@@ -630,6 +722,15 @@ static crabs_error_e _verify_operation_authorization(state_t* state, const opera
   // Resolve CONTAINS operators and {user_id} placeholders in the policy.
   policy_preprocess_result_t pp = preprocess_policy(policy, state, op->signer_id);
   if (!pp.resolved_ok) {
+    return CRABS_ERR_UNAUTHORIZED;
+  }
+
+  // v1.7 §attestation bridge: endorsement-bearing policies REQUIRE an
+  // explicit signer. Mode B resolves the user only by trial-verification
+  // against every registered user, while an attestation names a fixed
+  // user_id — the two can never be soundly matched, so an anonymous op on
+  // an endorsement policy is rejected here, before any signature work.
+  if (pp.parent_endorsement_count > 0 && op->signer_id[0] == '\0') {
     return CRABS_ERR_UNAUTHORIZED;
   }
 
@@ -668,6 +769,16 @@ static crabs_error_e _verify_operation_authorization(state_t* state, const opera
 
   strncpy(resolved_signer_out, vr.signer_id, CRABS_MAX_USER_ID - 1);
   resolved_signer_out[CRABS_MAX_USER_ID - 1] = '\0';
+
+  // v1.7 §attestation bridge: every @parent/ endorsement extracted from the
+  // policy must be covered by a verified op attestation.
+  if (pp.parent_endorsement_count > 0) {
+    crabs_error_e endorsement_rc = _verify_parent_endorsements(
+        state, op, &pp, resolved_signer_out);
+    if (endorsement_rc != CRABS_SUCCESS) {
+      return endorsement_rc;
+    }
+  }
 
   *pp_out = pp;
   return CRABS_SUCCESS;

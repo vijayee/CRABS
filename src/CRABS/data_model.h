@@ -411,6 +411,12 @@ typedef struct state_t {
   char    lineage_parent_id[CRABS_MAX_USER_ID];
   uint8_t lineage_parent_public_key[33];
   bool    lineage_parent_bound;
+  // v1.7: THIS machine's own id when spawned — the child_id an attestation
+  // resolved against this machine must name. Empty for a root (never-spawned)
+  // machine, which cannot resolve endorsements at all. Set at spawn time
+  // together with the parent binding above; persists in the same v11
+  // parent-binding block.
+  char    lineage_self_id[CRABS_MAX_USER_ID];
   // v1.5.2 §4: Compaction config (crabs_tombstone_config_t*). Externally owned
   // — the caller must free it after state_destroy.
   void* compaction_config;
