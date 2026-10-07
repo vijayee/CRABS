@@ -2114,3 +2114,23 @@ TEST(TestLineage, FindManifestEntryResolvesById) {
   machine_blueprint_destroy(blueprint);
   spawn_parent_destroy(&harness);
 }
+
+// ============================================================
+// Enum name helpers (single source for CLI / wasm / devtools)
+// ============================================================
+
+TEST(TestLineage, ModeNameCoversEveryEnumValue) {
+  EXPECT_STREQ(lineage_mode_name(LINEAGE_SHARED_ROOT), "shared_root");
+  EXPECT_STREQ(lineage_mode_name(LINEAGE_DELEGATED_COPY), "delegated_copy");
+  EXPECT_STREQ(lineage_mode_name(LINEAGE_SOVEREIGN), "sovereign");
+  EXPECT_STREQ(lineage_mode_name((lineage_trust_mode_e)0x42), "unknown");
+}
+
+TEST(TestLineage, StatusNameCoversEveryEnumValue) {
+  EXPECT_STREQ(lineage_status_name(LINEAGE_ACTIVE), "active");
+  EXPECT_STREQ(lineage_status_name(LINEAGE_DISSOLVED), "dissolved");
+  EXPECT_STREQ(lineage_status_name(LINEAGE_WITHDRAWN), "withdrawn");
+  EXPECT_STREQ(lineage_status_name(LINEAGE_ATTESTATION_REVOKED),
+               "attestation_revoked");
+  EXPECT_STREQ(lineage_status_name((lineage_status_e)0x2A), "unknown");
+}

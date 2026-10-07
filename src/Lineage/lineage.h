@@ -237,6 +237,13 @@ uint32_t lineage_query_children(const state_t* state,
 child_manifest_entry_t* lineage_find_manifest_entry(const state_t* state,
                                                     const char* child_id);
 
+// Human-readable names for the lineage enums — the single source for every
+// surface that renders lineage data humanly (CLI `machine children`, wasm
+// devtools, the devtools snapshot JSON). Values outside the enum return
+// "unknown".
+const char* lineage_mode_name(lineage_trust_mode_e mode);
+const char* lineage_status_name(lineage_status_e status);
+
 // ============================================================
 // Lineage ops: spawn / revoke attestation / dissolve / withdraw via the
 // operation pipeline

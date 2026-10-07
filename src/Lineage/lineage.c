@@ -1293,6 +1293,29 @@ child_manifest_entry_t* lineage_find_manifest_entry(const state_t* state,
   return NULL;
 }
 
+// ============================================================
+// Enum name helpers (single source for CLI / wasm / devtools)
+// ============================================================
+
+const char* lineage_mode_name(lineage_trust_mode_e mode) {
+  switch (mode) {
+    case LINEAGE_SHARED_ROOT:    return "shared_root";
+    case LINEAGE_DELEGATED_COPY: return "delegated_copy";
+    case LINEAGE_SOVEREIGN:      return "sovereign";
+    default:                     return "unknown";
+  }
+}
+
+const char* lineage_status_name(lineage_status_e status) {
+  switch (status) {
+    case LINEAGE_ACTIVE:              return "active";
+    case LINEAGE_DISSOLVED:           return "dissolved";
+    case LINEAGE_WITHDRAWN:           return "withdrawn";
+    case LINEAGE_ATTESTATION_REVOKED: return "attestation_revoked";
+    default:                          return "unknown";
+  }
+}
+
 crabs_error_e lineage_op_spawn(state_t* state, operation_t* op) {
   if (state == NULL || op == NULL || op->payload == NULL ||
       op->payload_size == 0) {
