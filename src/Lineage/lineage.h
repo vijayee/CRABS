@@ -168,12 +168,24 @@ machine_blueprint_t* blueprint_deserialize(const uint8_t* buf, size_t len);
 
 // Key transition record. Canonical body (the signed material):
 //   tag(3) = 'P','K','T'  +  u64le new_key_version  +  new_pk(33)
-//   +  old_pk(33)  +  child_id (string16 — the CHILD machine this record
-//   targets; the accepting machine requires it to equal its lineage_self_id)
+//   +  old_pk(33)  +  parent_id (string16 — the PARENT machine this record
+//   names; one record serves every child of that parent. The accepting
+//   machine requires it to equal its lineage_parent_id)
+//   +  u64le created_at (informational issue timestamp — never validated;
+//   the chain's forward-only version is the ordering authority, so 0 is a
+//   legitimate value)
 // Full record = body + signature(64) over the body, made with the old_pk
 // private key (continuity proof: only the superseded key may retire itself).
 // string16 = u16le byte length + bytes WITHOUT the trailing NUL.
-#define LINEAGE_KEY_TRANSITION_BODY_MAX (3 + 8 + 33 + 33 + 2 + CRABS_MAX_USER_ID)
+//
+// Why parent_id and not child_id: replay of the same record across many
+// children is the FEATURE — the parent mints ONE record and broadcasts it;
+// per-child binding would force the parent to mint and stash a separate
+// record per spawned child. Per-child idempotency comes from the accept
+// gates: once a child has accepted a record, the version-forward-only and
+// pk-already-known checks refuse re-acceptance of the same record.
+#define LINEAGE_KEY_TRANSITION_BODY_MAX \
+  (3 + 8 + 33 + 33 + 2 + CRABS_MAX_USER_ID + 8)
 #define LINEAGE_KEY_TRANSITION_WIRE_MAX \
   (LINEAGE_KEY_TRANSITION_BODY_MAX + CRABS_SIG_SIZE)
 
@@ -188,12 +200,14 @@ machine_blueprint_t* blueprint_deserialize(const uint8_t* buf, size_t len);
 // stash it as lineage_last_key_transition for re-emission. Bumps the state's
 // lineage_key_version (0, the spawn generation, counts as
 // CRABS_LINEAGE_KEY_VERSION_START) and binds the record to the new value.
-// The record's child_id is filled with this machine's v1 lineage identity
-// (config.bootstrap_admin). NOTE on targeting: the single-record stash +
-// child_id == lineage_self_id acceptance gate means a stashed record is
-// honoured by exactly the machines whose lineage_self_id equals that
-// identity; per-child emission is the __parent_key_update__ op's concern
-// (child accept is the authority on admission — see below).
+// The record's parent_id names THIS machine in the lineage namespace: its
+// lineage_self_id when set (a spawned parent), else its v1 root identity
+// (config.bootstrap_admin — the same parent_id string attestations carry).
+// One record serves every child of this parent; the broadcast/re-emission
+// channel is the __parent_key_update__ op's concern (child accept is the
+// authority on admission — see below).
+// now_ms is written into the record's created_at field (informational only;
+// never validated).
 // Does NOT install the new key — the caller pairs this with
 // state_set_node_key AFTER this call.
 // transition_out is caller-owned (get_clear_memory); NULL on any failure
@@ -208,7 +222,7 @@ crabs_error_e lineage_key_rotate(state_t* parent_state,
 // Child side: ingest a transition record (wire bytes; see the layout above).
 // Refusals (fail-closed, no partial mutation):
 //   - NULL inputs, malformed/truncated record, trailing garbage, wrong tag,
-//     non-canonical child_id, or a child_id != lineage_self_id
+//     non-canonical parent_id, or a parent_id != lineage_parent_id
 //       → CRABS_ERR_INVALID_PARAM
 //   - machine not bound to a parent, or lineage dissolved
 //       → CRABS_ERR_UNAUTHORIZED

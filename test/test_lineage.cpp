@@ -2872,14 +2872,16 @@ TEST(TestLineage, StatusNameCoversEveryEnumValue) {
 // Parent key chain (A10-M6): rotate / accept / verify
 // ============================================================
 //
-// The transition record's child_id is the id of the machine it targets. The
-// rotate API emits the rotating machine's v1 lineage identity
-// (config.bootstrap_admin — the same string children persist as
-// lineage_parent_id and attestations carry as parent_id), while acceptance
-// compares the field against the receiving machine's lineage_self_id; the
-// API-level fixtures below wire the two to the same id, exactly as the
-// task's hand-built child states permit (spawn stamps the real chain in the
-// v13 wire task).
+// The transition record's string16 names the PARENT machine (parent_id). The
+// rotate API emits the rotating machine's lineage_self_id when set, else its
+// v1 root identity (config.bootstrap_admin — the same string attestations
+// carry and children persist as lineage_parent_id). Acceptance compares the
+// field against the receiving machine's lineage_parent_id, so ONE record
+// serves every child of that parent (replay across children is the feature;
+// per-child idempotency comes from the version-forward-only + pk-already-
+// known gates). The API-level fixtures below wire the rotating parent to
+// "parent-red" and bind children to that id (spawn stamps the real chain in
+// the v13 wire task).
 
 typedef struct {
   state_t*         parent_state;   // rotating machine (signer), node key k1
@@ -2891,11 +2893,13 @@ typedef struct {
 
 // Build a bound child state with chain[0] = {CRABS_LINEAGE_KEY_VERSION_START,
 // spawn_pin_public_key} by hand (spawn will stamp this at spawn time in the
-// wire-format task; the API-level tests only need the chain shape).
+// wire-format task; the API-level tests only need the chain shape). The
+// child's parent_id ("parent-red") is what the rotate record names — the
+// accept gate compares the record's string16 against lineage_parent_id.
 static void keychain_bind_child(state_t* child_state,
                                 const uint8_t spawn_pin_public_key[33]) {
   memcpy(child_state->lineage_parent_public_key, spawn_pin_public_key, 33);
-  strncpy(child_state->lineage_parent_id, "child-red",
+  strncpy(child_state->lineage_parent_id, "parent-red",
           sizeof(child_state->lineage_parent_id) - 1);
   strncpy(child_state->lineage_self_id, "child-red",
           sizeof(child_state->lineage_self_id) - 1);
@@ -2924,9 +2928,9 @@ static void keychain_harness_setup(keychain_harness_t* harness) {
   ASSERT_EQ(state_set_node_key(harness->parent_state,
                                harness->k1->private_key,
                                harness->k1->public_key), CRABS_SUCCESS);
-  // The rotate record names this id in its child_id field (see the section
-  // comment above).
-  strncpy(harness->parent_state->config.bootstrap_admin, "child-red",
+  // A root parent has no lineage_self_id, so the rotate record falls back to
+  // its bootstrap_admin (the same id children persist as lineage_parent_id).
+  strncpy(harness->parent_state->config.bootstrap_admin, "parent-red",
           sizeof(harness->parent_state->config.bootstrap_admin) - 1);
 
   harness->child_state = state_create();
@@ -2945,11 +2949,12 @@ static void keychain_harness_destroy(keychain_harness_t* harness) {
 // Hand-craft a key transition record (wire image: canonical body + a
 // signature over the body made with signing_private_key). Lets the rejection
 // tests produce structurally valid-but-wrong records the rotate API could
-// never emit (bad version continuity, wrong target, forged signer).
+// never emit (bad version continuity, wrong parent_id, forged signer).
+// created_at is written as 0 — the accept gates never read it.
 static size_t keychain_make_record(uint64_t new_key_version,
                                    const uint8_t new_public_key[33],
                                    const uint8_t old_public_key[33],
-                                   const char* child_id,
+                                   const char* parent_id,
                                    const uint8_t signing_private_key[32],
                                    uint8_t* out, size_t out_capacity) {
   size_t offset = 0;
@@ -2964,11 +2969,15 @@ static size_t keychain_make_record(uint64_t new_key_version,
   offset += 33;
   memcpy(out + offset, old_public_key, 33);
   offset += 33;
-  uint16_t id_len = (uint16_t)strlen(child_id);
+  uint16_t id_len = (uint16_t)strlen(parent_id);
   out[offset++] = (uint8_t)(id_len & 0xFF);
   out[offset++] = (uint8_t)(id_len >> 8);
-  memcpy(out + offset, child_id, id_len);
+  memcpy(out + offset, parent_id, id_len);
   offset += id_len;
+  for (int byte_index = 0; byte_index < 8; byte_index++) {
+    out[offset + byte_index] = 0;  // created_at = 0 (informational)
+  }
+  offset += 8;
   EXPECT_LE(offset + CRABS_SIG_SIZE, out_capacity);
   EXPECT_EQ(crypto_ecdsa_sign(signing_private_key, out, offset, out + offset),
             CRABS_SUCCESS);
@@ -3048,6 +3057,136 @@ TEST(TestLineage, KeyChainRotateAppendsAndStashes) {
   keychain_harness_destroy(&harness);
 }
 
+// Replay-across-children: ONE record minted by the parent is honored by EVERY
+// child bound to that parent_id. Per-child idempotency then refuses a second
+// delivery of the SAME record (version-forward-only gate).
+TEST(TestLineage, KeyChainRecordServesAllChildrenOfOneParent) {
+  keychain_harness_t harness;
+  keychain_harness_setup(&harness);
+
+  // A second child bound to the SAME parent (same lineage_parent_id, same
+  // spawn pin) — distinct lineage_self_id is irrelevant to the accept gate.
+  state_t* second_child = state_create();
+  ASSERT_NE(second_child, nullptr);
+  keychain_bind_child(second_child, harness.k1->public_key);
+  strncpy(second_child->lineage_self_id, "child-blue",
+          sizeof(second_child->lineage_self_id) - 1);
+
+  // The parent mints ONE record.
+  uint8_t* record = nullptr;
+  size_t record_len = 0;
+  ASSERT_EQ(lineage_key_rotate(harness.parent_state,
+                               harness.k2->private_key, harness.k2->public_key,
+                               1700000000000ULL, &record, &record_len),
+            CRABS_SUCCESS);
+
+  // created_at is bound into the body (informational; never validated).
+  const size_t body_len = record_len - CRABS_SIG_SIZE;
+  uint64_t recorded_at = 0;
+  for (int byte_index = 0; byte_index < 8; byte_index++) {
+    recorded_at |= ((uint64_t)record[body_len - 8 + byte_index])
+                   << (byte_index * 8);
+  }
+  EXPECT_EQ(recorded_at, 1700000000000ULL);
+
+  // BOTH children accept the SAME record — this is the broadcast feature.
+  ASSERT_EQ(lineage_child_accept_key_transition(harness.child_state, record,
+                                                record_len),
+            CRABS_SUCCESS);
+  ASSERT_EQ(lineage_child_accept_key_transition(second_child, record,
+                                                record_len),
+            CRABS_SUCCESS);
+  EXPECT_EQ(harness.child_state->lineage_key_chain_count, 2u);
+  EXPECT_EQ(second_child->lineage_key_chain_count, 2u);
+
+  // Re-acceptance on EITHER child is refused (per-child idempotency): the
+  // version is no longer max+1 and the public key is already in the chain.
+  EXPECT_EQ(lineage_child_accept_key_transition(harness.child_state, record,
+                                                record_len),
+            CRABS_ERR_INVALID_PARAM);
+  EXPECT_EQ(lineage_child_accept_key_transition(second_child, record,
+                                                record_len),
+            CRABS_ERR_INVALID_PARAM);
+  EXPECT_EQ(harness.child_state->lineage_key_chain_count, 2u);
+  EXPECT_EQ(second_child->lineage_key_chain_count, 2u);
+
+  // A machine bound to a DIFFERENT parent refuses the record outright: its
+  // lineage_parent_id fails the strcmp gate before any verification.
+  state_t* foreign_child = state_create();
+  ASSERT_NE(foreign_child, nullptr);
+  memcpy(foreign_child->lineage_parent_public_key, harness.k1->public_key, 33);
+  strncpy(foreign_child->lineage_parent_id, "someone-else",
+          sizeof(foreign_child->lineage_parent_id) - 1);
+  strncpy(foreign_child->lineage_self_id, "child-green",
+          sizeof(foreign_child->lineage_self_id) - 1);
+  foreign_child->lineage_parent_bound = true;
+  foreign_child->lineage_key_chain = (lineage_key_chain_entry_t*)calloc(
+      1, sizeof(lineage_key_chain_entry_t));
+  ASSERT_NE(foreign_child->lineage_key_chain, nullptr);
+  foreign_child->lineage_key_chain[0].key_version =
+      CRABS_LINEAGE_KEY_VERSION_START;
+  memcpy(foreign_child->lineage_key_chain[0].public_key,
+         harness.k1->public_key, 33);
+  foreign_child->lineage_key_chain_count = 1;
+  EXPECT_EQ(lineage_child_accept_key_transition(foreign_child, record,
+                                                record_len),
+            CRABS_ERR_INVALID_PARAM);
+  EXPECT_EQ(foreign_child->lineage_key_chain_count, 1u);
+
+  free(record);
+  state_destroy(foreign_child);
+  state_destroy(second_child);
+  keychain_harness_destroy(&harness);
+}
+
+// A spawned parent names its OWN lineage_self_id (NOT a child's, NOT its
+// bootstrap_admin) in the transition record. Only children bound to that id
+// accept; children who still carry the pre-spawn bootstrap id refuse.
+TEST(TestLineage, KeyChainRotatePrefersLineageSelfIdOverBootstrap) {
+  keychain_harness_t harness;
+  keychain_harness_setup(&harness);
+
+  // Mark the rotating machine as itself a spawned child upstream.
+  strncpy(harness.parent_state->lineage_self_id, "self-red",
+          sizeof(harness.parent_state->lineage_self_id) - 1);
+
+  uint8_t* record = nullptr;
+  size_t record_len = 0;
+  ASSERT_EQ(lineage_key_rotate(harness.parent_state,
+                               harness.k2->private_key, harness.k2->public_key,
+                               0, &record, &record_len),
+            CRABS_SUCCESS);
+
+  // A child bound to the SELF id accepts the record.
+  state_t* bound_to_self = state_create();
+  ASSERT_NE(bound_to_self, nullptr);
+  memcpy(bound_to_self->lineage_parent_public_key, harness.k1->public_key, 33);
+  strncpy(bound_to_self->lineage_parent_id, "self-red",
+          sizeof(bound_to_self->lineage_parent_id) - 1);
+  bound_to_self->lineage_parent_bound = true;
+  bound_to_self->lineage_key_chain = (lineage_key_chain_entry_t*)calloc(
+      1, sizeof(lineage_key_chain_entry_t));
+  ASSERT_NE(bound_to_self->lineage_key_chain, nullptr);
+  bound_to_self->lineage_key_chain[0].key_version =
+      CRABS_LINEAGE_KEY_VERSION_START;
+  memcpy(bound_to_self->lineage_key_chain[0].public_key,
+         harness.k1->public_key, 33);
+  bound_to_self->lineage_key_chain_count = 1;
+  EXPECT_EQ(lineage_child_accept_key_transition(bound_to_self, record,
+                                                record_len),
+            CRABS_SUCCESS);
+
+  // The harness's default child (still bound to the bootstrap admin id
+  // "parent-red") refuses — its lineage_parent_id no longer matches.
+  EXPECT_EQ(lineage_child_accept_key_transition(harness.child_state, record,
+                                                record_len),
+            CRABS_ERR_INVALID_PARAM);
+
+  free(record);
+  state_destroy(bound_to_self);
+  keychain_harness_destroy(&harness);
+}
+
 TEST(TestLineage, KeyChainRotateRefusesBadInputs) {
   keychain_harness_t harness;
   keychain_harness_setup(&harness);
@@ -3107,7 +3246,7 @@ TEST(TestLineage, KeyChainRollbackAndGapRejected) {
   // Replay: the spawn pin's own generation is already the chain maximum.
   size_t replay_len = keychain_make_record(
       CRABS_LINEAGE_KEY_VERSION_START, k3->public_key,
-      harness.k1->public_key, "child-red", harness.k1->private_key,
+      harness.k1->public_key, "parent-red", harness.k1->private_key,
       record, sizeof(record));
   EXPECT_EQ(lineage_child_accept_key_transition(harness.child_state, record,
                                                 replay_len),
@@ -3116,7 +3255,7 @@ TEST(TestLineage, KeyChainRollbackAndGapRejected) {
   // Gap: version 3 when the chain maximum is 1 (versions must advance by
   // exactly one).
   size_t gap_len = keychain_make_record(3, k3->public_key,
-                                        harness.k1->public_key, "child-red",
+                                        harness.k1->public_key, "parent-red",
                                         harness.k1->private_key,
                                         record, sizeof(record));
   EXPECT_EQ(lineage_child_accept_key_transition(harness.child_state, record,
@@ -3125,24 +3264,26 @@ TEST(TestLineage, KeyChainRollbackAndGapRejected) {
 
   // Key already known: a fresh version naming an existing chain key.
   size_t known_len = keychain_make_record(2, harness.k1->public_key,
-                                          harness.k1->public_key, "child-red",
+                                          harness.k1->public_key, "parent-red",
                                           harness.k1->private_key,
                                           record, sizeof(record));
   EXPECT_EQ(lineage_child_accept_key_transition(harness.child_state, record,
                                                 known_len),
             CRABS_ERR_INVALID_PARAM);
 
-  // Wrong target: a validly-signed record naming a DIFFERENT child.
-  size_t wrong_child_len = keychain_make_record(
-      2, harness.k2->public_key, harness.k1->public_key, "child-blue",
+  // Wrong parent: a record minted by parent P but DELIVERED to a machine
+  // whose lineage_parent_id is "someone-else" — refused as targeting a
+  // different parent identity.
+  size_t wrong_parent_len = keychain_make_record(
+      2, harness.k2->public_key, harness.k1->public_key, "someone-else",
       harness.k1->private_key, record, sizeof(record));
   EXPECT_EQ(lineage_child_accept_key_transition(harness.child_state, record,
-                                                wrong_child_len),
+                                                wrong_parent_len),
             CRABS_ERR_INVALID_PARAM);
 
   // Wrong tag.
   size_t bad_tag_len = keychain_make_record(
-      2, harness.k2->public_key, harness.k1->public_key, "child-red",
+      2, harness.k2->public_key, harness.k1->public_key, "parent-red",
       harness.k1->private_key, record, sizeof(record));
   record[0] = 'X';
   EXPECT_EQ(lineage_child_accept_key_transition(harness.child_state, record,
@@ -3153,7 +3294,7 @@ TEST(TestLineage, KeyChainRollbackAndGapRejected) {
   // Continuity proof: old_pk names no chain entry, so nothing can verify the
   // signature (forged by a foreign key).
   size_t forged_len = keychain_make_record(
-      2, harness.k2->public_key, harness.foreign->public_key, "child-red",
+      2, harness.k2->public_key, harness.foreign->public_key, "parent-red",
       harness.foreign->private_key, record, sizeof(record));
   EXPECT_EQ(lineage_child_accept_key_transition(harness.child_state, record,
                                                 forged_len),
@@ -3162,7 +3303,7 @@ TEST(TestLineage, KeyChainRollbackAndGapRejected) {
   // A genuine record signed by the chain key is accepted — establishing that
   // the refusals above were about the record, not the machinery.
   size_t good_len = keychain_make_record(
-      2, harness.k2->public_key, harness.k1->public_key, "child-red",
+      2, harness.k2->public_key, harness.k1->public_key, "parent-red",
       harness.k1->private_key, record, sizeof(record));
   ASSERT_EQ(lineage_child_accept_key_transition(harness.child_state, record,
                                                 good_len),
@@ -3184,7 +3325,7 @@ TEST(TestLineage, KeyChainAcceptRefusesUnboundOrDissolvedChild) {
 
   uint8_t record[LINEAGE_KEY_TRANSITION_WIRE_MAX];
   size_t record_len = keychain_make_record(
-      2, harness.k2->public_key, harness.k1->public_key, "child-red",
+      2, harness.k2->public_key, harness.k1->public_key, "parent-red",
       harness.k1->private_key, record, sizeof(record));
 
   // Unbound: no chain exists to advance.
@@ -3235,7 +3376,7 @@ TEST(TestLineage, KeyChainCapacityRefusesNinthEntry) {
   // chain[0] = the spawn pin under k1.
   ASSERT_EQ(state_set_node_key(parent, keys[0]->private_key,
                              keys[0]->public_key), CRABS_SUCCESS);
-  strncpy(parent->config.bootstrap_admin, "child-red",
+  strncpy(parent->config.bootstrap_admin, "parent-red",
           sizeof(parent->config.bootstrap_admin) - 1);
   keychain_bind_child(child, keys[0]->public_key);
 
@@ -3323,7 +3464,7 @@ TEST(TestLineage, KeyChainVerifyByAnyChainKey) {
   // attestations keep working, new ones land.
   uint8_t record[LINEAGE_KEY_TRANSITION_WIRE_MAX];
   size_t record_len = keychain_make_record(
-      2, harness.k2->public_key, harness.k1->public_key, "child-red",
+      2, harness.k2->public_key, harness.k1->public_key, "parent-red",
       harness.k1->private_key, record, sizeof(record));
   ASSERT_EQ(lineage_child_accept_key_transition(harness.child_state, record,
                                                 record_len),

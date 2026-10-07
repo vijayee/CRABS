@@ -1825,16 +1825,17 @@ crabs_error_e crabs_issue_attestation(state_t* parent,
 // (lineage_key_rotate) and verification re-canonicalization, so signed bytes
 // and verified bytes can never drift (lineage.h documents the layout):
 //   'P','K','T' + u64le new_key_version + new_pk(33) + old_pk(33)
-//   + string16 child_id
-// Returns bytes written, or 0 when cap is too small or child_id is not
+//   + string16 parent_id + u64le created_at
+// Returns bytes written, or 0 when cap is too small or parent_id is not
 // NUL-terminated (strlen + 1 fails closed like the tombstone writer).
 static size_t _lineage_key_transition_write_body(uint64_t new_key_version,
                                                  const uint8_t new_pk[33],
                                                  const uint8_t old_pk[33],
-                                                 const char* child_id,
+                                                 const char* parent_id,
+                                                 uint64_t created_at,
                                                  uint8_t* out, size_t cap) {
   size_t offset = 0;
-  if (cap < 3 + 8 + 33 + 33 + 2) return 0;
+  if (cap < 3 + 8 + 33 + 33 + 2 + 8) return 0;
   out[offset++] = 'P';
   out[offset++] = 'K';
   out[offset++] = 'T';
@@ -1844,10 +1845,12 @@ static size_t _lineage_key_transition_write_body(uint64_t new_key_version,
   offset += 33;
   memcpy(out + offset, old_pk, 33);
   offset += 33;
-  if (!_lineage_string16_write(out, cap, &offset, child_id,
-                               strlen(child_id) + 1)) {
+  if (!_lineage_string16_write(out, cap, &offset, parent_id,
+                               strlen(parent_id) + 1)) {
     return 0;
   }
+  _lineage_u64le_write(out + offset, created_at);
+  offset += 8;
   return offset;
 }
 
@@ -1857,10 +1860,6 @@ crabs_error_e lineage_key_rotate(state_t* parent_state,
                                  uint64_t now_ms,
                                  uint8_t** transition_out,
                                  size_t* transition_len) {
-  // now_ms is carried for API symmetry with the other lineage signing
-  // surfaces; the transition record carries no validity window (the chain's
-  // forward-only version is its ordering).
-  (void)now_ms;
   if (parent_state == NULL || new_private_key == NULL ||
       new_public_key == NULL || transition_out == NULL ||
       transition_len == NULL) {
@@ -1902,12 +1901,16 @@ crabs_error_e lineage_key_rotate(state_t* parent_state,
   if (current_key_version == UINT64_MAX) return CRABS_ERR_INVALID_PARAM;
   uint64_t new_key_version = current_key_version + 1;
 
-  // The record names the machine in the lineage namespace by its v1 identity.
-  const char* target_id = parent_state->config.bootstrap_admin;
+  // The record names the PARENT machine in the lineage namespace. A spawned
+  // parent carries its own lineage_self_id; a root machine falls back to its
+  // v1 bootstrap_admin identity (the same string attestations carry).
+  const char* parent_id = parent_state->lineage_self_id[0] != '\0'
+      ? parent_state->lineage_self_id
+      : parent_state->config.bootstrap_admin;
   uint8_t body[LINEAGE_KEY_TRANSITION_BODY_MAX];
   size_t body_len = _lineage_key_transition_write_body(
       new_key_version, new_public_key, parent_state->node_public_key,
-      target_id, body, sizeof(body));
+      parent_id, now_ms, body, sizeof(body));
   if (body_len == 0) return CRABS_ERR_INVALID_PARAM;
 
   size_t record_len = body_len + CRABS_SIG_SIZE;
@@ -1943,10 +1946,10 @@ crabs_error_e lineage_child_accept_key_transition(state_t* child_state,
                                                   const uint8_t* record,
                                                   size_t record_len) {
   if (child_state == NULL || record == NULL) return CRABS_ERR_INVALID_PARAM;
-  // Size window: the smallest honest record carries an empty child_id
-  // (body 79 bytes) plus the signature; the cap keeps a hostile payload from
-  // making the parser walk unbounded bytes.
-  if (record_len < 3 + 8 + 33 + 33 + 2 + CRABS_SIG_SIZE ||
+  // Size window: the smallest honest record carries an empty parent_id and a
+  // zero created_at (body 87 bytes) plus the signature; the cap keeps a
+  // hostile payload from making the parser walk unbounded bytes.
+  if (record_len < 3 + 8 + 33 + 33 + 2 + 8 + CRABS_SIG_SIZE ||
       record_len > LINEAGE_KEY_TRANSITION_WIRE_MAX) {
     return CRABS_ERR_INVALID_PARAM;
   }
@@ -1974,17 +1977,25 @@ crabs_error_e lineage_child_accept_key_transition(state_t* child_state,
   offset += 33;
   const uint8_t* old_public_key = record + offset;
   offset += 33;
-  char record_child_id[CRABS_MAX_USER_ID];
+  char record_parent_id[CRABS_MAX_USER_ID];
+  uint64_t created_at = 0;
   // Full-consumption parse: trailing garbage could smuggle aliasing bytes
-  // past the signature surface.
-  if (!_lineage_string16_read(record, body_len, &offset, record_child_id,
-                              sizeof(record_child_id)) ||
+  // past the signature surface. The trailing created_at is informational
+  // only (never fed into the accept gates — the version is the ordering
+  // authority); it lands here so a future surface can read it without
+  // re-canonicalizing.
+  if (!_lineage_string16_read(record, body_len, &offset, record_parent_id,
+                              sizeof(record_parent_id)) ||
+      !_lineage_u64le_read(record, body_len, &offset, &created_at) ||
       offset != body_len) {
     return CRABS_ERR_INVALID_PARAM;
   }
-  // The record targets exactly one machine — refuse records naming another
-  // before spending verification work (mirrors the tombstone child_id gate).
-  if (strcmp(record_child_id, child_state->lineage_self_id) != 0) {
+  (void)created_at;
+  // The record names the PARENT this machine is bound to — refuse records
+  // minted by/for a different parent before spending verification work
+  // (mirrors the tombstone child_id gate). One record serves every child of
+  // the named parent, so this is an identity check, not a per-record target.
+  if (strcmp(record_parent_id, child_state->lineage_parent_id) != 0) {
     return CRABS_ERR_INVALID_PARAM;
   }
   // Never install an off-curve key into the verification surface.
