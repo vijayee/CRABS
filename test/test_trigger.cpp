@@ -223,15 +223,28 @@ TEST_F(TestTrigger, TestChangePolicyRejectsEmptyAndBuiltinTargets) {
 // Regression for audit A10-M1: lineage op types are handler-registered
 // custom ops, so the builtin-only guard in the trigger engine did not stop
 // a CHANGE_POLICY effect from rewriting them. The lineage lifecycle must
-// stay admin-gated: a CHANGE_POLICY trigger targeting a lineage op is
-// rejected and the "role:admin" policy installed by lineage_install
-// survives unchanged.
+// stay admin-gated: a CHANGE_POLICY trigger targeting ANY of the five
+// lineage ops is rejected and the "role:admin" policy installed by
+// lineage_install survives unchanged.
 TEST_F(TestTrigger, TestChangePolicyRejectsLineageTargets) {
   lineage_install(state);
+
+  const char* lineage_operations[] = {
+    CRABS_LINEAGE_OP_SPAWN,
+    CRABS_LINEAGE_OP_REVOKE_ATTESTATION,
+    CRABS_LINEAGE_OP_DISSOLVE,
+    CRABS_LINEAGE_OP_WITHDRAW_GENESIS,
+    CRABS_LINEAGE_OP_RECEIVE_DISSOLUTION,
+  };
+  const size_t lineage_operation_count =
+    sizeof(lineage_operations) / sizeof(lineage_operations[0]);
+
   // Sanity: lineage_install registers the default admin-only policy.
-  const char* installed = state_find_policy(state, CRABS_LINEAGE_OP_SPAWN);
-  ASSERT_NE(installed, nullptr);
-  ASSERT_STREQ(installed, "role:admin");
+  for (size_t operation_index = 0; operation_index < lineage_operation_count; operation_index++) {
+    const char* installed = state_find_policy(state, lineage_operations[operation_index]);
+    ASSERT_NE(installed, nullptr) << lineage_operations[operation_index];
+    ASSERT_STREQ(installed, "role:admin") << lineage_operations[operation_index];
+  }
 
   data_item_t* views = data_item_create("views", DATA_TYPE_COUNTER, CRDT_G_COUNTER);
   g_counter_t* gc = g_counter_create();
@@ -239,25 +252,73 @@ TEST_F(TestTrigger, TestChangePolicyRejectsLineageTargets) {
   views->value = gc;
   state_add_item(state, views);
 
-  trigger_effect_t effect;
-  memset(&effect, 0, sizeof(effect));
-  effect.type = TRIGGER_EFFECT_CHANGE_POLICY;
-  strncpy(effect.policy_operation, CRABS_LINEAGE_OP_SPAWN, CRABS_MAX_OP_NAME - 1);
-  strncpy(effect.policy_expression, "role:member", CRABS_MAX_POLICY_EXPR - 1);
+  for (size_t operation_index = 0; operation_index < lineage_operation_count; operation_index++) {
+    trigger_effect_t effect;
+    memset(&effect, 0, sizeof(effect));
+    effect.type = TRIGGER_EFFECT_CHANGE_POLICY;
+    strncpy(effect.policy_operation, lineage_operations[operation_index], CRABS_MAX_OP_NAME - 1);
+    strncpy(effect.policy_expression, "role:member", CRABS_MAX_POLICY_EXPR - 1);
 
-  trigger_t* trigger = trigger_create("weaken_spawn", "Fires when views >= 50",
-    "views >= 50", &effect, 0, false, "admin");
-  ASSERT_NE(trigger, nullptr);
-  state->trigger_count = 1;
-  state->triggers = (trigger_t*)realloc(state->triggers, sizeof(trigger_t));
-  state->triggers[0] = *trigger;
-  free(trigger);
+    trigger_t* trigger = trigger_create("weaken_lineage", "Fires when views >= 50",
+      "views >= 50", &effect, 0, false, "admin");
+    ASSERT_NE(trigger, nullptr);
+    state->trigger_count = 1;
+    state->triggers = (trigger_t*)realloc(state->triggers, sizeof(trigger_t));
+    state->triggers[0] = *trigger;
+    free(trigger);
 
-  uint32_t fired = trigger_process_all(state, state->triggers, state->trigger_count, NULL, 1000);
-  EXPECT_EQ(fired, 0u); // rejected — lineage policy not changed
+    uint32_t fired = trigger_process_all(state, state->triggers, state->trigger_count, NULL, 1000);
+    EXPECT_EQ(fired, 0u) << lineage_operations[operation_index]; // rejected — lineage policy not changed
+    const char* policy = state_find_policy(state, lineage_operations[operation_index]);
+    ASSERT_NE(policy, nullptr) << lineage_operations[operation_index];
+    EXPECT_STREQ(policy, "role:admin") << lineage_operations[operation_index]; // surviving admin gate
+
+    // Clean up this trigger's AST before reusing the slot next iteration.
+    condition_node_destroy(state->triggers[0].condition_ast);
+    state->triggers[0].condition_ast = NULL;
+    state->trigger_count = 0;
+    free(state->triggers);
+    state->triggers = NULL;
+  }
+}
+
+// Regression for audit A10-M1: the operation_is_protected guard in
+// state_machine_op_define_operation must reject a
+// __define_operation_type__ op that targets a lineage op type — a
+// signer-chosen dedup spec must never stack on top of a lineage handler.
+// The dedup spec and admin policy installed by lineage_install must
+// survive unchanged.
+TEST_F(TestTrigger, TestDefineOperationRejectsLineageTarget) {
+  lineage_install(state);
+
+  operation_t* op = operation_create(CRABS_OP_DEFINE_OPERATION);
+  ASSERT_NE(op, nullptr);
+  memset(op->uuid, 0x01, CRABS_UUID_SIZE);
+  strncpy(op->signer_id, "admin", CRABS_MAX_USER_ID - 1);
+  op->lamport_time = 1;
+  // The operation type name being defined is carried in resources[0]
+  op->resource_count = 1;
+  op->resources = (char(*)[CRABS_MAX_USER_ID])malloc(CRABS_MAX_USER_ID);
+  strncpy(op->resources[0], CRABS_LINEAGE_OP_SPAWN, CRABS_MAX_USER_ID - 1);
+  op->dedup.type = DEDUP_PER_USER;
+  strncpy(op->dedup.tracker_path, "spawners", CRABS_MAX_DEDUP_PATH - 1);
+
+  crabs_error_e result = state_machine_op_define_operation(state, op);
+  EXPECT_EQ(result, CRABS_ERR_INVALID_PARAM);
+
+  // The spec lookup returns the DEDUP_NONE spec lineage_install registered
+  // — the rejected define must not have overwritten it.
+  const dedup_spec_t* spec = state_find_op_type_def(state, CRABS_LINEAGE_OP_SPAWN);
+  ASSERT_NE(spec, nullptr);
+  EXPECT_EQ(spec->type, DEDUP_NONE);
+  EXPECT_STREQ(spec->tracker_path, "");
+
+  // The admin-only policy is untouched.
   const char* policy = state_find_policy(state, CRABS_LINEAGE_OP_SPAWN);
   ASSERT_NE(policy, nullptr);
-  EXPECT_STREQ(policy, "role:admin"); // surviving admin gate
+  EXPECT_STREQ(policy, "role:admin");
+
+  operation_destroy(op);
 }
 
 TEST_F(TestTrigger, TestProcessTriggersConditionFalse) {
