@@ -115,6 +115,11 @@ cli_result_e cli_cmd_state_config(cli_node_t* node);
 // already authenticated.
 cli_result_e cli_cmd_state_accept_unverified(cli_node_t* node);
 
+// Durability (v10): re-enroll the snapshot's recorded bootstrap admin on a
+// legacy (pre-v10) load, where no user registry was serialized. No-op
+// (with a notice) when the machine already carries users.
+cli_result_e cli_cmd_machine_migrate(cli_node_t* node);
+
 // ============================================================
 // User Management
 // ============================================================

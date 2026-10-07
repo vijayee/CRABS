@@ -1132,3 +1132,77 @@ TEST(TestCliDurability, DispatchSealKeyImportBadFileFails) {
 
   cli_node_destroy(node);
 }
+
+// ============================================================
+// Durability (v10): v9->v10 migration. A legacy snapshot carries no user
+// registry, so loading it restores the substrate with an EMPTY registry —
+// the recorded bootstrap_admin id is the only trace of who held authority.
+// 'state migrate' re-enrolls that admin (the §8.3 genesis equivalent) so the
+// machine can execute admin operations again, and afterwards the machine can
+// be saved sealed and reloaded with the admin intact.
+// ============================================================
+
+TEST(TestCliDurability, MigrateRebuildsBootstrapAdminOnLegacyLoad) {
+  // 1. "Legacy" content: an unkeyed state whose config names an admin but
+  //    whose user registry is empty (what every pre-v10 file restores to).
+  state_t* legacy_state = state_create();
+  ASSERT_NE(legacy_state, nullptr);
+  strncpy(legacy_state->config.bootstrap_admin, "admin", CRABS_MAX_USER_ID - 1);
+  serialized_buffer_t* legacy_blob = crabs_serialize_state(legacy_state);
+  ASSERT_NE(legacy_blob, nullptr);
+  state_destroy(legacy_state);
+  ASSERT_TRUE(test_write_file_bytes("/tmp/crabs-legacy.crabs",
+      std::vector<uint8_t>(legacy_blob->data,
+                           legacy_blob->data + legacy_blob->len)));
+  serialized_buffer_destroy(legacy_blob);
+
+  // 2. Load it the way the loader handles empty-registry files: a bare state
+  //    wrapped in a fresh attribute machine with no users.
+  cli_node_t* node = cli_node_create();
+  ASSERT_NE(node, nullptr);
+  ASSERT_EQ(cli_node_load(node, "/tmp/crabs-legacy.crabs"), CLI_OK);
+  EXPECT_EQ(node->attr_machine->user_count, 0u);
+  ASSERT_EQ(attribute_machine_find_user(node->attr_machine, "admin"), nullptr)
+      << "legacy load must start with no restored users";
+
+  // 3. Migrate re-enrolls the bootstrap admin.
+  ASSERT_EQ(cli_cmd_machine_migrate(node), CLI_OK);
+  user_t* admin = attribute_machine_find_user(node->attr_machine, "admin");
+  ASSERT_NE(admin, nullptr);
+  EXPECT_EQ(admin->status, USER_ACTIVE);
+  EXPECT_TRUE(attribute_machine_user_has_role(admin, "role"));
+  EXPECT_EQ(admin->key_version, 1u);
+
+  // Migration is idempotent-gated: a machine that now carries users is a
+  // no-op.
+  EXPECT_EQ(cli_cmd_machine_migrate(node), CLI_OK);
+
+  // 4. Now save-able and durable: with a seal key the machine persists and
+  //    reloads WITH the admin intact (authority survives restart). The
+  //    legacy blob was unsigned, so the operator must acknowledge it first
+  //    (fail-loud provenance gate).
+  ASSERT_EQ(cli_cmd_state_accept_unverified(node), CLI_OK);
+  ASSERT_TRUE(_apply_test_seal_key(node));
+  ASSERT_EQ(cli_node_save(node, "/tmp/crabs-migrated.crabs"), CLI_OK);
+  cli_node_destroy(node);
+
+  cli_node_t* reloaded = cli_node_create();
+  ASSERT_NE(reloaded, nullptr);
+  const uint8_t test_seal_key[32] = {
+    1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,
+    17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32
+  };
+  char seal_hex[65];
+  cli_bytes_to_hex(test_seal_key, 32, seal_hex);
+  seal_hex[64] = '\0';
+  ASSERT_EQ(cli_node_load_sealed(reloaded, "/tmp/crabs-migrated.crabs",
+            seal_hex), CLI_OK);
+  admin = attribute_machine_find_user(reloaded->attr_machine, "admin");
+  ASSERT_NE(admin, nullptr);
+  EXPECT_EQ(admin->status, USER_ACTIVE);
+  EXPECT_TRUE(attribute_machine_user_has_role(admin, "role"));
+  cli_node_destroy(reloaded);
+
+  remove("/tmp/crabs-legacy.crabs");
+  remove("/tmp/crabs-migrated.crabs");
+}

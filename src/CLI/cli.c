@@ -614,6 +614,69 @@ cli_result_e cli_cmd_state_accept_unverified(cli_node_t* node) {
 }
 
 // ============================================================
+// Machine Migration (v9 -> v10)
+// ============================================================
+
+// Durability (v10): a legacy (pre-v10) snapshot carries no user registry,
+// so loading it restores the machine's substrate with an EMPTY registry —
+// the recorded bootstrap_admin id is the only trace of who held authority.
+// Re-run §8.3 genesis for that id: register the admin against the node's
+// live public key and award role:admin (key_version=1, ACTIVE).
+//
+// The role attribute is written the way attribute_machine_create's genesis
+// block writes it: register with NO initial attributes, then set "role:admin"
+// on the user directly. register_user's R7-08 gate rightly refuses to mint
+// privileged attributes from caller-supplied initial_attrs, and grant_role is
+// admin-gated — circular here, because the empty registry has no admin to
+// authorize the grant. Migration is the operator-commanded re-enrollment of
+// the bootstrap id the snapshot itself records (the same construction genesis
+// uses), not a caller minting privileges for an arbitrary user.
+cli_result_e cli_cmd_machine_migrate(cli_node_t* node) {
+  if (node == NULL || !node->initialized || node->attr_machine == NULL)
+    return CLI_ERR_NOT_INIT;
+  attribute_machine_t* am = node->attr_machine;
+
+  if (am->users != NULL) {
+    // A v10 file already carries its authority; migration is a no-op there.
+    printf("Machine already carries a user registry — nothing to migrate.\n");
+    return CLI_OK;
+  }
+  const char* admin_id = am->base_state.config.bootstrap_admin;
+  if (admin_id[0] == '\0') {
+    fprintf(stderr, "ERROR: state has no bootstrap_admin to re-enroll\n");
+    return CLI_ERR_EXEC;
+  }
+  if (!am->base_state.node_key_valid) {
+    fprintf(stderr,
+            "ERROR: state has no live node key to register the admin under\n");
+    return CLI_ERR_EXEC;
+  }
+
+  crabs_error_e err = attribute_machine_register_user(am, admin_id,
+                                                      am->base_state.node_public_key,
+                                                      "");
+  if (err != CRABS_SUCCESS) {
+    fprintf(stderr, "ERROR: re-enrolling bootstrap admin failed: %s\n",
+            cli_error_string(err));
+    return CLI_ERR_EXEC;
+  }
+  user_t* admin = attribute_machine_find_user(am, admin_id);
+  if (admin == NULL) {
+    fprintf(stderr, "ERROR: re-enrolled bootstrap admin not found\n");
+    return CLI_ERR_EXEC;
+  }
+  strncpy(admin->attributes[0].value, "role:admin", CRABS_MAX_POLICY_EXPR - 1);
+  strncpy(admin->attributes[0].verified_by, admin_id, CRABS_MAX_USER_ID - 1);
+  admin->attributes[0].verified_at = 0;
+  admin->attributes[0].expires_at = 0;
+  admin->attribute_count = 1;
+
+  printf("Migrated: bootstrap admin '%s' re-enrolled (key_version=%llu).\n",
+         admin_id, (unsigned long long)admin->key_version);
+  return CLI_OK;
+}
+
+// ============================================================
 // User Management
 // ============================================================
 
@@ -1175,6 +1238,7 @@ static void _print_state_usage(void) {
   printf("  state policies         List policies\n");
   printf("  state config           Show machine configuration\n");
   printf("  state accept-unverified  Acknowledge an unsigned (unauthenticated) snapshot\n");
+  printf("  state migrate           Re-enroll the bootstrap admin on a legacy (pre-v10) snapshot\n");
 }
 
 // Audit: mutating an unauthenticated (unsigned) snapshot is risky but
@@ -1376,6 +1440,7 @@ cli_result_e cli_dispatch(cli_node_t* node, int argc, char** argv) {
     if (strcmp(sub, "config") == 0)    return cli_cmd_state_config(node);
     if (strcmp(sub, "accept-unverified") == 0)
       return cli_cmd_state_accept_unverified(node);
+    if (strcmp(sub, "migrate") == 0) return cli_cmd_machine_migrate(node);
     printf("Unknown state subcommand: %s\n", sub);
     _print_state_usage();
     return CLI_ERR_ARGS;
