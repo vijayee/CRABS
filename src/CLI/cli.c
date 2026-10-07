@@ -636,6 +636,17 @@ cli_result_e cli_cmd_machine_migrate(cli_node_t* node) {
     return CLI_ERR_NOT_INIT;
   attribute_machine_t* am = node->attr_machine;
 
+  // Audit: parity with cli_node_save — an UNSIGNED snapshot's provenance is
+  // unauthenticated, and migration re-enrolls authority from it. Require an
+  // explicit acknowledgment before acting on it.
+  if (node->loaded_unauthenticated) {
+    fprintf(stderr,
+            "ERROR: refusing to migrate — the loaded state is "
+            "unauthenticated (unsigned snapshot); run 'state accept-unverified' "
+            "to acknowledge it first\n");
+    return CLI_ERR_EXEC;
+  }
+
   if (am->users != NULL) {
     // A v10 file already carries its authority; migration is a no-op there.
     printf("Machine already carries a user registry — nothing to migrate.\n");

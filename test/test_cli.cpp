@@ -501,6 +501,26 @@ static bool test_write_file_bytes(const char* path, const std::vector<uint8_t>& 
   return written == file_bytes.size();
 }
 
+// "Legacy" content: an unkeyed state whose config names an admin but whose
+// user registry is empty (what every pre-v10 file restores to). Serializes
+// the blob and writes it to the given path; returns false on any failure.
+static bool test_write_legacy_registry_blob(const char* state_file_path) {
+  state_t* legacy_state = state_create();
+  if (legacy_state == NULL) return false;
+  strncpy(legacy_state->config.bootstrap_admin, "admin", CRABS_MAX_USER_ID - 1);
+  serialized_buffer_t* legacy_blob = crabs_serialize_state(legacy_state);
+  if (legacy_blob == NULL) {
+    state_destroy(legacy_state);
+    return false;
+  }
+  state_destroy(legacy_state);
+  bool wrote = test_write_file_bytes(state_file_path,
+      std::vector<uint8_t>(legacy_blob->data,
+                           legacy_blob->data + legacy_blob->len));
+  serialized_buffer_destroy(legacy_blob);
+  return wrote;
+}
+
 TEST_F(TestCLI, SaveLoadSignedRoundTripAuthenticates) {
   ASSERT_EQ(cli_node_init(node, "admin"), CLI_OK);
   ASSERT_TRUE(_apply_test_seal_key(node));
@@ -1145,16 +1165,7 @@ TEST(TestCliDurability, DispatchSealKeyImportBadFileFails) {
 TEST(TestCliDurability, MigrateRebuildsBootstrapAdminOnLegacyLoad) {
   // 1. "Legacy" content: an unkeyed state whose config names an admin but
   //    whose user registry is empty (what every pre-v10 file restores to).
-  state_t* legacy_state = state_create();
-  ASSERT_NE(legacy_state, nullptr);
-  strncpy(legacy_state->config.bootstrap_admin, "admin", CRABS_MAX_USER_ID - 1);
-  serialized_buffer_t* legacy_blob = crabs_serialize_state(legacy_state);
-  ASSERT_NE(legacy_blob, nullptr);
-  state_destroy(legacy_state);
-  ASSERT_TRUE(test_write_file_bytes("/tmp/crabs-legacy.crabs",
-      std::vector<uint8_t>(legacy_blob->data,
-                           legacy_blob->data + legacy_blob->len)));
-  serialized_buffer_destroy(legacy_blob);
+  ASSERT_TRUE(test_write_legacy_registry_blob("/tmp/crabs-legacy.crabs"));
 
   // 2. Load it the way the loader handles empty-registry files: a bare state
   //    wrapped in a fresh attribute machine with no users.
@@ -1164,6 +1175,13 @@ TEST(TestCliDurability, MigrateRebuildsBootstrapAdminOnLegacyLoad) {
   EXPECT_EQ(node->attr_machine->user_count, 0u);
   ASSERT_EQ(attribute_machine_find_user(node->attr_machine, "admin"), nullptr)
       << "legacy load must start with no restored users";
+
+  // The legacy blob was unsigned, so the loader flags it unauthenticated and
+  // migrate (like save) refuses to act on it until the operator acknowledges
+  // the provenance explicitly (fail-loud gate, parity with cli_node_save).
+  EXPECT_TRUE(node->loaded_unauthenticated);
+  EXPECT_NE(cli_cmd_machine_migrate(node), CLI_OK);
+  ASSERT_EQ(cli_cmd_state_accept_unverified(node), CLI_OK);
 
   // 3. Migrate re-enrolls the bootstrap admin.
   ASSERT_EQ(cli_cmd_machine_migrate(node), CLI_OK);
@@ -1178,10 +1196,7 @@ TEST(TestCliDurability, MigrateRebuildsBootstrapAdminOnLegacyLoad) {
   EXPECT_EQ(cli_cmd_machine_migrate(node), CLI_OK);
 
   // 4. Now save-able and durable: with a seal key the machine persists and
-  //    reloads WITH the admin intact (authority survives restart). The
-  //    legacy blob was unsigned, so the operator must acknowledge it first
-  //    (fail-loud provenance gate).
-  ASSERT_EQ(cli_cmd_state_accept_unverified(node), CLI_OK);
+  //    reloads WITH the admin intact (authority survives restart).
   ASSERT_TRUE(_apply_test_seal_key(node));
   ASSERT_EQ(cli_node_save(node, "/tmp/crabs-migrated.crabs"), CLI_OK);
   cli_node_destroy(node);
@@ -1205,4 +1220,26 @@ TEST(TestCliDurability, MigrateRebuildsBootstrapAdminOnLegacyLoad) {
 
   remove("/tmp/crabs-legacy.crabs");
   remove("/tmp/crabs-migrated.crabs");
+}
+
+TEST(TestCliDurability, MigrateRefusesUnauthenticatedSnapshot) {
+  // Build the legacy-equivalent empty-registry blob (same fixture as the
+  // migrate test) and load it WITHOUT authentication.
+  ASSERT_TRUE(test_write_legacy_registry_blob("/tmp/crabs-unauth.crabs"));
+  cli_node_t* node = cli_node_create();
+  ASSERT_NE(node, nullptr);
+  ASSERT_EQ(cli_node_load(node, "/tmp/crabs-unauth.crabs"), CLI_OK);
+
+  // The unsigned snapshot path sets loaded_unauthenticated; migrate must
+  // refuse before accept-unverified (parity with cli_node_save).
+  EXPECT_TRUE(node->loaded_unauthenticated);
+  EXPECT_NE(cli_cmd_machine_migrate(node), CLI_OK);
+
+  // After acknowledgment, migration works.
+  ASSERT_EQ(cli_cmd_state_accept_unverified(node), CLI_OK);
+  ASSERT_EQ(cli_cmd_machine_migrate(node), CLI_OK);
+  ASSERT_NE(attribute_machine_find_user(node->attr_machine, "admin"), nullptr);
+
+  cli_node_destroy(node);
+  remove("/tmp/crabs-unauth.crabs");
 }
