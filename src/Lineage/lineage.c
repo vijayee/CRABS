@@ -268,6 +268,329 @@ void attestation_destroy(attestation_t* attestation) {
 }
 
 // ============================================================
+// Blueprint wire format: stamp / serialize / deserialize
+// ============================================================
+
+// Canonical blueprint body (EXACT layout, shared by hash stamping,
+// serialization, and deserialization so the three can never drift):
+//   u8 trust_mode; string16 child_id; string16 bootstrap_admin;
+//   u64le attestation_ttl_ms;
+//   u32le item_count;  per item: string16 name; u8 type; u8 crdt_type;
+//   u32le policy_count;  per policy: string16 operation; string16 expression;
+//   u32le op_type_def_count;  per def: string16 op_type; <dedup_spec>
+// <dedup_spec> (mirrors serialization.c _serialize_dedup_spec):
+//   u8 dedup type; string16 tracker_path; string16 flag_path;
+//   string16 condition; u8 update type; string16 update.set_path;
+//   string16 update.element_value; string16 update.flag_path;
+//   string16 update.counter_path; i64le update.delta;
+//   string16 update.target_path; string16 update.value;
+//   string16 rejection_message
+// The blueprint hash stamped on the wire is SHA-256 over EXACTLY these bytes.
+// Worst case 77271 bytes; the cap lives in lineage.h
+// (CRABS_BLUEPRINT_BODY_MAX) next to the wire cap layered on top of it.
+
+// Fixed-capacity structured fields (dedup paths, rejection message) copied
+// from hand-built structs may be filled to capacity with no NUL terminator —
+// that has no reproducible canonical image and fails closed, mirroring the
+// attestation body writer.
+static bool _blueprint_dedup_field_write(uint8_t* out, size_t cap,
+                                         size_t* offset, const char* field,
+                                         size_t field_capacity) {
+  if (strnlen(field, field_capacity) >= field_capacity) return false;
+  return _lineage_string16_write(out, cap, offset, field, field_capacity);
+}
+
+static bool _blueprint_dedup_spec_write(uint8_t* out, size_t cap,
+                                        size_t* offset,
+                                        const dedup_spec_t* spec) {
+  if (cap < *offset + 2) return false;
+  out[(*offset)++] = (uint8_t)spec->type;
+  bool written =
+      _blueprint_dedup_field_write(out, cap, offset, spec->tracker_path,
+                                   sizeof(spec->tracker_path)) &&
+      _blueprint_dedup_field_write(out, cap, offset, spec->flag_path,
+                                   sizeof(spec->flag_path)) &&
+      _blueprint_dedup_field_write(out, cap, offset, spec->condition,
+                                   sizeof(spec->condition));
+  if (!written) return false;
+  if (cap < *offset + 1) return false;
+  out[(*offset)++] = (uint8_t)spec->update.type;
+  written =
+      _blueprint_dedup_field_write(out, cap, offset, spec->update.set_path,
+                                   sizeof(spec->update.set_path)) &&
+      _blueprint_dedup_field_write(out, cap, offset, spec->update.element_value,
+                                   sizeof(spec->update.element_value)) &&
+      _blueprint_dedup_field_write(out, cap, offset, spec->update.flag_path,
+                                   sizeof(spec->update.flag_path)) &&
+      _blueprint_dedup_field_write(out, cap, offset, spec->update.counter_path,
+                                   sizeof(spec->update.counter_path));
+  if (!written) return false;
+  if (cap < *offset + 8) return false;
+  _lineage_u64le_write(out + *offset, (uint64_t)spec->update.delta);
+  *offset += 8;
+  written =
+      _blueprint_dedup_field_write(out, cap, offset, spec->update.target_path,
+                                   sizeof(spec->update.target_path)) &&
+      _blueprint_dedup_field_write(out, cap, offset, spec->update.value,
+                                   sizeof(spec->update.value)) &&
+      _blueprint_dedup_field_write(out, cap, offset, spec->rejection_message,
+                                   sizeof(spec->rejection_message));
+  return written;
+}
+
+static size_t _blueprint_write_body(const machine_blueprint_t* blueprint,
+                                    uint8_t* out, size_t cap) {
+  size_t offset = 0;
+  if (cap < 1) return 0;
+  out[offset++] = (uint8_t)blueprint->trust_mode;
+  if (!_lineage_string16_write(out, cap, &offset, blueprint->child_id,
+                               sizeof(blueprint->child_id)) ||
+      !_lineage_string16_write(out, cap, &offset, blueprint->bootstrap_admin,
+                               sizeof(blueprint->bootstrap_admin))) {
+    return 0;
+  }
+  if (cap < offset + 8) return 0;
+  _lineage_u64le_write(out + offset, blueprint->attestation_ttl_ms);
+  offset += 8;
+
+  if (cap < offset + 4) return 0;
+  _lineage_u32le_write(out + offset, blueprint->item_count);
+  offset += 4;
+  for (uint32_t item_index = 0; item_index < blueprint->item_count;
+       item_index++) {
+    const blueprint_item_t* item = &blueprint->items[item_index];
+    if (!_lineage_string16_write(out, cap, &offset, item->name,
+                                 sizeof(item->name))) {
+      return 0;
+    }
+    if (cap < offset + 2) return 0;
+    out[offset++] = (uint8_t)item->type;
+    out[offset++] = (uint8_t)item->crdt_type;
+  }
+
+  if (cap < offset + 4) return 0;
+  _lineage_u32le_write(out + offset, blueprint->policy_count);
+  offset += 4;
+  for (uint32_t policy_index = 0; policy_index < blueprint->policy_count;
+       policy_index++) {
+    const blueprint_policy_t* policy = &blueprint->policies[policy_index];
+    if (!_lineage_string16_write(out, cap, &offset, policy->operation,
+                                 sizeof(policy->operation)) ||
+        !_lineage_string16_write(out, cap, &offset, policy->expression,
+                                 sizeof(policy->expression))) {
+      return 0;
+    }
+  }
+
+  if (cap < offset + 4) return 0;
+  _lineage_u32le_write(out + offset, blueprint->op_type_def_count);
+  offset += 4;
+  for (uint32_t def_index = 0; def_index < blueprint->op_type_def_count;
+       def_index++) {
+    const blueprint_op_type_def_t* definition =
+        &blueprint->op_type_defs[def_index];
+    if (!_lineage_string16_write(out, cap, &offset, definition->op_type,
+                                 sizeof(definition->op_type)) ||
+        !_blueprint_dedup_spec_write(out, cap, &offset, &definition->dedup)) {
+      return 0;
+    }
+  }
+  return offset;
+}
+
+crabs_error_e machine_blueprint_stamp_hash(machine_blueprint_t* blueprint) {
+  if (blueprint == NULL) return CRABS_ERR_INVALID_PARAM;
+  uint8_t body[CRABS_BLUEPRINT_BODY_MAX];
+  size_t body_len = _blueprint_write_body(blueprint, body, sizeof(body));
+  if (body_len == 0) return CRABS_ERR_INVALID_PARAM;
+  return crypto_sha256(body, body_len, blueprint->blueprint_hash);
+}
+
+size_t blueprint_serialize(machine_blueprint_t* blueprint,
+                           uint8_t* out_buf, size_t buf_len) {
+  if (blueprint == NULL || out_buf == NULL) return 0;
+  if (machine_blueprint_stamp_hash(blueprint) != CRABS_SUCCESS) return 0;
+  uint8_t body[CRABS_BLUEPRINT_BODY_MAX];
+  size_t body_len = _blueprint_write_body(blueprint, body, sizeof(body));
+  if (body_len == 0) return 0;
+  uint32_t total_len = (uint32_t)(body_len + CRABS_HASH_SIZE);
+  if (buf_len < 4 + total_len) return 0;
+  _lineage_u32le_write(out_buf, total_len);
+  memcpy(out_buf + 4, body, body_len);
+  memcpy(out_buf + 4 + body_len, blueprint->blueprint_hash, CRABS_HASH_SIZE);
+  return 4 + total_len;
+}
+
+static bool _blueprint_dedup_field_read(const uint8_t* buf, size_t len,
+                                        size_t* offset, char* out,
+                                        size_t out_capacity) {
+  return _lineage_string16_read(buf, len, offset, out, out_capacity);
+}
+
+static bool _blueprint_dedup_spec_read(const uint8_t* buf, size_t len,
+                                       size_t* offset, dedup_spec_t* spec) {
+  uint8_t raw_dedup_type;
+  uint8_t raw_mutation_type;
+  uint64_t raw_delta;
+  bool strings_ok;
+  if (*offset + 1 > len) return false;
+  raw_dedup_type = buf[(*offset)++];
+  strings_ok =
+      _blueprint_dedup_field_read(buf, len, offset, spec->tracker_path,
+                                  sizeof(spec->tracker_path)) &&
+      _blueprint_dedup_field_read(buf, len, offset, spec->flag_path,
+                                  sizeof(spec->flag_path)) &&
+      _blueprint_dedup_field_read(buf, len, offset, spec->condition,
+                                  sizeof(spec->condition));
+  if (!strings_ok) return false;
+  if (*offset + 1 > len) return false;
+  raw_mutation_type = buf[(*offset)++];
+  strings_ok =
+      _blueprint_dedup_field_read(buf, len, offset, spec->update.set_path,
+                                  sizeof(spec->update.set_path)) &&
+      _blueprint_dedup_field_read(buf, len, offset, spec->update.element_value,
+                                  sizeof(spec->update.element_value)) &&
+      _blueprint_dedup_field_read(buf, len, offset, spec->update.flag_path,
+                                  sizeof(spec->update.flag_path)) &&
+      _blueprint_dedup_field_read(buf, len, offset, spec->update.counter_path,
+                                  sizeof(spec->update.counter_path));
+  if (!strings_ok) return false;
+  if (!_lineage_u64le_read(buf, len, offset, &raw_delta)) return false;
+  spec->update.delta = (int64_t)raw_delta;
+  strings_ok =
+      _blueprint_dedup_field_read(buf, len, offset, spec->update.target_path,
+                                  sizeof(spec->update.target_path)) &&
+      _blueprint_dedup_field_read(buf, len, offset, spec->update.value,
+                                  sizeof(spec->update.value)) &&
+      _blueprint_dedup_field_read(buf, len, offset, spec->rejection_message,
+                                  sizeof(spec->rejection_message));
+  if (!strings_ok) return false;
+  spec->type = (dedup_type_e)raw_dedup_type;
+  spec->update.type = (mutation_type_e)raw_mutation_type;
+  return true;
+}
+
+machine_blueprint_t* blueprint_deserialize(const uint8_t* buf, size_t len) {
+  if (buf == NULL) return NULL;
+  size_t offset = 0;
+  uint32_t total_len;
+  uint32_t item_count = 0;
+  uint32_t policy_count = 0;
+  uint32_t def_count = 0;
+  size_t body_len;
+  machine_blueprint_t* blueprint = NULL;
+  bool parsed;
+  uint8_t stored_hash[CRABS_HASH_SIZE];
+  uint8_t recomputed_hash[CRABS_HASH_SIZE];
+
+  // The prefix must claim exactly the bytes that follow it, and the smallest
+  // possible body (trust mode + two empty strings16 + ttl + three zero
+  // counts) is 24 bytes before the hash.
+  if (!_lineage_u32le_read(buf, len, &offset, &total_len) ||
+      total_len != len - 4 ||
+      total_len < 24 + CRABS_HASH_SIZE) {
+    return NULL;
+  }
+  body_len = total_len - CRABS_HASH_SIZE;
+
+  blueprint = get_clear_memory(sizeof(*blueprint));
+  parsed = offset + 1 <= len;
+  if (parsed) {
+    blueprint->trust_mode = (lineage_trust_mode_e)buf[offset++];
+    parsed = blueprint->trust_mode == LINEAGE_SHARED_ROOT ||
+             blueprint->trust_mode == LINEAGE_DELEGATED_COPY ||
+             blueprint->trust_mode == LINEAGE_SOVEREIGN;
+  }
+  parsed = parsed &&
+      _lineage_string16_read(buf, len, &offset, blueprint->child_id,
+                             sizeof(blueprint->child_id)) &&
+      _lineage_string16_read(buf, len, &offset, blueprint->bootstrap_admin,
+                             sizeof(blueprint->bootstrap_admin)) &&
+      _lineage_u64le_read(buf, len, &offset, &blueprint->attestation_ttl_ms);
+
+  parsed = parsed &&
+      _lineage_u32le_read(buf, len, &offset, &item_count) &&
+      item_count <= CRABS_MAX_BLUEPRINT_ITEMS;
+  if (parsed && item_count > 0) {
+    // get_clear_memory aborts on exhaustion — allocation never fails here.
+    blueprint->items = get_clear_memory(
+        (size_t)item_count * sizeof(blueprint_item_t));
+    blueprint->item_count = item_count;
+  }
+
+  // The ITEM section (its count was just consumed).
+  for (uint32_t item_index = 0; parsed && item_index < item_count;
+       item_index++) {
+    blueprint_item_t* item = &blueprint->items[item_index];
+    uint8_t raw_item_type;
+    uint8_t raw_crdt_type;
+    parsed = _lineage_string16_read(buf, len, &offset, item->name,
+                                    sizeof(item->name)) &&
+             offset + 2 <= len;
+    if (parsed) {
+      raw_item_type = buf[offset++];
+      raw_crdt_type = buf[offset++];
+      item->type = (data_type_e)raw_item_type;
+      item->crdt_type = (crdt_type_e)raw_crdt_type;
+    }
+  }
+
+  parsed = parsed &&
+      _lineage_u32le_read(buf, len, &offset, &policy_count) &&
+      policy_count <= CRABS_MAX_BLUEPRINT_POLICIES;
+  if (parsed && policy_count > 0) {
+    blueprint->policies = get_clear_memory(
+        (size_t)policy_count * sizeof(blueprint_policy_t));
+    blueprint->policy_count = policy_count;
+  }
+
+  // The POLICY section (its count was just consumed).
+  for (uint32_t policy_index = 0; parsed && policy_index < policy_count;
+       policy_index++) {
+    blueprint_policy_t* policy = &blueprint->policies[policy_index];
+    parsed =
+        _lineage_string16_read(buf, len, &offset, policy->operation,
+                               sizeof(policy->operation)) &&
+        _lineage_string16_read(buf, len, &offset, policy->expression,
+                               sizeof(policy->expression));
+  }
+
+  parsed = parsed &&
+      _lineage_u32le_read(buf, len, &offset, &def_count) &&
+      def_count <= CRABS_MAX_BLUEPRINT_OP_TYPE_DEFS;
+  if (parsed && def_count > 0) {
+    blueprint->op_type_defs = get_clear_memory(
+        (size_t)def_count * sizeof(blueprint_op_type_def_t));
+    blueprint->op_type_def_count = def_count;
+  }
+  for (uint32_t def_index = 0; parsed && def_index < def_count; def_index++) {
+    blueprint_op_type_def_t* definition = &blueprint->op_type_defs[def_index];
+    parsed =
+        _lineage_string16_read(buf, len, &offset, definition->op_type,
+                               sizeof(definition->op_type)) &&
+        _blueprint_dedup_spec_read(buf, len, &offset, &definition->dedup);
+  }
+
+  // Every field consumed EXACTLY the body; the hash closes the image.
+  // Every field consumed EXACTLY the body; the hash closes the image.
+  parsed = parsed && offset == body_len + 4;
+  if (parsed) {
+    memcpy(stored_hash, buf + offset, CRABS_HASH_SIZE);
+    // Verify over the body ALONE — a tampered body can never reproduce the
+    // stored hash, so any mismatch rejects the whole image.
+    parsed = crypto_sha256(buf + 4, body_len, recomputed_hash) ==
+                 CRABS_SUCCESS &&
+             memcmp(recomputed_hash, stored_hash, CRABS_HASH_SIZE) == 0;
+  }
+  if (parsed) {
+    memcpy(blueprint->blueprint_hash, stored_hash, CRABS_HASH_SIZE);
+    return blueprint;
+  }
+  machine_blueprint_destroy(blueprint);
+  return NULL;
+}
+
+// ============================================================
 // Lifecycle
 // ============================================================
 

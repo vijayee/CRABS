@@ -1109,6 +1109,116 @@ TEST(TestLineage, SpawnRejectsDuplicateChildId) {
   spawn_parent_destroy(&harness);
 }
 
+// ============================================================
+// Blueprint wire format
+// ============================================================
+
+TEST(TestLineage, BlueprintSerializeDeserializeRoundTrip) {
+  machine_blueprint_t* blueprint = machine_blueprint_create();
+  ASSERT_NE(blueprint, nullptr);
+  strncpy(blueprint->child_id, "child-blue", sizeof(blueprint->child_id) - 1);
+  blueprint->trust_mode = LINEAGE_DELEGATED_COPY;
+  strncpy(blueprint->bootstrap_admin, "child-admin",
+          sizeof(blueprint->bootstrap_admin) - 1);
+  blueprint->attestation_ttl_ms = 120000;
+
+  EXPECT_EQ(blueprint_add_item(blueprint, "counter", DATA_TYPE_COUNTER,
+                               CRDT_G_COUNTER), CRABS_SUCCESS);
+  EXPECT_EQ(blueprint_add_item(blueprint, "doc", DATA_TYPE_REGISTER,
+                               CRDT_LWW_REG), CRABS_SUCCESS);
+  EXPECT_EQ(blueprint_add_policy(blueprint, "render",
+                                 "@parent/role:writer"), CRABS_SUCCESS);
+  EXPECT_EQ(blueprint_add_policy(blueprint, "increment",
+                                 "custody:child-blue"), CRABS_SUCCESS);
+
+  dedup_spec_t dedup;
+  memset(&dedup, 0, sizeof(dedup));
+  dedup.type = DEDUP_NONE;
+  EXPECT_EQ(blueprint_add_op_type_def(blueprint, "increment", &dedup),
+            CRABS_SUCCESS);
+  EXPECT_EQ(lineage_blueprint_validate(blueprint), CRABS_SUCCESS);
+
+  // The stamp is a public entry point but serialize calls it internally,
+  // so the hash on the wire image always matches the serialized body.
+  uint8_t wire[CRABS_BLUEPRINT_WIRE_MAX];
+  size_t wire_len = blueprint_serialize(blueprint, wire, sizeof(wire));
+  ASSERT_GT(wire_len, 0u);
+  for (int byte_index = 0; byte_index < CRABS_HASH_SIZE; byte_index++) {
+    EXPECT_NE(blueprint->blueprint_hash[byte_index], 0);
+  }
+
+  machine_blueprint_t* restored = blueprint_deserialize(wire, wire_len);
+  ASSERT_NE(restored, nullptr);
+  EXPECT_STREQ(restored->child_id, "child-blue");
+  EXPECT_EQ(restored->trust_mode, LINEAGE_DELEGATED_COPY);
+  EXPECT_STREQ(restored->bootstrap_admin, "child-admin");
+  EXPECT_EQ(restored->attestation_ttl_ms, 120000u);
+  ASSERT_EQ(restored->item_count, 2u);
+  EXPECT_STREQ(restored->items[0].name, "counter");
+  EXPECT_EQ(restored->items[0].type, DATA_TYPE_COUNTER);
+  EXPECT_EQ(restored->items[0].crdt_type, CRDT_G_COUNTER);
+  EXPECT_STREQ(restored->items[1].name, "doc");
+  EXPECT_EQ(restored->items[1].type, DATA_TYPE_REGISTER);
+  EXPECT_EQ(restored->items[1].crdt_type, CRDT_LWW_REG);
+  ASSERT_EQ(restored->policy_count, 2u);
+  EXPECT_STREQ(restored->policies[0].operation, "render");
+  EXPECT_STREQ(restored->policies[0].expression, "@parent/role:writer");
+  EXPECT_STREQ(restored->policies[1].operation, "increment");
+  EXPECT_STREQ(restored->policies[1].expression, "custody:child-blue");
+  ASSERT_EQ(restored->op_type_def_count, 1u);
+  EXPECT_STREQ(restored->op_type_defs[0].op_type, "increment");
+  EXPECT_EQ(restored->op_type_defs[0].dedup.type, DEDUP_NONE);
+  // The restored blueprint validates and re-serializes BYTE-IDENTICALLY —
+  // the canonical body writer is the single source of layout truth.
+  EXPECT_EQ(lineage_blueprint_validate(restored), CRABS_SUCCESS);
+  uint8_t wire_again[CRABS_BLUEPRINT_WIRE_MAX];
+  size_t wire_again_len = blueprint_serialize(restored, wire_again,
+                                              sizeof(wire_again));
+  ASSERT_EQ(wire_again_len, wire_len);
+  EXPECT_EQ(memcmp(wire_again, wire, wire_len), 0);
+
+  machine_blueprint_destroy(restored);
+  machine_blueprint_destroy(blueprint);
+}
+
+TEST(TestLineage, BlueprintDeserializeRejectsHashMismatch) {
+  machine_blueprint_t* blueprint = make_valid_blueprint();
+  ASSERT_NE(blueprint, nullptr);
+
+  uint8_t wire[CRABS_BLUEPRINT_WIRE_MAX];
+  size_t wire_len = blueprint_serialize(blueprint, wire, sizeof(wire));
+  ASSERT_GT(wire_len, 0u);
+
+  // Flip a byte INSIDE the body (child_id field, offset 4 prefix + 1 mode + 2
+  // string16 length) without touching the stored hash — deserialize must
+  // reject, not silently accept a tampered body.
+  wire[7] ^= 0x01;
+  EXPECT_EQ(blueprint_deserialize(wire, wire_len), nullptr);
+
+  // A wire image truncated by one byte is malformed too.
+  wire[7] ^= 0x01;
+  EXPECT_EQ(blueprint_deserialize(wire, wire_len - 1), nullptr);
+
+  // NULL/zero-size arguments never parse.
+  EXPECT_EQ(blueprint_deserialize(nullptr, wire_len), nullptr);
+  EXPECT_EQ(blueprint_deserialize(wire, 0), nullptr);
+
+  machine_blueprint_destroy(blueprint);
+}
+
+TEST(TestLineage, BlueprintStampHashRejectsInvalidStruct) {
+  EXPECT_EQ(machine_blueprint_stamp_hash(nullptr), CRABS_ERR_INVALID_PARAM);
+
+  // A hand-built struct with a capacity-full (unterminated) child_id field
+  // has no reproducible canonical body — the stamp fails closed.
+  machine_blueprint_t* unterminated = machine_blueprint_create();
+  ASSERT_NE(unterminated, nullptr);
+  memset(unterminated->child_id, 'a', sizeof(unterminated->child_id));
+  EXPECT_EQ(machine_blueprint_stamp_hash(unterminated),
+            CRABS_ERR_INVALID_PARAM);
+  machine_blueprint_destroy(unterminated);
+}
+
 TEST(TestLineage, SpawnRejectsInvalidBlueprint) {
   // Rejects: nullptr arguments, an invalid blueprint, a keyless parent — and
   // every rejection leaves NO manifest residue and no child allocation.

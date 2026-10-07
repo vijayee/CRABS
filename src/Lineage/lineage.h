@@ -29,6 +29,16 @@
 #define CRABS_ATTESTATION_BODY_MAX  512
 #define CRABS_ATTESTATION_WIRE_MAX  (4 + CRABS_ATTESTATION_BODY_MAX + CRABS_SIG_SIZE)
 
+// Canonical blueprint body cap. The worst-case body (lineage.c's
+// _blueprint_write_body) is 1 + 2*(2+63) + 8 + 4 + 64*(2+63+2) + 4 +
+// 64*(2+63+2+255) + 4 + 32*(2+63+1567) = 77271 bytes, where 1567 is the
+// worst-case dedup_spec image (1 + 2*(2+127) + (2+255) + 1 + 2*(2+127) +
+// (2+63) + 2*(2+127) + 8 + (2+255) — mirroring serialization.c's
+// _serialize_dedup_spec). The wire image adds a u32le length prefix and the
+// 32-byte blueprint hash on top.
+#define CRABS_BLUEPRINT_BODY_MAX  81920
+#define CRABS_BLUEPRINT_WIRE_MAX  (4 + CRABS_BLUEPRINT_BODY_MAX + CRABS_HASH_SIZE)
+
 // One blueprint data item: name + data type + CRDT strategy.
 typedef struct {
   char        name[CRABS_MAX_USER_ID];
@@ -112,6 +122,34 @@ crabs_error_e blueprint_add_op_type_def(machine_blueprint_t* blueprint,
 //   - item names safe + unique; counts within the blueprint caps above
 //   - operation/op_type names non-empty and within their capacity
 crabs_error_e lineage_blueprint_validate(const machine_blueprint_t* blueprint);
+
+// ============================================================
+// Blueprint wire format: stamp / serialize / deserialize
+// ============================================================
+
+// Compute blueprint->blueprint_hash = SHA-256 of the canonical blueprint body
+// (every section EXCEPT the hash itself, written by the single shared body
+// writer — the same layout attestation signing uses). Returns
+// CRABS_ERR_INVALID_PARAM when a fixed-capacity string field is unterminated
+// (no reproducible canonical body) or the writer overflows its cap.
+// blueprint_serialize calls this internally, so a serialized image always
+// carries a hash matching its body; direct callers keep hand-built
+// blueprints honest before persisting or signing them.
+crabs_error_e machine_blueprint_stamp_hash(machine_blueprint_t* blueprint);
+
+// Wire image: u32le total length (body + hash, EXCLUDING the prefix itself)
+// + canonical body + 32-byte blueprint hash. Stamps the hash first, so the
+// caller never has to. Returns bytes written, or 0 on overflow/capacity-full
+// string fields.
+size_t blueprint_serialize(machine_blueprint_t* blueprint,
+                           uint8_t* out_buf, size_t buf_len);
+
+// Parse a wire image back into a heap blueprint (free with
+// machine_blueprint_destroy). Verifies the embedded hash over the body and
+// rejects ANY mismatch (a tampered body can never pass), plus structural
+// bounds: counts within the blueprint caps, trust_mode within the enum.
+// Returns NULL on malformed input.
+machine_blueprint_t* blueprint_deserialize(const uint8_t* buf, size_t len);
 
 // ============================================================
 // Spawn: instantiate a child machine from a validated blueprint
