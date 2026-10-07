@@ -127,17 +127,20 @@ section below.
 | `machine spawn <file.cbp>` | Spawn a child machine (real `__spawn_machine__` op through the pipeline) |
 | `machine children` | List the child manifest: mode, status, residency, attestation TTL |
 | `machine attest <child_id> <user_id> <attributes>` | Mint and print a parent-signed, TTL-bounded attestation wire |
+| `machine tombstone <child_id>` | Print the parent-signed dissolution tombstone wire for a DISSOLVED child (off-chain transport material; refuses a non-dissolved child) |
+| `machine accept-tombstone <file>` | Deliver a tombstone hex file to THIS machine (real `__receive_dissolution__` op): verify the parent signature and durably sever the parent lineage |
 | `machine dissolve <child_id>` | Dissolve a non-sovereign child (real `__dissolve_machine__` op) |
 | `machine withdraw <child_id>` | Withdraw a sovereign child's genesis stake (real `__withdraw_genesis__` op) |
 | `machine revoke-attestation <child_id>` | Stop issuing attestations for a child (real `__revoke_attestation__` op) |
 
 The blueprint authoring commands are draft editing and never touch machine
-state; spawn, dissolve, withdraw, and revoke-attestation are signed operations
-through the same pipeline as `op submit`. The lineage op handlers are runtime
-registrations on the machine (`lineage_install` in the library/wasm path):
-after `crabs load-sealed` restores a saved machine, the spawning protocol
-re-installs the lineage ops on the reloaded machine before the lifecycle
-commands can act — the CLI refuses those commands loudly otherwise.
+state; spawn, dissolve, withdraw, revoke-attestation, and accept-tombstone are
+signed operations through the same pipeline as `op submit`. The lineage op
+handlers are runtime registrations on the machine (`lineage_install` in the
+library/wasm path): after `crabs load-sealed` restores a saved machine, the
+spawning protocol re-installs the lineage ops on the reloaded machine before
+the lifecycle commands can act — the CLI refuses those commands loudly
+otherwise.
 
 A minimal spawn flow:
 
@@ -152,6 +155,20 @@ crabs machine spawn /tmp/child-red.cbp
 crabs machine children
 crabs machine attest child-red child-admin role:writer   # prints the wire hex
 crabs machine dissolve child-red
+crabs machine tombstone child-red                        # prints the tombstone hex
+```
+
+**Ending a lineage across processes.** Dissolving a child severs the lineage
+in the parent's manifest immediately, but a child machine running in another
+process learns of the severance only when the tombstone reaches it: the
+parent operator runs `machine tombstone <child_id>` and hands the printed hex
+to the child operator (out-of-band, like the attestation wire), who writes it
+to a file and runs `machine accept-tombstone <file>` on the child machine.
+The op verifies the tombstone's embedded parent ECDSA signature against the
+persisted parent public key — carriage by the child admin authorizes nothing
+about its content — and the dissolved state is durable across the child's own
+save/reload, fail-closing every `@parent/` endorsement afterwards. A
+re-delivery is refused as already-performed.
 ```
 
 ### Wasm lineage exports
@@ -195,7 +212,7 @@ Spawning child machines extends the trust boundary across machines, not just wit
 
 **SHARED_ROOT couples parent and child identities by definition.** A shared-root child runs on one attribute registry and one MSK — the parent's. There is no boundary to police between them: revoking a shared-attribute endorsement on the parent stops the child's authorization instantly, but the parent has (and needs) full custody of the child's authority.
 
-**Attested (cross-MSK) trust is bounded by TTL lag, not instant revocation.** Delegated and sovereign children run their own authority and ride on the parent's attestation, which carries a TTL. A revoked attestation only takes effect when the child's verification re-checks it or the TTL expires — a determined child can ride out a stale attestation until expiry. In-process severance happens immediately on a `dissolve` (tombstone) for resident children, but a dissolve tombstone sent after a restart is not yet implemented (see `src/Lineage/lineage.h`), so treat attestation expiry — not dissolve delivery — as the guaranteed upper bound on cross-MSK trust.
+**Attested (cross-MSK) trust is bounded by TTL lag, not instant revocation.** Delegated and sovereign children run their own authority and ride on the parent's attestation, which carries a TTL. A revoked attestation only takes effect when the child's verification re-checks it or the TTL expires — a determined child can ride out a stale attestation until expiry. In-process severance happens immediately on a `dissolve` (tombstone) for resident children; a dissolved-but-distant child learns of the severance only once its operator hands it the parent's tombstone (`machine accept-tombstone` above) — until that delivery lands, treat attestation expiry, not dissolve delivery, as the guaranteed upper bound on cross-MSK trust for a detached child.
 
 **Sovereign children are beyond parent control — beyond provenance.** The parent may not dissolve a sovereign child; the only lineage op that still applies is `__withdraw_genesis__`, which retracts the parent's genesis attestation from its own manifest. A withdrawn parent no longer vouches for the child, but the child's own authority is unaffected.
 
