@@ -443,8 +443,13 @@ typedef struct state_t {
   // a restart while this registry starts empty, so a slot index bears no
   // relationship to a manifest index (A10-5). Dissolve NULLs the matching
   // slot — a hole — and lookups skip holes (the child may outlive the
-  // dissolve). Destroying a child out-of-band without a dissolve leaves a
-  // dangling entry.
+  // dissolve). A10-6 liveness invariant: NON-NULL slots always point at LIVE
+  // machines — the resident child's attribute_machine_destroy drops its slot
+  // first (lineage_resident_child_destroyed, via the child's weak
+  // lineage_owner_state back-pointer), and this state's own destroy detaches
+  // surviving children's back-pointers before freeing the array
+  // (lineage_detach_resident_children), so neither order of death can leave a
+  // dangling entry for find-by-id or dissolve to dereference.
   attribute_machine_t** resident_children;
   uint32_t              resident_child_count;
   // v1.5.2 §4: Compaction config (crabs_tombstone_config_t*). Externally owned

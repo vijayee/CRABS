@@ -103,6 +103,13 @@ typedef struct attribute_machine_t {
   user_t*   users;
   uint32_t  user_count;
   uint64_t  current_time_ms;  // Platform-injected time for temp attr expiry
+  // A10-6 (runtime ONLY, never serialized): weak back-pointer to the parent
+  // state whose resident-children registry currently holds THIS machine as a
+  // spawned child (NULL when the machine is not resident anywhere). Set by the
+  // lineage registry at spawn; cleared by lineage_resident_child_destroyed on
+  // destroy, by __dissolve_machine__ on severance, and by
+  // lineage_detach_resident_children when the owner state dies first.
+  state_t*  lineage_owner_state;
 } attribute_machine_t;
 
 // ============================================================

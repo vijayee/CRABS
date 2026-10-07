@@ -1575,11 +1575,12 @@ TEST(TestLineage, QueryResidentChildAccessor) {
 // after a restart (the manifest is persisted; the registry starts empty)
 // ============================================================
 
-// Spawn two children, then simulate a restart: the manifest is persisted
-// (left untouched) while the runtime resident-children registry is rebuilt
-// EMPTY. The pre-restart children's machines lived in the old process and
-// are gone with it — destroy them (the registry pointers are UNOWNED) and
-// clear the pointer array exactly the way a state load leaves it.
+// Simulate a restart: the manifest is persisted (left untouched) while the
+// runtime resident-children registry starts EMPTY on reload. This helper
+// only frees the registry pointer array; the callers destroy the pre-restart
+// machines themselves FIRST (each attribute_machine_destroy runs the A10-6
+// hook, which drops then-NULL's the machine's slot — what remains is exactly
+// the hole array a state load leaves behind).
 static void simulate_restart_clears_registry(state_t* parent) {
   free(parent->resident_children);
   parent->resident_children = NULL;
@@ -1719,6 +1720,85 @@ TEST(TestLineage, QueryKeyedByIdNotIndex) {
   machine_blueprint_destroy(blueprint_a);
   machine_blueprint_destroy(blueprint_b);
   machine_blueprint_destroy(blueprint_c);
+  spawn_parent_destroy(&harness);
+}
+
+// ============================================================
+// A10-6: out-of-band destroy of a resident child must not leave a dangling
+// registry slot for __dissolve_machine__ (or any find-by-id) to touch.
+// ============================================================
+
+TEST(TestLineage, OutOfBandChildDestroyIsSafeForDissolve) {
+  spawn_parent_harness_t harness;
+  spawn_parent_setup(&harness);
+  state_t* parent = &harness.am->base_state;
+  ASSERT_EQ(attribute_machine_grant_role(harness.am, "alice", "role", "admin",
+                                         "parent-root"), CRABS_SUCCESS);
+  lineage_install(parent);
+
+  machine_blueprint_t* blueprint = make_valid_blueprint();
+  ASSERT_NE(blueprint, nullptr);
+  attribute_machine_t* child = nullptr;
+  ASSERT_EQ(lineage_spawn_machine(parent, blueprint, &child), CRABS_SUCCESS);
+  ASSERT_NE(child, nullptr);
+
+  // Sanity: pre-destroy the child IS resident and resolves.
+  EXPECT_EQ(lineage_query_resident_child(parent, "child-red"), child);
+
+  // Out-of-band destroy — the exact pattern the spawn caller is entitled to
+  // (lineage.h: the spawn caller owns the child and destroys it via
+  // attribute_machine_destroy; the node bindings' destructor does precisely
+  // this for spawned_machines_).
+  attribute_machine_destroy(child);
+
+  // A10-6: the destroy hook must have dropped the registry slot — a query
+  // answers NULL instead of strcmp'ing through a dangling pointer.
+  EXPECT_EQ(lineage_query_resident_child(parent, "child-red"), nullptr);
+
+  // Dissolve for the destroyed child still flips the manifest and must not
+  // reach through freed memory (pre-fix this WRITES
+  // resident->base_state.lineage_parent_dissolved on the freed child).
+  operation_t* dissolve = make_signed_lineage_op(
+      harness.am, harness.alice_key, "alice", CRABS_LINEAGE_OP_DISSOLVE,
+      "child-red", strlen("child-red"));
+  ASSERT_NE(dissolve, nullptr);
+  EXPECT_EQ(state_machine_execute(parent, dissolve), CRABS_SUCCESS);
+  EXPECT_EQ(parent->children[0].status, LINEAGE_DISSOLVED);
+  operation_destroy(dissolve);
+
+  machine_blueprint_destroy(blueprint);
+  spawn_parent_destroy(&harness);
+}
+
+// The reverse death order: the registry OWNER dies while a spawned child is
+// still alive. This is exactly the node bindings' destructor order
+// (~CrabsNode destroys am_ first, then spawned_machines_). state_destroy /
+// attribute_machine_destroy must NULL the surviving children's weak
+// lineage_owner_state back-pointers, or the child's later destroy would walk
+// a dangling owner pointer (write-after-free on the dead parent).
+TEST(TestLineage, ParentDestroyDetachesResidentChildren) {
+  spawn_parent_harness_t harness;
+  spawn_parent_setup(&harness);
+  state_t* parent = &harness.am->base_state;
+
+  machine_blueprint_t* blueprint = make_valid_blueprint();
+  ASSERT_NE(blueprint, nullptr);
+  attribute_machine_t* child = nullptr;
+  ASSERT_EQ(lineage_spawn_machine(parent, blueprint, &child), CRABS_SUCCESS);
+  ASSERT_NE(child, nullptr);
+  EXPECT_EQ(child->lineage_owner_state, parent);
+
+  // Parent machine dies with the child still resident (registry ownership
+  // lives in the parent's base_state; the child must be detached BEFORE its
+  // back-pointer becomes dangling).
+  attribute_machine_destroy(harness.am);
+  harness.am = nullptr;  // spawn_parent_destroy guards on NULL
+  EXPECT_EQ(child->lineage_owner_state, nullptr);
+
+  // Must be a no-op: no walk into the freed parent's registry.
+  attribute_machine_destroy(child);
+
+  machine_blueprint_destroy(blueprint);
   spawn_parent_destroy(&harness);
 }
 

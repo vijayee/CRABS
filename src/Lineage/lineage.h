@@ -210,17 +210,38 @@ machine_blueprint_t* blueprint_deserialize(const uint8_t* buf, size_t len);
 //
 // child_out receives a heap attribute_machine_t whose state is
 // &child->base_state. Ownership: the caller destroys it via
-// attribute_machine_destroy.
+// attribute_machine_destroy — that destroy detaches the child from the
+// parent's resident-children registry (A10-6, lineage_resident_child_destroyed),
+// so destroying a child out-of-band never leaves a dangling registry slot.
 crabs_error_e lineage_spawn_machine(state_t* parent,
                                     const machine_blueprint_t* blueprint,
                                     attribute_machine_t** child_out);
 
 // Borrowed lookup of a child machine this machine spawned and still holds
 // resident (spawned in this process). Returns NULL when unknown, dissolved
-// (slot cleared), or not present. The pointer stays owned by the child's
+// (slot cleared), destroyed out-of-band by the spawn caller (the destroy hook
+// dropped the slot), or not present. The pointer stays owned by the child's
 // creator — borrow only.
 attribute_machine_t* lineage_query_resident_child(const state_t* state,
                                                   const char* child_id);
+
+// A10-6: the child-side destroy hook. attribute_machine_destroy calls this
+// FIRST, before freeing anything: when the child was registered as a resident
+// lineage child (lineage_owner_state set), its slot in the owner's registry is
+// dropped and the back-pointer detached, so no dangling pointer survives for a
+// later __dissolve_machine__ or find-by-id to dereference. The back-pointer is
+// NULLed BEFORE the registry drop so the machine is provably detached before
+// the owner's registry is touched. No-op for a NULL machine or one that is not
+// resident anywhere.
+void lineage_resident_child_destroyed(attribute_machine_t* child);
+
+// A10-6: the owner-side destroy complement. One of state_destroy or
+// attribute_machine_destroy calls this on the OWNER state, BEFORE the owner's
+// resident_children pointer array is freed: every resident child's weak
+// lineage_owner_state back-pointer is NULLed. Without this, a child that
+// outlives its parent would later pass a dangling owner pointer into
+// lineage_resident_child_destroyed (heap write-after-free on the dead parent).
+void lineage_detach_resident_children(state_t* owner);
 
 // Borrowed view over this machine's child manifest (v11 persisted): *out
 // entries receives a BORROWED pointer to the internal children array (the

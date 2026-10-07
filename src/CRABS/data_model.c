@@ -4,6 +4,7 @@
 
 #include "data_model.h"
 #include "../Attribute/attribute_machine.h"
+#include "../Lineage/lineage.h"
 #include "../Scheduler/scheduler.h"
 #include "../Trigger/trigger.h"
 #include "../Crypto/crypto.h"
@@ -153,6 +154,12 @@ void state_destroy(state_t* state) {
   if (state->children != NULL) free(state->children);
   // Lineage resident-child registry: runtime-only UNOWNED views (each child
   // is owned by whoever spawned/holds it) — free the pointer array only.
+  // A10-6: this state is the registry OWNER dying first — detach every
+  // resident child's weak lineage_owner_state back-pointer before the array
+  // is freed, or a child that outlives this state would later walk a dangling
+  // owner pointer in lineage_resident_child_destroyed (heap write-after-free
+  // on this state), exactly the reverse order of the dissolve UAF.
+  lineage_detach_resident_children(state);
   if (state->resident_children != NULL) free(state->resident_children);
   if (state->triggers != NULL) {
     for (uint32_t i = 0; i < state->trigger_count; i++) {

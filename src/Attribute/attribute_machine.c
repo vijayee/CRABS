@@ -3,6 +3,7 @@
 //
 
 #include "attribute_machine.h"
+#include "../Lineage/lineage.h"
 #include "../Util/platform.h"
 #include "../StateMachine/state_machine.h"
 #include "../Trigger/trigger.h"
@@ -381,6 +382,13 @@ void attribute_users_destroy_all(attribute_machine_t* am) {
 void attribute_machine_destroy(attribute_machine_t* am) {
   if (am == NULL) return;
 
+  // A10-6 FIRST, while every field is still valid: if this machine is a
+  // resident lineage child of some parent state, drop its registry slot in
+  // the owner and detach the weak back-pointer. Skipping this left the
+  // parent's registry holding a dangling pointer that __dissolve_machine__
+  // wrote through (heap write-after-free).
+  lineage_resident_child_destroyed(am);
+
   attribute_users_destroy_all(am);
 
   // Destroy base state items — clean up CRDT values before data_item_destroy
@@ -411,6 +419,11 @@ void attribute_machine_destroy(attribute_machine_t* am) {
   if (am->base_state.children != NULL) free(am->base_state.children);
   // Lineage resident-child registry: runtime-only UNOWNED views (each child
   // is owned by whoever spawned/holds it) — free the pointer array only.
+  // A10-6: this machine is the registry OWNER and is dying FIRST — NULL each
+  // resident child's weak lineage_owner_state back-pointer before the array
+  // is freed, or a child that outlives its parent would walk a dangling owner
+  // pointer in its own destroy hook.
+  lineage_detach_resident_children(&am->base_state);
   if (am->base_state.resident_children != NULL) {
     free(am->base_state.resident_children);
   }

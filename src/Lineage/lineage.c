@@ -964,6 +964,14 @@ crabs_error_e lineage_blueprint_validate(const machine_blueprint_t* blueprint) {
 // are holes (dissolved children) and are skipped. The manifest index is
 // only used to find the manifest ENTRY (status etc.) — never to index the
 // registry.
+//
+// A10-6 liveness invariant: every NON-NULL slot points at a LIVE machine.
+// The child's weak lineage_owner_state back-pointer and its registry slot
+// are paired: registration sets both, and EVERY removal path clears both —
+// __dissolve_machine__ (severance), lineage_resident_child_destroyed (the
+// attribute_machine_destroy hook, when the child dies first), and
+// lineage_detach_resident_children (when the owner state dies first). The
+// strcmp lookups below can therefore never read freed memory.
 
 static attribute_machine_t* _lineage_find_resident_child(
     const state_t* parent, const char* child_id) {
@@ -1000,9 +1008,13 @@ static void _lineage_drop_resident_child(state_t* parent,
 
 // Spawn appends the registry at the tail (slot resident_child_count). No
 // positional relationship with the manifest entry is required or relied on —
-// the lookups above key off lineage_self_id.
+// the lookups above key off lineage_self_id. A10-6: registration also sets
+// the child's weak lineage_owner_state back-pointer (paired with the slot);
+// a machine already resident somewhere else is a double-registration bug —
+// refuse it rather than leak the old owner's slot as a dangling entry.
 static crabs_error_e _lineage_register_resident_child(
     state_t* parent, attribute_machine_t* child) {
+  if (child->lineage_owner_state != NULL) return CRABS_ERR_INVALID_PARAM;
   attribute_machine_t** grown = realloc(
       parent->resident_children,
       (size_t)(parent->resident_child_count + 1) * sizeof(attribute_machine_t*));
@@ -1010,7 +1022,32 @@ static crabs_error_e _lineage_register_resident_child(
   parent->resident_children = grown;
   parent->resident_children[parent->resident_child_count] = child;
   parent->resident_child_count += 1;
+  child->lineage_owner_state = parent;
   return CRABS_SUCCESS;
+}
+
+void lineage_resident_child_destroyed(attribute_machine_t* child) {
+  if (child == NULL || child->lineage_owner_state == NULL) return;
+  state_t* owner = child->lineage_owner_state;
+  // NULL the back-pointer FIRST: the machine is provably detached before the
+  // owner's registry is touched, and a slot drop that (hypothetically)
+  // re-entered this hook on the same machine would terminate instead of
+  // looping.
+  child->lineage_owner_state = NULL;
+  _lineage_drop_resident_child(owner, child->base_state.lineage_self_id);
+}
+
+void lineage_detach_resident_children(state_t* owner) {
+  if (owner == NULL || owner->resident_children == NULL) return;
+  // The owner state is dying: NULL every resident child's back-pointer. The
+  // caller frees the pointer array right after this returns; any child that
+  // outlives the owner must not carry a dangling reference into the dead
+  // parent's registry (its later destroy would otherwise write-after-free).
+  for (uint32_t slot_index = 0; slot_index < owner->resident_child_count;
+       slot_index++) {
+    attribute_machine_t* child = owner->resident_children[slot_index];
+    if (child != NULL) child->lineage_owner_state = NULL;
+  }
 }
 
 // Apply the blueprint's items, policies, and op type definitions to the
@@ -1184,9 +1221,13 @@ crabs_error_e lineage_spawn_machine(state_t* parent,
         if (grown == NULL) {
           status = CRABS_ERR_OOM;
           // Roll back the registry slot appended just above — the child is
-          // destroyed below and no residue may survive either array.
+          // destroyed below and no residue may survive either array. Also
+          // detach the back-pointer: the child destroy below runs the A10-6
+          // hook, which would scan for an id whose slot just popped (a waste,
+          // though harmless, while the back-pointer still names this parent).
           parent->resident_child_count -= 1;
           parent->resident_children[parent->resident_child_count] = NULL;
+          child->lineage_owner_state = NULL;
         } else {
           parent->children = grown;
           child_manifest_entry_t* manifest_entry =
@@ -1399,8 +1440,13 @@ crabs_error_e lineage_op_dissolve(state_t* state, operation_t* op) {
   attribute_machine_t* resident = _lineage_find_resident_child(state, child_id);
   if (resident != NULL) {
     resident->base_state.lineage_parent_dissolved = true;
+    // A10-6: detach the back-pointer BEFORE dropping the slot — the child
+    // may outlive this machine, and its post-dissolution destroy must not
+    // walk back into the (possibly dead) parent's registry. Slot + back-
+    // pointer are cleared as a pair (the registry liveness invariant).
+    resident->lineage_owner_state = NULL;
+    _lineage_drop_resident_child(state, child_id);
   }
-  _lineage_drop_resident_child(state, child_id);
   state_notify_change(state, CRABS_CHANGE_LINEAGE, CRABS_LINEAGE_OP_DISSOLVE,
                       op->uuid, op->signer_id, op->node_id, child_id,
                       "dissolved", CRABS_SUCCESS);
