@@ -2706,8 +2706,10 @@ TEST(TestSerialization, V12ParentDissolvedFlagRoundTrips) {
 }
 
 // v11-layout compat: a blob written WITHOUT the trailing dissolved byte must
-// still load. Surgery: serialize a bound v12 blob, locate the self id, remove
-// the dissolved byte that directly follows it, patch the version field back
+// still load. Surgery: serialize a bound v13 blob, locate the self id, remove
+// everything between the self id and the final unsealed-MSK flag byte (the
+// v12 dissolved byte plus the v13 chain / key-version / transition tail —
+// none of which a v11 reader knows about), patch the version field back
 // to 11 (offset 4, uint32 LE, same idiom as TestSerializeV1StateStillLoads)
 // and recompute the checksum trailer. The v11 reader never reaches the flag
 // read, so the field falls back to its fresh-state default (false).
@@ -2730,12 +2732,16 @@ TEST(TestSerialization, V11BoundBlobWithoutDissolvedByteLoadsFalse) {
   for (size_t index = 0; index + sizeof(self_needle) <= buf->len - CRABS_HASH_SIZE;
        index++) {
     if (memcmp(buf->data + index, self_needle, sizeof(self_needle) - 1) == 0) {
-      // The dissolved byte sits immediately after the self id characters.
-      size_t dissolved_offset = index + sizeof(self_needle) - 1;
+      // Everything between the self id and the trailing unsealed-MSK flag
+      // byte is post-v11 format surface: the v12 dissolved byte and the v13
+      // chain / key-version / transition sections. Drop all of it, leaving
+      // the MSK flag and checksum trailer intact.
+      size_t tail_start = index + sizeof(self_needle) - 1;
       size_t payload_len = buf->len - CRABS_HASH_SIZE;
-      memmove(buf->data + dissolved_offset, buf->data + dissolved_offset + 1,
-              payload_len - dissolved_offset - 1);
-      buf->len -= 1;
+      size_t msk_flag_offset = payload_len - 1;
+      ASSERT_LT(tail_start, msk_flag_offset);
+      buf->data[tail_start] = buf->data[msk_flag_offset];
+      buf->len -= msk_flag_offset - tail_start;
       found = true;
       break;
     }
@@ -2759,4 +2765,273 @@ TEST(TestSerialization, V11BoundBlobWithoutDissolvedByteLoadsFalse) {
 
   state_destroy(restored);
   serialized_buffer_destroy(buf);
+}
+
+// ============================================================
+// v13 (A10-M6): lineage parent key chain + key version + last transition
+// ============================================================
+//
+// Wire layout additions over v12: the binding block's tail gains the child's
+// parent key chain (u8 count >= 1; per entry: u64 key_version + 33-byte
+// public key; entry [0] IS the binding block's spawn pin). Immediately after
+// the binding block — bound or not — come the parent-side fields: u64
+// lineage_key_version and a bytes32 holding the last signed key transition
+// record (capped at LINEAGE_KEY_TRANSITION_WIRE_MAX).
+
+// A rotating parent (node key k1 -> k2 via lineage_key_rotate, so the signed
+// record is stashed as lineage_last_key_transition) and its bound child,
+// whose chain has advanced via lineage_child_accept_key_transition to
+// [{1, k1.public}, {2, k2.public}]. Built with the real APIs so the states
+// satisfy every invariant the writer validates.
+typedef struct {
+  state_t*         parent_state;
+  state_t*         child_state;
+  ecdsa_keypair_t* k1;
+  ecdsa_keypair_t* k2;
+} keychain_wire_fixture_t;
+
+static void keychain_wire_fixture_setup(keychain_wire_fixture_t* fixture) {
+  memset(fixture, 0, sizeof(*fixture));
+  fixture->k1 = crypto_ecdsa_generate();
+  fixture->k2 = crypto_ecdsa_generate();
+  ASSERT_NE(fixture->k1, nullptr);
+  ASSERT_NE(fixture->k2, nullptr);
+
+  fixture->parent_state = state_create();
+  ASSERT_NE(fixture->parent_state, nullptr);
+  ASSERT_EQ(state_set_node_key(fixture->parent_state,
+                               fixture->k1->private_key,
+                               fixture->k1->public_key), CRABS_SUCCESS);
+  // A root parent has no lineage_self_id; the rotate record falls back to
+  // bootstrap_admin (the id children persist as lineage_parent_id).
+  strncpy(fixture->parent_state->config.bootstrap_admin, "parent-red",
+          sizeof(fixture->parent_state->config.bootstrap_admin) - 1);
+
+  fixture->child_state = state_create();
+  ASSERT_NE(fixture->child_state, nullptr);
+  state_t* child = fixture->child_state;
+  memcpy(child->lineage_parent_public_key, fixture->k1->public_key, 33);
+  strncpy(child->lineage_parent_id, "parent-red",
+          sizeof(child->lineage_parent_id) - 1);
+  strncpy(child->lineage_self_id, "child-red",
+          sizeof(child->lineage_self_id) - 1);
+  child->lineage_parent_bound = true;
+  child->lineage_key_chain = (lineage_key_chain_entry_t*)calloc(
+      1, sizeof(lineage_key_chain_entry_t));
+  ASSERT_NE(child->lineage_key_chain, nullptr);
+  child->lineage_key_chain[0].key_version = CRABS_LINEAGE_KEY_VERSION_START;
+  memcpy(child->lineage_key_chain[0].public_key, fixture->k1->public_key, 33);
+  child->lineage_key_chain_count = 1;
+
+  // Rotate the parent (k1 -> k2) and feed the child the signed record, so
+  // both sides carry their v13 surfaces: parent has key_version 2 and the
+  // stashed record; the child has a two-entry chain.
+  uint8_t* record = nullptr;
+  size_t record_len = 0;
+  ASSERT_EQ(lineage_key_rotate(fixture->parent_state,
+                               fixture->k2->private_key,
+                               fixture->k2->public_key,
+                               1700000000000ULL, &record, &record_len),
+            CRABS_SUCCESS);
+  ASSERT_EQ(lineage_child_accept_key_transition(child, record, record_len),
+            CRABS_SUCCESS);
+  free(record);
+}
+
+static void keychain_wire_fixture_destroy(keychain_wire_fixture_t* fixture) {
+  state_destroy(fixture->parent_state);
+  state_destroy(fixture->child_state);
+  crypto_ecdsa_keypair_destroy(fixture->k1);
+  crypto_ecdsa_keypair_destroy(fixture->k2);
+}
+
+TEST(LineageKeyChainWire, RoundTrip) {
+  keychain_wire_fixture_t fixture;
+  keychain_wire_fixture_setup(&fixture);
+
+  // Parent side: the key version and the stashed signed transition record
+  // must survive the blob exactly.
+  serialized_buffer_t* parent_buf = crabs_serialize_state(fixture.parent_state);
+  ASSERT_NE(parent_buf, nullptr);
+  state_t* parent_restored =
+      crabs_deserialize_state_keys(parent_buf->data, parent_buf->len, NULL);
+  ASSERT_NE(parent_restored, nullptr);
+  EXPECT_EQ(parent_restored->lineage_key_version,
+            fixture.parent_state->lineage_key_version);
+  EXPECT_EQ(parent_restored->lineage_key_version,
+            (uint64_t)CRABS_LINEAGE_KEY_VERSION_START + 1);
+  ASSERT_NE(parent_restored->lineage_last_key_transition, nullptr);
+  ASSERT_EQ(parent_restored->lineage_last_key_transition_len,
+            fixture.parent_state->lineage_last_key_transition_len);
+  EXPECT_GT(parent_restored->lineage_last_key_transition_len, 0u);
+  EXPECT_EQ(memcmp(parent_restored->lineage_last_key_transition,
+                   fixture.parent_state->lineage_last_key_transition,
+                   parent_restored->lineage_last_key_transition_len), 0);
+  // A root parent carries no binding and no chain.
+  EXPECT_FALSE(parent_restored->lineage_parent_bound);
+  EXPECT_EQ(parent_restored->lineage_key_chain, nullptr);
+  EXPECT_EQ(parent_restored->lineage_key_chain_count, 0u);
+
+  state_destroy(parent_restored);
+  serialized_buffer_destroy(parent_buf);
+
+  // Child side: the two-entry chain must survive exactly — versions, keys,
+  // and order.
+  serialized_buffer_t* child_buf = crabs_serialize_state(fixture.child_state);
+  ASSERT_NE(child_buf, nullptr);
+  state_t* child_restored =
+      crabs_deserialize_state_keys(child_buf->data, child_buf->len, NULL);
+  ASSERT_NE(child_restored, nullptr);
+  ASSERT_TRUE(child_restored->lineage_parent_bound);
+  ASSERT_EQ(child_restored->lineage_key_chain_count, 2u);
+  EXPECT_EQ(child_restored->lineage_key_chain[0].key_version,
+            (uint64_t)CRABS_LINEAGE_KEY_VERSION_START);
+  EXPECT_EQ(memcmp(child_restored->lineage_key_chain[0].public_key,
+                   fixture.k1->public_key, 33), 0);
+  EXPECT_EQ(child_restored->lineage_key_chain[1].key_version,
+            (uint64_t)CRABS_LINEAGE_KEY_VERSION_START + 1);
+  EXPECT_EQ(memcmp(child_restored->lineage_key_chain[1].public_key,
+                   fixture.k2->public_key, 33), 0);
+  // The child never rotated: no parent-side fields of its own.
+  EXPECT_EQ(child_restored->lineage_key_version, 0u);
+  EXPECT_EQ(child_restored->lineage_last_key_transition, nullptr);
+  EXPECT_EQ(child_restored->lineage_last_key_transition_len, 0u);
+
+  state_destroy(child_restored);
+  serialized_buffer_destroy(child_buf);
+  keychain_wire_fixture_destroy(&fixture);
+}
+
+// A v12-format blob carries no chain — the loader must synthesize the
+// single-entry pin chain (entry [0] == the binding block's public key at
+// CRABS_LINEAGE_KEY_VERSION_START) and leave the parent-side fields at their
+// fresh-state defaults. Surgery: serialize a bound v13 blob, keep the
+// v12 dissolved byte (a v12 blob requires it; it sits directly after the
+// self id and is already 0 for this undissolved fixture), drop the v13
+// sections that follow it — everything up to the trailing unsealed-MSK flag
+// byte — patch the version field back to 12 (offset 4, uint32 LE), and
+// recompute the checksum.
+TEST(LineageKeyChainWire, V12BlobSynthesizesChain) {
+  keychain_wire_fixture_t fixture;
+  keychain_wire_fixture_setup(&fixture);
+
+  serialized_buffer_t* buf = crabs_serialize_state(fixture.child_state);
+  ASSERT_NE(buf, nullptr);
+  keychain_wire_fixture_destroy(&fixture);
+
+  const char self_needle[] = "child-red";
+  bool found = false;
+  for (size_t index = 0; index + sizeof(self_needle) <= buf->len - CRABS_HASH_SIZE;
+       index++) {
+    if (memcmp(buf->data + index, self_needle, sizeof(self_needle) - 1) == 0) {
+      // dissolved_offset + 1 is where the v13 chain section begins.
+      size_t dissolved_offset = index + sizeof(self_needle) - 1;
+      size_t payload_len = buf->len - CRABS_HASH_SIZE;
+      size_t msk_flag_offset = payload_len - 1;
+      ASSERT_LT(dissolved_offset + 1, msk_flag_offset);
+      buf->data[dissolved_offset + 1] = buf->data[msk_flag_offset];
+      buf->len -= msk_flag_offset - dissolved_offset - 1;
+      found = true;
+      break;
+    }
+  }
+  ASSERT_TRUE(found);
+
+  uint32_t version_value = 12;
+  memcpy(buf->data + 4, &version_value, sizeof(version_value));
+
+  uint8_t recomputed_hash[CRABS_HASH_SIZE];
+  SHA256(buf->data, buf->len - CRABS_HASH_SIZE, recomputed_hash);
+  memcpy(buf->data + buf->len - CRABS_HASH_SIZE, recomputed_hash, CRABS_HASH_SIZE);
+
+  state_t* restored = crabs_deserialize_state_keys(buf->data, buf->len, NULL);
+  ASSERT_NE(restored, nullptr);
+  EXPECT_TRUE(restored->lineage_parent_bound);
+  // Chain synthesized from the spawn pin, exactly as the v11/v12 paths do.
+  ASSERT_EQ(restored->lineage_key_chain_count, 1u);
+  EXPECT_EQ(restored->lineage_key_chain[0].key_version,
+            (uint64_t)CRABS_LINEAGE_KEY_VERSION_START);
+  EXPECT_EQ(memcmp(restored->lineage_key_chain[0].public_key,
+                   restored->lineage_parent_public_key, 33), 0);
+  // The dissolved byte survived the surgery (it is v12 surface) and reads
+  // back false; the v13 parent-side fields revert to their defaults.
+  EXPECT_FALSE(restored->lineage_parent_dissolved);
+  EXPECT_EQ(restored->lineage_key_version, 0u);
+  EXPECT_EQ(restored->lineage_last_key_transition, nullptr);
+  EXPECT_EQ(restored->lineage_last_key_transition_len, 0u);
+
+  state_destroy(restored);
+  serialized_buffer_destroy(buf);
+}
+
+// Fail-closed chain validation: the whole load must be refused (state NULL)
+// when the wire chain violates any invariant. Cases: count 0, count above
+// CRABS_MAX_LINEAGE_KEY_CHAIN, non-increasing key versions, entry [0] not
+// equal to the binding block's public key, and a transition length above
+// LINEAGE_KEY_TRANSITION_WIRE_MAX.
+TEST(LineageKeyChainWire, CorruptChainRejected) {
+  keychain_wire_fixture_t fixture;
+  keychain_wire_fixture_setup(&fixture);
+
+  serialized_buffer_t* good_buf = crabs_serialize_state(fixture.child_state);
+  ASSERT_NE(good_buf, nullptr);
+  keychain_wire_fixture_destroy(&fixture);
+
+  // Locate the chain section: the self id's last character is followed by
+  // the dissolved byte, then the count byte, then entry [0] (u64 version +
+  // 33-byte key), then entry [1], then the parent-side u64 key version and
+  // u32 transition length.
+  const char self_needle[] = "child-red";
+  size_t self_end = 0;
+  bool found = false;
+  for (size_t index = 0;
+       index + sizeof(self_needle) <= good_buf->len - CRABS_HASH_SIZE;
+       index++) {
+    if (memcmp(good_buf->data + index, self_needle,
+               sizeof(self_needle) - 1) == 0) {
+      self_end = index + sizeof(self_needle) - 1;
+      found = true;
+      break;
+    }
+  }
+  ASSERT_TRUE(found);
+
+  auto expect_rejected = [&](void (*mutate)(uint8_t* blob, size_t self_end_pos)) {
+    std::vector<uint8_t> tampered(good_buf->data,
+                                  good_buf->data + good_buf->len);
+    mutate(tampered.data(), self_end);
+    uint8_t recomputed_hash[CRABS_HASH_SIZE];
+    SHA256(tampered.data(), tampered.size() - CRABS_HASH_SIZE, recomputed_hash);
+    memcpy(tampered.data() + tampered.size() - CRABS_HASH_SIZE,
+           recomputed_hash, CRABS_HASH_SIZE);
+    state_t* restored =
+        crabs_deserialize_state_keys(tampered.data(), tampered.size(), NULL);
+    EXPECT_EQ(restored, nullptr);
+    if (restored != nullptr) state_destroy(restored);
+  };
+
+  // count = 0: an empty chain cannot satisfy entry [0] == spawn pin.
+  expect_rejected([](uint8_t* blob, size_t pos) { blob[pos + 1] = 0; });
+  // count above CRABS_MAX_LINEAGE_KEY_CHAIN.
+  expect_rejected([](uint8_t* blob, size_t pos) {
+    blob[pos + 1] = (uint8_t)(CRABS_MAX_LINEAGE_KEY_CHAIN + 1);
+  });
+  // Non-increasing key versions: rewind entry [1] to entry [0]'s version.
+  expect_rejected([](uint8_t* blob, size_t pos) {
+    size_t e0 = pos + 2;
+    size_t e1_version = e0 + 8 + 33;
+    memcpy(blob + e1_version, blob + e0, 8);
+  });
+  // Entry [0] public key != the binding block's public key.
+  expect_rejected([](uint8_t* blob, size_t pos) {
+    blob[pos + 2 + 8] ^= 0xFF;
+  });
+  // Record length above LINEAGE_KEY_TRANSITION_WIRE_MAX.
+  expect_rejected([](uint8_t* blob, size_t pos) {
+    size_t len_off = pos + 2 + 2 * (8 + 33) + 8;
+    uint32_t oversized = (uint32_t)LINEAGE_KEY_TRANSITION_WIRE_MAX + 1;
+    memcpy(blob + len_off, &oversized, sizeof(oversized));
+  });
+
+  serialized_buffer_destroy(good_buf);
 }

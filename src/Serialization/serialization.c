@@ -59,6 +59,10 @@
 // (1), 32-byte genesis hash, 64-byte attestation signature, two u64s (16),
 // status (1) = 116 bytes.
 #define CRABS_DESER_MIN_CHILD_ENTRY_WIRE_BYTES 116
+// v13: wire size of one lineage key-chain entry: u64 key version + a 33-byte
+// compressed public key. Bounds the attacker-controlled chain count against
+// the remaining buffer (same audit A-3/A-5 pattern as the sections above).
+#define CRABS_DESER_LINEAGE_CHAIN_ENTRY_WIRE_BYTES (sizeof(uint64_t) + 33)
 
 // ============================================================
 // Write buffer helper
@@ -1612,7 +1616,46 @@ static serialized_buffer_t* _serialize_state_internal(const state_t* state,
     // (v11 tail position). A v11 reader stops before this byte and leaves the
     // runtime default — the flag is additive, not a layout change.
     _write_uint8(buf, state->lineage_parent_dissolved ? 1 : 0);
+    // v13 (A10-M6): child-side parent key chain, count >= 1 (entry [0] is
+    // the spawn pin == the binding block's public key). A bound state whose
+    // chain was never stamped (hand-built, or bound before chains existed)
+    // writes the synthetic single-entry pin chain — entry [0] derives from
+    // the binding block's own key, so the reader's pin-equality gate cannot
+    // refuse it. A stamped chain is validated before writing so the writer
+    // never emits a blob its own reader would reject.
+    if (state->lineage_key_chain_count > 0) {
+      if (state->lineage_key_chain_count > CRABS_MAX_LINEAGE_KEY_CHAIN ||
+          memcmp(state->lineage_key_chain[0].public_key,
+                 state->lineage_parent_public_key, 33) != 0) {
+        free(buf->data);
+        free(buf);
+        return NULL;
+      }
+      for (uint32_t chain_index = 1;
+           chain_index < state->lineage_key_chain_count; chain_index++) {
+        if (state->lineage_key_chain[chain_index].key_version <=
+            state->lineage_key_chain[chain_index - 1].key_version) {
+          free(buf->data);
+          free(buf);
+          return NULL;
+        }
+      }
+      _write_uint8(buf, (uint8_t)state->lineage_key_chain_count);
+      for (uint32_t chain_index = 0;
+           chain_index < state->lineage_key_chain_count; chain_index++) {
+        _write_uint64_le(buf, state->lineage_key_chain[chain_index].key_version);
+        _write_bytes(buf, state->lineage_key_chain[chain_index].public_key, 33);
+      }
+    } else {
+      _write_uint8(buf, 1);
+      _write_uint64_le(buf, CRABS_LINEAGE_KEY_VERSION_START);
+      _write_bytes(buf, state->lineage_parent_public_key, 33);
+    }
   }
+  // v13 (A10-M6): parent-side lineage key version + last signed transition.
+  _write_uint64_le(buf, state->lineage_key_version);
+  _write_bytes32(buf, state->lineage_last_key_transition,
+                 state->lineage_last_key_transition_len);
 
   // MSK (v10): sealed under seal_key when both the machine's authority and a
   // seal key are present. The unkeyed serializer omits the MSK (flag 0) —
@@ -2098,20 +2141,88 @@ static state_t* _deserialize_state_internal(const uint8_t* data, size_t len,
           state->lineage_parent_dissolved = (parent_dissolved == 1);
         }
         state->lineage_parent_bound = true;
-        // A10-M6 (T12): pre-v13 wire formats persist only the spawn pin.
-        // Back-fill chain entry [0] from it — the pin IS chain[0] by the
-        // state's own definition — so the chain-aware verification surfaces
-        // (endorsements, tombstones) keep working for revived bound
-        // machines. A failed allocation refuses the load: a child that
-        // trusts nothing silently is worse than no load at all.
-        state->lineage_key_chain =
-            get_clear_memory(sizeof(lineage_key_chain_entry_t));
-        if (state->lineage_key_chain == NULL) goto fail;
-        state->lineage_key_chain[0].key_version =
-            CRABS_LINEAGE_KEY_VERSION_START;
-        memcpy(state->lineage_key_chain[0].public_key,
-               state->lineage_parent_public_key, 33);
-        state->lineage_key_chain_count = 1;
+        // A10-M6 (T12/T13): exactly ONE chain-construction site per load
+        // path. v13 blobs carry the chain on the wire at the end of the
+        // binding block; pre-v13 formats persist only the spawn pin, so the
+        // chain is synthesized as the single-entry pin chain. A failed
+        // allocation refuses the load: a child that trusts nothing silently
+        // is worse than no load at all.
+        if (version >= 13) {
+          // v13: child-side parent key chain. Fail-closed validation: the
+          // count is in [1, CRABS_MAX_LINEAGE_KEY_CHAIN] and bounded by the
+          // remaining bytes; key versions are strictly increasing (a
+          // rotation history cannot revisit or skip-back a version); entry
+          // [0].public_key MUST equal the binding block's public key — the
+          // chain IS the spawn pin's history, so a mismatch is corruption.
+          // entry [0].key_version is NOT pinned to
+          // CRABS_LINEAGE_KEY_VERSION_START: forward-only continuity is the
+          // accept gate's concern (lineage_child_accept_key_transition),
+          // not the loader's.
+          uint8_t chain_count;
+          if (!_read_uint8(&buf, &chain_count)) goto fail;
+          if (chain_count == 0 || chain_count > CRABS_MAX_LINEAGE_KEY_CHAIN) {
+            goto fail;
+          }
+          if (chain_count >
+              (buf.len - buf.offset) /
+                  CRABS_DESER_LINEAGE_CHAIN_ENTRY_WIRE_BYTES) {
+            goto fail;
+          }
+          state->lineage_key_chain = get_clear_memory(
+              chain_count * sizeof(lineage_key_chain_entry_t));
+          if (state->lineage_key_chain == NULL) goto fail;
+          state->lineage_key_chain_count = chain_count;
+          for (uint32_t chain_index = 0; chain_index < chain_count;
+               chain_index++) {
+            lineage_key_chain_entry_t* chain_entry =
+                &state->lineage_key_chain[chain_index];
+            if (!_read_uint64_le(&buf, &chain_entry->key_version)) goto fail;
+            if (!_read_bytes(&buf, chain_entry->public_key, 33)) goto fail;
+            if (chain_index > 0 &&
+                chain_entry->key_version <= chain_entry[-1].key_version) {
+              goto fail;
+            }
+          }
+          if (memcmp(state->lineage_key_chain[0].public_key,
+                     state->lineage_parent_public_key, 33) != 0) {
+            goto fail;
+          }
+        } else {
+          // v11/v12: back-fill chain entry [0] from the spawn pin — the pin
+          // IS chain[0] by the state's own definition — so the chain-aware
+          // verification surfaces (endorsements, tombstones) keep working
+          // for revived bound machines.
+          state->lineage_key_chain =
+              get_clear_memory(sizeof(lineage_key_chain_entry_t));
+          if (state->lineage_key_chain == NULL) goto fail;
+          state->lineage_key_chain[0].key_version =
+              CRABS_LINEAGE_KEY_VERSION_START;
+          memcpy(state->lineage_key_chain[0].public_key,
+                 state->lineage_parent_public_key, 33);
+          state->lineage_key_chain_count = 1;
+        }
+      }
+      // v13 (A10-M6): parent-side lineage key version + last signed key
+      // transition. Present on every v13 blob (bound or not — a root parent
+      // carries no binding block but still rotates). Older blobs keep the
+      // fresh-state defaults (0 / empty). The transition length is capped by
+      // LINEAGE_KEY_TRANSITION_WIRE_MAX AND the remaining buffer before any
+      // allocation.
+      if (version >= 13) {
+        if (!_read_uint64_le(&buf, &state->lineage_key_version)) goto fail;
+        uint32_t transition_len;
+        if (!_read_uint32_le(&buf, &transition_len)) goto fail;
+        if (transition_len > LINEAGE_KEY_TRANSITION_WIRE_MAX) goto fail;
+        if (transition_len > buf.len - buf.offset) goto fail;
+        if (transition_len > 0) {
+          state->lineage_last_key_transition = get_memory(transition_len);
+          if (state->lineage_last_key_transition == NULL) goto fail;
+          if (!_read_bytes(&buf, state->lineage_last_key_transition,
+                           transition_len)) {
+            goto fail;
+          }
+          state->lineage_last_key_transition_len = transition_len;
+        }
       }
     }
 
