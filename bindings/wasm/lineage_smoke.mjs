@@ -144,8 +144,12 @@ async function main() {
   // Tombstone mint: `u8 tag LINEAGE_DISSOLVED + string16 child_id` +
   // 64-byte parent ECDSA — NO length prefix (the exact bytes a
   // __receive_dissolution__ op transports). The trailing signature is
-  // structurally verified here (nonzero); verifying it against the parent's
-  // public key in wasm would need pub-key plumbing the smoke skips.
+  // verified here as non-trivial (any single ECDSA r||s byte may
+  // legitimately be 0x00, so the only sound structural check without
+  // the parent public key is "not ALL zero"). Full ECDSA verification
+  // is skipped: the node holds its parent key inside the C state and
+  // deliberately does not expose it to JS, so the smoke has no key to
+  // verify against.
   // ------------------------------------------------------------
   const tombstone = parent.lineageTombstone(childId);
   const expectedLength = 3 + childId.length + CRABS_SIG_SIZE;
@@ -164,10 +168,14 @@ async function main() {
   if (tombstoneId !== childId) {
     throw new Error(`tombstone id "${tombstoneId}" != "${childId}"`);
   }
+  // ECDSA r||s legitimately contains 0x00 bytes (~22% of sign runs), so
+  // asserting any zero byte makes this smoke flaky. An all-zero 64-byte
+  // region is effectively impossible for a real signature — mirror the
+  // bindings/node smoke's all-zeros structural check.
   if (tombstone
         .subarray(3 + idLengthPrefix)
-        .some(signatureByteValue => signatureByteValue === 0)) {
-    throw new Error('tombstone signature carries a zero byte (not a real ECDSA)');
+        .every(signatureByteValue => signatureByteValue === 0)) {
+    throw new Error('tombstone signature is all zero bytes (not a real ECDSA)');
   }
 
   console.log('SMOKE OK: children=' + count +
