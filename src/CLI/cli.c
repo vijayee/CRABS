@@ -135,10 +135,10 @@ cli_result_e cli_node_init(cli_node_t* node, const char* admin_id) {
   if (node == NULL || admin_id == NULL) return CLI_ERR_ARGS;
   if (node->initialized) return CLI_ERR_ARGS;
 
-  // Generate ABE master key
-  node->abe_mk = crypto_abe_setup();
-  if (node->abe_mk == NULL) return CLI_ERR_EXEC;
-
+  // The node keeps NO second master key instance. attribute_machine_create
+  // generates the one live ABE master key on base_state.abe_mk; keeping a
+  // node-level copy would create a second, unrelated MSK domain (envelope
+  // creation and op verification would disagree about the keyspace).
   // Generate node ECDSA keypair
   node->node_key = crypto_ecdsa_generate();
   if (node->node_key == NULL) return CLI_ERR_EXEC;
@@ -248,9 +248,11 @@ cli_result_e cli_node_load(cli_node_t* node, const char* path) {
   // Audit: each load re-evaluates snapshot authenticity from scratch.
   node->loaded_unauthenticated = false;
   node->unauth_warning_shown = false;
+  const uint8_t* load_seal_key =
+      node->seal_key_valid ? node->seal_key : NULL;
   if (file_len > CRABS_SIG_SIZE) {
     size_t payload_len = file_len - CRABS_SIG_SIZE;
-    loaded = crabs_deserialize_state(data, payload_len);
+    loaded = crabs_deserialize_state_keys(data, payload_len, load_seal_key);
     if (loaded != NULL) {
       uint8_t* payload_copy = get_memory(payload_len);
       if (payload_copy == NULL) {
@@ -270,7 +272,7 @@ cli_result_e cli_node_load(cli_node_t* node, const char* path) {
     }
   }
   if (loaded == NULL) {
-    loaded = crabs_deserialize_state(data, file_len);
+    loaded = crabs_deserialize_state_keys(data, file_len, load_seal_key);
     if (loaded != NULL) {
       // Audit: the fallback parsed an UNSIGNED blob. Its provenance is
       // unauthenticated — mark the node so cli_node_save refuses to re-sign
@@ -287,23 +289,34 @@ cli_result_e cli_node_load(cli_node_t* node, const char* path) {
 
   if (loaded == NULL) return CLI_ERR_EXEC;
 
-  // Create attribute machine wrapping loaded state
-  node->abe_mk = crypto_abe_setup();
   node->node_key = crypto_ecdsa_generate();
 
-  // NOTE (v10): loaded v10 blobs may arrive as a returned attribute-machine
-  // shell (base_state first member) that ALREADY carries the restored user
-  // registry. The struct-copy + users=NULL wiring below predates v10 and
-  // drops the registry; adopting the shell return is Task 4 (seal-key
-  // custody) of docs/superpowers/plans/2026-10-06-durability-kernel.md.
-  // Build attribute machine from loaded state
-  node->attr_machine = get_clear_memory(sizeof(attribute_machine_t));
-  node->attr_machine->base_state = *loaded;
-  node->attr_machine->users = NULL;
-  node->attr_machine->user_count = 0;
-  node->attr_machine->current_time_ms = 0;
-  node->attr_machine->base_state.attr_machine = node->attr_machine;
-  free(loaded);
+  // v10: when the blob carried a user registry, the deserializer returns an
+  // attribute-machine SHELL (base_state is the first member of
+  // attribute_machine_t, so the returned state pointer IS the shell
+  // allocation) with the registry already spliced in — adopt it directly,
+  // no re-wiring. An identifiable shell has base_state.attr_machine
+  // pointing back at its own allocation; a bare state (empty registry or a
+  // pre-v10 blob) keeps attr_machine NULL and is wrapped the legacy way.
+  if (loaded->attr_machine != NULL &&
+      loaded->attr_machine == (attribute_machine_t*)loaded) {
+    // Adopt the shell wholesale.
+    node->attr_machine = (attribute_machine_t*)loaded;
+    node->attr_machine->base_state.attr_machine = node->attr_machine;
+  } else {
+    // Bare state: build the wrapping attribute machine. The shallow copy
+    // transfers ownership of items/policies/log/etc.; the source state
+    // struct itself carries no embedded registry to leak.
+    node->attr_machine = get_clear_memory(sizeof(attribute_machine_t));
+    node->attr_machine->base_state = *loaded;
+    node->attr_machine->base_state.attr_machine = node->attr_machine;
+    node->attr_machine->users = NULL;
+    node->attr_machine->user_count = 0;
+    node->attr_machine->current_time_ms = 0;
+    free(loaded);
+  }
+
+  node->abe_mk = NULL;   // the single live authority is base_state.abe_mk
 
   state_set_node_key(&node->attr_machine->base_state,
                      node->node_key->private_key,
@@ -386,6 +399,40 @@ cli_result_e cli_node_load_key(cli_node_t* node, const char* private_key_hex) {
   return CLI_OK;
 }
 
+// Durability (v10): import the operator's at-rest seal key. Stored in
+// memory only; never serialized anywhere. Re-import replaces the key
+// wholesale (the raw bytes are overwritten in place).
+cli_result_e cli_node_set_seal_key(cli_node_t* node, const char* key_hex) {
+  if (node == NULL || key_hex == NULL) return CLI_ERR_ARGS;
+  if (strlen(key_hex) != 64) {
+    fprintf(stderr, "ERROR: seal key must be 64 hex chars (32 bytes)\n");
+    return CLI_ERR_ARGS;
+  }
+  if (cli_hex_to_bytes(key_hex, node->seal_key, 32) != CLI_OK) {
+    return CLI_ERR_ARGS;
+  }
+  node->seal_key_valid = true;
+  return CLI_OK;
+}
+
+cli_result_e cli_node_load_sealed(cli_node_t* node, const char* path,
+                                    const char* key_hex) {
+  if (node == NULL || path == NULL || key_hex == NULL) return CLI_ERR_ARGS;
+  if (node->initialized) return CLI_ERR_ARGS;
+  if (cli_node_set_seal_key(node, key_hex) != CLI_OK) return CLI_ERR_ARGS;
+
+  cli_result_e result = cli_node_load(node, path);
+  if (result != CLI_OK) {
+    // Do not leave a half-imported seal key on a failed load.
+    node->seal_key_valid = false;
+    OPENSSL_cleanse(node->seal_key, sizeof(node->seal_key));
+    return result;
+  }
+  // The seal key is KEPT in node storage after a successful load: the next
+  // cli_node_save must seal the MSK under the same key.
+  return CLI_OK;
+}
+
 cli_result_e cli_node_save(cli_node_t* node, const char* path) {
   if (node == NULL || path == NULL || !node->initialized) return CLI_ERR_ARGS;
 
@@ -411,12 +458,43 @@ cli_result_e cli_node_save(cli_node_t* node, const char* path) {
     return CLI_ERR_EXEC;
   }
 
+  // Durability: refuse to persist without a seal key — an unsealed snapshot
+  // silently loses the machine's authority (fresh MSK on reload).
+  if (!node->seal_key_valid) {
+    fprintf(stderr,
+            "ERROR: refusing to save — no at-rest seal key imported; the "
+            "machine's ABE master key would be lost. Run 'seal-key import "
+            "<keyfile>' first\n");
+    return CLI_ERR_EXEC;
+  }
+
   // Audit M-1: sign the state blob with the node private key. The bare
   // SHA-256 checksum written by the unsigned serializer is integrity only —
   // an attacker who can write the file can recompute it.
+  // Durability (v10): seal the MSK under the at-rest key, then append the
+  // node-key signature over the sealed payload (seal and sign compose;
+  // this is crabs_serialize_state_sealed + the signed-trailer logic).
+  if (!node->attr_machine->base_state.node_key_valid) return CLI_ERR_EXEC;
+  serialized_buffer_t* sealed_payload =
+      crabs_serialize_state_sealed(&node->attr_machine->base_state,
+                                   node->seal_key);
+  if (sealed_payload == NULL) return CLI_ERR_EXEC;
   serialized_buffer_t* buf =
-      crabs_serialize_state_signed(&node->attr_machine->base_state);
-  if (buf == NULL) return CLI_ERR_EXEC;
+      serialized_buffer_create(sealed_payload->len + CRABS_SIG_SIZE);
+  if (buf == NULL) {
+    serialized_buffer_destroy(sealed_payload);
+    return CLI_ERR_EXEC;
+  }
+  memcpy(buf->data, sealed_payload->data, sealed_payload->len);
+  buf->len = sealed_payload->len + CRABS_SIG_SIZE;
+  if (crypto_ecdsa_sign(node->attr_machine->base_state.node_private_key,
+                        sealed_payload->data, sealed_payload->len,
+                        buf->data + sealed_payload->len) != CRABS_SUCCESS) {
+    serialized_buffer_destroy(sealed_payload);
+    serialized_buffer_destroy(buf);
+    return CLI_ERR_EXEC;
+  }
+  serialized_buffer_destroy(sealed_payload);
 
   FILE* f = fopen(path, "wb");
   if (f == NULL) {
@@ -802,7 +880,7 @@ cli_result_e cli_cmd_key_revoke(cli_node_t* node, const char* user_id,
   // Audit H-B: node-blind rotation. The node records the user's new public
   // key and issues an envelope; it never generates or holds the private key.
   recovery_result_t* result = crypto_revoke_and_rotate(
-      node->abe_mk,
+      (const abe_master_key_t*)node->attr_machine->base_state.abe_mk,
       node->node_key->private_key,
       node->attr_machine,
       user_id,
@@ -1161,7 +1239,9 @@ void cli_print_usage(const char* prog) {
   printf("Commands:\n");
   printf("  init <admin_id>          Initialize a new CRABS node\n");
   printf("  load <path>              Load node state from file\n");
-  printf("  save <path>              Save node state to file\n");
+  printf("  load-sealed <path> <keyfile>  Load state and restore its sealed master key\n");
+  printf("  save <path>              Save node state to file (requires an imported seal key)\n");
+  printf("  seal-key import <keyfile>  Import the at-rest seal key (64 hex chars; in memory only)\n");
   _print_state_usage();
   _print_user_usage();
   _print_item_usage();
@@ -1215,10 +1295,52 @@ cli_result_e cli_dispatch(cli_node_t* node, int argc, char** argv) {
     return cli_node_save(node, argv[2]);
   }
 
+  if (strcmp(cmd, "seal-key") == 0) {
+    if (argc >= 3 && strcmp(argv[2], "import") == 0) {
+      if (argc < 4) {
+        printf("Usage: %s seal-key import <keyfile with 64 hex chars>\n", argv[0]);
+        return CLI_ERR_ARGS;
+      }
+      char hex[65] = {0};
+      FILE* seal_file = fopen(argv[3], "r");
+      if (seal_file == NULL) return CLI_ERR_IO;
+      if (fread(hex, 1, 64, seal_file) != 64) {
+        fclose(seal_file);
+        return CLI_ERR_IO;
+      }
+      fclose(seal_file);
+      cli_result_e result = cli_node_set_seal_key(node, hex);
+      OPENSSL_cleanse(hex, sizeof(hex));
+      if (result == CLI_OK) printf("Seal key imported (in memory only).\n");
+      return result;
+    }
+    printf("Usage: %s seal-key import <keyfile>\n", argv[0]);
+    return CLI_ERR_ARGS;
+  }
+
+  if (strcmp(cmd, "load-sealed") == 0) {
+    if (argc < 4) {
+      printf("Usage: %s load-sealed <path> <seal-key-file>\n", argv[0]);
+      return CLI_ERR_ARGS;
+    }
+    char hex[65] = {0};
+    FILE* seal_file = fopen(argv[3], "r");
+    if (seal_file == NULL) return CLI_ERR_IO;
+    if (fread(hex, 1, 64, seal_file) != 64) {
+      fclose(seal_file);
+      return CLI_ERR_IO;
+    }
+    fclose(seal_file);
+    cli_result_e result = cli_node_load_sealed(node, argv[2], hex);
+    OPENSSL_cleanse(hex, sizeof(hex));
+    return result;
+  }
+
   // Check for known commands before init gate
   if (strcmp(cmd, "state") != 0 && strcmp(cmd, "user") != 0 &&
       strcmp(cmd, "item") != 0 && strcmp(cmd, "policy") != 0 &&
-      strcmp(cmd, "key") != 0 && strcmp(cmd, "op") != 0) {
+      strcmp(cmd, "key") != 0 && strcmp(cmd, "op") != 0 &&
+      strcmp(cmd, "seal-key") != 0 && strcmp(cmd, "load-sealed") != 0) {
     printf("Unknown command: %s\n", cmd);
     cli_print_usage(argv[0]);
     return CLI_ERR_ARGS;

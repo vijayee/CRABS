@@ -29,6 +29,19 @@ protected:
   }
 };
 
+// Durability (v10): cli_node_save persists a SEALED MSK and refuses to save
+// without an imported at-rest seal key. Tests that save must import this
+// fixed test seal key first (in-memory custody, never serialized).
+static bool _apply_test_seal_key(cli_node_t* node) {
+  const uint8_t test_seal_key[32] = {
+    1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,
+    17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32
+  };
+  memcpy(node->seal_key, test_seal_key, sizeof(test_seal_key));
+  node->seal_key_valid = true;
+  return true;
+}
+
 // ============================================================
 // Node Lifecycle Tests
 // ============================================================
@@ -43,7 +56,10 @@ TEST_F(TestCLI, InitNode) {
   EXPECT_EQ(rc, CLI_OK);
   EXPECT_TRUE(node->initialized);
   EXPECT_NE(node->attr_machine, nullptr);
-  EXPECT_NE(node->abe_mk, nullptr);
+  // Single live authority: the node keeps NO second master key instance —
+  // the attribute machine's base_state.abe_mk is the only MSK.
+  EXPECT_EQ(node->abe_mk, nullptr);
+  EXPECT_NE(node->attr_machine->base_state.abe_mk, nullptr);
   EXPECT_NE(node->node_key, nullptr);
 }
 
@@ -418,6 +434,7 @@ TEST_F(TestCLI, DispatchUserRegister) {
 
 TEST_F(TestCLI, SaveLoadRoundTrip) {
   cli_node_init(node, "admin");
+  ASSERT_TRUE(_apply_test_seal_key(node));
 
   // Add some state
   cli_cmd_item_add(node, "counter1", "counter");
@@ -486,6 +503,7 @@ static bool test_write_file_bytes(const char* path, const std::vector<uint8_t>& 
 
 TEST_F(TestCLI, SaveLoadSignedRoundTripAuthenticates) {
   ASSERT_EQ(cli_node_init(node, "admin"), CLI_OK);
+  ASSERT_TRUE(_apply_test_seal_key(node));
   ASSERT_EQ(cli_cmd_item_add(node, "counter1", "counter"), CLI_OK);
 
   // The operator persists the node private key out-of-band; capture it here
@@ -514,6 +532,7 @@ TEST_F(TestCLI, SaveLoadSignedRoundTripAuthenticates) {
 
 TEST_F(TestCLI, LoadRejectsTamperedSignedState) {
   ASSERT_EQ(cli_node_init(node, "admin"), CLI_OK);
+  ASSERT_TRUE(_apply_test_seal_key(node));
   ASSERT_EQ(cli_cmd_item_add(node, "counter1", "counter"), CLI_OK);
 
   const char* tmp_path = "/tmp/crabs_test_tampered_state.bin";
@@ -539,6 +558,7 @@ TEST_F(TestCLI, LoadRejectsTamperedSignedState) {
 
 TEST_F(TestCLI, KeyImportRejectsRechecksummedTamperedState) {
   ASSERT_EQ(cli_node_init(node, "admin"), CLI_OK);
+  ASSERT_TRUE(_apply_test_seal_key(node));
   char node_private_key_hex[65];
   cli_bytes_to_hex(node->node_key->private_key, 32, node_private_key_hex);
   ASSERT_EQ(cli_cmd_item_add(node, "counter1", "counter"), CLI_OK);
@@ -601,6 +621,7 @@ TEST_F(TestCLI, LoadLegacyUnsignedStateStillWorks) {
 
 TEST_F(TestCLI, SaveRefusesUnverifiedLoadedState) {
   ASSERT_EQ(cli_node_init(node, "admin"), CLI_OK);
+  ASSERT_TRUE(_apply_test_seal_key(node));
   char node_private_key_hex[65];
   cli_bytes_to_hex(node->node_key->private_key, 32, node_private_key_hex);
   ASSERT_EQ(cli_cmd_item_add(node, "counter1", "counter"), CLI_OK);
@@ -612,6 +633,9 @@ TEST_F(TestCLI, SaveRefusesUnverifiedLoadedState) {
   ASSERT_NE(loaded_node, nullptr);
   ASSERT_EQ(cli_node_load(loaded_node, tmp_path), CLI_OK);
   ASSERT_TRUE(loaded_node->state_sig_pending);
+  // Re-saving the verified snapshot also needs a seal key (same durability
+  // contract as any save).
+  ASSERT_TRUE(_apply_test_seal_key(loaded_node));
 
   // Do not persist state whose provenance is unverified: the save would
   // re-sign it with the ephemeral load-time key no one holds.
@@ -662,6 +686,8 @@ TEST_F(TestCLI, SaveRefusesUnacknowledgedUnsignedState) {
   ASSERT_EQ(cli_node_load(loaded_node, tmp_path), CLI_OK);
   // The unsigned fallback must mark the snapshot unauthenticated.
   EXPECT_TRUE(loaded_node->loaded_unauthenticated);
+  // Re-saving after acknowledgment also needs a seal key.
+  ASSERT_TRUE(_apply_test_seal_key(loaded_node));
 
   // Save must refuse — re-saving would put THIS node's signature on
   // unauthenticated state (signature laundering).
@@ -680,6 +706,7 @@ TEST_F(TestCLI, SaveRefusesUnacknowledgedUnsignedState) {
 
 TEST_F(TestCLI, SignedVerifiedLoadNeedsNoAcknowledgment) {
   ASSERT_EQ(cli_node_init(node, "admin"), CLI_OK);
+  ASSERT_TRUE(_apply_test_seal_key(node));
   ASSERT_EQ(cli_cmd_item_add(node, "counter1", "counter"), CLI_OK);
   char node_private_key_hex[65];
   cli_bytes_to_hex(node->node_key->private_key, 32, node_private_key_hex);
@@ -693,6 +720,8 @@ TEST_F(TestCLI, SignedVerifiedLoadNeedsNoAcknowledgment) {
   // A signed snapshot is pending verification, not unauthenticated.
   EXPECT_TRUE(loaded_node->state_sig_pending);
   EXPECT_FALSE(loaded_node->loaded_unauthenticated);
+  // Re-saving the verified snapshot also needs a seal key.
+  ASSERT_TRUE(_apply_test_seal_key(loaded_node));
 
   // Save is gated on signature verification (existing M-1 behavior), and
   // once verified no acknowledgment is needed.
@@ -733,6 +762,8 @@ TEST_F(TestCLI, DispatchStateAcceptUnverifiedClearsGate) {
   ASSERT_NE(loaded_node, nullptr);
   ASSERT_EQ(cli_node_load(loaded_node, tmp_path), CLI_OK);
   ASSERT_TRUE(loaded_node->loaded_unauthenticated);
+  // Re-saving after acknowledgment also needs a seal key.
+  ASSERT_TRUE(_apply_test_seal_key(loaded_node));
 
   const char* save_argv[] = {"crabs", "save", "/tmp/crabs_test_dispatch_out.bin"};
   EXPECT_EQ(cli_dispatch(loaded_node, 3, (char**)save_argv), CLI_ERR_EXEC);
@@ -922,4 +953,161 @@ TEST_F(TestCLI, OpSubmitSignsWithCustodiedKey) {
   // A user with no custodied key cannot submit (unsigned op is rejected).
   cli_cmd_user_register(node, "bob", pk_hex);
   EXPECT_NE(cli_cmd_op_submit(node, CRABS_OP_LOCK, nullptr, "bob"), CLI_OK);
+}
+
+// ============================================================
+// Durability (v10): seal-key custody and the save fail-loud gate.
+// Saving without an at-rest seal key would silently lose the machine's
+// ABE master key (a reload gets a FRESH MSK and every previously issued
+// envelope becomes garbage), so cli_node_save refuses.
+// ============================================================
+
+TEST(TestCliDurability, SaveRefusesWithoutSealKey) {
+  cli_node_t* node = cli_node_create();
+  ASSERT_EQ(cli_node_init(node, "admin"), CLI_OK);
+  EXPECT_FALSE(node->seal_key_valid);
+  EXPECT_NE(cli_node_save(node, "/tmp/crabs-noseal.crabs"), CLI_OK);
+  // The refusal is a durability gate, not a transient error: still refused
+  // after the operator retries without importing a key.
+  EXPECT_NE(cli_node_save(node, "/tmp/crabs-noseal.crabs"), CLI_OK);
+  cli_node_destroy(node);
+}
+
+TEST(TestCliDurability, SealKeyRoundTripPreservesUsersAndAuthority) {
+  cli_node_t* node = cli_node_create();
+  ASSERT_EQ(cli_node_init(node, "admin"), CLI_OK);
+  ASSERT_TRUE(_apply_test_seal_key(node));
+  // Register a second user through the attribute machine. initial_attrs
+  // stays empty: register_user must not mint privileged "role:*" attributes
+  // (R7-08) — attributes are granted via the admin grant path, not here.
+  ecdsa_keypair_t* other = crypto_ecdsa_generate();
+  ASSERT_NE(other, nullptr);
+  ASSERT_EQ(attribute_machine_register_user(node->attr_machine, "writer",
+            other->public_key, ""), CRABS_SUCCESS);
+  crypto_ecdsa_keypair_destroy(other);
+
+  ASSERT_EQ(cli_node_save(node, "/tmp/crabs-durable.crabs"), CLI_OK);
+  cli_node_destroy(node);
+
+  cli_node_t* reloaded = cli_node_create();
+  const uint8_t test_seal_key[32] = {
+    1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,
+    17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32
+  };
+  char seal_hex[65];
+  cli_bytes_to_hex(test_seal_key, 32, seal_hex);
+  seal_hex[64] = '\0';
+  ASSERT_EQ(cli_node_load_sealed(reloaded, "/tmp/crabs-durable.crabs",
+            seal_hex), CLI_OK);
+  ASSERT_NE(attribute_machine_find_user(reloaded->attr_machine, "writer"),
+            nullptr);
+  ASSERT_NE(attribute_machine_find_user(reloaded->attr_machine, "admin"),
+            nullptr);
+  // Authority preserved: the reloaded MSK is in the same domain (it can
+  // mint a user key that verifies against the machine's policy engine).
+  user_t* writer =
+      attribute_machine_find_user(reloaded->attr_machine, "writer");
+  ASSERT_NE(writer, nullptr);
+  // state_t::abe_mk is a type-erased void* in the data model; cast to the
+  // concrete key type for keygen (same pattern as test_serialization.cpp).
+  abe_user_key_t* sk = crypto_abe_keygen(
+      (const abe_master_key_t*)reloaded->attr_machine->base_state.abe_mk,
+      "role:writer");
+  ASSERT_NE(sk, nullptr);
+  crypto_abe_user_key_destroy(sk);
+  cli_node_destroy(reloaded);
+  remove("/tmp/crabs-durable.crabs");
+}
+
+TEST(TestCliDurability, SealKeyImportRejectsBadHex) {
+  cli_node_t* node = cli_node_create();
+  ASSERT_NE(node, nullptr);
+  // Wrong length, invalid characters, and NULL are all refused; a refusal
+  // must not leave a half-imported key behind.
+  EXPECT_EQ(cli_node_set_seal_key(node, "abcd"), CLI_ERR_ARGS);
+  EXPECT_EQ(cli_node_set_seal_key(node,
+            "zz1111111111111111111111111111111111111111111111111111111111111"),
+            CLI_ERR_ARGS);
+  EXPECT_EQ(cli_node_set_seal_key(node, nullptr), CLI_ERR_ARGS);
+  EXPECT_FALSE(node->seal_key_valid);
+  cli_node_destroy(node);
+}
+
+TEST(TestCliDurability, LoadSealedRejectsBadKeyHexBeforeReading) {
+  cli_node_t* node = cli_node_create();
+  ASSERT_NE(node, nullptr);
+  // A malformed key hex is refused before any load attempt; no half-imported
+  // seal key remains.
+  EXPECT_EQ(cli_node_load_sealed(node, "/tmp/crabs-durable-should-not-exist",
+            "abcd"), CLI_ERR_ARGS);
+  EXPECT_FALSE(node->seal_key_valid);
+  EXPECT_FALSE(node->initialized);
+  cli_node_destroy(node);
+}
+
+TEST(TestCliDurability, LoadSealedFailClearsImportedKey) {
+  cli_node_t* node = cli_node_create();
+  ASSERT_NE(node, nullptr);
+  // A failed load must not leave a half-imported seal key on the node.
+  EXPECT_EQ(cli_node_load_sealed(node, "/tmp/crabs-nosuch-file-9876",
+            "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20"),
+            CLI_ERR_IO);
+  EXPECT_FALSE(node->seal_key_valid);
+  EXPECT_FALSE(node->initialized);
+  cli_node_destroy(node);
+}
+
+// Dispatch wiring: 'seal-key import' reads the 64-hex-char key from a file
+// and cleanses the hex buffer; the imported key then lets a save succeed.
+TEST(TestCliDurability, DispatchSealKeyImportEnablesSave) {
+  cli_node_t* node = cli_node_create();
+  ASSERT_NE(node, nullptr);
+  ASSERT_EQ(cli_node_init(node, "admin"), CLI_OK);
+
+  const char* key_hex =
+      "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20";
+  const char* key_path = "/tmp/crabs_test_seal_key.hex";
+  ASSERT_TRUE(test_write_file_bytes(key_path, std::vector<uint8_t>(
+      key_hex, key_hex + strlen(key_hex))));
+
+  char* import_argv[] = {(char*)"crabs", (char*)"seal-key", (char*)"import",
+                         (char*)key_path};
+  EXPECT_EQ(cli_dispatch(node, 4, import_argv), CLI_OK);
+  EXPECT_TRUE(node->seal_key_valid);
+
+  EXPECT_EQ(cli_node_save(node, "/tmp/crabs_test_sealed_dispatch.crabs"),
+            CLI_OK);
+
+  // save via dispatch works with the imported key too.
+  char* save_argv[] = {(char*)"crabs", (char*)"save",
+                       (char*)"/tmp/crabs_test_sealed_dispatch.crabs"};
+  EXPECT_EQ(cli_dispatch(node, 3, save_argv), CLI_OK);
+
+  remove(key_path);
+  remove("/tmp/crabs_test_sealed_dispatch.crabs");
+  cli_node_destroy(node);
+}
+
+TEST(TestCliDurability, DispatchSealKeyImportBadFileFails) {
+  cli_node_t* node = cli_node_create();
+  ASSERT_NE(node, nullptr);
+  ASSERT_EQ(cli_node_init(node, "admin"), CLI_OK);
+
+  // Missing file is an IO error; a short file is refused; the node keeps no
+  // partial seal key in either case.
+  char* missing_argv[] = {(char*)"crabs", (char*)"seal-key", (char*)"import",
+                          (char*)"/tmp/crabs_no_such_seal_file"};
+  EXPECT_EQ(cli_dispatch(node, 4, missing_argv), CLI_ERR_IO);
+  EXPECT_FALSE(node->seal_key_valid);
+
+  const char* key_path = "/tmp/crabs_test_short_seal_key.hex";
+  ASSERT_TRUE(test_write_file_bytes(key_path, std::vector<uint8_t>(
+      {'a', 'b', 'c', 'd'})));
+  char* short_argv[] = {(char*)"crabs", (char*)"seal-key", (char*)"import",
+                        (char*)key_path};
+  EXPECT_EQ(cli_dispatch(node, 4, short_argv), CLI_ERR_IO);
+  EXPECT_FALSE(node->seal_key_valid);
+  remove(key_path);
+
+  cli_node_destroy(node);
 }

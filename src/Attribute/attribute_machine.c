@@ -336,7 +336,8 @@ attribute_machine_t* attribute_machine_create(const char* admin_id, const uint8_
 
 // Shared teardown for the user registry (v10 durability): frees every user
 // along the linked list together with its keyring and temporary attributes,
-// leaving counts untouched — the machine is typically about to be destroyed.
+// then clears am->users and am->user_count so the machine reports an empty
+// registry after the call — the machine is typically about to be destroyed.
 void attribute_users_destroy_all(attribute_machine_t* am) {
   if (am == NULL) return;
 

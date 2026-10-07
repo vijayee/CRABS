@@ -62,6 +62,10 @@ typedef struct {
   bool                 loaded_unauthenticated;
   bool                 unauth_warning_shown;
   bool                 initialized;
+  // Durability (v10): the operator's at-rest seal key for the machine MSK.
+  // 32 raw bytes imported from a keyfile; never serialized anywhere.
+  uint8_t              seal_key[32];
+  bool                 seal_key_valid;
 } cli_node_t;
 
 // Add (or replace) a per-user signing key the CLI can use to sign operations
@@ -84,6 +88,16 @@ cli_result_e cli_node_load(cli_node_t* node, const char* path);
 // derived public key must match a registered user; that user's id is used as
 // the custody alias.
 cli_result_e cli_node_load_key(cli_node_t* node, const char* private_key_hex);
+// Import the at-rest seal key (64 hex chars, decoded to 32 raw bytes). Once
+// set, cli_node_save persists the ABE MSK sealed under it and cli_node_load
+// unseals a saved MSK with it. Re-import replaces the key wholesale. Stored
+// in memory only — it is never serialized to any file.
+cli_result_e cli_node_set_seal_key(cli_node_t* node, const char* key_hex);
+// Load a state file whose MSK section is sealed: sets the seal key BEFORE
+// loading so the machine's authority (the MSK) is restored during the
+// parse. key_hex is the 64-hex-char seal key.
+cli_result_e cli_node_load_sealed(cli_node_t* node, const char* path,
+                                    const char* key_hex);
 cli_result_e cli_node_save(cli_node_t* node, const char* path);
 
 // ============================================================
