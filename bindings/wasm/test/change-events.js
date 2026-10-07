@@ -19,6 +19,10 @@ async function main() {
   node.grantRole('alice', 'role', 'member', 'admin');
   node.addCounter('views');
   node.setPolicy('view', 'AND role:member adult');
+  // The engine no longer silently no-ops handler-less, resource-less custom
+  // ops, so the view op needs a registered handler to execute (the handler
+  // fires the same op change event the old no-op path did).
+  node.registerHandlerJs('view', (state) => { return 0; });
 
   const op = await Operation.create('view');
   op.signerId = 'alice';
@@ -87,6 +91,9 @@ async function runProdCheck() {
     prodNode.registerUser('alice', prodKey.publicKeyHex(), 'adult');
     prodNode.grantRole('alice', 'role', 'member', 'admin');
     prodNode.setPolicy('view', 'AND role:member adult');
+    // Same engine contract as the dev run: handler-less resource-less custom
+    // ops fail, so register the handler ahead of the executed op.
+    prodNode.registerHandlerJs('view', (state) => { return 0; });
     const prodOp = await ProdOperation.create('view');
     prodOp.signerId = 'alice';
     prodOp.nodeId = 'alice';

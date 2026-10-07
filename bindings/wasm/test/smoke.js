@@ -16,6 +16,9 @@ const { Node, KeyPair, Operation } = require('..');
   node.addRegister('vote_alice', 0);
   node.setPolicy('view', 'AND role:member adult');
   node.setPolicy('like', 'AND role:member adult');
+  // The engine no longer silently no-ops handler-less, resource-less custom
+  // ops, so the view op needs a registered handler to execute.
+  node.registerHandlerJs('view', (state) => { return 0; });
 
   const op = await Operation.create('view');
   op.signerId = 'alice';
@@ -78,10 +81,22 @@ const { Node, KeyPair, Operation } = require('..');
   }
 
   node.unregisterHandler('ping');
+  // After unregister the ping op has no handler anymore. The engine no
+  // longer silently no-ops handler-less, resource-less custom ops — it must
+  // reject the execution with resource_not_found instead.
   const pingOp3 = await Operation.create('ping');
   pingOp3.signerId = 'alice';
   node.sign(pingOp3, key.privateKeyHex());
-  node.execute(pingOp3);
+  let unregisteredPingRejected = false;
+  try {
+    node.execute(pingOp3);
+  } catch (unregisteredPingError) {
+    unregisteredPingRejected =
+      unregisteredPingError.message.includes('resource_not_found');
+  }
+  if (!unregisteredPingRejected) {
+    throw new Error('Executing an unregistered handler op must fail loudly');
+  }
   if (node.getCounter('pings') !== 1) {
     throw new Error(`Expected pings=1 after unregister, got ${node.getCounter('pings')}`);
   }

@@ -59,6 +59,9 @@ async function testPerNodeDrain(dev, module) {
     node.grantRole(actorId, 'role', 'member', adminId);
     node.addCounter('views');
     node.setPolicy('view', 'role:member');
+    // The engine no longer silently no-ops handler-less, resource-less
+    // custom ops, so the view op needs a registered handler to execute.
+    node.registerHandlerJs('view', (state) => { return 0; });
   }
 
   // Any leftover events from earlier tests in this process must not leak
