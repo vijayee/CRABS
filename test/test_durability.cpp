@@ -793,3 +793,294 @@ TEST(TestDurability, LineageSurfacesEndToEnd) {
   remove(child_path);
   remove(blueprint_path);
 }
+
+// Attach a live attestation to an op shell (the signing image excludes
+// attestations — the same idiom test_lineage.cpp uses; op shells are
+// destroyed with operation_destroy, which frees the attached copy).
+static void test_attach_attestation(operation_t* op, const attestation_t* att) {
+  op->attestations = (attestation_t*)malloc(sizeof(attestation_t));
+  ASSERT_NE(op->attestations, nullptr);
+  op->attestations[0] = *att;
+  op->attestation_count = 1;
+}
+
+// The lineage dissolve deferred fix, closed END TO END across processes:
+// the parent machine dissolves a child it last saw in a PREVIOUS process
+// (the child's in-process copy is destroyed with the first parent process,
+// so the runtime severed flag can never leak into the child's FILE), prints
+// the dissolution tombstone via cli_dispatch, and the child — a machine
+// under a SEPARATE cli_node_t loaded from its own saved file, in no way
+// related to the first child instance — learns of the severance ONLY
+// through 'machine accept-tombstone'. The delivered flag is durable (v12):
+// it survives the child's own save/reload, and the custody chain it ends is
+// proven by a still-valid @parent/ endorsement op refusing afterwards.
+TEST(TestDurability, DissolutionSurvivesRestartThroughTombstoneDelivery) {
+  const char* parent_path = "/tmp/crabs-dissolution-parent.crabs";
+  const char* child_path = "/tmp/crabs-dissolution-child.crabs";
+  const char* child_saved_path = "/tmp/crabs-dissolution-child-saved.crabs";
+  const char* blueprint_path = "/tmp/crabs-dissolution.cbp";
+  const char* tombstone_hex_path = "/tmp/crabs-dissolution-tombstone.hex";
+
+  // ------------------------------------------------------------------
+  // 1. Parent through the CLI layer: seal-key custody + lineage installer;
+  //    its node key doubles as the genesis-registered child admin's signing
+  //    key (DELEGATED_COPY registers "child-admin" under the parent's node
+  //    public key — the established test custody model).
+  // ------------------------------------------------------------------
+  cli_node_t* node = cli_node_create();
+  ASSERT_NE(node, nullptr);
+  ASSERT_EQ(cli_node_init(node, "parent-root"), CLI_OK);
+
+  char seal_hex[65];
+  _import_test_seal_key(node, seal_hex);
+  lineage_install(&node->attr_machine->base_state);
+
+  char parent_priv_hex[65];
+  cli_bytes_to_hex(node->node_key->private_key, 32, parent_priv_hex);
+  parent_priv_hex[64] = '\0';
+  ecdsa_keypair_t parent_key_snapshot = *node->node_key;
+
+  // ------------------------------------------------------------------
+  // 2. Blueprint through dispatch. The child policy "render" resolves ONLY
+  //    through a @parent/ endorsement — the op whose authorization the
+  //    custody payoff below will exercise after the delivery.
+  // ------------------------------------------------------------------
+  char* new_argv[] = {(char*)"crabs_node", (char*)"machine", (char*)"blueprint",
+                      (char*)"new", (char*)"child-red", (char*)"delegated",
+                      (char*)"child-admin", (char*)"3600000"};
+  ASSERT_EQ(cli_dispatch(node, 8, new_argv), CLI_OK);
+  char* item_argv[] = {(char*)"crabs_node", (char*)"machine", (char*)"blueprint",
+                       (char*)"item", (char*)"counter1", (char*)"counter",
+                       (char*)"g_counter"};
+  ASSERT_EQ(cli_dispatch(node, 7, item_argv), CLI_OK);
+  char* policy_argv[] = {(char*)"crabs_node", (char*)"machine",
+                         (char*)"blueprint", (char*)"policy", (char*)"render",
+                         (char*)"@parent/role:writer"};
+  ASSERT_EQ(cli_dispatch(node, 6, policy_argv), CLI_OK);
+  char* dedup_argv[] = {(char*)"crabs_node", (char*)"machine", (char*)"blueprint",
+                        (char*)"dedup", (char*)"render", (char*)"none"};
+  ASSERT_EQ(cli_dispatch(node, 6, dedup_argv), CLI_OK);
+  char* save_argv[] = {(char*)"crabs_node", (char*)"machine", (char*)"blueprint",
+                       (char*)"save", (char*)blueprint_path};
+  ASSERT_EQ(cli_dispatch(node, 5, save_argv), CLI_OK);
+
+  // ------------------------------------------------------------------
+  // 3. Spawn via the op pipeline, then mint a LIVE attestation for the
+  //    child admin and keep it: the endorsement material the dissolved
+  //    lineage must stop honoring even though it stays cryptographically
+  //    valid ("revocation stops issuing, dissolution voids endorsements").
+  // ------------------------------------------------------------------
+  char* spawn_argv[] = {(char*)"crabs_node", (char*)"machine", (char*)"spawn",
+                        (char*)blueprint_path};
+  ASSERT_EQ(cli_dispatch(node, 4, spawn_argv), CLI_OK);
+  state_t* parent_state = &node->attr_machine->base_state;
+
+  const char* captured_path = "/tmp/crabs-dissolution-attest-captured.log";
+  FILE* captured_stream = fopen(captured_path, "w");
+  ASSERT_NE(captured_stream, nullptr);
+  FILE* saved_stdout = stdout;
+  stdout = captured_stream;
+  char* attest_argv[] = {(char*)"crabs_node", (char*)"machine", (char*)"attest",
+                         (char*)"child-red", (char*)"child-admin",
+                         (char*)"role:writer"};
+  ASSERT_EQ(cli_dispatch(node, 6, attest_argv), CLI_OK);
+  fflush(captured_stream);
+  fclose(captured_stream);
+  stdout = saved_stdout;
+  std::vector<uint8_t> captured_bytes;
+  ASSERT_TRUE(test_read_saved_bytes(captured_path, captured_bytes));
+  std::string captured(captured_bytes.begin(), captured_bytes.end());
+  std::vector<uint8_t> attestation_wire = test_extract_hex_wire(captured);
+  ASSERT_GE(attestation_wire.size(), 4u + CRABS_SIG_SIZE);
+  attestation_t* printed_attestation =
+      attestation_deserialize(attestation_wire.data(), attestation_wire.size());
+  ASSERT_NE(printed_attestation, nullptr);
+  remove(captured_path);
+
+  // ------------------------------------------------------------------
+  // 4. Persist the child: give it its own node key (so its operator can
+  //    keep saving snapshots independently) and write a SEALED snapshot
+  //    WITHOUT
+  //    the node-key signature — the child CLI node below then goes through
+  //    the unauthenticated-provenance path ('state accept-unverified'),
+  //    exactly an operator loading an unsigned-but-sealed machine file.
+  //    The child file is written BEFORE the dissolve, so the flag it
+  //    carries is the pre-severance false.
+  // ------------------------------------------------------------------
+  attribute_machine_t* child =
+      lineage_query_resident_child(parent_state, "child-red");
+  ASSERT_NE(child, nullptr);
+  ecdsa_keypair_t* child_node_key = crypto_ecdsa_generate();
+  ASSERT_NE(child_node_key, nullptr);
+  ASSERT_EQ(state_set_node_key(&child->base_state, child_node_key->private_key,
+                               child_node_key->public_key), CRABS_SUCCESS);
+  // The child operator's seal key is a DIFFERENT secret from the parent's.
+  static const uint8_t child_seal_key[32] = {
+    41,11,52,12,63,13,74,14,85,15,96,16,107,17,118,18,
+    19,129,20,131,21,142,22,153,23,164,24,175,25,186,26,197
+  };
+  char child_seal_hex[65];
+  cli_bytes_to_hex(child_seal_key, 32, child_seal_hex);
+  child_seal_hex[64] = '\0';
+
+  serialized_buffer_t* child_blob = crabs_serialize_state_sealed(
+      &child->base_state, child_seal_key);
+  ASSERT_NE(child_blob, nullptr);
+  FILE* child_file = fopen(child_path, "wb");
+  ASSERT_NE(child_file, nullptr);
+  ASSERT_EQ(fwrite(child_blob->data, 1, child_blob->len, child_file),
+            child_blob->len);
+  fclose(child_file);
+  serialized_buffer_destroy(child_blob);
+
+  // ------------------------------------------------------------------
+  // 5. Process one of the parent ends: save the parent, then destroy the
+  //    CHILD INSTANCE first — the detached-operator scenario — followed by
+  //    the parent. From here on the child exists only as its FILE.
+  // ------------------------------------------------------------------
+  ASSERT_EQ(cli_node_save(node, parent_path), CLI_OK);
+  attribute_machine_destroy(child);
+  crypto_ecdsa_keypair_destroy(child_node_key);
+  cli_node_destroy(node);
+
+  // ------------------------------------------------------------------
+  // 6. Parent restart: sealed load + key re-import, lineage handlers
+  //    re-installed, dissolve through dispatch — the child is NOT resident
+  //    in this process (a real parent process has no resident pointer for
+  //    a child it spawned two processes ago), so NO in-process flag is
+  //    ever set: the manifest is the only parent-side record.
+  // ------------------------------------------------------------------
+  cli_node_t* reloaded = cli_node_create();
+  ASSERT_NE(reloaded, nullptr);
+  ASSERT_EQ(cli_node_load_sealed(reloaded, parent_path, seal_hex), CLI_OK);
+  ASSERT_EQ(cli_node_load_key(reloaded, parent_priv_hex), CLI_OK);
+  lineage_install(&reloaded->attr_machine->base_state);
+
+  char* dissolve_argv[] = {(char*)"crabs_node", (char*)"machine",
+                           (char*)"dissolve", (char*)"child-red"};
+  ASSERT_EQ(cli_dispatch(reloaded, 4, dissolve_argv), CLI_OK);
+  ASSERT_EQ(
+      lineage_find_manifest_entry(&reloaded->attr_machine->base_state,
+                                  "child-red")->status,
+      LINEAGE_DISSOLVED);
+
+  // ------------------------------------------------------------------
+  // 7. Tombstone print through dispatch; capture the hex exactly as an
+  //    operator would pipe it, and write the hand-off file (trailing
+  //    newline included — the accept command parses the hex run
+  //    dynamically).
+  // ------------------------------------------------------------------
+  captured_path = "/tmp/crabs-dissolution-tombstone-captured.log";
+  captured_stream = fopen(captured_path, "w");
+  ASSERT_NE(captured_stream, nullptr);
+  stdout = captured_stream;
+  char* tombstone_argv[] = {(char*)"crabs_node", (char*)"machine",
+                            (char*)"tombstone", (char*)"child-red"};
+  ASSERT_EQ(cli_dispatch(reloaded, 4, tombstone_argv), CLI_OK);
+  fflush(captured_stream);
+  fclose(captured_stream);
+  stdout = saved_stdout;
+  captured_bytes.clear();
+  ASSERT_TRUE(test_read_saved_bytes(captured_path, captured_bytes));
+  captured.assign(captured_bytes.begin(), captured_bytes.end());
+  std::vector<uint8_t> tombstone_wire = test_extract_hex_wire(captured);
+  ASSERT_EQ(tombstone_wire.size(),
+            3 + strlen("child-red") + CRABS_SIG_SIZE);
+  EXPECT_EQ(tombstone_wire[0], (uint8_t)LINEAGE_DISSOLVED);
+  EXPECT_TRUE(crypto_ecdsa_verify(parent_key_snapshot.public_key,
+                                  tombstone_wire.data(),
+                                  tombstone_wire.size() - CRABS_SIG_SIZE,
+                                  tombstone_wire.data() +
+                                      tombstone_wire.size() - CRABS_SIG_SIZE));
+  char tombstone_hex_text[CRABS_DISSOLUTION_WIRE_MAX * 2 + 1];
+  cli_bytes_to_hex(tombstone_wire.data(), tombstone_wire.size(),
+                   tombstone_hex_text);
+  std::string tombstone_file_text = std::string(tombstone_hex_text) + "\n";
+  FILE* tombstone_file = fopen(tombstone_hex_path, "w");
+  ASSERT_NE(tombstone_file, nullptr);
+  ASSERT_EQ(tombstone_file_text.size(),
+            fwrite(tombstone_file_text.data(), 1, tombstone_file_text.size(),
+                   tombstone_file));
+  fclose(tombstone_file);
+  remove(captured_path);
+  cli_node_destroy(reloaded);
+
+  // ------------------------------------------------------------------
+  // 8. The child operator's machine, under its OWN cli_node_t in a fresh
+  //    process: sealed load of the child file, key custody restored (the
+  //    genesis-registered child admin signs with the parent's node key
+  //    material), lineage handlers re-installed — and the severed flag is
+  //    FALSE right up until the tombstone delivery.
+  // ------------------------------------------------------------------
+  cli_node_t* child_node = cli_node_create();
+  ASSERT_NE(child_node, nullptr);
+  ASSERT_EQ(cli_node_load_sealed(child_node, child_path, child_seal_hex),
+            CLI_OK);
+  state_t* child_state = &child_node->attr_machine->base_state;
+  ASSERT_TRUE(child_state->lineage_parent_bound);
+  ASSERT_STREQ(child_state->lineage_self_id, "child-red");
+  ASSERT_STREQ(child_state->lineage_parent_id, "parent-root");
+  ASSERT_FALSE(child_state->lineage_parent_dissolved);
+  ASSERT_EQ(cli_node_load_key(child_node, parent_priv_hex), CLI_OK);
+  ASSERT_NE(cli_node_get_user_key(child_node, "child-admin"), nullptr);
+
+  // Delivery is refused while the reloaded machine has no handler installed
+  // (the runtime-registration gate every machine lifecycle command shares).
+  char* accept_argv[] = {(char*)"crabs_node", (char*)"machine",
+                         (char*)"accept-tombstone", (char*)tombstone_hex_path};
+  EXPECT_EQ(cli_dispatch(child_node, 4, accept_argv), CLI_ERR_EXEC);
+
+  lineage_install(child_state);
+  ASSERT_EQ(cli_dispatch(child_node, 4, accept_argv), CLI_OK);
+  ASSERT_TRUE(child_state->lineage_parent_dissolved);
+
+  // A re-delivery is already-performed through the SAME command path.
+  EXPECT_EQ(cli_dispatch(child_node, 4, accept_argv), CLI_ERR_EXEC);
+
+  // ------------------------------------------------------------------
+  // 9. The child persists through its own seal-key custody, is destroyed
+  //    and reloaded AGAIN — the delivered flag survives on its own (v12
+  //    dissolved-flag tail), even though nothing in this second process saw
+  //    the delivery.
+  // ------------------------------------------------------------------
+  char* accept_unverified_argv[] = {(char*)"crabs_node", (char*)"state",
+                                    (char*)"accept-unverified"};
+  ASSERT_EQ(cli_dispatch(child_node, 3, accept_unverified_argv), CLI_OK);
+  ASSERT_EQ(cli_node_save(child_node, child_saved_path), CLI_OK);
+  cli_node_destroy(child_node);
+
+  cli_node_t* child_reloaded = cli_node_create();
+  ASSERT_NE(child_reloaded, nullptr);
+  ASSERT_EQ(cli_node_load_sealed(child_reloaded, child_saved_path,
+                                 child_seal_hex), CLI_OK);
+  ASSERT_EQ(cli_node_load_key(child_reloaded, parent_priv_hex), CLI_OK);
+  ASSERT_TRUE(
+      child_reloaded->attr_machine->base_state.lineage_parent_dissolved);
+
+  // ------------------------------------------------------------------
+  // 10. THE CUSTODY PAYOFF: the still-valid, already-minted attestation
+  //     (minted in process one, BEFORE the dissolve; never re-issued —
+  //     crabs_issue_attestation refuses a non-ACTIVE lineage) cannot carry a
+  //     @parent/-endorsed op across the delivered severance. The op's own
+  //     signature verifies (child-admin's registered key), and the dissolved
+  //     flag fail-closes the endorsement: CRABS_ERR_UNAUTHORIZED.
+  // ------------------------------------------------------------------
+  operation_t* render_op = operation_create("render");
+  ASSERT_NE(render_op, nullptr);
+  strncpy(render_op->signer_id, "child-admin", CRABS_MAX_USER_ID - 1);
+  crabs_test_sign_op_with(child_reloaded->attr_machine, &parent_key_snapshot,
+                          render_op);
+  test_attach_attestation(render_op, printed_attestation);
+  EXPECT_EQ(state_machine_execute(
+                &child_reloaded->attr_machine->base_state, render_op),
+            CRABS_ERR_UNAUTHORIZED);
+  operation_destroy(render_op);
+  attestation_destroy(printed_attestation);
+
+  cli_node_destroy(child_reloaded);
+  remove(parent_path);
+  remove(child_path);
+  remove(child_saved_path);
+  remove(blueprint_path);
+  remove(tombstone_hex_path);
+}
