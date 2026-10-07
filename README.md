@@ -105,6 +105,20 @@ ctest
 - **Self-Sovereign Identity** — User-controlled attributes with verifier attestation and audit trail
 - **Supply Chain Management** — Protocol-governed custody transfers across organizations
 
+## Trust Boundaries: What Is Durable and What Is Not
+
+Serialization v10 changes what a saved machine carries. A snapshot now holds the **full authority** of the machine: its users, key registries, operation-type definitions, and the CP-ABE master secret key (MSK). Restoring a snapshot restores the machine's authority as well as its state — which makes how that authority is protected the most important trust boundary in the system.
+
+**The MSK never touches disk unsealed.** Saving a machine requires an operator-supplied AES-256-GCM seal key; saving without one is refused. Loading is symmetrical: `crabs load-sealed <path> <keyfile>` decrypts the snapshot with the seal key and restores the machine, MSK included.
+
+**What happens when the seal key is wrong or absent:** the machine substrate (users, registries, operation types) is restored with a **fresh MSK**. This is a deliberately degraded state — the machine runs, but its authority is unproven. Treat post-fresh-MSK signatures as untrusted and re-enroll from the genesis admin via `crabs state migrate` rather than assuming the restored state was legitimately authorized.
+
+**The seal key is the machine's crown jewel.** It lives in memory only — it is never persisted — and anyone holding both a snapshot and its seal key holds full authority over that machine. Protect the seal key accordingly.
+
+**Sealing is confidentiality, not provenance.** Unsigned snapshots remain unauthenticated even in v10: the seal protects what is on disk, not who produced it. `key import` still verifies saved snapshots before trusting them.
+
+**Legacy v9 snapshots** load with an empty registry (no users carried over). Run `crabs state migrate` after loading to re-enroll the bootstrap admin.
+
 ## License
 
 MIT
