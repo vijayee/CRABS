@@ -1006,3 +1006,119 @@ TEST_F(TestStateMachine, ChangeHookPreviewCarriesTypeAndTarget) {
   EXPECT_NE(strstr(ChangeSink::last_event_storage.preview, "test_resource"), nullptr);
   state_set_change_hook(state, nullptr, nullptr);
 }
+
+// ============================================================
+// Resource-less custom ops without handlers fail loudly
+// ============================================================
+
+static int g_zero_resource_handler_calls = 0;
+
+static crabs_error_e counting_zero_resource_handler(state_t* op_state,
+                                                    operation_t* op) {
+  (void)op_state;
+  (void)op;
+  g_zero_resource_handler_calls++;
+  return CRABS_SUCCESS;
+}
+
+// A DECLARED custom op (a policy authorizes its type) with NO registered
+// handler and NO resources used to fall through the dispatch chain as a
+// silent CRABS_SUCCESS and was logged as a successful empty operation.
+// Declared is not implemented: with no handler and no resources there is no
+// wildcard work either, so the op must fail instead of logging a no-op.
+TEST_F(TestStateMachine, ResourcelessCustomOpWithoutHandlerFailsLoudly) {
+  state_add_policy(state, "audit_ping", "role:admin");
+
+  operation_t* op = operation_create("audit_ping");
+  memcpy(op->uuid, test_uuid, CRABS_UUID_SIZE);
+  op->resource_count = 0;
+  strncpy(op->signer_id, "alice", CRABS_MAX_USER_ID - 1);
+  set_signer_key_version(op);
+  sign_operation(op);
+
+  uint64_t version_before = state->version;
+  uint64_t log_count_before = state->log_count;
+
+  state_set_change_hook(state, ChangeSink::hook, nullptr);
+  ChangeSink::call_count = 0;
+  ChangeSink::has_event = false;
+
+  crabs_error_e result = state_machine_execute(state, op);
+  operation_destroy(op);
+
+  EXPECT_EQ(result, CRABS_ERR_RESOURCE_NOT_FOUND);
+
+  // The failed op is a no-op: no log entry, no version bump.
+  EXPECT_EQ(state->version, version_before);
+  EXPECT_EQ(state->log_count, log_count_before);
+
+  // The failure still surfaces through the change-hook contract ("failed ops
+  // surface result").
+  EXPECT_EQ(ChangeSink::call_count, 1);
+  ASSERT_TRUE(ChangeSink::has_event);
+  EXPECT_EQ(ChangeSink::last_event_storage.result, CRABS_ERR_RESOURCE_NOT_FOUND);
+  EXPECT_STREQ(ChangeSink::last_event_storage.type, "audit_ping");
+  state_set_change_hook(state, nullptr, nullptr);
+}
+
+// Regression guard: the same handler-less op WITH a resource on a LOCKED
+// item keeps the legitimate pure-lock workflow — the LOCKED→MODIFIED
+// wildcard runs and the op logs as successful.
+TEST_F(TestStateMachine, ResourceCarryingCustomOpWithoutHandlerStillAppliesWildcard) {
+  state_add_policy(state, "apply_patch", "role:admin");
+
+  // Lock the resource first: the wildcard workflow only acts on LOCKED items.
+  operation_t* lock_op = make_lock_op();
+  ASSERT_EQ(state_machine_execute(state, lock_op), CRABS_SUCCESS);
+  operation_destroy(lock_op);
+
+  operation_t* patch_op = operation_create("apply_patch");
+  for (int uuid_byte = 0; uuid_byte < CRABS_UUID_SIZE; uuid_byte++) {
+    patch_op->uuid[uuid_byte] = (uint8_t)(uuid_byte + 2);
+  }
+  patch_op->resources = (char(*)[CRABS_MAX_USER_ID])malloc(sizeof(char[CRABS_MAX_USER_ID]));
+  strncpy(patch_op->resources[0], "test_resource", CRABS_MAX_USER_ID - 1);
+  patch_op->resource_count = 1;
+  patch_op->required_state = (protocol_state_e*)malloc(sizeof(protocol_state_e));
+  patch_op->required_state[0] = PROTOCOL_LOCKED;
+  patch_op->next_state = (protocol_state_e*)malloc(sizeof(protocol_state_e));
+  patch_op->next_state[0] = PROTOCOL_MODIFIED;
+  strncpy(patch_op->signer_id, "alice", CRABS_MAX_USER_ID - 1);
+  set_signer_key_version(patch_op);
+  sign_operation(patch_op);
+
+  uint64_t log_count_before = state->log_count;
+  crabs_error_e result = state_machine_execute(state, patch_op);
+  operation_destroy(patch_op);
+
+  EXPECT_EQ(result, CRABS_SUCCESS);
+  data_item_t* item = state_find_item(state, "test_resource");
+  ASSERT_NE(item, nullptr);
+  EXPECT_EQ(item->protocol_state, PROTOCOL_MODIFIED);
+  EXPECT_EQ(state->log_count, log_count_before + 1);
+}
+
+// Regression guard: a registered-handler custom op with zero resources is a
+// real implementation and still succeeds (with its log entry).
+TEST_F(TestStateMachine, RegisteredHandlerCustomOpWithZeroResourcesSucceeds) {
+  state_add_policy(state, "heartbeat_ping", "role:admin");
+  ASSERT_EQ(state_machine_register_handler(state, "heartbeat_ping",
+                                           counting_zero_resource_handler),
+            CRABS_SUCCESS);
+  g_zero_resource_handler_calls = 0;
+
+  operation_t* op = operation_create("heartbeat_ping");
+  memcpy(op->uuid, test_uuid, CRABS_UUID_SIZE);
+  op->resource_count = 0;
+  strncpy(op->signer_id, "alice", CRABS_MAX_USER_ID - 1);
+  set_signer_key_version(op);
+  sign_operation(op);
+
+  uint64_t log_count_before = state->log_count;
+  crabs_error_e result = state_machine_execute(state, op);
+  operation_destroy(op);
+
+  EXPECT_EQ(result, CRABS_SUCCESS);
+  EXPECT_EQ(g_zero_resource_handler_calls, 1);
+  EXPECT_EQ(state->log_count, log_count_before + 1);
+}

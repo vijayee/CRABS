@@ -1154,6 +1154,13 @@ static crabs_error_e state_machine_execute_internal(state_t* state, operation_t*
     custom_handler = state_machine_find_handler(state, op->type);
     if (custom_handler != NULL) {
       result = custom_handler(state, op);
+    } else if (op->resource_count == 0) {
+      // Declared-but-unimplemented: a policy authorizes the op type (auth
+      // passed) but no handler was registered and there are no resources for
+      // the wildcard workflow below to act on. Failing so it does not log a
+      // successful empty operation — the NOT_FOUND error, also returned by
+      // the wildcard loop for unknown resources, applies to both cases.
+      result = CRABS_ERR_RESOURCE_NOT_FOUND;
     } else {
       result = CRABS_SUCCESS;
     }
