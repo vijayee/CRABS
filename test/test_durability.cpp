@@ -7,6 +7,7 @@
 #include <gtest/gtest.h>
 #include <cstdlib>
 #include <cstring>
+#include <string>
 #include <vector>
 
 extern "C" {
@@ -488,4 +489,307 @@ TEST(TestDurability, LineageSurvivesRestartWithManifestSignatureVerified) {
   state_destroy(restored_child);
   remove(parent_path);
   remove(child_path);
+}
+
+// ============================================================
+// Lineage surfaces (v1.7) end to end: the WHOLE surface chain is exercised
+// through cli_dispatch exactly as an operator types it — blueprint
+// authoring, blueprint save, spawn via the op pipeline, `machine children`,
+// attest (printed wire re-verified), then a REAL restart: both machines
+// saved (parent sealed+signed through the CLI custody path, child as its
+// own sealed+signed snapshot), everything destroyed, both reloaded, the
+// child manifest consulted through dispatch again, and the lifecycle
+// continued with a dissolve (+ its de-duplicated refusal).
+// ============================================================
+
+// The longest even-length run of lowercase-hex characters captured from the
+// redirected stdout — the printed attestation wire (same extractor shape as
+// test_cli.cpp; the command prints no other hex string near that length).
+static std::vector<uint8_t> test_extract_hex_wire(const std::string& captured) {
+  static const std::string hex_lower = "0123456789abcdef";
+  size_t best_start = std::string::npos;
+  size_t best_len = 0;
+  size_t run_start = 0;
+  for (size_t cursor = 0; cursor <= captured.size(); cursor++) {
+    bool is_hex = cursor < captured.size() &&
+                  hex_lower.find(captured[cursor]) != std::string::npos;
+    if (!is_hex) {
+      size_t run_len = cursor - run_start;
+      if (run_len % 2 == 0 && run_len > best_len) {
+        best_len = run_len;
+        best_start = run_start;
+      }
+      run_start = cursor + 1;
+    }
+  }
+  std::vector<uint8_t> wire;
+  for (size_t byte_index = 0; byte_index < best_len / 2; byte_index++) {
+    std::string byte_text = captured.substr(best_start + byte_index * 2, 2);
+    wire.push_back((uint8_t)std::strtol(byte_text.c_str(), nullptr, 16));
+  }
+  return wire;
+}
+
+// Read a whole file back (the durability round trips below re-import saved
+// bytes byte for byte).
+static bool test_read_saved_bytes(const char* path,
+                                  std::vector<uint8_t>& file_bytes) {
+  FILE* saved_file = fopen(path, "rb");
+  if (saved_file == NULL) return false;
+  fseek(saved_file, 0, SEEK_END);
+  long saved_size = ftell(saved_file);
+  fseek(saved_file, 0, SEEK_SET);
+  if (saved_size <= 0) {
+    fclose(saved_file);
+    return false;
+  }
+  file_bytes.resize((size_t)saved_size);
+  size_t read_count = fread(file_bytes.data(), 1, file_bytes.size(), saved_file);
+  fclose(saved_file);
+  return read_count == file_bytes.size();
+}
+
+TEST(TestDurability, LineageSurfacesEndToEnd) {
+  const char* parent_path = "/tmp/crabs-e2e-parent.crabs";
+  const char* child_path = "/tmp/crabs-e2e-child.crabs";
+  const char* blueprint_path = "/tmp/crabs-e2e.cbp";
+
+  // ------------------------------------------------------------------
+  // 1. Parent through the CLI layer: seal-key custody + the lineage op
+  //    installer (the CLI never installs lineage itself — the spawning
+  //    protocol calls lineage_install, as the machine usage note documents).
+  // ------------------------------------------------------------------
+  cli_node_t* node = cli_node_create();
+  ASSERT_NE(node, nullptr);
+  ASSERT_EQ(cli_node_init(node, "parent-root"), CLI_OK);
+
+  char seal_hex[65];
+  _import_test_seal_key(node, seal_hex);
+  lineage_install(&node->attr_machine->base_state);
+
+  // Node key material is persisted out-of-band by the operator and
+  // re-imported via cli_node_load_key after the restart.
+  char parent_priv_hex[65];
+  cli_bytes_to_hex(node->node_key->private_key, 32, parent_priv_hex);
+  parent_priv_hex[64] = '\0';
+  uint8_t parent_pub_snapshot[33];
+  memcpy(parent_pub_snapshot, node->node_key->public_key, 33);
+
+  // ------------------------------------------------------------------
+  // 2. Blueprint authoring entirely through dispatch: draft → item →
+  //    policy → dedup → save. The child policy names role:admin — the
+  //    DELEGATED_COPY genesis registers its bootstrap admin ("child-admin")
+  //    with role:admin under the parent's node public key.
+  // ------------------------------------------------------------------
+  char* new_argv[] = {(char*)"crabs_node", (char*)"machine", (char*)"blueprint",
+                      (char*)"new", (char*)"child-red", (char*)"delegated",
+                      (char*)"child-admin", (char*)"3600000"};
+  ASSERT_EQ(cli_dispatch(node, 8, new_argv), CLI_OK);
+  char* item_argv[] = {(char*)"crabs_node", (char*)"machine", (char*)"blueprint",
+                       (char*)"item", (char*)"counter1", (char*)"counter",
+                       (char*)"g_counter"};
+  ASSERT_EQ(cli_dispatch(node, 7, item_argv), CLI_OK);
+  char* policy_argv[] = {(char*)"crabs_node", (char*)"machine", (char*)"blueprint",
+                         (char*)"policy", (char*)"increment", (char*)"role:admin"};
+  ASSERT_EQ(cli_dispatch(node, 6, policy_argv), CLI_OK);
+  char* dedup_argv[] = {(char*)"crabs_node", (char*)"machine", (char*)"blueprint",
+                        (char*)"dedup", (char*)"increment", (char*)"none"};
+  ASSERT_EQ(cli_dispatch(node, 6, dedup_argv), CLI_OK);
+  char* save_argv[] = {(char*)"crabs_node", (char*)"machine", (char*)"blueprint",
+                       (char*)"save", (char*)blueprint_path};
+  ASSERT_EQ(cli_dispatch(node, 5, save_argv), CLI_OK);
+
+  // ------------------------------------------------------------------
+  // 3. Spawn via the op pipeline (__spawn_machine__ carries the wire image).
+  // ------------------------------------------------------------------
+  char* spawn_argv[] = {(char*)"crabs_node", (char*)"machine", (char*)"spawn",
+                        (char*)blueprint_path};
+  ASSERT_EQ(cli_dispatch(node, 4, spawn_argv), CLI_OK);
+
+  state_t* parent_state = &node->attr_machine->base_state;
+  const child_manifest_entry_t* manifest_entries = NULL;
+  ASSERT_EQ(lineage_query_children(parent_state, &manifest_entries), 1u);
+  ASSERT_NE(manifest_entries, nullptr);
+  EXPECT_STREQ(manifest_entries[0].child_id, "child-red");
+  EXPECT_EQ(manifest_entries[0].status, LINEAGE_ACTIVE);
+  EXPECT_EQ(manifest_entries[0].attestation_ttl_ms, 3600000u);
+  EXPECT_NE(lineage_query_resident_child(parent_state, "child-red"), nullptr);
+
+  char* children_argv[] = {(char*)"crabs_node", (char*)"machine",
+                           (char*)"children"};
+  EXPECT_EQ(cli_dispatch(node, 3, children_argv), CLI_OK);
+
+  // ------------------------------------------------------------------
+  // 4. `machine attest` through dispatch: the printed wire must re-verify.
+  //    Capture stdout the same way the attest surface test does.
+  // ------------------------------------------------------------------
+  const char* captured_path = "/tmp/crabs-e2e-attest-captured.log";
+  FILE* captured_stream = fopen(captured_path, "w");
+  ASSERT_NE(captured_stream, nullptr);
+  FILE* saved_stdout = stdout;
+  stdout = captured_stream;
+  char* attest_argv[] = {(char*)"crabs_node", (char*)"machine", (char*)"attest",
+                         (char*)"child-red", (char*)"child-admin",
+                         (char*)"role:writer"};
+  cli_result_e attest_result = cli_dispatch(node, 6, attest_argv);
+  fflush(captured_stream);
+  fclose(captured_stream);
+  stdout = saved_stdout;
+  ASSERT_EQ(attest_result, CLI_OK);
+
+  std::vector<uint8_t> captured_bytes;
+  ASSERT_TRUE(test_read_saved_bytes(captured_path, captured_bytes));
+  std::string captured(captured_bytes.begin(), captured_bytes.end());
+  std::vector<uint8_t> attestation_wire = test_extract_hex_wire(captured);
+  ASSERT_GE(attestation_wire.size(), 4u + CRABS_SIG_SIZE);
+  attestation_t* printed_attestation =
+      attestation_deserialize(attestation_wire.data(), attestation_wire.size());
+  ASSERT_NE(printed_attestation, nullptr);
+  EXPECT_STREQ(printed_attestation->child_id, "child-red");
+  EXPECT_STREQ(printed_attestation->user_id, "child-admin");
+  EXPECT_STREQ(printed_attestation->attributes, "role:writer");
+  EXPECT_EQ(printed_attestation->expires_at - printed_attestation->not_before,
+            3600000ull);
+  EXPECT_TRUE(attestation_verify(parent_pub_snapshot, "child-red",
+                                 printed_attestation,
+                                 printed_attestation->not_before));
+  attestation_destroy(printed_attestation);
+  remove(captured_path);
+
+  // ------------------------------------------------------------------
+  // 5. Persist BOTH machines like the lineage durability test does: the
+  //    child gets a node key OF ITS OWN and a raw sealed+signed snapshot;
+  //    the parent saves through the CLI custody path (sealed + node-key
+  //    signature).
+  // ------------------------------------------------------------------
+  attribute_machine_t* child =
+      lineage_query_resident_child(parent_state, "child-red");
+  ASSERT_NE(child, nullptr);
+  state_t* child_state = &child->base_state;
+  ecdsa_keypair_t* child_node_key = crypto_ecdsa_generate();
+  ASSERT_NE(child_node_key, nullptr);
+  ASSERT_EQ(state_set_node_key(child_state, child_node_key->private_key,
+                               child_node_key->public_key), CRABS_SUCCESS);
+  ecdsa_keypair_t child_node_key_snapshot = *child_node_key;
+
+  serialized_buffer_t* child_blob = crabs_serialize_state_sealed_signed(
+      child_state, test_seal_key);
+  ASSERT_NE(child_blob, nullptr);
+  FILE* child_file = fopen(child_path, "wb");
+  ASSERT_NE(child_file, nullptr);
+  ASSERT_EQ(fwrite(child_blob->data, 1, child_blob->len, child_file),
+            child_blob->len);
+  fclose(child_file);
+  const size_t child_blob_len = child_blob->len;
+  serialized_buffer_destroy(child_blob);
+
+  child_manifest_entry_t manifest_snapshot = manifest_entries[0];
+  ASSERT_EQ(cli_node_save(node, parent_path), CLI_OK);
+
+  // Destroy everything — the child first, then the parent (the parent's
+  // resident-children array drops the pointer; teardown frees the array).
+  crypto_ecdsa_keypair_destroy(child_node_key);
+  cli_node_destroy(node);
+
+  // ------------------------------------------------------------------
+  // 6. Restart the parent: sealed load + operator key import (the import
+  //    verifies the snapshot signature before custody — the M-1 gate).
+  // ------------------------------------------------------------------
+  cli_node_t* reloaded = cli_node_create();
+  ASSERT_NE(reloaded, nullptr);
+  ASSERT_EQ(cli_node_load_sealed(reloaded, parent_path, seal_hex), CLI_OK);
+  ASSERT_EQ(cli_node_load_key(reloaded, parent_priv_hex), CLI_OK);
+
+  state_t* reloaded_parent = &reloaded->attr_machine->base_state;
+  EXPECT_TRUE(reloaded_parent->node_key_valid);
+  EXPECT_EQ(memcmp(reloaded_parent->node_public_key, parent_pub_snapshot, 33),
+            0);
+
+  // ------------------------------------------------------------------
+  // 7. `machine children` through dispatch on the RELOADED parent; the
+  //    manifest came through the sealed snapshot and the runtime residency
+  //    did not.
+  // ------------------------------------------------------------------
+  char* reloaded_children_argv[] = {(char*)"crabs_node", (char*)"machine",
+                                    (char*)"children"};
+  EXPECT_EQ(cli_dispatch(reloaded, 3, reloaded_children_argv), CLI_OK);
+  const child_manifest_entry_t* restored_entries = NULL;
+  ASSERT_EQ(lineage_query_children(reloaded_parent, &restored_entries), 1u);
+  ASSERT_NE(restored_entries, nullptr);
+  EXPECT_STREQ(restored_entries[0].child_id, "child-red");
+  EXPECT_EQ(restored_entries[0].status, LINEAGE_ACTIVE);
+  EXPECT_EQ(memcmp(restored_entries[0].genesis_snapshot_hash,
+                   manifest_snapshot.genesis_snapshot_hash, CRABS_HASH_SIZE),
+            0);
+  EXPECT_EQ(lineage_query_resident_child(reloaded_parent, "child-red"),
+            nullptr);
+
+  // ------------------------------------------------------------------
+  // 8. The lifecycle CONTINUES across the restart through dispatch. First
+  //    the fail-closed contract: a reloaded machine registers op types and
+  //    policies durably, but the C op HANDLERS are runtime registrations —
+  //    without lineage_install the pipeline would log the dissolve as a
+  //    silent no-op success, so the CLI refuses the command loudly instead.
+  // ------------------------------------------------------------------
+  char* dissolve_argv[] = {(char*)"crabs_node", (char*)"machine",
+                           (char*)"dissolve", (char*)"child-red"};
+  EXPECT_NE(cli_dispatch(reloaded, 4, dissolve_argv), CLI_OK);
+  EXPECT_EQ(restored_entries[0].status, LINEAGE_ACTIVE);
+  EXPECT_EQ(
+      state_machine_find_handler(reloaded_parent, CRABS_LINEAGE_OP_DISSOLVE),
+      (op_handler_fn)NULL);
+
+  // Re-registering the handlers (idempotent installer, same protocol step as
+  // the original machine creation) makes the dissolve go through.
+  lineage_install(reloaded_parent);
+  ASSERT_EQ(cli_dispatch(reloaded, 4, dissolve_argv), CLI_OK);
+  child_manifest_entry_t* dissolved_entry = lineage_find_manifest_entry(
+      reloaded_parent, "child-red");
+  ASSERT_NE(dissolved_entry, nullptr);
+  EXPECT_EQ(dissolved_entry->status, LINEAGE_DISSOLVED);
+  EXPECT_EQ(lineage_query_resident_child(reloaded_parent, "child-red"),
+            nullptr);
+
+  // De-duplicated re-dissolve is refused.
+  EXPECT_NE(cli_dispatch(reloaded, 4, dissolve_argv), CLI_OK);
+
+  // The dissolved lineage also stops issuing: the manifest gate survives the
+  // restart (the direct attest path refuses a non-ACTIVE child).
+  char* attest_after_argv[] = {(char*)"crabs_node", (char*)"machine",
+                               (char*)"attest", (char*)"child-red",
+                               (char*)"child-admin", (char*)"role:writer"};
+  EXPECT_NE(cli_dispatch(reloaded, 6, attest_after_argv), CLI_OK);
+
+  cli_node_destroy(reloaded);
+
+  // ------------------------------------------------------------------
+  // 9. Reload the child from its sealed+signed snapshot: verify the trailer
+  //    against the child's OWN node key, then load with restoration
+  //    reporting — the child's OWN authority must come back.
+  // ------------------------------------------------------------------
+  std::vector<uint8_t> child_bytes;
+  ASSERT_TRUE(test_read_saved_bytes(child_path, child_bytes));
+  ASSERT_EQ(child_bytes.size(), child_blob_len);
+  ASSERT_GT(child_bytes.size(), (size_t)CRABS_SIG_SIZE);
+  size_t child_payload_len = child_bytes.size() - CRABS_SIG_SIZE;
+  EXPECT_TRUE(crypto_ecdsa_verify(child_node_key_snapshot.public_key,
+                                  child_bytes.data(), child_payload_len,
+                                  child_bytes.data() + child_payload_len));
+
+  bool authority_restored = false;
+  bool msk_section_present = false;
+  state_t* restored_child = crabs_deserialize_state_keys_reported(
+      child_bytes.data(), child_payload_len, test_seal_key,
+      &authority_restored, &msk_section_present);
+  ASSERT_NE(restored_child, nullptr);
+  EXPECT_TRUE(msk_section_present);
+  EXPECT_TRUE(authority_restored);
+  EXPECT_TRUE(restored_child->lineage_parent_bound);
+  EXPECT_STREQ(restored_child->lineage_parent_id, "parent-root");
+  EXPECT_STREQ(restored_child->lineage_self_id, "child-red");
+
+  state_destroy(restored_child);
+  remove(parent_path);
+  remove(child_path);
+  remove(blueprint_path);
 }
