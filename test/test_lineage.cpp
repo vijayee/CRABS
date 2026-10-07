@@ -1570,6 +1570,158 @@ TEST(TestLineage, QueryResidentChildAccessor) {
   spawn_parent_destroy(&harness);
 }
 
+// ============================================================
+// A10-5: the resident registry is NOT index-aligned with the manifest
+// after a restart (the manifest is persisted; the registry starts empty)
+// ============================================================
+
+// Spawn two children, then simulate a restart: the manifest is persisted
+// (left untouched) while the runtime resident-children registry is rebuilt
+// EMPTY. The pre-restart children's machines lived in the old process and
+// are gone with it — destroy them (the registry pointers are UNOWNED) and
+// clear the pointer array exactly the way a state load leaves it.
+static void simulate_restart_clears_registry(state_t* parent) {
+  free(parent->resident_children);
+  parent->resident_children = NULL;
+  parent->resident_child_count = 0;
+}
+
+TEST(TestLineage, RegistrySurvivesRestartReindexing) {
+  spawn_parent_harness_t harness;
+  spawn_parent_setup(&harness);
+  state_t* parent = &harness.am->base_state;
+  ASSERT_EQ(attribute_machine_grant_role(harness.am, "alice", "role", "admin",
+                                         "parent-root"), CRABS_SUCCESS);
+  lineage_install(parent);
+
+  // Pre-restart children A and B occupy manifest entries 0/1 AND registry
+  // slots 0/1 — the alignment holds only until the process exits.
+  machine_blueprint_t* blueprint_a = make_valid_blueprint();
+  ASSERT_NE(blueprint_a, nullptr);
+  strncpy(blueprint_a->child_id, "child-aaa",
+          sizeof(blueprint_a->child_id) - 1);
+  attribute_machine_t* child_a = nullptr;
+  ASSERT_EQ(lineage_spawn_machine(parent, blueprint_a, &child_a),
+            CRABS_SUCCESS);
+  machine_blueprint_t* blueprint_b = make_valid_blueprint();
+  ASSERT_NE(blueprint_b, nullptr);
+  strncpy(blueprint_b->child_id, "child-bbb",
+          sizeof(blueprint_b->child_id) - 1);
+  attribute_machine_t* child_b = nullptr;
+  ASSERT_EQ(lineage_spawn_machine(parent, blueprint_b, &child_b),
+            CRABS_SUCCESS);
+  ASSERT_EQ(parent->child_count, 2u);
+  ASSERT_EQ(parent->resident_child_count, 2u);
+
+  // Restart: A and B are destroyed with the old process; the manifest
+  // (persisted) still lists them, the registry is empty.
+  attribute_machine_destroy(child_a);
+  attribute_machine_destroy(child_b);
+  simulate_restart_clears_registry(parent);
+
+  // Post-restart spawn: C lands in registry slot 0 — the slot a positional
+  // lookup would (wrongly) resolve for manifest entry 0 ("child-aaa").
+  machine_blueprint_t* blueprint_c = make_valid_blueprint();
+  ASSERT_NE(blueprint_c, nullptr);
+  strncpy(blueprint_c->child_id, "child-ccc",
+          sizeof(blueprint_c->child_id) - 1);
+  attribute_machine_t* child_c = nullptr;
+  ASSERT_EQ(lineage_spawn_machine(parent, blueprint_c, &child_c),
+            CRABS_SUCCESS);
+  ASSERT_EQ(parent->child_count, 3u);
+  ASSERT_EQ(parent->resident_child_count, 1u);
+  EXPECT_EQ(parent->resident_children[0], child_c);
+
+  // Dissolving pre-restart A succeeds on the manifest and must NOT reach C:
+  // C stays resident and un-severed (no wrong-machine severance).
+  operation_t* dissolve_a = make_signed_lineage_op(
+      harness.am, harness.alice_key, "alice", CRABS_LINEAGE_OP_DISSOLVE,
+      "child-aaa", strlen("child-aaa"));
+  ASSERT_NE(dissolve_a, nullptr);
+  EXPECT_EQ(state_machine_execute(parent, dissolve_a), CRABS_SUCCESS);
+  operation_destroy(dissolve_a);
+  EXPECT_EQ(parent->children[0].status, LINEAGE_DISSOLVED);
+  EXPECT_FALSE(child_c->base_state.lineage_parent_dissolved);
+  EXPECT_EQ(lineage_query_resident_child(parent, "child-ccc"), child_c);
+
+  // Dissolve B likewise: manifest-only, no fallout on the resident C.
+  operation_t* dissolve_b = make_signed_lineage_op(
+      harness.am, harness.alice_key, "alice", CRABS_LINEAGE_OP_DISSOLVE,
+      "child-bbb", strlen("child-bbb"));
+  ASSERT_NE(dissolve_b, nullptr);
+  EXPECT_EQ(state_machine_execute(parent, dissolve_b), CRABS_SUCCESS);
+  operation_destroy(dissolve_b);
+  EXPECT_EQ(parent->children[1].status, LINEAGE_DISSOLVED);
+  EXPECT_FALSE(child_c->base_state.lineage_parent_dissolved);
+  EXPECT_EQ(lineage_query_resident_child(parent, "child-ccc"), child_c);
+
+  // Dissolving C itself severs C in-process and drops it from the registry —
+  // the positional lookup would miss it entirely (manifest index 2 is out of
+  // bounds for a one-slot registry).
+  operation_t* dissolve_c = make_signed_lineage_op(
+      harness.am, harness.alice_key, "alice", CRABS_LINEAGE_OP_DISSOLVE,
+      "child-ccc", strlen("child-ccc"));
+  ASSERT_NE(dissolve_c, nullptr);
+  EXPECT_EQ(state_machine_execute(parent, dissolve_c), CRABS_SUCCESS);
+  operation_destroy(dissolve_c);
+  EXPECT_EQ(parent->children[2].status, LINEAGE_DISSOLVED);
+  EXPECT_TRUE(child_c->base_state.lineage_parent_dissolved);
+  EXPECT_EQ(lineage_query_resident_child(parent, "child-ccc"), nullptr);
+
+  attribute_machine_destroy(child_c);
+  machine_blueprint_destroy(blueprint_a);
+  machine_blueprint_destroy(blueprint_b);
+  machine_blueprint_destroy(blueprint_c);
+  spawn_parent_destroy(&harness);
+}
+
+TEST(TestLineage, QueryKeyedByIdNotIndex) {
+  spawn_parent_harness_t harness;
+  spawn_parent_setup(&harness);
+  state_t* parent = &harness.am->base_state;
+
+  // Same restart shape: A and B persist only in the manifest.
+  machine_blueprint_t* blueprint_a = make_valid_blueprint();
+  ASSERT_NE(blueprint_a, nullptr);
+  strncpy(blueprint_a->child_id, "child-aaa",
+          sizeof(blueprint_a->child_id) - 1);
+  attribute_machine_t* child_a = nullptr;
+  ASSERT_EQ(lineage_spawn_machine(parent, blueprint_a, &child_a),
+            CRABS_SUCCESS);
+  machine_blueprint_t* blueprint_b = make_valid_blueprint();
+  ASSERT_NE(blueprint_b, nullptr);
+  strncpy(blueprint_b->child_id, "child-bbb",
+          sizeof(blueprint_b->child_id) - 1);
+  attribute_machine_t* child_b = nullptr;
+  ASSERT_EQ(lineage_spawn_machine(parent, blueprint_b, &child_b),
+            CRABS_SUCCESS);
+  attribute_machine_destroy(child_a);
+  attribute_machine_destroy(child_b);
+  simulate_restart_clears_registry(parent);
+
+  machine_blueprint_t* blueprint_c = make_valid_blueprint();
+  ASSERT_NE(blueprint_c, nullptr);
+  strncpy(blueprint_c->child_id, "child-ccc",
+          sizeof(blueprint_c->child_id) - 1);
+  attribute_machine_t* child_c = nullptr;
+  ASSERT_EQ(lineage_spawn_machine(parent, blueprint_c, &child_c),
+            CRABS_SUCCESS);
+
+  // Pre-restart ids resolve to NULL (their slots are gone — the manifest
+  // entry existing does NOT make the machine resident); C resolves to its
+  // machine regardless of sitting in slot 0 under manifest index 2.
+  EXPECT_EQ(lineage_query_resident_child(parent, "child-aaa"), nullptr);
+  EXPECT_EQ(lineage_query_resident_child(parent, "child-bbb"), nullptr);
+  EXPECT_EQ(lineage_query_resident_child(parent, "child-ccc"), child_c);
+  EXPECT_EQ(lineage_query_resident_child(parent, "child-ghost"), nullptr);
+
+  attribute_machine_destroy(child_c);
+  machine_blueprint_destroy(blueprint_a);
+  machine_blueprint_destroy(blueprint_b);
+  machine_blueprint_destroy(blueprint_c);
+  spawn_parent_destroy(&harness);
+}
+
 TEST(TestLineage, RevokeAttestationViaOp) {
   spawn_parent_harness_t harness;
   spawn_parent_setup(&harness);

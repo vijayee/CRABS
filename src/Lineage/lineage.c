@@ -955,20 +955,27 @@ crabs_error_e lineage_blueprint_validate(const machine_blueprint_t* blueprint) {
 // Spawn: the three trust modes
 // ============================================================
 
-// Runtime resident-child registry (state_t fields, UNOWNED views). Slots are
-// index-ALIGNED with the manifest (both arrays only ever append at the tail
-// and dissolve merely NULLs the slot), so a lookup resolves child_id through
-// the manifest entry — the only owned data — and never dereferences a
-// pointer slot that could dangle (a child destroyed by its owner out-of-band
-// without a dissolve).
+// Runtime resident-child registry (state_t fields, UNOWNED views). A10-5:
+// registry entries are matched by the child's lineage_self_id, NOT by
+// manifest position — the manifest is persisted across a restart while the
+// runtime registry starts empty, so positional alignment between the two
+// arrays is a fiction (a post-restart spawn lands in registry slot 0 while
+// its manifest entry sits at whatever index the reload left). NULL slots
+// are holes (dissolved children) and are skipped. The manifest index is
+// only used to find the manifest ENTRY (status etc.) — never to index the
+// registry.
 
 static attribute_machine_t* _lineage_find_resident_child(
-    state_t* parent, const char* child_id) {
-  for (uint32_t child_index = 0; child_index < parent->child_count;
-       child_index++) {
-    if (strcmp(parent->children[child_index].child_id, child_id) == 0 &&
-        child_index < parent->resident_child_count) {
-      return parent->resident_children[child_index];
+    const state_t* parent, const char* child_id) {
+  if (parent == NULL || child_id == NULL || parent->resident_children == NULL) {
+    return NULL;
+  }
+  for (uint32_t slot_index = 0; slot_index < parent->resident_child_count;
+       slot_index++) {
+    attribute_machine_t* child = parent->resident_children[slot_index];
+    if (child == NULL) continue;
+    if (strcmp(child->base_state.lineage_self_id, child_id) == 0) {
+      return child;
     }
   }
   return NULL;
@@ -976,20 +983,24 @@ static attribute_machine_t* _lineage_find_resident_child(
 
 static void _lineage_drop_resident_child(state_t* parent,
                                          const char* child_id) {
-  for (uint32_t child_index = 0;
-       child_index < parent->child_count &&
-       child_index < parent->resident_child_count;
-       child_index++) {
-    if (strcmp(parent->children[child_index].child_id, child_id) == 0) {
-      parent->resident_children[child_index] = NULL;
+  if (parent == NULL || child_id == NULL ||
+      parent->resident_children == NULL) {
+    return;
+  }
+  for (uint32_t slot_index = 0; slot_index < parent->resident_child_count;
+       slot_index++) {
+    attribute_machine_t* child = parent->resident_children[slot_index];
+    if (child == NULL) continue;
+    if (strcmp(child->base_state.lineage_self_id, child_id) == 0) {
+      parent->resident_children[slot_index] = NULL;
       return;
     }
   }
 }
 
-// Spawn appends both arrays at the tail in the same order — manifest entry
-// at child_count, registry slot at resident_child_count — keeping the index
-// alignment the lookups above rely on.
+// Spawn appends the registry at the tail (slot resident_child_count). No
+// positional relationship with the manifest entry is required or relied on —
+// the lookups above key off lineage_self_id.
 static crabs_error_e _lineage_register_resident_child(
     state_t* parent, attribute_machine_t* child) {
   attribute_machine_t** grown = realloc(
@@ -1262,24 +1273,10 @@ static crabs_error_e _lineage_child_id_from_payload(const operation_t* op,
 
 attribute_machine_t* lineage_query_resident_child(const state_t* state,
                                                   const char* child_id) {
-  if (state == NULL || child_id == NULL) return NULL;
-  // Resolve the child_id through the manifest entry — the only owned data.
-  // The registry slots are index-ALIGNED with the manifest (see the spawn
-  // helpers above), so the winning manifest index addresses the registry
-  // slot directly; a NULL slot means the child dissolved (or was dropped by
-  // its owner out-of-band) and answers NULL.
-  for (uint32_t child_index = 0; child_index < state->child_count;
-       child_index++) {
-    if (strcmp(state->children[child_index].child_id, child_id) != 0) {
-      continue;
-    }
-    if (child_index >= state->resident_child_count ||
-        state->resident_children == NULL) {
-      return NULL;
-    }
-    return state->resident_children[child_index];
-  }
-  return NULL;
+  // A10-5: keyed by lineage_self_id over the registry, never by manifest
+  // position — after a restart the manifest persists while the registry
+  // starts empty, so only ids spawned in THIS process resolve.
+  return _lineage_find_resident_child(state, child_id);
 }
 
 uint32_t lineage_query_children(const state_t* state,

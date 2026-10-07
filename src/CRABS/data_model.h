@@ -438,12 +438,13 @@ typedef struct state_t {
   // still resident in this process, so __dissolve_machine__ can reach the
   // child's state directly. UNOWNED POINTERS — each entry is a child some
   // caller built via lineage_spawn_machine and owns (destroys) itself; the
-  // state only frees the POINTER ARRAY. Slots are INDEX-ALIGNED with the
-  // manifest above (both arrays only append at the tail); dissolve NULLs its
-  // slot (the child may outlive the dissolve). Destroying a child
-  // out-of-band without a dissolve leaves a dangling entry — lineage
-  // lookups resolve child_id through the manifest and never dereference a
-  // slot that does not match.
+  // state only frees the POINTER ARRAY. Entries are matched by the child's
+  // lineage_self_id, NEVER by position: the manifest above persists across
+  // a restart while this registry starts empty, so a slot index bears no
+  // relationship to a manifest index (A10-5). Dissolve NULLs the matching
+  // slot — a hole — and lookups skip holes (the child may outlive the
+  // dissolve). Destroying a child out-of-band without a dissolve leaves a
+  // dangling entry.
   attribute_machine_t** resident_children;
   uint32_t              resident_child_count;
   // v1.5.2 §4: Compaction config (crabs_tombstone_config_t*). Externally owned
