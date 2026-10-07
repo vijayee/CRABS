@@ -105,6 +105,74 @@ ctest
 - **Self-Sovereign Identity** — User-controlled attributes with verifier attestation and audit trail
 - **Supply Chain Management** — Protocol-governed custody transfers across organizations
 
+## Machine Minting (CLI)
+
+A lineage-eligible machine can mint child machines from **blueprints**: a
+parent vouches for a child's genesis, keeps it in a durable child manifest,
+signs user attestations across the trust boundary, and ends a lineage through
+dissolve or withdrawal. The trust-mode caveats live in the Trust Boundaries
+section below.
+
+`crabs machine <subcommand>` group (the child-machine lifecycle surface):
+
+| Command | Effect |
+|---|---|
+| `machine blueprint new <child_id> <shared\|delegated\|sovereign> <bootstrap_admin> <attestation_ttl_ms>` | Open a machine blueprint draft on this node |
+| `machine blueprint item <name> <data_type> <crdt_type>` | Append a replicated data item to the draft |
+| `machine blueprint policy <operation> <expression>` | Append an authorization policy to the draft |
+| `machine blueprint dedup <op_type> <dedup_type> [tracker_path\|flag_path\|condition]` | Append an operation type definition (dedup: `none`, `per_user`, `global`, `custom`) |
+| `machine blueprint save <file.cbp>` | Validate the draft and write the `.cbp` wire file |
+| `machine blueprint validate <file.cbp>` | Validate a saved blueprint file (wire hash + structure) |
+| `machine blueprint drop` | Discard the current draft |
+| `machine spawn <file.cbp>` | Spawn a child machine (real `__spawn_machine__` op through the pipeline) |
+| `machine children` | List the child manifest: mode, status, residency, attestation TTL |
+| `machine attest <child_id> <user_id> <attributes>` | Mint and print a parent-signed, TTL-bounded attestation wire |
+| `machine dissolve <child_id>` | Dissolve a non-sovereign child (real `__dissolve_machine__` op) |
+| `machine withdraw <child_id>` | Withdraw a sovereign child's genesis stake (real `__withdraw_genesis__` op) |
+| `machine revoke-attestation <child_id>` | Stop issuing attestations for a child (real `__revoke_attestation__` op) |
+
+The blueprint authoring commands are draft editing and never touch machine
+state; spawn, dissolve, withdraw, and revoke-attestation are signed operations
+through the same pipeline as `op submit`. The lineage op handlers are runtime
+registrations on the machine (`lineage_install` in the library/wasm path):
+after `crabs load-sealed` restores a saved machine, the spawning protocol
+re-installs the lineage ops on the reloaded machine before the lifecycle
+commands can act — the CLI refuses those commands loudly otherwise.
+
+A minimal spawn flow:
+
+```bash
+crabs seal-key import <seal.key>
+crabs machine blueprint new child-red delegated child-admin 3600000
+crabs machine blueprint item counter counter g_counter
+crabs machine blueprint policy increment role:admin
+crabs machine blueprint dedup increment none
+crabs machine blueprint save /tmp/child-red.cbp
+crabs machine spawn /tmp/child-red.cbp
+crabs machine children
+crabs machine attest child-red child-admin role:writer   # prints the wire hex
+crabs machine dissolve child-red
+```
+
+### Wasm lineage exports
+
+The wasm module carries the same lineage surface (registered in
+`build_wasm.sh`, both variants), with the JS wrappers living in
+`bindings/wasm/bindings-core.js` (`Blueprint`, `Node.children/attest/...`):
+
+- `crabs_wasm_register_lineage_ops` — registers the four lineage ops +
+  default admin policies on a machine (`lineage_install`)
+- Blueprint family — `crabs_wasm_lineage_blueprint_new` / `_add_item` /
+  `_add_policy` / `_stamp_hash` / `_serialize` / `_deserialize` / `_destroy`
+- Spawn family — `crabs_wasm_lineage_spawn` (child pointers are borrowed;
+  the parent's resident-children registry anchors their lifetime),
+  `crabs_wasm_lineage_query_resident_child`
+- Manifest family — `crabs_wasm_lineage_children_count` / `_children_get_id`
+  / `_get_mode` / `_get_status` / `_get_ttl_ms` / `_get_spawned_at` /
+  `_find_manifest_entry`
+- `crabs_wasm_lineage_attest` — issues a parent-signed attestation and
+  returns its transport wire bytes
+
 ## Trust Boundaries: What Is Durable and What Is Not
 
 Serialization v10 changes what a saved machine carries. A snapshot now holds the **full authority** of the machine: its users, key registries, operation-type definitions, and the CP-ABE master secret key (MSK). Restoring a snapshot restores the machine's authority as well as its state — which makes how that authority is protected the most important trust boundary in the system.
