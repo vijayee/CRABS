@@ -212,6 +212,28 @@ bool attestation_verify(const uint8_t parent_public_key[33],
                              attestation->signature);
 }
 
+bool attestation_verify_by_lineage_key(const state_t* child_state,
+                                       const attestation_t* attestation,
+                                       uint64_t now_ms) {
+  if (child_state == NULL || attestation == NULL) return false;
+  // Unbound or never-chain-stamped: no accepted parent authority exists, so
+  // nothing can verify (fail closed — mirrors lineage_verify_by_parent_key).
+  if (!child_state->lineage_parent_bound) return false;
+  // The canonical check's child_id is THIS machine's lineage identity: any
+  // chain entry may have signed, but the attestation must still name this
+  // machine (attestation_verify's strcmp gate).
+  for (uint32_t chain_index = 0;
+       chain_index < child_state->lineage_key_chain_count; chain_index++) {
+    if (attestation_verify(child_state->lineage_key_chain[chain_index]
+                               .public_key,
+                           child_state->lineage_self_id, attestation,
+                           now_ms)) {
+      return true;
+    }
+  }
+  return false;
+}
+
 size_t attestation_serialize(const attestation_t* attestation,
                              uint8_t* out_buf, size_t buf_len) {
   if (attestation == NULL || out_buf == NULL) return 0;
@@ -1296,6 +1318,25 @@ crabs_error_e lineage_spawn_machine(state_t* parent,
   memcpy(child_state->lineage_parent_public_key, parent->node_public_key, 33);
   strncpy(child_state->lineage_self_id, blueprint->child_id,
           CRABS_MAX_USER_ID - 1);
+  // A10-M6: chain entry [0] is the spawn pin — the parent's CURRENT node key
+  // is the first accepted parent authority. Stamped at binding time so the
+  // chain-aware verification surfaces (endorsements, tombstones) work from
+  // genesis; __parent_key_update__ advances it forward-only from here. The
+  // v12 genesis serialization predates the chain (v13 persists it), so this
+  // allocation affects no signed bytes.
+  child_state->lineage_key_chain =
+      get_clear_memory(sizeof(lineage_key_chain_entry_t));
+  if (child_state->lineage_key_chain == NULL) {
+    // No manifest/registry residue exists yet — destroying the child is the
+    // whole cleanup (same failure shape as _spawn_apply_blueprint failures).
+    attribute_machine_destroy(child);
+    return CRABS_ERR_OOM;
+  }
+  child_state->lineage_key_chain[0].key_version =
+      CRABS_LINEAGE_KEY_VERSION_START;
+  memcpy(child_state->lineage_key_chain[0].public_key,
+         parent->node_public_key, 33);
+  child_state->lineage_key_chain_count = 1;
 
   status = _spawn_apply_blueprint(child_state, blueprint);
   if (status == CRABS_SUCCESS) {
@@ -1619,11 +1660,14 @@ void lineage_install(state_t* state) {
                              &no_dedup);
   state_register_op_type_def(state, CRABS_LINEAGE_OP_RECEIVE_DISSOLUTION,
                              &no_dedup);
+  state_register_op_type_def(state, CRABS_LINEAGE_OP_PARENT_KEY_UPDATE,
+                             &no_dedup);
   state_add_policy(state, CRABS_LINEAGE_OP_SPAWN, "role:admin");
   state_add_policy(state, CRABS_LINEAGE_OP_REVOKE_ATTESTATION, "role:admin");
   state_add_policy(state, CRABS_LINEAGE_OP_DISSOLVE, "role:admin");
   state_add_policy(state, CRABS_LINEAGE_OP_WITHDRAW_GENESIS, "role:admin");
   state_add_policy(state, CRABS_LINEAGE_OP_RECEIVE_DISSOLUTION, "role:admin");
+  state_add_policy(state, CRABS_LINEAGE_OP_PARENT_KEY_UPDATE, "role:admin");
   state_machine_register_handler(state, CRABS_LINEAGE_OP_SPAWN,
                                  lineage_op_spawn);
   state_machine_register_handler(state, CRABS_LINEAGE_OP_REVOKE_ATTESTATION,
@@ -1634,6 +1678,8 @@ void lineage_install(state_t* state) {
                                  lineage_op_withdraw_genesis);
   state_machine_register_handler(state, CRABS_LINEAGE_OP_RECEIVE_DISSOLUTION,
                                  lineage_op_receive_dissolution);
+  state_machine_register_handler(state, CRABS_LINEAGE_OP_PARENT_KEY_UPDATE,
+                                 lineage_op_parent_key_update);
 }
 
 // Canonical tombstone body: `u8 tag (= LINEAGE_DISSOLVED) + string16
@@ -1776,8 +1822,10 @@ crabs_error_e lineage_op_receive_dissolution(state_t* state, operation_t* op) {
   // Authenticity rests on the tombstone's own parent signature — NOT on the
   // op's signature or attestations: the pipeline already authorized the
   // child admin (carriage), this ECDSA proves the parent decided (content).
-  if (!crypto_ecdsa_verify(state->lineage_parent_public_key, op->payload,
-                           body_len, signature)) {
+  // Chain-aware (A10-M6): a tombstone signed by ANY accepted parent key —
+  // the spawn pin or an accepted rotation — is authoritative.
+  if (!lineage_verify_by_parent_key(state, op->payload, body_len,
+                                    signature)) {
     return CRABS_ERR_CRYPTOGRAPHIC_ERROR;
   }
 
@@ -1786,6 +1834,30 @@ crabs_error_e lineage_op_receive_dissolution(state_t* state, operation_t* op) {
                       CRABS_LINEAGE_OP_RECEIVE_DISSOLUTION, op->uuid,
                       op->signer_id, op->node_id, tombstone_child_id,
                       "dissolution received", CRABS_SUCCESS);
+  return CRABS_SUCCESS;
+}
+
+crabs_error_e lineage_op_parent_key_update(state_t* state, operation_t* op) {
+  // Belt-and-braces payload cap alongside the accept gate's own size window:
+  // an oversized payload is structural garbage before it is a record.
+  if (state == NULL || op == NULL || op->payload == NULL ||
+      op->payload_size > LINEAGE_KEY_TRANSITION_WIRE_MAX) {
+    return CRABS_ERR_INVALID_PARAM;
+  }
+  // The record's embedded parent signature is the authority — the accept
+  // gate validates structure, continuity, version, and the signature, and
+  // appends ONLY on full admission (no partial mutation).
+  crabs_error_e status =
+      lineage_child_accept_key_transition(state, op->payload,
+                                          op->payload_size);
+  if (status != CRABS_SUCCESS) return status;
+  // Attribute via the op (signer/node/uuid) like the other lineage lifecycle
+  // events; the target is THIS machine (the mutated subject) — the
+  // __receive_dissolution__ precedent for child-side ops.
+  state_notify_change(state, CRABS_CHANGE_LINEAGE,
+                      CRABS_LINEAGE_OP_PARENT_KEY_UPDATE, op->uuid,
+                      op->signer_id, op->node_id, state->lineage_self_id,
+                      "parent key accepted", CRABS_SUCCESS);
   return CRABS_SUCCESS;
 }
 

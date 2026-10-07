@@ -370,7 +370,7 @@ const char* lineage_status_name(lineage_status_e status);
 // ============================================================
 
 // Custom op types a lineage-eligible machine registers (lineage_install).
-// All five are admin-gated user-defined operations — the state machine's
+// All six are admin-gated user-defined operations — the state machine's
 // builtin chain stays untouched; handlers run POST-authorization, so the
 // handler bodies re-verify nothing about the caller.
 #define CRABS_LINEAGE_OP_SPAWN               "__spawn_machine__"
@@ -378,15 +378,16 @@ const char* lineage_status_name(lineage_status_e status);
 #define CRABS_LINEAGE_OP_DISSOLVE            "__dissolve_machine__"
 #define CRABS_LINEAGE_OP_WITHDRAW_GENESIS    "__withdraw_genesis__"
 #define CRABS_LINEAGE_OP_RECEIVE_DISSOLUTION "__receive_dissolution__"
+#define CRABS_LINEAGE_OP_PARENT_KEY_UPDATE   "__parent_key_update__"
 
 // Forward declaration: operation_t is full-defined in state_machine.h (which
 // itself includes this header). Pointer use only — safe on an incomplete type.
 typedef struct crabs_operation operation_t;
 
-// Convenience installer: registers the five op type definitions (DEDUP_NONE —
+// Convenience installer: registers the six op type definitions (DEDUP_NONE —
 // per-child replay guards are a protocol author's choice), the default
-// policies (all five "role:admin" — a protocol may override afterwards via
-// state_add_policy), and the five handlers. IDEMPOTENT: registration paths
+// policies (all six "role:admin" — a protocol may override afterwards via
+// state_add_policy), and the six handlers. IDEMPOTENT: registration paths
 // update in place when already present, so calling it twice is a no-op —
 // call once after machine creation.
 void lineage_install(state_t* state);
@@ -467,12 +468,26 @@ crabs_error_e lineage_dissolution_serialize(state_t* parent,
 // op pipeline already verified the submitting child admin's signature against
 // the "role:admin" policy, which authorizes CARRIAGE of the payload but says
 // nothing about its content; the tombstone's ECDSA over the canonical body
-// against the persisted lineage_parent_public_key is the ONLY proof that the
-// PARENT machine actually severed the lineage. The op's attestations play no
+// against the accepted parent key chain (lineage_verify_by_parent_key — the
+// spawn pin plus every accepted rotation) is the ONLY proof that the PARENT
+// machine actually severed the lineage. The op's attestations play no
 // part — a child admin carrying a forged parent "decision" must fail on the
 // parent signature, and a raw-but-unroutable parent signature needs the
 // authorized op carrier to reach the child machine at all.
 crabs_error_e lineage_op_receive_dissolution(state_t* state, operation_t* op);
+
+// payload = a key transition record (lineage_key_rotate's output / the
+// stashed lineage_last_key_transition re-emitted after a restart). Runs on
+// the CHILD: appends the new parent key to its lineage_key_chain when the
+// record passes lineage_child_accept_key_transition's gates (the record's own
+// parent signature is the authority — the op pipeline authorizes only its
+// child-admin carrier, the same two-proof shape as __receive_dissolution__).
+// The error surface is exactly the accept gate's (see
+// lineage_child_accept_key_transition); the handler adds only the NULL /
+// payload-cap pre-check (payload_size must not exceed
+// LINEAGE_KEY_TRANSITION_WIRE_MAX — belt and braces with the deserializer's
+// own bound).
+crabs_error_e lineage_op_parent_key_update(state_t* state, operation_t* op);
 
 // payload = child_id (raw string). Sovereign ONLY: the parent recovers its
 // genesis stake by voiding the manifest entry (WITHDRAWN) — attestations for
@@ -505,6 +520,18 @@ crabs_error_e attestation_create(state_t* parent,
 bool attestation_verify(const uint8_t parent_public_key[33],
                         const char* child_id,
                         const attestation_t* attestation, uint64_t now_ms);
+
+// Chain-aware endorsement verification (A10-M6): attestation_verify tried
+// against EVERY entry of the child state's lineage_key_chain — the spawn pin
+// (pre-rotation attestations keep verifying) and every accepted rotated key
+// (issuance under the current node key verifies immediately after a
+// __parent_key_update__). The child_id the canonical check matches is
+// child_state->lineage_self_id. Fails closed (false) on an unbound machine
+// or an empty chain; the caller's own lifecycle gates (dissolution etc.)
+// stay separate. No heap use.
+bool attestation_verify_by_lineage_key(const state_t* child_state,
+                                       const attestation_t* attestation,
+                                       uint64_t now_ms);
 
 // Wire format: u32le total length (canonical body + signature, excluding the
 // prefix itself) + the canonical body + signature. Returns bytes written, or

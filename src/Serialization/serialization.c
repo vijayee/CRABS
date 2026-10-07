@@ -2098,6 +2098,20 @@ static state_t* _deserialize_state_internal(const uint8_t* data, size_t len,
           state->lineage_parent_dissolved = (parent_dissolved == 1);
         }
         state->lineage_parent_bound = true;
+        // A10-M6 (T12): pre-v13 wire formats persist only the spawn pin.
+        // Back-fill chain entry [0] from it — the pin IS chain[0] by the
+        // state's own definition — so the chain-aware verification surfaces
+        // (endorsements, tombstones) keep working for revived bound
+        // machines. A failed allocation refuses the load: a child that
+        // trusts nothing silently is worse than no load at all.
+        state->lineage_key_chain =
+            get_clear_memory(sizeof(lineage_key_chain_entry_t));
+        if (state->lineage_key_chain == NULL) goto fail;
+        state->lineage_key_chain[0].key_version =
+            CRABS_LINEAGE_KEY_VERSION_START;
+        memcpy(state->lineage_key_chain[0].public_key,
+               state->lineage_parent_public_key, 33);
+        state->lineage_key_chain_count = 1;
       }
     }
 

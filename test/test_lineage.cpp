@@ -565,8 +565,9 @@ static void endorsement_harness_destroy(endorsement_harness_t* harness) {
   crypto_ecdsa_keypair_destroy(harness->impostor_key);
 }
 
-// Bind the child state to a parent: public key + self id + bound flag. This
-// is the in-memory shape spawn will produce (spawn itself is a later task).
+// Bind the child state to a parent: public key + self id + bound flag +
+// chain[0] = the spawn pin (the in-memory shape spawn produces — spawn stamps
+// the chain at binding time so chain-aware verification works from genesis).
 static void bind_child_to_parent(state_t* child_state,
                                  const ecdsa_keypair_t* parent_key,
                                  const char* parent_id,
@@ -577,6 +578,14 @@ static void bind_child_to_parent(state_t* child_state,
   strncpy(child_state->lineage_self_id, child_id,
           sizeof(child_state->lineage_self_id) - 1);
   child_state->lineage_parent_bound = true;
+  child_state->lineage_key_chain = (lineage_key_chain_entry_t*)calloc(
+      1, sizeof(lineage_key_chain_entry_t));
+  ASSERT_NE(child_state->lineage_key_chain, nullptr);
+  child_state->lineage_key_chain[0].key_version =
+      CRABS_LINEAGE_KEY_VERSION_START;
+  memcpy(child_state->lineage_key_chain[0].public_key,
+         parent_key->public_key, 33);
+  child_state->lineage_key_chain_count = 1;
 }
 
 // Attestation signed by whatever key the harness state carries.
@@ -1584,13 +1593,13 @@ TEST(TestLineage, SpawnViaOp) {
   ASSERT_EQ(attribute_machine_grant_role(harness.am, "alice", "role", "admin",
                                          "parent-root"), CRABS_SUCCESS);
 
-  // Idempotent installer: a second call registers nothing new (five lineage
-  // ops since __receive_dissolution__ joined).
+  // Idempotent installer: a second call registers nothing new (six lineage
+  // ops since __parent_key_update__ joined).
   lineage_install(parent);
-  EXPECT_EQ(parent->op_handler_count, 5u);
+  EXPECT_EQ(parent->op_handler_count, 6u);
   lineage_install(parent);
-  EXPECT_EQ(parent->op_handler_count, 5u);
-  EXPECT_EQ(parent->op_type_def_count, 5u);
+  EXPECT_EQ(parent->op_handler_count, 6u);
+  EXPECT_EQ(parent->op_type_def_count, 6u);
   EXPECT_NE(state_find_policy(parent, CRABS_LINEAGE_OP_SPAWN), nullptr);
 
   machine_blueprint_t* blueprint = make_valid_blueprint();
@@ -2306,12 +2315,12 @@ TEST(TestLineage, TombstoneDeliveryOpSetsAndPersistsDissolveState) {
   uint8_t seal_key[32];
   ASSERT_EQ(crypto_random_bytes(seal_key, sizeof(seal_key)), CRABS_SUCCESS);
 
-  // The installer on the CHILD registers the delivery op: five lineage ops,
-  // the delivery op gated "role:admin" like its four siblings. The blueprint
+  // The installer on the CHILD registers the delivery op: six lineage ops,
+  // the delivery op gated "role:admin" like its five siblings. The blueprint
   // already contributed one op type definition ("increment").
   lineage_install(&child->base_state);
-  EXPECT_EQ(child->base_state.op_handler_count, 5u);
-  EXPECT_EQ(child->base_state.op_type_def_count, 6u);
+  EXPECT_EQ(child->base_state.op_handler_count, 6u);
+  EXPECT_EQ(child->base_state.op_type_def_count, 7u);
   EXPECT_NE(state_find_policy(&child->base_state,
                               CRABS_LINEAGE_OP_RECEIVE_DISSOLUTION), nullptr);
   EXPECT_NE(state_find_op_type_def(&child->base_state,
@@ -3537,4 +3546,246 @@ TEST(TestLineage, KeyChainVerifyByAnyChainKey) {
                                             strlen(message), nullptr));
 
   keychain_harness_destroy(&harness);
+}
+
+// ============================================================
+// __parent_key_update__: the op pipeline path into the key chain (A10-M6)
+// ============================================================
+
+// Deliver a key transition record to a child machine through its own auth
+// pipeline: the signer is the child's genesis admin "child-admin" — registered
+// at spawn with the parent's PRE-rotation node public key, so the ORIGINAL
+// parent keypair carries the op — under the installer's "role:admin" policy.
+// Carriage (the op signature) and content (the parent-signed record inside)
+// are the same two independent proofs as __receive_dissolution__.
+static crabs_error_e deliver_key_update(attribute_machine_t* child,
+                                        ecdsa_keypair_t* carrier_key,
+                                        const uint8_t* record,
+                                        size_t record_len) {
+  operation_t* op = make_signed_lineage_op(child, carrier_key, "child-admin",
+                                           CRABS_LINEAGE_OP_PARENT_KEY_UPDATE,
+                                           record, record_len);
+  EXPECT_NE(op, nullptr);
+  if (op == NULL) return CRABS_ERR_INVALID_PARAM;
+  crabs_error_e status = state_machine_execute(&child->base_state, op);
+  operation_destroy(op);
+  return status;
+}
+
+TEST(TestLineage, ParentKeyUpdateEndToEnd) {
+  spawn_parent_harness_t harness;
+  spawn_parent_setup(&harness);
+  state_t* parent = &harness.am->base_state;
+
+  // Two resident delegated children: spawn stamps each chain at
+  // [(CRABS_LINEAGE_KEY_VERSION_START, parent node key)] alongside the
+  // lineage_parent_public_key pin.
+  machine_blueprint_t* red_blueprint =
+      make_fresh_authority_blueprint("child-red", LINEAGE_DELEGATED_COPY);
+  ASSERT_NE(red_blueprint, nullptr);
+  attribute_machine_t* child_red = nullptr;
+  ASSERT_EQ(lineage_spawn_machine(parent, red_blueprint, &child_red),
+            CRABS_SUCCESS);
+  machine_blueprint_t* blue_blueprint =
+      make_fresh_authority_blueprint("child-blue", LINEAGE_DELEGATED_COPY);
+  ASSERT_NE(blue_blueprint, nullptr);
+  attribute_machine_t* child_blue = nullptr;
+  ASSERT_EQ(lineage_spawn_machine(parent, blue_blueprint, &child_blue),
+            CRABS_SUCCESS);
+  attribute_machine_t* children[2] = {child_red, child_blue};
+  for (int child_index = 0; child_index < 2; child_index++) {
+    state_t* child_state = &children[child_index]->base_state;
+    lineage_install(child_state);
+    ASSERT_EQ(child_state->lineage_key_chain_count, 1u);
+    EXPECT_EQ(child_state->lineage_key_chain[0].key_version,
+              (uint64_t)CRABS_LINEAGE_KEY_VERSION_START);
+    EXPECT_EQ(memcmp(child_state->lineage_key_chain[0].public_key,
+                     harness.parent_key->public_key, 33), 0);
+  }
+
+  // Parent rotates k1 -> k2: the record is signed by k1 and stashed for
+  // re-emission; k2 becomes the parent's live node key.
+  ecdsa_keypair_t* k2 = crypto_ecdsa_generate();
+  ASSERT_NE(k2, nullptr);
+  uint8_t* record = nullptr;
+  size_t record_len = 0;
+  ASSERT_EQ(lineage_key_rotate(parent, k2->private_key, k2->public_key,
+                               1700000000000ULL, &record, &record_len),
+            CRABS_SUCCESS);
+  ASSERT_EQ(state_set_node_key(parent, k2->private_key, k2->public_key),
+            CRABS_SUCCESS);
+  EXPECT_EQ(parent->lineage_key_version,
+            (uint64_t)CRABS_LINEAGE_KEY_VERSION_START + 1);
+
+  // Capture the first child's change event for the update op.
+  static crabs_change_event_t captured_events[4];
+  static uint32_t captured_event_count;
+  captured_event_count = 0;
+  state_set_change_hook(&child_red->base_state,
+                        [](state_t*, const crabs_change_event_t* event,
+                           void*) {
+    if (event->kind != CRABS_CHANGE_LINEAGE) return;
+    if (captured_event_count < 4) {
+      captured_events[captured_event_count++] = *event;
+    }
+  }, nullptr);
+
+  // ONE record (bound to the parent_id, not a child) serves BOTH children —
+  // delivered through each child's own op pipeline.
+  for (int child_index = 0; child_index < 2; child_index++) {
+    EXPECT_EQ(deliver_key_update(children[child_index], harness.parent_key,
+                                 record, record_len),
+              CRABS_SUCCESS);
+    state_t* child_state = &children[child_index]->base_state;
+    ASSERT_EQ(child_state->lineage_key_chain_count, 2u);
+    EXPECT_EQ(child_state->lineage_key_chain[0].key_version,
+              (uint64_t)CRABS_LINEAGE_KEY_VERSION_START);
+    EXPECT_EQ(memcmp(child_state->lineage_key_chain[0].public_key,
+                     harness.parent_key->public_key, 33), 0);
+    EXPECT_EQ(child_state->lineage_key_chain[1].key_version,
+              (uint64_t)CRABS_LINEAGE_KEY_VERSION_START + 1);
+    EXPECT_EQ(memcmp(child_state->lineage_key_chain[1].public_key,
+                     k2->public_key, 33), 0);
+  }
+
+  // Change event: lineage kind, the update op type, attributed to the op,
+  // targeting THIS machine (the __receive_dissolution__ precedent for
+  // child-side ops names the mutated machine) — the preview carries that the
+  // PARENT's key was accepted.
+  ASSERT_EQ(captured_event_count, 1u);
+  EXPECT_EQ(captured_events[0].kind, CRABS_CHANGE_LINEAGE);
+  EXPECT_STREQ(captured_events[0].type, "__parent_key_update__");
+  EXPECT_STREQ(captured_events[0].target, "child-red");
+  EXPECT_STREQ(captured_events[0].preview, "parent key accepted");
+  EXPECT_EQ(captured_events[0].result, CRABS_SUCCESS);
+
+  free(record);
+  crypto_ecdsa_keypair_destroy(k2);
+  attribute_machine_destroy(child_red);
+  attribute_machine_destroy(child_blue);
+  machine_blueprint_destroy(red_blueprint);
+  machine_blueprint_destroy(blue_blueprint);
+  spawn_parent_destroy(&harness);
+}
+
+TEST(TestLineage, ParentKeyUpdateNewKeyEndorsementSatisfies) {
+  spawn_parent_harness_t harness;
+  spawn_parent_setup(&harness);
+  state_t* parent = &harness.am->base_state;
+  g_test_clock_ms = 1700000000000ULL;  // fixed test epoch T0
+  state_set_time_source(parent, &g_test_clock_ops);
+
+  machine_blueprint_t* blueprint =
+      make_endorsed_delegated_blueprint("child-delegated");
+  ASSERT_NE(blueprint, nullptr);
+  attribute_machine_t* child = nullptr;
+  ASSERT_EQ(lineage_spawn_machine(parent, blueprint, &child), CRABS_SUCCESS);
+  state_set_time_source(&child->base_state, &g_test_clock_ops);
+  register_child_render_handler(child);
+  lineage_install(&child->base_state);
+
+  // Rotate k1 -> k2 BEFORE the child learns of it: the parent's issuances
+  // are now k2-signed while the child still holds only the spawn pin.
+  ecdsa_keypair_t* k2 = crypto_ecdsa_generate();
+  ASSERT_NE(k2, nullptr);
+  uint8_t* record = nullptr;
+  size_t record_len = 0;
+  ASSERT_EQ(lineage_key_rotate(parent, k2->private_key, k2->public_key,
+                               g_test_clock_ms, &record, &record_len),
+            CRABS_SUCCESS);
+  ASSERT_EQ(state_set_node_key(parent, k2->private_key, k2->public_key),
+            CRABS_SUCCESS);
+
+  // Endorsement attestation signed with k2 (the parent's CURRENT node key).
+  attestation_t attestation;
+  ASSERT_EQ(crabs_issue_attestation(parent, &attestation, "child-delegated",
+                                    "child-admin", "role:writer",
+                                    g_test_clock_ms), CRABS_SUCCESS);
+
+  // The child-admin carries the endorsed op; its registry key is the
+  // pre-rotation parent public key, so the ORIGINAL parent keypair signs
+  // (the attestation attaches AFTER signing — the signing image excludes
+  // attestations, per the established idiom).
+  operation_t* op = operation_create("render");
+  ASSERT_NE(op, nullptr);
+  strncpy(op->signer_id, "child-admin", CRABS_MAX_USER_ID - 1);
+  crabs_test_sign_op_with(child, harness.parent_key, op);
+  attach_attestation(op, &attestation);
+
+  // Before the update: k2 is not an accepted parent key — the endorsement
+  // fails closed even though the attestation is honestly signed.
+  EXPECT_EQ(state_machine_execute(&child->base_state, op),
+            CRABS_ERR_UNAUTHORIZED);
+  operation_destroy(op);
+
+  // Deliver the transition through the pipeline.
+  ASSERT_EQ(deliver_key_update(child, harness.parent_key, record, record_len),
+            CRABS_SUCCESS);
+
+  // The SAME signer, SAME k2-signed attestation now authorizes via the
+  // chain. (A fresh op shell — lamport monotonicity refuses a literal
+  // re-execution, unrelated to the endorsement gate.)
+  operation_t* op2 = operation_create("render");
+  ASSERT_NE(op2, nullptr);
+  strncpy(op2->signer_id, "child-admin", CRABS_MAX_USER_ID - 1);
+  crabs_test_sign_op_with(child, harness.parent_key, op2);
+  attach_attestation(op2, &attestation);
+  EXPECT_EQ(state_machine_execute(&child->base_state, op2), CRABS_SUCCESS);
+
+  operation_destroy(op2);
+  free(record);
+  crypto_ecdsa_keypair_destroy(k2);
+  attribute_machine_destroy(child);
+  machine_blueprint_destroy(blueprint);
+  spawn_parent_destroy(&harness);
+}
+
+TEST(TestLineage, ParentKeyUpdateRejectsTamperedRecord) {
+  spawn_parent_harness_t harness;
+  spawn_parent_setup(&harness);
+  state_t* parent = &harness.am->base_state;
+
+  machine_blueprint_t* blueprint =
+      make_fresh_authority_blueprint("child-red", LINEAGE_DELEGATED_COPY);
+  ASSERT_NE(blueprint, nullptr);
+  attribute_machine_t* child = nullptr;
+  ASSERT_EQ(lineage_spawn_machine(parent, blueprint, &child), CRABS_SUCCESS);
+  lineage_install(&child->base_state);
+
+  ecdsa_keypair_t* k2 = crypto_ecdsa_generate();
+  ASSERT_NE(k2, nullptr);
+  uint8_t* record = nullptr;
+  size_t record_len = 0;
+  ASSERT_EQ(lineage_key_rotate(parent, k2->private_key, k2->public_key,
+                               1700000000000ULL, &record, &record_len),
+            CRABS_SUCCESS);
+
+  // Tamper INSIDE the signed body (created_at — informational, so every
+  // structural gate still parses and the failure is pure signature
+  // verification): the handler surfaces the accept gate's cryptographic
+  // refusal and the chain is untouched.
+  const size_t body_len = record_len - CRABS_SIG_SIZE;
+  uint8_t tampered[LINEAGE_KEY_TRANSITION_WIRE_MAX];
+  memcpy(tampered, record, record_len);
+  tampered[body_len - 1] ^= 0xFF;
+  EXPECT_EQ(deliver_key_update(child, harness.parent_key, tampered,
+                               record_len),
+            CRABS_ERR_CRYPTOGRAPHIC_ERROR);
+  EXPECT_EQ(child->base_state.lineage_key_chain_count, 1u);
+  EXPECT_EQ(memcmp(child->base_state.lineage_key_chain[0].public_key,
+                   harness.parent_key->public_key, 33), 0);
+
+  // Tampering the trailing signature fails closed the same way.
+  memcpy(tampered, record, record_len);
+  tampered[record_len - 1] ^= 0x01;
+  EXPECT_EQ(deliver_key_update(child, harness.parent_key, tampered,
+                               record_len),
+            CRABS_ERR_CRYPTOGRAPHIC_ERROR);
+  EXPECT_EQ(child->base_state.lineage_key_chain_count, 1u);
+
+  free(record);
+  crypto_ecdsa_keypair_destroy(k2);
+  attribute_machine_destroy(child);
+  machine_blueprint_destroy(blueprint);
+  spawn_parent_destroy(&harness);
 }

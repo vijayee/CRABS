@@ -244,7 +244,8 @@ bool operation_is_protected(const char* type) {
           strcmp(type, CRABS_LINEAGE_OP_REVOKE_ATTESTATION) == 0 ||
           strcmp(type, CRABS_LINEAGE_OP_DISSOLVE) == 0 ||
           strcmp(type, CRABS_LINEAGE_OP_WITHDRAW_GENESIS) == 0 ||
-          strcmp(type, CRABS_LINEAGE_OP_RECEIVE_DISSOLUTION) == 0);
+          strcmp(type, CRABS_LINEAGE_OP_RECEIVE_DISSOLUTION) == 0 ||
+          strcmp(type, CRABS_LINEAGE_OP_PARENT_KEY_UPDATE) == 0);
 }
 
 operation_t* operation_create(const char* type) {
@@ -665,7 +666,8 @@ static bool _attestation_covers(const attestation_t* attestation,
 //     endorsement — endorsement policies deny on an unbound machine even
 //     when the op carries attestations;
 //   - each endorsement needs ONE attestation that verifies against the
-//     machine's parent public key, names THIS machine
+//     machine's accepted parent key chain (A10-M6: the spawn pin plus every
+//     key admitted by __parent_key_update__), names THIS machine
 //     (child_id == lineage_self_id), sits inside its validity window, names
 //     the RESOLVED signer as its attested user, and whose attested
 //     attributes cover the endorsement exactly;
@@ -702,8 +704,7 @@ static crabs_error_e _verify_parent_endorsements(
          attestation_index < op->attestation_count; attestation_index++) {
       const attestation_t* attestation =
           &op->attestations[attestation_index];
-      if (!attestation_verify(state->lineage_parent_public_key,
-                              state->lineage_self_id, attestation, now_ms)) {
+      if (!attestation_verify_by_lineage_key(state, attestation, now_ms)) {
         continue;
       }
       // Identity anchor: the attestation must name THIS machine's bound
