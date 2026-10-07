@@ -120,7 +120,7 @@ section below.
 | `machine blueprint new <child_id> <shared\|delegated\|sovereign> <bootstrap_admin> <attestation_ttl_ms>` | Open a machine blueprint draft on this node |
 | `machine blueprint item <name> <data_type> <crdt_type>` | Append a replicated data item to the draft |
 | `machine blueprint policy <operation> <expression>` | Append an authorization policy to the draft |
-| `machine blueprint dedup <op_type> <dedup_type> [tracker_path\|flag_path\|condition]` | Append an operation type definition (dedup: `none`, `per_user`, `global`, `custom`) |
+| `machine blueprint dedup <op_type> <dedup_type> [tracker_path\|flag_path\|condition] [rejection_message]` | Append an operation type definition (dedup: `none`, `per_user`, `global`, `custom`) |
 | `machine blueprint save <file.cbp>` | Validate the draft and write the `.cbp` wire file |
 | `machine blueprint validate <file.cbp>` | Validate a saved blueprint file (wire hash + structure) |
 | `machine blueprint drop` | Discard the current draft |
