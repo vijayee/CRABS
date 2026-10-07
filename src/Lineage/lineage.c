@@ -1197,8 +1197,11 @@ crabs_error_e lineage_spawn_machine(state_t* parent,
                  genesis_signature, CRABS_SIG_SIZE);
           manifest_entry->attestation_ttl_ms = blueprint->attestation_ttl_ms;
           // The parent never reads the wall clock itself — spawn stamps the
-          // manifest with the parent's authenticated time (state_get_time_ms;
-          // 0 when no time is available rather than a spoofable local read).
+          // manifest with the parent's HLC time source (state_get_time_ms;
+          // 0 when the source reports no valid time — the default SYSTEM_
+          // CLOCK source backs this with the unauthenticated platform clock,
+          // so protocol authors needing authenticated spawn times configure
+          // an authenticated source).
           if (!state_get_time_ms(parent, &manifest_entry->spawned_at)) {
             manifest_entry->spawned_at = 0;
           }
@@ -1275,6 +1278,15 @@ attribute_machine_t* lineage_query_resident_child(const state_t* state,
     return state->resident_children[child_index];
   }
   return NULL;
+}
+
+uint32_t lineage_query_children(const state_t* state,
+                                const child_manifest_entry_t** out_entries) {
+  if (state == NULL || out_entries == NULL) return 0;
+  // Borrowed view: the state owns the array (state_destroy frees it); the
+  // caller never gets ownership. NULL when the machine never spawned.
+  *out_entries = state->children;
+  return state->child_count;
 }
 
 crabs_error_e lineage_op_spawn(state_t* state, operation_t* op) {

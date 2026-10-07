@@ -222,6 +222,15 @@ crabs_error_e lineage_spawn_machine(state_t* parent,
 attribute_machine_t* lineage_query_resident_child(const state_t* state,
                                                   const char* child_id);
 
+// Borrowed view over this machine's child manifest (v11 persisted): *out
+// entries receives a BORROWED pointer to the internal children array (the
+// state owns it — never free or hold past the state's lifetime) and the
+// return value is the entry count. Returns 0 and leaves *out_entries
+// untouched when state or out_entries is NULL. A count of 0 with an empty
+// manifest also leaves the internal pointer NULL.
+uint32_t lineage_query_children(const state_t* state,
+                                const child_manifest_entry_t** out_entries);
+
 // ============================================================
 // Lineage ops: spawn / revoke attestation / dissolve / withdraw via the
 // operation pipeline
