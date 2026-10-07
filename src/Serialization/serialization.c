@@ -1717,8 +1717,16 @@ fail:
   return false;
 }
 
+// authority_restored is set true only when a sealed MSK section unsealed and
+// deserialized with the provided key; msk_section_present reports whether the
+// sealed authority section existed at all. Both are nullable.
 static state_t* _deserialize_state_internal(const uint8_t* data, size_t len,
-                                            const uint8_t seal_key[32]) {
+                                            const uint8_t seal_key[32],
+                                            bool* authority_restored,
+                                            bool* msk_section_present) {
+  // Reporters default false; the sealed path below sets them true.
+  if (authority_restored != NULL) *authority_restored = false;
+  if (msk_section_present != NULL) *msk_section_present = false;
   if (data == NULL || len < CRABS_HASH_SIZE + 4 + 4 + 8 + 4 + 4 + 4) {
     return NULL;
   }
@@ -1970,6 +1978,7 @@ static state_t* _deserialize_state_internal(const uint8_t* data, size_t len,
     if (!_read_uint8(&buf, &msk_present)) goto fail;
     if (msk_present > 1) goto fail;   // the flag is boolean on the wire
     if (msk_present != 0) {
+      if (msk_section_present != NULL) *msk_section_present = true;
       uint32_t sealed_len;
       if (!_read_uint32_le(&buf, &sealed_len)) goto fail;
       if (sealed_len == 0 || sealed_len > CRABS_DESER_MAX_SEALED_MSK_BYTES) goto fail;
@@ -1989,6 +1998,7 @@ static state_t* _deserialize_state_internal(const uint8_t* data, size_t len,
           if (restored_master_key != NULL) {
             crypto_abe_master_key_destroy(state->abe_mk);   // discard fresh key
             state->abe_mk = restored_master_key;
+            if (authority_restored != NULL) *authority_restored = true;
           }
         }
         // Cleanse the recovered plaintext whether or not the unseal or the
@@ -2008,12 +2018,20 @@ fail:
 }
 
 state_t* crabs_deserialize_state(const uint8_t* data, size_t len) {
-  return _deserialize_state_internal(data, len, NULL);
+  return _deserialize_state_internal(data, len, NULL, NULL, NULL);
 }
 
 state_t* crabs_deserialize_state_keys(const uint8_t* data, size_t len,
                                       const uint8_t seal_key[32]) {
-  return _deserialize_state_internal(data, len, seal_key);
+  return _deserialize_state_internal(data, len, seal_key, NULL, NULL);
+}
+
+state_t* crabs_deserialize_state_keys_reported(const uint8_t* data, size_t len,
+                                               const uint8_t seal_key[32],
+                                               bool* authority_restored,
+                                               bool* msk_section_present) {
+  return _deserialize_state_internal(data, len, seal_key, authority_restored,
+                                     msk_section_present);
 }
 
 // R7-03: authenticated state snapshot. Serializes the state (with its SHA-256

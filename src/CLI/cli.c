@@ -257,7 +257,18 @@ cli_result_e cli_node_load(cli_node_t* node, const char* path) {
       node->seal_key_valid ? node->seal_key : NULL;
   if (file_len > CRABS_SIG_SIZE) {
     size_t payload_len = file_len - CRABS_SIG_SIZE;
-    loaded = crabs_deserialize_state_keys(data, payload_len, load_seal_key);
+    bool authority_restored = false;
+    bool msk_section_present = false;
+    loaded = crabs_deserialize_state_keys_reported(
+        data, payload_len, load_seal_key,
+        &authority_restored, &msk_section_present);
+    if (loaded != NULL && msk_section_present && !authority_restored) {
+      fprintf(stderr,
+              "WARNING: this snapshot's master secret key could NOT be "
+              "restored (wrong or missing seal key) — a FRESH authority was "
+              "created; re-enroll via 'state migrate' instead of trusting "
+              "signatures against this authority\n");
+    }
     if (loaded != NULL) {
       uint8_t* payload_copy = get_memory(payload_len);
       if (payload_copy == NULL) {
@@ -277,7 +288,18 @@ cli_result_e cli_node_load(cli_node_t* node, const char* path) {
     }
   }
   if (loaded == NULL) {
-    loaded = crabs_deserialize_state_keys(data, file_len, load_seal_key);
+    bool authority_restored = false;
+    bool msk_section_present = false;
+    loaded = crabs_deserialize_state_keys_reported(
+        data, file_len, load_seal_key,
+        &authority_restored, &msk_section_present);
+    if (loaded != NULL && msk_section_present && !authority_restored) {
+      fprintf(stderr,
+              "WARNING: this snapshot's master secret key could NOT be "
+              "restored (wrong or missing seal key) — a FRESH authority was "
+              "created; re-enroll via 'state migrate' instead of trusting "
+              "signatures against this authority\n");
+    }
     if (loaded != NULL) {
       // Audit: the fallback parsed an UNSIGNED blob. Its provenance is
       // unauthenticated — mark the node so cli_node_save refuses to re-sign

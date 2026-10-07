@@ -51,6 +51,16 @@ serialized_buffer_t* crabs_serialize_state_sealed(const state_t* state,
 state_t*             crabs_deserialize_state_keys(const uint8_t* data, size_t len,
                                                      const uint8_t seal_key[32]);
 
+// v10+ load with restoration reporting: *authority_restored is true only when
+// a sealed MSK section was present AND unsealed with the provided key;
+// *msk_section_present reports whether the authority section existed at all.
+// Either out-param may be NULL. Returns a state with a LIVE (restored or
+// fresh) MSK in every case — see crabs_deserialize_state_keys's contract.
+state_t*             crabs_deserialize_state_keys_reported(
+                         const uint8_t* data, size_t len,
+                         const uint8_t seal_key[32],
+                         bool* authority_restored, bool* msk_section_present);
+
 // R7-03: authenticated state snapshots. crabs_serialize_state_signed appends
 // an ECDSA signature (from state->node_private_key) over the whole blob after
 // the SHA-256 checksum; crabs_deserialize_state_signed verifies it with the

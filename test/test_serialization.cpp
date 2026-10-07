@@ -1862,3 +1862,40 @@ TEST(TestSerialization, V10CorruptUserEntryFailsWholeLoad) {
 
   serialized_buffer_destroy(buf);
 }
+
+// Plan-1 follow-up #1: a sealed snapshot loaded with a WRONG seal key must be
+// distinguishable from a snapshot with no sealed MSK section at all — the
+// substrate keeps a FRESH authority in both cases, so callers need explicit
+// restoration reporting.
+TEST(TestSerialization, AuthorityRestorationIsReportable) {
+  state_t* state = state_create();
+  ASSERT_NE(state, nullptr);
+  uint8_t seal_key[32];
+  ASSERT_EQ(crypto_random_bytes(seal_key, sizeof(seal_key)), CRABS_SUCCESS);
+
+  serialized_buffer_t* buf = crabs_serialize_state_sealed(state, seal_key);
+  ASSERT_NE(buf, nullptr);
+
+  uint8_t wrong_key[32];
+  memcpy(wrong_key, seal_key, 32);
+  wrong_key[0] ^= 0xFF;
+
+  bool authority_restored = true;
+  bool msk_section_present = false;
+  state_t* wrong = crabs_deserialize_state_keys_reported(
+      buf->data, buf->len, wrong_key, &authority_restored, &msk_section_present);
+  ASSERT_NE(wrong, nullptr);
+  EXPECT_FALSE(authority_restored);
+  EXPECT_TRUE(msk_section_present);
+
+  authority_restored = false;
+  state_t* correct = crabs_deserialize_state_keys_reported(
+      buf->data, buf->len, seal_key, &authority_restored, &msk_section_present);
+  ASSERT_NE(correct, nullptr);
+  EXPECT_TRUE(authority_restored);
+  EXPECT_TRUE(msk_section_present);
+  state_destroy(correct);
+  state_destroy(wrong);
+  serialized_buffer_destroy(buf);
+  state_destroy(state);
+}
