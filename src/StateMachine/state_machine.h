@@ -44,6 +44,10 @@ typedef struct {
 // ============================================================
 // Operation (§7.1 + v1.3 §4.2)
 // ============================================================
+// Current operation wire format version (the u32le heading every serialized
+// op). v3: dedup_spec; v4: ordering_system + HLC; v5: parent attestations.
+#define CRABS_OP_FORMAT_VERSION  5
+
 // Tagged so lineage.h can forward-declare the name for its op handlers
 // (those declarations land before this header's own definition of the type).
 typedef struct crabs_operation {
@@ -82,6 +86,13 @@ typedef struct crabs_operation {
   // v1.6 Amd6: Ordering system support
   crabs_ordering_system_e ordering_system;  // LAMPORT (default) or HLC
   crabs_hlc_t        hlc;                   // HLC timestamp (used when ordering_system == HLC)
+  // A10-L7: wire format version this op was parsed from / will be emitted as.
+  // The deserializer validates 1..CRABS_OP_FORMAT_VERSION and stores it here
+  // (previously discarded); operation_create stamps the current version.
+  // Included in the signed canonical form (signing format v3) so a relay
+  // cannot strip the attestation/dedup/HLC tail by downgrading the version
+  // byte — the rewritten op re-serializes to different signed bytes.
+  uint32_t           op_version;
 } operation_t;
 
 // ============================================================

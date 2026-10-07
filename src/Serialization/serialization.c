@@ -2255,13 +2255,38 @@ state_t* crabs_deserialize_state_signed(const uint8_t* data, size_t len,
 // ============================================================
 // Operation serialization
 // ============================================================
+// A10-L7: the op's effective wire/canonical version. Ops parsed from the
+// wire carry their stored version (validated 1..CRABS_OP_FORMAT_VERSION);
+// in-memory memset-constructed ops may carry 0, which reads as the current
+// version. Never invent a future version here.
+static uint32_t _op_format_version(const operation_t* op) {
+  if (op->op_version >= 1 && op->op_version <= CRABS_OP_FORMAT_VERSION) {
+    return op->op_version;
+  }
+  return CRABS_OP_FORMAT_VERSION;
+}
+
 serialized_buffer_t* crabs_serialize_operation(const operation_t* op) {
   if (op == NULL) return NULL;
+
+  // A10-L7: emit the op's declared version so a serialized→deserialized
+  // round-trip preserves it (and with it the signed canonical form). The
+  // version number tells the reader which of the tail sections below
+  // follow, so a low declared version cannot carry content the reader of
+  // that version will not parse — refuse such ops instead of silently
+  // truncating (silent truncation is the strip attack this audit closes,
+  // and would also break the reader's full-consumption check).
+  uint32_t wire_version = _op_format_version(op);
+  if ((wire_version < 3 && op->dedup.type != DEDUP_NONE) ||
+      (wire_version < 4 && op->ordering_system != CRABS_ORDERING_LAMPORT) ||
+      (wire_version < 5 && op->attestation_count > 0)) {
+    return NULL;
+  }
 
   write_buf_t* buf = _write_buf_create(1024);
 
   // Operation format version
-  _write_uint32_le(buf, 5);
+  _write_uint32_le(buf, wire_version);
   // v3: adds dedup_spec; v4: adds ordering_system + HLC;
   // v5: adds the parent-attestation section
 
@@ -2339,37 +2364,42 @@ serialized_buffer_t* crabs_serialize_operation(const operation_t* op) {
     _write_bytes32(buf, op->co_signers[i].signature, op->co_signers[i].signature_len);
   }
 
-  // v1.4: dedup_spec
-  _write_uint8(buf, (uint8_t)op->dedup.type);
-  if (op->dedup.type != DEDUP_NONE) {
-    _write_string16(buf, op->dedup.tracker_path);
-    _write_string16(buf, op->dedup.flag_path);
-    _write_string16(buf, op->dedup.condition);
-    _write_string16(buf, op->dedup.rejection_message);
-    // state_mutation
-    _write_uint8(buf, (uint8_t)op->dedup.update.type);
-    // R7-L-15: always write all 7 mutation fields, matching the canonical
-    // signing form. The prior conditional dropped them for MUTATION_CUSTOM, so
-    // an op carrying such fields failed verification after gossip.
-    _write_string16(buf, op->dedup.update.set_path);
-    _write_string16(buf, op->dedup.update.element_value);
-    _write_string16(buf, op->dedup.update.flag_path);
-    _write_string16(buf, op->dedup.update.counter_path);
-    _write_int64_le(buf, op->dedup.update.delta);
-    _write_string16(buf, op->dedup.update.target_path);
-    _write_string16(buf, op->dedup.update.value);
+  // v3 (v1.4): dedup_spec. A10-L7: gated on the op's declared version so the
+  // wire header and the section set never disagree.
+  if (wire_version >= 3) {
+    _write_uint8(buf, (uint8_t)op->dedup.type);
+    if (op->dedup.type != DEDUP_NONE) {
+      _write_string16(buf, op->dedup.tracker_path);
+      _write_string16(buf, op->dedup.flag_path);
+      _write_string16(buf, op->dedup.condition);
+      _write_string16(buf, op->dedup.rejection_message);
+      // state_mutation
+      _write_uint8(buf, (uint8_t)op->dedup.update.type);
+      // R7-L-15: always write all 7 mutation fields, matching the canonical
+      // signing form. The prior conditional dropped them for MUTATION_CUSTOM, so
+      // an op carrying such fields failed verification after gossip.
+      _write_string16(buf, op->dedup.update.set_path);
+      _write_string16(buf, op->dedup.update.element_value);
+      _write_string16(buf, op->dedup.update.flag_path);
+      _write_string16(buf, op->dedup.update.counter_path);
+      _write_int64_le(buf, op->dedup.update.delta);
+      _write_string16(buf, op->dedup.update.target_path);
+      _write_string16(buf, op->dedup.update.value);
+    }
   }
 
   // v4: ordering_system + HLC fields (v1.6 Amd6 §6.2). R7-15: the wire format
   // must cover the same field set as the canonical signing form, otherwise an
   // HLC-ordered op cannot verify after gossip (the deserialized op re-serializes
   // to different bytes).
-  _write_uint8(buf, (uint8_t)op->ordering_system);
-  if (op->ordering_system == CRABS_ORDERING_HLC) {
-    _write_uint64_le(buf, op->hlc.physical_seconds);
-    _write_uint64_le(buf, op->hlc.physical_nanos);
-    _write_uint64_le(buf, op->hlc.logical_counter);
-    _write_string16(buf, op->hlc.node_id);
+  if (wire_version >= 4) {
+    _write_uint8(buf, (uint8_t)op->ordering_system);
+    if (op->ordering_system == CRABS_ORDERING_HLC) {
+      _write_uint64_le(buf, op->hlc.physical_seconds);
+      _write_uint64_le(buf, op->hlc.physical_nanos);
+      _write_uint64_le(buf, op->hlc.logical_counter);
+      _write_string16(buf, op->hlc.node_id);
+    }
   }
 
   // v5 (v1.7 §attestation bridge): parent attestations carried by the op.
@@ -2380,27 +2410,29 @@ serialized_buffer_t* crabs_serialize_operation(const operation_t* op) {
   // signing form: each carries the parent's signature over its own body.
   // Symmetric with the reader's count cap: an over-cap op would serialize
   // into wire the deserializer fail-closes on, so refuse it here instead.
-  if (op->attestation_count > CRABS_MAX_OP_ATTESTATIONS) {
-    free(buf->data);
-    free(buf);
-    return NULL;
-  }
-  _write_uint32_le(buf, op->attestation_count);
-  for (uint32_t attestation_index = 0;
-       attestation_index < op->attestation_count; attestation_index++) {
-    uint8_t attestation_wire[CRABS_ATTESTATION_WIRE_MAX];
-    size_t attestation_wire_len = attestation_serialize(
-        &op->attestations[attestation_index],
-        attestation_wire, sizeof(attestation_wire));
-    if (attestation_wire_len == 0) {
-      // A structurally broken attestation (unterminated field) cannot be
-      // faithfully transported — refuse the op instead of truncating it.
+  if (wire_version >= 5) {
+    if (op->attestation_count > CRABS_MAX_OP_ATTESTATIONS) {
       free(buf->data);
       free(buf);
       return NULL;
     }
-    _write_uint32_le(buf, (uint32_t)attestation_wire_len);
-    _write_bytes(buf, attestation_wire, attestation_wire_len);
+    _write_uint32_le(buf, op->attestation_count);
+    for (uint32_t attestation_index = 0;
+         attestation_index < op->attestation_count; attestation_index++) {
+      uint8_t attestation_wire[CRABS_ATTESTATION_WIRE_MAX];
+      size_t attestation_wire_len = attestation_serialize(
+          &op->attestations[attestation_index],
+          attestation_wire, sizeof(attestation_wire));
+      if (attestation_wire_len == 0) {
+        // A structurally broken attestation (unterminated field) cannot be
+        // faithfully transported — refuse the op instead of truncating it.
+        free(buf->data);
+        free(buf);
+        return NULL;
+      }
+      _write_uint32_le(buf, (uint32_t)attestation_wire_len);
+      _write_bytes(buf, attestation_wire, attestation_wire_len);
+    }
   }
 
   // Create output
@@ -2427,7 +2459,13 @@ operation_t* crabs_deserialize_operation(const uint8_t* data, size_t len) {
   // Operation format version
   uint32_t op_version;
   if (!_read_uint32_le(&buf, &op_version)) goto fail;
-  if (op_version < 1 || op_version > 5) goto fail;
+  if (op_version < 1 || op_version > CRABS_OP_FORMAT_VERSION) goto fail;
+  // A10-L7: keep the parsed version on the op. It is part of the signed
+  // canonical form (signing format v3), so verify paths must re-serialize
+  // the op at exactly the version the signer declared. Discarding it (the
+  // prior behavior) let a relay strip the attestation/dedup/HLC tail by
+  // downgrading the version byte while the signature still verified.
+  op->op_version = op_version;
 
   // type
   if (!_read_string16(&buf, op->type, CRABS_MAX_OP_NAME)) goto fail;
@@ -2880,10 +2918,23 @@ serialized_buffer_t* crabs_serialize_for_signing(const operation_t* op) {
   _write_uint8(buf, 0x52); // 'R'
   _write_uint8(buf, 0x41); // 'A'
   _write_uint8(buf, 0x42); // 'B'
-  _write_uint8(buf, 0x02); // signing-format version 2 (full dedup + payload_format + domain tag)
+  // signing-format version 3 (A10-L7): adds op_version to the signed bytes.
+  // Under version 2, op_version was absent from the canonical form, so a
+  // relay could strip the attestation/dedup/HLC tail by downgrading the op's
+  // wire version (5→1) and the original signature still verified against the
+  // truncated op. Signatures minted under version 2 no longer verify — the
+  // version byte is consumed only as domain separation (nothing parses the
+  // signing form), so every signer and every verifier must run the same
+  // signing-format version.
+  _write_uint8(buf, 0x03);
 
   // 1. op.type (length-prefixed string)
   _write_string16(buf, op->type);
+
+  // 1b. op.op_version (uint32) — A10-L7: binds the declared wire version to
+  // the signature, so the downgrade-strip rewrite above re-serializes to
+  // different bytes and fails verification.
+  _write_uint32_le(buf, _op_format_version(op));
 
   // 2. op.uuid (16 bytes raw)
   _write_bytes(buf, op->uuid, CRABS_UUID_SIZE);

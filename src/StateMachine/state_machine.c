@@ -250,6 +250,9 @@ bool operation_is_protected(const char* type) {
 operation_t* operation_create(const char* type) {
   operation_t* op = get_clear_memory(sizeof(operation_t));
   strncpy(op->type, type, CRABS_MAX_OP_NAME - 1);
+  // A10-L7: new in-memory ops are authored at the current wire version; the
+  // deserializer overwrites this with the parsed version.
+  op->op_version = CRABS_OP_FORMAT_VERSION;
   return op;
 }
 

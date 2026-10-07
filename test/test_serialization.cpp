@@ -576,7 +576,7 @@ TEST(TestSerialization, TestCanonicalEncodingFieldOrder) {
   EXPECT_EQ(buf->data[1], 0x52);
   EXPECT_EQ(buf->data[2], 0x41);
   EXPECT_EQ(buf->data[3], 0x42);
-  EXPECT_EQ(buf->data[4], 0x02); // signing-format version
+  EXPECT_EQ(buf->data[4], 0x03); // signing-format version 3 (A10-L7)
 
   // After the domain tag, the first field is the type string (length-prefixed).
   // "__lock__" is 8 chars → uint16 length prefix = 8, then the bytes.
@@ -585,11 +585,120 @@ TEST(TestSerialization, TestCanonicalEncodingFieldOrder) {
   EXPECT_EQ(type_len, 8);
   EXPECT_EQ(memcmp(buf->data + base + 2, "__lock__", 8), 0);
 
-  // After type, the next 16 bytes should be the UUID
-  size_t offset = base + 2 + type_len;
+  // A10-L7: after type comes op_version as a u32le (signing format v3).
+  size_t op_version_offset = base + 2 + type_len;
+  uint32_t canonical_version =
+      (uint32_t)buf->data[op_version_offset] |
+      ((uint32_t)buf->data[op_version_offset + 1] << 8) |
+      ((uint32_t)buf->data[op_version_offset + 2] << 16) |
+      ((uint32_t)buf->data[op_version_offset + 3] << 24);
+  EXPECT_EQ(canonical_version, (uint32_t)CRABS_OP_FORMAT_VERSION);
+
+  // After op_version, the next 16 bytes should be the UUID
+  size_t offset = op_version_offset + 4;
   EXPECT_EQ(memcmp(buf->data + offset, op->uuid, CRABS_UUID_SIZE), 0);
 
   serialized_buffer_destroy(buf);
+  operation_destroy(op);
+}
+
+// A10-L7: op_version is part of the signed canonical form (signing format
+// v3). Two ops identical except op_version must serialize to DIFFERENT
+// signing bytes, and a signature minted over the version-5 canonical form
+// must NOT verify when the op is re-serialized as version 1 — this is the
+// strip attack: a relay downgrades the wire version byte to truncate the
+// attestation/dedup/HLC tail; pre-fix the signature still verified because
+// op_version never entered the canonical form.
+TEST(TestSerialization, TestCanonicalSigningBindsOpVersion) {
+  operation_t* op_v5 = operation_create(CRABS_OP_LOCK);
+  ASSERT_NE(op_v5, nullptr);
+  memset(op_v5->uuid, 0x11, CRABS_UUID_SIZE);
+  strncpy(op_v5->signer_id, "alice", CRABS_MAX_USER_ID - 1);
+  op_v5->signer_key_version = 1;
+  op_v5->lamport_time = 7;
+  strncpy(op_v5->node_id, "node1", CRABS_MAX_USER_ID - 1);
+  ASSERT_EQ(op_v5->op_version, (uint32_t)CRABS_OP_FORMAT_VERSION);
+
+  // Twin op: identical field-for-field, differing only in op_version —
+  // exactly what the stripped/re-parsed op looks like to a verifier.
+  operation_t op_v1 = *op_v5;
+  op_v1.op_version = 1;
+
+  serialized_buffer_t* buf_v5 = crabs_serialize_for_signing(op_v5);
+  serialized_buffer_t* buf_v1 = crabs_serialize_for_signing(&op_v1);
+  ASSERT_NE(buf_v5, nullptr);
+  ASSERT_NE(buf_v1, nullptr);
+
+  // Canonical forms must differ.
+  bool identical = (buf_v5->len == buf_v1->len) &&
+                   (memcmp(buf_v5->data, buf_v1->data, buf_v5->len) == 0);
+  EXPECT_FALSE(identical)
+      << "op_version is not bound into the signed canonical form: a "
+         "version-downgrade strip keeps the signature valid (A10-L7)";
+
+  // A signature over the version-5 canonical form verifies there, and MUST
+  // NOT verify against the version-1 canonical form.
+  ecdsa_keypair_t* keypair = crypto_ecdsa_generate();
+  ASSERT_NE(keypair, nullptr);
+  uint8_t signature[CRABS_SIG_SIZE];
+  ASSERT_EQ(crypto_ecdsa_sign(keypair->private_key, buf_v5->data,
+                              buf_v5->len, signature),
+            CRABS_SUCCESS);
+  EXPECT_TRUE(crypto_ecdsa_verify(keypair->public_key, buf_v5->data,
+                                  buf_v5->len, signature));
+  EXPECT_FALSE(crypto_ecdsa_verify(keypair->public_key, buf_v1->data,
+                                   buf_v1->len, signature))
+      << "signature minted at op_version 5 still verifies after a "
+         "downgrade to op_version 1 (A10-L7)";
+
+  crypto_ecdsa_keypair_destroy(keypair);
+  serialized_buffer_destroy(buf_v5);
+  serialized_buffer_destroy(buf_v1);
+  operation_destroy(op_v5);
+}
+
+// A10-L7: the wire round-trip preserves op_version. The serializer emits the
+// op's declared version (not a hardcoded current version), the deserializer
+// stores it back on the op, and the canonical signing form matches across
+// the round-trip — required for scheduled ops (serialized into the state
+// blob, deserialized and verified on fire) to keep verifying.
+TEST(TestSerialization, TestOpVersionRoundTrip) {
+  operation_t* op = operation_create(CRABS_OP_LOCK);
+  ASSERT_NE(op, nullptr);
+  memset(op->uuid, 0x22, CRABS_UUID_SIZE);
+  strncpy(op->signer_id, "bob", CRABS_MAX_USER_ID - 1);
+  op->lamport_time = 11;
+  op->ordering_system = CRABS_ORDERING_HLC;
+  op->hlc.physical_seconds = 100;
+  op->hlc.physical_nanos = 5;
+  op->hlc.logical_counter = 3;
+  strncpy(op->hlc.node_id, "node1", CRABS_HLC_NODE_ID_SIZE - 1);
+
+  serialized_buffer_t* wire = crabs_serialize_operation(op);
+  ASSERT_NE(wire, nullptr);
+  ASSERT_GE(wire->len, 4u);
+  uint32_t wire_version = (uint32_t)wire->data[0] |
+                          ((uint32_t)wire->data[1] << 8) |
+                          ((uint32_t)wire->data[2] << 16) |
+                          ((uint32_t)wire->data[3] << 24);
+  EXPECT_EQ(wire_version, (uint32_t)CRABS_OP_FORMAT_VERSION);
+
+  operation_t* restored = crabs_deserialize_operation(wire->data, wire->len);
+  ASSERT_NE(restored, nullptr);
+  EXPECT_EQ(restored->op_version, (uint32_t)CRABS_OP_FORMAT_VERSION);
+
+  serialized_buffer_t* canon_original = crabs_serialize_for_signing(op);
+  serialized_buffer_t* canon_restored = crabs_serialize_for_signing(restored);
+  ASSERT_NE(canon_original, nullptr);
+  ASSERT_NE(canon_restored, nullptr);
+  ASSERT_EQ(canon_original->len, canon_restored->len);
+  EXPECT_EQ(memcmp(canon_original->data, canon_restored->data,
+                   canon_original->len), 0);
+
+  serialized_buffer_destroy(canon_original);
+  serialized_buffer_destroy(canon_restored);
+  operation_destroy(restored);
+  serialized_buffer_destroy(wire);
   operation_destroy(op);
 }
 
