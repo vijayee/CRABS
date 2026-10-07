@@ -427,6 +427,45 @@ TEST(TestSerialization, TestOperationAttestationCountBoundAndTruncation) {
   operation_destroy(original);
 }
 
+// Symmetry with the reader: the deserializer already fail-closes on
+// attestation_count > CRABS_MAX_OP_ATTESTATIONS, so the writer must refuse
+// to emit such a blob rather than produce wire that can never be read back.
+TEST(TestSerialization, TestOperationWriterEnforcesAttestationCap) {
+  operation_t* original = operation_create(CRABS_OP_CHECK_DEDUP);
+  memset(original->uuid, 0x55, CRABS_UUID_SIZE);
+  strncpy(original->signer_id, "alice", CRABS_MAX_USER_ID - 1);
+
+  attestation_t* entries = (attestation_t*)malloc(
+      (CRABS_MAX_OP_ATTESTATIONS + 1) * sizeof(attestation_t));
+  ASSERT_NE(entries, nullptr);
+  for (uint32_t attestation_index = 0;
+       attestation_index <= CRABS_MAX_OP_ATTESTATIONS; attestation_index++) {
+    attestation_t* entry = &entries[attestation_index];
+    memset(entry, 0, sizeof(*entry));
+    entry->format_version = CRABS_ATTESTATION_FORMAT_VERSION;
+    strncpy(entry->parent_id, "parent-root", sizeof(entry->parent_id) - 1);
+    strncpy(entry->child_id, "child-red", sizeof(entry->child_id) - 1);
+    strncpy(entry->user_id, "alice", sizeof(entry->user_id) - 1);
+    strncpy(entry->attributes, "role:writer", sizeof(entry->attributes) - 1);
+    entry->not_before = 1700000000000ULL;
+    entry->expires_at = 1700000060000ULL;
+    memset(entry->signature, 0x44, CRABS_SIG_SIZE);
+  }
+  original->attestations = entries;
+
+  // At the cap the op still serializes; one over it the writer refuses.
+  original->attestation_count = CRABS_MAX_OP_ATTESTATIONS;
+  serialized_buffer_t* wire = crabs_serialize_operation(original);
+  ASSERT_NE(wire, nullptr);
+  serialized_buffer_destroy(wire);
+  wire = NULL;
+
+  original->attestation_count = CRABS_MAX_OP_ATTESTATIONS + 1;
+  EXPECT_EQ(crabs_serialize_operation(original), nullptr);
+
+  operation_destroy(original);
+}
+
 // R7-03: state snapshots must be authenticated with the node key, not just
 // SHA-256 checksummed. A tampered blob or a wrong verification key must be
 // rejected before parsing.

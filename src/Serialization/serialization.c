@@ -2357,6 +2357,13 @@ serialized_buffer_t* crabs_serialize_operation(const operation_t* op) {
   // own u32le length so the transport can never drift from the format
   // attestation_verify consumes. Attestations are NOT part of the canonical
   // signing form: each carries the parent's signature over its own body.
+  // Symmetric with the reader's count cap: an over-cap op would serialize
+  // into wire the deserializer fail-closes on, so refuse it here instead.
+  if (op->attestation_count > CRABS_MAX_OP_ATTESTATIONS) {
+    free(buf->data);
+    free(buf);
+    return NULL;
+  }
   _write_uint32_le(buf, op->attestation_count);
   for (uint32_t attestation_index = 0;
        attestation_index < op->attestation_count; attestation_index++) {
