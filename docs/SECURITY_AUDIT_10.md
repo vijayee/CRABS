@@ -88,4 +88,5 @@ Two halves of one finding. (a) `src/CLI/cli.c:2398-2419`: the `key` dispatcher w
 
 ## Remediation status
 
-*Pending. Suggested fix order: A10-1..A10-4 (openabe-c input validation, one contiguous patch), A10-5/A10-6 (lineage registry indexing + liveness), A10-7/A10-8 (CLI key-import wiring + single-shot design), then MEDIUMs.*
+- **A10-1..A10-4 — FIXED (2026-10-07).** openabe-c commit `9da0a04`: stale-rc error paths in `oabe_cp_ct_deserialize` (and the same pattern in the KP-ABE deserializer) now set `OABE_ERROR_INVALID_CIPHERTEXT`; all wire length prefixes in `oabe_secret_key_deserialize`, `oabe_user_key_deserialize`, and `deserialize_cp_key_elements` are bounds-checked. Regression tests verified to fail/segfault against the pre-fix code; 147 openabe-c tests and 1548 CRABS tests green. Submodule bumped to `602dbf2`.
+- *Pending: A10-5/A10-6 (lineage registry indexing + liveness), A10-7/A10-8 (CLI key-import wiring + single-shot design), then MEDIUMs.*
