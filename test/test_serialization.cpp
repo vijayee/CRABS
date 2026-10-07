@@ -13,6 +13,7 @@ extern "C" {
 #include "../src/CRDT/crdt_merge.h"
 #include "../src/Trigger/trigger.h"
 #include "../src/OT/ot_ordered_set.h"
+#include "../src/Util/allocator.h"
 #include <openssl/sha.h>
 }
 
@@ -1638,5 +1639,147 @@ TEST(TestSerialization, TestLogEntryHlcNanosOverflowRejected) {
   EXPECT_EQ(crabs_deserialize_state(wire->data, wire->len), nullptr);
 
   serialized_buffer_destroy(wire);
+  state_destroy(state);
+}
+
+// ============================================================
+// v10 serialization: op_type_defs, user registry, child manifest
+// space, sealed MSK (§11.5 durability)
+// ============================================================
+
+TEST(TestSerialization, V10OpTypeDefsRoundTrip) {
+  state_t* state = state_create();
+  ASSERT_NE(state, nullptr);
+  dedup_spec_t spec;
+  memset(&spec, 0, sizeof(spec));
+  spec.type = DEDUP_PER_USER;
+  strncpy(spec.tracker_path, "trackers/op1", sizeof(spec.tracker_path) - 1);
+  strncpy(spec.rejection_message, "duplicate op", sizeof(spec.rejection_message) - 1);
+  ASSERT_EQ(state_register_op_type_def(state, "vote-once", &spec), CRABS_SUCCESS);
+
+  serialized_buffer_t* buf = crabs_serialize_state(state);
+  ASSERT_NE(buf, nullptr);
+  state_t* restored = crabs_deserialize_state(buf->data, buf->len);
+  ASSERT_NE(restored, nullptr);
+
+  const dedup_spec_t* restored_dedup = state_find_op_type_def(restored, "vote-once");
+  ASSERT_NE(restored_dedup, nullptr);
+  EXPECT_EQ(restored_dedup->type, DEDUP_PER_USER);
+  EXPECT_STREQ(restored_dedup->tracker_path, "trackers/op1");
+  EXPECT_STREQ(restored_dedup->rejection_message, "duplicate op");
+
+  serialized_buffer_destroy(buf);
+  state_destroy(state);
+  state_destroy(restored);
+}
+
+TEST(TestSerialization, V10UserRegistryRoundTripPreservesAttributesAndKeys) {
+  state_t* state = state_create();
+  ASSERT_NE(state, nullptr);
+  // Simulate a CLI-style machine: an attribute machine holding users. The
+  // shell is caller-managed in this test — detached and freed manually below,
+  // because state_destroy never owned it.
+  state->attr_machine = (attribute_machine_t*)get_clear_memory(sizeof(attribute_machine_t));
+  state->attr_machine->base_state = *state;   // alias for pointer wiring only
+  user_t* writer = (user_t*)get_clear_memory(sizeof(user_t));
+  strncpy(writer->user_id, "alice", CRABS_MAX_USER_ID - 1);
+  writer->status = USER_ACTIVE;
+  writer->key_version = 3;
+  strncpy(writer->attributes[0].value, "role:writer", CRABS_MAX_POLICY_EXPR - 1);
+  writer->attribute_count = 1;
+  // Crypto random 33-byte key material is NOT validated here — serialization
+  // is a byte-level round trip; validation belongs to register_user.
+  user_key_t* first_key = (user_key_t*)get_clear_memory(sizeof(user_key_t));
+  strncpy(first_key->key_id, "k1", CRABS_MAX_KEY_ID - 1);
+  first_key->scheme = ECDSA_SECP256K1;
+  first_key->public_key_len = 33;
+  for (int byte_index = 0; byte_index < 33; byte_index++)
+    first_key->public_key[byte_index] = (uint8_t)(byte_index + 1);
+  first_key->status = KEY_ACTIVE;
+  writer->keys = first_key;
+  writer->key_count = 1;
+  strncpy(writer->default_key_id, "k1", CRABS_MAX_KEY_ID - 1);
+  state->attr_machine->users = writer;
+  state->attr_machine->user_count = 1;
+
+  serialized_buffer_t* buf = crabs_serialize_state(state);
+  ASSERT_NE(buf, nullptr);
+
+  state->attr_machine->users = NULL;   // detach before destroy
+  state->attr_machine->base_state.attr_machine = NULL;
+  state->attr_machine->base_state.abe_mk = NULL;  // owned by the original state
+  free(state->attr_machine);           // caller-managed shell
+  state->attr_machine = NULL;
+  state_destroy(state);
+  user_key_destroy_all(writer);
+  free(writer);
+
+  state_t* restored = crabs_deserialize_state(buf->data, buf->len);
+  ASSERT_NE(restored, nullptr);
+  ASSERT_NE(restored->attr_machine, nullptr);
+  user_t* restored_writer = attribute_machine_find_user(restored->attr_machine, "alice");
+  ASSERT_NE(restored_writer, nullptr);
+  EXPECT_EQ(restored_writer->status, USER_ACTIVE);
+  EXPECT_EQ(restored_writer->key_version, 3);
+  // Attributes persist verbatim ("name:value" pairs); role lookup keys on the
+  // name part (matches the attribute machine's own convention, see
+  // test_cli.cpp / test_integration.cpp which pass "role").
+  EXPECT_TRUE(attribute_machine_user_has_role(restored_writer, "role"));
+  ASSERT_EQ(restored_writer->key_count, 1);
+  ASSERT_NE(restored_writer->keys, nullptr);
+  EXPECT_STREQ(restored_writer->keys->key_id, "k1");
+  EXPECT_EQ(restored_writer->keys->scheme, ECDSA_SECP256K1);
+  EXPECT_EQ(restored_writer->keys->public_key[0], 1);
+
+  serialized_buffer_destroy(buf);
+  // The restored state carries the deserializer-owned attribute machine shell;
+  // state_destroy releases both the state fields and its user registry.
+  state_destroy(restored);
+}
+
+TEST(TestSerialization, V10SealedMskRoundTripRestoresAuthority) {
+  state_t* state = state_create();
+  ASSERT_NE(state, nullptr);
+  uint8_t seal_key[32];
+  ASSERT_EQ(crypto_random_bytes(seal_key, sizeof(seal_key)), CRABS_SUCCESS);
+
+  serialized_buffer_t* buf = crabs_serialize_state_sealed(state, seal_key);
+  ASSERT_NE(buf, nullptr);
+
+  // Wrong key: substrate restores, MSK stays fresh.
+  uint8_t wrong_key[32];
+  memcpy(wrong_key, seal_key, 32);
+  wrong_key[0] ^= 0xFF;
+  state_t* wrong = crabs_deserialize_state_keys(buf->data, buf->len, wrong_key);
+  ASSERT_NE(wrong, nullptr);
+  ASSERT_NE(wrong->abe_mk, nullptr);   // fresh key, never NULL
+  state_destroy(wrong);
+
+  // Correct key: the restored MSK matches the original bit-for-bit (same
+  // serialized MPK bytes) — the authority is preserved.
+  uint8_t* original_msk = (uint8_t*)malloc(16384);
+  size_t original_len = crypto_master_key_serialize(
+      (const abe_master_key_t*)state->abe_mk, original_msk, 16384);
+  ASSERT_GT(original_len, (size_t)0);
+
+  state_t* restored = crabs_deserialize_state_keys(buf->data, buf->len, seal_key);
+  ASSERT_NE(restored, nullptr);
+  uint8_t* restored_msk = (uint8_t*)malloc(16384);
+  size_t restored_len = crypto_master_key_serialize(
+      (const abe_master_key_t*)restored->abe_mk, restored_msk, 16384);
+  ASSERT_EQ(restored_len, original_len);
+  EXPECT_EQ(memcmp(restored_msk, original_msk, original_len), 0);
+  free(original_msk);
+  free(restored_msk);
+
+  // No key: MSK section cannot be unsealed — substrate restores with a FRESH
+  // MSK (the compat path), never NULL.
+  state_t* fresh = crabs_deserialize_state_keys(buf->data, buf->len, NULL);
+  ASSERT_NE(fresh, nullptr);
+  ASSERT_NE(fresh->abe_mk, nullptr);
+  state_destroy(fresh);
+
+  state_destroy(restored);
+  serialized_buffer_destroy(buf);
   state_destroy(state);
 }

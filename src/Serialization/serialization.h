@@ -18,7 +18,7 @@
 // Magic bytes and format version (§13.1)
 // ============================================================
 #define CRABS_SERIAL_MAGIC      0x42415243  // "CRAB" in little-endian
-#define CRABS_SERIAL_VERSION    9           // v9: triggers persisted
+#define CRABS_SERIAL_VERSION    10          // v10: op_type_defs, user registry, child-manifest space, sealed MSK
 
 // ============================================================
 // Serialized buffer
@@ -33,6 +33,23 @@ typedef struct {
 // ============================================================
 serialized_buffer_t* crabs_serialize_state(const state_t* state);
 state_t*             crabs_deserialize_state(const uint8_t* data, size_t len);
+
+// v10 keyed variants. crabs_serialize_state_sealed persists the machine's
+// ABE master key sealed with AES-256-GCM under seal_key (32 bytes); it
+// requires state->abe_mk and seal_key to be non-NULL (a "sealed" write
+// without the machine's authority is not the sealed format at all). The
+// unkeyed APIs keep v9 semantics: the MSK section is written with flag 0
+// (substrate-only — the same loss-of-authority behavior as v9).
+//
+// crabs_deserialize_state_keys restores the sealed MSK when seal_key is
+// provided and matches; when the file carries a sealed MSK but seal_key is
+// NULL (or wrong), the state still loads with a FRESH MSK (substrate-only
+// compatibility path) — the caller must treat authority as unproven in
+// that case. Never leaves state->abe_mk NULL.
+serialized_buffer_t* crabs_serialize_state_sealed(const state_t* state,
+                                                    const uint8_t seal_key[32]);
+state_t*             crabs_deserialize_state_keys(const uint8_t* data, size_t len,
+                                                     const uint8_t seal_key[32]);
 
 // R7-03: authenticated state snapshots. crabs_serialize_state_signed appends
 // an ECDSA signature (from state->node_private_key) over the whole blob after

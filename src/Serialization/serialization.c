@@ -14,6 +14,7 @@
 #include "../Condition/condition.h"
 #include <string.h>
 #include <openssl/sha.h>
+#include <openssl/crypto.h>
 
 // Upper bounds on attacker-controlled counts read from the wire. Without
 // these, a tiny crafted blob declaring log_count = 2^32 would force a
@@ -35,6 +36,17 @@
 // Bound on a single scheduled operation's serialized payload read from the
 // wire; blocks a tiny crafted blob from driving a huge allocation (audit M-2).
 #define CRABS_DESER_MAX_SCHEDULE_OP_BYTES (1024u * 1024u)
+// v10: bound the user-registry count read from the wire the same way as the
+// other attacker-controlled counts.
+#define CRABS_DESER_MAX_USERS 4096
+// Minimum wire size of one user entry: user_id/status (2+1), three u64
+// timestamps (24), attribute count (4), 33-byte legacy public key,
+// default_key_id (2), key_count (4), temp count (4) = 74 bytes. User entries
+// in a blob are bounded against the remaining buffer with this.
+#define CRABS_DESER_MIN_USER_WIRE_BYTES 74
+// v10: a sealed MSK blob is bounded to the same ceiling the writer uses
+// (16 KiB master-key buffer + seal overhead).
+#define CRABS_DESER_MAX_SEALED_MSK_BYTES (16384u + CRABS_SEAL_OVERHEAD)
 
 // ============================================================
 // Write buffer helper
@@ -1358,7 +1370,83 @@ static bool _deserialize_trigger(read_buf_t* buf, trigger_t* trigger) {
   return true;
 }
 
-serialized_buffer_t* crabs_serialize_state(const state_t* state) {
+// ============================================================
+// v10: op_type_def (dedup registry) and user-registry writers
+// ============================================================
+
+static void _serialize_dedup_spec(write_buf_t* buf, const dedup_spec_t* spec) {
+  _write_uint8(buf, (uint8_t)spec->type);
+  _write_string16(buf, spec->tracker_path);
+  _write_string16(buf, spec->flag_path);
+  _write_string16(buf, spec->condition);
+  _write_uint8(buf, (uint8_t)spec->update.type);
+  _write_string16(buf, spec->update.set_path);
+  _write_string16(buf, spec->update.element_value);
+  _write_string16(buf, spec->update.flag_path);
+  _write_string16(buf, spec->update.counter_path);
+  _write_uint64_le(buf, (uint64_t)spec->update.delta);
+  _write_string16(buf, spec->update.target_path);
+  _write_string16(buf, spec->update.value);
+  _write_string16(buf, spec->rejection_message);
+}
+
+static void _serialize_user(write_buf_t* buf, const user_t* user) {
+  _write_string16(buf, user->user_id);
+  _write_uint8(buf, (uint8_t)user->status);
+  _write_uint64_le(buf, user->key_version);
+  _write_uint64_le(buf, user->created_at);
+  _write_uint64_le(buf, user->updated_at);
+  _write_uint32_le(buf, user->attribute_count);
+  // Attributes persist verbatim: attribute_value_t stores the whole
+  // "name:value" pair in value (the attribute machine's lookup convention,
+  // _attribute_matches_name / _extract_name), so there is no separate name
+  // field to write — value round-trips byte-for-byte.
+  for (uint32_t attribute_index = 0; attribute_index < user->attribute_count;
+       attribute_index++) {
+    const attribute_value_t* attribute = &user->attributes[attribute_index];
+    _write_string16(buf, attribute->value);
+    _write_string16(buf, attribute->verified_by);
+    _write_uint64_le(buf, attribute->verified_at);
+    _write_uint64_le(buf, attribute->expires_at);
+  }
+  _write_bytes(buf, user->public_key, 33);
+  _write_string16(buf, user->default_key_id);
+  _write_uint32_le(buf, user->key_count);
+  for (const user_key_t* key = user->keys; key != NULL; key = key->next) {
+    _write_string16(buf, key->key_id);
+    _write_uint8(buf, (uint8_t)key->scheme);
+    _write_uint32_le(buf, key->public_key_len);
+    _write_bytes(buf, key->public_key, key->public_key_len);
+    _write_string16(buf, key->label);
+    _write_uint64_le(buf, key->registered_at);
+    _write_uint64_le(buf, key->last_used_at);
+    _write_uint8(buf, (uint8_t)key->status);
+    _write_uint64_le(buf, key->expires_at);
+    _write_uint64_le(buf, key->suspended_at);
+    _write_uint64_le(buf, key->revoked_at);
+    _write_string16(buf, key->predecessor_key_id);
+  }
+  // temp attrs: the linked list has no count field — count first.
+  uint32_t temp_count = 0;
+  for (const temp_attr_list_t* temp = user->temp_attrs; temp != NULL; temp = temp->next)
+    temp_count++;
+  _write_uint32_le(buf, temp_count);
+  for (const temp_attr_list_t* temp = user->temp_attrs; temp != NULL; temp = temp->next) {
+    _write_string16(buf, temp->name);
+    _write_string16(buf, temp->value);
+    _write_uint64_le(buf, temp->issued_at);
+    _write_uint64_le(buf, temp->expires_at);
+  }
+}
+
+// Core state writer. seal_key selects the v10 MSK section behavior:
+//  - seal_key == NULL (unkeyed, crabs_serialize_state): the MSK section is
+//    written with flag 0 — v9 semantics, substrate only.
+//  - seal_key != NULL (crabs_serialize_state_sealed): the ABE master key is
+//    sealed and written (flag 1). A sealed write whose blob carries no
+//    sealable master key fails the whole serialize.
+static serialized_buffer_t* _serialize_state_internal(const state_t* state,
+                                                      const uint8_t seal_key[32]) {
   if (state == NULL) return NULL;
 
   write_buf_t* buf = _write_buf_create(4096);
@@ -1438,6 +1526,66 @@ serialized_buffer_t* crabs_serialize_state(const state_t* state) {
     _serialize_trigger(buf, &state->triggers[trigger_index]);
   }
 
+  // op_type_defs (v10): the dedup registry — it was previously not persisted.
+  // The section order from here to the checksum is contractual (sequential
+  // blob).
+  _write_uint32_le(buf, state->op_type_def_count);
+  for (uint32_t def_index = 0; def_index < state->op_type_def_count; def_index++) {
+    _write_string16(buf, state->op_type_defs[def_index].op_type);
+    _serialize_dedup_spec(buf, &state->op_type_defs[def_index].dedup);
+  }
+
+  // user registry (v10): users live on the linked attribute machine. The
+  // count is derived by walking the list (same as items above) so the wire
+  // count can never disagree with the entries actually written, even if the
+  // machine's cached user_count were ever out of sync.
+  uint32_t user_count = 0;
+  if (state->attr_machine != NULL) {
+    const user_t* user = state->attr_machine->users;
+    while (user != NULL) {
+      user_count++;
+      user = user->next;
+    }
+  }
+  _write_uint32_le(buf, user_count);
+  if (state->attr_machine != NULL) {
+    for (const user_t* user = state->attr_machine->users; user != NULL; user = user->next) {
+      _serialize_user(buf, user);
+    }
+  }
+
+  // child manifest (v10): count placeholder — filled by the follow-up plan;
+  // the v10 reader strictly requires 0 here.
+  _write_uint32_le(buf, 0);
+
+  // MSK (v10): sealed under seal_key when both the machine's authority and a
+  // seal key are present. The unkeyed serializer omits the MSK (flag 0) —
+  // persisting an UNSEALED master key is never valid, and losing it (v9
+  // behavior) is the substrate-only compat path.
+  if (state->abe_mk != NULL && seal_key != NULL) {
+    uint8_t msk_blob[16384];
+    size_t msk_len = crypto_master_key_serialize(
+        (const abe_master_key_t*)state->abe_mk, msk_blob, sizeof(msk_blob));
+    uint8_t sealed_msk[sizeof(msk_blob) + CRABS_SEAL_OVERHEAD];
+    size_t sealed_len = sizeof(sealed_msk);
+    if (msk_len == 0 ||
+        crypto_seal(seal_key, msk_blob, msk_len, sealed_msk, &sealed_len) != CRABS_SUCCESS) {
+      // Fail loud: cannot persist authority. The caller sees a NULL buffer.
+      OPENSSL_cleanse(sealed_msk, sizeof(sealed_msk));
+      OPENSSL_cleanse(msk_blob, sizeof(msk_blob));
+      free(buf->data);
+      free(buf);
+      return NULL;
+    }
+    OPENSSL_cleanse(msk_blob, sizeof(msk_blob));
+    _write_uint8(buf, 1);
+    _write_uint32_le(buf, (uint32_t)sealed_len);
+    _write_bytes(buf, sealed_msk, sealed_len);
+    OPENSSL_cleanse(sealed_msk, sizeof(sealed_msk));
+  } else {
+    _write_uint8(buf, 0);
+  }
+
   // Checksum: SHA-256 of all preceding bytes.
   // NOTE: this is an INTEGRITY/CORRUPTION check, NOT authentication. An
   // attacker who can modify the blob can recompute this hash. Loading state
@@ -1458,7 +1606,117 @@ serialized_buffer_t* crabs_serialize_state(const state_t* state) {
   return result;
 }
 
-state_t* crabs_deserialize_state(const uint8_t* data, size_t len) {
+serialized_buffer_t* crabs_serialize_state(const state_t* state) {
+  return _serialize_state_internal(state, NULL);
+}
+
+serialized_buffer_t* crabs_serialize_state_sealed(const state_t* state,
+                                                    const uint8_t seal_key[32]) {
+  if (state == NULL || seal_key == NULL) return NULL;
+  // Fail loud: a "sealed" write without the machine's authority is not the
+  // sealed format at all.
+  if (state->abe_mk == NULL) return NULL;
+  return _serialize_state_internal(state, seal_key);
+}
+
+// v10: read one user entry from the wire into the attribute machine's user
+// list (the attribute machine owns the registry; see state_destroy and
+// attribute_machine_destroy's ownership contract). Returns false and frees
+// the partially built record on any malformed field.
+static bool _deserialize_user(read_buf_t* buf, attribute_machine_t* machine) {
+  user_t* user = get_clear_memory(sizeof(user_t));
+  if (user == NULL) return false;
+
+  if (!_read_string16(buf, user->user_id, CRABS_MAX_USER_ID)) goto fail;
+  uint8_t user_status;
+  if (!_read_uint8(buf, &user_status)) goto fail;
+  user->status = (user_status_e)user_status;
+  if (!_read_uint64_le(buf, &user->key_version)) goto fail;
+  if (!_read_uint64_le(buf, &user->created_at)) goto fail;
+  if (!_read_uint64_le(buf, &user->updated_at)) goto fail;
+  if (!_read_uint32_le(buf, &user->attribute_count)) goto fail;
+  if (user->attribute_count > CRABS_MAX_ATTRIBUTES) goto fail;
+  for (uint32_t attribute_index = 0; attribute_index < user->attribute_count;
+       attribute_index++) {
+    attribute_value_t* attribute = &user->attributes[attribute_index];
+    // Attributes persist verbatim as "name:value" pairs: the attribute name
+    // precedes the first ':' in the stored value (the attribute machine's
+    // lookup convention — _extract_name). There is no separate name field
+    // in attribute_value_t, so nothing else needs reconstructing.
+    if (!_read_string16(buf, attribute->value, CRABS_MAX_POLICY_EXPR)) goto fail;
+    if (!_read_string16(buf, attribute->verified_by, CRABS_MAX_USER_ID)) goto fail;
+    if (!_read_uint64_le(buf, &attribute->verified_at)) goto fail;
+    if (!_read_uint64_le(buf, &attribute->expires_at)) goto fail;
+  }
+  if (!_read_bytes(buf, user->public_key, 33)) goto fail;
+  if (!_read_string16(buf, user->default_key_id, CRABS_MAX_KEY_ID)) goto fail;
+  if (!_read_uint32_le(buf, &user->key_count)) goto fail;
+  if (user->key_count > CRABS_MAX_KEYS_PER_USER) goto fail;
+  user_key_t** key_tail = &user->keys;
+  for (uint32_t key_index = 0; key_index < user->key_count; key_index++) {
+    user_key_t* key = get_clear_memory(sizeof(user_key_t));
+    if (key == NULL) goto fail;
+    // A partially read key is NOT in the list yet, so the shared cleanup
+    // below cannot free it — release it at every malformed-field exit.
+    if (!_read_string16(buf, key->key_id, CRABS_MAX_KEY_ID)) { free(key); goto fail; }
+    uint8_t key_scheme;
+    if (!_read_uint8(buf, &key_scheme)) { free(key); goto fail; }
+    key->scheme = (signature_scheme_e)key_scheme;
+    if (!_read_uint32_le(buf, &key->public_key_len)) { free(key); goto fail; }
+    if (key->public_key_len > CRABS_MAX_PUBLIC_KEY) { free(key); goto fail; }
+    if (!_read_bytes(buf, key->public_key, key->public_key_len)) { free(key); goto fail; }
+    if (!_read_string16(buf, key->label, CRABS_MAX_KEY_LABEL)) { free(key); goto fail; }
+    if (!_read_uint64_le(buf, &key->registered_at)) { free(key); goto fail; }
+    if (!_read_uint64_le(buf, &key->last_used_at)) { free(key); goto fail; }
+    uint8_t key_status;
+    if (!_read_uint8(buf, &key_status)) { free(key); goto fail; }
+    key->status = (key_status_e)key_status;
+    if (!_read_uint64_le(buf, &key->expires_at)) { free(key); goto fail; }
+    if (!_read_uint64_le(buf, &key->suspended_at)) { free(key); goto fail; }
+    if (!_read_uint64_le(buf, &key->revoked_at)) { free(key); goto fail; }
+    if (!_read_string16(buf, key->predecessor_key_id, CRABS_MAX_KEY_ID)) { free(key); goto fail; }
+    *key_tail = key;
+    key_tail = &key->next;
+  }
+  uint32_t temp_count;
+  if (!_read_uint32_le(buf, &temp_count)) goto fail;
+  // Each temp entry is at least two string16s (4 bytes); a larger count
+  // cannot be satisfied by the remaining buffer.
+  if (temp_count > (buf->len - buf->offset) / 4) goto fail;
+  temp_attr_list_t** temp_tail = &user->temp_attrs;
+  for (uint32_t temp_index = 0; temp_index < temp_count; temp_index++) {
+    temp_attr_list_t* temp = get_clear_memory(sizeof(temp_attr_list_t));
+    if (temp == NULL) goto fail;
+    if (!_read_string16(buf, temp->name, CRABS_MAX_POLICY_EXPR) ||
+        !_read_string16(buf, temp->value, CRABS_MAX_POLICY_EXPR) ||
+        !_read_uint64_le(buf, &temp->issued_at) ||
+        !_read_uint64_le(buf, &temp->expires_at)) {
+      free(temp);
+      goto fail;
+    }
+    *temp_tail = temp;
+    temp_tail = &temp->next;
+  }
+  // Splice into the machine's list (the attribute machine is the owner).
+  user_t** user_tail = &machine->users;
+  while (*user_tail != NULL) user_tail = &(*user_tail)->next;
+  *user_tail = user;
+  user->next = NULL;
+  machine->user_count++;
+  return true;
+fail:
+  user_key_destroy_all(user);
+  temp_attr_list_t* temp_next;
+  for (temp_attr_list_t* temp = user->temp_attrs; temp != NULL; temp = temp_next) {
+    temp_next = temp->next;
+    free(temp);
+  }
+  free(user);
+  return false;
+}
+
+static state_t* _deserialize_state_internal(const uint8_t* data, size_t len,
+                                            const uint8_t seal_key[32]) {
   if (data == NULL || len < CRABS_HASH_SIZE + 4 + 4 + 8 + 4 + 4 + 4) {
     return NULL;
   }
@@ -1637,11 +1895,121 @@ state_t* crabs_deserialize_state(const uint8_t* data, size_t len) {
     }
   }
 
+  // v10 sections: op_type_defs, user registry, child manifest space, MSK.
+  // The section order is contractual (the blob is sequential).
+  if (version >= 10) {
+    // op_type_defs (v10): the dedup registry — previously not persisted.
+    uint32_t def_count;
+    if (!_read_uint32_le(&buf, &def_count)) goto fail;
+    if (def_count > CRABS_MAX_OP_TYPE_DEFS) goto fail;
+    if (def_count > 0) {
+      state->op_type_defs = get_clear_memory(def_count * sizeof(op_type_def_t));
+      if (state->op_type_defs == NULL) goto fail;
+      state->op_type_def_count = def_count;
+      for (uint32_t def_index = 0; def_index < def_count; def_index++) {
+        op_type_def_t* def = &state->op_type_defs[def_index];
+        if (!_read_string16(&buf, def->op_type, CRABS_MAX_OP_NAME)) goto fail;
+        uint8_t dedup_type;
+        if (!_read_uint8(&buf, &dedup_type)) goto fail;
+        def->dedup.type = (dedup_type_e)dedup_type;
+        if (!_read_string16(&buf, def->dedup.tracker_path, CRABS_MAX_DEDUP_PATH)) goto fail;
+        if (!_read_string16(&buf, def->dedup.flag_path, CRABS_MAX_DEDUP_PATH)) goto fail;
+        if (!_read_string16(&buf, def->dedup.condition, CRABS_MAX_POLICY_EXPR)) goto fail;
+        uint8_t mutation_type;
+        if (!_read_uint8(&buf, &mutation_type)) goto fail;
+        def->dedup.update.type = (mutation_type_e)mutation_type;
+        if (!_read_string16(&buf, def->dedup.update.set_path, CRABS_MAX_DEDUP_PATH)) goto fail;
+        if (!_read_string16(&buf, def->dedup.update.element_value, CRABS_MAX_USER_ID)) goto fail;
+        if (!_read_string16(&buf, def->dedup.update.flag_path, CRABS_MAX_DEDUP_PATH)) goto fail;
+        if (!_read_string16(&buf, def->dedup.update.counter_path, CRABS_MAX_DEDUP_PATH)) goto fail;
+        uint64_t dedup_delta;
+        if (!_read_uint64_le(&buf, &dedup_delta)) goto fail;
+        def->dedup.update.delta = (int64_t)dedup_delta;
+        if (!_read_string16(&buf, def->dedup.update.target_path, CRABS_MAX_DEDUP_PATH)) goto fail;
+        if (!_read_string16(&buf, def->dedup.update.value, CRABS_MAX_DEDUP_PATH)) goto fail;
+        if (!_read_string16(&buf, def->dedup.rejection_message, CRABS_MAX_DEDUP_MESSAGE)) goto fail;
+      }
+    }
+
+    // user registry (v10): users live on the linked attribute machine. The
+    // registry is non-empty in the blob only when the source machine had
+    // users, so a shell attribute machine is built here (base_state is the
+    // FIRST member of attribute_machine_t — the returned state pointer is
+    // also the shell allocation, so state_destroy releases it). Bare states
+    // (empty registry) keep attr_machine NULL.
+    uint32_t user_count;
+    if (!_read_uint32_le(&buf, &user_count)) goto fail;
+    if (user_count > CRABS_DESER_MAX_USERS ||
+        user_count > (buf.len - buf.offset) / CRABS_DESER_MIN_USER_WIRE_BYTES) {
+      goto fail;
+    }
+    if (user_count > 0) {
+      attribute_machine_t* shell = get_clear_memory(sizeof(attribute_machine_t));
+      if (shell == NULL) goto fail;
+      shell->base_state = *state;
+      shell->base_state.attr_machine = shell;
+      free(state);
+      state = &shell->base_state;
+    }
+    for (uint32_t user_index = 0; user_index < user_count; user_index++) {
+      if (!_deserialize_user(&buf, state->attr_machine)) goto fail;
+    }
+
+    // child manifest (v10): count is expected 0 until the follow-up plan
+    // fills this section; skip strictly.
+    uint32_t child_manifest_count;
+    if (!_read_uint32_le(&buf, &child_manifest_count)) goto fail;
+    if (child_manifest_count != 0) goto fail;
+
+    // MSK (v10): u8 flag; when 1, u32 sealed_len + sealed bytes. A wrong or
+    // absent seal key keeps the FRESH master key from state_create (the
+    // substrate-only compat path) — never NULL.
+    uint8_t msk_present;
+    if (!_read_uint8(&buf, &msk_present)) goto fail;
+    if (msk_present > 1) goto fail;   // the flag is boolean on the wire
+    if (msk_present != 0) {
+      uint32_t sealed_len;
+      if (!_read_uint32_le(&buf, &sealed_len)) goto fail;
+      if (sealed_len == 0 || sealed_len > CRABS_DESER_MAX_SEALED_MSK_BYTES) goto fail;
+      uint8_t* sealed_blob = get_memory(sealed_len);
+      if (sealed_blob == NULL) goto fail;
+      if (!_read_bytes(&buf, sealed_blob, sealed_len)) {
+        free(sealed_blob);
+        goto fail;
+      }
+      if (seal_key != NULL) {
+        uint8_t msk_plain[16384];
+        size_t msk_plain_len = 0;
+        if (crypto_unseal(seal_key, sealed_blob, sealed_len,
+                          msk_plain, sizeof(msk_plain), &msk_plain_len) == CRABS_SUCCESS) {
+          abe_master_key_t* restored_master_key =
+              crypto_master_key_deserialize(msk_plain, msk_plain_len);
+          OPENSSL_cleanse(msk_plain, sizeof(msk_plain));
+          if (restored_master_key != NULL) {
+            crypto_abe_master_key_destroy(state->abe_mk);   // discard fresh key
+            state->abe_mk = restored_master_key;
+          }
+        }
+      }
+      OPENSSL_cleanse(sealed_blob, sealed_len);
+      free(sealed_blob);
+    }
+  }
+
   return state;
 
 fail:
   state_destroy(state);
   return NULL;
+}
+
+state_t* crabs_deserialize_state(const uint8_t* data, size_t len) {
+  return _deserialize_state_internal(data, len, NULL);
+}
+
+state_t* crabs_deserialize_state_keys(const uint8_t* data, size_t len,
+                                      const uint8_t seal_key[32]) {
+  return _deserialize_state_internal(data, len, seal_key);
 }
 
 // R7-03: authenticated state snapshot. Serializes the state (with its SHA-256

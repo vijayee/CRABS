@@ -3,6 +3,7 @@
 //
 
 #include "data_model.h"
+#include "../Attribute/attribute_machine.h"
 #include "../Scheduler/scheduler.h"
 #include "../Trigger/trigger.h"
 #include "../Crypto/crypto.h"
@@ -117,6 +118,33 @@ void state_destroy(state_t* state) {
   }
   if (state->abe_mk != NULL) {
     crypto_abe_master_key_destroy(state->abe_mk);
+  }
+  // Release the user registry ONLY when the attached attribute machine is
+  // embedded in this very allocation (v10 durability: crabs_deserialize_
+  // state[_keys] builds an attribute machine shell whose base_state is the
+  // FIRST member of attribute_machine_t and returns &shell->base_state, so
+  // the restored state_t pointer IS the shell allocation; free(state) below
+  // releases the shell wholesale, and without this block its user list —
+  // users, keys, temporary attributes — would leak).
+  // Externally owned machines (fixture/CLI/wasm wiring:
+  // state->attr_machine = am where &am->base_state != state) keep their
+  // separate owner — attribute_machine_destroy — and must NOT be touched
+  // here.
+  if (state->attr_machine != NULL &&
+      state->attr_machine == (attribute_machine_t*)state) {
+    user_t* user = state->attr_machine->users;
+    while (user != NULL) {
+      user_t* next_user = user->next;
+      temp_attr_list_t* temp = user->temp_attrs;
+      while (temp != NULL) {
+        temp_attr_list_t* next_temp = temp->next;
+        free(temp);
+        temp = next_temp;
+      }
+      user_key_destroy_all(user);
+      free(user);
+      user = next_user;
+    }
   }
   data_item_t* item = state->items;
   while (item != NULL) {
