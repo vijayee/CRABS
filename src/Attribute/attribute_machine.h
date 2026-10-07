@@ -110,6 +110,7 @@ typedef struct attribute_machine_t {
 // ============================================================
 attribute_machine_t* attribute_machine_create(const char* admin_id, const uint8_t admin_pk[33]);
 void                  attribute_machine_destroy(attribute_machine_t* am);
+void                  attribute_users_destroy_all(attribute_machine_t* am);
 
 // ============================================================
 // User Operations (§8.4)

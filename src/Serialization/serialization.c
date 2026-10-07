@@ -1411,7 +1411,13 @@ static void _serialize_user(write_buf_t* buf, const user_t* user) {
   }
   _write_bytes(buf, user->public_key, 33);
   _write_string16(buf, user->default_key_id);
-  _write_uint32_le(buf, user->key_count);
+  // The key count is derived by walking the list (same derivation as the
+  // user-registry and temp-attr counts): a stale in-memory key_count would
+  // disagree with the entries actually written and corrupt round-trips.
+  uint32_t wire_key_count = 0;
+  for (const user_key_t* key = user->keys; key != NULL; key = key->next)
+    wire_key_count++;
+  _write_uint32_le(buf, wire_key_count);
   for (const user_key_t* key = user->keys; key != NULL; key = key->next) {
     _write_string16(buf, key->key_id);
     _write_uint8(buf, (uint8_t)key->scheme);
@@ -1984,12 +1990,14 @@ static state_t* _deserialize_state_internal(const uint8_t* data, size_t len,
                           msk_plain, sizeof(msk_plain), &msk_plain_len) == CRABS_SUCCESS) {
           abe_master_key_t* restored_master_key =
               crypto_master_key_deserialize(msk_plain, msk_plain_len);
-          OPENSSL_cleanse(msk_plain, sizeof(msk_plain));
           if (restored_master_key != NULL) {
             crypto_abe_master_key_destroy(state->abe_mk);   // discard fresh key
             state->abe_mk = restored_master_key;
           }
         }
+        // Cleanse the recovered plaintext whether or not the unseal or the
+        // deserialize succeeded — plaintext key material never lingers.
+        OPENSSL_cleanse(msk_plain, sizeof(msk_plain));
       }
       OPENSSL_cleanse(sealed_blob, sealed_len);
       free(sealed_blob);

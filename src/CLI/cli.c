@@ -291,6 +291,11 @@ cli_result_e cli_node_load(cli_node_t* node, const char* path) {
   node->abe_mk = crypto_abe_setup();
   node->node_key = crypto_ecdsa_generate();
 
+  // NOTE (v10): loaded v10 blobs may arrive as a returned attribute-machine
+  // shell (base_state first member) that ALREADY carries the restored user
+  // registry. The struct-copy + users=NULL wiring below predates v10 and
+  // drops the registry; adopting the shell return is Task 4 (seal-key
+  // custody) of docs/superpowers/plans/2026-10-06-durability-kernel.md.
   // Build attribute machine from loaded state
   node->attr_machine = get_clear_memory(sizeof(attribute_machine_t));
   node->attr_machine->base_state = *loaded;

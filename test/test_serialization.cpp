@@ -1783,3 +1783,82 @@ TEST(TestSerialization, V10SealedMskRoundTripRestoresAuthority) {
   serialized_buffer_destroy(buf);
   state_destroy(state);
 }
+
+TEST(TestSerialization, V10CorruptUserEntryFailsWholeLoad) {
+  state_t* state = state_create();
+  ASSERT_NE(state, nullptr);
+  // Same fixture style as V10UserRegistryRoundTripPreservesAttributesAndKeys:
+  // a caller-managed attribute-machine shell holding one user with one key.
+  state->attr_machine = (attribute_machine_t*)get_clear_memory(sizeof(attribute_machine_t));
+  state->attr_machine->base_state = *state;   // alias for pointer wiring only
+  user_t* writer = (user_t*)get_clear_memory(sizeof(user_t));
+  strncpy(writer->user_id, "alice", CRABS_MAX_USER_ID - 1);
+  writer->status = USER_ACTIVE;
+  writer->key_version = 3;
+  strncpy(writer->attributes[0].value, "role:writer", CRABS_MAX_POLICY_EXPR - 1);
+  writer->attribute_count = 1;
+  user_key_t* first_key = (user_key_t*)get_clear_memory(sizeof(user_key_t));
+  strncpy(first_key->key_id, "k1", CRABS_MAX_KEY_ID - 1);
+  first_key->scheme = ECDSA_SECP256K1;
+  first_key->public_key_len = 33;
+  first_key->status = KEY_ACTIVE;
+  writer->keys = first_key;
+  writer->key_count = 1;
+  strncpy(writer->default_key_id, "k1", CRABS_MAX_KEY_ID - 1);
+  state->attr_machine->users = writer;
+  state->attr_machine->user_count = 1;
+
+  serialized_buffer_t* buf = crabs_serialize_state(state);
+  ASSERT_NE(buf, nullptr);
+
+  // Control: the intact blob loads (whole parse, no partial adoption).
+  state_t* control = crabs_deserialize_state_keys(buf->data, buf->len, NULL);
+  ASSERT_NE(control, nullptr);
+  state_destroy(control);
+
+  // Detach and free the fixture exactly as in the round-trip test: the shell
+  // is caller-managed and state_destroy must not double-free its registry.
+  state->attr_machine->users = NULL;
+  state->attr_machine->base_state.attr_machine = NULL;
+  state->attr_machine->base_state.abe_mk = NULL;   // owned by the original state
+  free(state->attr_machine);
+  state->attr_machine = NULL;
+  state_destroy(state);
+  user_key_destroy_all(writer);
+  free(writer);
+
+  // Deterministic corruption INSIDE the user entry. The user's key_count
+  // field (u32, value 1) is located by its unique wire neighborhood:
+  // [01 00 00 00]key_count=1 followed by [02 00 'k' '1'], the first key's
+  // string16 id. Bumping the count to 2 makes the reader parse a second key
+  // out of the bytes after the real one (temp-attr count, child manifest,
+  // MSK flag) — a mid-entry failure with the first key already spliced into
+  // the user's keyring. The checksum is recomputed so the corruption reaches
+  // the section parsers (otherwise the checksum gate rejects before the
+  // registry is even reached).
+  const uint8_t needle[8] = {0x01, 0x00, 0x00, 0x00, 0x02, 0x00, 'k', '1'};
+  bool found = false;
+  for (size_t index = 8; index + 8 <= buf->len - 32; index++) {
+    if (memcmp(buf->data + index, needle, 8) == 0) {
+      buf->data[index] = 0x02;   // key_count 1 -> 2
+      found = true;
+      break;
+    }
+  }
+  ASSERT_TRUE(found);
+
+  uint8_t recomputed_hash[CRABS_HASH_SIZE];
+  SHA256(buf->data, buf->len - CRABS_HASH_SIZE, recomputed_hash);
+  memcpy(buf->data + buf->len - CRABS_HASH_SIZE, recomputed_hash, CRABS_HASH_SIZE);
+
+  // The corrupted entry must fail the WHOLE load — the reader returns NULL
+  // (never a partially restored state); the user-record cleanup on the fail
+  // path plus state_destroy's embedded-machine guard must free everything
+  // (verified leak-free under valgrind).
+  state_t* result = crabs_deserialize_state_keys(buf->data, buf->len, NULL);
+  EXPECT_EQ(result, nullptr);
+  state_t* result_again = crabs_deserialize_state(buf->data, buf->len);
+  EXPECT_EQ(result_again, nullptr);
+
+  serialized_buffer_destroy(buf);
+}

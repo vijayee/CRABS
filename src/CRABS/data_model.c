@@ -132,19 +132,9 @@ void state_destroy(state_t* state) {
   // here.
   if (state->attr_machine != NULL &&
       state->attr_machine == (attribute_machine_t*)state) {
-    user_t* user = state->attr_machine->users;
-    while (user != NULL) {
-      user_t* next_user = user->next;
-      temp_attr_list_t* temp = user->temp_attrs;
-      while (temp != NULL) {
-        temp_attr_list_t* next_temp = temp->next;
-        free(temp);
-        temp = next_temp;
-      }
-      user_key_destroy_all(user);
-      free(user);
-      user = next_user;
-    }
+    // base_state must remain the first member of attribute_machine_t for
+    // this ownership identity.
+    attribute_users_destroy_all(state->attr_machine);
   }
   data_item_t* item = state->items;
   while (item != NULL) {

@@ -334,7 +334,10 @@ attribute_machine_t* attribute_machine_create(const char* admin_id, const uint8_
   return am;
 }
 
-void attribute_machine_destroy(attribute_machine_t* am) {
+// Shared teardown for the user registry (v10 durability): frees every user
+// along the linked list together with its keyring and temporary attributes,
+// leaving counts untouched — the machine is typically about to be destroyed.
+void attribute_users_destroy_all(attribute_machine_t* am) {
   if (am == NULL) return;
 
   user_t* user = am->users;
@@ -355,6 +358,14 @@ void attribute_machine_destroy(attribute_machine_t* am) {
     free(user);
     user = next_user;
   }
+  am->users = NULL;
+  am->user_count = 0;
+}
+
+void attribute_machine_destroy(attribute_machine_t* am) {
+  if (am == NULL) return;
+
+  attribute_users_destroy_all(am);
 
   // Destroy base state items — clean up CRDT values before data_item_destroy
   // since data_item_destroy uses free() which doesn't clean up CRDT struct internals
