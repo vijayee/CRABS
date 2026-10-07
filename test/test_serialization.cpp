@@ -3035,3 +3035,60 @@ TEST(LineageKeyChainWire, CorruptChainRejected) {
 
   serialized_buffer_destroy(good_buf);
 }
+
+// Fail-loud writer validation: the serializer must refuse (NULL buffer) a
+// state whose parent-side lineage key fields or child-side chain break the
+// invariants the reader enforces — an oversized or NULL transition record,
+// and a NULL chain with a non-zero count.
+TEST(LineageKeyChainWire, WriterRejectsInvalidParentSideFields) {
+  keychain_wire_fixture_t fixture;
+  keychain_wire_fixture_setup(&fixture);
+
+  // transition_len above LINEAGE_KEY_TRANSITION_WIRE_MAX.
+  {
+    uint8_t* original_transition =
+        fixture.parent_state->lineage_last_key_transition;
+    size_t original_len = fixture.parent_state->lineage_last_key_transition_len;
+    fixture.parent_state->lineage_last_key_transition_len =
+        LINEAGE_KEY_TRANSITION_WIRE_MAX + 1;
+    serialized_buffer_t* buf = crabs_serialize_state(fixture.parent_state);
+    EXPECT_EQ(buf, nullptr);
+    if (buf != nullptr) serialized_buffer_destroy(buf);
+    fixture.parent_state->lineage_last_key_transition = original_transition;
+    fixture.parent_state->lineage_last_key_transition_len = original_len;
+  }
+
+  // Non-zero transition_len with a NULL transition pointer.
+  {
+    uint8_t* original_transition =
+        fixture.parent_state->lineage_last_key_transition;
+    fixture.parent_state->lineage_last_key_transition = nullptr;
+    ASSERT_GT(fixture.parent_state->lineage_last_key_transition_len, 0u);
+    serialized_buffer_t* buf = crabs_serialize_state(fixture.parent_state);
+    EXPECT_EQ(buf, nullptr);
+    if (buf != nullptr) serialized_buffer_destroy(buf);
+    fixture.parent_state->lineage_last_key_transition = original_transition;
+  }
+
+  // Non-zero chain count with a NULL chain array (bound child).
+  {
+    lineage_key_chain_entry_t* original_chain =
+        fixture.child_state->lineage_key_chain;
+    fixture.child_state->lineage_key_chain = nullptr;
+    ASSERT_GT(fixture.child_state->lineage_key_chain_count, 0u);
+    serialized_buffer_t* buf = crabs_serialize_state(fixture.child_state);
+    EXPECT_EQ(buf, nullptr);
+    if (buf != nullptr) serialized_buffer_destroy(buf);
+    fixture.child_state->lineage_key_chain = original_chain;
+  }
+
+  // Sanity: the restored fixtures serialize cleanly again.
+  serialized_buffer_t* parent_buf = crabs_serialize_state(fixture.parent_state);
+  EXPECT_NE(parent_buf, nullptr);
+  serialized_buffer_destroy(parent_buf);
+  serialized_buffer_t* child_buf = crabs_serialize_state(fixture.child_state);
+  EXPECT_NE(child_buf, nullptr);
+  serialized_buffer_destroy(child_buf);
+
+  keychain_wire_fixture_destroy(&fixture);
+}

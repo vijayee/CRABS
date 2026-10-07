@@ -1625,6 +1625,7 @@ static serialized_buffer_t* _serialize_state_internal(const state_t* state,
     // never emits a blob its own reader would reject.
     if (state->lineage_key_chain_count > 0) {
       if (state->lineage_key_chain_count > CRABS_MAX_LINEAGE_KEY_CHAIN ||
+          state->lineage_key_chain == NULL ||
           memcmp(state->lineage_key_chain[0].public_key,
                  state->lineage_parent_public_key, 33) != 0) {
         free(buf->data);
@@ -1653,6 +1654,16 @@ static serialized_buffer_t* _serialize_state_internal(const state_t* state,
     }
   }
   // v13 (A10-M6): parent-side lineage key version + last signed transition.
+  // Fail-loud validation, mirroring the chain block above: a length above the
+  // wire cap, or a non-zero length with no bytes, would produce a blob the
+  // reader rejects — refuse instead of emitting it.
+  if (state->lineage_last_key_transition_len > LINEAGE_KEY_TRANSITION_WIRE_MAX ||
+      (state->lineage_last_key_transition_len > 0 &&
+       state->lineage_last_key_transition == NULL)) {
+    free(buf->data);
+    free(buf);
+    return NULL;
+  }
   _write_uint64_le(buf, state->lineage_key_version);
   _write_bytes32(buf, state->lineage_last_key_transition,
                  state->lineage_last_key_transition_len);
@@ -2130,10 +2141,11 @@ static state_t* _deserialize_state_internal(const uint8_t* data, size_t len,
                             CRABS_MAX_USER_ID)) {
           goto fail;
         }
-        // v12: the dissolve tombstone flag closes the binding block. v11 and
-        // older blobs end the block at the self id — the flag byte does not
-        // exist there, so the read is gated on version >= 12 and older files
-        // keep the fresh-state default (dissolved false).
+        // v12: the dissolve tombstone flag follows the binding block's fixed
+        // fields; the v13 key-chain section follows the block. v11 and older
+        // blobs end the block at the self id — the flag byte does not exist
+        // there, so the read is gated on version >= 12 and older files keep
+        // the fresh-state default (dissolved false).
         if (version >= 12) {
           uint8_t parent_dissolved;
           if (!_read_uint8(&buf, &parent_dissolved)) goto fail;
