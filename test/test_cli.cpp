@@ -1645,6 +1645,42 @@ TEST(TestCliDurability, DispatchCompactRunsOnMachineState) {
   cli_node_destroy(compact_node);
 }
 
+// De-wonk (silent no-op on a reloaded machine): the lineage op HANDLERS are
+// runtime registrations (lineage_install), while the lineage policies and op
+// type definitions are durable state — a reloaded machine that was not
+// re-installed passes op authorization, finds NO handler, and the pipeline
+// logs the lifecycle op as a successful no-op while the manifest never
+// changes. The machine lifecycle commands must refuse loudly instead of
+// letting that happen.
+TEST(TestCliDurability, MachineLifecycleRefusesWithoutInstalledHandlers) {
+  cli_node_t* node = cli_node_create();
+  ASSERT_EQ(cli_node_init(node, "admin"), CLI_OK);
+
+  // Every op-pipeline machine subcommand is refused (the refusal names the
+  // missing lineage_install, not a manifest or authorization error).
+  char* dissolve_argv[] = {(char*)"crabs", (char*)"machine",
+                           (char*)"dissolve", (char*)"child-red"};
+  EXPECT_EQ(cli_dispatch(node, 4, dissolve_argv), CLI_ERR_EXEC);
+  char* withdraw_argv[] = {(char*)"crabs", (char*)"machine",
+                           (char*)"withdraw", (char*)"child-red"};
+  EXPECT_EQ(cli_dispatch(node, 4, withdraw_argv), CLI_ERR_EXEC);
+  char* revoke_argv[] = {(char*)"crabs", (char*)"machine",
+                         (char*)"revoke-attestation", (char*)"child-red"};
+  EXPECT_EQ(cli_dispatch(node, 4, revoke_argv), CLI_ERR_EXEC);
+  // A well-formed blueprint file makes the refusal an execution failure (the
+  // handler gate), not an argument or I/O error.
+  std::vector<char*> spawn_argv = {(char*)"crabs", (char*)"machine",
+                                   (char*)"spawn",
+                                   (char*)"/tmp/crabs-no-such-bp.cbp"};
+  EXPECT_EQ(cli_dispatch(node, 4, spawn_argv.data()), CLI_ERR_IO);
+
+  // The read-only query is NOT gated: children still answers (empty).
+  char* children_argv[] = {(char*)"crabs", (char*)"machine", (char*)"children"};
+  EXPECT_EQ(cli_dispatch(node, 3, children_argv), CLI_OK);
+
+  cli_node_destroy(node);
+}
+
 // The longest even-length run of lowercase-hex characters captured from the
 // redirected stdout — the printed attestation wire (the command prints no
 // other hex string anywhere near that length).

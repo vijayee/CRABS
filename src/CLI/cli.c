@@ -1612,11 +1612,26 @@ static cli_result_e _machine_blueprint_cmd_validate(cli_node_t* node,
 // Build a bootstrap-admin-signed lineage op with `payload` (copied) and run
 // it through the pipeline via _op_sign_and_execute. `command_name` is the
 // operator-facing subcommand word used in error messages.
+// The op's HANDLER is a runtime registration (lineage_install) and the op's
+// policy/type-definition are durable state, so a reloaded machine that was
+// not re-installed in this process would pass authorization and then run the
+// op with NO handler — state_machine_execute logs it as a silent no-op
+// success while the manifest never changes. Gate the command on the handler
+// being present instead of letting the pipeline round-trip a no-op.
 static cli_result_e _machine_lifecycle_op_submit(cli_node_t* node,
                                                  const char* op_type,
                                                  const uint8_t* payload,
                                                  size_t payload_size,
                                                  const char* command_name) {
+  if (state_machine_find_handler(&node->attr_machine->base_state,
+                                 op_type) == NULL) {
+    printf("Error: the '%s' op handler is not installed on this machine — "
+           "the lineage ops are runtime registrations; the spawning protocol "
+           "must call lineage_install on the (re)loaded machine first.\n",
+           command_name);
+    return CLI_ERR_EXEC;
+  }
+
   operation_t* op = operation_create(op_type);
   if (op == NULL) {
     printf("Error: Failed to build the %s operation.\n", command_name);
