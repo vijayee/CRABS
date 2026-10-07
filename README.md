@@ -119,6 +119,18 @@ Serialization v10 changes what a saved machine carries. A snapshot now holds the
 
 **Legacy v9 snapshots** load with an empty registry (no users carried over). Run `crabs state migrate` after loading to re-enroll the bootstrap admin.
 
+### Machine Minting and Lineage
+
+Spawning child machines extends the trust boundary across machines, not just within one.
+
+**The parent is the provenance root for its descendants' custody chains.** A parent machine holds full authority over its manifest of children and signs every child's genesis attestation. A compromised parent can mint arbitrarily many children that are, by every verifiable marker in the system, legitimate. Defending the parent node key and the parent snapshot is defending the supply chain of everything it spawns.
+
+**SHARED_ROOT couples parent and child identities by definition.** A shared-root child runs on one attribute registry and one MSK — the parent's. There is no boundary to police between them: revoking a shared-attribute endorsement on the parent stops the child's authorization instantly, but the parent has (and needs) full custody of the child's authority.
+
+**Attested (cross-MSK) trust is bounded by TTL lag, not instant revocation.** Delegated and sovereign children run their own authority and ride on the parent's attestation, which carries a TTL. A revoked attestation only takes effect when the child's verification re-checks it or the TTL expires — a determined child can ride out a stale attestation until expiry. In-process severance happens immediately on a `dissolve` (tombstone) for resident children, but a dissolve tombstone sent after a restart is not yet implemented (see `src/Lineage/lineage.h`), so treat attestation expiry — not dissolve delivery — as the guaranteed upper bound on cross-MSK trust.
+
+**Sovereign children are beyond parent control — beyond provenance.** The parent may not dissolve a sovereign child; the only lineage op that still applies is `__withdraw_genesis__`, which retracts the parent's genesis attestation from its own manifest. A withdrawn parent no longer vouches for the child, but the child's own authority is unaffected.
+
 ## License
 
 MIT
