@@ -48,6 +48,13 @@
 // v10: a sealed MSK blob is bounded to the same ceiling the writer uses
 // (16 KiB master-key buffer + seal overhead).
 #define CRABS_DESER_MAX_SEALED_MSK_BYTES (16384u + CRABS_SEAL_OVERHEAD)
+// v11: bound the lineage child-manifest count against the remaining buffer the
+// same way as the other attacker-controlled counts.
+#define CRABS_DESER_MAX_CHILDREN CRABS_MAX_CHILD_MACHINES
+// Minimum wire size of one child-manifest entry: empty string16 id (2), mode
+// (1), 32-byte genesis hash, 64-byte attestation signature, two u64s (16),
+// status (1) = 116 bytes.
+#define CRABS_DESER_MIN_CHILD_ENTRY_WIRE_BYTES 116
 
 // ============================================================
 // Write buffer helper
@@ -1561,9 +1568,34 @@ static serialized_buffer_t* _serialize_state_internal(const state_t* state,
     }
   }
 
-  // child manifest (v10): count placeholder — filled by the follow-up plan;
-  // the v10 reader strictly requires 0 here.
-  _write_uint32_le(buf, 0);
+  // child manifest (v11): the position v10 booked as a strictly-zero u32
+  // count now carries the count plus one fixed-order entry per spawned child.
+  // Entries are written from the state's heap array in index order with
+  // fixed-width fields, so re-serializing a restored state is byte-identical
+  // (canonical wire). The writer derives nothing from the entries — the count
+  // is state->child_count, matching the state-owned array invariant (children
+  // non-NULL iff child_count > 0; state_destroy frees the array wholesale).
+  _write_uint32_le(buf, state->child_count);
+  for (uint32_t child_index = 0; child_index < state->child_count; child_index++) {
+    const child_manifest_entry_t* manifest_entry = &state->children[child_index];
+    _write_string16(buf, manifest_entry->child_id);
+    _write_uint8(buf, (uint8_t)manifest_entry->mode);
+    _write_bytes(buf, manifest_entry->genesis_snapshot_hash, CRABS_HASH_SIZE);
+    _write_bytes(buf, manifest_entry->genesis_attestation_signature, CRABS_SIG_SIZE);
+    _write_uint64_le(buf, manifest_entry->attestation_ttl_ms);
+    _write_uint64_le(buf, manifest_entry->spawned_at);
+    _write_uint8(buf, (uint8_t)manifest_entry->status);
+  }
+
+  // parent binding (v11): present only for spawned children. lineage_self_id
+  // travels WITH the binding (required) — it is the child_id the machine's
+  // genesis attestation names, so endorsement checks survive restart.
+  _write_uint8(buf, state->lineage_parent_bound ? 1 : 0);
+  if (state->lineage_parent_bound) {
+    _write_string16(buf, state->lineage_parent_id);
+    _write_bytes(buf, state->lineage_parent_public_key, 33);
+    _write_string16(buf, state->lineage_self_id);
+  }
 
   // MSK (v10): sealed under seal_key when both the machine's authority and a
   // seal key are present. The unkeyed serializer omits the MSK (flag 0) —
@@ -1966,11 +1998,79 @@ static state_t* _deserialize_state_internal(const uint8_t* data, size_t len,
       if (!_deserialize_user(&buf, state->attr_machine)) goto fail;
     }
 
-    // child manifest (v10): count is expected 0 until the follow-up plan
-    // fills this section; skip strictly.
+    // child manifest: v10 booked a strictly-zero u32 count at this position;
+    // v11 fills it with the count plus one entry per spawned child, followed
+    // by the parent-binding block. The count is ALWAYS consumed here so v10
+    // and v11 blobs stay byte-aligned through this section.
     uint32_t child_manifest_count;
     if (!_read_uint32_le(&buf, &child_manifest_count)) goto fail;
-    if (child_manifest_count != 0) goto fail;
+    if (version < 11) {
+      // v10: the manifest section is count-only — it must be empty.
+      if (child_manifest_count != 0) goto fail;
+    } else {
+      // v11: entries + parent binding. Both counts above are bounded by the
+      // cap and by the remaining buffer (audit A-3/A-5 pattern).
+      if (child_manifest_count > CRABS_DESER_MAX_CHILDREN ||
+          child_manifest_count >
+              (buf.len - buf.offset) / CRABS_DESER_MIN_CHILD_ENTRY_WIRE_BYTES) {
+        goto fail;
+      }
+      if (child_manifest_count > 0) {
+        state->children =
+            get_clear_memory(child_manifest_count * sizeof(child_manifest_entry_t));
+        if (state->children == NULL) goto fail;
+        state->child_count = child_manifest_count;
+        for (uint32_t child_index = 0; child_index < child_manifest_count;
+             child_index++) {
+          child_manifest_entry_t* manifest_entry = &state->children[child_index];
+          if (!_read_string16(&buf, manifest_entry->child_id, CRABS_MAX_USER_ID)) {
+            goto fail;
+          }
+          uint8_t entry_mode;
+          if (!_read_uint8(&buf, &entry_mode)) goto fail;
+          if (entry_mode < (uint8_t)LINEAGE_SHARED_ROOT ||
+              entry_mode > (uint8_t)LINEAGE_SOVEREIGN) {
+            goto fail;
+          }
+          manifest_entry->mode = (lineage_trust_mode_e)entry_mode;
+          if (!_read_bytes(&buf, manifest_entry->genesis_snapshot_hash,
+                           CRABS_HASH_SIZE)) {
+            goto fail;
+          }
+          if (!_read_bytes(&buf, manifest_entry->genesis_attestation_signature,
+                           CRABS_SIG_SIZE)) {
+            goto fail;
+          }
+          if (!_read_uint64_le(&buf, &manifest_entry->attestation_ttl_ms)) goto fail;
+          if (!_read_uint64_le(&buf, &manifest_entry->spawned_at)) goto fail;
+          uint8_t entry_status;
+          if (!_read_uint8(&buf, &entry_status)) goto fail;
+          if (entry_status > (uint8_t)LINEAGE_WITHDRAWN) goto fail;
+          manifest_entry->status = (lineage_status_e)entry_status;
+        }
+      }
+
+      // parent binding (v11): the flag is boolean on the wire — strictly
+      // 0 or 1. When set, all three binding fields are required: parent id,
+      // the parent's 33-byte public key, and THIS machine's id. It is read
+      // even when the manifest is empty — a spawned child may have no
+      // children of its own but still carry its binding.
+      uint8_t parent_bound;
+      if (!_read_uint8(&buf, &parent_bound)) goto fail;
+      if (parent_bound > 1) goto fail;
+      if (parent_bound == 1) {
+        if (!_read_string16(&buf, state->lineage_parent_id,
+                            CRABS_MAX_USER_ID)) {
+          goto fail;
+        }
+        if (!_read_bytes(&buf, state->lineage_parent_public_key, 33)) goto fail;
+        if (!_read_string16(&buf, state->lineage_self_id,
+                            CRABS_MAX_USER_ID)) {
+          goto fail;
+        }
+        state->lineage_parent_bound = true;
+      }
+    }
 
     // MSK (v10): u8 flag; when 1, u32 sealed_len + sealed bytes. A wrong or
     // absent seal key keeps the FRESH master key from state_create (the

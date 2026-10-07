@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 #include <vector>
 #include <cstring>
+#include <cstdio>
 extern "C" {
 #include "../src/Serialization/serialization.h"
 #include "../src/CRABS/crabs.h"
@@ -2055,5 +2056,279 @@ TEST(TestSerialization, AuthorityRestorationIsReportable) {
   state_destroy(correct);
   state_destroy(wrong);
   serialized_buffer_destroy(buf);
+  state_destroy(state);
+}
+
+// ============================================================
+// v11: lineage child manifest + parent binding
+// ============================================================
+
+// v11 fixture: append one manifest entry by direct field writes. The children
+// array is a heap array OWNED by the state (state_destroy frees it), so the
+// fixture reallocs it and lets state_destroy release it — the same ownership
+// the spawn path will use.
+static void append_manifest_entry(state_t* state, const char* child_id,
+                                  lineage_trust_mode_e mode,
+                                  lineage_status_e status,
+                                  uint64_t attestation_ttl_ms,
+                                  uint64_t spawned_at) {
+  child_manifest_entry_t* grown = (child_manifest_entry_t*)realloc(
+      state->children, (state->child_count + 1) * sizeof(child_manifest_entry_t));
+  ASSERT_NE(grown, nullptr);
+  state->children = grown;
+  child_manifest_entry_t* entry = &state->children[state->child_count];
+  memset(entry, 0, sizeof(*entry));
+  strncpy(entry->child_id, child_id, CRABS_MAX_USER_ID - 1);
+  entry->mode = mode;
+  entry->status = status;
+  entry->attestation_ttl_ms = attestation_ttl_ms;
+  entry->spawned_at = spawned_at;
+  state->child_count++;
+}
+
+TEST(TestSerialization, V11ManifestRoundTrip) {
+  state_t* state = state_create();
+  ASSERT_NE(state, nullptr);
+
+  // Two entries with every field deliberately different so a swapped or
+  // truncated entry cannot pass by coincidence.
+  append_manifest_entry(state, "child-red", LINEAGE_SHARED_ROOT, LINEAGE_ACTIVE,
+                        60000, 1700000000000);
+  append_manifest_entry(state, "child-blue", LINEAGE_DELEGATED_COPY,
+                        LINEAGE_DISSOLVED, 120000, 1700000600000);
+  for (int hash_byte = 0; hash_byte < CRABS_HASH_SIZE; hash_byte++) {
+    state->children[0].genesis_snapshot_hash[hash_byte] = (uint8_t)(hash_byte + 0xA0);
+    state->children[1].genesis_snapshot_hash[hash_byte] = (uint8_t)(0x5A ^ hash_byte);
+  }
+  for (int signature_byte = 0; signature_byte < CRABS_SIG_SIZE; signature_byte++) {
+    state->children[0].genesis_attestation_signature[signature_byte] =
+        (uint8_t)(signature_byte * 7 + 1);
+    state->children[1].genesis_attestation_signature[signature_byte] =
+        (uint8_t)(signature_byte * 11 + 3);
+  }
+
+  // Parent binding: the child resolves endorsements as "machine-self-id"
+  // against the parent key that signed its genesis attestation.
+  state->lineage_parent_bound = true;
+  strncpy(state->lineage_parent_id, "parent-root", CRABS_MAX_USER_ID - 1);
+  for (int public_byte = 0; public_byte < 33; public_byte++) {
+    state->lineage_parent_public_key[public_byte] = (uint8_t)(public_byte + 0x21);
+  }
+  strncpy(state->lineage_self_id, "machine-self-id", CRABS_MAX_USER_ID - 1);
+
+  serialized_buffer_t* buf = crabs_serialize_state(state);
+  ASSERT_NE(buf, nullptr);
+
+  state_t* restored = crabs_deserialize_state_keys(buf->data, buf->len, NULL);
+  ASSERT_NE(restored, nullptr);
+  ASSERT_EQ(restored->child_count, 2u);
+  ASSERT_NE(restored->children, nullptr);
+
+  EXPECT_STREQ(restored->children[0].child_id, "child-red");
+  EXPECT_EQ(restored->children[0].mode, LINEAGE_SHARED_ROOT);
+  EXPECT_EQ(restored->children[0].status, LINEAGE_ACTIVE);
+  EXPECT_EQ(restored->children[0].attestation_ttl_ms, 60000u);
+  EXPECT_EQ(restored->children[0].spawned_at, 1700000000000ull);
+  EXPECT_EQ(memcmp(restored->children[0].genesis_snapshot_hash,
+                   state->children[0].genesis_snapshot_hash,
+                   CRABS_HASH_SIZE), 0);
+  EXPECT_EQ(memcmp(restored->children[0].genesis_attestation_signature,
+                   state->children[0].genesis_attestation_signature,
+                   CRABS_SIG_SIZE), 0);
+
+  EXPECT_STREQ(restored->children[1].child_id, "child-blue");
+  EXPECT_EQ(restored->children[1].mode, LINEAGE_DELEGATED_COPY);
+  EXPECT_EQ(restored->children[1].status, LINEAGE_DISSOLVED);
+  EXPECT_EQ(restored->children[1].attestation_ttl_ms, 120000u);
+  EXPECT_EQ(restored->children[1].spawned_at, 1700000600000ull);
+  EXPECT_EQ(memcmp(restored->children[1].genesis_snapshot_hash,
+                   state->children[1].genesis_snapshot_hash,
+                   CRABS_HASH_SIZE), 0);
+  EXPECT_EQ(memcmp(restored->children[1].genesis_attestation_signature,
+                   state->children[1].genesis_attestation_signature,
+                   CRABS_SIG_SIZE), 0);
+
+  EXPECT_TRUE(restored->lineage_parent_bound);
+  EXPECT_STREQ(restored->lineage_parent_id, "parent-root");
+  EXPECT_EQ(memcmp(restored->lineage_parent_public_key,
+                   state->lineage_parent_public_key, 33), 0);
+  EXPECT_STREQ(restored->lineage_self_id, "machine-self-id");
+
+  serialized_buffer_destroy(buf);
+  state_destroy(state);   // frees the fixture's children array
+  state_destroy(restored);
+}
+
+// Reader strictness under byte surgery. The writer never emits out-of-range
+// values, so malformed entries are produced by patching a real blob and
+// recomputing the checksum trailer — the same deterministic approach as
+// V10CorruptUserEntryFailsWholeLoad. Wire layout of one entry (fixed order):
+//   [u16 len]['child-red'] [u8 mode] [32B hash] [64B sig]
+//   [u64 ttl] [u64 spawned_at] [u8 status]
+// so the needle {09 00 'child-red'} locates the entry head: mode sits at
+// needle + 11, status at needle + 124.
+TEST(TestSerialization, V11RejectsBadManifestEntry) {
+  state_t* state = state_create();
+  ASSERT_NE(state, nullptr);
+  append_manifest_entry(state, "child-red", LINEAGE_SHARED_ROOT, LINEAGE_ACTIVE,
+                        60000, 1700000000000);
+  serialized_buffer_t* buf = crabs_serialize_state(state);
+  ASSERT_NE(buf, nullptr);
+  state_destroy(state);   // frees the children array; buf is independent
+
+  // Control: the intact blob loads.
+  state_t* control = crabs_deserialize_state(buf->data, buf->len);
+  ASSERT_NE(control, nullptr);
+  state_destroy(control);
+
+  // Out-of-range trust mode: 0x7F is between no enum value.
+  const uint8_t needle[11] = {0x09, 0x00, 'c', 'h', 'i', 'l', 'd', '-', 'r', 'e', 'd'};
+  bool found = false;
+  for (size_t index = 0; index + 11 <= buf->len - CRABS_HASH_SIZE; index++) {
+    if (memcmp(buf->data + index, needle, 11) == 0) {
+      buf->data[index + 11] = 0x7F;   // mode byte
+      found = true;
+      break;
+    }
+  }
+  ASSERT_TRUE(found);
+
+  uint8_t recomputed_hash[CRABS_HASH_SIZE];
+  SHA256(buf->data, buf->len - CRABS_HASH_SIZE, recomputed_hash);
+  memcpy(buf->data + buf->len - CRABS_HASH_SIZE, recomputed_hash, CRABS_HASH_SIZE);
+
+  EXPECT_EQ(crabs_deserialize_state(buf->data, buf->len), nullptr);
+  EXPECT_EQ(crabs_deserialize_state_keys(buf->data, buf->len, NULL), nullptr);
+
+  serialized_buffer_destroy(buf);
+}
+
+// Same surgery machinery against the parent-binding block: the strict 0/1
+// bool flag must reject any other value. With one entry followed by
+// [u8 bound][u16 len]['parent-root'][33B pubkey][u16 len self id], the flag
+// byte sits directly before the parent-id length prefix.
+TEST(TestSerialization, V11RejectsBadParentBoundFlag) {
+  state_t* state = state_create();
+  ASSERT_NE(state, nullptr);
+  append_manifest_entry(state, "child-red", LINEAGE_SHARED_ROOT, LINEAGE_ACTIVE,
+                        60000, 1700000000000);
+  state->lineage_parent_bound = true;
+  strncpy(state->lineage_parent_id, "parent-root", CRABS_MAX_USER_ID - 1);
+  strncpy(state->lineage_self_id, "machine-self-id", CRABS_MAX_USER_ID - 1);
+
+  serialized_buffer_t* buf = crabs_serialize_state(state);
+  ASSERT_NE(buf, nullptr);
+  state_destroy(state);
+
+  const char parent_needle[] = "parent-root";
+  bool found = false;
+  for (size_t index = 0; index + sizeof(parent_needle) - 1 <= buf->len - CRABS_HASH_SIZE; index++) {
+    if (memcmp(buf->data + index, parent_needle, sizeof(parent_needle) - 1) == 0) {
+      // bound flag is [u16 len] + parent_id chars - ... : before the prefix,
+      // i.e. one byte above the chars minus their length and 2 prefix bytes.
+      buf->data[index - 3] = 0x42;
+      found = true;
+      break;
+    }
+  }
+  ASSERT_TRUE(found);
+
+  uint8_t recomputed_hash[CRABS_HASH_SIZE];
+  SHA256(buf->data, buf->len - CRABS_HASH_SIZE, recomputed_hash);
+  memcpy(buf->data + buf->len - CRABS_HASH_SIZE, recomputed_hash, CRABS_HASH_SIZE);
+
+  EXPECT_EQ(crabs_deserialize_state(buf->data, buf->len), nullptr);
+
+  serialized_buffer_destroy(buf);
+}
+
+// v10-shape compat: the v11 reader must accept a blob that carries NO manifest
+// entries and NO parent binding (count 0, bound flag 0) and restore the
+// lineage-neutral defaults. This is the shape every pre-lineage state
+// serializes to, and it is what a v10 file reduces to once the count position
+// is consumed.
+TEST(TestSerialization, V10ShapeBlobStillLoadsUnderV11) {
+  state_t* state = state_create();
+  ASSERT_NE(state, nullptr);
+
+  serialized_buffer_t* buf = crabs_serialize_state(state);
+  ASSERT_NE(buf, nullptr);
+
+  state_t* restored = crabs_deserialize_state(buf->data, buf->len);
+  ASSERT_NE(restored, nullptr);
+  EXPECT_EQ(restored->child_count, 0u);
+  EXPECT_EQ(restored->children, nullptr);
+  EXPECT_FALSE(restored->lineage_parent_bound);
+  EXPECT_STREQ(restored->lineage_self_id, "");
+
+  serialized_buffer_destroy(buf);
+  state_destroy(state);
+  state_destroy(restored);
+}
+
+// Reader cap: the manifest count is attacker-controlled on the wire, so it is
+// strictly capped at CRABS_MAX_CHILD_MACHINES. The writer does not validate,
+// so a fixture with an over-cap count reaches the reader unchanged.
+TEST(TestSerialization, V11RejectsOverCapChildCount) {
+  state_t* state = state_create();
+  ASSERT_NE(state, nullptr);
+  for (uint32_t child_index = 0; child_index <= CRABS_MAX_CHILD_MACHINES; child_index++) {
+    char child_id[CRABS_MAX_USER_ID];
+    snprintf(child_id, sizeof(child_id), "child-%02u", (unsigned)child_index);
+    append_manifest_entry(state, child_id, LINEAGE_SHARED_ROOT, LINEAGE_ACTIVE,
+                          60000, 1700000000000);
+  }
+  ASSERT_EQ(state->child_count, CRABS_MAX_CHILD_MACHINES + 1);
+
+  serialized_buffer_t* buf = crabs_serialize_state(state);
+  ASSERT_NE(buf, nullptr);
+  state_destroy(state);
+
+  EXPECT_EQ(crabs_deserialize_state(buf->data, buf->len), nullptr);
+
+  serialized_buffer_destroy(buf);
+}
+
+// Wire-check: serialization must be CANONICAL — serialize → deserialize →
+// serialize must reproduce the exact byte stream. Fixed-width fields and
+// walk-derived counts make the v11 blob deterministic; this is the strongest
+// regression net for the spawn/restart work that follows.
+TEST(TestSerialization, V11SerializationIsByteStableAcrossRoundTrip) {
+  state_t* state = state_create();
+  ASSERT_NE(state, nullptr);
+  append_manifest_entry(state, "child-red", LINEAGE_SHARED_ROOT, LINEAGE_ACTIVE,
+                        60000, 1700000000000);
+  append_manifest_entry(state, "child-blue", LINEAGE_SOVEREIGN,
+                        LINEAGE_WITHDRAWN, 120000, 1700000600000);
+  for (int hash_byte = 0; hash_byte < CRABS_HASH_SIZE; hash_byte++) {
+    state->children[0].genesis_snapshot_hash[hash_byte] = (uint8_t)(hash_byte + 0xA0);
+    state->children[1].genesis_snapshot_hash[hash_byte] = (uint8_t)(0x5A ^ hash_byte);
+  }
+  for (int signature_byte = 0; signature_byte < CRABS_SIG_SIZE; signature_byte++) {
+    state->children[0].genesis_attestation_signature[signature_byte] =
+        (uint8_t)(signature_byte * 7 + 1);
+    state->children[1].genesis_attestation_signature[signature_byte] =
+        (uint8_t)(signature_byte * 11 + 3);
+  }
+  state->lineage_parent_bound = true;
+  strncpy(state->lineage_parent_id, "parent-root", CRABS_MAX_USER_ID - 1);
+  for (int public_byte = 0; public_byte < 33; public_byte++) {
+    state->lineage_parent_public_key[public_byte] = (uint8_t)(public_byte + 0x21);
+  }
+  strncpy(state->lineage_self_id, "machine-self-id", CRABS_MAX_USER_ID - 1);
+
+  serialized_buffer_t* first = crabs_serialize_state(state);
+  ASSERT_NE(first, nullptr);
+  state_t* restored = crabs_deserialize_state_keys(first->data, first->len, NULL);
+  ASSERT_NE(restored, nullptr);
+  serialized_buffer_t* second = crabs_serialize_state(restored);
+  ASSERT_NE(second, nullptr);
+
+  ASSERT_EQ(first->len, second->len);
+  EXPECT_EQ(memcmp(first->data, second->data, first->len), 0);
+
+  serialized_buffer_destroy(second);
+  state_destroy(restored);
+  serialized_buffer_destroy(first);
   state_destroy(state);
 }
