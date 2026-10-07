@@ -1536,6 +1536,26 @@ TEST(TestLineage, RevokeAttestationViaOp) {
                                          "parent-root"), CRABS_SUCCESS);
   lineage_install(parent);
 
+  // Capture the lineage op's change event. The OP event that wraps every
+  // executed op is ignored here — only LINEAGE-kind events are captured.
+  // Event strings are borrowed only for the hook call, so the target is
+  // copied (the op handler's child_id is a stack buffer).
+  static crabs_change_event_t captured_events[4];
+  static char captured_targets[4][CRABS_MAX_USER_ID];
+  static uint32_t captured_event_count;
+  captured_event_count = 0;
+  state_set_change_hook(parent, [](state_t*, const crabs_change_event_t* event,
+                                   void*) {
+    if (event->kind != CRABS_CHANGE_LINEAGE) return;
+    if (captured_event_count >= 4) return;
+    captured_events[captured_event_count] = *event;
+    strncpy(captured_targets[captured_event_count],
+            event->target ? event->target : "", CRABS_MAX_USER_ID - 1);
+    captured_events[captured_event_count].target =
+        captured_targets[captured_event_count];
+    captured_event_count += 1;
+  }, nullptr);
+
   machine_blueprint_t* blueprint = make_valid_blueprint();
   ASSERT_NE(blueprint, nullptr);
   attribute_machine_t* child = nullptr;
@@ -1549,6 +1569,14 @@ TEST(TestLineage, RevokeAttestationViaOp) {
   ASSERT_NE(revoke, nullptr);
   EXPECT_EQ(state_machine_execute(parent, revoke), CRABS_SUCCESS);
   EXPECT_EQ(parent->children[0].status, LINEAGE_ATTESTATION_REVOKED);
+  // Change event: kind LINEAGE, the revoke op type, target = child.
+  ASSERT_EQ(captured_event_count, 1u);
+  EXPECT_EQ(captured_events[0].kind, CRABS_CHANGE_LINEAGE);
+  EXPECT_STREQ(captured_events[0].type, "__revoke_attestation__");
+  EXPECT_EQ(captured_events[0].uuid, nullptr);
+  EXPECT_STREQ(captured_events[0].target, "child-red");
+  EXPECT_STREQ(captured_events[0].preview, "attestation issuing revoked");
+  EXPECT_EQ(captured_events[0].result, CRABS_SUCCESS);
   operation_destroy(revoke);
 
   // Revoking twice is idempotent-rejected, not a re-write.
@@ -1582,6 +1610,26 @@ TEST(TestLineage, DissolveViaOpSeversResidentChildImmediately) {
                                          "parent-root"), CRABS_SUCCESS);
   lineage_install(parent);
 
+  // Capture the lineage op's change event. The OP event that wraps every
+  // executed op is ignored here — only LINEAGE-kind events are captured.
+  // Event strings are borrowed only for the hook call, so the target is
+  // copied (the op handler's child_id is a stack buffer).
+  static crabs_change_event_t captured_events[4];
+  static char captured_targets[4][CRABS_MAX_USER_ID];
+  static uint32_t captured_event_count;
+  captured_event_count = 0;
+  state_set_change_hook(parent, [](state_t*, const crabs_change_event_t* event,
+                                   void*) {
+    if (event->kind != CRABS_CHANGE_LINEAGE) return;
+    if (captured_event_count >= 4) return;
+    captured_events[captured_event_count] = *event;
+    strncpy(captured_targets[captured_event_count],
+            event->target ? event->target : "", CRABS_MAX_USER_ID - 1);
+    captured_events[captured_event_count].target =
+        captured_targets[captured_event_count];
+    captured_event_count += 1;
+  }, nullptr);
+
   machine_blueprint_t* blueprint = make_valid_blueprint();
   ASSERT_NE(blueprint, nullptr);
   attribute_machine_t* child = nullptr;
@@ -1594,6 +1642,14 @@ TEST(TestLineage, DissolveViaOpSeversResidentChildImmediately) {
       "child-red", strlen("child-red"));
   ASSERT_NE(dissolve, nullptr);
   EXPECT_EQ(state_machine_execute(parent, dissolve), CRABS_SUCCESS);
+  // Change event: kind LINEAGE, the dissolve op type, target = child.
+  ASSERT_EQ(captured_event_count, 1u);
+  EXPECT_EQ(captured_events[0].kind, CRABS_CHANGE_LINEAGE);
+  EXPECT_STREQ(captured_events[0].type, "__dissolve_machine__");
+  EXPECT_EQ(captured_events[0].uuid, nullptr);
+  EXPECT_STREQ(captured_events[0].target, "child-red");
+  EXPECT_STREQ(captured_events[0].preview, "dissolved");
+  EXPECT_EQ(captured_events[0].result, CRABS_SUCCESS);
   operation_destroy(dissolve);
 
   // Manifest DISSOLVED; the resident child is severed INSTANTLY (its
@@ -1627,6 +1683,27 @@ TEST(TestLineage, SovereignDissolveRefusedWithdrawSovereignOnly) {
                                          "parent-root"), CRABS_SUCCESS);
   lineage_install(parent);
 
+  // Capture the lineage op's change event. The OP event that wraps every
+  // executed op is ignored here — only LINEAGE-kind events are captured
+  // (a refused dissolve emits none; only the successful withdraw fires).
+  // Event strings are borrowed only for the hook call, so the target is
+  // copied (the op handler's child_id is a stack buffer).
+  static crabs_change_event_t captured_events[4];
+  static char captured_targets[4][CRABS_MAX_USER_ID];
+  static uint32_t captured_event_count;
+  captured_event_count = 0;
+  state_set_change_hook(parent, [](state_t*, const crabs_change_event_t* event,
+                                   void*) {
+    if (event->kind != CRABS_CHANGE_LINEAGE) return;
+    if (captured_event_count >= 4) return;
+    captured_events[captured_event_count] = *event;
+    strncpy(captured_targets[captured_event_count],
+            event->target ? event->target : "", CRABS_MAX_USER_ID - 1);
+    captured_events[captured_event_count].target =
+        captured_targets[captured_event_count];
+    captured_event_count += 1;
+  }, nullptr);
+
   // Sovereign child.
   machine_blueprint_t* sovereign = make_fresh_authority_blueprint(
       "child-sov", LINEAGE_SOVEREIGN);
@@ -1650,6 +1727,14 @@ TEST(TestLineage, SovereignDissolveRefusedWithdrawSovereignOnly) {
       CRABS_LINEAGE_OP_WITHDRAW_GENESIS, "child-sov", strlen("child-sov"));
   ASSERT_NE(withdraw, nullptr);
   EXPECT_EQ(state_machine_execute(parent, withdraw), CRABS_SUCCESS);
+  // Change event: kind LINEAGE, the withdraw op type, target = child.
+  ASSERT_EQ(captured_event_count, 1u);
+  EXPECT_EQ(captured_events[0].kind, CRABS_CHANGE_LINEAGE);
+  EXPECT_STREQ(captured_events[0].type, "__withdraw_genesis__");
+  EXPECT_EQ(captured_events[0].uuid, nullptr);
+  EXPECT_STREQ(captured_events[0].target, "child-sov");
+  EXPECT_STREQ(captured_events[0].preview, "genesis attested chain withdrawn");
+  EXPECT_EQ(captured_events[0].result, CRABS_SUCCESS);
   operation_destroy(withdraw);
   EXPECT_EQ(parent->children[0].status, LINEAGE_WITHDRAWN);
 

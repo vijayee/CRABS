@@ -1325,6 +1325,9 @@ crabs_error_e lineage_op_revoke_attestation(state_t* state, operation_t* op) {
     return CRABS_ERR_UNAUTHORIZED;
   }
   manifest_entry->status = LINEAGE_ATTESTATION_REVOKED;
+  state_notify_change(state, CRABS_CHANGE_LINEAGE,
+                      CRABS_LINEAGE_OP_REVOKE_ATTESTATION, NULL, NULL, NULL,
+                      child_id, "attestation issuing revoked", CRABS_SUCCESS);
   return CRABS_SUCCESS;
 }
 
@@ -1358,6 +1361,8 @@ crabs_error_e lineage_op_dissolve(state_t* state, operation_t* op) {
     resident->base_state.lineage_parent_dissolved = true;
   }
   _lineage_drop_resident_child(state, child_id);
+  state_notify_change(state, CRABS_CHANGE_LINEAGE, CRABS_LINEAGE_OP_DISSOLVE,
+                      NULL, NULL, NULL, child_id, "dissolved", CRABS_SUCCESS);
   return CRABS_SUCCESS;
 }
 
@@ -1384,6 +1389,10 @@ crabs_error_e lineage_op_withdraw_genesis(state_t* state, operation_t* op) {
     return CRABS_ERR_UNAUTHORIZED;
   }
   manifest_entry->status = LINEAGE_WITHDRAWN;
+  state_notify_change(state, CRABS_CHANGE_LINEAGE,
+                      CRABS_LINEAGE_OP_WITHDRAW_GENESIS, NULL, NULL, NULL,
+                      child_id, "genesis attested chain withdrawn",
+                      CRABS_SUCCESS);
   return CRABS_SUCCESS;
 }
 

@@ -219,7 +219,8 @@ typedef enum {
   CRABS_CHANGE_SCHEDULE  = 0x02,  // scheduled materialization (each fire)
   CRABS_CHANGE_TRIGGER   = 0x03,  // trigger-fired mutation
   CRABS_CHANGE_ATTRIBUTE = 0x04,  // attribute-machine user mutation
-  CRABS_CHANGE_SPAWN     = 0x05   // machine spawned from a blueprint (lineage)
+  CRABS_CHANGE_SPAWN     = 0x05,  // machine spawned from a blueprint (lineage)
+  CRABS_CHANGE_LINEAGE   = 0x06   // lineage lifecycle op (revoke/dissolve/withdraw)
 } crabs_change_kind_e;
 
 typedef struct {
