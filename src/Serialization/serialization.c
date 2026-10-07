@@ -34,6 +34,10 @@
 // parent-lookup scans cannot be driven to a multi-minute CPU DoS by a crafted
 // blob (CRABS_DESER_MAX_LOG allows 1M nodes → ~10¹² strcmp calls).
 #define CRABS_DESER_MAX_TREE_NODES 10000
+// A10-M7: bound ordered-set elements like the OT tree so the per-element
+// duplicate-id scan cannot be driven to a multi-minute CPU DoS by a crafted
+// blob, and bound the count by the bytes actually remaining.
+#define CRABS_DESER_MAX_SET_ELEMENTS 10000
 // Bound on a single scheduled operation's serialized payload read from the
 // wire; blocks a tiny crafted blob from driving a huge allocation (audit M-2).
 #define CRABS_DESER_MAX_SCHEDULE_OP_BYTES (1024u * 1024u)
@@ -248,6 +252,11 @@ void serialized_buffer_destroy(serialized_buffer_t* buf) {
 // ============================================================
 // OT Operation Serialization (v1.5 §9)
 // ============================================================
+
+// Wire size of one serialized op id: node_id[CRABS_MAX_USER_ID] + sequence_num
+// (u64) + timestamp (u64). Used to bound attacker-controlled element counts
+// against the remaining buffer (A10-M7).
+#define CRABS_OT_OP_ID_WIRE_SIZE (CRABS_MAX_USER_ID + 2 * sizeof(uint64_t))
 
 static void _serialize_ot_op_id(write_buf_t* buf, const crabs_ot_op_id_t* id) {
   _write_bytes(buf, (const uint8_t*)id->node_id, CRABS_MAX_USER_ID);
@@ -465,7 +474,11 @@ static bool _deserialize_ot_type_state(read_buf_t* buf, data_item_t* item,
 
       uint32_t count;
       if (!_read_uint32_le(buf, &count)) return false;
-      if (count > CRABS_DESER_MAX_LOG) return false;
+      if (count > CRABS_DESER_MAX_SET_ELEMENTS) return false;
+      // A10-M7: each element carries at least one op id on the wire, so a
+      // count above remaining/op-id-size cannot be satisfied by the blob —
+      // reject before the per-element duplicate-id scan runs.
+      if (count > (buf->len - buf->offset) / CRABS_OT_OP_ID_WIRE_SIZE) return false;
 
       crabs_ordered_element_t* tail = NULL;
       for (uint32_t i = 0; i < count; i++) {

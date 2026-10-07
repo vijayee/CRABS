@@ -1751,6 +1751,119 @@ TEST(TestSerialization, TestDeserialRejectsDuplicateOrderedSetElementIds) {
   state_destroy(state);
 }
 
+// Audit A10-M7: the ordered-set reader capped the element count at
+// CRABS_DESER_MAX_LOG (1,000,000) and then ran a per-element linear
+// duplicate-id scan over the accumulated set — O(n²), ~10¹² id comparisons
+// for a ~120 MB crafted blob. The count is now bounded at
+// CRABS_DESER_MAX_SET_ELEMENTS (10,000), matching the OT tree node cap from
+// Audit 8. A legitimate blob carrying 10,001 elements (one above the cap, far
+// below the old 1M cap) must now be rejected outright.
+TEST(OrderedSetDeserialize, ElementCountBoundedAboveTreeNodes) {
+  state_t* state = state_create();
+  crabs_ot_ordered_set_t* set = crabs_ot_ordered_set_create();
+  ASSERT_NE(set, nullptr);
+
+  const uint32_t element_total = 10001; // CRABS_DESER_MAX_SET_ELEMENTS + 1
+  for (uint32_t elem_index = 0; elem_index < element_total; elem_index++) {
+    crabs_ot_operation_t insert_op = {};
+    strncpy(insert_op.id.node_id, "node1", sizeof(insert_op.id.node_id) - 1);
+    insert_op.id.sequence_num = elem_index + 1;
+    insert_op.id.timestamp = 1000 + elem_index;
+    insert_op.op_type = CRABS_OT_OP_INSERT;
+    insert_op.payload = (uint8_t*)"vv";
+    insert_op.payload_size = 2;
+    ASSERT_NE(crabs_ot_ordered_set_apply_insert(set, &insert_op), nullptr);
+  }
+
+  data_item_t* item = data_item_create("set1", (data_type_e)DATA_TYPE_OT_ORDERED_SET, CRDT_CUSTOM);
+  item->value = set;
+  item->ot_data = set->ot_data;
+  state_add_item(state, item);
+
+  // The blob is well-formed; only the element count exceeds the new cap.
+  serialized_buffer_t* buf = crabs_serialize_state(state);
+  ASSERT_NE(buf, nullptr);
+
+  state_t* result = crabs_deserialize_state(buf->data, buf->len);
+  EXPECT_EQ(result, nullptr);
+
+  serialized_buffer_destroy(buf);
+  state_destroy(state);
+}
+
+// Audit A10-M7: the element count is also bounded against the bytes actually
+// remaining in the buffer (each element needs at least one 80-byte op id).
+// Craft a valid 2-element blob, overwrite the count with 5000 — plausible in
+// magnitude (under CRABS_DESER_MAX_SET_ELEMENTS, so the count cap is not what
+// rejects it) but unsatisfiable by the blob — fix the checksum, and expect
+// rejection before the duplicate-id scan runs.
+TEST(OrderedSetDeserialize, CountBoundedByRemainingBytes) {
+  state_t* state = state_create();
+  crabs_ot_ordered_set_t* set = crabs_ot_ordered_set_create();
+  ASSERT_NE(set, nullptr);
+
+  crabs_ot_op_id_t id1 = {"node1", 1, 1000};
+  crabs_ot_op_id_t id2 = {"node1", 2, 2000};
+  crabs_ot_operation_t op1 = {};
+  op1.id = id1;
+  op1.op_type = CRABS_OT_OP_INSERT;
+  op1.payload = (uint8_t*)"aaaa";
+  op1.payload_size = 4;
+  ASSERT_NE(crabs_ot_ordered_set_apply_insert(set, &op1), nullptr);
+  crabs_ot_operation_t op2 = {};
+  op2.id = id2;
+  op2.op_type = CRABS_OT_OP_INSERT;
+  op2.payload = (uint8_t*)"bbbb";
+  op2.payload_size = 4;
+  ASSERT_NE(crabs_ot_ordered_set_apply_insert(set, &op2), nullptr);
+
+  data_item_t* item = data_item_create("set2", (data_type_e)DATA_TYPE_OT_ORDERED_SET, CRDT_CUSTOM);
+  item->value = set;
+  item->ot_data = set->ot_data;
+  state_add_item(state, item);
+
+  // Sanity: the unmodified blob must round-trip
+  serialized_buffer_t* buf = crabs_serialize_state(state);
+  ASSERT_NE(buf, nullptr);
+  state_t* sane = crabs_deserialize_state(buf->data, buf->len);
+  ASSERT_NE(sane, nullptr);
+  state_destroy(sane);
+
+  // Locate the ordered-set element count. State header is magic(4) +
+  // version(4) + state_version(8) + item_count(4) + policy_count(4) +
+  // log_count(4) = 28 bytes. The single item then carries name string16,
+  // type/crdt/protocol (3 bytes), the ot_data bytes32, and finally the
+  // type-state element count.
+  const size_t state_header_len = 28;
+  const size_t ot_data_len_offset = state_header_len + 2 + strlen("set2") + 3;
+  uint32_t ot_data_len = 0;
+  for (int byte_index = 0; byte_index < 4; byte_index++) {
+    ot_data_len |= ((uint32_t)buf->data[ot_data_len_offset + byte_index]) << (byte_index * 8);
+  }
+  const size_t count_offset = ot_data_len_offset + 4 + ot_data_len;
+  uint32_t stored_count = 0;
+  for (int byte_index = 0; byte_index < 4; byte_index++) {
+    stored_count |= ((uint32_t)buf->data[count_offset + byte_index]) << (byte_index * 8);
+  }
+  ASSERT_EQ(stored_count, 2u); // guard against wire-layout drift
+
+  uint32_t bloated_count = 5000; // under CRABS_DESER_MAX_SET_ELEMENTS
+  for (int byte_index = 0; byte_index < 4; byte_index++) {
+    buf->data[count_offset + byte_index] = (uint8_t)((bloated_count >> (byte_index * 8)) & 0xFF);
+  }
+
+  // Recompute checksum so only the remaining-bytes bound can reject the blob
+  uint8_t hash[32];
+  SHA256(buf->data, buf->len - 32, hash);
+  memcpy(buf->data + buf->len - 32, hash, 32);
+
+  state_t* result = crabs_deserialize_state(buf->data, buf->len);
+  EXPECT_EQ(result, nullptr);
+
+  serialized_buffer_destroy(buf);
+  state_destroy(state);
+}
+
 // ============================================================
 // Audit A-4: HLC nanos bound on the wire paths
 //
