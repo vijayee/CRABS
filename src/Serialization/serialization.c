@@ -2034,10 +2034,32 @@ state_t* crabs_deserialize_state_keys_reported(const uint8_t* data, size_t len,
                                      msk_section_present);
 }
 
+// R7-03: append the node-key ECDSA trailer over the whole blob. The bare
+// SHA-256 is not authentication — an attacker who can write the state file can
+// recompute it. Returns NULL without touching the blob when the state has no
+// valid node key.
+static serialized_buffer_t* _append_state_signature(
+    serialized_buffer_t* blob, const state_t* state) {
+  if (blob == NULL || state == NULL) return NULL;
+  if (!state->node_key_valid) return NULL;
+
+  serialized_buffer_t* result =
+      serialized_buffer_create(blob->len + CRABS_SIG_SIZE);
+  if (result == NULL) return NULL;
+  memcpy(result->data, blob->data, blob->len);
+  result->len = blob->len + CRABS_SIG_SIZE;
+
+  if (crypto_ecdsa_sign(state->node_private_key, blob->data, blob->len,
+                        result->data + blob->len) != CRABS_SUCCESS) {
+    serialized_buffer_destroy(result);
+    return NULL;
+  }
+  return result;
+}
+
 // R7-03: authenticated state snapshot. Serializes the state (with its SHA-256
 // corruption checksum) and appends an ECDSA signature over the whole blob from
-// the node's private key. The bare SHA-256 is not authentication — an attacker
-// who can write the state file can recompute it.
+// the node's private key.
 serialized_buffer_t* crabs_serialize_state_signed(const state_t* state) {
   if (state == NULL) return NULL;
   if (!state->node_key_valid) return NULL;
@@ -2045,22 +2067,34 @@ serialized_buffer_t* crabs_serialize_state_signed(const state_t* state) {
   serialized_buffer_t* payload = crabs_serialize_state(state);
   if (payload == NULL) return NULL;
 
-  serialized_buffer_t* result = serialized_buffer_create(payload->len + CRABS_SIG_SIZE);
+  serialized_buffer_t* result = _append_state_signature(payload, state);
   if (result == NULL) {
     serialized_buffer_destroy(payload);
     return NULL;
   }
-  memcpy(result->data, payload->data, payload->len);
-  result->len = payload->len + CRABS_SIG_SIZE;
+  serialized_buffer_destroy(payload);
+  return result;
+}
 
-  if (crypto_ecdsa_sign(state->node_private_key, payload->data, payload->len,
-                        result->data + payload->len) != CRABS_SUCCESS) {
-    serialized_buffer_destroy(payload);
-    serialized_buffer_destroy(result);
+// Sealed + signed: the full snapshot seals the MSK under seal_key, then the
+// node-key trailer covers the WHOLE sealed payload. cli_node_save is the
+// canonical caller; the CLI's durability path keeps both at-rest guarantees
+// (authority persistence + snapshot authentication) in one serialized form.
+serialized_buffer_t* crabs_serialize_state_sealed_signed(
+    const state_t* state, const uint8_t seal_key[32]) {
+  if (state == NULL || seal_key == NULL) return NULL;
+  if (!state->node_key_valid) return NULL;
+
+  serialized_buffer_t* sealed_payload =
+      crabs_serialize_state_sealed(state, seal_key);
+  if (sealed_payload == NULL) return NULL;
+
+  serialized_buffer_t* result = _append_state_signature(sealed_payload, state);
+  if (result == NULL) {
+    serialized_buffer_destroy(sealed_payload);
     return NULL;
   }
-
-  serialized_buffer_destroy(payload);
+  serialized_buffer_destroy(sealed_payload);
   return result;
 }
 

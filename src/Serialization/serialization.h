@@ -71,6 +71,13 @@ serialized_buffer_t* crabs_serialize_state_signed(const state_t* state);
 state_t*             crabs_deserialize_state_signed(const uint8_t* data, size_t len,
                                                      const uint8_t node_public_key[33]);
 
+// Sealed + node-key-signed full snapshot: _serialize_state_internal with
+// seal_key (requires state->abe_mk), then the ECDSA trailer from
+// state->node_private_key. Returns NULL when the state has no valid node key
+// or no live master key to seal.
+serialized_buffer_t* crabs_serialize_state_sealed_signed(
+                         const state_t* state, const uint8_t seal_key[32]);
+
 // ============================================================
 // Operation serialization (§7.5)
 // ============================================================

@@ -1243,3 +1243,31 @@ TEST(TestCliDurability, MigrateRefusesUnauthenticatedSnapshot) {
   cli_node_destroy(node);
   remove("/tmp/crabs-unauth.crabs");
 }
+
+// Sealed+signed composition (centralized API): cli_node_save must emit the
+// sealed-MSK blob WITH the node-key ECDSA trailer — the exact wire shape
+// cli_node_load's signed parse expects. This pins the composition through the
+// CLI save path.
+TEST(TestSerialization, SealedSignedBlobComposesSealAndSignature) {
+  cli_node_t* node = cli_node_create();
+  ASSERT_EQ(cli_node_init(node, "admin"), CLI_OK);
+  ASSERT_TRUE(_apply_test_seal_key(node));
+  ASSERT_EQ(cli_node_save(node, "/tmp/crabs-sealed-signed.crabs"), CLI_OK);
+  cli_node_destroy(node);
+
+  cli_node_t* reloaded = cli_node_create();
+  const uint8_t test_seal_key[32] = {
+    1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,
+    17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32
+  };
+  char seal_hex[65];
+  cli_bytes_to_hex(test_seal_key, 32, seal_hex);
+  seal_hex[64] = '\0';
+  // The sealed file loads through the EXISTING cli_node_load path (signed
+  // parse first) and the import verifies the signature — proving the
+  // composition produces the same wire shape the signed loader expects.
+  ASSERT_EQ(cli_node_load(reloaded, "/tmp/crabs-sealed-signed.crabs"), CLI_OK);
+  ASSERT_TRUE(reloaded->state_sig_pending);   // signature present + pending
+  cli_node_destroy(reloaded);
+  remove("/tmp/crabs-sealed-signed.crabs");
+}

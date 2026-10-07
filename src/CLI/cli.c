@@ -516,29 +516,12 @@ cli_result_e cli_node_save(cli_node_t* node, const char* path) {
   // SHA-256 checksum written by the unsigned serializer is integrity only —
   // an attacker who can write the file can recompute it.
   // Durability (v10): seal the MSK under the at-rest key, then append the
-  // node-key signature over the sealed payload (seal and sign compose;
-  // this is crabs_serialize_state_sealed + the signed-trailer logic).
+  // node-key signature over the sealed payload — the single centralized
+  // crabs_serialize_state_sealed_signed composition.
   if (!node->attr_machine->base_state.node_key_valid) return CLI_ERR_EXEC;
-  serialized_buffer_t* sealed_payload =
-      crabs_serialize_state_sealed(&node->attr_machine->base_state,
-                                   node->seal_key);
-  if (sealed_payload == NULL) return CLI_ERR_EXEC;
-  serialized_buffer_t* buf =
-      serialized_buffer_create(sealed_payload->len + CRABS_SIG_SIZE);
-  if (buf == NULL) {
-    serialized_buffer_destroy(sealed_payload);
-    return CLI_ERR_EXEC;
-  }
-  memcpy(buf->data, sealed_payload->data, sealed_payload->len);
-  buf->len = sealed_payload->len + CRABS_SIG_SIZE;
-  if (crypto_ecdsa_sign(node->attr_machine->base_state.node_private_key,
-                        sealed_payload->data, sealed_payload->len,
-                        buf->data + sealed_payload->len) != CRABS_SUCCESS) {
-    serialized_buffer_destroy(sealed_payload);
-    serialized_buffer_destroy(buf);
-    return CLI_ERR_EXEC;
-  }
-  serialized_buffer_destroy(sealed_payload);
+  serialized_buffer_t* buf = crabs_serialize_state_sealed_signed(
+      &node->attr_machine->base_state, node->seal_key);
+  if (buf == NULL) return CLI_ERR_EXEC;
 
   FILE* f = fopen(path, "wb");
   if (f == NULL) {
