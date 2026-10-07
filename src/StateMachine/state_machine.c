@@ -604,19 +604,6 @@ static crabs_error_e _validate_received_hlc(state_t* state, const operation_t* o
   return CRABS_ERR_PROTOCOL_VIOLATION;
 }
 
-// Step 3 helper: Authorization (§10.3) — fail closed. Every operation
-// requires a registered policy and a valid signature.
-// Audit L-a: authorize BEFORE the protocol/lock/dedup checks (steps 4-6)
-// so an unauthenticated caller cannot learn resource existence, lock
-// state, or dedup-tracker membership from distinct error codes. An
-// unauthenticated caller gets a single CRABS_ERR_UNAUTHORIZED; an
-// authenticated caller still receives the specific protocol error below.
-// On success, *pp_out receives the preprocessed policy result (needed by
-// the co-signature check in step 6c) and *resolved_signer_out receives the
-// signer whose key actually verified. For Mode A that is op->signer_id; for
-// Mode B (anonymous ops) it is the user the trial verification matched —
-// the key-version gates in steps 6/6b must run against this resolved
-// signer, because op->signer_id is empty there.
 // v1.7 §attestation bridge: does the attestation's comma-separated
 // attributes list contain the endorsement attribute EXACTLY? Direct string
 // membership only — v1 evaluates no boolean logic over attested attributes
@@ -707,6 +694,19 @@ static crabs_error_e _verify_parent_endorsements(
   return CRABS_SUCCESS;
 }
 
+// Step 3 helper: Authorization (§10.3) — fail closed. Every operation
+// requires a registered policy and a valid signature.
+// Audit L-a: authorize BEFORE the protocol/lock/dedup checks (steps 4-6)
+// so an unauthenticated caller cannot learn resource existence, lock
+// state, or dedup-tracker membership from distinct error codes. An
+// unauthenticated caller gets a single CRABS_ERR_UNAUTHORIZED; an
+// authenticated caller still receives the specific protocol error below.
+// On success, *pp_out receives the preprocessed policy result (needed by
+// the co-signature check in step 6c) and *resolved_signer_out receives the
+// signer whose key actually verified. For Mode A that is op->signer_id; for
+// Mode B (anonymous ops) it is the user the trial verification matched —
+// the key-version gates in steps 6/6b must run against this resolved
+// signer, because op->signer_id is empty there.
 static crabs_error_e _verify_operation_authorization(state_t* state, const operation_t* op,
                                                      policy_preprocess_result_t* pp_out,
                                                      char* resolved_signer_out) {
