@@ -6,6 +6,7 @@ extern "C" {
 #include "../src/CRABS/crabs.h"
 #include "../src/CRABS/data_model.h"
 #include "../src/StateMachine/state_machine.h"
+#include "../src/Lineage/lineage.h"
 #include "../src/Scheduler/scheduler.h"
 #include "../src/Crypto/sig_scheme.h"
 #include "../src/Crypto/crypto.h"
@@ -266,6 +267,163 @@ TEST(TestSerialization, TestHlcOrderingSurvivesWireRoundTrip) {
   serialized_buffer_destroy(wire);
   operation_destroy(original);
   operation_destroy(restored);
+}
+
+// v1.7 §attestation bridge: operations carry parent attestations on the
+// wire. Each entry reuses the attestation wire format, and the deserializer
+// owns the heap array exactly like co_signers.
+TEST(TestSerialization, TestOperationCarriesAttestationsOnWire) {
+  operation_t* original = operation_create(CRABS_OP_CHECK_DEDUP);
+  memset(original->uuid, 0x55, CRABS_UUID_SIZE);
+  strncpy(original->policy, "@parent/role:writer", CRABS_MAX_POLICY_EXPR - 1);
+  memset(original->signature, 0xDD, CRABS_SIG_SIZE);
+  strncpy(original->signer_id, "alice", CRABS_MAX_USER_ID - 1);
+  original->lamport_time = 42;
+  strncpy(original->node_id, "node1", CRABS_MAX_USER_ID - 1);
+
+  // Hand-built attestations: this test covers transport only (opaque
+  // signature bytes; semantic verify lives in test_lineage.cpp).
+  const uint64_t not_before = 1700000000000ULL;
+  attestation_t first_attestation;
+  memset(&first_attestation, 0, sizeof(first_attestation));
+  first_attestation.format_version = CRABS_ATTESTATION_FORMAT_VERSION;
+  strncpy(first_attestation.parent_id, "parent-root",
+          sizeof(first_attestation.parent_id) - 1);
+  strncpy(first_attestation.child_id, "child-red",
+          sizeof(first_attestation.child_id) - 1);
+  strncpy(first_attestation.user_id, "alice",
+          sizeof(first_attestation.user_id) - 1);
+  strncpy(first_attestation.attributes, "role:writer,dept:red",
+          sizeof(first_attestation.attributes) - 1);
+  first_attestation.not_before = not_before;
+  first_attestation.expires_at = not_before + 60000;
+  memset(first_attestation.signature, 0x44, CRABS_SIG_SIZE);
+
+  attestation_t second_attestation;
+  memset(&second_attestation, 0, sizeof(second_attestation));
+  second_attestation.format_version = CRABS_ATTESTATION_FORMAT_VERSION;
+  strncpy(second_attestation.parent_id, "parent-root",
+          sizeof(second_attestation.parent_id) - 1);
+  strncpy(second_attestation.child_id, "child-red",
+          sizeof(second_attestation.child_id) - 1);
+  strncpy(second_attestation.user_id, "bob",
+          sizeof(second_attestation.user_id) - 1);
+  strncpy(second_attestation.attributes, "custody:video",
+          sizeof(second_attestation.attributes) - 1);
+  second_attestation.not_before = not_before;
+  second_attestation.expires_at = not_before + 120000;
+  memset(second_attestation.signature, 0x66, CRABS_SIG_SIZE);
+
+  original->attestations = (attestation_t*)malloc(2 * sizeof(attestation_t));
+  ASSERT_NE(original->attestations, nullptr);
+  original->attestations[0] = first_attestation;
+  original->attestations[1] = second_attestation;
+  original->attestation_count = 2;
+
+  serialized_buffer_t* wire = crabs_serialize_operation(original);
+  ASSERT_NE(wire, nullptr);
+
+  operation_t* restored = crabs_deserialize_operation(wire->data, wire->len);
+  ASSERT_NE(restored, nullptr);
+
+  EXPECT_EQ(restored->attestation_count, 2u);
+  ASSERT_NE(restored->attestations, nullptr);
+  EXPECT_EQ(restored->attestations[0].format_version,
+            CRABS_ATTESTATION_FORMAT_VERSION);
+  EXPECT_STREQ(restored->attestations[0].parent_id, "parent-root");
+  EXPECT_STREQ(restored->attestations[0].child_id, "child-red");
+  EXPECT_STREQ(restored->attestations[0].user_id, "alice");
+  EXPECT_STREQ(restored->attestations[0].attributes, "role:writer,dept:red");
+  EXPECT_EQ(restored->attestations[0].not_before, not_before);
+  EXPECT_EQ(restored->attestations[0].expires_at, not_before + 60000);
+  EXPECT_EQ(memcmp(restored->attestations[0].signature,
+                   first_attestation.signature, CRABS_SIG_SIZE), 0);
+  EXPECT_STREQ(restored->attestations[1].user_id, "bob");
+  EXPECT_STREQ(restored->attestations[1].attributes, "custody:video");
+  EXPECT_EQ(memcmp(restored->attestations[1].signature,
+                   second_attestation.signature, CRABS_SIG_SIZE), 0);
+
+  // The canonical signing form excludes attestations (each carries its own
+  // parent signature), so signing bytes are stable across the round trip.
+  serialized_buffer_t* sig1 = crabs_serialize_for_signing(original);
+  serialized_buffer_t* sig2 = crabs_serialize_for_signing(restored);
+  ASSERT_NE(sig1, nullptr);
+  ASSERT_NE(sig2, nullptr);
+  EXPECT_EQ(sig1->len, sig2->len);
+  EXPECT_EQ(memcmp(sig1->data, sig2->data, sig1->len), 0);
+
+  serialized_buffer_destroy(sig1);
+  serialized_buffer_destroy(sig2);
+  serialized_buffer_destroy(wire);
+  operation_destroy(original);
+  operation_destroy(restored);
+}
+
+TEST(TestSerialization, TestOperationAttestationCountBoundAndTruncation) {
+  // An op serialized WITHOUT attestations still deserializes (count 0).
+  operation_t* plain = operation_create(CRABS_OP_CHECK_DEDUP);
+  memset(plain->uuid, 0x55, CRABS_UUID_SIZE);
+  strncpy(plain->signer_id, "alice", CRABS_MAX_USER_ID - 1);
+  serialized_buffer_t* plain_wire = crabs_serialize_operation(plain);
+  ASSERT_NE(plain_wire, nullptr);
+  operation_t* plain_restored =
+      crabs_deserialize_operation(plain_wire->data, plain_wire->len);
+  ASSERT_NE(plain_restored, nullptr);
+  EXPECT_EQ(plain_restored->attestation_count, 0u);
+  EXPECT_EQ(plain_restored->attestations, nullptr);
+  serialized_buffer_destroy(plain_wire);
+  operation_destroy(plain);
+  operation_destroy(plain_restored);
+
+  // A serialized op carrying one attestation, truncated to a fraction of its
+  // final byte, must fail closed.
+  operation_t* original = operation_create(CRABS_OP_CHECK_DEDUP);
+  memset(original->uuid, 0x55, CRABS_UUID_SIZE);
+  strncpy(original->signer_id, "alice", CRABS_MAX_USER_ID - 1);
+  attestation_t attestation;
+  memset(&attestation, 0, sizeof(attestation));
+  attestation.format_version = CRABS_ATTESTATION_FORMAT_VERSION;
+  strncpy(attestation.parent_id, "parent-root",
+          sizeof(attestation.parent_id) - 1);
+  strncpy(attestation.child_id, "child-red",
+          sizeof(attestation.child_id) - 1);
+  strncpy(attestation.user_id, "alice", sizeof(attestation.user_id) - 1);
+  strncpy(attestation.attributes, "role:writer",
+          sizeof(attestation.attributes) - 1);
+  attestation.not_before = 1700000000000ULL;
+  attestation.expires_at = 1700000060000ULL;
+  memset(attestation.signature, 0x44, CRABS_SIG_SIZE);
+  original->attestations = (attestation_t*)malloc(sizeof(attestation_t));
+  ASSERT_NE(original->attestations, nullptr);
+  original->attestations[0] = attestation;
+  original->attestation_count = 1;
+
+  serialized_buffer_t* wire = crabs_serialize_operation(original);
+  ASSERT_NE(wire, nullptr);
+
+  // Locate the per-entry length prefix (u32le, directly before the blob it
+  // describes: the attestation section is the last section on the wire) and
+  // inflate it beyond the wire cap.
+  uint8_t scratch[CRABS_ATTESTATION_WIRE_MAX];
+  size_t attestation_wire_len =
+      attestation_serialize(&attestation, scratch, sizeof(scratch));
+  ASSERT_GT(attestation_wire_len, 0u);
+  uint8_t* length_prefix =
+      wire->data + wire->len - attestation_wire_len - 4;
+  // Sanity: the blob the prefix describes re-parses on its own.
+  attestation_t* direct = attestation_deserialize(length_prefix + 4,
+                                                  attestation_wire_len);
+  ASSERT_NE(direct, nullptr);
+  attestation_destroy(direct);
+  memset(length_prefix, 0xFF, 4);
+
+  EXPECT_EQ(crabs_deserialize_operation(wire->data, wire->len), nullptr);
+
+  // Truncation: chop anything after the attestation entry.
+  EXPECT_EQ(crabs_deserialize_operation(wire->data, wire->len - 8), nullptr);
+
+  serialized_buffer_destroy(wire);
+  operation_destroy(original);
 }
 
 // R7-03: state snapshots must be authenticated with the node key, not just

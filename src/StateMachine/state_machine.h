@@ -12,6 +12,7 @@
 #include "../Trigger/trigger.h"
 #include "../Crypto/sig_scheme.h"
 #include "../HLC/hlc.h"
+#include "../Lineage/lineage.h"
 
 // ============================================================
 // Lock Claim (§7.2)
@@ -25,6 +26,12 @@ typedef struct {
 // Co-Signature (v1.3 Amendment 3, §4.2)
 // ============================================================
 #define CRABS_MAX_CO_SIGNERS  8
+
+// Parent attestations an operation may carry (v1.7 §attestation bridge).
+// Matches the per-policy endorsement slot cap in condition.h — a policy
+// cannot name more endorsements than CRABS_MAX_PARENT_ENDORSEMENTS, so an
+// op never needs more attestations than that either.
+#define CRABS_MAX_OP_ATTESTATIONS  CRABS_MAX_PARENT_ENDORSEMENTS
 
 typedef struct {
   char               signer_id[CRABS_MAX_USER_ID];
@@ -60,6 +67,14 @@ typedef struct {
   char               key_id[CRABS_MAX_KEY_ID];
   co_signature_t*    co_signers;
   uint32_t           co_signer_count;
+  // v1.7 lineage: parent attestations carried by the op (§attestation
+  // bridge). Verified in the authorization pipeline against the machine's
+  // lineage parent binding; on the wire each entry reuses the attestation
+  // wire format. Single-owner heap array like co_signers: allocated by the
+  // deserializer, freed by operation_destroy; value copies of the struct
+  // only borrow the pointer.
+  attestation_t*     attestations;
+  uint32_t           attestation_count;
   // v1.4: Dedup specification
   dedup_spec_t       dedup;
   // v1.6 Amd6: Ordering system support

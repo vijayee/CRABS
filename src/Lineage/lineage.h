@@ -22,6 +22,13 @@
 // Independent of key_envelope_t's 0x03.
 #define CRABS_ATTESTATION_FORMAT_VERSION 0x01
 
+// Canonical attestation body cap. The worst-case body (lineage.c's
+// canonical writer) is 1 + 3*(2+63) + (2+255) + 16 = 469 bytes; the cap
+// gives headroom. The wire image adds a u32le length prefix and the 64-byte
+// signature on top.
+#define CRABS_ATTESTATION_BODY_MAX  512
+#define CRABS_ATTESTATION_WIRE_MAX  (4 + CRABS_ATTESTATION_BODY_MAX + CRABS_SIG_SIZE)
+
 // One blueprint data item: name + data type + CRDT strategy.
 typedef struct {
   char        name[CRABS_MAX_USER_ID];

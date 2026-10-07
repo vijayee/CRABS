@@ -12,6 +12,7 @@
 #include "../OT/ot_transform.h"
 #include "../Trigger/trigger.h"
 #include "../Condition/condition.h"
+#include "../Lineage/lineage.h"
 #include <string.h>
 #include <openssl/sha.h>
 #include <openssl/crypto.h>
@@ -2123,7 +2124,9 @@ serialized_buffer_t* crabs_serialize_operation(const operation_t* op) {
   write_buf_t* buf = _write_buf_create(1024);
 
   // Operation format version
-  _write_uint32_le(buf, 4); // v3: adds dedup_spec; v4: adds ordering_system + HLC
+  _write_uint32_le(buf, 5);
+  // v3: adds dedup_spec; v4: adds ordering_system + HLC;
+  // v5: adds the parent-attestation section
 
   // type (length-prefixed string)
   _write_string16(buf, op->type);
@@ -2232,6 +2235,30 @@ serialized_buffer_t* crabs_serialize_operation(const operation_t* op) {
     _write_string16(buf, op->hlc.node_id);
   }
 
+  // v5 (v1.7 §attestation bridge): parent attestations carried by the op.
+  // Each entry reuses the attestation wire format verbatim (u32le total
+  // length + canonical body + signature, lineage.h), prefixed here by its
+  // own u32le length so the transport can never drift from the format
+  // attestation_verify consumes. Attestations are NOT part of the canonical
+  // signing form: each carries the parent's signature over its own body.
+  _write_uint32_le(buf, op->attestation_count);
+  for (uint32_t attestation_index = 0;
+       attestation_index < op->attestation_count; attestation_index++) {
+    uint8_t attestation_wire[CRABS_ATTESTATION_WIRE_MAX];
+    size_t attestation_wire_len = attestation_serialize(
+        &op->attestations[attestation_index],
+        attestation_wire, sizeof(attestation_wire));
+    if (attestation_wire_len == 0) {
+      // A structurally broken attestation (unterminated field) cannot be
+      // faithfully transported — refuse the op instead of truncating it.
+      free(buf->data);
+      free(buf);
+      return NULL;
+    }
+    _write_uint32_le(buf, (uint32_t)attestation_wire_len);
+    _write_bytes(buf, attestation_wire, attestation_wire_len);
+  }
+
   // Create output
   serialized_buffer_t* result = serialized_buffer_create(buf->offset);
   memcpy(result->data, buf->data, buf->offset);
@@ -2256,7 +2283,7 @@ operation_t* crabs_deserialize_operation(const uint8_t* data, size_t len) {
   // Operation format version
   uint32_t op_version;
   if (!_read_uint32_le(&buf, &op_version)) goto fail;
-  if (op_version < 1 || op_version > 4) goto fail;
+  if (op_version < 1 || op_version > 5) goto fail;
 
   // type
   if (!_read_string16(&buf, op->type, CRABS_MAX_OP_NAME)) goto fail;
@@ -2433,6 +2460,33 @@ operation_t* crabs_deserialize_operation(const uint8_t* data, size_t len) {
       if (op->hlc.physical_nanos >= 1000000000ULL) goto fail;
       if (!_read_uint64_le(&buf, &op->hlc.logical_counter)) goto fail;
       if (!_read_string16(&buf, op->hlc.node_id, CRABS_HLC_NODE_ID_SIZE)) goto fail;
+    }
+  }
+
+  // v5 (v1.7 §attestation bridge): parent attestations. Older versions
+  // default to none (zero-init).
+  if (op_version >= 5) {
+    uint32_t attestation_count;
+    if (!_read_uint32_le(&buf, &attestation_count)) goto fail;
+    if (attestation_count > CRABS_MAX_OP_ATTESTATIONS) goto fail;
+    op->attestation_count = attestation_count;
+    if (attestation_count > 0) {
+      op->attestations = get_clear_memory(attestation_count * sizeof(attestation_t));
+      for (uint32_t attestation_index = 0;
+           attestation_index < attestation_count; attestation_index++) {
+        uint32_t attestation_wire_len;
+        if (!_read_uint32_le(&buf, &attestation_wire_len)) goto fail;
+        if (attestation_wire_len > CRABS_ATTESTATION_WIRE_MAX ||
+            buf.offset + attestation_wire_len > buf.len) {
+          goto fail;
+        }
+        attestation_t* parsed = attestation_deserialize(
+            buf.data + buf.offset, attestation_wire_len);
+        if (parsed == NULL) goto fail;
+        op->attestations[attestation_index] = *parsed;
+        free(parsed);
+        buf.offset += attestation_wire_len;
+      }
     }
   }
 
