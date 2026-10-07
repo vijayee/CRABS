@@ -1075,6 +1075,25 @@ class Node {
     return out;
   }
 
+  // Mints a dissolution tombstone for a DISSOLVED manifest child: the
+  // canonical body (u8 tag LINEAGE_DISSOLVED + string16 childId) plus the
+  // 64-byte parent ECDSA signature. The wire has NO length prefix — these are
+  // the exact bytes a __receive_dissolution__ op transports and verifies.
+  // Refuses (throws) when the child is unknown or NOT currently dissolved —
+  // the honesty gate is lineage_dissolution_serialize's own, in C.
+  lineageTombstone(childId) {
+    const M = this._M;
+    const idPtr = writeString(M, childId);
+    const ser = M._crabs_wasm_lineage_tombstone(this._am, idPtr);
+    if (idPtr) M._free(idPtr);
+    if (!ser) throw new Error('lineage tombstone failed (unknown or non-dissolved child)');
+    const len = M._crabs_wasm_buffer_len(ser);
+    const data = M._crabs_wasm_buffer_data(ser);
+    const out = new Uint8Array(M.HEAPU8.subarray(data, data + len));
+    M._crabs_wasm_buffer_destroy(ser);
+    return out;
+  }
+
   destroy() {
     if (this._am) { this._M._crabs_wasm_node_destroy(this._am); this._am = null; }
   }

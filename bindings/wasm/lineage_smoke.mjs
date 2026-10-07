@@ -22,10 +22,12 @@ const bindingsDir = path.basename(scriptDir) === 'wasm' &&
   ? scriptDir
   : path.join(process.cwd(), 'bindings', 'wasm');
 
-const { Node, Blueprint, TRUST_MODE, DATA_TYPE, CRDT_TYPE } =
+const { Node, KeyPair, Operation, Blueprint, TRUST_MODE, DATA_TYPE, CRDT_TYPE } =
   createRequire(path.join(bindingsDir, 'dev.js'))('./dev.js');
 
 const childId = 'child-omega';
+const LINEAGE_DISSOLVED_TAG = 0x01;   // lineage_status_e LINEAGE_DISSOLVED
+const CRABS_SIG_SIZE = 64;
 
 async function main() {
   // Parent node: full admin of its own machine.
@@ -80,10 +82,100 @@ async function main() {
   const attestationWire = parent.attest(childId, 'alice', 'role:member');
   if (attestationWire.length === 0) throw new Error('attestation wire empty');
 
+  // ------------------------------------------------------------
+  // Dissolve through the OP PIPELINE: role:admin must resolve against a
+  // registered user (registerUser rejects privileged attrs, so the admin
+  // grantRole path is the honest route — mirrors test/smoke.js).
+  // ------------------------------------------------------------
+  const dissolverKey = await KeyPair.generate();
+  parent.registerUser('dissolver', dissolverKey.publicKeyHex(), 'adult');
+  parent.grantRole('dissolver', 'role', 'admin', 'parent-admin');
+
+  // The child is RESIDENT (spawned in this process), so __dissolve_machine__
+  // takes the in-process severance branch: it sets the child's
+  // lineage_parent_dissolved flag immediately (every @parent/ endorsement on
+  // the child fails closed from that moment) and drops the registry slot.
+  // The observable JS contract for that in-process severance is the registry:
+  // residentChild resolves before the op and must be null after it.
+  const dissolveOp = await Operation.create('__dissolve_machine__');
+  dissolveOp.signerId = 'dissolver';
+  dissolveOp.nodeId = 'dissolver';
+  dissolveOp.payload = new TextEncoder().encode(childId);  // NUL-excluded
+  parent.sign(dissolveOp, dissolverKey.privateKeyHex());
+  parent.execute(dissolveOp);
+  dissolveOp.destroy();
+
+  if (parent.lineageResidentChild(childId) !== null) {
+    throw new Error('in-process severance must clear the resident registry slot');
+  }
+  const dissolvedEntry = parent.childById(childId);
+  if (dissolvedEntry === null || dissolvedEntry.status !== 'dissolved') {
+    throw new Error(`manifest status after dissolve: ${JSON.stringify(dissolvedEntry)}`);
+  }
+  // The manifest entry the exported accessor resolves is DISSOLVED — the
+  // exact honesty-gate state the tombstone mint must pass.
+  const dissolvedIndex = parent.childIndex(childId);
+  if (dissolvedIndex < 0) throw new Error('dissolved child lost from manifest');
+
+  // Attest now refuses: the entry is no longer ACTIVE (honesty gate).
+  let postDissolveAttestRefused = false;
+  try {
+    parent.attest(childId, 'alice', 'role:member');
+  } catch (attestRefused) {
+    postDissolveAttestRefused =
+      attestRefused.message.includes('attest failed');
+  }
+  if (!postDissolveAttestRefused) {
+    throw new Error('attest must fail closed for a dissolved child');
+  }
+
+  // Minting a tombstone for a non-dissolved child is a lie — refused.
+  let tombstoneGateRefused = false;
+  try {
+    parent.lineageTombstone('not-spawned');
+  } catch (gateRefused) {
+    tombstoneGateRefused = gateRefused.message.includes('tombstone failed');
+  }
+  if (!tombstoneGateRefused) {
+    throw new Error('tombstone mint must fail closed for a non-dissolved child');
+  }
+
+  // ------------------------------------------------------------
+  // Tombstone mint: `u8 tag LINEAGE_DISSOLVED + string16 child_id` +
+  // 64-byte parent ECDSA — NO length prefix (the exact bytes a
+  // __receive_dissolution__ op transports). The trailing signature is
+  // structurally verified here (nonzero); verifying it against the parent's
+  // public key in wasm would need pub-key plumbing the smoke skips.
+  // ------------------------------------------------------------
+  const tombstone = parent.lineageTombstone(childId);
+  const expectedLength = 3 + childId.length + CRABS_SIG_SIZE;
+  if (tombstone.length !== expectedLength) {
+    throw new Error(`tombstone length ${tombstone.length} != ${expectedLength}`);
+  }
+  if (tombstone[0] !== LINEAGE_DISSOLVED_TAG) {
+    throw new Error(`tombstone tag ${tombstone[0]} != LINEAGE_DISSOLVED(${LINEAGE_DISSOLVED_TAG})`);
+  }
+  const idLengthPrefix = new DataView(tombstone.buffer, tombstone.byteOffset)
+                           .getUint16(1, true);
+  if (idLengthPrefix !== childId.length) {
+    throw new Error(`tombstone id length ${idLengthPrefix} != ${childId.length}`);
+  }
+  const tombstoneId = new TextDecoder().decode(tombstone.subarray(3, 3 + idLengthPrefix));
+  if (tombstoneId !== childId) {
+    throw new Error(`tombstone id "${tombstoneId}" != "${childId}"`);
+  }
+  if (tombstone
+        .subarray(3 + idLengthPrefix)
+        .some(signatureByteValue => signatureByteValue === 0)) {
+    throw new Error('tombstone signature carries a zero byte (not a real ECDSA)');
+  }
+
   console.log('SMOKE OK: children=' + count +
               ', entry=' + JSON.stringify(childEntry) +
               ', blueprint_bytes=' + wire.length +
-              ', attestation_bytes=' + attestationWire.length);
+              ', attestation_bytes=' + attestationWire.length +
+              ', dissolved_status=' + dissolvedEntry.status +
+              ', tombstone_bytes=' + tombstone.length);
 
   blueprint.destroy();
   reloaded.destroy();

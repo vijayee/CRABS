@@ -142,6 +142,7 @@ BASE_EXPORTS='[
   "_crabs_wasm_lineage_children_get_ttl_ms",
   "_crabs_wasm_lineage_children_get_spawned_at",
   "_crabs_wasm_lineage_attest",
+  "_crabs_wasm_lineage_tombstone",
   "_crabs_wasm_lineage_find_manifest_entry",
   "_crabs_wasm_register_lineage_ops"
 ]'

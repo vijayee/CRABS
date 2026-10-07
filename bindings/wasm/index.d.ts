@@ -217,6 +217,10 @@ export interface Node {
   children(): ChildManifestView[];
   /** Issue a parent-signed attestation; returns the transport wire bytes. */
   attest(childId: string, userId: string, attributes: string): Uint8Array;
+  /** Mint a dissolution tombstone for a DISSOLVED child: canonical body
+   *  (u8 tag + string16 childId) + 64-byte parent signature, NO length
+   *  prefix. Throws when the child is unknown or not dissolved. */
+  lineageTombstone(childId: string): Uint8Array;
 
   // The bootstrap admin id this node was created with — also the node's HLC
   // identity, which signing stamps into op->node_id (used by devtools

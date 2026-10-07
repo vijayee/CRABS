@@ -1004,6 +1004,33 @@ serialized_buffer_t* crabs_wasm_lineage_attest(attribute_machine_t* am,
   return buffer;
 }
 
+// Mint a dissolution tombstone for a DISSOLVED manifest child and return its
+// wire image (canonical body `u8 tag LINEAGE_DISSOLVED + string16 child_id` +
+// the 64-byte parent ECDSA signature, NO length prefix) as a
+// serialized_buffer_t. There is deliberately no JS-visible honesty precheck:
+// resolving the manifest entry and refusing anything but DISSOLVED is the C
+// gate inside lineage_dissolution_serialize, so a non-dissolved child simply
+// yields NULL (JS throws) exactly like the attest refusal does.
+EMSCRIPTEN_KEEPALIVE
+serialized_buffer_t* crabs_wasm_lineage_tombstone(attribute_machine_t* am,
+                                                 const char* child_id) {
+  if (am == NULL || child_id == NULL) {
+    return NULL;
+  }
+  serialized_buffer_t* buffer =
+      serialized_buffer_create(CRABS_DISSOLUTION_WIRE_MAX);
+  if (buffer == NULL) return NULL;
+  size_t written = 0;
+  if (lineage_dissolution_serialize(&am->base_state, child_id, buffer->data,
+                                    CRABS_DISSOLUTION_WIRE_MAX,
+                                    &written) != CRABS_SUCCESS) {
+    serialized_buffer_destroy(buffer);
+    return NULL;
+  }
+  buffer->len = written;
+  return buffer;
+}
+
 // Register the four lineage ops (__spawn_machine__ / __revoke_attestation__ /
 // __dissolve_machine__ / __withdraw_genesis__) + their default admin policies
 // on this machine. After this, JS submits those ops through the ordinary
