@@ -208,6 +208,10 @@ op_handler_fn  state_machine_find_handler(const state_t* state, const char* op_t
 operation_t*   operation_create(const char* type);
 void           operation_destroy(operation_t* op);
 bool           operation_is_builtin(const char* type);
+// Superset of operation_is_builtin that also covers the lineage op types
+// (handler-registered custom ops that must not be re-policyable by triggers
+// or re-definable by __define_operation_type__ — audit A10-M1).
+bool           operation_is_protected(const char* type);
 
 // Cross-system operation ordering (v1.6 Amd6 §10.2)
 // Compares two operations by their ordering system (Lamport or HLC).

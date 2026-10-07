@@ -220,6 +220,46 @@ TEST_F(TestTrigger, TestChangePolicyRejectsEmptyAndBuiltinTargets) {
   }
 }
 
+// Regression for audit A10-M1: lineage op types are handler-registered
+// custom ops, so the builtin-only guard in the trigger engine did not stop
+// a CHANGE_POLICY effect from rewriting them. The lineage lifecycle must
+// stay admin-gated: a CHANGE_POLICY trigger targeting a lineage op is
+// rejected and the "role:admin" policy installed by lineage_install
+// survives unchanged.
+TEST_F(TestTrigger, TestChangePolicyRejectsLineageTargets) {
+  lineage_install(state);
+  // Sanity: lineage_install registers the default admin-only policy.
+  const char* installed = state_find_policy(state, CRABS_LINEAGE_OP_SPAWN);
+  ASSERT_NE(installed, nullptr);
+  ASSERT_STREQ(installed, "role:admin");
+
+  data_item_t* views = data_item_create("views", DATA_TYPE_COUNTER, CRDT_G_COUNTER);
+  g_counter_t* gc = g_counter_create();
+  g_counter_increment(gc, "nodeA", 100);
+  views->value = gc;
+  state_add_item(state, views);
+
+  trigger_effect_t effect;
+  memset(&effect, 0, sizeof(effect));
+  effect.type = TRIGGER_EFFECT_CHANGE_POLICY;
+  strncpy(effect.policy_operation, CRABS_LINEAGE_OP_SPAWN, CRABS_MAX_OP_NAME - 1);
+  strncpy(effect.policy_expression, "role:member", CRABS_MAX_POLICY_EXPR - 1);
+
+  trigger_t* trigger = trigger_create("weaken_spawn", "Fires when views >= 50",
+    "views >= 50", &effect, 0, false, "admin");
+  ASSERT_NE(trigger, nullptr);
+  state->trigger_count = 1;
+  state->triggers = (trigger_t*)realloc(state->triggers, sizeof(trigger_t));
+  state->triggers[0] = *trigger;
+  free(trigger);
+
+  uint32_t fired = trigger_process_all(state, state->triggers, state->trigger_count, NULL, 1000);
+  EXPECT_EQ(fired, 0u); // rejected — lineage policy not changed
+  const char* policy = state_find_policy(state, CRABS_LINEAGE_OP_SPAWN);
+  ASSERT_NE(policy, nullptr);
+  EXPECT_STREQ(policy, "role:admin"); // surviving admin gate
+}
+
 TEST_F(TestTrigger, TestProcessTriggersConditionFalse) {
   // Add a counter item "views" with value 10
   data_item_t* views = data_item_create("views", DATA_TYPE_COUNTER, CRDT_G_COUNTER);

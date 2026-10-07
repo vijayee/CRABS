@@ -123,16 +123,16 @@ static crabs_error_e _execute_trigger_effect(state_t* state, trigger_t* trigger,
       //   (1) Never allow an empty policy_expression via a trigger — it
       //       removes attribute gating. Use a signed __change_config__-class
       //       op to set an empty policy if that is ever intended.
-      //   (2) Never allow a trigger to change the policy of a BUILTIN op
-      //       type. Triggers may only set policies for application-defined
-      //       (non-builtin) op types; builtin policies must be changed by a
-      //       direct signed operation, not a side effect of condition
-      //       evaluation.
+      //   (2) Never allow a trigger to change the policy of a PROTECTED op
+      //       type (builtin ∪ lineage — audit A10-M1). Triggers may only
+      //       set policies for application-defined op types; protected
+      //       policies must be changed by a direct signed operation, not a
+      //       side effect of condition evaluation.
       if (trigger->effect.policy_operation[0] == '\0') break;
       if (trigger->effect.policy_expression[0] == '\0') {
         return CRABS_ERR_INVALID_PARAM;
       }
-      if (operation_is_builtin(trigger->effect.policy_operation)) {
+      if (operation_is_protected(trigger->effect.policy_operation)) {
         return CRABS_ERR_UNAUTHORIZED;
       }
       // Audit fix (High): defense in depth for triggers that bypass

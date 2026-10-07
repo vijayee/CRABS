@@ -233,6 +233,20 @@ bool operation_is_builtin(const char* type) {
           strcmp(type, CRABS_OP_CANCEL_SCHEDULE) == 0);
 }
 
+// v1.7: lineage operations are handler-registered custom types, but the
+// lineage lifecycle must not be rewritable by triggers or re-definable by
+// __define_operation_type__ (audit A10-M1). Protected = builtin ∪ lineage.
+// Callers that depend on strict builtin/custom semantics (the step-7b
+// protocol-transition skip, the CLI) keep using operation_is_builtin.
+bool operation_is_protected(const char* type) {
+  if (operation_is_builtin(type)) return true;
+  return (strcmp(type, CRABS_LINEAGE_OP_SPAWN) == 0 ||
+          strcmp(type, CRABS_LINEAGE_OP_REVOKE_ATTESTATION) == 0 ||
+          strcmp(type, CRABS_LINEAGE_OP_DISSOLVE) == 0 ||
+          strcmp(type, CRABS_LINEAGE_OP_WITHDRAW_GENESIS) == 0 ||
+          strcmp(type, CRABS_LINEAGE_OP_RECEIVE_DISSOLUTION) == 0);
+}
+
 operation_t* operation_create(const char* type) {
   operation_t* op = get_clear_memory(sizeof(operation_t));
   strncpy(op->type, type, CRABS_MAX_OP_NAME - 1);
@@ -2182,11 +2196,12 @@ crabs_error_e state_machine_op_define_operation(state_t* state, operation_t* op)
   // The operation type name to define is carried in resources[0]
   if (op->resource_count == 0 || op->resources == NULL) return CRABS_ERR_INVALID_PARAM;
 
-  // Audit: built-in operation types have their own handlers and protocol
-  // transitions; a registered dedup spec on one would stack a signer-chosen
-  // guard/mutation on top of them. The define operation may only register
-  // specs for user-defined operation types.
-  if (operation_is_builtin(op->resources[0])) return CRABS_ERR_INVALID_PARAM;
+  // Audit: protected operation types (built-in ∪ lineage, A10-M1) have
+  // their own handlers and protocol transitions; a registered dedup spec on
+  // one would stack a signer-chosen guard/mutation on top of them. The
+  // define operation may only register specs for user-defined operation
+  // types.
+  if (operation_is_protected(op->resources[0])) return CRABS_ERR_INVALID_PARAM;
 
   crabs_error_e rc = state_register_op_type_def(state, op->resources[0], &op->dedup);
   if (rc != CRABS_SUCCESS) return rc;
