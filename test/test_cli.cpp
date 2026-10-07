@@ -3,10 +3,12 @@
 //
 
 #include <gtest/gtest.h>
+#include <sys/stat.h>
 #include <vector>
 extern "C" {
 #include "../src/CLI/cli.h"
 #include "../src/CRABS/data_model.h"
+#include "../src/Lineage/lineage.h"
 #include "../src/Serialization/serialization.h"
 #include "../src/CRDT/one_shot.h"
 #include <openssl/sha.h>
@@ -1270,4 +1272,191 @@ TEST(TestSerialization, SealedSignedBlobComposesSealAndSignature) {
   ASSERT_TRUE(reloaded->state_sig_pending);   // signature present + pending
   cli_node_destroy(reloaded);
   remove("/tmp/crabs-sealed-signed.crabs");
+}
+
+// ============================================================
+// Machine blueprint authoring (lineage surfaces)
+// ============================================================
+
+// The full draft → save → validate-file cycle through cli_dispatch: a machine
+// blueprint is built item by item on one node, persisted to a .cbp file, and
+// a SECOND node reads the file back and validates it.
+TEST(TestCliDurability, MachineBlueprintBuildCycle) {
+  cli_node_t* author = cli_node_create();
+  ASSERT_EQ(cli_node_init(author, "admin"), CLI_OK);
+
+  char* new_argv[] = {(char*)"crabs_node", (char*)"machine", (char*)"blueprint",
+                      (char*)"new", (char*)"child-red", (char*)"delegated",
+                      (char*)"child-admin", (char*)"3600000"};
+  ASSERT_EQ(cli_dispatch(author, 8, new_argv), CLI_OK);
+  ASSERT_NE(author->blueprint_draft, nullptr);
+  EXPECT_STREQ(author->blueprint_draft->child_id, "child-red");
+  EXPECT_EQ(author->blueprint_draft->trust_mode, LINEAGE_DELEGATED_COPY);
+  EXPECT_STREQ(author->blueprint_draft->bootstrap_admin, "child-admin");
+  EXPECT_EQ(author->blueprint_draft->attestation_ttl_ms, 3600000ull);
+  EXPECT_EQ(author->blueprint_draft->item_count, 0u);
+
+  char* item_argv[] = {(char*)"crabs_node", (char*)"machine", (char*)"blueprint",
+                       (char*)"item", (char*)"counter1", (char*)"counter",
+                       (char*)"g_counter"};
+  EXPECT_EQ(cli_dispatch(author, 7, item_argv), CLI_OK);
+  ASSERT_EQ(author->blueprint_draft->item_count, 1u);
+  EXPECT_STREQ(author->blueprint_draft->items[0].name, "counter1");
+  EXPECT_EQ(author->blueprint_draft->items[0].type, DATA_TYPE_COUNTER);
+  EXPECT_EQ(author->blueprint_draft->items[0].crdt_type, CRDT_G_COUNTER);
+
+  char* policy_argv[] = {(char*)"crabs_node", (char*)"machine", (char*)"blueprint",
+                         (char*)"policy", (char*)"render", (char*)"custody:child-red"};
+  EXPECT_EQ(cli_dispatch(author, 6, policy_argv), CLI_OK);
+  EXPECT_EQ(author->blueprint_draft->policy_count, 1u);
+  EXPECT_STREQ(author->blueprint_draft->policies[0].operation, "render");
+  EXPECT_STREQ(author->blueprint_draft->policies[0].expression, "custody:child-red");
+
+  char* dedup_argv[] = {(char*)"crabs_node", (char*)"machine", (char*)"blueprint",
+                        (char*)"dedup", (char*)"render", (char*)"per_user",
+                        (char*)"item.user_id"};
+  EXPECT_EQ(cli_dispatch(author, 7, dedup_argv), CLI_OK);
+  EXPECT_EQ(author->blueprint_draft->op_type_def_count, 1u);
+  EXPECT_STREQ(author->blueprint_draft->op_type_defs[0].op_type, "render");
+  EXPECT_EQ(author->blueprint_draft->op_type_defs[0].dedup.type, DEDUP_PER_USER);
+  EXPECT_STREQ(author->blueprint_draft->op_type_defs[0].dedup.tracker_path,
+               "item.user_id");
+
+  char* save_argv[] = {(char*)"crabs_node", (char*)"machine", (char*)"blueprint",
+                       (char*)"save", (char*)"/tmp/crabs-bp.cbp"};
+  EXPECT_EQ(cli_dispatch(author, 5, save_argv), CLI_OK);
+
+  // The saved image is a real blueprint wire file: length prefix + body + hash.
+  std::vector<uint8_t> image;
+  ASSERT_TRUE(test_read_file_bytes("/tmp/crabs-bp.cbp", image));
+  ASSERT_GE(image.size(), 28u);
+
+  // A SECOND node reads the file back through the validate command.
+  cli_node_t* reader = cli_node_create();
+  ASSERT_EQ(cli_node_init(reader, "admin"), CLI_OK);
+  char* validate_argv[] = {(char*)"crabs_node", (char*)"machine", (char*)"blueprint",
+                           (char*)"validate", (char*)"/tmp/crabs-bp.cbp"};
+  EXPECT_EQ(cli_dispatch(reader, 5, validate_argv), CLI_OK);
+
+  // The reader node holds no draft of its own after a file validation.
+  EXPECT_EQ(reader->blueprint_draft, nullptr);
+
+  cli_node_destroy(author);
+  cli_node_destroy(reader);
+  remove("/tmp/crabs-bp.cbp");
+}
+
+// The landed blueprint validator is the single gate: a malformed policy
+// expression (an endorsement token inside parens) is refused when the draft
+// is appended to, an unsalvageable child id is refused at SAVE time by
+// lineage_blueprint_validate, and an unknown mode word is an argument error.
+TEST(TestCliDurability, MachineBlueprintSaveRefusesMalformed) {
+  cli_node_t* node = cli_node_create();
+  ASSERT_EQ(cli_node_init(node, "admin"), CLI_OK);
+
+  // Endorsement token inside parens — the landed validator fails it at
+  // append time and the command surfaces the refusal; the draft stays intact
+  // (no malformed policy ever reaches it).
+  char* new_argv[] = {(char*)"crabs_node", (char*)"machine", (char*)"blueprint",
+                      (char*)"new", (char*)"child-red", (char*)"delegated",
+                      (char*)"child-admin", (char*)"3600000"};
+  ASSERT_EQ(cli_dispatch(node, 8, new_argv), CLI_OK);
+  char* bad_policy_argv[] = {(char*)"crabs_node", (char*)"machine",
+                             (char*)"blueprint", (char*)"policy", (char*)"render",
+                             (char*)"( @parent/role:x )"};
+  EXPECT_NE(cli_dispatch(node, 6, bad_policy_argv), CLI_OK);
+  ASSERT_NE(node->blueprint_draft, nullptr);
+  EXPECT_EQ(node->blueprint_draft->policy_count, 0u);
+
+  // An unsafe child id passes the permissive 'new' but save refuses to
+  // serialize an unvalidated draft: validation fails and NO file is written.
+  char* unsafe_argv[] = {(char*)"crabs_node", (char*)"machine", (char*)"blueprint",
+                         (char*)"new", (char*)"(bad)id", (char*)"delegated",
+                         (char*)"child-admin", (char*)"3600000"};
+  EXPECT_EQ(cli_dispatch(node, 8, unsafe_argv), CLI_OK);
+  char* save_argv[] = {(char*)"crabs_node", (char*)"machine", (char*)"blueprint",
+                       (char*)"save", (char*)"/tmp/crabs-bp-malformed.cbp"};
+  EXPECT_NE(cli_dispatch(node, 5, save_argv), CLI_OK);
+  struct stat malformed_stat;
+  EXPECT_NE(stat("/tmp/crabs-bp-malformed.cbp", &malformed_stat), 0);
+
+  // Unknown mode word is rejected outright and creates no draft.
+  char* bad_mode_argv[] = {(char*)"crabs_node", (char*)"machine", (char*)"blueprint",
+                           (char*)"new", (char*)"child-x", (char*)"feudal",
+                           (char*)"child-admin", (char*)"3600000"};
+  EXPECT_EQ(cli_dispatch(node, 8, bad_mode_argv), CLI_ERR_ARGS);
+  // The previous (unsafe-id) draft survives a failed parse — 'new' only
+  // replaces the draft on a VALID parse.
+  EXPECT_NE(node->blueprint_draft, nullptr);
+
+  cli_node_destroy(node);
+  remove("/tmp/crabs-bp-malformed.cbp");
+}
+
+// Validate refuses files that are not blueprint wire images (missing file is
+// an I/O error; garbage bytes fail the deserialize hash check).
+TEST(TestCliDurability, MachineBlueprintValidateRefusesGarbage) {
+  cli_node_t* node = cli_node_create();
+  ASSERT_EQ(cli_node_init(node, "admin"), CLI_OK);
+
+  char* missing_argv[] = {(char*)"crabs_node", (char*)"machine", (char*)"blueprint",
+                          (char*)"validate", (char*)"/tmp/crabs-no-such-bp.cbp"};
+  EXPECT_EQ(cli_dispatch(node, 5, missing_argv), CLI_ERR_IO);
+
+  ASSERT_TRUE(test_write_file_bytes("/tmp/crabs-bp-garbage.cbp",
+                                    {0x99, 0xEC, 0x00, 0x01, 0x22}));
+  char* validate_argv[] = {(char*)"crabs_node", (char*)"machine", (char*)"blueprint",
+                           (char*)"validate", (char*)"/tmp/crabs-bp-garbage.cbp"};
+  EXPECT_NE(cli_dispatch(node, 5, validate_argv), CLI_OK);
+
+  cli_node_destroy(node);
+  remove("/tmp/crabs-bp-garbage.cbp");
+}
+
+// Draft lifecycle: blueprint commands before 'new' are argument errors, a
+// re-'new' replaces the whole draft, and 'drop' discards it.
+TEST(TestCliDurability, MachineBlueprintDropAndReplace) {
+  cli_node_t* node = cli_node_create();
+  ASSERT_EQ(cli_node_init(node, "admin"), CLI_OK);
+
+  // No draft yet: appending is refused.
+  char* item_argv[] = {(char*)"crabs_node", (char*)"machine", (char*)"blueprint",
+                       (char*)"item", (char*)"counter1", (char*)"counter",
+                       (char*)"g_counter"};
+  EXPECT_EQ(cli_dispatch(node, 7, item_argv), CLI_ERR_ARGS);
+
+  char* new_argv[] = {(char*)"crabs_node", (char*)"machine", (char*)"blueprint",
+                      (char*)"new", (char*)"child-red", (char*)"shared",
+                      (char*)"", (char*)"3600000"};
+  char* replace_argv[] = {(char*)"crabs_node", (char*)"machine", (char*)"blueprint",
+                          (char*)"new", (char*)"child-blue", (char*)"sovereign",
+                          (char*)"child-admin", (char*)"1000"};
+  EXPECT_EQ(cli_dispatch(node, 8, new_argv), CLI_OK);
+  ASSERT_NE(node->blueprint_draft, nullptr);
+  EXPECT_EQ(node->blueprint_draft->trust_mode, LINEAGE_SHARED_ROOT);
+  char* new_item_argv[] = {(char*)"crabs_node", (char*)"machine", (char*)"blueprint",
+                           (char*)"item", (char*)"counter1", (char*)"counter",
+                           (char*)"g_counter"};
+  EXPECT_EQ(cli_dispatch(node, 7, new_item_argv), CLI_OK);
+  EXPECT_EQ(node->blueprint_draft->item_count, 1u);
+
+  // A fresh 'new' destroys the previous draft entirely (no stale items).
+  EXPECT_EQ(cli_dispatch(node, 8, replace_argv), CLI_OK);
+  ASSERT_NE(node->blueprint_draft, nullptr);
+  EXPECT_EQ(node->blueprint_draft->item_count, 0u);
+  EXPECT_EQ(node->blueprint_draft->trust_mode, LINEAGE_SOVEREIGN);
+
+  char* drop_argv[] = {(char*)"crabs_node", (char*)"machine", (char*)"blueprint",
+                       (char*)"drop"};
+  EXPECT_EQ(cli_dispatch(node, 4, drop_argv), CLI_OK);
+  EXPECT_EQ(node->blueprint_draft, nullptr);
+
+  cli_node_destroy(node);
+
+  // Unknown subcommand prints usage and errors.
+  cli_node_t* other = cli_node_create();
+  ASSERT_EQ(cli_node_init(other, "admin"), CLI_OK);
+  char* unknown_argv[] = {(char*)"crabs_node", (char*)"machine", (char*)"frobnicate"};
+  EXPECT_EQ(cli_dispatch(other, 3, unknown_argv), CLI_ERR_ARGS);
+  cli_node_destroy(other);
 }

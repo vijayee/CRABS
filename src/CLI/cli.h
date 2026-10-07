@@ -12,6 +12,7 @@
 #include "../Attribute/attribute_machine.h"
 #include "../StateMachine/state_machine.h"
 #include "../Crypto/crypto.h"
+#include "../Lineage/lineage.h"
 
 // ============================================================
 // CLI Result Codes
@@ -69,6 +70,10 @@ typedef struct {
   // 32 raw bytes imported from a keyfile; never serialized anywhere.
   uint8_t              seal_key[32];
   bool                 seal_key_valid;
+  // Lineage (v1.7): the node-resident machine blueprint draft — NULL until
+  // 'machine blueprint new' starts authoring, replaced by each later 'new',
+  // destroyed by 'machine blueprint drop' and by cli_node_destroy.
+  machine_blueprint_t* blueprint_draft;
 } cli_node_t;
 
 // Add (or replace) a per-user signing key the CLI can use to sign operations

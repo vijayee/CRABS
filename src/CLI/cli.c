@@ -106,8 +106,17 @@ cli_node_t* cli_node_create(void) {
   return node;
 }
 
+// Internal: release the node-resident machine blueprint draft (lineage v1.7).
+// A no-op when no draft is open; the pointer is always NULL afterwards.
+static void cli_node_blueprint_clear(cli_node_t* node) {
+  if (node == NULL || node->blueprint_draft == NULL) return;
+  machine_blueprint_destroy(node->blueprint_draft);
+  node->blueprint_draft = NULL;
+}
+
 void cli_node_destroy(cli_node_t* node) {
   if (node == NULL) return;
+  cli_node_blueprint_clear(node);
   if (node->state_sig_payload != NULL) {
     free(node->state_sig_payload);
     node->state_sig_payload = NULL;
@@ -1259,6 +1268,301 @@ cli_result_e cli_cmd_compact(cli_node_t* node) {
 }
 
 // ============================================================
+// Machine Blueprint Authoring (lineage v1.7)
+// ============================================================
+//
+// A machine blueprint is authored as a NODE-RESIDENT DRAFT: 'machine
+// blueprint new' opens it, item/policy/dedup append to it, 'save' runs the
+// landed validator plus the wire serializer and writes the .cbp file,
+// 'validate' reads a file back through the wire-format parser, and 'drop'
+// discards the draft. The draft carries NO machine state — it is the author's
+// scratch space; the landed validator (lineage_blueprint_validate) is the
+// single structural gate for every surface.
+
+// Map the CLI mode word to the enum (exact table; anything else is
+// caller-validated via the out-param before use).
+static lineage_trust_mode_e _parse_lineage_trust_mode(const char* word,
+                                                      bool* valid) {
+  if (strcmp(word, "shared") == 0) {
+    *valid = true;
+    return LINEAGE_SHARED_ROOT;
+  }
+  if (strcmp(word, "delegated") == 0) {
+    *valid = true;
+    return LINEAGE_DELEGATED_COPY;
+  }
+  if (strcmp(word, "sovereign") == 0) {
+    *valid = true;
+    return LINEAGE_SOVEREIGN;
+  }
+  *valid = false;
+  return LINEAGE_SHARED_ROOT;
+}
+
+static cli_result_e _machine_blueprint_cmd_new(
+    cli_node_t* node, const char* child_id, const char* mode_word,
+    const char* bootstrap_admin, const char* ttl_text) {
+  if (node == NULL || child_id == NULL || mode_word == NULL ||
+      bootstrap_admin == NULL || ttl_text == NULL) {
+    return CLI_ERR_ARGS;
+  }
+  bool mode_valid = false;
+  lineage_trust_mode_e trust_mode =
+      _parse_lineage_trust_mode(mode_word, &mode_valid);
+  if (!mode_valid) {
+    printf("Error: Invalid trust mode '%s'. Use shared|delegated|sovereign.\n",
+           mode_word);
+    return CLI_ERR_ARGS;
+  }
+  // Decimal-only TTL parse (leading '-' is rejected — strtoull would wrap it).
+  if (ttl_text[0] < '0' || ttl_text[0] > '9') {
+    printf("Error: attestation_ttl_ms must be a decimal integer.\n");
+    return CLI_ERR_ARGS;
+  }
+  char* ttl_end = NULL;
+  unsigned long long ttl_value = strtoull(ttl_text, &ttl_end, 10);
+  if (*ttl_end != '\0') {
+    printf("Error: attestation_ttl_ms must be a decimal integer.\n");
+    return CLI_ERR_ARGS;
+  }
+  // Fixed-capacity id fields: an overlong id would silently truncate to a
+  // DIFFERENT machine identity — refuse at the argument level instead.
+  if (strlen(child_id) >= CRABS_MAX_USER_ID ||
+      strlen(bootstrap_admin) >= CRABS_MAX_USER_ID) {
+    printf("Error: child_id and bootstrap_admin must be shorter than %d "
+           "characters.\n", CRABS_MAX_USER_ID);
+    return CLI_ERR_ARGS;
+  }
+
+  cli_node_blueprint_clear(node);
+  machine_blueprint_t* draft = machine_blueprint_create();
+  if (draft == NULL) return CLI_ERR_EXEC;
+  snprintf(draft->child_id, sizeof(draft->child_id), "%s", child_id);
+  draft->trust_mode = trust_mode;
+  snprintf(draft->bootstrap_admin, sizeof(draft->bootstrap_admin), "%s",
+           bootstrap_admin);
+  draft->attestation_ttl_ms = (uint64_t)ttl_value;
+  node->blueprint_draft = draft;
+
+  printf("Blueprint draft opened for '%s' (mode %s, admin %s, "
+         "attestation ttl %llu ms).\n",
+         draft->child_id, lineage_mode_name(trust_mode), bootstrap_admin,
+         (unsigned long long)ttl_value);
+  return CLI_OK;
+}
+
+static cli_result_e _machine_blueprint_require_draft(cli_node_t* node) {
+  if (node == NULL || !node->initialized) return CLI_ERR_NOT_INIT;
+  if (node->blueprint_draft == NULL) {
+    printf("Error: no blueprint draft open. Run 'machine blueprint new' "
+           "first.\n");
+    return CLI_ERR_ARGS;
+  }
+  return CLI_OK;
+}
+
+static cli_result_e _machine_blueprint_cmd_item(cli_node_t* node,
+                                                const char* name,
+                                                const char* data_type_word,
+                                                const char* crdt_type_word) {
+  cli_result_e draft_result = _machine_blueprint_require_draft(node);
+  if (draft_result != CLI_OK) return draft_result;
+  if (name == NULL || data_type_word == NULL || crdt_type_word == NULL) {
+    return CLI_ERR_ARGS;
+  }
+
+  // The same string→enum tables the 'item add' command uses (shared single
+  // source in this file).
+  data_type_e data_type = _parse_data_type(data_type_word);
+  crdt_type_e crdt_type = _parse_crdt_type(crdt_type_word);
+
+  crabs_error_e err = blueprint_add_item(node->blueprint_draft, name,
+                                         data_type, crdt_type);
+  if (err != CRABS_SUCCESS) {
+    printf("Error: %s\n", cli_error_string(err));
+    return CLI_ERR_EXEC;
+  }
+  printf("Blueprint item '%s' added (type 0x%02x, crdt 0x%02x).\n",
+         name, data_type, crdt_type);
+  return CLI_OK;
+}
+
+static cli_result_e _machine_blueprint_cmd_policy(cli_node_t* node,
+                                                  const char* operation,
+                                                  const char* expression) {
+  cli_result_e draft_result = _machine_blueprint_require_draft(node);
+  if (draft_result != CLI_OK) return draft_result;
+  if (operation == NULL || expression == NULL) return CLI_ERR_ARGS;
+
+  // blueprint_add_policy parses the expression with the landed validator
+  // immediately — a malformed authorization never reaches the draft.
+  crabs_error_e err = blueprint_add_policy(node->blueprint_draft, operation,
+                                           expression);
+  if (err != CRABS_SUCCESS) {
+    printf("Error: %s\n", cli_error_string(err));
+    return CLI_ERR_EXEC;
+  }
+  printf("Blueprint policy added: %s -> %s\n", operation, expression);
+  return CLI_OK;
+}
+
+// dedup_arg carries the dedup-type-specific extra (tracker_path for
+// PER_USER, flag_path for GLOBAL, condition for CUSTOM; rejected for NONE).
+static cli_result_e _machine_blueprint_cmd_dedup(
+    cli_node_t* node, const char* op_type, const char* dedup_word,
+    const char* dedup_arg, const char* rejection_message) {
+  cli_result_e draft_result = _machine_blueprint_require_draft(node);
+  if (draft_result != CLI_OK) return draft_result;
+  if (op_type == NULL || dedup_word == NULL) return CLI_ERR_ARGS;
+
+  bool dedup_valid = false;
+  dedup_type_e dedup_type = _parse_dedup_type(dedup_word, &dedup_valid);
+  if (!dedup_valid) {
+    printf("Error: Invalid dedup type '%s'. Use none|per_user|global|custom.\n",
+           dedup_word);
+    return CLI_ERR_ARGS;
+  }
+  if (dedup_type == DEDUP_PER_USER && dedup_arg == NULL) {
+    printf("Error: per_user dedup requires a tracker_path.\n");
+    return CLI_ERR_ARGS;
+  }
+  if (dedup_type == DEDUP_GLOBAL && dedup_arg == NULL) {
+    printf("Error: global dedup requires a flag_path.\n");
+    return CLI_ERR_ARGS;
+  }
+  if (dedup_type == DEDUP_CUSTOM && dedup_arg == NULL) {
+    printf("Error: custom dedup requires a condition expression.\n");
+    return CLI_ERR_ARGS;
+  }
+  if (dedup_type == DEDUP_NONE && dedup_arg != NULL) {
+    printf("Error: none dedup takes no tracker/flag/condition argument.\n");
+    return CLI_ERR_ARGS;
+  }
+
+  dedup_spec_t dedup;
+  memset(&dedup, 0, sizeof(dedup));
+  dedup.type = dedup_type;
+  if (dedup_type == DEDUP_PER_USER) {
+    strncpy(dedup.tracker_path, dedup_arg, sizeof(dedup.tracker_path) - 1);
+  } else if (dedup_type == DEDUP_GLOBAL) {
+    strncpy(dedup.flag_path, dedup_arg, sizeof(dedup.flag_path) - 1);
+  } else if (dedup_type == DEDUP_CUSTOM) {
+    strncpy(dedup.condition, dedup_arg, sizeof(dedup.condition) - 1);
+  }
+  if (rejection_message != NULL) {
+    strncpy(dedup.rejection_message, rejection_message,
+            sizeof(dedup.rejection_message) - 1);
+  }
+
+  crabs_error_e err = blueprint_add_op_type_def(node->blueprint_draft, op_type,
+                                                &dedup);
+  if (err != CRABS_SUCCESS) {
+    printf("Error: %s\n", cli_error_string(err));
+    return CLI_ERR_EXEC;
+  }
+  printf("Blueprint op type '%s' added (dedup %s).\n", op_type, dedup_word);
+  return CLI_OK;
+}
+
+static cli_result_e _machine_blueprint_cmd_save(cli_node_t* node,
+                                                const char* path) {
+  cli_result_e draft_result = _machine_blueprint_require_draft(node);
+  if (draft_result != CLI_OK) return draft_result;
+  if (path == NULL) return CLI_ERR_ARGS;
+
+  crabs_error_e err = lineage_blueprint_validate(node->blueprint_draft);
+  if (err != CRABS_SUCCESS) {
+    printf("Error: blueprint validation failed: %s\n", cli_error_string(err));
+    return CLI_ERR_EXEC;
+  }
+
+  // Binary write of the full wire image — the exact fread/fwrite pattern
+  // cli_node_save/load use.
+  uint8_t* image = get_memory(CRABS_BLUEPRINT_WIRE_MAX);
+  if (image == NULL) return CLI_ERR_EXEC;
+  size_t image_len = blueprint_serialize(node->blueprint_draft, image,
+                                         CRABS_BLUEPRINT_WIRE_MAX);
+  if (image_len == 0) {
+    free(image);
+    printf("Error: blueprint serialization failed.\n");
+    return CLI_ERR_EXEC;
+  }
+
+  FILE* blueprint_file = fopen(path, "wb");
+  if (blueprint_file == NULL) {
+    free(image);
+    return CLI_ERR_IO;
+  }
+  size_t written = fwrite(image, 1, image_len, blueprint_file);
+  fclose(blueprint_file);
+  free(image);
+  if (written != image_len) return CLI_ERR_IO;
+
+  printf("Blueprint for '%s' saved to %s (%zu bytes).\n",
+         node->blueprint_draft->child_id, path, image_len);
+  return CLI_OK;
+}
+
+// Read <file.cbp> fully into memory (cli_node_load's pattern; the fd is the
+// file's only owner — the caller frees).
+static uint8_t* _read_file_bytes(const char* path, size_t* out_len) {
+  FILE* blueprint_file = fopen(path, "rb");
+  if (blueprint_file == NULL) return NULL;
+  fseek(blueprint_file, 0, SEEK_END);
+  long file_size = ftell(blueprint_file);
+  fseek(blueprint_file, 0, SEEK_SET);
+  if (file_size <= 0) {
+    fclose(blueprint_file);
+    return NULL;
+  }
+  size_t file_len = (size_t)file_size;
+  uint8_t* data = get_memory(file_len);
+  if (data == NULL) {
+    fclose(blueprint_file);
+    return NULL;
+  }
+  if (fread(data, 1, file_len, blueprint_file) != file_len) {
+    free(data);
+    fclose(blueprint_file);
+    return NULL;
+  }
+  fclose(blueprint_file);
+  *out_len = file_len;
+  return data;
+}
+
+static cli_result_e _machine_blueprint_cmd_validate(cli_node_t* node,
+                                                    const char* path) {
+  if (node == NULL || !node->initialized) return CLI_ERR_NOT_INIT;
+  if (path == NULL) return CLI_ERR_ARGS;
+
+  size_t file_len = 0;
+  uint8_t* data = _read_file_bytes(path, &file_len);
+  if (data == NULL) return CLI_ERR_IO;
+
+  // The wire-format parser verifies the embedded blueprint hash — a tampered
+  // body can never pass — and applies the structural bounds.
+  machine_blueprint_t* blueprint = blueprint_deserialize(data, file_len);
+  free(data);
+  if (blueprint == NULL) {
+    printf("Error: %s is not a readable blueprint file.\n", path);
+    return CLI_ERR_EXEC;
+  }
+
+  crabs_error_e err = lineage_blueprint_validate(blueprint);
+  if (err != CRABS_SUCCESS) {
+    printf("Error: blueprint invalid: %s\n", cli_error_string(err));
+    machine_blueprint_destroy(blueprint);
+    return CLI_ERR_EXEC;
+  }
+  printf("Valid: %s (mode %s, %u items, %u policies)\n",
+         blueprint->child_id, lineage_mode_name(blueprint->trust_mode),
+         blueprint->item_count, blueprint->policy_count);
+  machine_blueprint_destroy(blueprint);
+  return CLI_OK;
+}
+
+// ============================================================
 // Command Dispatch
 // ============================================================
 
@@ -1335,6 +1639,18 @@ static void _print_op_usage(void) {
   printf("  compact                       Run compaction on all items\n");
 }
 
+static void _print_machine_usage(void) {
+  printf("  machine blueprint new <child_id> <shared|delegated|sovereign> <bootstrap_admin> <attestation_ttl_ms>\n");
+  printf("                                       Open a machine blueprint draft on this node\n");
+  printf("  machine blueprint item <name> <data_type> <crdt_type>  Append a data item to the draft\n");
+  printf("  machine blueprint policy <operation> <expression>      Append an authorization policy\n");
+  printf("  machine blueprint dedup <op_type> <dedup_type> [tracker_path|flag_path|condition] [rejection_message]\n");
+  printf("                                       Append an operation type definition\n");
+  printf("  machine blueprint save <file.cbp>    Validate and write the draft to a blueprint file\n");
+  printf("  machine blueprint validate <file.cbp>  Validate a saved blueprint file\n");
+  printf("  machine blueprint drop               Discard the current draft\n");
+}
+
 void cli_print_usage(const char* prog) {
   printf("CRABS - Cryptographic Resource Authorization & Binding System\n\n");
   printf("Usage: %s <command> [subcommand] [args]\n\n", prog);
@@ -1350,6 +1666,7 @@ void cli_print_usage(const char* prog) {
   _print_policy_usage();
   _print_key_usage();
   _print_op_usage();
+  _print_machine_usage();
   printf("  compact                 Run tombstone compaction on all items\n");
   printf("\n  help                     Show this help message\n");
 }
@@ -1442,6 +1759,7 @@ cli_result_e cli_dispatch(cli_node_t* node, int argc, char** argv) {
   if (strcmp(cmd, "state") != 0 && strcmp(cmd, "user") != 0 &&
       strcmp(cmd, "item") != 0 && strcmp(cmd, "policy") != 0 &&
       strcmp(cmd, "key") != 0 && strcmp(cmd, "op") != 0 &&
+      strcmp(cmd, "machine") != 0 &&
       strcmp(cmd, "seal-key") != 0 && strcmp(cmd, "load-sealed") != 0) {
     printf("Unknown command: %s\n", cmd);
     cli_print_usage(argv[0]);
@@ -1473,6 +1791,77 @@ cli_result_e cli_dispatch(cli_node_t* node, int argc, char** argv) {
     if (strcmp(sub, "migrate") == 0) return cli_cmd_machine_migrate(node);
     printf("Unknown state subcommand: %s\n", sub);
     _print_state_usage();
+    return CLI_ERR_ARGS;
+  }
+
+  if (strcmp(cmd, "machine") == 0) {
+    if (argc < 4 || strcmp(argv[2], "blueprint") != 0) {
+      if (argc >= 3 && strcmp(argv[2], "blueprint") != 0) {
+        printf("Unknown machine subcommand: %s\n", argv[2]);
+      }
+      _print_machine_usage();
+      return CLI_ERR_ARGS;
+    }
+    const char* sub = argv[3];
+    if (strcmp(sub, "new") == 0) {
+      if (argc < 8) {
+        printf("Usage: machine blueprint new <child_id> "
+               "<shared|delegated|sovereign> <bootstrap_admin> "
+               "<attestation_ttl_ms>\n");
+        return CLI_ERR_ARGS;
+      }
+      return _machine_blueprint_cmd_new(node, argv[4], argv[5], argv[6],
+                                        argv[7]);
+    }
+    if (strcmp(sub, "item") == 0) {
+      if (argc < 7) {
+        printf("Usage: machine blueprint item <name> <data_type> <crdt_type>\n");
+        return CLI_ERR_ARGS;
+      }
+      return _machine_blueprint_cmd_item(node, argv[4], argv[5], argv[6]);
+    }
+    if (strcmp(sub, "policy") == 0) {
+      if (argc < 6) {
+        printf("Usage: machine blueprint policy <operation> <expression>\n");
+        return CLI_ERR_ARGS;
+      }
+      return _machine_blueprint_cmd_policy(node, argv[4], argv[5]);
+    }
+    if (strcmp(sub, "dedup") == 0) {
+      if (argc < 6) {
+        printf("Usage: machine blueprint dedup <op_type> <dedup_type> "
+               "[tracker_path|flag_path|condition] [rejection_message]\n");
+        printf("  dedup_type: none|per_user|global|custom\n");
+        printf("  For per_user: ... dedup <op_type> per_user <tracker_path>\n");
+        printf("  For global:   ... dedup <op_type> global <flag_path>\n");
+        printf("  For custom:   ... dedup <op_type> custom <condition>\n");
+        printf("  For none:     ... dedup <op_type> none\n");
+        return CLI_ERR_ARGS;
+      }
+      return _machine_blueprint_cmd_dedup(node, argv[4], argv[5],
+                                          argc > 6 ? argv[6] : NULL,
+                                          argc > 7 ? argv[7] : NULL);
+    }
+    if (strcmp(sub, "save") == 0) {
+      if (argc < 5) {
+        printf("Usage: machine blueprint save <file.cbp>\n");
+        return CLI_ERR_ARGS;
+      }
+      return _machine_blueprint_cmd_save(node, argv[4]);
+    }
+    if (strcmp(sub, "validate") == 0) {
+      if (argc < 5) {
+        printf("Usage: machine blueprint validate <file.cbp>\n");
+        return CLI_ERR_ARGS;
+      }
+      return _machine_blueprint_cmd_validate(node, argv[4]);
+    }
+    if (strcmp(sub, "drop") == 0) {
+      cli_node_blueprint_clear(node);
+      return CLI_OK;
+    }
+    printf("Unknown machine blueprint subcommand: %s\n", sub);
+    _print_machine_usage();
     return CLI_ERR_ARGS;
   }
 
