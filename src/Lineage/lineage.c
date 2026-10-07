@@ -958,16 +958,6 @@ crabs_error_e lineage_blueprint_validate(const machine_blueprint_t* blueprint) {
 // the manifest entry — the only owned data — and never dereferences a
 // pointer slot that could dangle (a child destroyed by its owner out-of-band
 // without a dissolve).
-static child_manifest_entry_t* _lineage_find_manifest_entry(
-    state_t* parent, const char* child_id) {
-  for (uint32_t child_index = 0; child_index < parent->child_count;
-       child_index++) {
-    if (strcmp(parent->children[child_index].child_id, child_id) == 0) {
-      return &parent->children[child_index];
-    }
-  }
-  return NULL;
-}
 
 static attribute_machine_t* _lineage_find_resident_child(
     state_t* parent, const char* child_id) {
@@ -1329,7 +1319,7 @@ crabs_error_e lineage_op_revoke_attestation(state_t* state, operation_t* op) {
   if (state == NULL) return CRABS_ERR_INVALID_PARAM;
 
   child_manifest_entry_t* manifest_entry =
-      _lineage_find_manifest_entry(state, child_id);
+      lineage_find_manifest_entry(state, child_id);
   if (manifest_entry == NULL) return CRABS_ERR_RESOURCE_NOT_FOUND;
   if (manifest_entry->status == LINEAGE_ATTESTATION_REVOKED) {
     return CRABS_ERR_ALREADY_PERFORMED;
@@ -1353,7 +1343,7 @@ crabs_error_e lineage_op_dissolve(state_t* state, operation_t* op) {
   if (state == NULL) return CRABS_ERR_INVALID_PARAM;
 
   child_manifest_entry_t* manifest_entry =
-      _lineage_find_manifest_entry(state, child_id);
+      lineage_find_manifest_entry(state, child_id);
   if (manifest_entry == NULL) return CRABS_ERR_RESOURCE_NOT_FOUND;
   if (manifest_entry->status == LINEAGE_DISSOLVED) {
     return CRABS_ERR_ALREADY_PERFORMED;
@@ -1388,7 +1378,7 @@ crabs_error_e lineage_op_withdraw_genesis(state_t* state, operation_t* op) {
   if (state == NULL) return CRABS_ERR_INVALID_PARAM;
 
   child_manifest_entry_t* manifest_entry =
-      _lineage_find_manifest_entry(state, child_id);
+      lineage_find_manifest_entry(state, child_id);
   if (manifest_entry == NULL) return CRABS_ERR_RESOURCE_NOT_FOUND;
   // Sovereign ONLY: the genesis stake recoverable by withdrawal exists only
   // where the child self-mints (LINEAGE_SOVEREIGN). Non-sovereign children
@@ -1456,7 +1446,7 @@ crabs_error_e lineage_sign_dissolution(state_t* parent, const char* child_id,
     return CRABS_ERR_INVALID_PARAM;
   }
   const child_manifest_entry_t* manifest_entry =
-      _lineage_find_manifest_entry(parent, child_id);
+      lineage_find_manifest_entry(parent, child_id);
   if (manifest_entry == NULL) return CRABS_ERR_RESOURCE_NOT_FOUND;
   // Honesty gate: a tombstone proves a dissolution — never sign one for a
   // child that is not dissolved.
@@ -1488,7 +1478,7 @@ crabs_error_e crabs_issue_attestation(state_t* parent,
                                       uint64_t now_ms) {
   if (parent == NULL || attestation_out == NULL) return CRABS_ERR_INVALID_PARAM;
   const child_manifest_entry_t* manifest_entry =
-      _lineage_find_manifest_entry(parent, child_id);
+      lineage_find_manifest_entry(parent, child_id);
   if (manifest_entry == NULL) return CRABS_ERR_RESOURCE_NOT_FOUND;
   // Only an ACTIVE child carries live attestation authority — a revoked,
   // dissolved, or withdrawn lineage stops issuing (existing attestations
