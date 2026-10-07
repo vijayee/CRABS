@@ -220,10 +220,14 @@ int            crabs_operation_compare(const operation_t* a, const operation_t* 
 // Otherwise falls back to wall-clock millisecond comparison using now_ms.
 bool           state_machine_lock_expired(state_t* state, const lock_state_t* lock, uint64_t now_ms);
 
-// Current time in ms from the state's authenticated HLC time source
-// (system-clock fallback when no source is configured, R7-01). Machines
-// never read the wall clock directly — lineage spawn stamps the manifest's
-// spawned_at from the parent's authenticated time through this helper.
+// Current time in ms from the state's HLC time source. The default
+// SYSTEM_CLOCK source backs reads with the UNAUTHENTICATED platform clock
+// (R8-H-1); every other source requires attached ops and fails closed —
+// returns false — when it reports no valid time. Callers that treat time as
+// an authorization input (attestation windows, expiry) must run on an
+// authenticated source; on a false return they treat time as unavailable
+// rather than reading the wall clock themselves. Lineage spawn stamps the
+// manifest's spawned_at through this helper (0 when unavailable).
 bool           state_get_time_ms(const state_t* state, uint64_t* now_ms);
 
 // Misc

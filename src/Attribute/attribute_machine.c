@@ -409,6 +409,11 @@ void attribute_machine_destroy(attribute_machine_t* am) {
   // state_destroy's teardown so independently owned machines (this path)
   // release it too.
   if (am->base_state.children != NULL) free(am->base_state.children);
+  // Lineage resident-child registry: runtime-only UNOWNED views (each child
+  // is owned by whoever spawned/holds it) — free the pointer array only.
+  if (am->base_state.resident_children != NULL) {
+    free(am->base_state.resident_children);
+  }
   if (am->base_state.tx_manager != NULL) {
     crabs_tx_manager_t* tx = (crabs_tx_manager_t*)am->base_state.tx_manager;
     if (tx->vtable.destroy != NULL) tx->vtable.destroy(tx);

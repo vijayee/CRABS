@@ -513,11 +513,14 @@ op_handler_fn state_machine_find_handler(const state_t* state, const char* op_ty
 // Main Execution Algorithm (§7.4)
 // ============================================================
 
-// R7-01: get the current physical time in ms from the state's HLC time source.
-// Returns false when no authenticated time is available (fail-closed for
-// expiry decisions). When no time source is configured, falls back to the
-// system clock (backward compatible). Public since v1.7 — lineage spawn
-// stamps the manifest's spawned_at from the parent's authenticated time.
+// R7-01: get the current physical time in ms from the state's HLC time
+// source. The default SYSTEM_CLOCK source backs reads with the
+// UNAUTHENTICATED platform clock (R8-H-1, crabs_hlc_get_physical_time);
+// every other source requires attached ops and fails closed — returns
+// false — when it reports no valid time. Public since v1.7 — lineage spawn
+// stamps the manifest's spawned_at from the parent's time source (0 when
+// unavailable; spawn consumers needing authentication must configure an
+// authenticated source).
 bool state_get_time_ms(const state_t* state, uint64_t* now_ms) {
   if (state == NULL || now_ms == NULL) return false;
   crabs_physical_time_t phys = crabs_hlc_get_physical_time(&((state_t*)state)->hlc_state);
@@ -684,6 +687,14 @@ static crabs_error_e _verify_parent_endorsements(
           &op->attestations[attestation_index];
       if (!attestation_verify(state->lineage_parent_public_key,
                               state->lineage_self_id, attestation, now_ms)) {
+        continue;
+      }
+      // Identity anchor: the attestation must name THIS machine's bound
+      // parent. The signature check verifies the attestation against the
+      // stored parent key but cannot see WHO the attestation names — a
+      // different parent's attestation (validly signed by its own key that
+      // happens to be bound here) must not satisfy an endorsement.
+      if (strcmp(attestation->parent_id, state->lineage_parent_id) != 0) {
         continue;
       }
       if (strcmp(attestation->user_id, resolved_signer) != 0) {

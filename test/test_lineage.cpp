@@ -880,9 +880,8 @@ TEST(TestLineage, SpawnSharedRootSharesParentAuthority) {
                    harness.parent_key->public_key, 33), 0);
 
   // Manifest entry appended: child_id, mode, ACTIVE, ttl, spawned_at.
-  state_t* parent_state = parent;
-  ASSERT_EQ(parent_state->child_count, 1u);
-  const child_manifest_entry_t* manifest_entry = &parent_state->children[0];
+  ASSERT_EQ(parent->child_count, 1u);
+  const child_manifest_entry_t* manifest_entry = &parent->children[0];
   EXPECT_STREQ(manifest_entry->child_id, "child-red");
   EXPECT_EQ(manifest_entry->mode, LINEAGE_SHARED_ROOT);
   EXPECT_EQ(manifest_entry->status, LINEAGE_ACTIVE);
