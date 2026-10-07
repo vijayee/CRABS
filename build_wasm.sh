@@ -125,7 +125,25 @@ BASE_EXPORTS='[
   "_crabs_wasm_schedule_end_at",
   "_crabs_time_source_https_create",
   "_crabs_time_source_https_create_with_transport",
-  "_crabs_time_source_destroy"
+  "_crabs_time_source_destroy",
+  "_crabs_wasm_lineage_blueprint_new",
+  "_crabs_wasm_lineage_blueprint_destroy",
+  "_crabs_wasm_lineage_blueprint_add_item",
+  "_crabs_wasm_lineage_blueprint_add_policy",
+  "_crabs_wasm_lineage_blueprint_stamp_hash",
+  "_crabs_wasm_lineage_blueprint_serialize",
+  "_crabs_wasm_lineage_blueprint_deserialize",
+  "_crabs_wasm_lineage_spawn",
+  "_crabs_wasm_lineage_query_resident_child",
+  "_crabs_wasm_lineage_children_count",
+  "_crabs_wasm_lineage_children_get_id",
+  "_crabs_wasm_lineage_children_get_mode",
+  "_crabs_wasm_lineage_children_get_status",
+  "_crabs_wasm_lineage_children_get_ttl_ms",
+  "_crabs_wasm_lineage_children_get_spawned_at",
+  "_crabs_wasm_lineage_attest",
+  "_crabs_wasm_lineage_find_manifest_entry",
+  "_crabs_wasm_register_lineage_ops"
 ]'
 
 DEVTOOLS_EXPORTS='[

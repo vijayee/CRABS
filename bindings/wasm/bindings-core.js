@@ -302,6 +302,119 @@ class Operation {
 }
 
 // ============================================================
+// Lineage (v1.7: machines mint machines)
+// ============================================================
+
+// Trust modes for spawned child machines (lineage_trust_mode_e wire values):
+//   SHARED_ROOT    — the child resolves attributes against the PARENT's
+//                    authority (shared registry + live MSK pointer).
+//   DELEGATED_COPY — the child mints a fresh CP-ABE authority; the parent
+//                    attests attributes across the domain bridge.
+//   SOVEREIGN      — identical construction to DELEGATED_COPY, but the
+//                    parent may only WITHDRAW its genesis stake (never
+//                    dissolve).
+const TRUST_MODE = {
+  SHARED_ROOT: 0x01,
+  DELEGATED_COPY: 0x02,
+  SOVEREIGN: 0x03,
+};
+
+// Data item / CRDT strategy numbers used by Blueprint.addItem — the subset
+// the v1.7 blueprint surface covers (crabs.h's full enums accept any value).
+const DATA_TYPE = {
+  COUNTER: 0x01, PN_COUNTER: 0x02, SET: 0x03, REGISTER: 0x05,
+  ONE_SHOT_SET: 0x08, ONE_SHOT_FLAG: 0x09,
+};
+const CRDT_TYPE = {
+  G_COUNTER: 0x01, PN_COUNTER: 0x02, OR_SET: 0x03, LWW_REG: 0x05,
+  ONE_SHOT_SET: 0x08, ONE_SHOT_FLAG: 0x09,
+};
+
+// JS wrapper over the C machine_blueprint_t. JS OWNS the blueprint: it must
+// be released with destroy(). The MACHINE the blueprint spawns is different —
+// C keeps child machines in the parent's resident-children registry (see
+// Node.lineageSpawn) and JS only ever borrows those pointers.
+class Blueprint {
+  constructor(M, ptr) {
+    this._M = M;
+    this._ptr = ptr;
+  }
+
+  // Build a fresh blueprint. trustMode is a TRUST_MODE value; ttlMs bounds
+  // every attestation the parent issues for this child later.
+  static async create(childId, trustMode, bootstrapAdmin, ttlMs) {
+    const M = await getModule();
+    const childIdPtr = writeString(M, childId);
+    const adminPtr = writeString(M, bootstrapAdmin);
+    const ptr = M._crabs_wasm_lineage_blueprint_new(
+        0, childIdPtr, trustMode, adminPtr, BigInt(ttlMs));
+    freeAll(M, childIdPtr, adminPtr);
+    if (!ptr) throw new Error('Blueprint.create failed');
+    return new Blueprint(M, ptr);
+  }
+
+  // Parse a blueprint wire image (as produced by serialize). Verifies the
+  // embedded blueprint hash — a tampered body can never deserialize.
+  static async deserialize(bytes) {
+    const M = await getModule();
+    const { ptr, len } = writeBytes(M, bytes);
+    const bpPtr = M._crabs_wasm_lineage_blueprint_deserialize(ptr, len);
+    if (ptr) M._free(ptr);
+    if (!bpPtr) throw new Error('Blueprint.deserialize failed');
+    return new Blueprint(M, bpPtr);
+  }
+
+  // Append a replicated data item to the child's definition.
+  addItem(name, dataType, crdtType) {
+    const M = this._M;
+    const namePtr = writeString(M, name);
+    const rc = M._crabs_wasm_lineage_blueprint_add_item(
+        this._ptr, namePtr, dataType, crdtType);
+    if (namePtr) M._free(namePtr);
+    wrapRc(rc, 'blueprint.addItem');
+  }
+
+  // Append an authorization policy: operation type + condition expression.
+  addPolicy(operation, expression) {
+    const M = this._M;
+    const opPtr = writeString(M, operation);
+    const exprPtr = writeString(M, expression);
+    const rc = M._crabs_wasm_lineage_blueprint_add_policy(
+        this._ptr, opPtr, exprPtr);
+    freeAll(M, opPtr, exprPtr);
+    wrapRc(rc, 'blueprint.addPolicy');
+  }
+
+  // Recompute the blueprint's SHA-256 over its canonical body. Called before
+  // signing hand-built blueprints; serialize() stamps it automatically.
+  stampHash() {
+    wrapRc(this._M._crabs_wasm_lineage_blueprint_stamp_hash(this._ptr),
+        'blueprint.stampHash');
+  }
+
+  // Wire image (u32le total length + canonical body + 32-byte blueprint
+  // hash). This is exactly the payload an ops-pipeline __spawn_machine__ op
+  // carries, so blueprints can be shipped between processes.
+  serialize() {
+    const M = this._M;
+    const ser = M._crabs_wasm_lineage_blueprint_serialize(this._ptr);
+    if (!ser) throw new Error('blueprint.serialize failed');
+    const len = M._crabs_wasm_buffer_len(ser);
+    const data = M._crabs_wasm_buffer_data(ser);
+    const out = new Uint8Array(M.HEAPU8.subarray(data, data + len));
+    M._crabs_wasm_buffer_destroy(ser);
+    return out;
+  }
+
+  destroy() {
+    if (this._ptr) {
+      this._M._crabs_wasm_lineage_blueprint_destroy(this._ptr);
+      this._ptr = null;
+    }
+  }
+}
+
+// ============================================================
 // Node
 // ============================================================
 
@@ -861,6 +974,107 @@ class Node {
     return 0;
   }
 
+  // ============================================================
+  // Lineage (v1.7): machines mint machines
+  // ============================================================
+
+  // Registers the four lineage ops (__spawn_machine__ / __revoke_attestation__
+  // / __dissolve_machine__ / __withdraw_genesis__) plus their default
+  // role:admin policies on this node, so those ops can be submitted through
+  // the ordinary execute() path (an __spawn_machine__ op carries a
+  // Blueprint.serialize() payload). Idempotent in C.
+  lineageInstall() {
+    this._M._crabs_wasm_register_lineage_ops(this._am);
+  }
+
+  // Instantiates a child machine from the blueprint and appends it to this
+  // node's child manifest. Returns the opaque pointer of the child machine.
+  // JS NEVER owns that pointer: the parent's resident-children registry in C
+  // anchors the child's lifetime, and the returned point of reference must be
+  // re-resolved through lineageResidentChild rather than stashed (a dissolve
+  // clears the registry slot while the manifest entry remains for history).
+  lineageSpawn(blueprint) {
+    const childPtr = this._M._crabs_wasm_lineage_spawn(this._am, blueprint._ptr);
+    if (!childPtr) throw new Error('lineageSpawn failed');
+    return childPtr;
+  }
+
+  // Borrowed pointer of the child still resident in this process (spawned
+  // here and not dissolved), or null.
+  lineageResidentChild(childId) {
+    const M = this._M;
+    const idPtr = writeString(M, childId);
+    const childPtr = M._crabs_wasm_lineage_query_resident_child(this._am, idPtr);
+    if (idPtr) M._free(idPtr);
+    return childPtr ? childPtr : null;
+  }
+
+  childCount() {
+    return this._M._crabs_wasm_lineage_children_count(this._am);
+  }
+
+  // Manifest index of childId, or -1 when the child is not manifested.
+  childIndex(childId) {
+    const M = this._M;
+    const idPtr = writeString(M, childId);
+    const index = M._crabs_wasm_lineage_find_manifest_entry(this._am, idPtr);
+    if (idPtr) M._free(idPtr);
+    return index;
+  }
+
+  // Flat view of the manifest entry at `index` — id/mode/status/ttlMs/
+  // spawnedAt are the only fields the manifest renders to JS. Modes and
+  // statuses arrive as human names ("delegated_copy", "active", ...).
+  childAt(index) {
+    const M = this._M;
+    if (index < 0 || index >= this.childCount()) return null;
+    const idPtr = M._crabs_wasm_lineage_children_get_id(this._am, index);
+    if (!idPtr) return null;
+    const childId = readString(M, idPtr);
+    return {
+      childId,
+      mode: readString(M, M._crabs_wasm_lineage_children_get_mode(this._am, index)),
+      status: readString(M, M._crabs_wasm_lineage_children_get_status(this._am, index)),
+      ttlMs: Number(M._crabs_wasm_lineage_children_get_ttl_ms(this._am, index)),
+      spawnedAt: Number(M._crabs_wasm_lineage_children_get_spawned_at(this._am, index)),
+    };
+  }
+
+  childById(childId) {
+    const index = this.childIndex(childId);
+    return index < 0 ? null : this.childAt(index);
+  }
+
+  // Snapshot of the whole child manifest.
+  children() {
+    const count = this.childCount();
+    const children = [];
+    for (let childIndex = 0; childIndex < count; childIndex++) {
+      children.push(this.childAt(childIndex));
+    }
+    return children;
+  }
+
+  // Issues a parent-signed attestation for an ACTIVE manifest child: the
+  // parent vouches for `attributes` (comma-separated name:value pairs) of
+  // `userId` in the child's domain, bounded by the child's attestation TTL.
+  // Returns the attestation wire bytes (u32le total length + canonical body +
+  // 64-byte parent signature) ready for transport to the child.
+  attest(childId, userId, attributes) {
+    const M = this._M;
+    const idPtr = writeString(M, childId);
+    const userPtr = writeString(M, userId);
+    const attrsPtr = writeString(M, attributes);
+    const ser = M._crabs_wasm_lineage_attest(this._am, idPtr, userPtr, attrsPtr);
+    freeAll(M, idPtr, userPtr, attrsPtr);
+    if (!ser) throw new Error('lineage attest failed (unknown or non-active child)');
+    const len = M._crabs_wasm_buffer_len(ser);
+    const data = M._crabs_wasm_buffer_data(ser);
+    const out = new Uint8Array(M.HEAPU8.subarray(data, data + len));
+    M._crabs_wasm_buffer_destroy(ser);
+    return out;
+  }
+
   destroy() {
     if (this._am) { this._M._crabs_wasm_node_destroy(this._am); this._am = null; }
   }
@@ -870,7 +1084,7 @@ class Node {
 // Module exports
 // ============================================================
 
-  return { Node, KeyPair, Operation, getModule };
+  return { Node, KeyPair, Operation, Blueprint, TRUST_MODE, DATA_TYPE, CRDT_TYPE, getModule };
 }
 
 // UMD: CommonJS for Node/bundlers; window.CRABSWasmCore for plain <script>

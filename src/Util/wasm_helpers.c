@@ -22,6 +22,7 @@
 #include "../CRDT/crdt_merge.h"
 #include "../CRDT/one_shot.h"
 #include "../Scheduler/scheduler.h"
+#include "../Lineage/lineage.h"
 
 #ifdef CRABS_ENABLE_DEVTOOLS
 #include "../Devtools/devtools.h"
@@ -774,6 +775,243 @@ uint64_t crabs_wasm_schedule_repeat_count(const scheduled_operation_t* entry) {
 EMSCRIPTEN_KEEPALIVE
 uint64_t crabs_wasm_schedule_end_at(const scheduled_operation_t* entry) {
   return entry ? entry->end_at_ms : 0;
+}
+
+// ============================================================
+// Lineage (v1.7: machines mint machines)
+// ============================================================
+// Blueprint authoring, spawn, child-manifest accessors, and attestation
+// issuance for the JS wrapper. Lineage is CORE data — none of the exports
+// below are devtools-gated and both wasm build variants carry them.
+//
+// Pointer ownership across the JS boundary:
+//   - machine_blueprint_t*       — owned by the JS Blueprint wrapper, which
+//                                  releases it via ..._blueprint_destroy.
+//   - attribute_machine_t*       — never owned by JS. Every spawned child
+//                                  stays in the PARENT's resident-children
+//                                  registry (lineage_spawn_machine registers
+//                                  it); the returned pointer is borrowed for
+//                                  immediate use and the registry is the
+//                                  lifetime anchor — re-resolve through
+//                                  crabs_wasm_lineage_query_resident_child
+//                                  instead of stashing pointers.
+//   - child manifest strings     — owned by the parent state; borrow within
+//                                  the call that obtained the index.
+//
+// Int-valued enums (trust mode, data type, CRDT strategy) are ints on the
+// wire to keep the JS side free of C enum tables; the same numeric values
+// the header comments document (e.g. LINEAGE_DELEGATED_COPY = 0x02) apply.
+
+EMSCRIPTEN_KEEPALIVE
+machine_blueprint_t* crabs_wasm_lineage_blueprint_new(
+    attribute_machine_t* am, const char* child_id, int trust_mode,
+    const char* bootstrap_admin, uint64_t attestation_ttl_ms) {
+  // `am` is accepted for call-site symmetry with the other lineage exports
+  // (spawn / attest), which do take the parent machine; blueprint authoring
+  // is a standalone object build and does not read the parent.
+  (void)am;
+  if (child_id == NULL || bootstrap_admin == NULL) return NULL;
+  machine_blueprint_t* blueprint = machine_blueprint_create();
+  if (blueprint == NULL) return NULL;
+  strncpy(blueprint->child_id, child_id, CRABS_MAX_USER_ID - 1);
+  blueprint->child_id[CRABS_MAX_USER_ID - 1] = '\0';
+  blueprint->trust_mode = (lineage_trust_mode_e)trust_mode;
+  strncpy(blueprint->bootstrap_admin, bootstrap_admin, CRABS_MAX_USER_ID - 1);
+  blueprint->bootstrap_admin[CRABS_MAX_USER_ID - 1] = '\0';
+  blueprint->attestation_ttl_ms = attestation_ttl_ms;
+  return blueprint;
+}
+
+EMSCRIPTEN_KEEPALIVE
+void crabs_wasm_lineage_blueprint_destroy(machine_blueprint_t* blueprint) {
+  if (blueprint) machine_blueprint_destroy(blueprint);
+}
+
+EMSCRIPTEN_KEEPALIVE
+crabs_error_e crabs_wasm_lineage_blueprint_add_item(
+    machine_blueprint_t* blueprint, const char* name, int data_type,
+    int crdt_type) {
+  if (!blueprint || !name) return CRABS_ERR_INVALID_PARAM;
+  return blueprint_add_item(blueprint, name, (data_type_e)data_type,
+                            (crdt_type_e)crdt_type);
+}
+
+EMSCRIPTEN_KEEPALIVE
+crabs_error_e crabs_wasm_lineage_blueprint_add_policy(
+    machine_blueprint_t* blueprint, const char* operation,
+    const char* expression) {
+  if (!blueprint || !operation || !expression) return CRABS_ERR_INVALID_PARAM;
+  return blueprint_add_policy(blueprint, operation, expression);
+}
+
+EMSCRIPTEN_KEEPALIVE
+crabs_error_e crabs_wasm_lineage_blueprint_stamp_hash(
+    machine_blueprint_t* blueprint) {
+  if (!blueprint) return CRABS_ERR_INVALID_PARAM;
+  return machine_blueprint_stamp_hash(blueprint);
+}
+
+EMSCRIPTEN_KEEPALIVE
+serialized_buffer_t* crabs_wasm_lineage_blueprint_serialize(
+    machine_blueprint_t* blueprint) {
+  if (!blueprint) return NULL;
+  serialized_buffer_t* buffer = serialized_buffer_create(CRABS_BLUEPRINT_WIRE_MAX);
+  if (buffer == NULL) return NULL;
+  size_t written = blueprint_serialize(blueprint, buffer->data,
+                                       CRABS_BLUEPRINT_WIRE_MAX);
+  if (written == 0) {
+    serialized_buffer_destroy(buffer);
+    return NULL;
+  }
+  buffer->len = written;
+  return buffer;
+}
+
+EMSCRIPTEN_KEEPALIVE
+machine_blueprint_t* crabs_wasm_lineage_blueprint_deserialize(
+    const uint8_t* data, uint32_t len) {
+  if (data == NULL || len == 0) return NULL;
+  return blueprint_deserialize(data, (size_t)len);
+}
+
+EMSCRIPTEN_KEEPALIVE
+attribute_machine_t* crabs_wasm_lineage_spawn(attribute_machine_t* am,
+                                             machine_blueprint_t* blueprint) {
+  if (am == NULL || blueprint == NULL) return NULL;
+  attribute_machine_t* child = NULL;
+  if (lineage_spawn_machine(&am->base_state, blueprint, &child) !=
+      CRABS_SUCCESS) {
+    return NULL;
+  }
+  // Child ownership stays in the parent's resident-children registry (the
+  // lifetime anchor); JS borrows the pointer from the registry via
+  // crabs_wasm_lineage_query_resident_child instead of stashing it.
+  return child;
+}
+
+EMSCRIPTEN_KEEPALIVE
+attribute_machine_t* crabs_wasm_lineage_query_resident_child(
+    attribute_machine_t* am, const char* child_id) {
+  if (am == NULL || child_id == NULL) return NULL;
+  return lineage_query_resident_child(&am->base_state, child_id);
+}
+
+// Borrowed entry accessor for the flat index accessors below. Returns the
+// manifest entry at `index`, or NULL when the index is out of range.
+static const child_manifest_entry_t* _lineage_children_at(
+    attribute_machine_t* am, uint32_t index) {
+  if (am == NULL) return NULL;
+  const child_manifest_entry_t* entries = NULL;
+  const uint32_t count = lineage_query_children(&am->base_state, &entries);
+  if (entries == NULL || index >= count) return NULL;
+  return &entries[index];
+}
+
+EMSCRIPTEN_KEEPALIVE
+uint32_t crabs_wasm_lineage_children_count(attribute_machine_t* am) {
+  if (am == NULL) return 0;
+  const child_manifest_entry_t* entries = NULL;
+  return lineage_query_children(&am->base_state, &entries);
+}
+
+EMSCRIPTEN_KEEPALIVE
+const char* crabs_wasm_lineage_children_get_id(attribute_machine_t* am,
+                                              uint32_t index) {
+  const child_manifest_entry_t* entry = _lineage_children_at(am, index);
+  return entry ? entry->child_id : NULL;
+}
+
+// Mode / status are rendered through lineage_mode_name / lineage_status_name
+// (the single human-name source shared with the CLI and devtools); values
+// outside the enums render as "unknown".
+
+EMSCRIPTEN_KEEPALIVE
+const char* crabs_wasm_lineage_children_get_mode(attribute_machine_t* am,
+                                                uint32_t index) {
+  const child_manifest_entry_t* entry = _lineage_children_at(am, index);
+  return entry ? lineage_mode_name(entry->mode) : NULL;
+}
+
+EMSCRIPTEN_KEEPALIVE
+const char* crabs_wasm_lineage_children_get_status(attribute_machine_t* am,
+                                                  uint32_t index) {
+  const child_manifest_entry_t* entry = _lineage_children_at(am, index);
+  return entry ? lineage_status_name(entry->status) : NULL;
+}
+
+EMSCRIPTEN_KEEPALIVE
+uint64_t crabs_wasm_lineage_children_get_ttl_ms(attribute_machine_t* am,
+                                               uint32_t index) {
+  const child_manifest_entry_t* entry = _lineage_children_at(am, index);
+  return entry ? entry->attestation_ttl_ms : 0;
+}
+
+EMSCRIPTEN_KEEPALIVE
+uint64_t crabs_wasm_lineage_children_get_spawned_at(attribute_machine_t* am,
+                                                   uint32_t index) {
+  const child_manifest_entry_t* entry = _lineage_children_at(am, index);
+  return entry ? entry->spawned_at : 0;
+}
+
+EMSCRIPTEN_KEEPALIVE
+int32_t crabs_wasm_lineage_find_manifest_entry(attribute_machine_t* am,
+                                              const char* child_id) {
+  if (am == NULL || child_id == NULL) return -1;
+  const child_manifest_entry_t* entries = NULL;
+  const uint32_t count = lineage_query_children(&am->base_state, &entries);
+  if (entries == NULL) return -1;
+  for (uint32_t entry_index = 0; entry_index < count; entry_index++) {
+    if (strcmp(entries[entry_index].child_id, child_id) == 0) {
+      return (int32_t)entry_index;
+    }
+  }
+  return -1;
+}
+
+// Issue a parent-signed attestation for an ACTIVE manifest child and return
+// its wire image (u32le length + canonical body + signature) as a
+// serialized_buffer_t. now_ms comes from the parent's time source
+// (state_get_time_ms); when no source reports a valid time the attestation is
+// minted with now_ms = 0, so its window starts at epoch 0 and ends at
+// now + ttl — usable for local testing, but consumers needing an
+// authenticated window must configure a time source on the node first.
+EMSCRIPTEN_KEEPALIVE
+serialized_buffer_t* crabs_wasm_lineage_attest(attribute_machine_t* am,
+                                              const char* child_id,
+                                              const char* user_id,
+                                              const char* attributes) {
+  if (am == NULL || child_id == NULL || user_id == NULL ||
+      attributes == NULL) {
+    return NULL;
+  }
+  uint64_t now_ms = 0;
+  (void)state_get_time_ms(&am->base_state, &now_ms);
+  attestation_t attestation;
+  if (crabs_issue_attestation(&am->base_state, &attestation, child_id, user_id,
+                              attributes, now_ms) != CRABS_SUCCESS) {
+    return NULL;
+  }
+  serialized_buffer_t* buffer = serialized_buffer_create(CRABS_ATTESTATION_WIRE_MAX);
+  if (buffer == NULL) return NULL;
+  size_t written = attestation_serialize(&attestation, buffer->data,
+                                         CRABS_ATTESTATION_WIRE_MAX);
+  if (written == 0) {
+    serialized_buffer_destroy(buffer);
+    return NULL;
+  }
+  buffer->len = written;
+  return buffer;
+}
+
+// Register the four lineage ops (__spawn_machine__ / __revoke_attestation__ /
+// __dissolve_machine__ / __withdraw_genesis__) + their default admin policies
+// on this machine. After this, JS submits those ops through the ordinary
+// crabs_wasm_execute path, composing __spawn_machine__ ops by stamping
+// crabs_wasm_lineage_blueprint_serialize bytes into the op payload.
+EMSCRIPTEN_KEEPALIVE
+void crabs_wasm_register_lineage_ops(attribute_machine_t* am) {
+  if (am == NULL) return;
+  lineage_install(&am->base_state);
 }
 
 // ============================================================

@@ -37,6 +37,44 @@ export namespace Operation {
   function deserialize(bytes: Uint8Array): Promise<Operation>;
 }
 
+// Trust modes for spawned child machines (v1.7 lineage wire values).
+export const TRUST_MODE: {
+  SHARED_ROOT: number;       // 0x01
+  DELEGATED_COPY: number;    // 0x02
+  SOVEREIGN: number;         // 0x03
+};
+// Data item / CRDT strategy numbers for Blueprint.addItem.
+export const DATA_TYPE: Record<string, number>;
+export const CRDT_TYPE: Record<string, number>;
+
+export interface Blueprint {
+  /** Append a replicated data item to the child's definition. */
+  addItem(name: string, dataType: number, crdtType: number): void;
+  /** Append an authorization policy: operation type + condition expression. */
+  addPolicy(operation: string, expression: string): void;
+  /** Recompute the blueprint's SHA-256 over its canonical body. */
+  stampHash(): void;
+  /** Wire image (u32le length + canonical body + 32-byte hash). */
+  serialize(): Uint8Array;
+  destroy(): void;
+}
+
+export namespace Blueprint {
+  function create(childId: string, trustMode: number,
+                  bootstrapAdmin: string, ttlMs: number): Promise<Blueprint>;
+  function deserialize(bytes: Uint8Array): Promise<Blueprint>;
+}
+
+export interface ChildManifestView {
+  childId: string;
+  /** Human name, e.g. "delegated_copy". */
+  mode: string;
+  /** Human name, e.g. "active". */
+  status: string;
+  ttlMs: number;
+  spawnedAt: number;
+}
+
 export interface HandlerState {
   incrementCounter(name: string, delta?: number, nodeId?: string): void;
   incrementPNCounter(name: string, delta?: number, nodeId?: string): void;
@@ -158,6 +196,28 @@ export interface Node {
                               endAt: bigint; submitter: string }>;
 
   evaluateTriggers(): void;
+
+  // Lineage (v1.7): machines mint machines. Child machines are NEVER owned
+  // by JS — the parent's resident-children registry in C anchors their
+  // lifetime; JS only borrows the opaque pointers.
+  /** Register the four lineage ops + default admin policies (idempotent). */
+  lineageInstall(): void;
+  /** Spawn a child machine; returns its opaque borrowed pointer. */
+  lineageSpawn(blueprint: Blueprint): number;
+  /** Borrowed pointer of the child still resident, or null. */
+  lineageResidentChild(childId: string): number | null;
+  /** Child manifest size. */
+  childCount(): number;
+  /** Manifest index of childId, or -1 when not manifested. */
+  childIndex(childId: string): number;
+  /** Flat manifest entry at index (id/mode/status/ttlMs/spawnedAt). */
+  childAt(index: number): ChildManifestView | null;
+  childById(childId: string): ChildManifestView | null;
+  /** Snapshot of the whole child manifest. */
+  children(): ChildManifestView[];
+  /** Issue a parent-signed attestation; returns the transport wire bytes. */
+  attest(childId: string, userId: string, attributes: string): Uint8Array;
+
   // The bootstrap admin id this node was created with — also the node's HLC
   // identity, which signing stamps into op->node_id (used by devtools
   // per-node event drains).
