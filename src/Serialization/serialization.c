@@ -1595,6 +1595,10 @@ static serialized_buffer_t* _serialize_state_internal(const state_t* state,
     _write_string16(buf, state->lineage_parent_id);
     _write_bytes(buf, state->lineage_parent_public_key, 33);
     _write_string16(buf, state->lineage_self_id);
+    // v12: the dissolve tombstone flag rides at the END of the binding block
+    // (v11 tail position). A v11 reader stops before this byte and leaves the
+    // runtime default — the flag is additive, not a layout change.
+    _write_uint8(buf, state->lineage_parent_dissolved ? 1 : 0);
   }
 
   // MSK (v10): sealed under seal_key when both the machine's authority and a
@@ -2069,6 +2073,16 @@ static state_t* _deserialize_state_internal(const uint8_t* data, size_t len,
         if (!_read_string16(&buf, state->lineage_self_id,
                             CRABS_MAX_USER_ID)) {
           goto fail;
+        }
+        // v12: the dissolve tombstone flag closes the binding block. v11 and
+        // older blobs end the block at the self id — the flag byte does not
+        // exist there, so the read is gated on version >= 12 and older files
+        // keep the fresh-state default (dissolved false).
+        if (version >= 12) {
+          uint8_t parent_dissolved;
+          if (!_read_uint8(&buf, &parent_dissolved)) goto fail;
+          if (parent_dissolved > 1) goto fail;
+          state->lineage_parent_dissolved = (parent_dissolved == 1);
         }
         state->lineage_parent_bound = true;
       }

@@ -2332,3 +2332,113 @@ TEST(TestSerialization, V11SerializationIsByteStableAcrossRoundTrip) {
   serialized_buffer_destroy(first);
   state_destroy(state);
 }
+
+// v12: the parent-binding block gains a trailing byte — the dissolve
+// tombstone flag — so a child that accepted dissolution comes back dissolved
+// after a restart instead of trusting the (now-stale) parent endorsements.
+// Layout when bound: [u8 bound][string16 parent_id][33B pubkey]
+// [string16 self_id][u8 parent_dissolved].
+TEST(TestSerialization, V12ParentDissolvedFlagRoundTrips) {
+  state_t* state = state_create();
+  ASSERT_NE(state, nullptr);
+
+  state->lineage_parent_bound = true;
+  state->lineage_parent_dissolved = true;
+  strncpy(state->lineage_parent_id, "parent-root", CRABS_MAX_USER_ID - 1);
+  for (int public_byte = 0; public_byte < 33; public_byte++) {
+    state->lineage_parent_public_key[public_byte] = (uint8_t)(public_byte + 0x21);
+  }
+  strncpy(state->lineage_self_id, "machine-self-id", CRABS_MAX_USER_ID - 1);
+
+  serialized_buffer_t* buf = crabs_serialize_state(state);
+  ASSERT_NE(buf, nullptr);
+
+  state_t* restored = crabs_deserialize_state_keys(buf->data, buf->len, NULL);
+  ASSERT_NE(restored, nullptr);
+  EXPECT_TRUE(restored->lineage_parent_bound);
+  EXPECT_STREQ(restored->lineage_parent_id, "parent-root");
+  EXPECT_EQ(memcmp(restored->lineage_parent_public_key,
+                   state->lineage_parent_public_key, 33), 0);
+  EXPECT_STREQ(restored->lineage_self_id, "machine-self-id");
+  EXPECT_TRUE(restored->lineage_parent_dissolved);
+
+  state_destroy(restored);
+  serialized_buffer_destroy(buf);
+  state_destroy(state);
+
+  // An undissolved binding must round trip false, not come back sticky-true.
+  state_t* undissolved = state_create();
+  ASSERT_NE(undissolved, nullptr);
+  undissolved->lineage_parent_bound = true;
+  strncpy(undissolved->lineage_parent_id, "parent-root", CRABS_MAX_USER_ID - 1);
+  strncpy(undissolved->lineage_self_id, "machine-self-id", CRABS_MAX_USER_ID - 1);
+
+  serialized_buffer_t* plain_buf = crabs_serialize_state(undissolved);
+  ASSERT_NE(plain_buf, nullptr);
+
+  state_t* plain_restored =
+      crabs_deserialize_state_keys(plain_buf->data, plain_buf->len, NULL);
+  ASSERT_NE(plain_restored, nullptr);
+  EXPECT_TRUE(plain_restored->lineage_parent_bound);
+  EXPECT_FALSE(plain_restored->lineage_parent_dissolved);
+
+  state_destroy(plain_restored);
+  serialized_buffer_destroy(plain_buf);
+  state_destroy(undissolved);
+}
+
+// v11-layout compat: a blob written WITHOUT the trailing dissolved byte must
+// still load. Surgery: serialize a bound v12 blob, locate the self id, remove
+// the dissolved byte that directly follows it, patch the version field back
+// to 11 (offset 4, uint32 LE, same idiom as TestSerializeV1StateStillLoads)
+// and recompute the checksum trailer. The v11 reader never reaches the flag
+// read, so the field falls back to its fresh-state default (false).
+TEST(TestSerialization, V11BoundBlobWithoutDissolvedByteLoadsFalse) {
+  state_t* state = state_create();
+  ASSERT_NE(state, nullptr);
+  append_manifest_entry(state, "child-red", LINEAGE_SHARED_ROOT, LINEAGE_ACTIVE,
+                        60000, 1700000000000);
+  state->lineage_parent_bound = true;
+  state->lineage_parent_dissolved = true;
+  strncpy(state->lineage_parent_id, "parent-root", CRABS_MAX_USER_ID - 1);
+  strncpy(state->lineage_self_id, "machine-self-id", CRABS_MAX_USER_ID - 1);
+
+  serialized_buffer_t* buf = crabs_serialize_state(state);
+  ASSERT_NE(buf, nullptr);
+  state_destroy(state);
+
+  const char self_needle[] = "machine-self-id";
+  bool found = false;
+  for (size_t index = 0; index + sizeof(self_needle) <= buf->len - CRABS_HASH_SIZE;
+       index++) {
+    if (memcmp(buf->data + index, self_needle, sizeof(self_needle) - 1) == 0) {
+      // The dissolved byte sits immediately after the self id characters.
+      size_t dissolved_offset = index + sizeof(self_needle) - 1;
+      size_t payload_len = buf->len - CRABS_HASH_SIZE;
+      memmove(buf->data + dissolved_offset, buf->data + dissolved_offset + 1,
+              payload_len - dissolved_offset - 1);
+      buf->len -= 1;
+      found = true;
+      break;
+    }
+  }
+  ASSERT_TRUE(found);
+
+  uint32_t version_value = 11;
+  memcpy(buf->data + 4, &version_value, sizeof(version_value));
+
+  uint8_t recomputed_hash[CRABS_HASH_SIZE];
+  SHA256(buf->data, buf->len - CRABS_HASH_SIZE, recomputed_hash);
+  memcpy(buf->data + buf->len - CRABS_HASH_SIZE, recomputed_hash, CRABS_HASH_SIZE);
+
+  state_t* restored = crabs_deserialize_state_keys(buf->data, buf->len, NULL);
+  ASSERT_NE(restored, nullptr);
+  EXPECT_TRUE(restored->lineage_parent_bound);
+  EXPECT_STREQ(restored->lineage_parent_id, "parent-root");
+  EXPECT_STREQ(restored->lineage_self_id, "machine-self-id");
+  EXPECT_EQ(restored->child_count, 1u);
+  EXPECT_FALSE(restored->lineage_parent_dissolved);
+
+  state_destroy(restored);
+  serialized_buffer_destroy(buf);
+}

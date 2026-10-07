@@ -18,7 +18,7 @@
 // Magic bytes and format version (§13.1)
 // ============================================================
 #define CRABS_SERIAL_MAGIC      0x42415243  // "CRAB" in little-endian
-#define CRABS_SERIAL_VERSION    11          // v11: lineage child manifest + parent binding (fills the v10-manifested space)
+#define CRABS_SERIAL_VERSION    12          // v12: parent-binding block carries the lineage dissolve flag (v11 manifest + binding layout)
 
 // ============================================================
 // Serialized buffer
