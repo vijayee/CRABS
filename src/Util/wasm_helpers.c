@@ -957,15 +957,16 @@ EMSCRIPTEN_KEEPALIVE
 int32_t crabs_wasm_lineage_find_manifest_entry(attribute_machine_t* am,
                                               const char* child_id) {
   if (am == NULL || child_id == NULL) return -1;
+  // The manifest scan is the landed accessor's job (single source, shared
+  // with the CLI); the export only translates the borrowed entry pointer
+  // into the flat index the JS surface accesses entries through.
+  const child_manifest_entry_t* matched =
+      lineage_find_manifest_entry(&am->base_state, child_id);
+  if (matched == NULL) return -1;
   const child_manifest_entry_t* entries = NULL;
   const uint32_t count = lineage_query_children(&am->base_state, &entries);
-  if (entries == NULL) return -1;
-  for (uint32_t entry_index = 0; entry_index < count; entry_index++) {
-    if (strcmp(entries[entry_index].child_id, child_id) == 0) {
-      return (int32_t)entry_index;
-    }
-  }
-  return -1;
+  if (entries == NULL || count == 0) return -1;
+  return (int32_t)(matched - entries);
 }
 
 // Issue a parent-signed attestation for an ACTIVE manifest child and return
