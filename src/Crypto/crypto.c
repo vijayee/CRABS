@@ -1694,6 +1694,58 @@ done:
   return rc;
 }
 
+// ============================================================
+// At-Rest Sealing (§11.5): AES-256-GCM envelope for durable
+// secrets (MSK at rest). Sealed layout: IV(12) + ciphertext + tag(16).
+// ============================================================
+
+crabs_error_e crypto_seal(const uint8_t key[32],
+                            const uint8_t* plain, size_t plain_len,
+                            uint8_t* sealed, size_t* sealed_len) {
+  if (!key || (!plain && plain_len != 0) || !sealed || !sealed_len)
+    return CRABS_ERR_INVALID_PARAM;
+  if (*sealed_len < plain_len + CRABS_SEAL_OVERHEAD)
+    return CRABS_ERR_INVALID_PARAM;
+
+  uint8_t initialization_vector[12];
+  crabs_error_e random_error = crypto_random_bytes(initialization_vector,
+                                                     sizeof(initialization_vector));
+  if (random_error != CRABS_SUCCESS) return random_error;
+
+  memcpy(sealed, initialization_vector, 12);
+  uint8_t* ciphertext = sealed + 12;
+  uint8_t* tag = sealed + 12 + plain_len;
+  if (_aes256_gcm_encrypt(key, initialization_vector, plain, plain_len,
+                          ciphertext, tag) != 0)
+    return CRABS_ERR_CRYPTOGRAPHIC_ERROR;
+  *sealed_len = plain_len + 12 + 16;
+  return CRABS_SUCCESS;
+}
+
+crabs_error_e crypto_unseal(const uint8_t key[32],
+                              const uint8_t* sealed, size_t sealed_len,
+                              uint8_t* plain, size_t plain_cap,
+                              size_t* plain_len) {
+  if (!key || !sealed || !plain || !plain_len)
+    return CRABS_ERR_INVALID_PARAM;
+  if (sealed_len < CRABS_SEAL_OVERHEAD)
+    return CRABS_ERR_INVALID_PARAM;
+  size_t cipher_len = sealed_len - 12 - 16;
+  if (cipher_len > plain_cap)
+    return CRABS_ERR_INVALID_PARAM;
+
+  const uint8_t* initialization_vector = sealed;
+  const uint8_t* ciphertext = sealed + 12;
+  const uint8_t* tag = sealed + 12 + cipher_len;
+  // DecryptFinal_ex fails on tag mismatch, so a wrong key or tampered blob
+  // never yields usable plaintext.
+  if (_aes256_gcm_decrypt(key, initialization_vector, ciphertext, cipher_len,
+                          tag, plain) != 0)
+    return CRABS_ERR_UNAUTHORIZED;
+  *plain_len = cipher_len;
+  return CRABS_SUCCESS;
+}
+
 // ECIES encrypt: out = eph_pub(33) + iv(12) + ct(pt_len) + tag(16). Returns
 // total length, or 0 on failure.
 static size_t _ecies_encrypt_to_pub(const uint8_t recipient_pub[33],

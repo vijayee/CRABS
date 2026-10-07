@@ -1121,3 +1121,54 @@ TEST(TestDurability, MasterKeyDeserializeRejectsGarbage) {
   const uint8_t junk[16] = {0};
   EXPECT_EQ(crypto_master_key_deserialize(junk, sizeof(junk)), nullptr);
 }
+
+// The length fields must respect the blob's bounds: a valid magic header with
+// a length that overruns `len` is a malformed/truncated blob, not authority.
+TEST(TestDurability, MasterKeyDeserializeRejectsOverrun) {
+  // Valid magic header, bogus oversized length -> bounds failure.
+  uint8_t overrun[11] = {0};
+  overrun[0] = 'M'; overrun[1] = 'K'; overrun[2] = 0x01;
+  uint32_t fake_len = 0xFFFFFFFF;
+  memcpy(overrun + 3, &fake_len, 4);   // pp_len (LE)
+  memcpy(overrun + 7, &fake_len, 4);   // ms_len (LE)
+  EXPECT_EQ(crypto_master_key_deserialize(overrun, sizeof(overrun)), nullptr);
+}
+
+// At-rest sealing (§11.5): AES-256-GCM envelope. Sealed layout is
+// IV(12) + ciphertext + tag(16); unseal restores the plaintext exactly and
+// rejects any tampering with ciphertext or key authentication.
+TEST(TestDurability, SealUnsealRoundTrip) {
+  uint8_t seal_key[32];
+  ASSERT_EQ(crypto_random_bytes(seal_key, sizeof(seal_key)), CRABS_SUCCESS);
+
+  uint8_t plain[100];
+  for (size_t byte_index = 0; byte_index < sizeof(plain); byte_index++) {
+    plain[byte_index] = (uint8_t)(byte_index * 3);
+  }
+  uint8_t sealed[200];
+  size_t sealed_len = sizeof(sealed);
+  ASSERT_EQ(crypto_seal(seal_key, plain, sizeof(plain),
+                        sealed, &sealed_len), CRABS_SUCCESS);
+  // 12-byte IV + 100 ciphertext + 16-byte tag
+  ASSERT_EQ(sealed_len, sizeof(plain) + 16 + 12);
+
+  uint8_t out[128];
+  size_t out_len = 0;
+  ASSERT_EQ(crypto_unseal(seal_key, sealed, sealed_len, out, sizeof(out), &out_len),
+            CRABS_SUCCESS);
+  ASSERT_EQ(out_len, sizeof(plain));
+  EXPECT_EQ(memcmp(out, plain, sizeof(plain)), 0);
+
+  // Tamper with one ciphertext byte -> authentication failure.
+  sealed[20] ^= 0x01;
+  EXPECT_EQ(crypto_unseal(seal_key, sealed, sealed_len, out, sizeof(out), &out_len),
+            CRABS_ERR_UNAUTHORIZED);
+  sealed[20] ^= 0x01;
+
+  // Wrong key -> authentication failure.
+  uint8_t wrong_key[32];
+  memcpy(wrong_key, seal_key, 32);
+  wrong_key[0] ^= 0xFF;
+  EXPECT_EQ(crypto_unseal(wrong_key, sealed, sealed_len, out, sizeof(out), &out_len),
+            CRABS_ERR_UNAUTHORIZED);
+}

@@ -52,6 +52,20 @@ crabs_error_e crypto_sha256(const uint8_t* data, size_t len,
                              uint8_t hash[CRABS_HASH_SIZE]);
 
 // ============================================================
+// At-Rest Sealing (§11.5): AES-256-GCM envelope for durable
+// secrets (MSK at rest). Sealed layout: IV(12) + ciphertext + tag(16).
+// ============================================================
+#define CRABS_SEAL_OVERHEAD 28   // 12-byte IV + 16-byte GCM tag
+
+crabs_error_e crypto_seal(const uint8_t key[32],
+                            const uint8_t* plain, size_t plain_len,
+                            uint8_t* sealed, size_t* sealed_len);
+crabs_error_e crypto_unseal(const uint8_t key[32],
+                              const uint8_t* sealed, size_t sealed_len,
+                              uint8_t* plain, size_t plain_cap,
+                              size_t* plain_len);
+
+// ============================================================
 // CSPRNG (§14.2)
 // ============================================================
 crabs_error_e crypto_random_bytes(uint8_t* buf, size_t len);
