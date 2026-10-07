@@ -898,22 +898,17 @@ TEST(TestDurability, DissolutionSurvivesRestartThroughTombstoneDelivery) {
   remove(captured_path);
 
   // ------------------------------------------------------------------
-  // 4. Persist the child: give it its own node key (so its operator can
-  //    keep saving snapshots independently) and write a SEALED snapshot
-  //    WITHOUT
-  //    the node-key signature — the child CLI node below then goes through
-  //    the unauthenticated-provenance path ('state accept-unverified'),
-  //    exactly an operator loading an unsigned-but-sealed machine file.
-  //    The child file is written BEFORE the dissolve, so the flag it
-  //    carries is the pre-severance false.
+  // 4. Persist the child: write a SEALED snapshot WITHOUT the node-key
+  //    signature — the child CLI node below then goes through the
+  //    unauthenticated-provenance path ('state accept-unverified'),
+  //    exactly an operator loading an unsigned-but-sealed machine file
+  //    (and holding their signing key material out-of-band, as the child
+  //    admin does). The child file is written BEFORE the dissolve, so the
+  //    flag it carries is the pre-severance false.
   // ------------------------------------------------------------------
   attribute_machine_t* child =
       lineage_query_resident_child(parent_state, "child-red");
   ASSERT_NE(child, nullptr);
-  ecdsa_keypair_t* child_node_key = crypto_ecdsa_generate();
-  ASSERT_NE(child_node_key, nullptr);
-  ASSERT_EQ(state_set_node_key(&child->base_state, child_node_key->private_key,
-                               child_node_key->public_key), CRABS_SUCCESS);
   // The child operator's seal key is a DIFFERENT secret from the parent's.
   static const uint8_t child_seal_key[32] = {
     41,11,52,12,63,13,74,14,85,15,96,16,107,17,118,18,
@@ -940,7 +935,6 @@ TEST(TestDurability, DissolutionSurvivesRestartThroughTombstoneDelivery) {
   // ------------------------------------------------------------------
   ASSERT_EQ(cli_node_save(node, parent_path), CLI_OK);
   attribute_machine_destroy(child);
-  crypto_ecdsa_keypair_destroy(child_node_key);
   cli_node_destroy(node);
 
   // ------------------------------------------------------------------
