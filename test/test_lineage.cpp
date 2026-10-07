@@ -13,6 +13,7 @@ extern "C" {
 #include "../src/CRABS/data_model.h"
 #include "../src/CRABS/crabs.h"
 #include "../src/Attribute/attribute_machine.h"
+#include "../src/Crypto/crypto.h"
 }
 
 // ============================================================
@@ -324,6 +325,138 @@ TEST(TestLineage, StateDestroyReleasesChildrenArray) {
   memset(state->children, 0, sizeof(child_manifest_entry_t) * 2);
   state->child_count = 2;
   state_destroy(state);
+}
+
+// ============================================================
+// Attestations
+// ============================================================
+
+// A parent state with a valid ECDSA node key — the signer for attestations.
+static state_t* make_parent_state(ecdsa_keypair_t** parent_key_out) {
+  state_t* parent = state_create();
+  EXPECT_NE(parent, nullptr);
+  ecdsa_keypair_t* parent_key = crypto_ecdsa_generate();
+  EXPECT_NE(parent_key, nullptr);
+  if (parent != nullptr && parent_key != nullptr) {
+    EXPECT_EQ(state_set_node_key(parent, parent_key->private_key,
+                                 parent_key->public_key), CRABS_SUCCESS);
+  }
+  *parent_key_out = parent_key;
+  return parent;
+}
+
+TEST(TestLineage, AttestationSignVerifyRoundTrip) {
+  ecdsa_keypair_t* parent_key = nullptr;
+  state_t* parent = make_parent_state(&parent_key);
+  ASSERT_NE(parent, nullptr);
+  ASSERT_NE(parent_key, nullptr);
+
+  const uint64_t now = 1700000000000ULL;  // fixed test epoch, ms
+  attestation_t attestation = {0};
+  ASSERT_EQ(attestation_create(parent, &attestation,
+      "parent-root", "child-red", "alice",
+      "role:writer,dept:red", now, now + 60000), CRABS_SUCCESS);
+  EXPECT_EQ(attestation.format_version, CRABS_ATTESTATION_FORMAT_VERSION);
+
+  // Positive: correct parent key, correct child, inside window.
+  EXPECT_TRUE(attestation_verify(parent_key->public_key, "child-red",
+                                 &attestation, now));
+  // Negative: wrong child id.
+  EXPECT_FALSE(attestation_verify(parent_key->public_key, "child-blue",
+                                  &attestation, now));
+  // Negative: expired.
+  EXPECT_FALSE(attestation_verify(parent_key->public_key, "child-red",
+                                  &attestation, now + 120000));
+  // Negative: tampered attributes (flip the first attribute character).
+  attestation.attributes[0] ^= 0x01;
+  EXPECT_FALSE(attestation_verify(parent_key->public_key, "child-red",
+                                  &attestation, now));
+  attestation.attributes[0] ^= 0x01;
+  EXPECT_TRUE(attestation_verify(parent_key->public_key, "child-red",
+                                 &attestation, now));
+
+  // Byte transport round trip re-verifies.
+  uint8_t wire[2048];
+  size_t wire_len = attestation_serialize(&attestation, wire, sizeof(wire));
+  ASSERT_GT(wire_len, 0u);
+  attestation_t* restored = attestation_deserialize(wire, wire_len);
+  ASSERT_NE(restored, nullptr);
+  EXPECT_TRUE(attestation_verify(parent_key->public_key, "child-red",
+                                 restored, now));
+  attestation_destroy(restored);
+
+  crypto_ecdsa_keypair_destroy(parent_key);
+  state_destroy(parent);
+}
+
+TEST(TestLineage, AttestationCreateRejectsBadInputs) {
+  ecdsa_keypair_t* parent_key = nullptr;
+  state_t* parent = make_parent_state(&parent_key);
+  ASSERT_NE(parent, nullptr);
+  ASSERT_NE(parent_key, nullptr);
+
+  const uint64_t now = 1700000000000ULL;
+  attestation_t attestation = {0};
+  EXPECT_EQ(attestation_create(nullptr, &attestation, "parent-root",
+              "child-red", "alice", "role:writer", now, now + 60000),
+            CRABS_ERR_INVALID_PARAM);
+  EXPECT_EQ(attestation_create(parent, nullptr, "parent-root",
+              "child-red", "alice", "role:writer", now, now + 60000),
+            CRABS_ERR_INVALID_PARAM);
+  EXPECT_EQ(attestation_create(parent, &attestation, "",
+              "child-red", "alice", "role:writer", now, now + 60000),
+            CRABS_ERR_INVALID_PARAM);
+  EXPECT_EQ(attestation_create(parent, &attestation, "parent-root",
+              "a<b", "alice", "role:writer", now, now + 60000),
+            CRABS_ERR_INVALID_PARAM);
+  EXPECT_EQ(attestation_create(parent, &attestation, "parent-root",
+              "child-red", "alice", "role:writer", now, now - 1),
+            CRABS_ERR_INVALID_PARAM);
+
+  // A state with no node key cannot sign.
+  state_t* keyless = state_create();
+  ASSERT_NE(keyless, nullptr);
+  EXPECT_EQ(attestation_create(keyless, &attestation, "parent-root",
+              "child-red", "alice", "role:writer", now, now + 60000),
+            CRABS_ERR_CRYPTOGRAPHIC_ERROR);
+  state_destroy(keyless);
+
+  crypto_ecdsa_keypair_destroy(parent_key);
+  state_destroy(parent);
+}
+
+TEST(TestLineage, AttestationDeserializeRejectsGarbage) {
+  EXPECT_EQ(attestation_deserialize(nullptr, 100), nullptr);
+  EXPECT_EQ(attestation_deserialize(nullptr, 0), nullptr);
+
+  // Four junk bytes cannot form a length prefix + body + signature.
+  const uint8_t junk[4] = {0xDE, 0xAD, 0xBE, 0xEF};
+  EXPECT_EQ(attestation_deserialize(junk, sizeof(junk)), nullptr);
+
+  // A valid wire image truncated by one byte must be rejected, not silently
+  // recovered from the length prefix.
+  ecdsa_keypair_t* parent_key = nullptr;
+  state_t* parent = make_parent_state(&parent_key);
+  ASSERT_NE(parent, nullptr);
+  ASSERT_NE(parent_key, nullptr);
+  const uint64_t now = 1700000000000ULL;
+  attestation_t attestation = {0};
+  ASSERT_EQ(attestation_create(parent, &attestation, "parent-root",
+              "child-red", "alice", "role:writer", now, now + 60000),
+            CRABS_SUCCESS);
+  uint8_t wire[2048];
+  size_t wire_len = attestation_serialize(&attestation, wire, sizeof(wire));
+  ASSERT_GT(wire_len, 0u);
+  EXPECT_EQ(attestation_deserialize(wire, wire_len - 1), nullptr);
+
+  // A length prefix claiming MORE bytes than the buffer holds is rejected.
+  uint8_t lying[128];
+  memset(lying, 0, sizeof(lying));
+  lying[0] = 0xFF;  // u32le total length 0x000000FF > 124 usable bytes
+  EXPECT_EQ(attestation_deserialize(lying, sizeof(lying)), nullptr);
+
+  crypto_ecdsa_keypair_destroy(parent_key);
+  state_destroy(parent);
 }
 
 TEST(TestLineage, ManifestEntryTypeLayout) {

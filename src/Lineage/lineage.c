@@ -13,14 +13,256 @@
 #include "lineage.h"
 #include "../Attribute/attribute_machine.h"
 #include "../Condition/condition.h"
+#include "../Crypto/crypto.h"
 #include "../Util/allocator.h"
 #include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 
 // Forward declaration: defined below (Policy expression parsing checks).
 static bool _lineage_policy_expression_is_valid(const char* expression);
+
+// ============================================================
+// Attestations: issue / verify / wire transport
+// ============================================================
+
+// Canonical signing body (EXACT layout, shared by create/sign, verify, and
+// serialize so the three can never drift):
+//   u8 format_version; string16 parent_id; string16 child_id;
+//   string16 user_id; string16 attributes; u64le not_before; u64le expires_at
+// string16 = u16le byte length + bytes WITHOUT the trailing NUL.
+// Worst case: 1 + 2*(63+1)*3 + 2*(255+1) + 8 + 8 = 470 bytes.
+#define CRABS_ATTESTATION_BODY_MAX 512
+
+static bool _lineage_field_is_safe(const char* field, size_t capacity) {
+  if (field == NULL || strnlen(field, capacity) >= capacity) return false;
+  return attribute_machine_is_safe_user_id(field);
+}
+
+static void _lineage_u16le_write(uint8_t* out, uint16_t value) {
+  out[0] = (uint8_t)(value & 0xFF);
+  out[1] = (uint8_t)(value >> 8);
+}
+
+static void _lineage_u32le_write(uint8_t* out, uint32_t value) {
+  _lineage_u16le_write(out, (uint16_t)(value & 0xFFFF));
+  _lineage_u16le_write(out + 2, (uint16_t)(value >> 16));
+}
+
+static void _lineage_u64le_write(uint8_t* out, uint64_t value) {
+  for (size_t byte_index = 0; byte_index < 8; byte_index++) {
+    out[byte_index] = (uint8_t)(value >> (byte_index * 8));
+  }
+}
+
+static bool _lineage_u32le_read(const uint8_t* buf, size_t len,
+                                size_t* offset, uint32_t* out) {
+  if (*offset + 4 > len) return false;
+  *out = (uint32_t)buf[*offset] |
+         ((uint32_t)buf[*offset + 1] << 8) |
+         ((uint32_t)buf[*offset + 2] << 16) |
+         ((uint32_t)buf[*offset + 3] << 24);
+  *offset += 4;
+  return true;
+}
+
+static bool _lineage_u64le_read(const uint8_t* buf, size_t len,
+                                size_t* offset, uint64_t* out) {
+  if (*offset + 8 > len) return false;
+  *out = 0;
+  for (size_t byte_index = 0; byte_index < 8; byte_index++) {
+    *out |= ((uint64_t)buf[*offset + byte_index]) << (byte_index * 8);
+  }
+  *offset += 8;
+  return true;
+}
+
+// string16 write: a capacity-full (unterminated) field is a caller bug and
+// fails closed — the canonical body could not be reproduced by a verifier.
+static bool _lineage_string16_write(uint8_t* out, size_t cap, size_t* offset,
+                                    const char* field, size_t field_capacity) {
+  size_t field_len = strnlen(field, field_capacity);
+  if (field_len >= field_capacity) return false;
+  if (*offset + 2 + field_len > cap) return false;
+  _lineage_u16le_write(out + *offset, (uint16_t)field_len);
+  memcpy(out + *offset + 2, field, field_len);
+  *offset += 2 + field_len;
+  return true;
+}
+
+static bool _lineage_string16_read(const uint8_t* buf, size_t len,
+                                   size_t* offset, char* out,
+                                   size_t out_capacity) {
+  if (*offset + 2 > len) return false;
+  uint16_t str_len = (uint16_t)(buf[*offset] | (buf[*offset + 1] << 8));
+  *offset += 2;
+  // Reject over-long strings instead of truncating — a truncated string could
+  // alias a different legitimate value.
+  if (str_len >= out_capacity || *offset + str_len > len) return false;
+  memcpy(out, buf + *offset, str_len);
+  out[str_len] = '\0';
+  *offset += str_len;
+  return true;
+}
+
+// Single shared canonical-body writer behind signing, verification, and wire
+// serialization. Returns bytes written, or 0 when a struct field is
+// unterminated or `cap` is too small.
+static size_t _attestation_write_canonical_body(const attestation_t* attestation,
+                                                uint8_t* out, size_t cap) {
+  size_t offset = 0;
+  if (cap < 1) return 0;
+  out[offset++] = attestation->format_version;
+  if (!_lineage_string16_write(out, cap, &offset, attestation->parent_id,
+                               sizeof(attestation->parent_id)) ||
+      !_lineage_string16_write(out, cap, &offset, attestation->child_id,
+                               sizeof(attestation->child_id)) ||
+      !_lineage_string16_write(out, cap, &offset, attestation->user_id,
+                               sizeof(attestation->user_id)) ||
+      !_lineage_string16_write(out, cap, &offset, attestation->attributes,
+                               sizeof(attestation->attributes))) {
+    return 0;
+  }
+  if (offset + 16 > cap) return 0;
+  _lineage_u64le_write(out + offset, attestation->not_before);
+  _lineage_u64le_write(out + offset + 8, attestation->expires_at);
+  offset += 16;
+  return offset;
+}
+
+crabs_error_e attestation_create(state_t* parent,
+                                 attestation_t* attestation_out,
+                                 const char* parent_id, const char* child_id,
+                                 const char* user_id, const char* attributes,
+                                 uint64_t now_ms, uint64_t expires_at) {
+  if (parent == NULL || attestation_out == NULL) {
+    return CRABS_ERR_INVALID_PARAM;
+  }
+  if (!_lineage_field_is_safe(parent_id, sizeof(attestation_out->parent_id)) ||
+      !_lineage_field_is_safe(child_id, sizeof(attestation_out->child_id)) ||
+      !_lineage_field_is_safe(user_id, sizeof(attestation_out->user_id))) {
+    return CRABS_ERR_INVALID_PARAM;
+  }
+  if (attributes == NULL || strnlen(attributes, CRABS_MAX_POLICY_EXPR) >=
+                                CRABS_MAX_POLICY_EXPR) {
+    return CRABS_ERR_INVALID_PARAM;
+  }
+  if (expires_at < now_ms) return CRABS_ERR_INVALID_PARAM;
+
+  if (!parent->node_key_valid ||
+      !crypto_ecdsa_validate_public_key(parent->node_public_key)) {
+    return CRABS_ERR_CRYPTOGRAPHIC_ERROR;
+  }
+
+  memset(attestation_out, 0, sizeof(*attestation_out));
+  attestation_out->format_version = CRABS_ATTESTATION_FORMAT_VERSION;
+  strncpy(attestation_out->parent_id, parent_id,
+          sizeof(attestation_out->parent_id) - 1);
+  strncpy(attestation_out->child_id, child_id,
+          sizeof(attestation_out->child_id) - 1);
+  strncpy(attestation_out->user_id, user_id,
+          sizeof(attestation_out->user_id) - 1);
+  strncpy(attestation_out->attributes, attributes,
+          sizeof(attestation_out->attributes) - 1);
+  attestation_out->not_before = now_ms;
+  attestation_out->expires_at = expires_at;
+
+  uint8_t canonical_body[CRABS_ATTESTATION_BODY_MAX];
+  size_t body_len = _attestation_write_canonical_body(
+      attestation_out, canonical_body, sizeof(canonical_body));
+  if (body_len == 0) return CRABS_ERR_CRYPTOGRAPHIC_ERROR;
+  if (crypto_ecdsa_sign(parent->node_private_key, canonical_body, body_len,
+                        attestation_out->signature) != CRABS_SUCCESS) {
+    return CRABS_ERR_CRYPTOGRAPHIC_ERROR;
+  }
+  return CRABS_SUCCESS;
+}
+
+bool attestation_verify(const uint8_t parent_public_key[33],
+                        const char* child_id,
+                        const attestation_t* attestation, uint64_t now_ms) {
+  if (parent_public_key == NULL || child_id == NULL || attestation == NULL) {
+    return false;
+  }
+  if (attestation->format_version != CRABS_ATTESTATION_FORMAT_VERSION) {
+    return false;
+  }
+  if (attestation->not_before > now_ms || now_ms > attestation->expires_at) {
+    return false;
+  }
+  // The signature covers child_id, so it must match the challenger exactly.
+  if (strnlen(attestation->child_id, sizeof(attestation->child_id)) >=
+          sizeof(attestation->child_id) ||
+      strcmp(attestation->child_id, child_id) != 0) {
+    return false;
+  }
+  uint8_t canonical_body[CRABS_ATTESTATION_BODY_MAX];
+  size_t body_len = _attestation_write_canonical_body(
+      attestation, canonical_body, sizeof(canonical_body));
+  if (body_len == 0) return false;
+  return crypto_ecdsa_verify(parent_public_key, canonical_body, body_len,
+                             attestation->signature);
+}
+
+size_t attestation_serialize(const attestation_t* attestation,
+                             uint8_t* out_buf, size_t buf_len) {
+  if (attestation == NULL || out_buf == NULL) return 0;
+  uint8_t canonical_body[CRABS_ATTESTATION_BODY_MAX];
+  size_t body_len = _attestation_write_canonical_body(
+      attestation, canonical_body, sizeof(canonical_body));
+  if (body_len == 0) return 0;
+  // u32le total length of everything that follows the prefix.
+  uint32_t total_len = (uint32_t)(body_len + CRABS_SIG_SIZE);
+  if (buf_len < 4 + total_len) return 0;
+  _lineage_u32le_write(out_buf, total_len);
+  memcpy(out_buf + 4, canonical_body, body_len);
+  memcpy(out_buf + 4 + body_len, attestation->signature, CRABS_SIG_SIZE);
+  return 4 + total_len;
+}
+
+attestation_t* attestation_deserialize(const uint8_t* buf, size_t len) {
+  if (buf == NULL) return NULL;
+  size_t offset = 0;
+  uint32_t total_len;
+  // The prefix must claim exactly the bytes that follow it.
+  if (!_lineage_u32le_read(buf, len, &offset, &total_len) ||
+      total_len != len - 4 ||
+      total_len < CRABS_SIG_SIZE + 1 + 16) {
+    return NULL;
+  }
+  uint8_t format_version;
+  if (offset + 1 > len) return NULL;
+  format_version = buf[offset++];
+  if (format_version != CRABS_ATTESTATION_FORMAT_VERSION) return NULL;
+
+  attestation_t* attestation = get_clear_memory(sizeof(*attestation));
+  attestation->format_version = format_version;
+  bool parsed =
+      _lineage_string16_read(buf, len, &offset, attestation->parent_id,
+                             sizeof(attestation->parent_id)) &&
+      _lineage_string16_read(buf, len, &offset, attestation->child_id,
+                             sizeof(attestation->child_id)) &&
+      _lineage_string16_read(buf, len, &offset, attestation->user_id,
+                             sizeof(attestation->user_id)) &&
+      _lineage_string16_read(buf, len, &offset, attestation->attributes,
+                             sizeof(attestation->attributes)) &&
+      _lineage_u64le_read(buf, len, &offset, &attestation->not_before) &&
+      _lineage_u64le_read(buf, len, &offset, &attestation->expires_at) &&
+      offset + CRABS_SIG_SIZE == len;
+  if (parsed) {
+    memcpy(attestation->signature, buf + offset, CRABS_SIG_SIZE);
+    return attestation;
+  }
+  free(attestation);
+  return NULL;
+}
+
+void attestation_destroy(attestation_t* attestation) {
+  if (attestation == NULL) return;
+  free(attestation);
+}
 
 // ============================================================
 // Lifecycle

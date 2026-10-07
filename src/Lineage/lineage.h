@@ -106,4 +106,40 @@ crabs_error_e blueprint_add_op_type_def(machine_blueprint_t* blueprint,
 //   - operation/op_type names non-empty and within their capacity
 crabs_error_e lineage_blueprint_validate(const machine_blueprint_t* blueprint);
 
+// ============================================================
+// Attestations: issue / verify / wire transport
+// ============================================================
+
+// Create an attestation and sign its canonical body with the parent
+// machine's node key (state_set_node_key must have been called — a machine
+// never reads the wall clock itself, so `now_ms` is supplied by the caller).
+// `expires_at` must not precede `now_ms`. Returns CRABS_ERR_INVALID_PARAM on
+// missing or structurally invalid inputs (unsafe/overlong ids or attributes),
+// and CRABS_ERR_CRYPTOGRAPHIC_ERROR when the node key is invalid or signing
+// fails.
+crabs_error_e attestation_create(state_t* parent,
+                                 attestation_t* attestation_out,
+                                 const char* parent_id, const char* child_id,
+                                 const char* user_id, const char* attributes,
+                                 uint64_t now_ms, uint64_t expires_at);
+
+// Canonical checks: format_version match, child_id exact match, validity
+// window (not_before <= now_ms <= expires_at), ECDSA verify over the
+// canonical body against `parent_public_key`. No heap use.
+bool attestation_verify(const uint8_t parent_public_key[33],
+                        const char* child_id,
+                        const attestation_t* attestation, uint64_t now_ms);
+
+// Wire format: u32le total length (canonical body + signature, excluding the
+// prefix itself) + the canonical body + signature. Returns bytes written, or
+// 0 on overflow/error.
+size_t attestation_serialize(const attestation_t* attestation,
+                             uint8_t* out_buf, size_t buf_len);
+
+// Parse a wire image back into a heap attestation_t (free with
+// attestation_destroy). Returns NULL on malformed input.
+attestation_t* attestation_deserialize(const uint8_t* buf, size_t len);
+
+void attestation_destroy(attestation_t* attestation);
+
 #endif // CRABS_LINEAGE_H
