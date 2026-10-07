@@ -122,6 +122,9 @@ crabs_error_e blueprint_add_op_type_def(machine_blueprint_t* blueprint,
 //   - per-policy expression parseability (condition grammar or bare
 //     name:value attribute token family)
 //   - item names safe + unique; counts within the blueprint caps above
+//   - item data/CRDT types and dedup spec dedup/mutation types within their
+//     enum ranges (A10-L2 — hand-built structs bypass the deserializer, so
+//     the wire whitelists run here too)
 //   - operation/op_type names non-empty and within their capacity
 crabs_error_e lineage_blueprint_validate(const machine_blueprint_t* blueprint);
 
@@ -148,8 +151,12 @@ size_t blueprint_serialize(machine_blueprint_t* blueprint,
 
 // Parse a wire image back into a heap blueprint (free with
 // machine_blueprint_destroy). Verifies the embedded hash over the body and
-// rejects ANY mismatch (a tampered body can never pass), plus structural
-// bounds: counts within the blueprint caps, trust_mode within the enum.
+// rejects ANY mismatch, plus structural bounds: counts within the blueprint
+// caps, and trust_mode / item / CRDT / dedup / mutation bytes whitelisted
+// against their enums (A10-L2).
+// NOTE: the hash is an integrity check recomputed at serialize time; a
+// deliberate tamperer can re-stamp it. Provenance/authenticity comes from
+// the signed __spawn_machine__ op, not from this hash.
 // Returns NULL on malformed input.
 machine_blueprint_t* blueprint_deserialize(const uint8_t* buf, size_t len);
 

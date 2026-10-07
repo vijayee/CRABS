@@ -447,6 +447,81 @@ static bool _blueprint_dedup_field_read(const uint8_t* buf, size_t len,
   return _lineage_string16_read(buf, len, offset, out, out_capacity);
 }
 
+// Wire enum whitelists (A10-L2). Raw bytes arriving over the wire (or from a
+// hand-built struct) are cast to enum types in a handful of places; anything
+// outside the enum's defined range must be rejected BEFORE the cast, or an
+// admin-signed __spawn_machine__ blueprint could plant an unrecognized enum
+// in a child's state. Both the deserializer below and the struct-level
+// lineage_blueprint_validate fail closed against these lists.
+static bool _lineage_enum_valid_data_type(uint8_t raw) {
+  switch ((data_type_e)raw) {
+    case DATA_TYPE_COUNTER:
+    case DATA_TYPE_PN_COUNTER:
+    case DATA_TYPE_SET:
+    case DATA_TYPE_2P_SET:
+    case DATA_TYPE_REGISTER:
+    case DATA_TYPE_DOCUMENT:
+    case DATA_TYPE_RESOURCE:
+    case DATA_TYPE_ONE_SHOT_SET:
+    case DATA_TYPE_ONE_SHOT_FLAG:
+    case DATA_TYPE_OT_ORDERED_SET:
+    case DATA_TYPE_OT_DOCUMENT:
+    case DATA_TYPE_OT_TABLE:
+    case DATA_TYPE_OT_TREE:
+    case DATA_TYPE_OT_ORDERED_MAP:
+    case DATA_TYPE_CUSTOM:
+      return true;
+    default:
+      return false;
+  }
+}
+
+static bool _lineage_enum_valid_crdt_type(uint8_t raw) {
+  switch ((crdt_type_e)raw) {
+    case CRDT_G_COUNTER:
+    case CRDT_PN_COUNTER:
+    case CRDT_OR_SET:
+    case CRDT_2P_SET:
+    case CRDT_LWW_REG:
+    case CRDT_RGA:
+    case CRDT_ONE_SHOT_SET:
+    case CRDT_ONE_SHOT_FLAG:
+    case CRDT_CUSTOM:
+      return true;
+    default:
+      return false;
+  }
+}
+
+static bool _lineage_enum_valid_dedup_type(uint8_t raw) {
+  switch ((dedup_type_e)raw) {
+    case DEDUP_NONE:
+    case DEDUP_PER_USER:
+    case DEDUP_GLOBAL:
+    case DEDUP_CUSTOM:
+      return true;
+    default:
+      return false;
+  }
+}
+
+static bool _lineage_enum_valid_mutation_type(uint8_t raw) {
+  switch ((mutation_type_e)raw) {
+    case MUTATION_SET_ADD:
+    case MUTATION_FLAG_SET:
+    case MUTATION_COUNTER_INCREMENT:
+    case MUTATION_ASSIGN:
+    case MUTATION_CUSTOM:
+      return true;
+    default:
+      return false;
+  }
+}
+
+// Returns false on ANY malformed input (truncated fields, capacity overflow,
+// out-of-range enum bytes). No dedicated error channel: the sole caller
+// (blueprint_deserialize) folds the failure into its `parsed` flag and
+// destroys the partially filled blueprint, so no partial state escapes.
 static bool _blueprint_dedup_spec_read(const uint8_t* buf, size_t len,
                                        size_t* offset, dedup_spec_t* spec) {
   uint8_t raw_dedup_type;
@@ -455,6 +530,7 @@ static bool _blueprint_dedup_spec_read(const uint8_t* buf, size_t len,
   bool strings_ok;
   if (*offset + 1 > len) return false;
   raw_dedup_type = buf[(*offset)++];
+  if (!_lineage_enum_valid_dedup_type(raw_dedup_type)) return false;
   strings_ok =
       _blueprint_dedup_field_read(buf, len, offset, spec->tracker_path,
                                   sizeof(spec->tracker_path)) &&
@@ -465,6 +541,15 @@ static bool _blueprint_dedup_spec_read(const uint8_t* buf, size_t len,
   if (!strings_ok) return false;
   if (*offset + 1 > len) return false;
   raw_mutation_type = buf[(*offset)++];
+  // update.type is consumed ONLY under DEDUP_CUSTOM (dedup.c switches on the
+  // dedup type first and never reaches the mutation switch otherwise), so the
+  // byte is inert for DEDUP_NONE/PER_USER/GLOBAL — existing images carry a
+  // memset 0x00 there and must keep loading. The whitelist is therefore
+  // enforced exactly where the value would reach a mutation switch.
+  if ((dedup_type_e)raw_dedup_type == DEDUP_CUSTOM &&
+      !_lineage_enum_valid_mutation_type(raw_mutation_type)) {
+    return false;
+  }
   strings_ok =
       _blueprint_dedup_field_read(buf, len, offset, spec->update.set_path,
                                   sizeof(spec->update.set_path)) &&
@@ -542,16 +627,17 @@ machine_blueprint_t* blueprint_deserialize(const uint8_t* buf, size_t len) {
   for (uint32_t item_index = 0; parsed && item_index < item_count;
        item_index++) {
     blueprint_item_t* item = &blueprint->items[item_index];
-    uint8_t raw_item_type;
-    uint8_t raw_crdt_type;
+    // The two enum bytes are whitelisted BEFORE the offset advances or the
+    // item fields are cast/assigned — an out-of-range byte leaves no partial
+    // mutation in the item slot (A10-L2).
     parsed = _lineage_string16_read(buf, len, &offset, item->name,
                                     sizeof(item->name)) &&
-             offset + 2 <= len;
+             offset + 2 <= len &&
+             _lineage_enum_valid_data_type(buf[offset]) &&
+             _lineage_enum_valid_crdt_type(buf[offset + 1]);
     if (parsed) {
-      raw_item_type = buf[offset++];
-      raw_crdt_type = buf[offset++];
-      item->type = (data_type_e)raw_item_type;
-      item->crdt_type = (crdt_type_e)raw_crdt_type;
+      item->type = (data_type_e)buf[offset++];
+      item->crdt_type = (crdt_type_e)buf[offset++];
     }
   }
 
@@ -595,8 +681,9 @@ machine_blueprint_t* blueprint_deserialize(const uint8_t* buf, size_t len) {
   parsed = parsed && offset == body_len + 4;
   if (parsed) {
     memcpy(stored_hash, buf + offset, CRABS_HASH_SIZE);
-    // Verify over the body ALONE — a tampered body can never reproduce the
-    // stored hash, so any mismatch rejects the whole image.
+    // NOTE: the hash is an integrity check recomputed at serialize time; a
+    // deliberate tamperer can re-stamp it. Provenance/authenticity comes from
+    // the signed __spawn_machine__ op, not from this hash.
     parsed = crypto_sha256(buf + 4, body_len, recomputed_hash) ==
                  CRABS_SUCCESS &&
              memcmp(recomputed_hash, stored_hash, CRABS_HASH_SIZE) == 0;
@@ -914,8 +1001,14 @@ crabs_error_e lineage_blueprint_validate(const machine_blueprint_t* blueprint) {
   }
   for (uint32_t item_index = 0; item_index < blueprint->item_count;
        item_index++) {
-    if (!_blueprint_id_field_is_safe(blueprint->items[item_index].name,
-                                     sizeof(blueprint->items[item_index].name))) {
+    const blueprint_item_t* item = &blueprint->items[item_index];
+    if (!_blueprint_id_field_is_safe(item->name, sizeof(item->name))) {
+      return CRABS_ERR_INVALID_PARAM;
+    }
+    // Enum whitelists (A10-L2): hand-built structs reach spawn without ever
+    // touching the deserializer, so the same range checks run here too.
+    if (!_lineage_enum_valid_data_type((uint8_t)item->type) ||
+        !_lineage_enum_valid_crdt_type((uint8_t)item->crdt_type)) {
       return CRABS_ERR_INVALID_PARAM;
     }
     for (uint32_t earlier_index = 0; earlier_index < item_index;
@@ -943,8 +1036,19 @@ crabs_error_e lineage_blueprint_validate(const machine_blueprint_t* blueprint) {
   }
   for (uint32_t def_index = 0; def_index < blueprint->op_type_def_count;
        def_index++) {
-    if (!_blueprint_id_field_is_safe(blueprint->op_type_defs[def_index].op_type,
-                                     sizeof(blueprint->op_type_defs[def_index].op_type))) {
+    const blueprint_op_type_def_t* definition =
+        &blueprint->op_type_defs[def_index];
+    if (!_blueprint_id_field_is_safe(definition->op_type,
+                                     sizeof(definition->op_type))) {
+      return CRABS_ERR_INVALID_PARAM;
+    }
+    // Enum whitelists (A10-L2): same defense-in-depth as the item checks.
+    // update.type is enforced only under DEDUP_CUSTOM (the sole consumer —
+    // mirrors the deserializer); elsewhere the byte is inert.
+    if (!_lineage_enum_valid_dedup_type((uint8_t)definition->dedup.type) ||
+        (definition->dedup.type == DEDUP_CUSTOM &&
+         !_lineage_enum_valid_mutation_type(
+             (uint8_t)definition->dedup.update.type))) {
       return CRABS_ERR_INVALID_PARAM;
     }
   }

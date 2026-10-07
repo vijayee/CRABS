@@ -428,11 +428,10 @@ typedef struct state_t {
   // together with the parent binding above; persists in the same v11
   // parent-binding block.
   char    lineage_self_id[CRABS_MAX_USER_ID];
-  // v1.7 (runtime ONLY, never serialized): set on a spawned child when its
-  // parent executes __dissolve_machine__ while the child is resident in the
-  // same process — every @parent/ endorsement fails closed from that moment.
-  // After a restart the flag is gone; delivering the parent's dissolution
-  // tombstone as an op on the child is a later-plan concern.
+  // v1.7 (persists in the v12 binding-block tail): set on a spawned child when
+  // the parent executes __dissolve_machine__. On the wire the flag survives
+  // restarts; a resident child is additionally severed immediately in-process.
+  // Default when absent (v11 blobs): false.
   bool    lineage_parent_dissolved;
   // v1.7 (runtime ONLY, never serialized): registry of children spawned and
   // still resident in this process, so __dissolve_machine__ can reach the

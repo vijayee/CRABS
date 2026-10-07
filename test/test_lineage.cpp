@@ -1244,6 +1244,136 @@ TEST(TestLineage, BlueprintDeserializeRejectsHashMismatch) {
   machine_blueprint_destroy(blueprint);
 }
 
+// Locate the offset JUST PAST the last occurrence of a string16-carried
+// ASCII blob in a serialized blueprint wire image (the u16le length prefix
+// immediately precedes the text). Returns SIZE_MAX when not found.
+static size_t blueprint_wire_find_string_end(uint8_t* wire, size_t wire_len,
+                                             const char* text) {
+  size_t text_len = strlen(text);
+  size_t found = SIZE_MAX;
+  for (size_t search = 0; search + 2 + text_len <= wire_len; search++) {
+    if (wire[search] == (uint8_t)(text_len & 0xFF) &&
+        wire[search + 1] == (uint8_t)(text_len >> 8) &&
+        memcmp(wire + search + 2, text, text_len) == 0) {
+      found = search + 2 + text_len;
+    }
+  }
+  return found;
+}
+
+// Recompute the blueprint body-hash trailer after patching wire bytes, so the
+// ONLY thing a deserializer can reject is the patched field itself (the hash
+// is an integrity stamp, not an authenticity check — it is re-stampable).
+static void blueprint_wire_restamp_hash(uint8_t* wire, size_t wire_len) {
+  size_t body_len = wire_len - 4 - CRABS_HASH_SIZE;
+  ASSERT_EQ(crypto_sha256(wire + 4, body_len, wire + 4 + body_len),
+            CRABS_SUCCESS);
+}
+
+// A blueprint wire image whose item type byte is outside data_type_e must be
+// rejected at load (A10-L2), hash re-stamped so only the enum byte differs.
+TEST(TestLineage, BlueprintDeserializeRejectsOutOfRangeItemType) {
+  machine_blueprint_t* blueprint = make_valid_blueprint();
+  ASSERT_NE(blueprint, nullptr);
+
+  uint8_t wire[CRABS_BLUEPRINT_WIRE_MAX];
+  size_t wire_len = blueprint_serialize(blueprint, wire, sizeof(wire));
+  ASSERT_GT(wire_len, 0u);
+
+  size_t item_end = blueprint_wire_find_string_end(wire, wire_len, "counter");
+  ASSERT_NE(item_end, SIZE_MAX);
+  ASSERT_LT(item_end + 1, wire_len);
+  // 0x0A sits in the gap between the classic types (0x01-0x09) and the OT
+  // family (0x10-0x14); the original bytes are 0x01 (COUNTER) / 0x01 (G_COUNT).
+  ASSERT_EQ(wire[item_end], (uint8_t)DATA_TYPE_COUNTER);
+  ASSERT_EQ(wire[item_end + 1], (uint8_t)CRDT_G_COUNTER);
+
+  wire[item_end] = 0x0A;
+  blueprint_wire_restamp_hash(wire, wire_len);
+  EXPECT_EQ(blueprint_deserialize(wire, wire_len), nullptr);
+
+  wire[item_end] = (uint8_t)DATA_TYPE_COUNTER;
+  wire[item_end + 1] = 0x07;  // no such crdt_type_e (0x01-0x06, 0x08, 0x09, 0xFF)
+  blueprint_wire_restamp_hash(wire, wire_len);
+  EXPECT_EQ(blueprint_deserialize(wire, wire_len), nullptr);
+
+  machine_blueprint_destroy(blueprint);
+}
+
+// Same for the dedup spec bytes inside an op type definition: dedup_type and
+// mutation_type are whitelisted at load too.
+TEST(TestLineage, BlueprintDeserializeRejectsOutOfRangeDedupType) {
+  machine_blueprint_t* blueprint = make_valid_blueprint();
+  ASSERT_NE(blueprint, nullptr);
+
+  uint8_t wire[CRABS_BLUEPRINT_WIRE_MAX];
+  size_t wire_len = blueprint_serialize(blueprint, wire, sizeof(wire));
+  ASSERT_GT(wire_len, 0u);
+
+  // The LAST "increment" string16 is the op type definition's name (the
+  // policy operation earlier in the image shares the same text); the dedup
+  // spec begins immediately after it with the dedup_type byte.
+  size_t spec_start = blueprint_wire_find_string_end(wire, wire_len,
+                                                     "increment");
+  ASSERT_NE(spec_start, SIZE_MAX);
+  // Layout: u8 dedup_type | 3 X string16 (empty => 2 bytes each) | u8 mutation.
+  size_t dedup_type_offset = spec_start;
+  size_t mutation_type_offset = spec_start + 1 + 3 * 2;
+  ASSERT_LT(mutation_type_offset, wire_len);
+  ASSERT_EQ(wire[dedup_type_offset], (uint8_t)DEDUP_NONE);
+  ASSERT_EQ(wire[mutation_type_offset], 0x00);
+
+  wire[dedup_type_offset] = 0x7F;
+  blueprint_wire_restamp_hash(wire, wire_len);
+  EXPECT_EQ(blueprint_deserialize(wire, wire_len), nullptr);
+
+  // update.type is whitelisted under DEDUP_CUSTOM (its only consumer);
+  // mutation_type_e runs 0x01-0x04, 0xFF — 0x05 is out of range.
+  wire[dedup_type_offset] = (uint8_t)DEDUP_CUSTOM;
+  wire[mutation_type_offset] = 0x05;
+  blueprint_wire_restamp_hash(wire, wire_len);
+  EXPECT_EQ(blueprint_deserialize(wire, wire_len), nullptr);
+
+  machine_blueprint_destroy(blueprint);
+}
+
+// Defense in depth: struct-level validation rejects out-of-range enums too,
+// so a hand-built blueprint cannot reach spawn with them (A10-L2).
+TEST(TestLineage, BlueprintValidateRejectsOutOfRangeCrdtType) {
+  machine_blueprint_t* blueprint = make_valid_blueprint();
+  ASSERT_NE(blueprint, nullptr);
+
+  machine_blueprint_t* bad_crdt = make_valid_blueprint();
+  ASSERT_NE(bad_crdt, nullptr);
+  bad_crdt->items[0].crdt_type = (crdt_type_e)0x07;
+  EXPECT_EQ(lineage_blueprint_validate(bad_crdt), CRABS_ERR_INVALID_PARAM);
+  machine_blueprint_destroy(bad_crdt);
+
+  machine_blueprint_t* bad_item = make_valid_blueprint();
+  ASSERT_NE(bad_item, nullptr);
+  bad_item->items[0].type = (data_type_e)0x0A;
+  EXPECT_EQ(lineage_blueprint_validate(bad_item), CRABS_ERR_INVALID_PARAM);
+  machine_blueprint_destroy(bad_item);
+
+  machine_blueprint_t* bad_dedup = make_valid_blueprint();
+  ASSERT_NE(bad_dedup, nullptr);
+  bad_dedup->op_type_defs[0].dedup.type = (dedup_type_e)0x7F;
+  EXPECT_EQ(lineage_blueprint_validate(bad_dedup), CRABS_ERR_INVALID_PARAM);
+  machine_blueprint_destroy(bad_dedup);
+
+  machine_blueprint_t* bad_mutation = make_valid_blueprint();
+  ASSERT_NE(bad_mutation, nullptr);
+  // update.type is checked only under DEDUP_CUSTOM (its sole consumer).
+  bad_mutation->op_type_defs[0].dedup.type = DEDUP_CUSTOM;
+  bad_mutation->op_type_defs[0].dedup.update.type = (mutation_type_e)0x05;
+  EXPECT_EQ(lineage_blueprint_validate(bad_mutation), CRABS_ERR_INVALID_PARAM);
+  machine_blueprint_destroy(bad_mutation);
+
+  // Sanity: the untouched fixture still validates.
+  EXPECT_EQ(lineage_blueprint_validate(blueprint), CRABS_SUCCESS);
+  machine_blueprint_destroy(blueprint);
+}
+
 TEST(TestLineage, BlueprintStampHashRejectsInvalidStruct) {
   EXPECT_EQ(machine_blueprint_stamp_hash(nullptr), CRABS_ERR_INVALID_PARAM);
 
