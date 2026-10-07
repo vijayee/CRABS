@@ -1197,17 +1197,27 @@ static crabs_error_e state_machine_execute_internal(state_t* state, operation_t*
   // protocol state in their handlers. Skip when a custom handler was invoked
   // — the handler owns its own protocol state transitions.
   if (!operation_is_builtin(op->type) && custom_handler == NULL) {
-    for (uint32_t i = 0; i < op->resource_count; i++) {
-      data_item_t* item = state_find_item(state, op->resources[i]);
+    // Pre-validate every resource BEFORE mutating any, so a later failure
+    // cannot leave a partial apply (audit A10-L11: a mutation without a log
+    // entry must never happen — the op would carry no version bump, no tx
+    // commit, and its uuid could be replayed).
+    for (uint32_t resource_index = 0; resource_index < op->resource_count;
+         resource_index++) {
+      data_item_t* item = state_find_item(state, op->resources[resource_index]);
       if (item == NULL) return CRABS_ERR_RESOURCE_NOT_FOUND;
       if (item->type != DATA_TYPE_RESOURCE) continue; // only RESOURCE has protocol state
-      if (item->protocol_state == PROTOCOL_LOCKED) {
-        item->protocol_state = PROTOCOL_MODIFIED;
-      } else {
-        // A user operation may only be applied to a LOCKED resource (the
-        // wildcard transition). Other states require a builtin transition.
+      // A user operation may only be applied to a LOCKED resource (the
+      // wildcard transition). Other states require a builtin transition.
+      if (item->protocol_state != PROTOCOL_LOCKED) {
         return CRABS_ERR_PROTOCOL_VIOLATION;
       }
+    }
+    for (uint32_t resource_index = 0; resource_index < op->resource_count;
+         resource_index++) {
+      data_item_t* item = state_find_item(state, op->resources[resource_index]);
+      if (item == NULL) continue; // unreachable: validated above
+      if (item->type != DATA_TYPE_RESOURCE) continue;
+      item->protocol_state = PROTOCOL_MODIFIED;
     }
   }
 
