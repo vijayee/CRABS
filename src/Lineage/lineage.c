@@ -203,7 +203,10 @@ static bool _lineage_policy_expression_is_valid(const char* expression) {
   if (strchr(expression, '"') != NULL) return false;
   if (_has_non_canonical_boolean_operator(expression)) return false;
 
-  char transformed[CRABS_MAX_POLICY_EXPR * 4];
+  // Worst case: a 3-char "a:b" token plus a one-char separator expands to
+  // "attrNN == attrNN " (~17 chars per 4 input) — the x8 margin stays safe
+  // for a fully colon-dense expression; snprintf guards remain fail-closed.
+  char transformed[CRABS_MAX_POLICY_EXPR * 8];
   size_t write_pos = 0;
   int token_index = 0;
   const char* cursor = expression;
