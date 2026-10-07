@@ -1711,6 +1711,60 @@ static cli_result_e _machine_cmd_child_targeted_op(
                                       strlen(child_id), command_name);
 }
 
+// 'machine attest': mint a parent-signed, ttl-bounded attestation for a
+// child-user pair DIRECTLY through crabs_issue_attestation (not an op —
+// attestations are transport material the child carries, not state changes).
+// The machine never reads the wall clock: now_ms comes from its own time
+// source (state_get_time_ms), and the ttl comes from the manifest entry.
+// The wire image is printed as hex for out-of-band transport.
+static cli_result_e _machine_cmd_attest(cli_node_t* node, const char* child_id,
+                                        const char* user_id,
+                                        const char* attributes) {
+  if (node == NULL || !node->initialized || node->attr_machine == NULL)
+    return CLI_ERR_NOT_INIT;
+  if (child_id == NULL || user_id == NULL || attributes == NULL ||
+      child_id[0] == '\0') {
+    return CLI_ERR_ARGS;
+  }
+  if (strlen(child_id) >= CRABS_MAX_USER_ID ||
+      strlen(user_id) >= CRABS_MAX_USER_ID) {
+    printf("Error: child_id and user_id must be shorter than %d "
+           "characters.\n", CRABS_MAX_USER_ID);
+    return CLI_ERR_ARGS;
+  }
+
+  uint64_t now_ms = 0;
+  if (!state_get_time_ms(&node->attr_machine->base_state, &now_ms)) {
+    printf("Error: the machine has no valid time source; an attestation "
+           "cannot be bounded.\n");
+    return CLI_ERR_EXEC;
+  }
+
+  // Value struct: everything lives in fixed arrays — no attestation_destroy
+  // here (that frees a heap deserialized copy only).
+  attestation_t attestation;
+  memset(&attestation, 0, sizeof(attestation));
+  crabs_error_e err = crabs_issue_attestation(
+      &node->attr_machine->base_state, &attestation, child_id, user_id,
+      attributes, now_ms);
+  if (err != CRABS_SUCCESS) {
+    printf("Error: attestation issue failed: %s\n", cli_error_string(err));
+    return CLI_ERR_EXEC;
+  }
+
+  uint8_t wire[CRABS_ATTESTATION_WIRE_MAX];
+  size_t wire_len = attestation_serialize(&attestation, wire, sizeof(wire));
+  if (wire_len == 0) {
+    printf("Error: attestation serialization failed.\n");
+    return CLI_ERR_EXEC;
+  }
+  char hex[((CRABS_ATTESTATION_WIRE_MAX) * 2) + 1];
+  cli_bytes_to_hex(wire, wire_len, hex);
+  printf("Attestation wire for %s (user %s, %zu bytes), hex:\n%s\n",
+         child_id, user_id, wire_len, hex);
+  return CLI_OK;
+}
+
 
 // ============================================================
 // Command Dispatch
@@ -1809,6 +1863,8 @@ static void _print_machine_usage(void) {
   printf("  machine dissolve <child_id>            Dissolve a non-sovereign child\n");
   printf("  machine withdraw <child_id>            Withdraw a sovereign child's genesis stake\n");
   printf("  machine revoke-attestation <child_id>   Stop issuing attestations for a child\n");
+  printf("  machine attest <child_id> <user_id> <attributes>\n");
+  printf("                                        Mint and print a parent-signed user attestation\n");
   printf("\n  Note: the lineage op handlers/policies must be installed on this\n");
   printf("  machine first (lineage_install) — spawn and lifecycle ops fail otherwise.\n");
 }
@@ -2073,6 +2129,14 @@ cli_result_e cli_dispatch(cli_node_t* node, int argc, char** argv) {
       return _machine_cmd_child_targeted_op(node, machine_sub,
                                             CRABS_LINEAGE_OP_REVOKE_ATTESTATION,
                                             argv[3]);
+    }
+    if (strcmp(machine_sub, "attest") == 0) {
+      if (argc < 6) {
+        printf("Usage: machine attest <child_id> <user_id> <attributes>\n");
+        printf("  attributes: comma-separated name:value pairs, e.g. tier:gold\n");
+        return CLI_ERR_ARGS;
+      }
+      return _machine_cmd_attest(node, argv[3], argv[4], argv[5]);
     }
     printf("Unknown machine subcommand: %s\n", machine_sub);
     _print_machine_usage();

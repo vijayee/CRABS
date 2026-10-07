@@ -5,6 +5,7 @@
 #include <gtest/gtest.h>
 #include <sys/stat.h>
 #include <vector>
+#include <cstdlib>
 extern "C" {
 #include "../src/CLI/cli.h"
 #include "../src/CRABS/data_model.h"
@@ -1617,4 +1618,98 @@ TEST(TestCliDurability, MachineSpawnRefusesInvalidBlueprintFile) {
 
   cli_node_destroy(author);
   remove(garbage_path);
+}
+
+// The longest even-length run of lowercase-hex characters captured from the
+// redirected stdout — the printed attestation wire (the command prints no
+// other hex string anywhere near that length).
+static std::vector<uint8_t> test_extract_hex_wire(const std::string& captured) {
+  static const std::string hex_lower = "0123456789abcdef";
+  size_t best_start = std::string::npos;
+  size_t best_len = 0;
+  size_t run_start = 0;
+  for (size_t cursor = 0; cursor <= captured.size(); cursor++) {
+    bool is_hex = cursor < captured.size() &&
+                  hex_lower.find(captured[cursor]) != std::string::npos;
+    if (!is_hex) {
+      size_t run_len = cursor - run_start;
+      if (run_len % 2 == 0 && run_len > best_len) {
+        best_len = run_len;
+        best_start = run_start;
+      }
+      run_start = cursor + 1;
+    }
+  }
+  std::vector<uint8_t> wire;
+  for (size_t byte_index = 0; byte_index < best_len / 2; byte_index++) {
+    std::string byte_text = captured.substr(best_start + byte_index * 2, 2);
+    wire.push_back((uint8_t)std::strtol(byte_text.c_str(), nullptr, 16));
+  }
+  return wire;
+}
+
+TEST(TestCliDurability, MachineAttestPrintsVerifiableWire) {
+  cli_node_t* author = cli_node_create();
+  ASSERT_EQ(cli_node_init(author, "admin"), CLI_OK);
+  lineage_install(&author->attr_machine->base_state);
+  state_t* parent = &author->attr_machine->base_state;
+
+  const char* blueprint_path = "/tmp/crabs-bp-attest.cbp";
+  ASSERT_TRUE(test_author_machine_blueprint(author, "child-red", "delegated",
+                                            blueprint_path));
+  std::vector<char*> spawn_argv = {(char*)"crabs_node", (char*)"machine",
+                                   (char*)"spawn", (char*)blueprint_path};
+  ASSERT_EQ(cli_dispatch(author, 4, spawn_argv.data()), CLI_OK);
+
+  uint64_t now_ms = 0;
+  ASSERT_TRUE(state_get_time_ms(parent, &now_ms));
+
+  // Capture the command's printed attestation wire hex from stdout.
+  const char* captured_path = "/tmp/crabs-attest-captured.log";
+  FILE* captured_stream = fopen(captured_path, "w");
+  ASSERT_NE(captured_stream, nullptr);
+  FILE* saved_stdout = stdout;
+  stdout = captured_stream;
+  std::vector<char*> attest_argv = {(char*)"crabs_node", (char*)"machine",
+                                    (char*)"attest", (char*)"child-red",
+                                    (char*)"user-1", (char*)"tier:gold"};
+  cli_result_e attest_result = cli_dispatch(author, 6, attest_argv.data());
+  fflush(captured_stream);
+  fclose(captured_stream);
+  stdout = saved_stdout;
+  EXPECT_EQ(attest_result, CLI_OK);
+
+  std::vector<uint8_t> captured_bytes;
+  ASSERT_TRUE(test_read_file_bytes(captured_path, captured_bytes));
+  std::string captured(captured_bytes.begin(), captured_bytes.end());
+
+  // The printed wire is real transport material: it parses back and
+  // verifies against the parent machine's node public key.
+  std::vector<uint8_t> wire = test_extract_hex_wire(captured);
+  ASSERT_GE(wire.size(), 4u + CRABS_SIG_SIZE);
+  attestation_t* attestation = attestation_deserialize(wire.data(),
+                                                       wire.size());
+  ASSERT_NE(attestation, nullptr);
+  EXPECT_EQ(attestation->format_version, CRABS_ATTESTATION_FORMAT_VERSION);
+  EXPECT_STREQ(attestation->child_id, "child-red");
+  EXPECT_STREQ(attestation->user_id, "user-1");
+  EXPECT_STREQ(attestation->attributes, "tier:gold");
+  // The window spans exactly the manifest's recorded ttl, issued from the
+  // machine's own time source (clock may have advanced a hair since we
+  // sampled now_ms, so assert the ttl span rather than absolute stamps).
+  EXPECT_EQ(attestation->expires_at - attestation->not_before, 3600000ull);
+  EXPECT_GE(attestation->not_before, now_ms);
+  EXPECT_TRUE(attestation_verify(author->node_key->public_key, "child-red",
+                                 attestation, attestation->not_before));
+  attestation_destroy(attestation);
+
+  // Unknown child → refused (no wire printed for it).
+  std::vector<char*> attest_ghost = {(char*)"crabs_node", (char*)"machine",
+                                     (char*)"attest", (char*)"child-ghost",
+                                     (char*)"user-1", (char*)"tier:gold"};
+  EXPECT_NE(cli_dispatch(author, 6, attest_ghost.data()), CLI_OK);
+
+  cli_node_destroy(author);
+  remove(blueprint_path);
+  remove(captured_path);
 }
