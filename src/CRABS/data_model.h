@@ -299,6 +299,43 @@ typedef struct {
 } op_type_def_t;
 
 // ============================================================
+// Lineage (v1.7: machines mint machines)
+// ============================================================
+// Ceiling on children a single machine may spawn into its manifest. Bounds
+// the serialized manifest and the spawn operation's lookup cost.
+#define CRABS_MAX_CHILD_MACHINES 64
+
+// Trust profiles for spawned children (spec §Blueprint payload):
+//   SHARED_ROOT    — child resolves attributes against the PARENT's authority
+//                    (same pointer; parent revocation is instant).
+//   DELEGATED_COPY — child mints a fresh authority via a parent-signed
+//                    attestation bridging the two domains.
+//   SOVEREIGN      — child self-mints its authority; the parent may only
+//                    withdraw, never dissolve.
+typedef enum {
+  LINEAGE_SHARED_ROOT    = 0x01,
+  LINEAGE_DELEGATED_COPY = 0x02,
+  LINEAGE_SOVEREIGN      = 0x03
+} lineage_trust_mode_e;
+
+typedef enum {
+  LINEAGE_ACTIVE    = 0x00,
+  LINEAGE_DISSOLVED = 0x01,
+  LINEAGE_WITHDRAWN = 0x02
+} lineage_status_e;
+
+// One entry of the parent's serialized child manifest.
+typedef struct {
+  char                 child_id[CRABS_MAX_USER_ID];
+  lineage_trust_mode_e mode;
+  uint8_t              genesis_snapshot_hash[CRABS_HASH_SIZE];
+  uint8_t              genesis_attestation_signature[CRABS_SIG_SIZE];
+  uint64_t             attestation_ttl_ms;
+  uint64_t             spawned_at;
+  lineage_status_e     status;
+} child_manifest_entry_t;
+
+// ============================================================
 // Log Entry (§7.4 step 9)
 // ============================================================
 typedef struct {
@@ -365,6 +402,15 @@ typedef struct state_t {
   // User-defined operation handler registry
   op_handler_entry_t* op_handlers;
   uint32_t            op_handler_count;
+  // Lineage (v1.7 §machines-mint-machines): children this machine spawned.
+  // Heap array owned by the state — freed by state_destroy; never a view
+  // into embedded storage.
+  child_manifest_entry_t* children;
+  uint32_t                child_count;
+  // This machine's parent binding (present only for spawned children).
+  char    lineage_parent_id[CRABS_MAX_USER_ID];
+  uint8_t lineage_parent_public_key[33];
+  bool    lineage_parent_bound;
   // v1.5.2 §4: Compaction config (crabs_tombstone_config_t*). Externally owned
   // — the caller must free it after state_destroy.
   void* compaction_config;

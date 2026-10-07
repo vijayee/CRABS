@@ -146,6 +146,9 @@ void state_destroy(state_t* state) {
   if (state->log != NULL) free(state->log);
   if (state->op_type_defs != NULL) free(state->op_type_defs);
   if (state->op_handlers != NULL) free(state->op_handlers);
+  // Lineage child manifest: heap array owned by this state (spawn appends,
+  // deserialization restores) — free it wholesale.
+  if (state->children != NULL) free(state->children);
   if (state->triggers != NULL) {
     for (uint32_t i = 0; i < state->trigger_count; i++) {
       if (state->triggers[i].condition_ast != NULL) {

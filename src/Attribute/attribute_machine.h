@@ -181,6 +181,12 @@ user_t*        attribute_machine_find_user(attribute_machine_t* am, const char* 
 bool           attribute_machine_user_has_role(user_t* user, const char* role);
 attribute_value_t* attribute_machine_find_attribute(user_t* user, const char* name);
 
+// Safe signer-id charset predicate (Audit M-C / N-2 rules, made public so
+// lineage blueprint ids obey the same rules as registered signer ids —
+// manifest keys and policy-text splices cannot inject condition-language
+// operators). `id` must be NUL-terminated within CRABS_MAX_USER_ID.
+bool attribute_machine_is_safe_user_id(const char* id);
+
 // ============================================================
 // Temporary Attributes (Amendment 1, §7.1)
 // ============================================================

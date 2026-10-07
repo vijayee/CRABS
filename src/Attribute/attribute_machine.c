@@ -50,7 +50,9 @@ static bool _is_policy_keyword(const char* id) {
   return false;
 }
 
-static bool _is_safe_user_id(const char* id) {
+// Public safe-id predicate (see attribute_machine.h). The static wrapper
+// keeps the audit-era call sites unchanged.
+bool attribute_machine_is_safe_user_id(const char* id) {
   if (id == NULL || id[0] == '\0') return false;
   // R8-A-4: reject over-long ids. register_user truncates to 63 bytes, so two
   // distinct long ids sharing a 63-byte prefix would collide after truncation.
@@ -65,6 +67,10 @@ static bool _is_safe_user_id(const char* id) {
   // operator tokens into the condition AST.
   if (_is_policy_keyword(id)) return false;
   return true;
+}
+
+static bool _is_safe_user_id(const char* id) {
+  return attribute_machine_is_safe_user_id(id);
 }
 
 // Audit R5-2 / R6-2: forward declarations so _parse_attributes can validate
@@ -399,6 +405,10 @@ void attribute_machine_destroy(attribute_machine_t* am) {
   scheduler_destroy_all(&am->base_state);
   if (am->base_state.op_type_defs != NULL) free(am->base_state.op_type_defs);
   if (am->base_state.op_handlers != NULL) free(am->base_state.op_handlers);
+  // Lineage child manifest: heap array owned by the state — mirror
+  // state_destroy's teardown so independently owned machines (this path)
+  // release it too.
+  if (am->base_state.children != NULL) free(am->base_state.children);
   if (am->base_state.tx_manager != NULL) {
     crabs_tx_manager_t* tx = (crabs_tx_manager_t*)am->base_state.tx_manager;
     if (tx->vtable.destroy != NULL) tx->vtable.destroy(tx);
