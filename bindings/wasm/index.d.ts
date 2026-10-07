@@ -1,7 +1,7 @@
 // TypeScript definitions for crabs-wasm
 
 export interface CrabsChangeEvent {
-  kind: 'op' | 'schedule' | 'trigger' | 'attribute';
+  kind: 'op' | 'schedule' | 'trigger' | 'attribute' | 'spawn';
   type: string;
   uuid: string;
   signer: string;

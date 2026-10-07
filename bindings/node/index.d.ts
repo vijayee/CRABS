@@ -79,7 +79,7 @@ export interface NodeOptions {
 }
 
 export interface CrabsChangeEvent {
-  kind: 'op' | 'schedule' | 'trigger' | 'attribute';
+  kind: 'op' | 'schedule' | 'trigger' | 'attribute' | 'spawn';
   type: string;
   signer: string | null;
   node: string | null;
