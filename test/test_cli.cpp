@@ -15,6 +15,7 @@ extern "C" {
 #include "../src/Lineage/lineage.h"
 #include "../src/Serialization/serialization.h"
 #include "../src/CRDT/one_shot.h"
+#include "../src/TimeSource/time_source.h"
 #include <openssl/sha.h>
 }
 
@@ -2219,6 +2220,164 @@ TEST(TestCliDurability, TombstoneAcceptCommandSeversLineageAndPersists) {
   remove(tombstone_hex_bad_path);
   remove(garbage_path);
   remove(captured_path);
+}
+
+// ============================================================
+// Time source selection (A10-L9 wiring): 'time-source https|system|show'
+// selects the machine's clock per session. The selection is session-scoped
+// node config (never serialized) and is re-applied whenever init/load
+// recreates the node's state_t. A configured HTTPS source that cannot fetch
+// NEVER falls back to the local clock (R7-02) — these tests only assert the
+// wiring, never perform a real fetch.
+// ============================================================
+
+TEST_F(TestCLI, TimeSourceHttpsConfiguredThenInitReloadingKeepsIt) {
+  ASSERT_EQ(cli_node_init(node, "admin"), CLI_OK);
+
+  char* set_argv[] = {(char*)"crabs_node", (char*)"time-source",
+                      (char*)"https", (char*)"https://example.com/trace"};
+  EXPECT_EQ(cli_dispatch(node, 4, set_argv), CLI_OK);
+  EXPECT_EQ(node->time_source_mode, CLI_TIME_SOURCE_HTTPS);
+  EXPECT_STREQ(node->https_url, "https://example.com/trace");
+  ASSERT_NE(node->https_source, nullptr);
+  // The state's HLC must point at the node's owned ops object.
+  EXPECT_EQ(node->attr_machine->base_state.hlc_state.time_source_ops,
+            node->https_source);
+
+  // init/load recreate state_t — a session-scoped selection carried on the
+  // node must be re-applied to the fresh state, not silently dropped back to
+  // the system clock.
+  cli_node_t* seeded = cli_node_create();
+  ASSERT_NE(seeded, nullptr);
+  seeded->time_source_mode = CLI_TIME_SOURCE_HTTPS;
+  strncpy(seeded->https_url, "https://example.com/trace",
+          sizeof(seeded->https_url) - 1);
+  ASSERT_EQ(cli_node_init(seeded, "admin"), CLI_OK);
+  EXPECT_NE(seeded->https_source, nullptr);
+  EXPECT_EQ(seeded->attr_machine->base_state.hlc_state.time_source_ops,
+            seeded->https_source);
+
+  ASSERT_TRUE(_apply_test_seal_key(node));
+  const char* path = "/tmp/crabs_test_timesrc_state.bin";
+  ASSERT_EQ(cli_node_save(node, path), CLI_OK);
+  cli_node_t* reloaded = cli_node_create();
+  ASSERT_NE(reloaded, nullptr);
+  reloaded->time_source_mode = CLI_TIME_SOURCE_HTTPS;
+  strncpy(reloaded->https_url, "https://example.com/trace",
+          sizeof(reloaded->https_url) - 1);
+  ASSERT_EQ(cli_node_load(reloaded, path), CLI_OK);
+  EXPECT_NE(reloaded->https_source, nullptr);
+  EXPECT_EQ(reloaded->attr_machine->base_state.hlc_state.time_source_ops,
+            reloaded->https_source);
+
+  cli_node_destroy(seeded);
+  cli_node_destroy(reloaded);
+  remove(path);
+}
+
+TEST_F(TestCLI, TimeSourceSystemClears) {
+  ASSERT_EQ(cli_node_init(node, "admin"), CLI_OK);
+  char* set_argv[] = {(char*)"crabs_node", (char*)"time-source",
+                      (char*)"https", (char*)"https://example.com/trace"};
+  ASSERT_EQ(cli_dispatch(node, 4, set_argv), CLI_OK);
+  ASSERT_NE(node->https_source, nullptr);
+
+  char* clear_argv[] = {(char*)"crabs_node", (char*)"time-source",
+                        (char*)"system"};
+  EXPECT_EQ(cli_dispatch(node, 3, clear_argv), CLI_OK);
+  EXPECT_EQ(node->time_source_mode, CLI_TIME_SOURCE_SYSTEM);
+  EXPECT_EQ(node->https_source, nullptr);
+  EXPECT_EQ(node->attr_machine->base_state.hlc_state.time_source_ops, nullptr);
+
+  // 'system' with nothing configured is a no-op success.
+  EXPECT_EQ(cli_dispatch(node, 3, clear_argv), CLI_OK);
+  EXPECT_EQ(node->https_source, nullptr);
+}
+
+TEST_F(TestCLI, TimeSourceShowPrintsCurrent) {
+  ASSERT_EQ(cli_node_init(node, "admin"), CLI_OK);
+  char* show_argv[] = {(char*)"crabs_node", (char*)"time-source",
+                       (char*)"show"};
+  const char* captured_path = "/tmp/crabs-timesrc-show.log";
+
+  FILE* captured_stream = fopen(captured_path, "w");
+  ASSERT_NE(captured_stream, nullptr);
+  FILE* saved_stdout = stdout;
+  stdout = captured_stream;
+  cli_result_e show_result = cli_dispatch(node, 3, show_argv);
+  fflush(captured_stream);
+  fclose(captured_stream);
+  stdout = saved_stdout;
+  EXPECT_EQ(show_result, CLI_OK);
+  std::vector<uint8_t> captured_bytes;
+  ASSERT_TRUE(test_read_file_bytes(captured_path, captured_bytes));
+  std::string captured(captured_bytes.begin(), captured_bytes.end());
+  EXPECT_NE(captured.find("system (default)"), std::string::npos);
+
+  // 'https' with no url selects the default endpoint.
+  char* set_argv[] = {(char*)"crabs_node", (char*)"time-source",
+                      (char*)"https"};
+  ASSERT_EQ(cli_dispatch(node, 3, set_argv), CLI_OK);
+  EXPECT_EQ(node->https_url[0], '\0');
+  ASSERT_NE(node->https_source, nullptr);
+
+  captured_stream = fopen(captured_path, "w");
+  ASSERT_NE(captured_stream, nullptr);
+  stdout = captured_stream;
+  show_result = cli_dispatch(node, 3, show_argv);
+  fflush(captured_stream);
+  fclose(captured_stream);
+  stdout = saved_stdout;
+  EXPECT_EQ(show_result, CLI_OK);
+  ASSERT_TRUE(test_read_file_bytes(captured_path, captured_bytes));
+  captured.assign(captured_bytes.begin(), captured_bytes.end());
+  EXPECT_NE(captured.find("https:"), std::string::npos);
+  EXPECT_NE(captured.find(CRABS_TIME_SOURCE_DEFAULT_URL),
+            std::string::npos);
+
+  remove(captured_path);
+}
+
+TEST_F(TestCLI, TimeSourceRefusesBeforeInit) {
+  // Matches the adjacent mutating commands: the init gate returns
+  // CLI_ERR_NOT_INIT and nothing is recorded on the node.
+  char* argv[] = {(char*)"crabs_node", (char*)"time-source", (char*)"https"};
+  EXPECT_EQ(cli_dispatch(node, 3, argv), CLI_ERR_NOT_INIT);
+  EXPECT_EQ(node->time_source_mode, CLI_TIME_SOURCE_SYSTEM);
+  EXPECT_EQ(node->https_source, nullptr);
+}
+
+TEST_F(TestCLI, TimeSourceRejectsHttpUrl) {
+  ASSERT_EQ(cli_node_init(node, "admin"), CLI_OK);
+
+  char* http_argv[] = {(char*)"crabs_node", (char*)"time-source",
+                       (char*)"https", (char*)"http://example.com/trace"};
+  EXPECT_EQ(cli_dispatch(node, 4, http_argv), CLI_ERR_ARGS);
+  // A rejected url changes NOTHING: still the system clock, no ops object.
+  EXPECT_EQ(node->time_source_mode, CLI_TIME_SOURCE_SYSTEM);
+  EXPECT_EQ(node->https_source, nullptr);
+  EXPECT_EQ(node->attr_machine->base_state.hlc_state.time_source_ops, nullptr);
+
+  // "https://" with an empty host is refused too (the native parser would
+  // reject it downstream; the CLI refuses earlier with a clear message).
+  char* empty_host_argv[] = {(char*)"crabs_node", (char*)"time-source",
+                             (char*)"https", (char*)"https://"};
+  EXPECT_EQ(cli_dispatch(node, 4, empty_host_argv), CLI_ERR_ARGS);
+  EXPECT_EQ(node->time_source_mode, CLI_TIME_SOURCE_SYSTEM);
+
+  // Oversized urls are refused (the session buffer is 256 bytes).
+  std::string oversized_url = std::string("https://") + std::string(300, 'a');
+  char* oversized_argv[] = {(char*)"crabs_node", (char*)"time-source",
+                            (char*)"https", (char*)oversized_url.c_str()};
+  EXPECT_EQ(cli_dispatch(node, 4, oversized_argv), CLI_ERR_ARGS);
+  EXPECT_EQ(node->time_source_mode, CLI_TIME_SOURCE_SYSTEM);
+
+  // Any other subcommand shape is a usage error.
+  char* unknown_sub_argv[] = {(char*)"crabs_node", (char*)"time-source",
+                              (char*)"bogus"};
+  EXPECT_EQ(cli_dispatch(node, 3, unknown_sub_argv), CLI_ERR_ARGS);
+  char* bare_argv[] = {(char*)"crabs_node", (char*)"time-source"};
+  EXPECT_EQ(cli_dispatch(node, 2, bare_argv), CLI_ERR_ARGS);
 }
 
 // ============================================================

@@ -13,6 +13,7 @@
 #include "../StateMachine/state_machine.h"
 #include "../Crypto/crypto.h"
 #include "../Lineage/lineage.h"
+#include "../TimeSource/time_source.h"
 
 // ============================================================
 // CLI Result Codes
@@ -30,6 +31,12 @@ typedef enum {
 // CLI Node Context
 // ============================================================
 #define CRABS_CLI_KEYRING_MAX 32
+
+// Session-scoped time-source selection (cli_node_t.time_source_mode).
+typedef enum {
+  CLI_TIME_SOURCE_SYSTEM = 0,  // local system clock (the default)
+  CLI_TIME_SOURCE_HTTPS  = 1   // authenticated HTTPS time source
+} cli_time_source_mode_e;
 
 typedef struct {
   char             user_id[CRABS_MAX_USER_ID];
@@ -74,6 +81,17 @@ typedef struct {
   // 'machine blueprint new' starts authoring, replaced by each later 'new',
   // destroyed by 'machine blueprint drop' and by cli_node_destroy.
   machine_blueprint_t* blueprint_draft;
+  // Authenticated time-source selection (A10-L9 wiring, 'time-source'
+  // command). Session-scoped runtime config — NOT serialized anywhere:
+  // implementations are code + endpoint, not machine state. Re-applied to
+  // whichever state_t the node currently carries whenever init/load recreates
+  // that state (otherwise a configured source would silently drop back to the
+  // system clock). R7-02: a configured HTTPS source that cannot fetch never
+  // falls back to the local clock — time reports invalid and window checks
+  // fail closed.
+  int                      time_source_mode;  // cli_time_source_mode_e
+  char                     https_url[256];    // "" = default endpoint
+  crabs_time_source_ops_t* https_source;      // owned ops, NULL otherwise
 } cli_node_t;
 
 // Add (or replace) a per-user signing key the CLI can use to sign operations
@@ -186,6 +204,19 @@ cli_result_e cli_cmd_op_check_dedup(cli_node_t* node, const char* op_type_name,
 // Compaction Command (v1.5.2 §4.3)
 // ============================================================
 cli_result_e cli_cmd_compact(cli_node_t* node);
+
+// ============================================================
+// Time Source Selection (A10-L9 wiring)
+// ============================================================
+// Select the machine's physical clock for this session. 'https' creates and
+// applies the authenticated HTTPS time source (url NULL/"" = default
+// endpoint); 'system' clears any configured source; 'show' prints the
+// current selection. The node's owned ops object is destroyed on switch,
+// clear, and cli_node_destroy. R7-02: a configured source that fails to
+// fetch never falls back to the local clock — time reports invalid.
+cli_result_e cli_cmd_time_source_https(cli_node_t* node, const char* url);
+cli_result_e cli_cmd_time_source_system(cli_node_t* node);
+cli_result_e cli_cmd_time_source_show(cli_node_t* node);
 
 // ============================================================
 // Command Dispatch

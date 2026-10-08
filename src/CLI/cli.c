@@ -105,6 +105,9 @@ cli_node_t* cli_node_create(void) {
   node->abe_mk = NULL;
   node->node_key = NULL;
   node->initialized = false;
+  node->time_source_mode = CLI_TIME_SOURCE_SYSTEM;
+  node->https_url[0] = '\0';
+  node->https_source = NULL;
   return node;
 }
 
@@ -118,6 +121,19 @@ static void cli_node_blueprint_clear(cli_node_t* node) {
 
 void cli_node_destroy(cli_node_t* node) {
   if (node == NULL) return;
+  // The node owns the HTTPS time-source ops but the current state's HLC holds
+  // a raw, non-owning pointer to it (state_set_time_source). Detach it from
+  // the live state FIRST, then destroy the ops, before the state itself is
+  // destroyed below — nothing may observe a dangling ops pointer.
+  if (node->https_source != NULL) {
+    if (node->attr_machine != NULL) {
+      state_set_time_source(&node->attr_machine->base_state, NULL);
+    } else if (node->state != NULL) {
+      state_set_time_source(node->state, NULL);
+    }
+    crabs_time_source_destroy(node->https_source);
+    node->https_source = NULL;
+  }
   cli_node_blueprint_clear(node);
   if (node->state_sig_payload != NULL) {
     free(node->state_sig_payload);
@@ -141,6 +157,52 @@ void cli_node_destroy(cli_node_t* node) {
   if (node->node_key != NULL) crypto_ecdsa_keypair_destroy(node->node_key);
   OPENSSL_cleanse(node->seal_key, sizeof(node->seal_key));
   free(node);
+}
+
+// Re-apply the node's session-scoped time-source selection to the CURRENT
+// state. init/load/load-sealed recreate or swap the node's state_t, so a
+// configured HTTPS source must be re-attached after each — otherwise the
+// machine silently falls back to the system clock. Idempotent: in HTTPS mode
+// a fresh ops object replaces the old one (its monotonic anchor belongs to
+// the old state's lifetime anyway); in SYSTEM mode any existing ops are
+// detached and destroyed. No-op until the node is initialized.
+static void _cli_apply_time_source(cli_node_t* node) {
+  if (node == NULL || !node->initialized || node->attr_machine == NULL) return;
+  state_t* state = &node->attr_machine->base_state;
+
+  if (node->time_source_mode == CLI_TIME_SOURCE_HTTPS) {
+    // Creator-defaults subtlety (time_source.c _create): a NON-NULL config's
+    // scalar fields are used AS-IS — 0 is meaningful (resync 0 = re-query on
+    // every call; max_skew 0 disables the plausibility check), NOT the
+    // documented defaults. The documented defaults apply only when the whole
+    // config is NULL. So either pass NULL config (all defaults, default
+    // endpoint) or spell the CRABS_TIME_SOURCE_DEFAULT_* values out — an
+    // all-zero config would be a very different, much chattier source. Only
+    // server_url maps NULL -> the default endpoint inside a non-NULL config.
+    crabs_time_source_config_t config;
+    config.server_url = node->https_url[0] != '\0' ? node->https_url : NULL;
+    config.resync_interval_ms = CRABS_TIME_SOURCE_DEFAULT_RESYNC_MS;
+    config.timeout_ms = CRABS_TIME_SOURCE_DEFAULT_TIMEOUT_MS;
+    config.max_skew_ms = CRABS_TIME_SOURCE_DEFAULT_MAX_SKEW_MS;
+    crabs_time_source_ops_t* fresh = crabs_time_source_https_create(&config);
+    if (fresh == NULL) {
+      // Allocation failure: leave the state on NO source (never silently on
+      // the system clock — a half-applied authenticated config must fail
+      // closed, R7-02) and drop the stale ops.
+      state_set_time_source(state, NULL);
+      crabs_time_source_destroy(node->https_source);
+      node->https_source = NULL;
+      fprintf(stderr, "ERROR: could not create the HTTPS time source\n");
+      return;
+    }
+    state_set_time_source(state, fresh);
+    crabs_time_source_destroy(node->https_source);
+    node->https_source = fresh;
+  } else {
+    state_set_time_source(state, NULL);
+    crabs_time_source_destroy(node->https_source);
+    node->https_source = NULL;
+  }
 }
 
 cli_result_e cli_node_init(cli_node_t* node, const char* admin_id) {
@@ -176,6 +238,8 @@ cli_result_e cli_node_init(cli_node_t* node, const char* admin_id) {
   // Custody the bootstrap admin's signing key under their user id so the CLI
   // signs admin operations with the admin's key (audit M-17).
   cli_node_add_user_key(node, admin_id, node->node_key);
+  // A pre-seeded session time-source selection survives the state creation.
+  _cli_apply_time_source(node);
   return CLI_OK;
 }
 
@@ -368,6 +432,9 @@ cli_result_e cli_node_load(cli_node_t* node, const char* path) {
                      node->node_key->public_key);
 
   node->initialized = true;
+  // The freshly-loaded state_t knows nothing of the session's time-source
+  // selection — re-attach it (or it would silently revert to system clock).
+  _cli_apply_time_source(node);
   return CLI_OK;
 }
 
@@ -565,6 +632,9 @@ cli_result_e cli_node_load_sealed(cli_node_t* node, const char* path,
   }
   // The seal key is KEPT in node storage after a successful load: the next
   // cli_node_save must seal the MSK under the same key.
+  // Note: the session time-source selection is already re-applied — the state
+  // swap happens inside cli_node_load, whose success path ends with
+  // _cli_apply_time_source.
   return CLI_OK;
 }
 
@@ -1395,6 +1465,71 @@ cli_result_e cli_cmd_compact(cli_node_t* node) {
 }
 
 // ============================================================
+// Time Source Selection (A10-L9 wiring)
+// ============================================================
+
+cli_result_e cli_cmd_time_source_https(cli_node_t* node, const char* url) {
+  if (node == NULL || !node->initialized) return CLI_ERR_NOT_INIT;
+
+  if (url != NULL) {
+    // The native transport's URL parser enforces the scheme downstream too;
+    // rejecting here just yields a clearer message. A bad url must change
+    // NOTHING on the node (no mode flip, no ops churn).
+    if (strncmp(url, "https://", 8) != 0 || url[8] == '\0' ||
+        url[8] == '/' || url[8] == ':') {
+      fprintf(stderr, "ERROR: time source URL must be https://<host>[/path] "
+                      "(got '%s')\n", url);
+      return CLI_ERR_ARGS;
+    }
+    if (strlen(url) > sizeof(node->https_url) - 1) {
+      fprintf(stderr, "ERROR: time source URL too long (max %u chars)\n",
+              (unsigned)(sizeof(node->https_url) - 1));
+      return CLI_ERR_ARGS;
+    }
+  }
+
+  node->time_source_mode = CLI_TIME_SOURCE_HTTPS;
+  node->https_url[0] = '\0';
+  if (url != NULL) {
+    memcpy(node->https_url, url, strlen(url) + 1);
+  }
+  _cli_apply_time_source(node);
+  if (node->https_source == NULL) {
+    // Creation failed — leave the machine on NO source rather than silently
+    // on the system clock (fail closed, R7-02), but don't record a selection
+    // we could not honor.
+    node->time_source_mode = CLI_TIME_SOURCE_SYSTEM;
+    node->https_url[0] = '\0';
+    return CLI_ERR_EXEC;
+  }
+  printf("Time source: https: %s\n",
+         node->https_url[0] != '\0' ? node->https_url
+                                    : CRABS_TIME_SOURCE_DEFAULT_URL);
+  return CLI_OK;
+}
+
+cli_result_e cli_cmd_time_source_system(cli_node_t* node) {
+  if (node == NULL || !node->initialized) return CLI_ERR_NOT_INIT;
+  node->time_source_mode = CLI_TIME_SOURCE_SYSTEM;
+  node->https_url[0] = '\0';
+  _cli_apply_time_source(node);
+  printf("Time source: system (default)\n");
+  return CLI_OK;
+}
+
+cli_result_e cli_cmd_time_source_show(cli_node_t* node) {
+  if (node == NULL || !node->initialized) return CLI_ERR_NOT_INIT;
+  if (node->time_source_mode == CLI_TIME_SOURCE_HTTPS) {
+    printf("time source: https: %s\n",
+           node->https_url[0] != '\0' ? node->https_url
+                                      : CRABS_TIME_SOURCE_DEFAULT_URL);
+  } else {
+    printf("time source: system (default)\n");
+  }
+  return CLI_OK;
+}
+
+// ============================================================
 // Machine Blueprint Authoring (lineage v1.7)
 // ============================================================
 //
@@ -2110,6 +2245,15 @@ static void _print_key_usage(void) {
   printf("  key revoke <user_id>        Revoke and rotate keys for a user\n");
 }
 
+static void _print_time_source_usage(void) {
+  printf("  time-source https [url]   Use the authenticated HTTPS time source\n");
+  printf("                            (url optional; default %s;\n",
+         CRABS_TIME_SOURCE_DEFAULT_URL);
+  printf("                            an unreachable source fails closed: no local-clock fallback)\n");
+  printf("  time-source system        Revert to the local system clock (default)\n");
+  printf("  time-source show          Show the current time source selection\n");
+}
+
 static void _print_op_usage(void) {
   printf("  op submit <type> [payload_hex] [signer_id]           Submit an operation\n");
   printf("  op define <op_type> <dedup_type> [tracker|flag|condition]  Define operation type with dedup\n");
@@ -2224,6 +2368,7 @@ void cli_print_usage(const char* prog) {
   _print_key_usage();
   _print_op_usage();
   _print_machine_usage();
+  _print_time_source_usage();
   printf("  compact                 Run tombstone compaction on all items\n");
   // Audit A10-7b: single-shot mode destroys the node at process exit, so
   // multi-command flows (load → seal-key import → mutate → save) only work
@@ -2321,6 +2466,7 @@ cli_result_e cli_dispatch(cli_node_t* node, int argc, char** argv) {
       strcmp(cmd, "item") != 0 && strcmp(cmd, "policy") != 0 &&
       strcmp(cmd, "key") != 0 && strcmp(cmd, "op") != 0 &&
       strcmp(cmd, "machine") != 0 && strcmp(cmd, "compact") != 0 &&
+      strcmp(cmd, "time-source") != 0 &&
       strcmp(cmd, "seal-key") != 0 && strcmp(cmd, "load-sealed") != 0) {
     printf("Unknown command: %s\n", cmd);
     cli_print_usage(argv[0]);
@@ -2590,6 +2736,26 @@ cli_result_e cli_dispatch(cli_node_t* node, int argc, char** argv) {
 
   if (strcmp(cmd, "compact") == 0) {
     return cli_cmd_compact(node);
+  }
+
+  if (strcmp(cmd, "time-source") == 0) {
+    if (argc < 3) {
+      _print_time_source_usage();
+      return CLI_ERR_ARGS;
+    }
+    const char* time_source_sub = argv[2];
+    if (strcmp(time_source_sub, "https") == 0) {
+      return cli_cmd_time_source_https(node, argc > 3 ? argv[3] : NULL);
+    }
+    if (strcmp(time_source_sub, "system") == 0) {
+      return cli_cmd_time_source_system(node);
+    }
+    if (strcmp(time_source_sub, "show") == 0) {
+      return cli_cmd_time_source_show(node);
+    }
+    printf("Unknown time-source subcommand: %s\n", time_source_sub);
+    _print_time_source_usage();
+    return CLI_ERR_ARGS;
   }
 
   // Unreachable if all commands are handled above
