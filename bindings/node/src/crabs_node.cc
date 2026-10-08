@@ -27,6 +27,8 @@
 #include <openssl/crypto.h>
 #include <string.h>
 #include <stdlib.h>
+#include <cstdint>
+#include <string>
 #include <vector>
 
 extern "C" {
@@ -126,6 +128,18 @@ struct NodeAddonInstanceData {
 struct NodeAdoption {
   attribute_machine_t* am;
 };
+
+// A10-L12: reject non-string input at the boundary with a typed error instead
+// of letting As<Napi::String>() coerce (or throw an untyped N-API failure)
+// on JS-provided values.
+static std::string require_js_string(const Napi::Value& value,
+                                     const char* method, const char* field) {
+  if (!value.IsString()) {
+    throw Napi::TypeError::New(value.Env(),
+        std::string(method) + ": " + field + " must be a string");
+  }
+  return value.As<Napi::String>().Utf8Value();
+}
 
 static std::string to_lower_ascii(const std::string& value) {
   std::string lowered = value;
@@ -536,21 +550,29 @@ private:
     return Napi::String::New(info.Env(), op_->type);
   }
   void SetType(const Napi::CallbackInfo& info, const Napi::Value& val) {
-    strncpy(op_->type, val.As<Napi::String>().Utf8Value().c_str(), CRABS_MAX_OP_NAME - 1);
+    (void)info;
+    strncpy(op_->type, require_js_string(val, "Operation.type", "value").c_str(),
+            CRABS_MAX_OP_NAME - 1);
   }
 
   Napi::Value GetSignerId(const Napi::CallbackInfo& info) {
     return Napi::String::New(info.Env(), op_->signer_id);
   }
   void SetSignerId(const Napi::CallbackInfo& info, const Napi::Value& val) {
-    strncpy(op_->signer_id, val.As<Napi::String>().Utf8Value().c_str(), CRABS_MAX_USER_ID - 1);
+    (void)info;
+    strncpy(op_->signer_id,
+            require_js_string(val, "Operation.signerId", "value").c_str(),
+            CRABS_MAX_USER_ID - 1);
   }
 
   Napi::Value GetNodeId(const Napi::CallbackInfo& info) {
     return Napi::String::New(info.Env(), op_->node_id);
   }
   void SetNodeId(const Napi::CallbackInfo& info, const Napi::Value& val) {
-    strncpy(op_->node_id, val.As<Napi::String>().Utf8Value().c_str(), CRABS_MAX_USER_ID - 1);
+    (void)info;
+    strncpy(op_->node_id,
+            require_js_string(val, "Operation.nodeId", "value").c_str(),
+            CRABS_MAX_USER_ID - 1);
   }
 
   Napi::Value GetPayload(const Napi::CallbackInfo& info) {
@@ -562,11 +584,19 @@ private:
     if (op_->payload) { free(op_->payload); op_->payload = NULL; op_->payload_size = 0; }
     if (val.IsBuffer()) {
       auto buf = val.As<Napi::Buffer<uint8_t>>();
+      // A10-L13: payload_size is u32 — reject an oversize payload rather than
+      // silently truncating the recorded length.
+      if (buf.Length() > UINT32_MAX)
+        throw Napi::RangeError::New(info.Env(),
+            "payload: buffer exceeds UINT32_MAX bytes");
       op_->payload = (uint8_t*)malloc(buf.Length());
       memcpy(op_->payload, buf.Data(), buf.Length());
       op_->payload_size = (uint32_t)buf.Length();
     } else if (val.IsString()) {
       std::string s = val.As<Napi::String>().Utf8Value();
+      if (s.length() > UINT32_MAX)
+        throw Napi::RangeError::New(info.Env(),
+            "payload: string exceeds UINT32_MAX bytes");
       op_->payload = (uint8_t*)malloc(s.length());
       memcpy(op_->payload, s.data(), s.length());
       op_->payload_size = (uint32_t)s.length();
@@ -603,7 +633,10 @@ private:
     if (!hex_decode(hex, priv, 32))
       throw Napi::Error::New(env, "Invalid private key hex");
     serialized_buffer_t* ser = crabs_serialize_for_signing(op_);
-    if (!ser) throw crabs_error(env, CRABS_ERR_SERIALIZATION_ERROR, "sign");
+    if (!ser) {
+      OPENSSL_cleanse(priv, 32);
+      throw crabs_error(env, CRABS_ERR_SERIALIZATION_ERROR, "sign");
+    }
     crabs_error_e rc = crypto_ecdsa_sign(priv, ser->data, ser->len, op_->signature);
     serialized_buffer_destroy(ser);
     OPENSSL_cleanse(priv, 32);
@@ -718,7 +751,8 @@ public:
     if (info.Length() > 1 && info[1].IsObject()) {
       Napi::Object opts = info[1].As<Napi::Object>();
       if (opts.Has("ordering")) {
-        std::string ord = opts.Get("ordering").As<Napi::String>().Utf8Value();
+        std::string ord = require_js_string(opts.Get("ordering"),
+                                            "Node", "ordering");
         use_hlc = (ord == "hlc");
       }
     }
@@ -870,8 +904,8 @@ private:
     Napi::Env env = info.Env();
     if (info.Length() < 2)
       throw Napi::TypeError::New(env, "Expected (userId, publicKeyHex[, initialAttrs])");
-    std::string user_id = info[0].As<Napi::String>().Utf8Value();
-    std::string pk_hex = info[1].As<Napi::String>().Utf8Value();
+    std::string user_id = require_js_string(info[0], "registerUser", "userId");
+    std::string pk_hex = require_js_string(info[1], "registerUser", "publicKeyHex");
     uint8_t pk[33];
     if (!hex_decode(pk_hex, pk, 33))
       throw Napi::Error::New(env, "Invalid public key hex (expected 66 chars)");
@@ -890,10 +924,10 @@ private:
     Napi::Env env = info.Env();
     if (info.Length() < 4)
       throw Napi::TypeError::New(env, "Expected (targetUser, role, value, signerId)");
-    std::string target = info[0].As<Napi::String>().Utf8Value();
-    std::string role = info[1].As<Napi::String>().Utf8Value();
-    std::string value = info[2].As<Napi::String>().Utf8Value();
-    std::string signer = info[3].As<Napi::String>().Utf8Value();
+    std::string target = require_js_string(info[0], "grantRole", "targetUser");
+    std::string role = require_js_string(info[1], "grantRole", "role");
+    std::string value = require_js_string(info[2], "grantRole", "value");
+    std::string signer = require_js_string(info[3], "grantRole", "signerId");
     crabs_error_e rc = attribute_machine_grant_role(am_, target.c_str(),
                                                       role.c_str(), value.c_str(),
                                                       signer.c_str());
@@ -905,9 +939,9 @@ private:
     Napi::Env env = info.Env();
     if (info.Length() < 3)
       throw Napi::TypeError::New(env, "Expected (attribute, value, signerId)");
-    std::string attr = info[0].As<Napi::String>().Utf8Value();
-    std::string value = info[1].As<Napi::String>().Utf8Value();
-    std::string signer = info[2].As<Napi::String>().Utf8Value();
+    std::string attr = require_js_string(info[0], "selfAssert", "attribute");
+    std::string value = require_js_string(info[1], "selfAssert", "value");
+    std::string signer = require_js_string(info[2], "selfAssert", "signerId");
     crabs_error_e rc = attribute_machine_self_assert(am_, attr.c_str(),
                                                        value.c_str(), signer.c_str());
     if (rc != CRABS_SUCCESS) throw crabs_error(env, rc, "selfAssert");
@@ -918,10 +952,10 @@ private:
     Napi::Env env = info.Env();
     if (info.Length() < 4)
       throw Napi::TypeError::New(env, "Expected (targetUser, attribute, value, signerId)");
-    std::string target = info[0].As<Napi::String>().Utf8Value();
-    std::string attr = info[1].As<Napi::String>().Utf8Value();
-    std::string value = info[2].As<Napi::String>().Utf8Value();
-    std::string signer = info[3].As<Napi::String>().Utf8Value();
+    std::string target = require_js_string(info[0], "verifyIdentity", "targetUser");
+    std::string attr = require_js_string(info[1], "verifyIdentity", "attribute");
+    std::string value = require_js_string(info[2], "verifyIdentity", "value");
+    std::string signer = require_js_string(info[3], "verifyIdentity", "signerId");
     crabs_error_e rc = attribute_machine_verify_identity(am_, target.c_str(),
                                                           attr.c_str(), value.c_str(),
                                                           signer.c_str());
@@ -931,11 +965,11 @@ private:
 
   Napi::Value RevokeUser(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
-    std::string user_id = info[0].As<Napi::String>().Utf8Value();
+    std::string user_id = require_js_string(info[0], "revokeUser", "userId");
     // Admin-gated in C (audit follow-up); the signer defaults to the node
     // admin when the caller omits it.
     std::string signer_id = info.Length() > 1 && !info[1].IsUndefined()
-        ? info[1].As<Napi::String>().Utf8Value() : admin_id_;
+        ? require_js_string(info[1], "revokeUser", "signerId") : admin_id_;
     crabs_error_e rc = attribute_machine_revoke_user(am_, user_id.c_str(),
                                                      signer_id.c_str());
     if (rc != CRABS_SUCCESS) throw crabs_error(env, rc, "revokeUser");
@@ -944,7 +978,7 @@ private:
 
   Napi::Value GetUser(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
-    std::string user_id = info[0].As<Napi::String>().Utf8Value();
+    std::string user_id = require_js_string(info[0], "getUser", "userId");
     user_t* user = attribute_machine_find_user(am_, user_id.c_str());
     if (!user) return env.Undefined();
     Napi::Object obj = Napi::Object::New(env);
@@ -999,7 +1033,7 @@ private:
 
   Napi::Value AddCounter(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
-    std::string name = info[0].As<Napi::String>().Utf8Value();
+    std::string name = require_js_string(info[0], "addCounter", "name");
     data_item_t* item = data_item_create(name.c_str(), DATA_TYPE_COUNTER, CRDT_G_COUNTER);
     item->value = g_counter_create();
     crabs_error_e rc = state_add_item(&am_->base_state, item);
@@ -1009,7 +1043,7 @@ private:
 
   Napi::Value AddPNCounter(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
-    std::string name = info[0].As<Napi::String>().Utf8Value();
+    std::string name = require_js_string(info[0], "addPNCounter", "name");
     data_item_t* item = data_item_create(name.c_str(), DATA_TYPE_PN_COUNTER, CRDT_PN_COUNTER);
     item->value = pn_counter_create();
     crabs_error_e rc = state_add_item(&am_->base_state, item);
@@ -1019,7 +1053,7 @@ private:
 
   Napi::Value AddORSet(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
-    std::string name = info[0].As<Napi::String>().Utf8Value();
+    std::string name = require_js_string(info[0], "addORSet", "name");
     data_item_t* item = data_item_create(name.c_str(), DATA_TYPE_SET, CRDT_OR_SET);
     item->value = or_set_create();
     crabs_error_e rc = state_add_item(&am_->base_state, item);
@@ -1029,7 +1063,7 @@ private:
 
   Napi::Value AddOneShotSet(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
-    std::string name = info[0].As<Napi::String>().Utf8Value();
+    std::string name = require_js_string(info[0], "addOneShotSet", "name");
     data_item_t* item = data_item_create(name.c_str(), DATA_TYPE_ONE_SHOT_SET, CRDT_ONE_SHOT_SET);
     item->value = one_shot_set_create();
     crabs_error_e rc = state_add_item(&am_->base_state, item);
@@ -1039,7 +1073,7 @@ private:
 
   Napi::Value AddOneShotFlag(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
-    std::string name = info[0].As<Napi::String>().Utf8Value();
+    std::string name = require_js_string(info[0], "addOneShotFlag", "name");
     data_item_t* item = data_item_create(name.c_str(), DATA_TYPE_ONE_SHOT_FLAG, CRDT_ONE_SHOT_FLAG);
     item->value = one_shot_flag_create();
     crabs_error_e rc = state_add_item(&am_->base_state, item);
@@ -1049,7 +1083,7 @@ private:
 
   Napi::Value AddRegister(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
-    std::string name = info[0].As<Napi::String>().Utf8Value();
+    std::string name = require_js_string(info[0], "addRegister", "name");
     data_item_t* item = data_item_create(name.c_str(), DATA_TYPE_REGISTER, CRDT_LWW_REG);
     int64_t initial = 0;
     if (info.Length() > 1 && info[1].IsNumber())
@@ -1062,7 +1096,7 @@ private:
 
   Napi::Value AddResource(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
-    std::string name = info[0].As<Napi::String>().Utf8Value();
+    std::string name = require_js_string(info[0], "addResource", "name");
     data_item_t* item = data_item_create(name.c_str(), DATA_TYPE_RESOURCE, CRDT_PN_COUNTER);
     item->value = pn_counter_create();
     crabs_error_e rc = state_add_item(&am_->base_state, item);
@@ -1074,7 +1108,7 @@ private:
 
   Napi::Value GetCounter(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
-    std::string name = info[0].As<Napi::String>().Utf8Value();
+    std::string name = require_js_string(info[0], "getCounter", "name");
     data_item_t* item = state_find_item(&am_->base_state, name.c_str());
     if (!item) return env.Undefined();
     if (item->crdt_type == CRDT_G_COUNTER)
@@ -1084,9 +1118,10 @@ private:
 
   Napi::Value IncrementCounter(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
-    std::string name = info[0].As<Napi::String>().Utf8Value();
+    std::string name = require_js_string(info[0], "incrementCounter", "name");
     int64_t delta = info.Length() > 1 ? (int64_t)info[1].As<Napi::Number>().Int64Value() : 1;
-    std::string node_id = info.Length() > 2 ? info[2].As<Napi::String>().Utf8Value() : "system";
+    std::string node_id = info.Length() > 2
+        ? require_js_string(info[2], "incrementCounter", "nodeId") : "system";
     data_item_t* item = state_find_item(&am_->base_state, name.c_str());
     if (!item) throw crabs_error(env, CRABS_ERR_RESOURCE_NOT_FOUND, "incrementCounter");
     crabs_error_e rc = g_counter_increment((g_counter_t*)item->value, node_id.c_str(), delta);
@@ -1096,9 +1131,10 @@ private:
 
   Napi::Value IncrementPNCounter(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
-    std::string name = info[0].As<Napi::String>().Utf8Value();
+    std::string name = require_js_string(info[0], "incrementPNCounter", "name");
     int64_t delta = info.Length() > 1 ? (int64_t)info[1].As<Napi::Number>().Int64Value() : 1;
-    std::string node_id = info.Length() > 2 ? info[2].As<Napi::String>().Utf8Value() : "system";
+    std::string node_id = info.Length() > 2
+        ? require_js_string(info[2], "incrementPNCounter", "nodeId") : "system";
     data_item_t* item = state_find_item(&am_->base_state, name.c_str());
     if (!item) throw crabs_error(env, CRABS_ERR_RESOURCE_NOT_FOUND, "incrementPNCounter");
     crabs_error_e rc = pn_counter_increment((pn_counter_t*)item->value, node_id.c_str(), delta);
@@ -1108,9 +1144,10 @@ private:
 
   Napi::Value DecrementPNCounter(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
-    std::string name = info[0].As<Napi::String>().Utf8Value();
+    std::string name = require_js_string(info[0], "decrementPNCounter", "name");
     int64_t delta = info.Length() > 1 ? (int64_t)info[1].As<Napi::Number>().Int64Value() : 1;
-    std::string node_id = info.Length() > 2 ? info[2].As<Napi::String>().Utf8Value() : "system";
+    std::string node_id = info.Length() > 2
+        ? require_js_string(info[2], "decrementPNCounter", "nodeId") : "system";
     data_item_t* item = state_find_item(&am_->base_state, name.c_str());
     if (!item) throw crabs_error(env, CRABS_ERR_RESOURCE_NOT_FOUND, "decrementPNCounter");
     crabs_error_e rc = pn_counter_decrement((pn_counter_t*)item->value, node_id.c_str(), delta);
@@ -1120,7 +1157,7 @@ private:
 
   Napi::Value GetPNCounter(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
-    std::string name = info[0].As<Napi::String>().Utf8Value();
+    std::string name = require_js_string(info[0], "getPNCounter", "name");
     data_item_t* item = state_find_item(&am_->base_state, name.c_str());
     if (!item) return env.Undefined();
     if (item->crdt_type == CRDT_PN_COUNTER)
@@ -1130,7 +1167,7 @@ private:
 
   Napi::Value GetRegister(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
-    std::string name = info[0].As<Napi::String>().Utf8Value();
+    std::string name = require_js_string(info[0], "getRegister", "name");
     data_item_t* item = state_find_item(&am_->base_state, name.c_str());
     if (!item) return env.Undefined();
     if (item->crdt_type == CRDT_LWW_REG) {
@@ -1145,9 +1182,10 @@ private:
     Napi::Env env = info.Env();
     if (info.Length() < 2)
       throw Napi::TypeError::New(env, "Expected (name, value[, nodeId])");
-    std::string name = info[0].As<Napi::String>().Utf8Value();
+    std::string name = require_js_string(info[0], "setRegister", "name");
     int64_t value = (int64_t)info[1].As<Napi::Number>().Int64Value();
-    std::string node_id = info.Length() > 2 ? info[2].As<Napi::String>().Utf8Value() : "system";
+    std::string node_id = info.Length() > 2
+        ? require_js_string(info[2], "setRegister", "nodeId") : "system";
     data_item_t* item = state_find_item(&am_->base_state, name.c_str());
     if (!item) throw crabs_error(env, CRABS_ERR_RESOURCE_NOT_FOUND, "setRegister");
     if (item->crdt_type != CRDT_LWW_REG)
@@ -1170,8 +1208,8 @@ private:
 
   Napi::Value SetContains(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
-    std::string name = info[0].As<Napi::String>().Utf8Value();
-    std::string element = info[1].As<Napi::String>().Utf8Value();
+    std::string name = require_js_string(info[0], "setContains", "name");
+    std::string element = require_js_string(info[1], "setContains", "element");
     data_item_t* item = state_find_item(&am_->base_state, name.c_str());
     if (!item) return Napi::Boolean::New(env, false);
     bool contains = false;
@@ -1186,9 +1224,10 @@ private:
 
   Napi::Value SetAdd(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
-    std::string name = info[0].As<Napi::String>().Utf8Value();
-    std::string element = info[1].As<Napi::String>().Utf8Value();
-    std::string tag = info.Length() > 2 ? info[2].As<Napi::String>().Utf8Value() : element;
+    std::string name = require_js_string(info[0], "setAdd", "name");
+    std::string element = require_js_string(info[1], "setAdd", "element");
+    std::string tag = info.Length() > 2
+        ? require_js_string(info[2], "setAdd", "tag") : element;
     data_item_t* item = state_find_item(&am_->base_state, name.c_str());
     if (!item) throw crabs_error(env, CRABS_ERR_RESOURCE_NOT_FOUND, "setAdd");
     crabs_error_e rc = CRABS_ERR_TYPE_MISMATCH;
@@ -1202,8 +1241,8 @@ private:
 
   Napi::Value SetRemove(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
-    std::string name = info[0].As<Napi::String>().Utf8Value();
-    std::string element = info[1].As<Napi::String>().Utf8Value();
+    std::string name = require_js_string(info[0], "setRemove", "name");
+    std::string element = require_js_string(info[1], "setRemove", "element");
     data_item_t* item = state_find_item(&am_->base_state, name.c_str());
     if (!item) throw crabs_error(env, CRABS_ERR_RESOURCE_NOT_FOUND, "setRemove");
     if (item->crdt_type == CRDT_OR_SET)
@@ -1213,8 +1252,8 @@ private:
 
   Napi::Value FlagSet(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
-    std::string name = info[0].As<Napi::String>().Utf8Value();
-    std::string setBy = info[1].As<Napi::String>().Utf8Value();
+    std::string name = require_js_string(info[0], "flagSet", "name");
+    std::string setBy = require_js_string(info[1], "flagSet", "setBy");
     uint64_t setAt = info.Length() > 2 ? (uint64_t)info[2].As<Napi::Number>().DoubleValue() : 0;
     data_item_t* item = state_find_item(&am_->base_state, name.c_str());
     if (!item) throw crabs_error(env, CRABS_ERR_RESOURCE_NOT_FOUND, "flagSet");
@@ -1224,7 +1263,7 @@ private:
 
   Napi::Value FlagValue(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
-    std::string name = info[0].As<Napi::String>().Utf8Value();
+    std::string name = require_js_string(info[0], "flagValue", "name");
     data_item_t* item = state_find_item(&am_->base_state, name.c_str());
     if (!item) return Napi::Boolean::New(env, false);
     return Napi::Boolean::New(env, one_shot_flag_value((one_shot_flag_t*)item->value));
@@ -1234,8 +1273,8 @@ private:
 
   Napi::Value SetPolicy(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
-    std::string op_type = info[0].As<Napi::String>().Utf8Value();
-    std::string expr = info[1].As<Napi::String>().Utf8Value();
+    std::string op_type = require_js_string(info[0], "setPolicy", "opType");
+    std::string expr = require_js_string(info[1], "setPolicy", "expression");
     crabs_error_e rc = state_add_policy(&am_->base_state, op_type.c_str(), expr.c_str());
     if (rc != CRABS_SUCCESS) throw crabs_error(env, rc, "setPolicy");
     return env.Undefined();
@@ -1287,7 +1326,10 @@ private:
       if (!hex_decode(hex, priv, 32))
         throw Napi::Error::New(env, "Invalid private key hex");
       serialized_buffer_t* ser = crabs_serialize_for_signing(op->raw());
-      if (!ser) throw crabs_error(env, CRABS_ERR_SERIALIZATION_ERROR, "sign");
+      if (!ser) {
+        OPENSSL_cleanse(priv, 32);
+        throw crabs_error(env, CRABS_ERR_SERIALIZATION_ERROR, "sign");
+      }
       crabs_error_e rc = crypto_ecdsa_sign(priv, ser->data, ser->len, op->raw()->signature);
       serialized_buffer_destroy(ser);
       OPENSSL_cleanse(priv, 32);
@@ -1318,9 +1360,12 @@ private:
     Napi::Object cfg = info[0].As<Napi::Object>();
 
     // Build the operation payload for __create_trigger__
-    std::string trigger_id = cfg.Get("triggerId").As<Napi::String>().Utf8Value();
-    std::string condition = cfg.Get("condition").As<Napi::String>().Utf8Value();
-    std::string effect_type_str = cfg.Get("effectType").As<Napi::String>().Utf8Value();
+    std::string trigger_id = require_js_string(
+        cfg.Get("triggerId"), "createTrigger", "triggerId");
+    std::string condition = require_js_string(
+        cfg.Get("condition"), "createTrigger", "condition");
+    std::string effect_type_str = require_js_string(
+        cfg.Get("effectType"), "createTrigger", "effectType");
     // Map string effect type to the numeric enum value (trigger_effect_type_e
     // in trigger.h: ISSUE_ATTRIBUTE=0x01, CREATE_TRIGGER=0x02, etc.)
     int effect_type_num = 0;
@@ -1331,7 +1376,9 @@ private:
     else if (effect_type_str == "change_policy") effect_type_num = 5;
     else throw Napi::Error::New(env, "Unknown effectType: " + effect_type_str);
 
-    std::string description = cfg.Has("description") ? cfg.Get("description").As<Napi::String>().Utf8Value() : "";
+    std::string description = cfg.Has("description")
+        ? require_js_string(cfg.Get("description"), "createTrigger", "description")
+        : "";
     uint64_t cooldown = cfg.Has("cooldownMs") ? (uint64_t)cfg.Get("cooldownMs").As<Napi::Number>().DoubleValue() : 0;
     bool one_shot = cfg.Has("oneShot") ? cfg.Get("oneShot").As<Napi::Boolean>().Value() : false;
 
@@ -1351,9 +1398,12 @@ private:
 
     // Add effect-specific fields
     if (effect_type_str == "issue_attribute") {
-      std::string attr = cfg.Get("issueAttribute").As<Napi::String>().Utf8Value();
-      std::string role = cfg.Get("targetRole").As<Napi::String>().Utf8Value();
-      std::string value = cfg.Get("attributeValue").As<Napi::String>().Utf8Value();
+      std::string attr = require_js_string(
+          cfg.Get("issueAttribute"), "createTrigger", "issueAttribute");
+      std::string role = require_js_string(
+          cfg.Get("targetRole"), "createTrigger", "targetRole");
+      std::string value = require_js_string(
+          cfg.Get("attributeValue"), "createTrigger", "attributeValue");
       uint64_t duration = cfg.Has("durationMs") ? (uint64_t)cfg.Get("durationMs").As<Napi::Number>().DoubleValue() : 0;
       written = snprintf(payload + pos, sizeof(payload) - pos,
         ";issue_attribute=%s;target_role=%s;attribute_value=%s;duration_ms=%llu",
@@ -1398,7 +1448,7 @@ private:
     if (info.Length() < 2)
       throw Napi::TypeError::New(env, "Expected (payload, policy)");
     auto buf = info[0].As<Napi::Buffer<uint8_t>>();
-    std::string policy = info[1].As<Napi::String>().Utf8Value();
+    std::string policy = require_js_string(info[1], "encrypt", "policy");
 
     abe_ciphertext_t* ct = crypto_abe_encrypt((const abe_master_key_t*)am_->base_state.abe_mk,
                                                 buf.Data(), buf.Length(),

@@ -235,5 +235,28 @@ assert(survivorEvents.length > 0,
   'listeners must still fire when an earlier listener unregisters itself');
 survivorOff();
 
+// Test 21: typed rejection of non-string arguments (A10-L12). Unguarded
+// As<Napi::String>() conversions used to coerce or die untyped; every
+// JS-controlled string boundary now throws a TypeError naming the field.
+function expectTypeError(thunk, label) {
+  try {
+    thunk();
+    assert(false, `${label} should throw a TypeError`);
+  } catch (typeRejection) {
+    assert(typeRejection instanceof TypeError &&
+           typeRejection.message.includes('must be a string'),
+      `${label} should throw a typed 'must be a string' error`);
+  }
+}
+expectTypeError(() => node.addCounter(42), 'addCounter(number)');
+expectTypeError(() => node.getUser(null), 'getUser(null)');
+expectTypeError(() => node.revokeUser({}), 'revokeUser(object)');
+expectTypeError(() => node.setPolicy('view', 7), 'setPolicy(number expr)');
+expectTypeError(() => node.createTrigger({ triggerId: 1, condition: 'true',
+                                           effectType: 'issue_attribute' }),
+  'createTrigger(number triggerId)');
+const typedOp = new Operation('typed');
+expectTypeError(() => { typedOp.signerId = 42; }, 'Operation.signerId = number');
+
 console.log(`\n${passed} passed, ${failed} failed`);
 process.exit(failed > 0 ? 1 : 0);
