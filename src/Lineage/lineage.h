@@ -232,8 +232,10 @@ crabs_error_e lineage_key_rotate(state_t* parent_state,
 //       → CRABS_ERR_INVALID_PARAM
 //   - machine not bound to a parent, or lineage dissolved
 //       → CRABS_ERR_UNAUTHORIZED
-//   - old_pk matches no chain entry (no continuity proof), or the signature
-//     fails under that entry → CRABS_ERR_CRYPTOGRAPHIC_ERROR
+//   - old_pk is not the chain TIP (transitions are accepted only from the
+//     currently-pinned tip key — a compromised RETIRED key can no longer
+//     advance the chain), or the signature fails under the tip
+//       → CRABS_ERR_CRYPTOGRAPHIC_ERROR
 //   - new_key_version != (max chain version) + 1 (rollback, replay, or gap),
 //     or new_pk equals an existing chain key → CRABS_ERR_INVALID_PARAM
 //   - chain already holds CRABS_MAX_LINEAGE_KEY_CHAIN entries, or OOM growing

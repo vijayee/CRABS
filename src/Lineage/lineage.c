@@ -2133,17 +2133,27 @@ crabs_error_e lineage_child_accept_key_transition(state_t* child_state,
   }
 
   // Continuity proof: the transition is authorized by the private half of
-  // the chain entry it retires — the exact old_pk entry, not "any chain key".
-  const lineage_key_chain_entry_t* retired_entry = NULL;
-  for (uint32_t chain_index = 0;
-       chain_index < child_state->lineage_key_chain_count; chain_index++) {
-    if (memcmp(child_state->lineage_key_chain[chain_index].public_key,
-               old_public_key, 33) == 0) {
-      retired_entry = &child_state->lineage_key_chain[chain_index];
-      break;
-    }
+  // the chain TIP it retires. Tip-only admission is deliberate hardening:
+  // every honest record (rotation signed with the current node key ==
+  // chain tip; re-emission re-delivers that same record) names the tip, so
+  // refusing retired-key records closes the "compromised retired key can
+  // still advance the chain" hole with zero legitimate-traffic cost. Key
+  // rotation retires the tip (version-bump authority moves to the new key),
+  // but chain-wide verification (lineage_verify_by_parent_key) keeps prior
+  // entries accepted for historical attestations/tombstones.
+  // Guard the tip index rather than assume it: a bound state SHOULD always
+  // carry chain_count >= 1 (spawn stamps the pin; the deserializer
+  // synthesizes one), but a hand-built state could reach here with no
+  // chain — fail closed instead of underflowing.
+  if (child_state->lineage_key_chain_count == 0) {
+    return CRABS_ERR_CRYPTOGRAPHIC_ERROR;
   }
-  if (retired_entry == NULL) return CRABS_ERR_CRYPTOGRAPHIC_ERROR;
+  const lineage_key_chain_entry_t* retired_entry =
+      &child_state->lineage_key_chain[
+          child_state->lineage_key_chain_count - 1];
+  if (memcmp(retired_entry->public_key, old_public_key, 33) != 0) {
+    return CRABS_ERR_CRYPTOGRAPHIC_ERROR;
+  }
   if (!crypto_verify_operation(retired_entry->public_key, record, body_len,
                                signature)) {
     return CRABS_ERR_CRYPTOGRAPHIC_ERROR;

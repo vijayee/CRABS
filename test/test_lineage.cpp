@@ -3300,8 +3300,8 @@ TEST(TestLineage, KeyChainRollbackAndGapRejected) {
             CRABS_ERR_INVALID_PARAM);
   record[0] = 'P';
 
-  // Continuity proof: old_pk names no chain entry, so nothing can verify the
-  // signature (forged by a foreign key).
+  // Continuity proof: old_pk is not the chain tip (it matches no chain entry
+  // at all), so it fails the tip gate before any signature work.
   size_t forged_len = keychain_make_record(
       2, harness.k2->public_key, harness.foreign->public_key, "parent-red",
       harness.foreign->private_key, record, sizeof(record));
@@ -3328,14 +3328,15 @@ TEST(TestLineage, KeyChainRollbackAndGapRejected) {
   keychain_harness_destroy(&harness);
 }
 
-// Continuity-proof forgery path: the record's old_pk field names the chain's
-// spawn pin (k1.public — retired_entry IS found), so the chain lookup
-// succeeds, but the signature was made by a foreign/never-registered private
-// key. Verification against the pinned k1.public fails, refusing the record
-// with CRABS_ERR_CRYPTOGRAPHIC_ERROR and leaving the chain byte-identical.
-// (The sibling case in KeyChainRollbackAndGapRejected — old_pk matches NO
-// chain entry — exercises the earlier retired_entry == NULL refusal; this one
-// isolates the verify-under-known-old_key failure.)
+// Continuity-proof forgery path: the record's old_pk field names the chain
+// TIP (k1.public — the tip gate passes), but the signature was made by a
+// foreign/never-registered private key. Verification against the pinned
+// k1.public fails, refusing the record with CRABS_ERR_CRYPTOGRAPHIC_ERROR
+// and leaving the chain byte-identical.
+// (The sibling cases — old_pk is not the tip:
+// KeyChainRollbackAndGapRejected exercises a never-chained key,
+// KeyChainTipOnlyTransitionAccepted exercises a RETIRED chain key; this one
+// isolates the verify-under-known-tip failure.)
 TEST(TestLineage, KeyChainForgedSignatureUnderKnownOldKey) {
   keychain_harness_t harness;
   keychain_harness_setup(&harness);
@@ -3362,6 +3363,64 @@ TEST(TestLineage, KeyChainForgedSignatureUnderKnownOldKey) {
                    chain_count_before * sizeof(lineage_key_chain_entry_t)),
             0);
 
+  keychain_harness_destroy(&harness);
+}
+
+// Tip-only admission: a transition's old_pk must be the chain TIP — a record
+// signed by a RETIRED (but still chained) key must NOT advance the chain,
+// even when its signature is perfectly valid. Chain [(1,k1),(2,k2)]: the
+// record retiring k1 is refused; the record retiring k2 (the tip) succeeds.
+TEST(TestLineage, KeyChainTipOnlyTransitionAccepted) {
+  keychain_harness_t harness;
+  keychain_harness_setup(&harness);
+
+  // Advance the child to chain [(1,k1),(2,k2)] via a legitimate rotation.
+  uint8_t* record = nullptr;
+  size_t record_len = 0;
+  ASSERT_EQ(lineage_key_rotate(harness.parent_state,
+                               harness.k2->private_key, harness.k2->public_key,
+                               0, &record, &record_len),
+            CRABS_SUCCESS);
+  ASSERT_EQ(lineage_child_accept_key_transition(harness.child_state, record,
+                                                record_len),
+            CRABS_SUCCESS);
+  ASSERT_EQ(harness.child_state->lineage_key_chain_count, 2u);
+  free(record);
+
+  ecdsa_keypair_t* k3 = crypto_ecdsa_generate();
+  ASSERT_NE(k3, nullptr);
+
+  // Snapshot the chain so the refusal can be proven mutation-free.
+  lineage_key_chain_entry_t chain_before[CRABS_MAX_LINEAGE_KEY_CHAIN];
+  memcpy(chain_before, harness.child_state->lineage_key_chain,
+         2 * sizeof(lineage_key_chain_entry_t));
+
+  // A compromised RETIRED key: old_pk = k1, signed VALIDLY by k1's private
+  // half, correct version continuity (3) and a fresh new_pk — still refused.
+  uint8_t forged[LINEAGE_KEY_TRANSITION_WIRE_MAX];
+  size_t forged_len = keychain_make_record(
+      3, k3->public_key, harness.k1->public_key, "parent-red",
+      harness.k1->private_key, forged, sizeof(forged));
+  EXPECT_EQ(lineage_child_accept_key_transition(harness.child_state, forged,
+                                                forged_len),
+            CRABS_ERR_CRYPTOGRAPHIC_ERROR);
+  EXPECT_EQ(harness.child_state->lineage_key_chain_count, 2u);
+  EXPECT_EQ(memcmp(harness.child_state->lineage_key_chain, chain_before,
+                   2 * sizeof(lineage_key_chain_entry_t)), 0);
+
+  // The tip key (k2) may still advance the chain.
+  size_t tip_len = keychain_make_record(
+      3, k3->public_key, harness.k2->public_key, "parent-red",
+      harness.k2->private_key, forged, sizeof(forged));
+  EXPECT_EQ(lineage_child_accept_key_transition(harness.child_state, forged,
+                                                tip_len),
+            CRABS_SUCCESS);
+  ASSERT_EQ(harness.child_state->lineage_key_chain_count, 3u);
+  EXPECT_EQ(harness.child_state->lineage_key_chain[2].key_version, 3u);
+  EXPECT_EQ(memcmp(harness.child_state->lineage_key_chain[2].public_key,
+                   k3->public_key, 33), 0);
+
+  crypto_ecdsa_keypair_destroy(k3);
   keychain_harness_destroy(&harness);
 }
 
