@@ -108,8 +108,12 @@ policy pairs, registered as custom ops so authorization applies to each):
 | `__dissolve_machine__`   | Parent-signed tombstone halts a delegated child.    |
 | `__withdraw_genesis__`   | Sovereign-only: remove genesis attestation.         |
 
-Read-only lineage access is API-first (`lineage_query_children`); the CLI and
-devtools surface the same data.
+As implemented, `lineage_install` registers two more ops beyond this design
+table: `__receive_dissolution__` (child-side tombstone delivery, so a detached
+child durably severs its own parent lineage) and `__parent_key_update__`
+(child-side admission of a parent key-chain transition after a parent key
+rotation). Read-only lineage access is API-first (`lineage_query_children`);
+the CLI and devtools surface the same data.
 
 ## Trust profiles
 
