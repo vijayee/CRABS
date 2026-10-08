@@ -2,8 +2,8 @@
 // Lineage (v1.7: machines mint machines) — blueprint data layer:
 // create/destroy, append helpers, and full structural validation, plus the
 // lineage ops (__spawn_machine__ / __revoke_attestation__ /
-// __dissolve_machine__ / __withdraw_genesis__ / __receive_dissolution__)
-// registered on a machine by lineage_install.
+// __dissolve_machine__ / __withdraw_genesis__ / __receive_dissolution__ /
+// __parent_key_update__) registered on a machine by lineage_install.
 //
 // Error mapping (crabs.h has no policy-specific enumerator, so the nearest
 // real ones carry the semantics):
