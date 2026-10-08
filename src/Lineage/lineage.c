@@ -1931,7 +1931,7 @@ crabs_error_e crabs_issue_attestation(state_t* parent,
 //   + string16 parent_id + u64le created_at
 // Returns bytes written, or 0 when cap is too small — true at EVERY stage,
 // including the trailing created_at — or when parent_id is not NUL-terminated
-// (strlen + 1 fails closed like the tombstone writer).
+// within CRABS_MAX_USER_ID (strnlen-bounded, like the attestation writer).
 static size_t _lineage_key_transition_write_body(uint64_t new_key_version,
                                                  const uint8_t new_pk[33],
                                                  const uint8_t old_pk[33],
@@ -1949,8 +1949,12 @@ static size_t _lineage_key_transition_write_body(uint64_t new_key_version,
   offset += 33;
   memcpy(out + offset, old_pk, 33);
   offset += 33;
+  // A11-L3: parent_id arrives as a pointer into a fixed char[CRABS_MAX_USER_ID]
+  // field — bound the length read at that declared capacity (the attestation
+  // writer's sizeof-field discipline): a capacity-full, unterminated field is
+  // a caller bug and _lineage_string16_write fails closed on it.
   if (!_lineage_string16_write(out, cap, &offset, parent_id,
-                               strlen(parent_id) + 1)) {
+                               CRABS_MAX_USER_ID)) {
     return 0;
   }
   // A11-L2: the trailing write needs its own cap check — a cap in

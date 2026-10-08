@@ -3642,6 +3642,22 @@ TEST(TestLineage, KeyTransitionBodyWriterRefusesUndersizedCap) {
   EXPECT_EQ(written, 0u);
 }
 
+// Regression for audit A11-L3: the body writer bounds its parent_id length
+// read at CRABS_MAX_USER_ID and fails closed when the field has no NUL inside
+// that window (deserialized states are always terminated; a hand-built state
+// could violate it, and the old strlen would read past the fixed field).
+TEST(TestLineage, KeyTransitionBodyWriterRefusesUnterminatedParentId) {
+  uint8_t new_pk[33] = {0};
+  uint8_t old_pk[33] = {0};
+  uint8_t out[LINEAGE_KEY_TRANSITION_BODY_MAX] = {0};
+  char unterminated[CRABS_MAX_USER_ID];
+  memset(unterminated, 'a', sizeof(unterminated));
+  size_t written = crabs_test_lineage_key_transition_write_body(
+      CRABS_LINEAGE_KEY_VERSION_START + 1, new_pk, old_pk, unterminated, 0,
+      out, sizeof(out));
+  EXPECT_EQ(written, 0u);
+}
+
 TEST(TestLineage, KeyChainVerifyByAnyChainKey) {
   keychain_harness_t harness;
   keychain_harness_setup(&harness);
