@@ -231,15 +231,25 @@ void          cli_print_usage(const char* prog);
 // was unusable in the shipped binary. The shell dispatches each entered line
 // against the SAME persistent node instead.
 //
-// Tokenizes one input line (whitespace-separated) and dispatches it against
-// `node`. `line` is modified in place (strtok). Blank lines are no-ops and
-// return CLI_OK. A line whose first token is "exit" or "quit" is handled
-// here, never reaches cli_dispatch, and sets `*should_exit` so the caller's
-// loop stops; on entry `*should_exit` is always cleared first, so the caller
-// can reuse one flag across iterations. Lines with more than the fixed token
-// limit are REFUSED with CLI_ERR_ARGS rather than silently truncated:
-// truncation could quietly drop an argument from a destructive command and
-// retarget it. All other lines go to cli_dispatch and its result is returned
+// Tokenizes one input line and dispatches it against `node`. `line` is
+// modified in place. Tokenizer grammar (audit 11 A11-2 — quote-aware):
+//   - Whitespace (space/tab/CR/LF) separates tokens OUTSIDE a quote span.
+//   - '"' or '\'' opens a no-split span ending at the MATCHING quote char;
+//     the quote chars are stripped from the token, the other quote kind
+//     inside a span is an ordinary byte, and a span concatenates with
+//     adjacent text into one token ("ab"cd → abcd).
+//   - There are NO escape sequences: backslash is an ordinary byte.
+//   - An unbalanced quote at end of line REFUSES the line (CLI_ERR_ARGS),
+//     as does a token consisting of an empty quoted span ("").
+//   - Lines with more than the fixed token limit are REFUSED with
+//     CLI_ERR_ARGS rather than silently truncated: truncation could quietly
+//     drop an argument from a destructive command and retarget it (and, per
+//     A11-2, silently weaken an installed policy expression).
+// Blank lines are no-ops and return CLI_OK. A line whose first token is
+// "exit" or "quit" is handled here, never reaches cli_dispatch, and sets
+// `*should_exit` so the caller's loop stops; on entry `*should_exit` is
+// always cleared first, so the caller can reuse one flag across iterations.
+// All other lines go to cli_dispatch and its result is returned
 // (CLI_OK on success).
 cli_result_e cli_shell_execute_line(cli_node_t* node, char* line,
                                      bool* should_exit);

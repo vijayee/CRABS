@@ -2312,6 +2312,15 @@ static cli_result_e _dispatch_machine_blueprint(cli_node_t* node, int argc,
       printf("Usage: machine blueprint policy <operation> <expression>\n");
       return CLI_ERR_ARGS;
     }
+    // A11-2: the expression is ONE argument; refuse surplus words (silent
+    // truncation weakens the policy) with a pointer to quoting.
+    if (argc > 6) {
+      printf("Error: 'machine blueprint policy' takes exactly <operation> "
+             "<expression>.\n"
+             "  Quote expressions with spaces, e.g.: machine blueprint policy "
+             "myop \"role:admin OR role:member\"\n");
+      return CLI_ERR_ARGS;
+    }
     return _machine_blueprint_cmd_policy(node, argv[4], argv[5]);
   }
   if (strcmp(sub, "dedup") == 0) {
@@ -2323,6 +2332,14 @@ static cli_result_e _dispatch_machine_blueprint(cli_node_t* node, int argc,
       printf("  For global:   ... dedup <op_type> global <flag_path>\n");
       printf("  For custom:   ... dedup <op_type> custom <condition>\n");
       printf("  For none:     ... dedup <op_type> none\n");
+      return CLI_ERR_ARGS;
+    }
+    // A11-2: condition (custom) and rejection_message are each ONE argument;
+    // refuse surplus words (silent truncation changes the guard textually)
+    // with a pointer to quoting.
+    if (argc > 8) {
+      printf("Error: surplus arguments. Quote a custom <condition> or "
+             "<rejection_message> that contains spaces.\n");
       return CLI_ERR_ARGS;
     }
     return _machine_blueprint_cmd_dedup(node, argv[4], argv[5],
@@ -2647,6 +2664,17 @@ cli_result_e cli_dispatch(cli_node_t* node, int argc, char** argv) {
         printf("Usage: policy add <operation> <expression>\n");
         return CLI_ERR_ARGS;
       }
+      // A11-2 (defense in depth): the expression is exactly ONE argument.
+      // Unquoted surplus words used to be silently dropped here, truncating
+      // e.g. "role:admin OR role:member" to "role:admin" — a policy-
+      // weakening footgun that also hits single-shot argv users (their own
+      // shell already split the words). Refuse with a pointer to quoting.
+      if (argc > 5) {
+        printf("Error: 'policy add' takes exactly <operation> <expression>.\n"
+               "  Quote expressions with spaces, e.g.: policy add myop "
+               "\"role:admin OR role:member\"\n");
+        return CLI_ERR_ARGS;
+      }
       return cli_cmd_policy_add(node, argv[3], argv[4]);
     }
     printf("Unknown policy subcommand: %s\n", argv[2]);
@@ -2712,6 +2740,17 @@ cli_result_e cli_dispatch(cli_node_t* node, int argc, char** argv) {
         printf("  For none: op define <op_type> none\n");
         return CLI_ERR_ARGS;
       }
+      // A11-2: the tracker_path/flag_path/condition is ONE argument; a
+      // custom <condition> is an expression that may contain spaces. Refuse
+      // surplus words (silent truncation changes the guard) with a pointer
+      // to quoting.
+      if (argc > 6) {
+        printf("Error: 'op define' takes at most one "
+               "tracker_path/flag_path/condition argument.\n"
+               "  Quote a condition with spaces, e.g.: op define myop custom "
+               "\"votes.count >= 3\"\n");
+        return CLI_ERR_ARGS;
+      }
       const char* path = argc > 5 ? argv[5] : NULL;
       bool dedup_valid = false;
       dedup_type_e dtype = _parse_dedup_type(argv[4], &dedup_valid);
@@ -2773,6 +2812,82 @@ cli_result_e cli_dispatch(cli_node_t* node, int argc, char** argv) {
 // which could silently retarget a destructive command's arguments).
 #define CLI_SHELL_MAX_TOKENS 32
 
+static bool _cli_shell_is_space(char c) {
+  return c == ' ' || c == '\t' || c == '\r' || c == '\n';
+}
+
+// Audit 11 A11-2: quote-aware tokenizer. The pre-fix whitespace split
+// silently truncated quoted-looking input — `policy add myop role:admin OR
+// role:member` installed the weakened policy "role:admin" and echoed only
+// that. Grammar (kept minimal and documented in cli.h):
+//   - Whitespace separates tokens while OUTSIDE a quote span.
+//   - '"' or '\'' opens a no-split span: every byte up to the MATCHING
+//     quote char belongs to the current token, whitespace included; the
+//     quote chars themselves are stripped. The other quote kind inside a
+//     span is an ordinary byte. A span that opens mid-token concatenates
+//     with the adjacent text into one token ("ab"cd parses as: abcd).
+//   - There are NO escape sequences: backslash is an ordinary byte.
+//   - An unbalanced quote at end of line is REFUSED (CLI_ERR_ARGS): the
+//     operator's intent is unreadable and dispatching a cut-off token could
+//     retarget a destructive command.
+//   - A token consisting entirely of an empty quoted span (e.g. "") is
+//     REFUSED (CLI_ERR_ARGS): ambiguous intent, no command takes an empty
+//     argument legitimately.
+//   - More than CLI_SHELL_MAX_TOKENS tokens → REFUSED (never truncated).
+// The parse runs in place: each emitted token is never longer than the input
+// span consumed, so the write cursor never passes the read cursor.
+static cli_result_e _cli_shell_tokenize(char* line, char** argv,
+                                        int* token_count) {
+  int count = 0;
+  char* read = line;
+  while (_cli_shell_is_space(*read)) read++;
+
+  while (*read != '\0') {
+    if (count >= CLI_SHELL_MAX_TOKENS) {
+      // A 33rd token exists: refuse the whole line rather than dispatch a
+      // truncated argument list. Routed to stderr (matching _run_shell's
+      // per-line failure label) so the message does not land on stdout where
+      // a scripted consumer might mistake it for command output.
+      fprintf(stderr, "Error: too many tokens in one line (max %d).\n",
+              CLI_SHELL_MAX_TOKENS);
+      return CLI_ERR_ARGS;
+    }
+    char* token_begin = read;
+    char* write = read;
+    while (*read != '\0' && !_cli_shell_is_space(*read)) {
+      if (*read == '"' || *read == '\'') {
+        char quote = *read;
+        read++;
+        while (*read != '\0' && *read != quote) {
+          *write++ = *read++;
+        }
+        if (*read == '\0') {
+          fprintf(stderr, "Error: unbalanced quote in line.\n");
+          return CLI_ERR_ARGS;
+        }
+        read++;  // consume the closing quote char
+        continue;
+      }
+      *write++ = *read++;
+    }
+    if (write == token_begin) {
+      fprintf(stderr,
+              "Error: empty quoted token is ambiguous; remove it or give it "
+              "content.\n");
+      return CLI_ERR_ARGS;
+    }
+    // Skip the separator BEFORE terminating the token: for an unquoted
+    // token `write` sits exactly on the separator char, and the '\0' would
+    // otherwise clobber the whitespace the skip must consume.
+    while (_cli_shell_is_space(*read)) read++;
+    *write = '\0';
+    argv[count] = token_begin;
+    count++;
+  }
+  *token_count = count;
+  return CLI_OK;
+}
+
 cli_result_e cli_shell_execute_line(cli_node_t* node, char* line,
                                      bool* should_exit) {
   if (node == NULL || line == NULL || should_exit == NULL) {
@@ -2786,21 +2901,9 @@ cli_result_e cli_shell_execute_line(cli_node_t* node, char* line,
   char* argv[CLI_SHELL_MAX_TOKENS + 1];
   argv[0] = (char*)"crabs_node";  // program name for dispatch usage messages
   int token_count = 0;
-  char* token = strtok(line, " \t\r\n");
-  while (token != NULL && token_count < CLI_SHELL_MAX_TOKENS) {
-    argv[token_count + 1] = token;
-    token_count++;
-    token = strtok(NULL, " \t\r\n");
-  }
-  if (token != NULL) {
-    // A 33rd token exists: refuse the whole line rather than dispatch a
-    // truncated argument list. Routed to stderr (matching _run_shell's
-    // per-line failure label) so the message does not land on stdout where
-    // a scripted consumer might mistake it for command output.
-    fprintf(stderr, "Error: too many tokens in one line (max %d).\n",
-            CLI_SHELL_MAX_TOKENS);
-    return CLI_ERR_ARGS;
-  }
+  cli_result_e tokenize_result = _cli_shell_tokenize(line, &argv[1],
+                                                     &token_count);
+  if (tokenize_result != CLI_OK) return tokenize_result;
   if (token_count == 0) return CLI_OK;  // blank line: no-op
 
   if (strcmp(argv[1], "exit") == 0 || strcmp(argv[1], "quit") == 0) {

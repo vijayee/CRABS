@@ -2533,3 +2533,142 @@ TEST(ShellLine, UnknownCommandSurfacesError) {
   EXPECT_TRUE(should_exit);
   cli_node_destroy(node);
 }
+
+// ============================================================
+// Shell tokenizer quoting (audit 11 A11-2). The pre-fix tokenizer split on
+// whitespace with no quoting, so
+//   policy add myop role:admin OR role:member
+// silently installed the TRUNCATED policy "role:admin" — a policy-weakening
+// footgun — and the confirmation echoed only the truncated form. The
+// tokenizer is now quote-aware ('"' and '\'' create one token containing
+// spaces), and expression-taking arms REFUSE surplus words instead of
+// dropping them.
+// ============================================================
+
+TEST(ShellTokenizer, QuotedPolicyExpressionInstallsFully) {
+  cli_node_t* node = cli_node_create();
+  ASSERT_NE(node, nullptr);
+  bool should_exit = false;
+  char init_line[] = "init shell_admin";
+  ASSERT_EQ(cli_shell_execute_line(node, init_line, &should_exit), CLI_OK);
+
+  // Quoting carries the full OR expression through as ONE argument.
+  char double_quoted[] = "policy add myop \"role:admin OR role:member\"";
+  EXPECT_EQ(cli_shell_execute_line(node, double_quoted, &should_exit),
+            CLI_OK);
+  const char* expression =
+      state_find_policy(&node->attr_machine->base_state, "myop");
+  ASSERT_NE(expression, nullptr);
+  EXPECT_STREQ(expression, "role:admin OR role:member");
+
+  // Single quotes work the same way (state_add_policy updates in place, so
+  // this also proves the second install lands whole, not truncated).
+  char single_quoted[] = "policy add myop 'role:member OR role:reader'";
+  EXPECT_EQ(cli_shell_execute_line(node, single_quoted, &should_exit),
+            CLI_OK);
+  expression = state_find_policy(&node->attr_machine->base_state, "myop");
+  ASSERT_NE(expression, nullptr);
+  EXPECT_STREQ(expression, "role:member OR role:reader");
+
+  EXPECT_FALSE(should_exit);
+  cli_node_destroy(node);
+}
+
+TEST(ShellTokenizer, UnquotedSpacedPolicyRefused) {
+  cli_node_t* node = cli_node_create();
+  ASSERT_NE(node, nullptr);
+  bool should_exit = false;
+  char init_line[] = "init shell_admin";
+  ASSERT_EQ(cli_shell_execute_line(node, init_line, &should_exit), CLI_OK);
+
+  // Without quotes the expression is NOT silently truncated to "role:admin":
+  // the line is refused outright and nothing is installed (A11-2). This
+  // protects single-shot (argv) users too, whose shells also split on
+  // whitespace.
+  char unquoted[] = "policy add myop role:admin OR role:member";
+  EXPECT_EQ(cli_shell_execute_line(node, unquoted, &should_exit),
+            CLI_ERR_ARGS);
+  EXPECT_EQ(state_find_policy(&node->attr_machine->base_state, "myop"),
+            nullptr);
+  EXPECT_FALSE(should_exit);
+
+  // The node stays usable after the refused line.
+  char quoted[] = "policy add myop \"role:admin\"";
+  EXPECT_EQ(cli_shell_execute_line(node, quoted, &should_exit), CLI_OK);
+  const char* expression =
+      state_find_policy(&node->attr_machine->base_state, "myop");
+  ASSERT_NE(expression, nullptr);
+  EXPECT_STREQ(expression, "role:admin");
+  cli_node_destroy(node);
+}
+
+TEST(ShellTokenizer, UnbalancedQuoteRefused) {
+  cli_node_t* node = cli_node_create();
+  ASSERT_NE(node, nullptr);
+  bool should_exit = false;
+  char init_line[] = "init shell_admin";
+  ASSERT_EQ(cli_shell_execute_line(node, init_line, &should_exit), CLI_OK);
+
+  // A quote with no closing partner at end of line: the operator's intent is
+  // unreadable, so the whole line is refused and nothing installs.
+  char unbalanced[] = "policy add myop \"role:admin";
+  EXPECT_EQ(cli_shell_execute_line(node, unbalanced, &should_exit),
+            CLI_ERR_ARGS);
+  EXPECT_EQ(state_find_policy(&node->attr_machine->base_state, "myop"),
+            nullptr);
+  EXPECT_FALSE(should_exit);
+  cli_node_destroy(node);
+}
+
+TEST(ShellTokenizer, SingleQuotesAndMixedArgs) {
+  cli_node_t* node = cli_node_create();
+  ASSERT_NE(node, nullptr);
+  bool should_exit = false;
+  char init_line[] = "init shell_admin";
+  ASSERT_EQ(cli_shell_execute_line(node, init_line, &should_exit), CLI_OK);
+
+  // A space-containing identifier as a real single argument: item add takes
+  // <name> <type>; the quoted name arrives as ONE token and the unquoted
+  // type token still splits at whitespace.
+  char item_line[] = "item add \"my item\" counter";
+  EXPECT_EQ(cli_shell_execute_line(node, item_line, &should_exit), CLI_OK);
+  data_item_t* item = state_find_item(&node->attr_machine->base_state,
+                                      "my item");
+  ASSERT_NE(item, nullptr);
+  // "counter" landed as the separate type argument, not glued to the name.
+  EXPECT_EQ(state_find_item(&node->attr_machine->base_state,
+                            "my item\" counter"),
+            nullptr);
+
+  // Single-quoted identifier, same shape.
+  char single_item_line[] = "item add 'other item' set";
+  EXPECT_EQ(cli_shell_execute_line(node, single_item_line, &should_exit),
+            CLI_OK);
+  EXPECT_NE(state_find_item(&node->attr_machine->base_state, "other item"),
+            nullptr);
+
+  // A quoted span concatenates with adjacent unquoted text in one token,
+  // matching the shell quote-toggling rule (no escaping).
+  char fused_line[] = "item add pre\"fix ed\"post counter";
+  EXPECT_EQ(cli_shell_execute_line(node, fused_line, &should_exit), CLI_OK);
+  EXPECT_NE(state_find_item(&node->attr_machine->base_state, "prefix edpost"),
+            nullptr);
+
+  // An empty quoted token ("") is ambiguous; the line is refused.
+  char empty_token_line[] = "item add \"\" counter";
+  EXPECT_EQ(cli_shell_execute_line(node, empty_token_line, &should_exit),
+            CLI_ERR_ARGS);
+  // No item got installed from the refused line including the empty name.
+  EXPECT_EQ(state_find_item(&node->attr_machine->base_state, ""), nullptr);
+
+  // No escape sequences: backslash is an ordinary byte, so \" keeps the
+  // quote OPEN (the token runs to the real closing quote).
+  char backslash_line[] = "item add back\\slash counter";
+  EXPECT_EQ(cli_shell_execute_line(node, backslash_line, &should_exit),
+            CLI_OK);
+  EXPECT_NE(state_find_item(&node->attr_machine->base_state, "back\\slash"),
+            nullptr);
+
+  EXPECT_FALSE(should_exit);
+  cli_node_destroy(node);
+}

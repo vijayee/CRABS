@@ -73,6 +73,14 @@ make
 
 This starts the CRABS CLI with an interactive REPL for managing state machines, users, policies, and operations.
 
+REPL arguments split on whitespace; quote any argument that contains spaces with `"..."` or `'...'`. This matters most for **policy expressions** — an unquoted multi-word expression is now refused (it used to be silently truncated, weakening the installed policy):
+
+```text
+crabs> policy add myop "role:admin OR role:member"
+```
+
+There are no escape sequences (backslash is literal); an unbalanced quote refuses the line.
+
 ### Tests
 
 ```bash
