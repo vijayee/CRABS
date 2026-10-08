@@ -108,7 +108,7 @@ Two halves of one finding. (a) `src/CLI/cli.c:2398-2419`: the `key` dispatcher w
 - **A10-L6 — FIXED (2026-10-08).** `847a6c0`: trailing bytes rejected in state deserialization.
 - **A10-L7 — FIXED (2026-10-08).** `b5dd4e4`: `op_version` included in the signed canonical form (signing format v3).
 - **A10-L8 — FIXED (2026-10-08).** `4332204` (0600 state saves) + race-free `fchmod` `92ca15f`.
-- **A10-L9 — FIXED (docs, 2026-10-08).** `80fa716`: README caveat that attestation TTLs trust the local clock and a page-overrideable WASM `Date.now` can roll it back; the Audit-9 clock caveat rides the same documentation fix.
+- **A10-L9 — FIXED (2026-10-08).** Caveat `80fa716` plus shipped selection surfaces: CLI `crabs_node time-source https [url]` (`6798c6f`) and node bindings `setTimeSource({ mode: 'https', ... })` / `getTimeSource()` (`e77ce3d`). HTTPS source resyncs at most once per 30 s by default with monotonic interpolation between resyncs and fails closed on an unreachable server — never falls back to the local clock.
 - **A10-L10 — FIXED (2026-10-08).** `e85fe06`: `_extract_parent_endorsements` now tracks quoted regions with the same `'"'`-toggle/no-escape convention as `_collapse_whitespace`; quoted `@parent/` literals are copied verbatim into the remaining policy instead of being extracted as endorsements.
 - **A10-L11 — FIXED (2026-10-08).** `a25718f`: wildcard protocol transition made atomic across resources.
 - **A10-L12 / A10-L13 — FIXED (2026-10-08).** `35e6419`: `IsString()` checks on N-API casts and a payload size guard on `SetPayload`.
