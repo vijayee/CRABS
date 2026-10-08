@@ -150,7 +150,10 @@ As implemented, the wire carries no `parent_key_chain`: the bounded chain of
 accepted parent keys lives on the CHILD state (`lineage_key_chain`, entry [0]
 pinned at spawn), advanced forward-only by `__parent_key_update__` transitions
 signed by the superseded key, and verification accepts the attestation under
-ANY accepted chain entry (`lineage_verify_by_parent_key`). Format v13 persists
+ANY accepted chain entry (`lineage_verify_by_parent_key`). Advancement is
+tip-only: a transition's old_pk must be the chain's current tip, so a
+compromised retired parent key can no longer advance the chain (retired keys
+still verify historical attestations/tombstones). Format v13 persists
 the chain.
 
 - Issued by the parent (new API `crabs_issue_attestation`); carried as op
