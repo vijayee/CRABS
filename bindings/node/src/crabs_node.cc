@@ -822,8 +822,9 @@ public:
     obj.Set("result", Napi::Number::New(env, (double)event->result));
     // A10-M4: a synchronous listener may register or unregister listeners on
     // this Node (push_back reallocates change_listeners_). Iterate a snapshot
-    // of live Napi::Function handles instead of the vector itself; the
-    // FunctionReference keeps each function alive within this same scope.
+    // of live Napi::Function handles instead of the vector itself; each copied
+    // handle is scope-owned, so a function stays callable for this dispatch
+    // even if its FunctionReference slot is Reset mid-emit (self-unregister).
     std::vector<Napi::Function> listener_snapshot;
     listener_snapshot.reserve(change_listeners_.size());
     for (auto& listener_reference : change_listeners_) {
