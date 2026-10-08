@@ -223,8 +223,9 @@ TEST_F(TestTrigger, TestChangePolicyRejectsEmptyAndBuiltinTargets) {
 // Regression for audit A10-M1: lineage op types are handler-registered
 // custom ops, so the builtin-only guard in the trigger engine did not stop
 // a CHANGE_POLICY effect from rewriting them. The lineage lifecycle must
-// stay admin-gated: a CHANGE_POLICY trigger targeting ANY of the five
-// lineage ops is rejected and the "role:admin" policy installed by
+// stay admin-gated: a CHANGE_POLICY trigger targeting ANY of the six
+// lineage ops (A11-L10: __parent_key_update__, added with the key chain, is
+// covered too) is rejected and the "role:admin" policy installed by
 // lineage_install survives unchanged.
 TEST_F(TestTrigger, TestChangePolicyRejectsLineageTargets) {
   lineage_install(state);
@@ -235,6 +236,7 @@ TEST_F(TestTrigger, TestChangePolicyRejectsLineageTargets) {
     CRABS_LINEAGE_OP_DISSOLVE,
     CRABS_LINEAGE_OP_WITHDRAW_GENESIS,
     CRABS_LINEAGE_OP_RECEIVE_DISSOLUTION,
+    CRABS_LINEAGE_OP_PARENT_KEY_UPDATE,
   };
   const size_t lineage_operation_count =
     sizeof(lineage_operations) / sizeof(lineage_operations[0]);
@@ -287,38 +289,54 @@ TEST_F(TestTrigger, TestChangePolicyRejectsLineageTargets) {
 // __define_operation_type__ op that targets a lineage op type — a
 // signer-chosen dedup spec must never stack on top of a lineage handler.
 // The dedup spec and admin policy installed by lineage_install must
-// survive unchanged.
+// survive unchanged. The loop covers ALL six lineage ops (A11-L10:
+// __parent_key_update__ joined the protected set with the key chain).
 TEST_F(TestTrigger, TestDefineOperationRejectsLineageTarget) {
   lineage_install(state);
 
-  operation_t* op = operation_create(CRABS_OP_DEFINE_OPERATION);
-  ASSERT_NE(op, nullptr);
-  memset(op->uuid, 0x01, CRABS_UUID_SIZE);
-  strncpy(op->signer_id, "admin", CRABS_MAX_USER_ID - 1);
-  op->lamport_time = 1;
-  // The operation type name being defined is carried in resources[0]
-  op->resource_count = 1;
-  op->resources = (char(*)[CRABS_MAX_USER_ID])malloc(CRABS_MAX_USER_ID);
-  strncpy(op->resources[0], CRABS_LINEAGE_OP_SPAWN, CRABS_MAX_USER_ID - 1);
-  op->dedup.type = DEDUP_PER_USER;
-  strncpy(op->dedup.tracker_path, "spawners", CRABS_MAX_DEDUP_PATH - 1);
+  const char* lineage_operations[] = {
+    CRABS_LINEAGE_OP_SPAWN,
+    CRABS_LINEAGE_OP_REVOKE_ATTESTATION,
+    CRABS_LINEAGE_OP_DISSOLVE,
+    CRABS_LINEAGE_OP_WITHDRAW_GENESIS,
+    CRABS_LINEAGE_OP_RECEIVE_DISSOLUTION,
+    CRABS_LINEAGE_OP_PARENT_KEY_UPDATE,
+  };
+  const size_t lineage_operation_count =
+    sizeof(lineage_operations) / sizeof(lineage_operations[0]);
 
-  crabs_error_e result = state_machine_op_define_operation(state, op);
-  EXPECT_EQ(result, CRABS_ERR_INVALID_PARAM);
+  for (size_t operation_index = 0; operation_index < lineage_operation_count; operation_index++) {
+    const char* target = lineage_operations[operation_index];
 
-  // The spec lookup returns the DEDUP_NONE spec lineage_install registered
-  // — the rejected define must not have overwritten it.
-  const dedup_spec_t* spec = state_find_op_type_def(state, CRABS_LINEAGE_OP_SPAWN);
-  ASSERT_NE(spec, nullptr);
-  EXPECT_EQ(spec->type, DEDUP_NONE);
-  EXPECT_STREQ(spec->tracker_path, "");
+    operation_t* op = operation_create(CRABS_OP_DEFINE_OPERATION);
+    ASSERT_NE(op, nullptr) << target;
+    memset(op->uuid, 0x01, CRABS_UUID_SIZE);
+    strncpy(op->signer_id, "admin", CRABS_MAX_USER_ID - 1);
+    op->lamport_time = 1;
+    // The operation type name being defined is carried in resources[0]
+    op->resource_count = 1;
+    op->resources = (char(*)[CRABS_MAX_USER_ID])malloc(CRABS_MAX_USER_ID);
+    strncpy(op->resources[0], target, CRABS_MAX_USER_ID - 1);
+    op->dedup.type = DEDUP_PER_USER;
+    strncpy(op->dedup.tracker_path, "spawners", CRABS_MAX_DEDUP_PATH - 1);
 
-  // The admin-only policy is untouched.
-  const char* policy = state_find_policy(state, CRABS_LINEAGE_OP_SPAWN);
-  ASSERT_NE(policy, nullptr);
-  EXPECT_STREQ(policy, "role:admin");
+    crabs_error_e result = state_machine_op_define_operation(state, op);
+    EXPECT_EQ(result, CRABS_ERR_INVALID_PARAM) << target;
 
-  operation_destroy(op);
+    // The spec lookup returns the DEDUP_NONE spec lineage_install registered
+    // — the rejected define must not have overwritten it.
+    const dedup_spec_t* spec = state_find_op_type_def(state, target);
+    ASSERT_NE(spec, nullptr) << target;
+    EXPECT_EQ(spec->type, DEDUP_NONE) << target;
+    EXPECT_STREQ(spec->tracker_path, "") << target;
+
+    // The admin-only policy is untouched.
+    const char* policy = state_find_policy(state, target);
+    ASSERT_NE(policy, nullptr) << target;
+    EXPECT_STREQ(policy, "role:admin") << target;
+
+    operation_destroy(op);
+  }
 }
 
 TEST_F(TestTrigger, TestProcessTriggersConditionFalse) {
