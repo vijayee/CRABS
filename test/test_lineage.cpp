@@ -3115,13 +3115,15 @@ TEST(TestLineage, KeyChainRecordServesAllChildrenOfOneParent) {
   EXPECT_EQ(second_child->lineage_key_chain_count, 2u);
 
   // Re-acceptance on EITHER child is refused (per-child idempotency): the
-  // version is no longer max+1 and the public key is already in the chain.
+  // version is no longer max+1 and the public key is already in the chain —
+  // an exact replay of an accepted record is ALREADY_PERFORMED (A11-L5),
+  // matching the dissolve/withdraw/tombstone re-delivery siblings.
   EXPECT_EQ(lineage_child_accept_key_transition(harness.child_state, record,
                                                 record_len),
-            CRABS_ERR_INVALID_PARAM);
+            CRABS_ERR_ALREADY_PERFORMED);
   EXPECT_EQ(lineage_child_accept_key_transition(second_child, record,
                                                 record_len),
-            CRABS_ERR_INVALID_PARAM);
+            CRABS_ERR_ALREADY_PERFORMED);
   EXPECT_EQ(harness.child_state->lineage_key_chain_count, 2u);
   EXPECT_EQ(second_child->lineage_key_chain_count, 2u);
 
@@ -3402,10 +3404,24 @@ TEST(TestLineage, KeyChainRollbackAndGapRejected) {
             CRABS_SUCCESS);
   ASSERT_EQ(harness.child_state->lineage_key_chain_count, 2u);
 
-  // Re-delivery of the same record is a rollback (version 2 == max now).
+  // Re-delivery of the same record is an exact replay: version 2 == max now
+  // and new_pk matches the accepted entry — answered ALREADY_PERFORMED
+  // (A11-L5), unlike the rollback/gap cases above whose records are distinct.
   EXPECT_EQ(lineage_child_accept_key_transition(harness.child_state, record,
                                                 good_len),
+            CRABS_ERR_ALREADY_PERFORMED);
+  // A rollback to the same version with a DIFFERENT key is still a plain
+  // invalid record, not an idempotent replay.
+  ecdsa_keypair_t* k4 = crypto_ecdsa_generate();
+  ASSERT_NE(k4, nullptr);
+  size_t fork_len = keychain_make_record(2, k4->public_key,
+                                         harness.k1->public_key, "parent-red",
+                                         harness.k1->private_key,
+                                         record, sizeof(record));
+  EXPECT_EQ(lineage_child_accept_key_transition(harness.child_state, record,
+                                                fork_len),
             CRABS_ERR_INVALID_PARAM);
+  crypto_ecdsa_keypair_destroy(k4);
 
   crypto_ecdsa_keypair_destroy(k3);
   keychain_harness_destroy(&harness);

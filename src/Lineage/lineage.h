@@ -244,6 +244,9 @@ crabs_error_e lineage_key_rotate(state_t* parent_state,
 //       → CRABS_ERR_CRYPTOGRAPHIC_ERROR
 //   - new_key_version != (max chain version) + 1 (rollback, replay, or gap),
 //     or new_pk equals an existing chain key → CRABS_ERR_INVALID_PARAM
+//     EXCEPT an exact re-delivery of an already-accepted record (its version
+//     AND new_pk both match an accepted entry) → CRABS_ERR_ALREADY_PERFORMED
+//     (mirrors the dissolve/withdraw/tombstone re-delivery siblings)
 //   - chain already holds CRABS_MAX_LINEAGE_KEY_CHAIN entries, or OOM growing
 //       → CRABS_ERR_OOM
 // On success appends {new_key_version, new_pk} to lineage_key_chain.

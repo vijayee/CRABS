@@ -2153,6 +2153,22 @@ crabs_error_e lineage_child_accept_key_transition(state_t* child_state,
           child_state->lineage_key_chain[chain_index].key_version;
     }
   }
+  // Duplicated delivery before the generic forward-only refusal (A11-L5):
+  // chain versions are append-only unique, so a record whose version AND
+  // new_pk both match an accepted entry can only be a replay of THAT admitted
+  // record. Answer ALREADY_PERFORMED (observable idempotence — mirrors the
+  // dissolve/withdraw/tombstone re-delivery siblings) instead of letting the
+  // version-continuity check below label it INVALID_PARAM. Distinct records
+  // (a rollback or gap with a different key) keep the INVALID_PARAM refusal.
+  for (uint32_t chain_index = 0;
+       chain_index < child_state->lineage_key_chain_count; chain_index++) {
+    if (child_state->lineage_key_chain[chain_index].key_version ==
+            new_key_version &&
+        memcmp(child_state->lineage_key_chain[chain_index].public_key,
+               new_public_key, 33) == 0) {
+      return CRABS_ERR_ALREADY_PERFORMED;
+    }
+  }
   if (new_key_version == 0 || new_key_version != max_key_version + 1) {
     return CRABS_ERR_INVALID_PARAM;
   }
