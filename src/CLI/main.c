@@ -64,7 +64,15 @@ int main(int argc, char** argv) {
   // still prints usage and fails via cli_dispatch.
   cli_result_e result;
   if (argc >= 2 && strcmp(argv[1], "shell") == 0) {
-    result = _run_shell(node);
+    if (argc > 2) {
+      // 'shell' takes no arguments; silently dropping extras could hide a
+      // typo'd flag (e.g. 'shell --readonly') that the operator believes is
+      // in effect. Fail at the argument level instead.
+      fprintf(stderr, "Error: 'shell' takes no arguments.\n");
+      result = CLI_ERR_ARGS;
+    } else {
+      result = _run_shell(node);
+    }
   } else {
     result = cli_dispatch(node, argc, argv);
   }

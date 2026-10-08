@@ -4,6 +4,9 @@
 
 #include <gtest/gtest.h>
 #include <sys/stat.h>
+#include <unistd.h>
+#include <cstdio>
+#include <string>
 #include <vector>
 #include <cstdlib>
 extern "C" {
@@ -2161,6 +2164,33 @@ TEST(TestCliDurability, TombstoneAcceptCommandSeversLineageAndPersists) {
 // node (and its initialized/seal-key/ack state) alive for the session.
 // ============================================================
 
+// RAII guard for shell-test temp files. /tmp/crabs_shell_* paths are
+// constant across runs and machines, so two developers (or a stray earlier
+// test binary that crashed mid-cleanup) can collide on them. Guard paths
+// are suffixed with the PID and a per-process counter so they are unique,
+// and the destructor unlinks the file so a failed ASSERT_* (which
+// early-returns the test body) does not leak it.
+struct ShellTempFileGuard {
+  std::string path;
+
+  explicit ShellTempFileGuard(const char* basename) {
+    static int counter = 0;
+    path = "/tmp/";
+    path += basename;
+    path += ".";
+    path += std::to_string(static_cast<long>(getpid()));
+    path += ".";
+    path += std::to_string(counter++);
+  }
+
+  ~ShellTempFileGuard() {
+    std::remove(path.c_str());
+  }
+
+  ShellTempFileGuard(const ShellTempFileGuard&) = delete;
+  ShellTempFileGuard& operator=(const ShellTempFileGuard&) = delete;
+};
+
 TEST(ShellLine, PersistsNodeAcrossCommands) {
   cli_node_t* node = cli_node_create();
   ASSERT_NE(node, nullptr);
@@ -2182,18 +2212,19 @@ TEST(ShellLine, PersistsNodeAcrossCommands) {
   // because the imported (in-memory-only) key died with the process.
   const char* key_hex =
       "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20";
-  const char* key_path = "/tmp/crabs_shell_seal_key.hex";
-  ASSERT_TRUE(test_write_file_bytes(key_path, std::vector<uint8_t>(
-      key_hex, key_hex + strlen(key_hex))));
-  char import_line[128];
-  snprintf(import_line, sizeof(import_line), "seal-key import %s", key_path);
+  ShellTempFileGuard key_file("crabs_shell_seal_key.hex");
+  ASSERT_TRUE(test_write_file_bytes(key_file.path.c_str(),
+      std::vector<uint8_t>(key_hex, key_hex + strlen(key_hex))));
+  char import_line[256];
+  snprintf(import_line, sizeof(import_line), "seal-key import %s",
+           key_file.path.c_str());
   EXPECT_EQ(cli_shell_execute_line(node, import_line, &should_exit), CLI_OK);
   EXPECT_TRUE(node->seal_key_valid);
   EXPECT_FALSE(should_exit);
 
-  const char* save_path = "/tmp/crabs_shell_state.crabs";
-  char save_line[128];
-  snprintf(save_line, sizeof(save_line), "save %s", save_path);
+  ShellTempFileGuard save_file("crabs_shell_state.crabs");
+  char save_line[256];
+  snprintf(save_line, sizeof(save_line), "save %s", save_file.path.c_str());
   EXPECT_EQ(cli_shell_execute_line(node, save_line, &should_exit), CLI_OK);
   // Same node, still initialized after every command in the session.
   EXPECT_TRUE(node->initialized);
@@ -2202,8 +2233,6 @@ TEST(ShellLine, PersistsNodeAcrossCommands) {
   EXPECT_EQ(cli_shell_execute_line(node, exit_line, &should_exit), CLI_OK);
   EXPECT_TRUE(should_exit);
 
-  remove(key_path);
-  remove(save_path);
   cli_node_destroy(node);
 }
 

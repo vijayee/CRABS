@@ -2607,9 +2607,11 @@ cli_result_e cli_shell_execute_line(cli_node_t* node, char* line,
   }
   if (token != NULL) {
     // A 33rd token exists: refuse the whole line rather than dispatch a
-    // truncated argument list.
-    printf("Error: too many tokens in one line (max %d).\n",
-           CLI_SHELL_MAX_TOKENS);
+    // truncated argument list. Routed to stderr (matching _run_shell's
+    // per-line failure label) so the message does not land on stdout where
+    // a scripted consumer might mistake it for command output.
+    fprintf(stderr, "Error: too many tokens in one line (max %d).\n",
+            CLI_SHELL_MAX_TOKENS);
     return CLI_ERR_ARGS;
   }
   if (token_count == 0) return CLI_OK;  // blank line: no-op

@@ -204,8 +204,8 @@ void          cli_print_usage(const char* prog);
 // `node`. `line` is modified in place (strtok). Blank lines are no-ops and
 // return CLI_OK. A line whose first token is "exit" or "quit" is handled
 // here, never reaches cli_dispatch, and sets `*should_exit` so the caller's
-// stop; on entry `*should_exit` is always cleared first, so the caller can
-// reuse one flag across iterations. Lines with more than the fixed token
+// loop stops; on entry `*should_exit` is always cleared first, so the caller
+// can reuse one flag across iterations. Lines with more than the fixed token
 // limit are REFUSED with CLI_ERR_ARGS rather than silently truncated:
 // truncation could quietly drop an argument from a destructive command and
 // retarget it. All other lines go to cli_dispatch and its result is returned
