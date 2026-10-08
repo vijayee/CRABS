@@ -89,4 +89,31 @@ Two halves of one finding. (a) `src/CLI/cli.c:2398-2419`: the `key` dispatcher w
 ## Remediation status
 
 - **A10-1..A10-4 — FIXED (2026-10-07).** openabe-c commit `9da0a04`: stale-rc error paths in `oabe_cp_ct_deserialize` (and the same pattern in the KP-ABE deserializer) now set `OABE_ERROR_INVALID_CIPHERTEXT`; all wire length prefixes in `oabe_secret_key_deserialize`, `oabe_user_key_deserialize`, and `deserialize_cp_key_elements` are bounds-checked. Regression tests verified to fail/segfault against the pre-fix code; 147 openabe-c tests and 1548 CRABS tests green. Submodule bumped to `602dbf2`.
-- *Pending: A10-5/A10-6 (lineage registry indexing + liveness), A10-7/A10-8 (CLI key-import wiring + single-shot design), then MEDIUMs.*
+- **A10-5 — FIXED (2026-10-08).** CRABS `4ab90d9`: resident lineage children matched by child id, not manifest index.
+- **A10-6 — FIXED (2026-10-08).** CRABS `5f02fe8`: resident lineage slot dropped on child destroy — dissolve UAF closed.
+- **A10-7 — FIXED (2026-10-08).** (a) key import wired with a stdin (`-`) form and private-key cleansing on every exit path: `ddbdbbc` + `7fcea01`. (b) `crabs_node shell` REPL keeps one node alive across commands, so load → verify → mutate → save works in a single session: `5e6aa13` + `18a7f68`.
+- **A10-8 — FIXED (2026-10-08).** Closes via the A10-7 commits: verification is now wired (`cli_node_load_key` reachable through the REPL/`key import`), so signed snapshots are no longer adopted without a reachable verify step; the hard save-gate and unauthenticated-snapshot warnings (`db09bfd`) remain intact.
+- **A10-M1 — FIXED (2026-10-08).** `519e99c` (lineage ops protected from trigger rewrites and redefinition) + test coverage `87e47f4`.
+- **A10-M2 — FIXED (2026-10-08).** `ad52615`: co-signer distinctness enforced against the resolved Mode B primary signer.
+- **A10-M3 — FIXED (2026-10-08).** `3f48b41`: node-key access guarded in `CreateTrigger` (and kin) for adopted wrappers.
+- **A10-M4 — FIXED (2026-10-08).** `7488409`: `EmitChange` dispatches over a listener snapshot; wording precision `f386211`.
+- **A10-M5 — FIXED (docs, 2026-10-08).** `80fa716` + `07491cc`: README/spec now state that parent custody persists until a cooperative rotation at spawn; no silent "full sovereignty".
+- **A10-M6 — FIXED (2026-10-08).** Parent key chain data model and rotate/accept APIs `56c127a`; transition records bound to parent_id `43ad2b2`; chain-verify test + const API + body-min constant `727611a`; `__parent_key_update__` op wired to chain-aware verification `62a0254`; v13 wire format `acc8836`; writer-side validation `85dd419`.
+- **A10-M7 — FIXED (2026-10-08).** `8d6e864`: cap plus remaining-buffer bound on ordered-set deserialization.
+- **A10-M8 — FIXED (2026-10-08).** `db09bfd` (machine subcommands in the unauthenticated-snapshot warn list) + `4332204` + `0543b0a` + `92ca15f` (save hardening).
+- **A10-L1 — FIXED (2026-10-08).** `815b72d`: genesis provenance verifier exposed via machine children.
+- **A10-L2 / A10-L3 / A10-L17 — FIXED (2026-10-08).** `207e185` (wire enum validation, corrected blueprint-hash and dissolve-flag comments) + NULL-section guard `43324bb`.
+- **A10-L4 — FIXED (2026-10-08).** CLI cleanse paths `ddbdbbc` + keygen buffer cleanse `0543b0a`; bindings cleanse-on-throw `35e6419`.
+- **A10-L5 — FIXED (2026-10-08).** `ddbdbbc`: key import accepts `-` (stdin); no hex argv form.
+- **A10-L6 — FIXED (2026-10-08).** `847a6c0`: trailing bytes rejected in state deserialization.
+- **A10-L7 — FIXED (2026-10-08).** `b5dd4e4`: `op_version` included in the signed canonical form (signing format v3).
+- **A10-L8 — FIXED (2026-10-08).** `4332204` (0600 state saves) + race-free `fchmod` `92ca15f`.
+- **A10-L9 — FIXED (docs, 2026-10-08).** `80fa716`: README caveat that attestation TTLs trust the local clock and a page-overrideable WASM `Date.now` can roll it back; the Audit-9 clock caveat rides the same documentation fix.
+- **A10-L10 — ACCEPTED (no code change).** Direction is fail-closed and blueprint validation rejects quoted `@parent/` literals outright; the rewrite only affects `state_add_policy` policies, which run under same-process trust. Documented here as accepted-with-rationale rather than code-fixed.
+- **A10-L11 — FIXED (2026-10-08).** `a25718f`: wildcard protocol transition made atomic across resources.
+- **A10-L12 / A10-L13 — FIXED (2026-10-08).** `35e6419`: `IsString()` checks on N-API casts and a payload size guard on `SetPayload`.
+- **A10-L14 — FIXED (docs, 2026-10-08).** `80fa716`: README trust-model note that the `lineageSpawn` binding calls the C function directly; the signed `__spawn_machine__` op path is the audited one.
+- **A10-L15 — FIXED (2026-10-08).** openabe-c `c6e050f`: DEM KDF domain-separated; submodule bumped (deps/openabe-c now at `94bb40e`).
+- **A10-L16 — FIXED (2026-10-08).** openabe-c `94bb40e`: master scalars reconstructed on secret-key deserialize; CRABS local parser dropped in `16de228`.
+
+WASM artifacts (`bindings/wasm/crabs*.js/.wasm`) regenerated for signing format v3 and the v13 state format (`3b26c78`); node and wasm lineage smoke suites pass against the rebuilt artifacts.
