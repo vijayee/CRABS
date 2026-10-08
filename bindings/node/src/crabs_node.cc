@@ -1361,8 +1361,17 @@ private:
     strncpy(op->signer_id, "admin", CRABS_MAX_USER_ID - 1);
     strncpy(op->node_id, "admin", CRABS_MAX_USER_ID - 1);
 
-    // Sign with node key
+    // Sign with node key — adopted child wrappers carry no own key (A10-M3).
+    if (node_key_ == nullptr) {
+      operation_destroy(op);
+      throw Napi::Error::New(env,
+        "createTrigger: this machine carries no own node key");
+    }
     serialized_buffer_t* ser = crabs_serialize_for_signing(op);
+    if (ser == nullptr) {
+      operation_destroy(op);
+      throw crabs_error(env, CRABS_ERR_SERIALIZATION_ERROR, "createTrigger");
+    }
     crypto_ecdsa_sign(node_key_->private_key, ser->data, ser->len, op->signature);
     serialized_buffer_destroy(ser);
 

@@ -176,5 +176,29 @@ try {
   assert(true, 'createTrigger with oversized fields rejected cleanly');
 }
 
+// Test 18: createTrigger on an adopted child wrapper must throw, not segfault.
+// Audit 10 A10-M3: a spawned (borrowed) child Node wrapper carries no own node
+// key (node_key_ == nullptr); CreateTrigger used to dereference it blindly.
+// The spawn below happened in test 16 — grab the borrowed wrapper back from
+// the resident registry and demand a typed refusal.
+const adoptedChild = node.lineageResidentChild('test-child');
+assert(adoptedChild !== null, 'spawned test-child should be resident');
+let adoptedTriggerRefused = false;
+try {
+  adoptedChild.createTrigger({
+    triggerId: 'adopted-trigger',
+    condition: 'true',
+    effectType: 'issue_attribute',
+    issueAttribute: 'temp:x',
+    targetRole: 'role',
+    attributeValue: 'member',
+  });
+} catch (adoptedRefusal) {
+  adoptedTriggerRefused = adoptedRefusal instanceof Error &&
+    adoptedRefusal.message.includes('no own node key');
+}
+assert(adoptedTriggerRefused,
+  'createTrigger on an adopted child wrapper must throw (no own node key)');
+
 console.log(`\n${passed} passed, ${failed} failed`);
 process.exit(failed > 0 ? 1 : 0);
