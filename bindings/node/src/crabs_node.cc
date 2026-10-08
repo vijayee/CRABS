@@ -631,8 +631,13 @@ private:
       throw Napi::TypeError::New(env, "Expected private key hex string");
     uint8_t priv[32];
     std::string hex = info[0].As<Napi::String>().Utf8Value();
-    if (!hex_decode(hex, priv, 32))
+    // A11-L7: cleanse even on the decode-failure throw — a partial decode
+    // leaves a prefix of the caller's key bytes on the stack, and every other
+    // exit from this buffer is scrubbed.
+    if (!hex_decode(hex, priv, 32)) {
+      OPENSSL_cleanse(priv, 32);
       throw Napi::Error::New(env, "Invalid private key hex");
+    }
     serialized_buffer_t* ser = crabs_serialize_for_signing(op_);
     if (!ser) {
       OPENSSL_cleanse(priv, 32);
@@ -1361,8 +1366,12 @@ private:
       // Private key hex string
       uint8_t priv[32];
       std::string hex = info[1].As<Napi::String>().Utf8Value();
-      if (!hex_decode(hex, priv, 32))
+      // A11-L7: cleanse even on the decode-failure throw — a partial decode
+      // leaves a prefix of the caller's key bytes on the stack.
+      if (!hex_decode(hex, priv, 32)) {
+        OPENSSL_cleanse(priv, 32);
         throw Napi::Error::New(env, "Invalid private key hex");
+      }
       serialized_buffer_t* ser = crabs_serialize_for_signing(op->raw());
       if (!ser) {
         OPENSSL_cleanse(priv, 32);
