@@ -1372,6 +1372,15 @@ static void _collapse_whitespace(char* s) {
 // This scanner runs BEFORE condition_parse: the condition lexer has no token
 // classes for '@' or '/', so endorsements must be resolved at the string
 // layer.
+//
+// Quoted string literals are skipped verbatim (A10-L10): a "@parent/x" inside
+// quotes is literal set-member text compared verbatim against CRDT members,
+// not an endorsement token — extracting it would rewrite the policy
+// ("CONTAINS \"@parent/x\"" → endorsement "x" plus "CONTAINS \"\""). Same
+// quote convention as _collapse_whitespace: '"' toggles in/out of a literal,
+// with no escaping. Quote characters are copied into `remaining`; they are
+// policy syntax. An attr run can never span a quote because '"' is not in the
+// attribute character set — the run simply ends there.
 static bool _extract_parent_endorsements(
     const char* input,
     policy_preprocess_result_t* result,
@@ -1379,9 +1388,24 @@ static bool _extract_parent_endorsements(
   size_t read_pos = 0;
   size_t write_pos = 0;
   int paren_depth = 0;
+  bool inside_string_literal = false;
 
   while (input[read_pos] != '\0') {
     char c = input[read_pos];
+
+    if (c == '"') {
+      inside_string_literal = !inside_string_literal;
+      remaining[write_pos++] = c;
+      read_pos++;
+      continue;
+    }
+    // Inside a quoted literal every character (including '@', '/', '(' and
+    // ')') is verbatim text: copy it without token or paren processing.
+    if (inside_string_literal) {
+      remaining[write_pos++] = c;
+      read_pos++;
+      continue;
+    }
 
     if (c == '(') {
       paren_depth++;

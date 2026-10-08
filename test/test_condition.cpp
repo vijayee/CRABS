@@ -63,6 +63,15 @@ protected:
     spaced_members->value = spaced_set;
     state_add_item(state, spaced_members);
 
+    // Add an OR-Set whose member is the literal string "@parent/x", so tests
+    // can observe whether endorsement extraction mistakes quoted literal text
+    // for a @parent/ endorsement token (it must not — A10-L10).
+    data_item_t* tagged_members = data_item_create("tagged_members", DATA_TYPE_SET, CRDT_OR_SET);
+    or_set_t* tagged_set = or_set_create();
+    or_set_add(tagged_set, "@parent/x", "nodeA:1");
+    tagged_members->value = tagged_set;
+    state_add_item(state, tagged_members);
+
     // Add a counter for BETWEEN tests
     data_item_t* likes = data_item_create("likes", DATA_TYPE_COUNTER, CRDT_G_COUNTER);
     g_counter_t* likes_gc = g_counter_create();
@@ -938,6 +947,45 @@ TEST_F(TestCondition, TestPreprocessParentQuotedLiteralWhitespacePreserved) {
       state, "alice");
   EXPECT_TRUE(result.resolved_ok);
   EXPECT_EQ(result.parent_endorsement_count, 1u);
+}
+
+TEST_F(TestCondition, TestPreprocessParentQuotedLiteralIsNotAnEndorsement) {
+  // A10-L10: "@parent/x" inside a quoted string literal is VERBATIM set-member
+  // text, not an endorsement token. Extraction must skip it; the literal must
+  // survive the pass and match the CRDT set member "@parent/x" verbatim,
+  // leaving no endorsement and no ABE residue.
+  auto result = preprocess_policy(
+      "tagged_members CONTAINS \"@parent/x\"", state, "alice");
+  EXPECT_TRUE(result.resolved_ok);
+  EXPECT_EQ(result.parent_endorsement_count, 0u);
+  EXPECT_STREQ(result.abe_policy, "");
+}
+
+TEST_F(TestCondition, TestPreprocessParentQuotedLiteralPlusRealEndorsement) {
+  // Mixed form (A10-L10): the quoted literal is ignored while the real
+  // endorsement token outside quotes is still extracted.
+  auto result = preprocess_policy(
+      "tagged_members CONTAINS \"@parent/x\" AND @parent/role:writer",
+      state, "alice");
+  EXPECT_TRUE(result.resolved_ok);
+  EXPECT_EQ(result.parent_endorsement_count, 1u);
+  EXPECT_STREQ(result.parent_endorsements[0], "role:writer");
+  EXPECT_STREQ(result.abe_policy, "");
+}
+
+TEST_F(TestCondition, TestPreprocessParentQuoteRegionsDoNotSwallowRealTokens) {
+  // Quote convention is the same blind toggle as _collapse_whitespace ('"'
+  // toggles, no escaping): a CLOSED quote returns the scanner to normal mode,
+  // so real endorsements on both sides of a quoted literal are both extracted.
+  auto result = preprocess_policy(
+      "@parent/role:writer AND tagged_members CONTAINS \"@parent/x\" AND "
+      "@parent/dept:red",
+      state, "alice");
+  EXPECT_TRUE(result.resolved_ok);
+  EXPECT_EQ(result.parent_endorsement_count, 2u);
+  EXPECT_STREQ(result.parent_endorsements[0], "role:writer");
+  EXPECT_STREQ(result.parent_endorsements[1], "dept:red");
+  EXPECT_STREQ(result.abe_policy, "");
 }
 
 TEST_F(TestCondition, TestPreprocessParentMalformedTokensFailClosed) {
