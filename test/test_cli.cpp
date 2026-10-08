@@ -2152,3 +2152,113 @@ TEST(TestCliDurability, TombstoneAcceptCommandSeversLineageAndPersists) {
   remove(garbage_path);
   remove(captured_path);
 }
+
+// ============================================================
+// Shell (A10-7b): the REPL tokenizes one input line and dispatches it
+// against the SAME persistent node. The single-shot argv path destroys the
+// node when the process exits, so load → key import → mutate → save could
+// never survive across commands in the shipped binary; the shell keeps the
+// node (and its initialized/seal-key/ack state) alive for the session.
+// ============================================================
+
+TEST(ShellLine, PersistsNodeAcrossCommands) {
+  cli_node_t* node = cli_node_create();
+  ASSERT_NE(node, nullptr);
+  bool should_exit = true;  // execution must clear it unless the line exits
+
+  char init_line[] = "init shell_admin";
+  EXPECT_EQ(cli_shell_execute_line(node, init_line, &should_exit), CLI_OK);
+  EXPECT_TRUE(node->initialized);
+  EXPECT_FALSE(should_exit);
+
+  // 'key generate' needs no node; running it in-shell must leave the live
+  // node untouched.
+  char keygen_line[] = "key generate";
+  EXPECT_EQ(cli_shell_execute_line(node, keygen_line, &should_exit), CLI_OK);
+  EXPECT_TRUE(node->initialized);
+  EXPECT_FALSE(should_exit);
+
+  // seal-key import → save: the flow that was impossible in single-shot mode
+  // because the imported (in-memory-only) key died with the process.
+  const char* key_hex =
+      "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20";
+  const char* key_path = "/tmp/crabs_shell_seal_key.hex";
+  ASSERT_TRUE(test_write_file_bytes(key_path, std::vector<uint8_t>(
+      key_hex, key_hex + strlen(key_hex))));
+  char import_line[128];
+  snprintf(import_line, sizeof(import_line), "seal-key import %s", key_path);
+  EXPECT_EQ(cli_shell_execute_line(node, import_line, &should_exit), CLI_OK);
+  EXPECT_TRUE(node->seal_key_valid);
+  EXPECT_FALSE(should_exit);
+
+  const char* save_path = "/tmp/crabs_shell_state.crabs";
+  char save_line[128];
+  snprintf(save_line, sizeof(save_line), "save %s", save_path);
+  EXPECT_EQ(cli_shell_execute_line(node, save_line, &should_exit), CLI_OK);
+  // Same node, still initialized after every command in the session.
+  EXPECT_TRUE(node->initialized);
+
+  char exit_line[] = "exit";
+  EXPECT_EQ(cli_shell_execute_line(node, exit_line, &should_exit), CLI_OK);
+  EXPECT_TRUE(should_exit);
+
+  remove(key_path);
+  remove(save_path);
+  cli_node_destroy(node);
+}
+
+TEST(ShellLine, BlankLineIsNoop) {
+  cli_node_t* node = cli_node_create();
+  ASSERT_NE(node, nullptr);
+  bool should_exit = false;
+  char blank[] = "";
+  EXPECT_EQ(cli_shell_execute_line(node, blank, &should_exit), CLI_OK);
+  char whitespace[] = "   \t  ";
+  EXPECT_EQ(cli_shell_execute_line(node, whitespace, &should_exit), CLI_OK);
+  char newline[] = "\n";
+  EXPECT_EQ(cli_shell_execute_line(node, newline, &should_exit), CLI_OK);
+  EXPECT_FALSE(should_exit);
+  EXPECT_FALSE(node->initialized);  // nothing ran
+  cli_node_destroy(node);
+}
+
+TEST(ShellLine, TooManyTokensRefused) {
+  cli_node_t* node = cli_node_create();
+  ASSERT_NE(node, nullptr);
+  bool should_exit = false;
+  // 33 tokens exceed the 32-token shell argv limit. The line must be REFUSED
+  // outright: silent truncation could quietly drop an argument from a
+  // destructive command and retarget it.
+  std::string too_long = "state";
+  for (int token_index = 0; token_index < 32; token_index++) too_long += " x";
+  std::vector<char> line(too_long.begin(), too_long.end());
+  line.push_back('\0');
+  EXPECT_EQ(cli_shell_execute_line(node, line.data(), &should_exit),
+            CLI_ERR_ARGS);
+  EXPECT_FALSE(should_exit);
+  // The node stays usable after the refused line.
+  char init_line[] = "init shell_admin";
+  EXPECT_EQ(cli_shell_execute_line(node, init_line, &should_exit), CLI_OK);
+  EXPECT_TRUE(node->initialized);
+  cli_node_destroy(node);
+}
+
+TEST(ShellLine, UnknownCommandSurfacesError) {
+  cli_node_t* node = cli_node_create();
+  ASSERT_NE(node, nullptr);
+  bool should_exit = false;
+  // cli_dispatch already prints the unknown-command message + usage; the
+  // shell surfaces its error result and keeps the node usable.
+  char bogus_line[] = "frobnicate-the-gizmo";
+  EXPECT_EQ(cli_shell_execute_line(node, bogus_line, &should_exit),
+            CLI_ERR_ARGS);
+  EXPECT_FALSE(should_exit);
+  char init_line[] = "init shell_admin";
+  EXPECT_EQ(cli_shell_execute_line(node, init_line, &should_exit), CLI_OK);
+  EXPECT_TRUE(node->initialized);
+  // 'quit' is the other exit keyword; it must not fall through to dispatch.
+  char quit_line[] = "quit";
+  EXPECT_EQ(cli_shell_execute_line(node, quit_line, &should_exit), CLI_OK);
+  EXPECT_TRUE(should_exit);
+  cli_node_destroy(node);
+}

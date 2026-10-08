@@ -193,6 +193,26 @@ cli_result_e cli_cmd_compact(cli_node_t* node);
 cli_result_e cli_dispatch(cli_node_t* node, int argc, char** argv);
 void          cli_print_usage(const char* prog);
 
+// Audit A10-7b: shell mode. The single-shot argv path (main: create node →
+// dispatch → destroy node) discards everything a command sets up — a loaded
+// snapshot's custody, an imported seal key, a 'state accept-unverified'
+// acknowledgment all die with the process — so load → import → mutate → save
+// was unusable in the shipped binary. The shell dispatches each entered line
+// against the SAME persistent node instead.
+//
+// Tokenizes one input line (whitespace-separated) and dispatches it against
+// `node`. `line` is modified in place (strtok). Blank lines are no-ops and
+// return CLI_OK. A line whose first token is "exit" or "quit" is handled
+// here, never reaches cli_dispatch, and sets `*should_exit` so the caller's
+// stop; on entry `*should_exit` is always cleared first, so the caller can
+// reuse one flag across iterations. Lines with more than the fixed token
+// limit are REFUSED with CLI_ERR_ARGS rather than silently truncated:
+// truncation could quietly drop an argument from a destructive command and
+// retarget it. All other lines go to cli_dispatch and its result is returned
+// (CLI_OK on success).
+cli_result_e cli_shell_execute_line(cli_node_t* node, char* line,
+                                     bool* should_exit);
+
 // ============================================================
 // Utility Functions
 // ============================================================

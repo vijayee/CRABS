@@ -2204,6 +2204,10 @@ void cli_print_usage(const char* prog) {
   _print_op_usage();
   _print_machine_usage();
   printf("  compact                 Run tombstone compaction on all items\n");
+  // Audit A10-7b: single-shot mode destroys the node at process exit, so
+  // multi-command flows (load → seal-key import → mutate → save) only work
+  // in an interactive shell session.
+  printf("  shell                   Interactive shell: many commands, one live node\n");
   printf("\n  help                     Show this help message\n");
 }
 
@@ -2569,4 +2573,51 @@ cli_result_e cli_dispatch(cli_node_t* node, int argc, char** argv) {
 
   // Unreachable if all commands are handled above
   return CLI_ERR_ARGS;
+}
+
+// Audit A10-7b: shell line execution. One typed line = one dispatch against
+// the caller's persistent node, so session state (loaded snapshot custody,
+// imported seal key, accept-unverified acknowledgment, blueprint draft)
+// survives across commands — unlike the single-shot argv path, which
+// destroys the node at process exit.
+
+// Command tokens per shell line, not counting argv[0]. Fixed-size so the
+// REPL never allocates; a line with more tokens is REFUSED (not truncated,
+// which could silently retarget a destructive command's arguments).
+#define CLI_SHELL_MAX_TOKENS 32
+
+cli_result_e cli_shell_execute_line(cli_node_t* node, char* line,
+                                     bool* should_exit) {
+  if (node == NULL || line == NULL || should_exit == NULL) {
+    return CLI_ERR_ARGS;
+  }
+  // Caller-visible contract: the flag is always written. Cleared here, set
+  // only by the exit/quit branch below. Trailing tokens after exit/quit are
+  // ignored — the operator's intent to leave the session is unambiguous.
+  *should_exit = false;
+
+  char* argv[CLI_SHELL_MAX_TOKENS + 1];
+  argv[0] = (char*)"crabs_node";  // program name for dispatch usage messages
+  int token_count = 0;
+  char* token = strtok(line, " \t\r\n");
+  while (token != NULL && token_count < CLI_SHELL_MAX_TOKENS) {
+    argv[token_count + 1] = token;
+    token_count++;
+    token = strtok(NULL, " \t\r\n");
+  }
+  if (token != NULL) {
+    // A 33rd token exists: refuse the whole line rather than dispatch a
+    // truncated argument list.
+    printf("Error: too many tokens in one line (max %d).\n",
+           CLI_SHELL_MAX_TOKENS);
+    return CLI_ERR_ARGS;
+  }
+  if (token_count == 0) return CLI_OK;  // blank line: no-op
+
+  if (strcmp(argv[1], "exit") == 0 || strcmp(argv[1], "quit") == 0) {
+    *should_exit = true;
+    return CLI_OK;
+  }
+
+  return cli_dispatch(node, token_count + 1, argv);
 }
