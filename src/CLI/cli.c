@@ -373,20 +373,33 @@ cli_result_e cli_node_load(cli_node_t* node, const char* path) {
 // Audit L5: 'key import -' reads the node private key hex from stdin so the
 // key never appears in argv, the process list, or shell history. Returns a
 // freshly allocated, NUL-terminated line trimmed to exactly 64 hex chars, or
-// NULL on read/parse failure (the line buffer is cleansed before free).
+// NULL on read/parse failure (the line buffer is cleansed across the full
+// getline width before free, so no byte ever escapes cleansing).
 static char* _read_node_key_stdin_line(void) {
   char* line = NULL;
   size_t line_capacity = 0;
   ssize_t line_length = getline(&line, &line_capacity, stdin);
   if (line_length < 0) {
-    free(line);
+    // getline can leave a partially-filled buffer behind on failure.
+    if (line != NULL) {
+      OPENSSL_cleanse(line, line_capacity);
+      free(line);
+    }
     return NULL;
   }
+  const size_t raw_length = (size_t)line_length;
   while (line_length > 0 && isspace((unsigned char)line[line_length - 1])) {
     line[--line_length] = '\0';
   }
+  // An embedded NUL (strlen shorter than the bytes getline returned) means
+  // corrupt input; reject it so no key material hides beyond the terminator.
+  if ((size_t)line_length != strlen(line)) {
+    OPENSSL_cleanse(line, raw_length);
+    free(line);
+    return NULL;
+  }
   if (line_length != 64) {
-    OPENSSL_cleanse(line, strlen(line));
+    OPENSSL_cleanse(line, raw_length);
     free(line);
     return NULL;
   }
@@ -443,7 +456,6 @@ cli_result_e cli_node_load_key(cli_node_t* node, const char* private_key_hex) {
   if (key_line != NULL) {
     OPENSSL_cleanse(key_line, key_line_len);
     free(key_line);
-    key_line = NULL;
   }
 
   uint8_t pub[33];
