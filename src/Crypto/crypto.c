@@ -886,79 +886,6 @@ abe_user_key_t* crypto_abe_user_key_deserialize(const abe_master_key_t* mk,
 // Master Key Durability (§11.5)
 // ============================================================
 
-// oabe-c's oabe_secret_key_deserialize parses the MSK envelope but leaves the
-// alpha/beta master scalars unset (see the "placeholder" note in oabe_key.c),
-// which would leave a restored authority minting garbage keys. The scalars are
-// present in the serialized MSK (key_type + scheme bytes, then two packed ZP
-// elements), so parse them back out here and attach them to the restored
-// context's secret key.
-static bool _restore_msk_scalars(OABE_ContextCP* ctx, const OABE_ByteString* msk) {
-  if (!ctx || !msk || !ctx->secret_key) return false;
-  size_t offset = 2;                     // key_type byte + scheme byte
-  uint32_t alpha_len = 0;
-  uint32_t beta_len = 0;
-  if (oabe_bytestring_unpack32(msk, &offset, &alpha_len) != OABE_SUCCESS ||
-      offset + alpha_len + 4 > oabe_bytestring_get_size(msk)) {
-    return false;
-  }
-  offset += alpha_len;                   // skip the alpha element bytes
-  if (oabe_bytestring_unpack32(msk, &offset, &beta_len) != OABE_SUCCESS) {
-    return false;
-  }
-  const uint8_t* msk_data = oabe_bytestring_get_const_ptr(msk);
-  size_t header_len = 2 + 4 + alpha_len + 4;
-  if (header_len + beta_len > oabe_bytestring_get_size(msk)) return false;
-
-  // Alpha starts right after key_type(1) + scheme(1) + alpha_len(4) = 6 bytes;
-  // beta starts after 2 + 4 + alpha_len + 4 (the second length prefix) —
-  // both mirror oabe_secret_key_deserialize's parse order.
-  OABE_ByteString* alpha_bytes = oabe_bytestring_new_from_data(msk_data + 6, alpha_len);
-  OABE_ByteString* beta_bytes = oabe_bytestring_new_from_data(msk_data + header_len, beta_len);
-  OABE_ZP* alpha_scalar = NULL;
-  OABE_ZP* beta_scalar = NULL;
-  if (!alpha_bytes || !beta_bytes ||
-      oabe_zp_deserialize(ctx->base.group, alpha_bytes, &alpha_scalar) != OABE_SUCCESS ||
-      oabe_zp_deserialize(ctx->base.group, beta_bytes, &beta_scalar) != OABE_SUCCESS) {
-    if (alpha_scalar) oabe_zp_free(alpha_scalar);
-    if (beta_scalar) oabe_zp_free(beta_scalar);
-    // Same rationale as Audit N-17: cleanse the master scalars before the
-    // transient buffers holding them are freed.
-    if (alpha_bytes) {
-      const uint8_t* alpha_data = oabe_bytestring_get_const_ptr(alpha_bytes);
-      size_t alpha_data_len = oabe_bytestring_get_size(alpha_bytes);
-      if (alpha_data != NULL && alpha_data_len > 0) {
-        OPENSSL_cleanse((void*)alpha_data, alpha_data_len);
-      }
-      oabe_bytestring_free(alpha_bytes);
-    }
-    if (beta_bytes) {
-      const uint8_t* beta_data = oabe_bytestring_get_const_ptr(beta_bytes);
-      size_t beta_data_len = oabe_bytestring_get_size(beta_bytes);
-      if (beta_data != NULL && beta_data_len > 0) {
-        OPENSSL_cleanse((void*)beta_data, beta_data_len);
-      }
-      oabe_bytestring_free(beta_bytes);
-    }
-    return false;
-  }
-  // Cleanse the transient master-scalar copies before freeing.
-  const uint8_t* alpha_data = oabe_bytestring_get_const_ptr(alpha_bytes);
-  size_t alpha_data_len = oabe_bytestring_get_size(alpha_bytes);
-  if (alpha_data != NULL && alpha_data_len > 0) {
-    OPENSSL_cleanse((void*)alpha_data, alpha_data_len);
-  }
-  const uint8_t* beta_data = oabe_bytestring_get_const_ptr(beta_bytes);
-  size_t beta_data_len = oabe_bytestring_get_size(beta_bytes);
-  if (beta_data != NULL && beta_data_len > 0) {
-    OPENSSL_cleanse((void*)beta_data, beta_data_len);
-  }
-  oabe_bytestring_free(alpha_bytes);
-  oabe_bytestring_free(beta_bytes);
-  ctx->secret_key->alpha = alpha_scalar;
-  ctx->secret_key->beta = beta_scalar;
-  return true;
-}
-
 size_t crypto_master_key_serialize(const abe_master_key_t* mk,
                                      uint8_t* buf, size_t buf_len) {
   if (!mk || !mk->public_params || !mk->master_secret) return 0;
@@ -1033,18 +960,11 @@ abe_master_key_t* crypto_master_key_deserialize(const uint8_t* buf, size_t len) 
     return NULL;
   }
   oabe_bytestring_free(params);
-  if (!_restore_msk_scalars(mk->ctx, secret)) {
-    const uint8_t* secret_data = oabe_bytestring_get_const_ptr(secret);
-    size_t secret_data_len = oabe_bytestring_get_size(secret);
-    if (secret_data != NULL && secret_data_len > 0) {
-      OPENSSL_cleanse((void*)secret_data, secret_data_len);
-    }
-    oabe_bytestring_free(secret);
-    oabe_context_cp_free(mk->ctx);
-    free(mk);
-    return NULL;
-  }
   {
+    // Same rationale as Audit N-17: the MSK is root trust material, and
+    // oabe_bytestring_free does not zero the buffer. Since openabe-c A10-L16,
+    // oabe_context_cp_set_secret_key above reconstructs the alpha/beta master
+    // scalars itself, so no local re-parse of the envelope is needed here.
     const uint8_t* secret_data = oabe_bytestring_get_const_ptr(secret);
     size_t secret_data_len = oabe_bytestring_get_size(secret);
     if (secret_data != NULL && secret_data_len > 0) {
