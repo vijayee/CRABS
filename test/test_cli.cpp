@@ -2037,10 +2037,12 @@ TEST(TestCliDurability, TombstoneCommandPrintsDissolvedChildWire) {
   ASSERT_TRUE(test_read_file_bytes(captured_path, captured_bytes));
   std::string captured(captured_bytes.begin(), captured_bytes.end());
 
-  // The printed wire is canonical body (tag + string16 id) + the 64-byte
-  // parent ECDSA signature — exactly what __receive_dissolution__ transports.
+  // The printed wire is canonical body (tag + string16 id + u64le
+  // parent_key_version stamp) + the 64-byte parent ECDSA signature — exactly
+  // what __receive_dissolution__ transports.
   std::vector<uint8_t> wire = test_extract_hex_wire(captured);
-  const size_t expected_wire_len = 3 + strlen("child-red") + CRABS_SIG_SIZE;
+  const size_t expected_wire_len = 3 + strlen("child-red") + 8 +
+                                   CRABS_SIG_SIZE;
   ASSERT_EQ(wire.size(), expected_wire_len);
   EXPECT_EQ(wire[0], (uint8_t)LINEAGE_DISSOLVED);
   EXPECT_EQ(wire[1], (uint8_t)strlen("child-red"));
@@ -2129,7 +2131,8 @@ TEST(TestCliDurability, TombstoneAcceptCommandSeversLineageAndPersists) {
   ASSERT_TRUE(test_read_file_bytes(captured_path, captured_bytes));
   std::string captured(captured_bytes.begin(), captured_bytes.end());
   std::vector<uint8_t> wire = test_extract_hex_wire(captured);
-  ASSERT_EQ(wire.size(), 3 + strlen("child-red") + CRABS_SIG_SIZE);
+  ASSERT_EQ(wire.size(),
+            3 + strlen("child-red") + 8 + CRABS_SIG_SIZE);
   // Hand-off file: the printed hex plus a trailing newline — the accept
   // command must parse the hex run dynamically (the tombstone is wider
   // than any fixed 64-hex read) and tolerate the whitespace.

@@ -141,9 +141,10 @@ async function main() {
   }
 
   // ------------------------------------------------------------
-  // Tombstone mint: `u8 tag LINEAGE_DISSOLVED + string16 child_id` +
-  // 64-byte parent ECDSA — NO length prefix (the exact bytes a
-  // __receive_dissolution__ op transports). The trailing signature is
+  // Tombstone mint: `u8 tag LINEAGE_DISSOLVED + string16 child_id +
+  // u64le parent_key_version` (A11-4 key-stamp) + 64-byte parent ECDSA —
+  // NO length prefix (the exact bytes a __receive_dissolution__ op
+  // transports). The trailing signature is
   // verified here as non-trivial (any single ECDSA r||s byte may
   // legitimately be 0x00, so the only sound structural check without
   // the parent public key is "not ALL zero"). Full ECDSA verification
@@ -152,15 +153,15 @@ async function main() {
   // verify against.
   // ------------------------------------------------------------
   const tombstone = parent.lineageTombstone(childId);
-  const expectedLength = 3 + childId.length + CRABS_SIG_SIZE;
+  const expectedLength = 3 + childId.length + 8 + CRABS_SIG_SIZE;
   if (tombstone.length !== expectedLength) {
     throw new Error(`tombstone length ${tombstone.length} != ${expectedLength}`);
   }
   if (tombstone[0] !== LINEAGE_DISSOLVED_TAG) {
     throw new Error(`tombstone tag ${tombstone[0]} != LINEAGE_DISSOLVED(${LINEAGE_DISSOLVED_TAG})`);
   }
-  const idLengthPrefix = new DataView(tombstone.buffer, tombstone.byteOffset)
-                           .getUint16(1, true);
+  const tombstoneView = new DataView(tombstone.buffer, tombstone.byteOffset);
+  const idLengthPrefix = tombstoneView.getUint16(1, true);
   if (idLengthPrefix !== childId.length) {
     throw new Error(`tombstone id length ${idLengthPrefix} != ${childId.length}`);
   }
@@ -168,12 +169,18 @@ async function main() {
   if (tombstoneId !== childId) {
     throw new Error(`tombstone id "${tombstoneId}" != "${childId}"`);
   }
+  // The u64le key-version stamp trails the id: a fresh (never-rotated)
+  // parent stamps the spawn generation, 1.
+  const stampedVersion = tombstoneView.getBigUint64(3 + idLengthPrefix, true);
+  if (stampedVersion !== 1n) {
+    throw new Error(`tombstone key-version stamp ${stampedVersion} != 1`);
+  }
   // ECDSA r||s legitimately contains 0x00 bytes (~22% of sign runs), so
   // asserting any zero byte makes this smoke flaky. An all-zero 64-byte
   // region is effectively impossible for a real signature — mirror the
   // bindings/node smoke's all-zeros structural check.
   if (tombstone
-        .subarray(3 + idLengthPrefix)
+        .subarray(3 + idLengthPrefix + 8)
         .every(signatureByteValue => signatureByteValue === 0)) {
     throw new Error('tombstone signature is all zero bytes (not a real ECDSA)');
   }

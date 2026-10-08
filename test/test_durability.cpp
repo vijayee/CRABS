@@ -1007,8 +1007,10 @@ TEST(TestDurability, DissolutionSurvivesRestartThroughTombstoneDelivery) {
   ASSERT_TRUE(test_read_saved_bytes(captured_path, captured_bytes));
   captured.assign(captured_bytes.begin(), captured_bytes.end());
   std::vector<uint8_t> tombstone_wire = test_extract_hex_wire(captured);
+  // v2 tombstone body: u8 tag + string16 child_id + u64le parent_key_version
+  // (A11-4 key-stamp) + the 64-byte parent signature.
   ASSERT_EQ(tombstone_wire.size(),
-            3 + strlen("child-red") + CRABS_SIG_SIZE);
+            3 + strlen("child-red") + 8 + CRABS_SIG_SIZE);
   EXPECT_EQ(tombstone_wire[0], (uint8_t)LINEAGE_DISSOLVED);
   EXPECT_TRUE(crypto_ecdsa_verify(parent_key_snapshot.public_key,
                                   tombstone_wire.data(),

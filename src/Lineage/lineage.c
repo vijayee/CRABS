@@ -36,11 +36,13 @@ static bool _lineage_policy_expression_is_valid(const char* expression);
 // Canonical signing body (EXACT layout, shared by create/sign, verify, and
 // serialize so the three can never drift):
 //   u8 format_version; string16 parent_id; string16 child_id;
-//   string16 user_id; string16 attributes; u64le not_before; u64le expires_at
+//   string16 user_id; string16 attributes; u64le not_before; u64le expires_at;
+//   u64le parent_key_version   (v2, A11-4: the minting parent's chain key
+//   version — the sig covers it, and endorsement verification is tip-only)
 // string16 = u16le byte length + bytes WITHOUT the trailing NUL.
-// Worst case: 1 + (2+63)*3 + (2+255) + 8 + 8 = 469 bytes; the cap lives in
-// lineage.h (CRABS_ATTESTATION_BODY_MAX) next to the wire cap that layers on
-// top of it.
+// Worst case: 1 + (2+63)*3 + (2+255) + 8 + 8 + 8 = 477 bytes; the cap lives
+// in lineage.h (CRABS_ATTESTATION_BODY_MAX) next to the wire cap that layers
+// on top of it.
 
 static bool _lineage_field_is_safe(const char* field, size_t capacity) {
   if (field == NULL || strnlen(field, capacity) >= capacity) return false;
@@ -135,6 +137,9 @@ static size_t _attestation_write_canonical_body(const attestation_t* attestation
   _lineage_u64le_write(out + offset, attestation->not_before);
   _lineage_u64le_write(out + offset + 8, attestation->expires_at);
   offset += 16;
+  if (offset + 8 > cap) return 0;
+  _lineage_u64le_write(out + offset, attestation->parent_key_version);
+  offset += 8;
   return offset;
 }
 
@@ -174,6 +179,14 @@ crabs_error_e attestation_create(state_t* parent,
           sizeof(attestation_out->attributes) - 1);
   attestation_out->not_before = now_ms;
   attestation_out->expires_at = expires_at;
+  // A11-4 key-stamp: bind the body to the parent's CURRENT lineage key
+  // version. An unversioned machine key IS the spawn generation
+  // (CRABS_LINEAGE_KEY_VERSION_START) — lineage_key_rotate's normalization —
+  // so a fresh root parent stamps 1 (matching every child's spawn pin), and
+  // the chain-aware verifier's tip gate never sees stamp 0.
+  attestation_out->parent_key_version = parent->lineage_key_version != 0
+      ? parent->lineage_key_version
+      : (uint64_t)CRABS_LINEAGE_KEY_VERSION_START;
 
   uint8_t canonical_body[CRABS_ATTESTATION_BODY_MAX];
   size_t body_len = _attestation_write_canonical_body(
@@ -217,21 +230,27 @@ bool attestation_verify_by_lineage_key(const state_t* child_state,
                                        uint64_t now_ms) {
   if (child_state == NULL || attestation == NULL) return false;
   // Unbound or never-chain-stamped: no accepted parent authority exists, so
-  // nothing can verify (fail closed — mirrors lineage_verify_by_parent_key).
+  // nothing can verify (fail closed).
   if (!child_state->lineage_parent_bound) return false;
-  // The canonical check's child_id is THIS machine's lineage identity: any
-  // chain entry may have signed, but the attestation must still name this
-  // machine (attestation_verify's strcmp gate).
-  for (uint32_t chain_index = 0;
-       chain_index < child_state->lineage_key_chain_count; chain_index++) {
-    if (attestation_verify(child_state->lineage_key_chain[chain_index]
-                               .public_key,
-                           child_state->lineage_self_id, attestation,
-                           now_ms)) {
-      return true;
-    }
+  // A bound state should always carry chain_count >= 1 (spawn stamps the
+  // pin; the deserializer synthesizes one), but a hand-built state could
+  // reach here with no chain — fail closed instead of underflowing.
+  if (child_state->lineage_key_chain_count == 0) return false;
+  // TIP-ONLY (A11-4): the body's parent_key_version stamp must equal the
+  // chain tip's version AND the signature must verify under the tip's key.
+  // A retired-key holder cannot satisfy the tip-version gate with its own
+  // version, and a forged tip-stamp signature fails under the tip's key, so
+  // retired keys verify nothing; honest pre-rotation attestations expire
+  // with the rotation (children re-attest — see lineage.h).
+  const lineage_key_chain_entry_t* tip_entry =
+      &child_state->lineage_key_chain[
+          child_state->lineage_key_chain_count - 1];
+  if (attestation->parent_key_version != tip_entry->key_version) {
+    return false;
   }
-  return false;
+  return attestation_verify(tip_entry->public_key,
+                            child_state->lineage_self_id, attestation,
+                            now_ms);
 }
 
 size_t attestation_serialize(const attestation_t* attestation,
@@ -254,10 +273,12 @@ attestation_t* attestation_deserialize(const uint8_t* buf, size_t len) {
   if (buf == NULL) return NULL;
   size_t offset = 0;
   uint32_t total_len;
-  // The prefix must claim exactly the bytes that follow it.
+  // The prefix must claim exactly the bytes that follow it. Floor: the
+  // signature plus the v2 fixed section (u8 version + not_before +
+  // expires_at + parent_key_version stamp).
   if (!_lineage_u32le_read(buf, len, &offset, &total_len) ||
       total_len != len - 4 ||
-      total_len < CRABS_SIG_SIZE + 1 + 16) {
+      total_len < CRABS_SIG_SIZE + 1 + 16 + 8) {
     return NULL;
   }
   uint8_t format_version;
@@ -278,6 +299,8 @@ attestation_t* attestation_deserialize(const uint8_t* buf, size_t len) {
                              sizeof(attestation->attributes)) &&
       _lineage_u64le_read(buf, len, &offset, &attestation->not_before) &&
       _lineage_u64le_read(buf, len, &offset, &attestation->expires_at) &&
+      _lineage_u64le_read(buf, len, &offset,
+                          &attestation->parent_key_version) &&
       offset + CRABS_SIG_SIZE == len;
   if (parsed) {
     memcpy(attestation->signature, buf + offset, CRABS_SIG_SIZE);
@@ -1326,7 +1349,11 @@ crabs_error_e lineage_spawn_machine(state_t* parent,
   // serializer INCLUDES the stamped chain in the genesis blob, which is
   // hashed (genesis_hash) and signed (genesis_signature), so the spawn pin
   // is bound into the child's provenance rather than floating outside the
-  // signed bytes.
+  // signed bytes. The pin's VERSION is the parent's version AT SPAWN (A11-4
+  // reconciliation): a pre-rotated parent's first attestations stamp its
+  // current version, so chain[0].key_version must equal it or the genesis
+  // attestations would fail the tip gate. A never-rotated parent's key IS
+  // the spawn generation (lineage_key_rotate's normalization).
   child_state->lineage_key_chain =
       get_clear_memory(sizeof(lineage_key_chain_entry_t));
   if (child_state->lineage_key_chain == NULL) {
@@ -1335,8 +1362,9 @@ crabs_error_e lineage_spawn_machine(state_t* parent,
     attribute_machine_destroy(child);
     return CRABS_ERR_OOM;
   }
-  child_state->lineage_key_chain[0].key_version =
-      CRABS_LINEAGE_KEY_VERSION_START;
+  child_state->lineage_key_chain[0].key_version = parent->lineage_key_version
+      != 0 ? parent->lineage_key_version
+           : (uint64_t)CRABS_LINEAGE_KEY_VERSION_START;
   memcpy(child_state->lineage_key_chain[0].public_key,
          parent->node_public_key, 33);
   child_state->lineage_key_chain_count = 1;
@@ -1714,15 +1742,20 @@ void lineage_install(state_t* state) {
 }
 
 // Canonical tombstone body: `u8 tag (= LINEAGE_DISSOLVED) + string16
-// child_id` (string length EXCLUDES the NUL). Sole writer for the signing
-// surfaces — lineage_sign_dissolution signs it and
+// child_id + u64le parent_key_version` (string length EXCLUDES the NUL). The
+// stamp (A11-4) binds the tombstone to the parent chain version at mint
+// time; the delivery side verifies TIP-ONLY (stamp == chain tip's
+// key_version AND signature under the tip), so a tombstone re-emitted after
+// a rotation must be re-issued under the current parent key. Sole writer
+// for the signing surfaces — lineage_sign_dissolution signs it and
 // lineage_dissolution_serialize appends the signature to it; the delivery
 // op lineage_op_receive_dissolution only PARSES the same layout (it never
 // writes), so delivery bytes can never drift from signing bytes. Worst
-// case 3 + (CRABS_MAX_USER_ID - 1) = 66 bytes.
+// case 3 + (CRABS_MAX_USER_ID - 1) + 8 = 74 bytes.
 static bool _lineage_tombstone_write_body(uint8_t* out, size_t cap,
                                           size_t* offset_out,
-                                          const char* child_id) {
+                                          const char* child_id,
+                                          uint64_t parent_key_version) {
   size_t offset = 0;
   if (cap < 1) return false;
   out[offset++] = (uint8_t)LINEAGE_DISSOLVED;
@@ -1732,6 +1765,9 @@ static bool _lineage_tombstone_write_body(uint8_t* out, size_t cap,
                                strlen(child_id) + 1)) {
     return false;
   }
+  if (offset + 8 > cap) return false;
+  _lineage_u64le_write(out + offset, parent_key_version);
+  offset += 8;
   *offset_out = offset;
   return true;
 }
@@ -1755,9 +1791,12 @@ static crabs_error_e _lineage_dissolved_entry(state_t* parent,
 }
 
 // Off-chain dissolution proof: ECDSA over the canonical tombstone
-// `u8 tag (= LINEAGE_DISSOLVED) + string16 child_id`. Verifiable by any
-// third party holding the parent's node public key — no manifest needed.
-// Worst case 1 + 2 + CRABS_MAX_USER_ID = 67 bytes.
+// `u8 tag (= LINEAGE_DISSOLVED) + string16 child_id + u64le
+// parent_key_version`. Verifiable by any third party holding the parent's
+// node public key — no manifest needed. The stamp is the parent's current
+// lineage key version (unversioned == the spawn generation, mirroring
+// lineage_key_rotate's normalization). Worst case
+// 1 + 2 + CRABS_MAX_USER_ID + 8 = 75 bytes.
 crabs_error_e lineage_sign_dissolution(state_t* parent, const char* child_id,
                                        uint8_t signature_out[CRABS_SIG_SIZE]) {
   if (parent == NULL || child_id == NULL || signature_out == NULL) {
@@ -1766,10 +1805,14 @@ crabs_error_e lineage_sign_dissolution(state_t* parent, const char* child_id,
   crabs_error_e status = _lineage_dissolved_entry(parent, child_id);
   if (status != CRABS_SUCCESS) return status;
 
-  uint8_t tombstone[1 + 2 + CRABS_MAX_USER_ID];
+  uint8_t tombstone[1 + 2 + CRABS_MAX_USER_ID + 8];
   size_t tombstone_len = 0;
+  uint64_t parent_key_version = parent->lineage_key_version != 0
+      ? parent->lineage_key_version
+      : (uint64_t)CRABS_LINEAGE_KEY_VERSION_START;
   if (!_lineage_tombstone_write_body(tombstone, sizeof(tombstone),
-                                     &tombstone_len, child_id)) {
+                                     &tombstone_len, child_id,
+                                     parent_key_version)) {
     return CRABS_ERR_INVALID_PARAM;
   }
   if (crypto_ecdsa_sign(parent->node_private_key, tombstone, tombstone_len,
@@ -1793,7 +1836,11 @@ crabs_error_e lineage_dissolution_serialize(state_t* parent,
   if (status != CRABS_SUCCESS) return status;
 
   size_t body_len = 0;
-  if (!_lineage_tombstone_write_body(out_buf, buf_len, &body_len, child_id) ||
+  uint64_t parent_key_version = parent->lineage_key_version != 0
+      ? parent->lineage_key_version
+      : (uint64_t)CRABS_LINEAGE_KEY_VERSION_START;
+  if (!_lineage_tombstone_write_body(out_buf, buf_len, &body_len, child_id,
+                                     parent_key_version) ||
       buf_len - body_len < CRABS_SIG_SIZE) {
     return CRABS_ERR_INVALID_PARAM;
   }
@@ -1814,10 +1861,11 @@ crabs_error_e lineage_op_receive_dissolution(state_t* state, operation_t* op) {
     return CRABS_ERR_INVALID_PARAM;
   }
   // Size window: a 1-character id is the smallest honest tombstone
-  // (3 + 1 + CRABS_SIG_SIZE); a safe id tops out at CRABS_MAX_USER_ID - 1
-  // characters (it must keep room for its NUL).
-  size_t tombstone_min = 3 + 1 + CRABS_SIG_SIZE;
-  size_t tombstone_max = 3 + (CRABS_MAX_USER_ID - 1) + CRABS_SIG_SIZE;
+  // (3 + 1 + 8 + CRABS_SIG_SIZE — body carries the u64le stamp); a safe id
+  // tops out at CRABS_MAX_USER_ID - 1 characters (it must keep room for its
+  // NUL).
+  size_t tombstone_min = 3 + 1 + 8 + CRABS_SIG_SIZE;
+  size_t tombstone_max = 3 + (CRABS_MAX_USER_ID - 1) + 8 + CRABS_SIG_SIZE;
   if (op->payload_size < tombstone_min || op->payload_size > tombstone_max) {
     return CRABS_ERR_INVALID_PARAM;
   }
@@ -1841,8 +1889,11 @@ crabs_error_e lineage_op_receive_dissolution(state_t* state, operation_t* op) {
   }
   size_t offset = 1;
   char tombstone_child_id[CRABS_MAX_USER_ID];
+  uint64_t tombstone_parent_key_version;
   if (!_lineage_string16_read(op->payload, body_len, &offset,
                               tombstone_child_id, sizeof(tombstone_child_id)) ||
+      !_lineage_u64le_read(op->payload, body_len, &offset,
+                           &tombstone_parent_key_version) ||
       offset != body_len) {
     return CRABS_ERR_INVALID_PARAM;
   }
@@ -1853,10 +1904,21 @@ crabs_error_e lineage_op_receive_dissolution(state_t* state, operation_t* op) {
   // Authenticity rests on the tombstone's own parent signature — NOT on the
   // op's signature or attestations: the pipeline already authorized the
   // child admin (carriage), this ECDSA proves the parent decided (content).
-  // Chain-aware (A10-M6): a tombstone signed by ANY accepted parent key —
-  // the spawn pin or an accepted rotation — is authoritative.
-  if (!lineage_verify_by_parent_key(state, op->payload, body_len,
-                                    signature)) {
+  // TIP-ONLY (A11-4): the body's parent_key_version stamp must equal the
+  // accepted chain TIP's version AND the signature must verify under the
+  // tip's key — a retired chain key (the spawn pin after a rotation) can no
+  // longer deliver a dissolution; re-emission after a rotation is re-issued
+  // under the parent's current key. A bound state SHOULD always carry a
+  // non-empty chain (spawn stamps the pin; the deserializer synthesizes
+  // one); fail closed rather than underflowing if not.
+  if (state->lineage_key_chain_count == 0) {
+    return CRABS_ERR_CRYPTOGRAPHIC_ERROR;
+  }
+  const lineage_key_chain_entry_t* tip_entry =
+      &state->lineage_key_chain[state->lineage_key_chain_count - 1];
+  if (tombstone_parent_key_version != tip_entry->key_version ||
+      !crypto_ecdsa_verify(tip_entry->public_key, op->payload, body_len,
+                           signature)) {
     return CRABS_ERR_CRYPTOGRAPHIC_ERROR;
   }
 
@@ -1921,7 +1983,8 @@ crabs_error_e crabs_issue_attestation(state_t* parent,
 }
 
 // ============================================================
-// Parent key chain (A10-M6): rotate / accept / chain-wide verify
+// Parent key chain (A10-M6): rotate / accept (verification is tip-only —
+// attestation_verify_by_lineage_key and lineage_op_receive_dissolution)
 // ============================================================
 
 // Canonical key transition body writer — the SINGLE writer shared by signing
@@ -2192,9 +2255,9 @@ crabs_error_e lineage_child_accept_key_transition(state_t* child_state,
   // chain tip; re-emission re-delivers that same record) names the tip, so
   // refusing retired-key records closes the "compromised retired key can
   // still advance the chain" hole with zero legitimate-traffic cost. Key
-  // rotation retires the tip (version-bump authority moves to the new key),
-  // but chain-wide verification (lineage_verify_by_parent_key) keeps prior
-  // entries accepted for historical attestations/tombstones.
+  // rotation retires the tip, and retired entries verify NOTHING afterwards
+  // (A11-4 tip-only verification): their remaining purpose is the chain's
+  // continuity history and the version-forward-only ordering.
   // Guard the tip index rather than assume it: a bound state SHOULD always
   // carry chain_count >= 1 (spawn stamps the pin; the deserializer
   // synthesizes one), but a hand-built state could reach here with no
@@ -2228,19 +2291,3 @@ crabs_error_e lineage_child_accept_key_transition(state_t* child_state,
   return CRABS_SUCCESS;
 }
 
-bool lineage_verify_by_parent_key(const state_t* state, const uint8_t* msg,
-                                  size_t msg_len,
-                                  const uint8_t sig[CRABS_SIG_SIZE]) {
-  if (state == NULL || msg == NULL || sig == NULL) return false;
-  // Any current chain entry is an accepted parent authority — the spawn pin
-  // keeps verifying old attestations after a rotation, and each rotated key
-  // joins the surface. An empty chain (never bound) fails closed.
-  for (uint32_t chain_index = 0;
-       chain_index < state->lineage_key_chain_count; chain_index++) {
-    if (crypto_ecdsa_verify(state->lineage_key_chain[chain_index].public_key,
-                            msg, msg_len, sig)) {
-      return true;
-    }
-  }
-  return false;
-}

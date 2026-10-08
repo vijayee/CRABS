@@ -22,11 +22,17 @@
 #define CRABS_MAX_BLUEPRINT_OP_TYPE_DEFS 32
 
 // Cross-domain endorsement wire version (spec §attestation bridge).
-// Independent of key_envelope_t's 0x03.
-#define CRABS_ATTESTATION_FORMAT_VERSION 0x01
+// Independent of key_envelope_t's 0x03. v2 appends u64le parent_key_version
+// after expires_at (A11-4): the stamp binds the body to the parent chain
+// version under which it was minted, and endorsement verification is
+// TIP-ONLY (stamp == chain tip's key_version AND signature under the tip's
+// key). v1 bodies fail closed — an un-stamped body would be forgeable by
+// any retired chain key, voiding the restriction; children re-attest after
+// every rotation.
+#define CRABS_ATTESTATION_FORMAT_VERSION 0x02
 
 // Canonical attestation body cap. The worst-case body (lineage.c's
-// canonical writer) is 1 + 3*(2+63) + (2+255) + 16 = 469 bytes; the cap
+// canonical writer) is 1 + 3*(2+63) + (2+255) + 16 + 8 = 477 bytes; the cap
 // gives headroom. The wire image adds a u32le length prefix and the 64-byte
 // signature on top.
 #define CRABS_ATTESTATION_BODY_MAX  512
@@ -63,6 +69,9 @@ typedef struct {
 
 // Cross-domain endorsement (spec §attestation bridge): a parent-signed,
 // TTL-bounded attribute grant a spawned child resolves against.
+// parent_key_version (v2): the parent chain key version under which the
+// body was minted — bound into the canonical body (and thus the signature);
+// endorsement verification requires it to equal the chain TIP's key_version.
 typedef struct {
   uint8_t  format_version;
   char     parent_id[CRABS_MAX_USER_ID];
@@ -71,6 +80,7 @@ typedef struct {
   char     attributes[CRABS_MAX_POLICY_EXPR];   // comma-separated name:value pairs
   uint64_t not_before;
   uint64_t expires_at;                            // not_before + ttl <= expires_at
+  uint64_t parent_key_version;                    // minting parent's chain version
   uint8_t  signature[CRABS_SIG_SIZE];             // parent ECDSA over canonical body
 } attestation_t;
 
@@ -198,8 +208,12 @@ machine_blueprint_t* blueprint_deserialize(const uint8_t* buf, size_t len);
 // Chain bounds. A bounded history caps verification cost and (v13) blob size;
 // overflow is REFUSED rather than silently truncating the spawn pin.
 #define CRABS_MAX_LINEAGE_KEY_CHAIN 8
-// Key version of the spawn pin (chain entry [0]) — every state starts its
-// (implicit) current node key at this generation; rotations advance it.
+// Key version of the spawn pin (chain entry [0]) for a NEVER-ROTATED
+// parent — every state starts its (implicit) current node key at this
+// generation; rotations advance it. A parent that rotated BEFORE the spawn
+// pins the child at its CURRENT version instead (the spawn pin carries the
+// parent's version at spawn), so the first attestations' stamps equal
+// chain[0].key_version from genesis.
 #define CRABS_LINEAGE_KEY_VERSION_START 1
 
 // Parent side: build + sign a key transition with the CURRENT node key and
@@ -250,18 +264,16 @@ crabs_error_e lineage_key_rotate(state_t* parent_state,
 //   - chain already holds CRABS_MAX_LINEAGE_KEY_CHAIN entries, or OOM growing
 //       → CRABS_ERR_OOM
 // On success appends {new_key_version, new_pk} to lineage_key_chain.
+//
+// Verification surface (A11-4): attestations and tombstones verify against
+// the chain TIP ONLY — retired entries advance/history-prove the chain but
+// verify NOTHING (see attestation_verify_by_lineage_key and
+// lineage_op_receive_dissolution). The chain's retired entries therefore
+// carry no signing trust: the version stamp inside every minted body makes
+// retired-key forgeries fail the tip-version gate.
 crabs_error_e lineage_child_accept_key_transition(state_t* child_state,
                                                   const uint8_t* record,
                                                   size_t record_len);
-
-// Chain-wide verification: true iff sig verifies over msg under ANY current
-// chain entry. Used by the endorsement + tombstone paths so attestations and
-// tombstones signed under any accepted parent key — including the pre-
-// rotation spawn pin — keep verifying (backward compatible). A machine with
-// an empty chain (never bound, or bound pre-chain-stamping) fails closed.
-bool lineage_verify_by_parent_key(const state_t* state, const uint8_t* msg,
-                                  size_t msg_len,
-                                  const uint8_t sig[CRABS_SIG_SIZE]);
 
 // ============================================================
 // Spawn: instantiate a child machine from a validated blueprint
@@ -479,28 +491,33 @@ crabs_error_e lineage_op_dissolve(state_t* state, operation_t* op);
 
 // Off-chain dissolution proof: the parent machine's ECDSA signature over the
 // canonical tombstone bytes `u8 tag (= LINEAGE_DISSOLVED) + string16
-// child_id` — a third party can verify a child's lineage was severed without
-// the manifest being persisted anywhere. Honesty gate: the manifest entry
-// must exist and currently read DISSOLVED (signing a tombstone for a
-// non-dissolved child is a lie). Unknown child →
+// child_id + u64le parent_key_version` — a third party can verify a child's
+// lineage was severed without the manifest being persisted anywhere. The
+// stamp (A11-4) binds the tombstone to the parent chain version at mint
+// time; delivery verifies tip-only (see lineage_op_receive_dissolution), so
+// a tombstone is re-issued under the current key whenever it is re-emitted
+// after a rotation. Honesty gate: the manifest entry must exist and
+// currently read DISSOLVED (signing a tombstone for a non-dissolved child
+// is a lie). Unknown child →
 // CRABS_ERR_RESOURCE_NOT_FOUND; not dissolved → CRABS_ERR_UNAUTHORIZED; no
 // node key / signing failure → CRABS_ERR_CRYPTOGRAPHIC_ERROR.
 crabs_error_e lineage_sign_dissolution(state_t* parent, const char* child_id,
                                        uint8_t signature_out[CRABS_SIG_SIZE]);
 
 // Tombstone WIRE image: canonical body (`u8 tag (= LINEAGE_DISSOLVED) +
-// string16 child_id`, string length EXCLUDES the NUL) + the 64-byte parent
-// ECDSA signature appended — 3 + strlen(child_id) + CRABS_SIG_SIZE bytes, no
-// length prefix (the op pipeline already transports payload_size). Worst
-// case 3 + (CRABS_MAX_USER_ID - 1) + CRABS_SIG_SIZE (a safe id keeps room
-// for its NUL), which CRABS_DISSOLUTION_WIRE_MAX bounds. This is the exact
+// string16 child_id + u64le parent_key_version`, string length EXCLUDES the
+// NUL) + the 64-byte parent ECDSA signature appended — 3 + strlen(child_id)
+// + 8 + CRABS_SIG_SIZE bytes, no length prefix (the op pipeline already
+// transports payload_size). Worst case 3 + (CRABS_MAX_USER_ID - 1) + 8 +
+// CRABS_SIG_SIZE (a safe id keeps room for its NUL), which
+// CRABS_DISSOLUTION_WIRE_MAX bounds. This is the exact
 // byte sequence a __receive_dissolution__ op transports and verifies, so
 // delivery bytes can never drift from signing bytes. Writes *out_len and
 // returns CRABS_SUCCESS; the error surface and honesty gate are
 // lineage_sign_dissolution's exactly (manifest entry must currently read
 // DISSOLVED); a buffer smaller than the wire is CRABS_ERR_INVALID_PARAM.
 #define CRABS_DISSOLUTION_WIRE_MAX \
-  (3 + (CRABS_MAX_USER_ID - 1) + CRABS_SIG_SIZE)
+  (3 + (CRABS_MAX_USER_ID - 1) + 8 + CRABS_SIG_SIZE)
 crabs_error_e lineage_dissolution_serialize(state_t* parent,
                                             const char* child_id,
                                             uint8_t* out_buf, size_t buf_len,
@@ -520,12 +537,15 @@ crabs_error_e lineage_dissolution_serialize(state_t* parent,
 // op pipeline already verified the submitting child admin's signature against
 // the "role:admin" policy, which authorizes CARRIAGE of the payload but says
 // nothing about its content; the tombstone's ECDSA over the canonical body
-// against the accepted parent key chain (lineage_verify_by_parent_key — the
-// spawn pin plus every accepted rotation) is the ONLY proof that the PARENT
-// machine actually severed the lineage. The op's attestations play no
-// part — a child admin carrying a forged parent "decision" must fail on the
-// parent signature, and a raw-but-unroutable parent signature needs the
-// authorized op carrier to reach the child machine at all.
+// is the ONLY proof that the PARENT machine actually severed the lineage.
+// That proof is TIP-ONLY (A11-4): the body's parent_key_version stamp must
+// equal the accepted chain TIP's key_version AND the signature must verify
+// under the tip's key — a retired chain key (the spawn pin after a
+// rotation) can no longer deliver a dissolution, so a re-emitted tombstone
+// must be re-issued under the parent's current key. The op's attestations
+// play no part — a child admin carrying a forged parent "decision" must fail
+// on the parent signature, and a raw-but-unroutable parent signature needs
+// the authorized op carrier to reach the child machine at all.
 crabs_error_e lineage_op_receive_dissolution(state_t* state, operation_t* op);
 
 // payload = a key transition record (lineage_key_rotate's output / the
@@ -556,10 +576,13 @@ crabs_error_e lineage_op_withdraw_genesis(state_t* state, operation_t* op);
 // Create an attestation and sign its canonical body with the parent
 // machine's node key (state_set_node_key must have been called — a machine
 // never reads the wall clock itself, so `now_ms` is supplied by the caller).
-// `expires_at` must not precede `now_ms`. Returns CRABS_ERR_INVALID_PARAM on
-// missing or structurally invalid inputs (unsafe/overlong ids or attributes),
-// and CRABS_ERR_CRYPTOGRAPHIC_ERROR when the node key is invalid or signing
-// fails.
+// Stamps parent_key_version with the parent's current lineage key version
+// (an unversioned machine key IS the spawn generation —
+// CRABS_LINEAGE_KEY_VERSION_START — mirroring lineage_key_rotate's
+// normalization). `expires_at` must not precede `now_ms`. Returns
+// CRABS_ERR_INVALID_PARAM on missing or structurally invalid inputs
+// (unsafe/overlong ids or attributes), and CRABS_ERR_CRYPTOGRAPHIC_ERROR
+// when the node key is invalid or signing fails.
 crabs_error_e attestation_create(state_t* parent,
                                  attestation_t* attestation_out,
                                  const char* parent_id, const char* child_id,
@@ -573,14 +596,17 @@ bool attestation_verify(const uint8_t parent_public_key[33],
                         const char* child_id,
                         const attestation_t* attestation, uint64_t now_ms);
 
-// Chain-aware endorsement verification (A10-M6): attestation_verify tried
-// against EVERY entry of the child state's lineage_key_chain — the spawn pin
-// (pre-rotation attestations keep verifying) and every accepted rotated key
-// (issuance under the current node key verifies immediately after a
-// __parent_key_update__). The child_id the canonical check matches is
-// child_state->lineage_self_id. Fails closed (false) on an unbound machine
-// or an empty chain; the caller's own lifecycle gates (dissolution etc.)
-// stay separate. No heap use.
+// Chain-aware endorsement verification (A10-M6, A11-4 TIP-ONLY): the
+// attestation's parent_key_version stamp must equal the child state's
+// lineage_key_chain TIP entry's key_version AND the signature must verify
+// under the tip's key. Retired (sub-tip) chain entries verify nothing — a
+// compromised retired parent key can mint no fresh endorsement (its stamp
+// can never equal the tip), and honestly-minted pre-rotation attestations
+// stop verifying at the rotation: children re-attest after every rotation.
+// The child_id the canonical check matches is child_state->lineage_self_id.
+// Fails closed (false) on an unbound machine or an empty chain; the
+// caller's own lifecycle gates (dissolution etc.) stay separate. No heap
+// use.
 bool attestation_verify_by_lineage_key(const state_t* child_state,
                                        const attestation_t* attestation,
                                        uint64_t now_ms);

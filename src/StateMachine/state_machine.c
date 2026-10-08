@@ -709,9 +709,9 @@ static crabs_error_e _verify_parent_endorsements(
       }
       // Identity anchor: the attestation must name THIS machine's bound
       // parent. The signature check verifies the attestation against the
-      // stored parent key but cannot see WHO the attestation names — a
-      // different parent's attestation (validly signed by its own key that
-      // happens to be bound here) must not satisfy an endorsement.
+      // chain TIP key (tip-only, A11-4) but cannot see WHO the attestation
+      // names — a different parent's attestation (validly signed by its own
+      // key that happens to be bound here) must not satisfy an endorsement.
       if (strcmp(attestation->parent_id, state->lineage_parent_id) != 0) {
         continue;
       }

@@ -437,7 +437,10 @@ typedef struct state_t {
   // A10-M6 (v13, runtime + wire): bounded chain of node keys this machine
   // accepts for parent attestations/tombstones. Entry [0] is the spawn pin
   // (== lineage_parent_public_key); forward-only via __parent_key_update__.
-  // Heap array owned by the state — freed by state_destroy /
+  // Verification is TIP-ONLY (A11-4): a minted attestation/tombstone's
+  // parent_key_version stamp must equal the TIP entry's key_version and its
+  // signature must verify under the tip's key — retired entries verify
+  // nothing. Heap array owned by the state — freed by state_destroy /
   // attribute_machine_destroy. Cap CRABS_MAX_LINEAGE_KEY_CHAIN (lineage.h).
   lineage_key_chain_entry_t* lineage_key_chain;
   uint32_t                   lineage_key_chain_count;

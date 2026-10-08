@@ -162,12 +162,13 @@ async function main() {
   }
 
   // ------------------------------------------------------------
-  // Tombstone mint: `u8 tag LINEAGE_DISSOLVED + string16 child_id` +
-  // 64-byte parent ECDSA — NO length prefix (the exact bytes a
-  // __receive_dissolution__ op transports). Structurally verified here.
+  // Tombstone mint: `u8 tag LINEAGE_DISSOLVED + string16 child_id +
+  // u64le parent_key_version` (A11-4 key-stamp) + 64-byte parent ECDSA —
+  // NO length prefix (the exact bytes a __receive_dissolution__ op
+  // transports). Structurally verified here.
   // ------------------------------------------------------------
   const tombstone = parent.lineageTombstone(childId);
-  const expectedLength = 3 + childId.length + CRABS_SIG_SIZE;
+  const expectedLength = 3 + childId.length + 8 + CRABS_SIG_SIZE;
   if (tombstone.length !== expectedLength) {
     throw new Error(`tombstone length ${tombstone.length} != ${expectedLength}`);
   }
@@ -181,10 +182,16 @@ async function main() {
   if (tombstone.subarray(3, 3 + idLengthPrefix).toString('utf8') !== childId) {
     throw new Error(`tombstone id "${tombstone.subarray(3, 3 + idLengthPrefix).toString('utf8')}" != "${childId}"`);
   }
+  // The u64le key-version stamp trails the id: a fresh (never-rotated)
+  // parent stamps the spawn generation, 1.
+  const stampedVersion = tombstone.readBigUInt64LE(3 + idLengthPrefix);
+  if (stampedVersion !== 1n) {
+    throw new Error(`tombstone key-version stamp ${stampedVersion} != 1`);
+  }
   // Deterministic structural check only: ECDSA r||s values legitimately
   // contain zero bytes (the wasm smoke's any-zero-byte assertion is
   // ~22%-of-runs flaky), so the honest check is "not a zeroed signature".
-  if (tombstone.subarray(3 + idLengthPrefix).every(sigByte => sigByte === 0)) {
+  if (tombstone.subarray(3 + idLengthPrefix + 8).every(sigByte => sigByte === 0)) {
     throw new Error('tombstone signature is all zero bytes (not a real ECDSA)');
   }
 

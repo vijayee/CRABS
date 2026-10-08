@@ -1173,8 +1173,9 @@ serialized_buffer_t* crabs_wasm_lineage_attest(attribute_machine_t* am,
 }
 
 // Mint a dissolution tombstone for a DISSOLVED manifest child and return its
-// wire image (canonical body `u8 tag LINEAGE_DISSOLVED + string16 child_id` +
-// the 64-byte parent ECDSA signature, NO length prefix) as a
+// wire image (canonical body `u8 tag LINEAGE_DISSOLVED + string16 child_id +
+// u64le parent_key_version` + the 64-byte parent ECDSA signature, NO length
+// prefix) as a
 // serialized_buffer_t. There is deliberately no JS-visible honesty precheck:
 // resolving the manifest entry and refusing anything but DISSOLVED is the C
 // gate inside lineage_dissolution_serialize, so a non-dissolved child simply

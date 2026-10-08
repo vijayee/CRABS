@@ -2238,7 +2238,8 @@ TEST(TestLineage, DissolutionTombstoneSignsOnlyAfterDissolve) {
   // Dissolve directly through the handler (it runs post-authorization, so
   // an unsigned op shell is enough for a direct call), then the tombstone
   // signs and verifies against the parent's node public key over the
-  // canonical tombstone bytes `u8 tag + string16 child_id`.
+  // canonical tombstone bytes `u8 tag + string16 child_id + u64le
+  // parent_key_version`.
   operation_t* dissolve_op = operation_create(CRABS_LINEAGE_OP_DISSOLVE);
   ASSERT_NE(dissolve_op, nullptr);
   EXPECT_EQ(lineage_op_dissolve(parent, dissolve_op),
@@ -2253,11 +2254,15 @@ TEST(TestLineage, DissolutionTombstoneSignsOnlyAfterDissolve) {
 
   EXPECT_EQ(lineage_sign_dissolution(parent, "child-red", tombstone),
             CRABS_SUCCESS);
-  uint8_t canonical_tombstone[1 + 2 + 9];
+  uint8_t canonical_tombstone[1 + 2 + 9 + 8];
   canonical_tombstone[0] = (uint8_t)LINEAGE_DISSOLVED;
   canonical_tombstone[1] = 9;
   canonical_tombstone[2] = 0;
   memcpy(canonical_tombstone + 3, "child-red", 9);
+  // Stamp = the minting parent's normalized key version (fresh parent → the
+  // spawn generation), written u64le.
+  canonical_tombstone[12] = (uint8_t)CRABS_LINEAGE_KEY_VERSION_START;
+  memset(canonical_tombstone + 13, 0, 7);
   EXPECT_TRUE(crypto_ecdsa_verify(harness.parent_key->public_key,
                                   canonical_tombstone,
                                   sizeof(canonical_tombstone), tombstone));
@@ -2360,13 +2365,23 @@ TEST(TestLineage, TombstoneDeliveryOpSetsAndPersistsDissolveState) {
                                           sizeof(tombstone), &tombstone_len),
             CRABS_SUCCESS);
   ASSERT_EQ(tombstone_len,
-            (size_t)(3 + strlen("child-delegated") + CRABS_SIG_SIZE));
-  // Wire layout: u8 tag + u16le string length + child_id + 64B signature.
+            (size_t)(3 + strlen("child-delegated") + 8 + CRABS_SIG_SIZE));
+  // Wire layout: u8 tag + u16le string length + child_id + u64le
+  // parent_key_version + 64B signature.
   EXPECT_EQ(tombstone[0], (uint8_t)LINEAGE_DISSOLVED);
   EXPECT_EQ(tombstone[1], (uint8_t)strlen("child-delegated"));
   EXPECT_EQ(tombstone[2], 0x00);
   EXPECT_EQ(memcmp(tombstone + 3, "child-delegated",
                    strlen("child-delegated")), 0);
+  // The stamp (u64le at 3 + strlen(child_id)) is the fresh parent's
+  // normalized version — the spawn generation.
+  uint64_t stamped_version = 0;
+  for (int byte_index = 0; byte_index < 8; byte_index++) {
+    stamped_version |= ((uint64_t)tombstone[3 + strlen("child-delegated") +
+                                            byte_index])
+                       << (byte_index * 8);
+  }
+  EXPECT_EQ(stamped_version, (uint64_t)CRABS_LINEAGE_KEY_VERSION_START);
   EXPECT_TRUE(crypto_ecdsa_verify(harness.parent_key->public_key, tombstone,
                                   tombstone_len - CRABS_SIG_SIZE,
                                   tombstone + tombstone_len - CRABS_SIG_SIZE));
@@ -3674,73 +3689,13 @@ TEST(TestLineage, KeyTransitionBodyWriterRefusesUnterminatedParentId) {
   EXPECT_EQ(written, 0u);
 }
 
-TEST(TestLineage, KeyChainVerifyByAnyChainKey) {
-  keychain_harness_t harness;
-  keychain_harness_setup(&harness);
+// NOTE: the any-chain-key verifier `lineage_verify_by_parent_key` was
+// REMOVED with the A11-4 key-stamp change — verification of attestations
+// and tombstones is TIP-ONLY (the stamped parent_key_version must equal the
+// chain tip's key_version). The replacement semantics are tested by
+// AttestationKeyStampBindsVerificationToTip /
+// AttestationRetiredKeyVerifiesNothing / TombstoneKeyStampTipOnly below.
 
-  const char* message = "tombstone or endorsement material";
-  uint8_t signature_by_k1[CRABS_SIG_SIZE];
-  uint8_t signature_by_k2[CRABS_SIG_SIZE];
-  uint8_t signature_by_foreign[CRABS_SIG_SIZE];
-  ASSERT_EQ(crypto_ecdsa_sign(harness.k1->private_key,
-                              (const uint8_t*)message, strlen(message),
-                              signature_by_k1), CRABS_SUCCESS);
-  ASSERT_EQ(crypto_ecdsa_sign(harness.k2->private_key,
-                              (const uint8_t*)message, strlen(message),
-                              signature_by_k2), CRABS_SUCCESS);
-  ASSERT_EQ(crypto_ecdsa_sign(harness.foreign->private_key,
-                              (const uint8_t*)message, strlen(message),
-                              signature_by_foreign), CRABS_SUCCESS);
-
-  // Chain holds only k1 for now: k1 verifies, k2 and foreign do not.
-  EXPECT_TRUE(lineage_verify_by_parent_key(harness.child_state,
-                                           (const uint8_t*)message,
-                                           strlen(message), signature_by_k1));
-  EXPECT_FALSE(lineage_verify_by_parent_key(harness.child_state,
-                                            (const uint8_t*)message,
-                                            strlen(message), signature_by_k2));
-
-  // Advance the chain: both the spawn pin and the rotated key verify — old
-  // attestations keep working, new ones land.
-  uint8_t record[LINEAGE_KEY_TRANSITION_WIRE_MAX];
-  size_t record_len = keychain_make_record(
-      2, harness.k2->public_key, harness.k1->public_key, "parent-red",
-      harness.k1->private_key, record, sizeof(record));
-  ASSERT_EQ(lineage_child_accept_key_transition(harness.child_state, record,
-                                                record_len),
-            CRABS_SUCCESS);
-  EXPECT_TRUE(lineage_verify_by_parent_key(harness.child_state,
-                                           (const uint8_t*)message,
-                                           strlen(message), signature_by_k1));
-  EXPECT_TRUE(lineage_verify_by_parent_key(harness.child_state,
-                                           (const uint8_t*)message,
-                                           strlen(message), signature_by_k2));
-  EXPECT_FALSE(lineage_verify_by_parent_key(harness.child_state,
-                                            (const uint8_t*)message,
-                                            strlen(message),
-                                            signature_by_foreign));
-
-  // A never-bound machine carries no chain and fails closed.
-  state_t* unbound = state_create();
-  ASSERT_NE(unbound, nullptr);
-  EXPECT_FALSE(lineage_verify_by_parent_key(unbound, (const uint8_t*)message,
-                                            strlen(message),
-                                            signature_by_k1));
-  state_destroy(unbound);
-
-  // NULL-safety.
-  EXPECT_FALSE(lineage_verify_by_parent_key(nullptr, (const uint8_t*)message,
-                                            strlen(message),
-                                            signature_by_k1));
-  EXPECT_FALSE(lineage_verify_by_parent_key(harness.child_state, nullptr,
-                                            strlen(message),
-                                            signature_by_k1));
-  EXPECT_FALSE(lineage_verify_by_parent_key(harness.child_state,
-                                            (const uint8_t*)message,
-                                            strlen(message), nullptr));
-
-  keychain_harness_destroy(&harness);
-}
 
 // ============================================================
 // __parent_key_update__: the op pipeline path into the key chain (A10-M6)
@@ -4091,6 +4046,363 @@ TEST(GenesisProvenance, UnknownChildNotFound) {
   EXPECT_EQ(lineage_verify_child_provenance(parent, NULL),
             CRABS_ERR_INVALID_PARAM);
 
+  attribute_machine_destroy(child);
+  machine_blueprint_destroy(blueprint);
+  spawn_parent_destroy(&harness);
+}
+
+// ============================================================
+// Attestation/tombstone key-stamp (A11-4 residual closure): every minted
+// attestation and tombstone body carries u64le parent_key_version, and
+// verification is TIP-ONLY — the stamp must equal the chain tip's key_version
+// AND the signature must verify under the tip's key. Retired chain keys
+// verify nothing.
+// ============================================================
+
+TEST(TestLineage, AttestationKeyStampBindsVerificationToTip) {
+  keychain_harness_t harness;
+  keychain_harness_setup(&harness);
+
+  // Fresh parent (lineage_key_version 0 counts as the spawn generation
+  // CRABS_LINEAGE_KEY_VERSION_START): the stamp lands at 1, matching the
+  // child chain's sole entry [(1, k1.public)].
+  const uint64_t now = 1700000000000ULL;
+  attestation_t attestation = {0};
+  ASSERT_EQ(attestation_create(harness.parent_state, &attestation,
+                               "parent-red", "child-red", "alice",
+                               "role:writer", now, now + 60000),
+            CRABS_SUCCESS);
+  EXPECT_EQ(attestation.parent_key_version,
+            (uint64_t)CRABS_LINEAGE_KEY_VERSION_START);
+
+  // Tip-stamped attestation verifies via the tip lookup.
+  EXPECT_TRUE(attestation_verify_by_lineage_key(harness.child_state,
+                                                &attestation, now));
+
+  // The stamp is INSIDE the signed body, so tampering it breaks the
+  // signature outright — but even with the signature intact (impossible for
+  // an attacker), a stamp != tip version refused on the version gate.
+  const uint64_t stamped_version = attestation.parent_key_version;
+  attestation.parent_key_version = stamped_version + 8;
+  EXPECT_FALSE(attestation_verify_by_lineage_key(harness.child_state,
+                                                 &attestation, now));
+  attestation.parent_key_version = stamped_version;
+
+  // Wire round trip preserves the stamp and still verifies.
+  uint8_t wire[2048];
+  size_t wire_len = attestation_serialize(&attestation, wire, sizeof(wire));
+  ASSERT_GT(wire_len, 0u);
+  attestation_t* restored = attestation_deserialize(wire, wire_len);
+  ASSERT_NE(restored, nullptr);
+  EXPECT_EQ(restored->parent_key_version,
+            (uint64_t)CRABS_LINEAGE_KEY_VERSION_START);
+  EXPECT_TRUE(attestation_verify_by_lineage_key(harness.child_state,
+                                                restored, now));
+  attestation_destroy(restored);
+
+  keychain_harness_destroy(&harness);
+}
+
+TEST(TestLineage, AttestationRetiredKeyVerifiesNothing) {
+  keychain_harness_t harness;
+  keychain_harness_setup(&harness);
+
+  const uint64_t now = 1700000000000ULL;
+
+  // An honest attestation minted while k1 was the tip (stamp 1, sig by k1).
+  attestation_t retired_attestation = {0};
+  ASSERT_EQ(attestation_create(harness.parent_state, &retired_attestation,
+                               "parent-red", "child-red", "alice",
+                               "role:writer", now, now + 60000),
+            CRABS_SUCCESS);
+  ASSERT_EQ(retired_attestation.parent_key_version,
+            (uint64_t)CRABS_LINEAGE_KEY_VERSION_START);
+  ASSERT_TRUE(attestation_verify_by_lineage_key(harness.child_state,
+                                                &retired_attestation, now));
+
+  // Rotate k1 -> k2 per the A11-5 ordering (rotate, then install), and the
+  // child accepts the record: tip becomes (2, k2.public).
+  uint8_t* record = nullptr;
+  size_t record_len = 0;
+  ASSERT_EQ(lineage_key_rotate(harness.parent_state,
+                               harness.k2->private_key, harness.k2->public_key,
+                               now, &record, &record_len),
+            CRABS_SUCCESS);
+  ASSERT_EQ(state_set_node_key(harness.parent_state, harness.k2->private_key,
+                               harness.k2->public_key),
+            CRABS_SUCCESS);
+  ASSERT_EQ(lineage_child_accept_key_transition(harness.child_state, record,
+                                                record_len),
+            CRABS_SUCCESS);
+  ASSERT_EQ(harness.child_state->lineage_key_chain_count, 2u);
+
+  // The honest pre-rotation attestation (stamp 1) no longer verifies: only
+  // the tip entry counts. Children re-attest after every rotation.
+  EXPECT_FALSE(attestation_verify_by_lineage_key(harness.child_state,
+                                                 &retired_attestation, now));
+
+  // THE A11-4 FORGING SCENARIO: the retired k1 holder mints a FRESH-window
+  // attestation. Any stamp it writes is refused — stamp=1 mismatches the
+  // tip version, stamp=2 cannot carry a valid k2 signature.
+  state_t* retired_forger = state_create();
+  ASSERT_NE(retired_forger, nullptr);
+  ASSERT_EQ(state_set_node_key(retired_forger, harness.k1->private_key,
+                               harness.k1->public_key),
+            CRABS_SUCCESS);
+  attestation_t forged = {0};
+  ASSERT_EQ(attestation_create(retired_forger, &forged,
+                               "parent-red", "child-red", "alice",
+                               "role:admin", now, now + 3600000),
+            CRABS_SUCCESS);
+  EXPECT_EQ(forged.parent_key_version,
+            (uint64_t)CRABS_LINEAGE_KEY_VERSION_START);  // stamps its own 0->1
+  EXPECT_FALSE(attestation_verify_by_lineage_key(harness.child_state,
+                                                 &forged, now));
+  // Retired key masquerading as the tip: hand-stamp 2 over the k1 signature.
+  forged.parent_key_version = 2;
+  EXPECT_FALSE(attestation_verify_by_lineage_key(harness.child_state,
+                                                 &forged, now));
+  state_destroy(retired_forger);
+
+  // Fresh attestation issued under the live tip key (stamp 2, sig by k2)
+  // verifies.
+  attestation_t renewed = {0};
+  ASSERT_EQ(attestation_create(harness.parent_state, &renewed,
+                               "parent-red", "child-red", "alice",
+                               "role:writer", now, now + 60000),
+            CRABS_SUCCESS);
+  EXPECT_EQ(renewed.parent_key_version,
+            (uint64_t)CRABS_LINEAGE_KEY_VERSION_START + 1);
+  EXPECT_TRUE(attestation_verify_by_lineage_key(harness.child_state,
+                                                &renewed, now));
+
+  free(record);
+  keychain_harness_destroy(&harness);
+}
+
+TEST(TestLineage, AttestationV1BodyRejected) {
+  keychain_harness_t harness;
+  keychain_harness_setup(&harness);
+
+  const uint64_t now = 1700000000000ULL;
+  attestation_t attestation = {0};
+  ASSERT_EQ(attestation_create(harness.parent_state, &attestation,
+                               "parent-red", "child-red", "alice",
+                               "role:writer", now, now + 60000),
+            CRABS_SUCCESS);
+  ASSERT_EQ(attestation.format_version, CRABS_ATTESTATION_FORMAT_VERSION);
+
+  // A v1-labeled struct fails closed at the version gate — both the bare
+  // verifier and the chain-aware endorsement verifier.
+  attestation.format_version = 0x01;
+  EXPECT_FALSE(attestation_verify(harness.k1->public_key, "child-red",
+                                  &attestation, now));
+  EXPECT_FALSE(attestation_verify_by_lineage_key(harness.child_state,
+                                                 &attestation, now));
+
+  // Wire level: flip the format byte of an honest v2 image to 0x01 — the
+  // deserializer refuses it outright (no grandfathering).
+  attestation.format_version = CRABS_ATTESTATION_FORMAT_VERSION;
+  uint8_t wire[2048];
+  size_t wire_len = attestation_serialize(&attestation, wire, sizeof(wire));
+  ASSERT_GT(wire_len, 0u);
+  wire[4] = 0x01;  // u32le length prefix, then the u8 format version
+  EXPECT_EQ(attestation_deserialize(wire, wire_len), nullptr);
+
+  keychain_harness_destroy(&harness);
+}
+
+TEST(TestLineage, TombstoneKeyStampTipOnly) {
+  spawn_parent_harness_t harness;
+  spawn_parent_setup(&harness);
+  state_t* parent = &harness.am->base_state;
+
+  // Delegated child, dissolved parent-side.
+  machine_blueprint_t* blueprint =
+      make_fresh_authority_blueprint("child-keyed", LINEAGE_DELEGATED_COPY);
+  ASSERT_NE(blueprint, nullptr);
+  attribute_machine_t* child = nullptr;
+  ASSERT_EQ(lineage_spawn_machine(parent, blueprint, &child), CRABS_SUCCESS);
+  state_t* child_state = &child->base_state;
+  operation_t* dissolve = make_handler_shell_op(
+      CRABS_LINEAGE_OP_DISSOLVE, (const uint8_t*)"child-keyed",
+      strlen("child-keyed"));
+  ASSERT_NE(dissolve, nullptr);
+  ASSERT_EQ(lineage_op_dissolve(parent, dissolve), CRABS_SUCCESS);
+  release_handler_shell_op(dissolve);
+  // Simulate the child operator's node: the in-process severance is not
+  // observable across processes.
+  child_state->lineage_parent_dissolved = false;
+
+  // Tombstone minted while k1 was the tip: stamp 1, sig over the stamped
+  // body with k1.
+  uint8_t retired_tombstone[CRABS_DISSOLUTION_WIRE_MAX];
+  size_t retired_tombstone_len = 0;
+  ASSERT_EQ(lineage_dissolution_serialize(parent, "child-keyed",
+                                          retired_tombstone,
+                                          sizeof(retired_tombstone),
+                                          &retired_tombstone_len),
+            CRABS_SUCCESS);
+  ASSERT_EQ(retired_tombstone_len,
+            (size_t)(3 + strlen("child-keyed") + 8 + CRABS_SIG_SIZE));
+  // The trailing stamp is the minting parent's normalized key version (1).
+  size_t stamp_offset = 3 + strlen("child-keyed");
+  uint64_t stamp = 0;
+  for (int byte_index = 0; byte_index < 8; byte_index++) {
+    stamp |= ((uint64_t)retired_tombstone[stamp_offset + byte_index])
+             << (byte_index * 8);
+  }
+  EXPECT_EQ(stamp, (uint64_t)CRABS_LINEAGE_KEY_VERSION_START);
+
+  // Delivered NOW (chain tip == (1, k1)) the stamped tombstone verifies.
+  operation_t* delivery = make_handler_shell_op(
+      CRABS_LINEAGE_OP_RECEIVE_DISSOLUTION, retired_tombstone,
+      retired_tombstone_len);
+  ASSERT_NE(delivery, nullptr);
+  EXPECT_EQ(lineage_op_receive_dissolution(child_state, delivery),
+            CRABS_SUCCESS);
+  release_handler_shell_op(delivery);
+  child_state->lineage_parent_dissolved = false;  // rewind for the scenario
+
+  // Rotate k1 -> k2, the child accepts the record: tip becomes (2, k2).
+  ecdsa_keypair_t* k2 = crypto_ecdsa_generate();
+  ASSERT_NE(k2, nullptr);
+  uint8_t* record = nullptr;
+  size_t record_len = 0;
+  ASSERT_EQ(lineage_key_rotate(parent, k2->private_key, k2->public_key,
+                               1700000000000ULL, &record, &record_len),
+            CRABS_SUCCESS);
+  ASSERT_EQ(state_set_node_key(parent, k2->private_key, k2->public_key),
+            CRABS_SUCCESS);
+  ASSERT_EQ(lineage_child_accept_key_transition(child_state, record,
+                                                record_len),
+            CRABS_SUCCESS);
+  ASSERT_EQ(child_state->lineage_key_chain_count, 2u);
+
+  // The retired-key tombstone (stamp 1) is REFUSED against the new tip —
+  // re-emission after a rotation requires re-issue under the current key.
+  operation_t* stale = make_handler_shell_op(
+      CRABS_LINEAGE_OP_RECEIVE_DISSOLUTION, retired_tombstone,
+      retired_tombstone_len);
+  ASSERT_NE(stale, nullptr);
+  EXPECT_EQ(lineage_op_receive_dissolution(child_state, stale),
+            CRABS_ERR_CRYPTOGRAPHIC_ERROR);
+  release_handler_shell_op(stale);
+  EXPECT_FALSE(child_state->lineage_parent_dissolved);
+
+  // Re-issued under the current tip (stamp 2, sig by k2): accepted.
+  uint8_t renewed_tombstone[CRABS_DISSOLUTION_WIRE_MAX];
+  size_t renewed_tombstone_len = 0;
+  ASSERT_EQ(lineage_dissolution_serialize(parent, "child-keyed",
+                                          renewed_tombstone,
+                                          sizeof(renewed_tombstone),
+                                          &renewed_tombstone_len),
+            CRABS_SUCCESS);
+  stamp = 0;
+  for (int byte_index = 0; byte_index < 8; byte_index++) {
+    stamp |= ((uint64_t)renewed_tombstone[stamp_offset + byte_index])
+             << (byte_index * 8);
+  }
+  EXPECT_EQ(stamp, (uint64_t)CRABS_LINEAGE_KEY_VERSION_START + 1);
+  operation_t* renewed_delivery = make_handler_shell_op(
+      CRABS_LINEAGE_OP_RECEIVE_DISSOLUTION, renewed_tombstone,
+      renewed_tombstone_len);
+  ASSERT_NE(renewed_delivery, nullptr);
+  EXPECT_EQ(lineage_op_receive_dissolution(child_state, renewed_delivery),
+            CRABS_SUCCESS);
+  release_handler_shell_op(renewed_delivery);
+  EXPECT_TRUE(child_state->lineage_parent_dissolved);
+
+  // Replay gates unchanged: a re-delivery is already-performed.
+  operation_t* replay = make_handler_shell_op(
+      CRABS_LINEAGE_OP_RECEIVE_DISSOLUTION, renewed_tombstone,
+      renewed_tombstone_len);
+  ASSERT_NE(replay, nullptr);
+  EXPECT_EQ(lineage_op_receive_dissolution(child_state, replay),
+            CRABS_ERR_ALREADY_PERFORMED);
+  release_handler_shell_op(replay);
+
+  free(record);
+  crypto_ecdsa_keypair_destroy(k2);
+  attribute_machine_destroy(child);
+  machine_blueprint_destroy(blueprint);
+  spawn_parent_destroy(&harness);
+}
+
+// Genesis version reconciliation: a PRE-ROTATED parent's spawn pins the
+// child's chain at the parent's version AT SPAWN (not the constant 1), so the
+// first attestations' stamps equal chain[0].key_version and tip-only
+// verification works from genesis.
+TEST(TestLineage, GenesisChainPinCarriesParentsSpawnVersion) {
+  spawn_parent_harness_t harness;
+  spawn_parent_setup(&harness);
+  state_t* parent = &harness.am->base_state;
+
+  // Rotate k1 -> k2 BEFORE the spawn: the parent's version is 2 at spawn.
+  ecdsa_keypair_t* k2 = crypto_ecdsa_generate();
+  ASSERT_NE(k2, nullptr);
+  uint8_t* record = nullptr;
+  size_t record_len = 0;
+  ASSERT_EQ(lineage_key_rotate(parent, k2->private_key, k2->public_key,
+                               1700000000000ULL, &record, &record_len),
+            CRABS_SUCCESS);
+  ASSERT_EQ(state_set_node_key(parent, k2->private_key, k2->public_key),
+            CRABS_SUCCESS);
+  ASSERT_EQ(parent->lineage_key_version,
+            (uint64_t)CRABS_LINEAGE_KEY_VERSION_START + 1);
+
+  machine_blueprint_t* blueprint =
+      make_fresh_authority_blueprint("child-red", LINEAGE_DELEGATED_COPY);
+  ASSERT_NE(blueprint, nullptr);
+  attribute_machine_t* child = nullptr;
+  ASSERT_EQ(lineage_spawn_machine(parent, blueprint, &child), CRABS_SUCCESS);
+  state_t* child_state = &child->base_state;
+
+  // The spawn pin carries the parent's version at spawn, and the pin's key
+  // is the CURRENT parent key (which the genesis signature was made with).
+  ASSERT_EQ(child_state->lineage_key_chain_count, 1u);
+  EXPECT_EQ(child_state->lineage_key_chain[0].key_version,
+            parent->lineage_key_version);
+  EXPECT_EQ(memcmp(child_state->lineage_key_chain[0].public_key,
+                   k2->public_key, 33), 0);
+
+  // Genesis provenance still verifies under the parent's CURRENT node key
+  // (the provenance verifier never consults the child-side chain).
+  EXPECT_EQ(lineage_verify_child_provenance(parent, "child-red"),
+            CRABS_SUCCESS);
+
+  // The first attestation stamps version 2 == chain[0].key_version == the
+  // tip, so endorsement verification works from genesis under tip-only.
+  const uint64_t now = 1700000001000ULL;
+  attestation_t attestation = {0};
+  ASSERT_EQ(crabs_issue_attestation(parent, &attestation, "child-red",
+                                    "child-admin", "role:writer", now),
+            CRABS_SUCCESS);
+  EXPECT_EQ(attestation.parent_key_version,
+            child_state->lineage_key_chain[0].key_version);
+  EXPECT_TRUE(attestation_verify_by_lineage_key(child_state, &attestation,
+                                                now));
+
+  // And a FRESH (never-rotated) parent still pins the spawn generation: the
+  // reconciliation normalizes lineage_key_version 0 to START, exactly like
+  // lineage_key_rotate.
+  machine_blueprint_t* blueprint2 =
+      make_fresh_authority_blueprint("child-blue", LINEAGE_DELEGATED_COPY);
+  ASSERT_NE(blueprint2, nullptr);
+  spawn_parent_harness_t fresh_harness;
+  spawn_parent_setup(&fresh_harness);
+  attribute_machine_t* fresh_child = nullptr;
+  ASSERT_EQ(lineage_spawn_machine(&fresh_harness.am->base_state, blueprint2,
+                                  &fresh_child), CRABS_SUCCESS);
+  ASSERT_EQ(fresh_child->base_state.lineage_key_chain_count, 1u);
+  EXPECT_EQ(fresh_child->base_state.lineage_key_chain[0].key_version,
+            (uint64_t)CRABS_LINEAGE_KEY_VERSION_START);
+
+  attribute_machine_destroy(fresh_child);
+  machine_blueprint_destroy(blueprint2);
+  spawn_parent_destroy(&fresh_harness);
+  free(record);
+  crypto_ecdsa_keypair_destroy(k2);
   attribute_machine_destroy(child);
   machine_blueprint_destroy(blueprint);
   spawn_parent_destroy(&harness);
