@@ -81,9 +81,15 @@ typedef struct {
 
 The manifest is an array inside `state_t` (like `triggers[]`), so lineage is
 parent state and serializes with it. The runtime live-registry of child
-handles is process-local and rebuilt on load: child state files are read,
-their genesis re-verified against the parent's manifest signature, then the
-child handles activate.
+handles is process-local and rebuilt on load. Provenance re-verification is
+**on demand, not automatic at activation**: `lineage_verify_child_provenance`
+re-checks a manifest entry's stored genesis hash against its stored signature
+under the parent's CURRENT node key (digest-level only — the genesis body is
+not persisted, so no byte-level re-verification is possible), and the CLI
+surfaces the result per child in `machine children`. After a parent node-key
+rotation, pre-rotation entries can no longer re-verify parent-side (the
+child's own key chain entry [0] still pins the spawn key child-side); they
+surface as cryptographic failures, not "unknown".
 
 ### Spawn interface
 
@@ -132,18 +138,25 @@ attestation_t {
   parent_id, child_id, user_id
   attributes[]                 // names + values from parent's registry
   not_before, expires_at       // not_before + ttl <= expires_at
-  parent_key_chain             // key chain hashes used to attest
   signature[64]                // parent node ECDSA key
 }
 ```
+
+As implemented, the wire carries no `parent_key_chain`: the bounded chain of
+accepted parent keys lives on the CHILD state (`lineage_key_chain`, entry [0]
+pinned at spawn), advanced forward-only by `__parent_key_update__` transitions
+signed by the superseded key, and verification accepts the attestation under
+ANY accepted chain entry (`lineage_verify_by_parent_key`). Format v13 persists
+the chain.
 
 - Issued by the parent (new API `crabs_issue_attestation`); carried as op
   payload in the child.
 - Child-side policy syntax gains `@parent/role:writer` (new token in
   `condition.c` parsing): the child verifies the attestation signature
-  against the parent's node key (learned from its genesis snapshot), checks
-  `child_id` match and validity window, then treats the covered attributes as
-  satisfied for that user.
+  against ANY accepted parent key in its chain (entry [0] is the spawn pin,
+  learned from its genesis snapshot; later entries arrive via
+  `__parent_key_update__`), checks `child_id` match and validity window,
+  then treats the covered attributes as satisfied for that user.
 - Revocation = parent declines to re-sign; enforcement lag bounded by the
   TTL chosen at spawn. A `__dissolve_machine__` tombstone voids outstanding
   attestations immediately for non-sovereign children.
@@ -212,8 +225,12 @@ surfacing through the existing error enum.
   semantics for library-level callers).
 - **Child persistence**: each child is its own state file
   (`machine-<child_id>.crabs`); the parent holds only the manifest. On load,
-  runtime rebuilds child handles and re-verifies genesis against the manifest
-  signature before activation.
+  runtime rebuilds child handles. Genesis re-verification is partial as
+  implemented: `lineage_verify_child_provenance` proves the parent attested
+  the stored genesis HASH (digest-level verify under the parent's current
+  node key) but cannot re-check the genesis body, which is not persisted.
+  It runs on demand (`machine children` renders ok/failed per child), not
+  automatically before child activation.
 - `key_envelope_t` stays 0x03; the new attestation format starts at 0x01.
 
 ## Migration (v9 → v10)
@@ -268,7 +285,9 @@ successful instantiation). Dissolve of a sovereign child returns
   profiles, child op authorized, parent revokes attestation → child op fails
   after TTL (sovereign) / instantly (shared root); dissolve tombstone
   propagation; restart round-trip: spawn → save → reload → child still
-  authorized, manifest intact, genesis re-verified against parent signature.
+  authorized, manifest intact, provenance re-verified digest-level against
+  the parent's (current) node key — the genesis body itself is not persisted,
+  so byte-level genesis re-verification is not part of the round-trip.
 - **Wasm smoke**: spawn + inspect via bindings; devtools lineage section
   renders the tree.
 

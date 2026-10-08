@@ -177,8 +177,10 @@ The wasm module carries the same lineage surface (registered in
 `build_wasm.sh`, both variants), with the JS wrappers living in
 `bindings/wasm/bindings-core.js` (`Blueprint`, `Node.children/attest/...`):
 
-- `crabs_wasm_register_lineage_ops` — registers the four lineage ops +
-  default admin policies on a machine (`lineage_install`)
+- `crabs_wasm_register_lineage_ops` — registers the six lineage ops +
+  default admin policies on a machine (`lineage_install`): `__spawn_machine__`,
+  `__revoke_attestation__`, `__dissolve_machine__`, `__withdraw_genesis__`,
+  `__receive_dissolution__`, `__parent_key_update__`
 - Blueprint family — `crabs_wasm_lineage_blueprint_new` / `_add_item` /
   `_add_policy` / `_stamp_hash` / `_serialize` / `_deserialize` / `_destroy`
 - Spawn family — `crabs_wasm_lineage_spawn` (child pointers are borrowed;
@@ -215,6 +217,14 @@ Spawning child machines extends the trust boundary across machines, not just wit
 **Attested (cross-MSK) trust is bounded by TTL lag, not instant revocation.** Delegated and sovereign children run their own authority and ride on the parent's attestation, which carries a TTL. A revoked attestation only takes effect when the child's verification re-checks it or the TTL expires — a determined child can ride out a stale attestation until expiry. In-process severance happens immediately on a `dissolve` (tombstone) for resident children; a dissolved-but-distant child learns of the severance only once its operator hands it the parent's tombstone (`machine accept-tombstone` above) — until that delivery lands, treat attestation expiry, not dissolve delivery, as the guaranteed upper bound on cross-MSK trust for a detached child.
 
 **Sovereign children are beyond parent control — beyond provenance.** The parent may not dissolve a sovereign child; the only lineage op that still applies is `__withdraw_genesis__`, which retracts the parent's genesis attestation from its own manifest. A withdrawn parent no longer vouches for the child, but the child's own authority is unaffected.
+
+**Spawning lends the parent custody of the child's genesis admin.** For delegated and sovereign children, spawn registers the child's bootstrap admin with `role:admin` under the parent's node key — the minting machine vouches for the genesis admin, and only it holds the matching private key at that point. State-machine-level sovereignty is immediate (no dissolve, no tombstone from the parent), but key-level sovereignty is not: until the operator rotates the child's genesis admin key off the parent key, whoever holds the parent private key can sign arbitrary child-admin ops. A parent key rotation — and the `__parent_key_update__` transitions that flow from it — advances the child's pinned parent attestation key; it does NOT hand over the genesis admin key. For sovereign children, rotate the genesis admin off the parent key immediately after spawn.
+
+**Parent key rotation is survivable, but it is not a handover.** A child accepts `__parent_key_update__` transitions: forward-only records signed by the superseded key, which advance a bounded chain (eight entries, overflow refused) of accepted parent verification keys, so attestations and tombstones signed under any accepted key — including the spawn-pin key — keep verifying across rotations. Serialization format v13 persists the chain.
+
+**Attestation TTLs ride the machine's clock, and the default clock is not honest.** Endorsement windows (`not_before` … `expires_at` on each attestation) are evaluated against the machine's configured time source; the default `SYSTEM_CLOCK` source reads the unauthenticated platform clock — under WASM, effectively the page-controllable `Date.now()`. Rolling a child machine's clock back resurrects a just-expired attestation; it is usable only by someone who already holds it, but it verifies all the same. For machines whose attestation TTLs load-bear, configure an authenticated time source (`state_set_time_source` with an HTTPS-backed time source in the library) instead of accepting the default.
+
+**The node/wasm spawn bindings are a same-process trust surface, not the audited path.** The N-API `lineageSpawn` and the wasm `lineage_spawn` call the C lineage API directly: the child spawns and the parent's manifest gains an entry, but no `__spawn_machine__` op is signed and nothing is appended to the operation log. Same-process trust only. The signed `__spawn_machine__` op path — what the CLI's `machine spawn` runs — is the durable and audited one.
 
 ## License
 
