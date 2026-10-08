@@ -370,6 +370,29 @@ cli_result_e cli_node_load(cli_node_t* node, const char* path) {
   return CLI_OK;
 }
 
+// Audit L5: 'key import -' reads the node private key hex from stdin so the
+// key never appears in argv, the process list, or shell history. Returns a
+// freshly allocated, NUL-terminated line trimmed to exactly 64 hex chars, or
+// NULL on read/parse failure (the line buffer is cleansed before free).
+static char* _read_node_key_stdin_line(void) {
+  char* line = NULL;
+  size_t line_capacity = 0;
+  ssize_t line_length = getline(&line, &line_capacity, stdin);
+  if (line_length < 0) {
+    free(line);
+    return NULL;
+  }
+  while (line_length > 0 && isspace((unsigned char)line[line_length - 1])) {
+    line[--line_length] = '\0';
+  }
+  if (line_length != 64) {
+    OPENSSL_cleanse(line, strlen(line));
+    free(line);
+    return NULL;
+  }
+  return line;
+}
+
 // Audit L-l: restore node-key custody after cli_node_load. The operator
 // persists the node private key out-of-band and imports it here so the node
 // can sign for the bootstrap admin again. If the loaded snapshot carried a
@@ -377,15 +400,57 @@ cli_result_e cli_node_load(cli_node_t* node, const char* path) {
 // custody is granted; a verified signature also identifies the key as the
 // snapshot's node key, so custody falls back to the bootstrap admin id when
 // the deserialized state has no matching registered user.
+// Audit L4: every exit path cleanses the decoded private key (and the stdin
+// line buffer, when the '-' form supplied the hex) before returning.
 cli_result_e cli_node_load_key(cli_node_t* node, const char* private_key_hex) {
   if (node == NULL || private_key_hex == NULL) return CLI_ERR_ARGS;
-  if (!node->initialized || node->attr_machine == NULL) return CLI_ERR_NOT_INIT;
+
+  // Audit L5 (stdin form): "-" pulls the key material out of argv entirely.
+  char* key_line = NULL;
+  size_t key_line_len = 0;
+  if (strcmp(private_key_hex, "-") == 0) {
+    key_line = _read_node_key_stdin_line();
+    if (key_line == NULL) {
+      fprintf(stderr,
+              "ERROR: expected 64 hex chars for the node private key on "
+              "stdin\n");
+      return CLI_ERR_ARGS;
+    }
+    key_line_len = strlen(key_line);
+    private_key_hex = key_line;
+  }
+
+  if (!node->initialized || node->attr_machine == NULL) {
+    if (key_line != NULL) {
+      OPENSSL_cleanse(key_line, key_line_len);
+      free(key_line);
+    }
+    return CLI_ERR_NOT_INIT;
+  }
 
   uint8_t priv[32];
-  if (cli_hex_to_bytes(private_key_hex, priv, 32) != CLI_OK) return CLI_ERR_ARGS;
+  if (cli_hex_to_bytes(private_key_hex, priv, 32) != CLI_OK) {
+    // cli_hex_to_bytes decodes incrementally; a failed parse can leave a
+    // partial decode in priv — cleanse it and the stdin line copy.
+    OPENSSL_cleanse(priv, sizeof(priv));
+    if (key_line != NULL) {
+      OPENSSL_cleanse(key_line, key_line_len);
+      free(key_line);
+    }
+    return CLI_ERR_ARGS;
+  }
+  // The hex source is consumed; drop the stdin copy before continuing.
+  if (key_line != NULL) {
+    OPENSSL_cleanse(key_line, key_line_len);
+    free(key_line);
+    key_line = NULL;
+  }
 
   uint8_t pub[33];
-  if (crypto_ecdsa_derive_public_key(priv, pub) != CRABS_SUCCESS) return CLI_ERR_EXEC;
+  if (crypto_ecdsa_derive_public_key(priv, pub) != CRABS_SUCCESS) {
+    OPENSSL_cleanse(priv, sizeof(priv));
+    return CLI_ERR_EXEC;
+  }
 
   // Audit M-1: a loaded snapshot carrying a node-key signature is only
   // authenticated once the imported key verifies that signature. Fail closed
@@ -427,7 +492,10 @@ cli_result_e cli_node_load_key(cli_node_t* node, const char* private_key_hex) {
       node->attr_machine->base_state.config.bootstrap_admin[0] != '\0') {
     custody_id = node->attr_machine->base_state.config.bootstrap_admin;
   }
-  if (custody_id == NULL) return CLI_ERR_EXEC; // no matching user
+  if (custody_id == NULL) {
+    OPENSSL_cleanse(priv, sizeof(priv));
+    return CLI_ERR_EXEC; // no matching user
+  }
 
   // Replace the node key with the imported one.
   if (node->node_key != NULL) crypto_ecdsa_keypair_destroy(node->node_key);
@@ -2003,6 +2071,8 @@ static void _print_policy_usage(void) {
 
 static void _print_key_usage(void) {
   printf("  key generate                Generate a new ECDSA keypair\n");
+  printf("  key import <hex|->          Import the node private key after a load\n");
+  printf("                              (64 hex chars; '-' reads one line from stdin)\n");
   printf("  key refresh <user_id>       Refresh ABE key for a user\n");
   printf("  key revoke <user_id>        Revoke and rotate keys for a user\n");
 }
@@ -2407,6 +2477,13 @@ cli_result_e cli_dispatch(cli_node_t* node, int argc, char** argv) {
       return CLI_ERR_ARGS;
     }
     const char* sub = argv[2];
+    if (strcmp(sub, "import") == 0) {
+      if (argc < 4) {
+        printf("Usage: key import <hex|->\n");
+        return CLI_ERR_ARGS;
+      }
+      return cli_node_load_key(node, argv[3]);
+    }
     if (strcmp(sub, "generate") == 0)   return cli_cmd_key_generate();
     if (strcmp(sub, "refresh") == 0) {
       if (argc < 4) {

@@ -95,6 +95,9 @@ cli_result_e cli_node_load(cli_node_t* node, const char* path);
 // until the operator imports the persisted private key (64 hex chars). The
 // derived public key must match a registered user; that user's id is used as
 // the custody alias.
+// Audit L5: pass "-" as private_key_hex to read the 64-char hex line from
+// stdin instead of argv, keeping the private key out of the process list and
+// shell history.
 cli_result_e cli_node_load_key(cli_node_t* node, const char* private_key_hex);
 // Import the at-rest seal key (64 hex chars, decoded to 32 raw bytes). Once
 // set, cli_node_save persists the ABE MSK sealed under it and cli_node_load

@@ -618,6 +618,129 @@ TEST_F(TestCLI, KeyImportRejectsRechecksummedTamperedState) {
   cli_node_destroy(loaded_node);
 }
 
+// Dispatch wiring (A10-7a): every load/save message points the operator at
+// 'key import' — the key dispatcher must actually route that subcommand to
+// cli_node_load_key (the ONLY function that verifies the pending snapshot
+// signature and clears state_sig_pending).
+TEST_F(TestCLI, KeyImportVerifiesPendingSnapshot) {
+  ASSERT_EQ(cli_node_init(node, "admin"), CLI_OK);
+  ASSERT_TRUE(_apply_test_seal_key(node));
+  ASSERT_EQ(cli_cmd_item_add(node, "counter1", "counter"), CLI_OK);
+
+  // The operator persists the node private key out-of-band; capture it here
+  // the same way an operator would hold it.
+  char node_private_key_hex[65];
+  cli_bytes_to_hex(node->node_key->private_key, 32, node_private_key_hex);
+
+  const char* tmp_path = "/tmp/crabs_test_key_import_state.bin";
+  ASSERT_EQ(cli_node_save(node, tmp_path), CLI_OK);
+
+  // Direct call: a signed snapshot stays pending until the imported key
+  // verifies its signature; custody then makes node_key_valid true.
+  cli_node_t* loaded_node = cli_node_create();
+  ASSERT_NE(loaded_node, nullptr);
+  ASSERT_EQ(cli_node_load(loaded_node, tmp_path), CLI_OK);
+  ASSERT_TRUE(loaded_node->state_sig_pending);
+  EXPECT_EQ(cli_node_load_key(loaded_node, node_private_key_hex), CLI_OK);
+  EXPECT_FALSE(loaded_node->state_sig_pending);
+  EXPECT_TRUE(loaded_node->attr_machine->base_state.node_key_valid);
+  cli_node_destroy(loaded_node);
+
+  // Dispatch level: 'key import <hex>' must reach cli_node_load_key.
+  cli_node_t* dispatched_node = cli_node_create();
+  ASSERT_NE(dispatched_node, nullptr);
+  ASSERT_EQ(cli_node_load(dispatched_node, tmp_path), CLI_OK);
+  ASSERT_TRUE(dispatched_node->state_sig_pending);
+  char* import_argv[] = {(char*)"crabs_node", (char*)"key", (char*)"import",
+                         node_private_key_hex};
+  EXPECT_EQ(cli_dispatch(dispatched_node, 4, import_argv), CLI_OK);
+  EXPECT_FALSE(dispatched_node->state_sig_pending);
+  EXPECT_TRUE(dispatched_node->attr_machine->base_state.node_key_valid);
+
+  // A wrong key is refused and the pending state survives the refusal.
+  ecdsa_keypair_t* wrong_key = crypto_ecdsa_generate();
+  ASSERT_NE(wrong_key, nullptr);
+  char wrong_key_hex[65];
+  cli_bytes_to_hex(wrong_key->private_key, 32, wrong_key_hex);
+  crypto_ecdsa_keypair_destroy(wrong_key);
+  cli_node_t* pending_node = cli_node_create();
+  ASSERT_NE(pending_node, nullptr);
+  ASSERT_EQ(cli_node_load(pending_node, tmp_path), CLI_OK);
+  ASSERT_TRUE(pending_node->state_sig_pending);
+  char* wrong_argv[] = {(char*)"crabs_node", (char*)"key", (char*)"import",
+                        wrong_key_hex};
+  EXPECT_EQ(cli_dispatch(pending_node, 4, wrong_argv), CLI_ERR_EXEC);
+  EXPECT_TRUE(pending_node->state_sig_pending);
+  cli_node_destroy(pending_node);
+
+  // Missing argument is a usage error, not "unknown subcommand".
+  char* noarg_argv[] = {(char*)"crabs_node", (char*)"key", (char*)"import"};
+  EXPECT_EQ(cli_dispatch(dispatched_node, 3, noarg_argv), CLI_ERR_ARGS);
+
+  cli_node_destroy(dispatched_node);
+  remove(tmp_path);
+}
+
+// A10-L5: 'key import -' reads the hex line from stdin so the private key
+// never appears in argv, the process list, or shell history.
+TEST_F(TestCLI, KeyImportFromStdinHidesKeyFromArgv) {
+  ASSERT_EQ(cli_node_init(node, "admin"), CLI_OK);
+  ASSERT_TRUE(_apply_test_seal_key(node));
+  char node_private_key_hex[65];
+  cli_bytes_to_hex(node->node_key->private_key, 32, node_private_key_hex);
+
+  const char* tmp_path = "/tmp/crabs_test_key_import_stdin_state.bin";
+  ASSERT_EQ(cli_node_save(node, tmp_path), CLI_OK);
+
+  const char* stdin_path = "/tmp/crabs_test_key_stdin.hex";
+  std::string hex_line = std::string(node_private_key_hex) + "\n";
+  ASSERT_TRUE(test_write_file_bytes(stdin_path,
+      std::vector<uint8_t>(hex_line.begin(), hex_line.end())));
+
+  cli_node_t* loaded_node = cli_node_create();
+  ASSERT_NE(loaded_node, nullptr);
+  ASSERT_EQ(cli_node_load(loaded_node, tmp_path), CLI_OK);
+  ASSERT_TRUE(loaded_node->state_sig_pending);
+
+  FILE* stdin_stream = fopen(stdin_path, "r");
+  ASSERT_NE(stdin_stream, nullptr);
+  FILE* saved_stdin = stdin;
+  stdin = stdin_stream;
+  char* import_argv[] = {(char*)"crabs_node", (char*)"key", (char*)"import",
+                         (char*)"-"};
+  cli_result_e import_result = cli_dispatch(loaded_node, 4, import_argv);
+  fclose(stdin_stream);
+  stdin = saved_stdin;
+
+  EXPECT_EQ(import_result, CLI_OK);
+  EXPECT_FALSE(loaded_node->state_sig_pending);
+  EXPECT_TRUE(loaded_node->attr_machine->base_state.node_key_valid);
+  cli_node_destroy(loaded_node);
+
+  // A short/garbage stdin line is refused and clears nothing.
+  const char* bad_stdin_path = "/tmp/crabs_test_key_stdin_bad.hex";
+  ASSERT_TRUE(test_write_file_bytes(bad_stdin_path,
+      std::vector<uint8_t>({'a', 'b', 'c', 'd', '\n'})));
+  cli_node_t* pending_node = cli_node_create();
+  ASSERT_NE(pending_node, nullptr);
+  ASSERT_EQ(cli_node_load(pending_node, tmp_path), CLI_OK);
+  ASSERT_TRUE(pending_node->state_sig_pending);
+  FILE* bad_stdin_stream = fopen(bad_stdin_path, "r");
+  ASSERT_NE(bad_stdin_stream, nullptr);
+  saved_stdin = stdin;
+  stdin = bad_stdin_stream;
+  import_result = cli_dispatch(pending_node, 4, import_argv);
+  fclose(bad_stdin_stream);
+  stdin = saved_stdin;
+  EXPECT_EQ(import_result, CLI_ERR_ARGS);
+  EXPECT_TRUE(pending_node->state_sig_pending);
+  cli_node_destroy(pending_node);
+
+  remove(tmp_path);
+  remove(stdin_path);
+  remove(bad_stdin_path);
+}
+
 TEST_F(TestCLI, LoadLegacyUnsignedStateStillWorks) {
   ASSERT_EQ(cli_node_init(node, "admin"), CLI_OK);
   ASSERT_EQ(cli_cmd_item_add(node, "counter1", "counter"), CLI_OK);
