@@ -212,6 +212,12 @@ machine_blueprint_t* blueprint_deserialize(const uint8_t* buf, size_t len);
 // One record serves every child of this parent; the broadcast/re-emission
 // channel is the __parent_key_update__ op's concern (child accept is the
 // authority on admission — see below).
+// Operational precondition (A11-L1): deliver each rotation's record to EVERY
+// child BEFORE minting the next rotation. The stash is a single slot carrying
+// only the LAST record — a child that missed two rotations gap-rejects the
+// newest record unrecoverably: the intermediate record is gone and the
+// retired private key that signed it no longer exists (or the operator must
+// retain every transition record out-of-band and replay them in order).
 // now_ms is written into the record's created_at field (informational only;
 // never validated).
 // Does NOT install the new key — the caller pairs this with
