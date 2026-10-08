@@ -244,7 +244,8 @@ export interface Node {
   lineageAttest(childId: string, userId: string, attributes?: string): Buffer;
   /**
    * Off-chain dissolution proof for an already-DISSOLVED child: canonical
-   * tombstone body + 64-byte parent ECDSA — the exact bytes a
+   * tombstone body (u8 tag + string16 childId + u64le parent_key_version
+   * key-stamp) + 64-byte parent ECDSA over the body — the exact bytes a
    * __receive_dissolution__ op transports. Honesty-gate refusals surface as
    * typed errors (resource_not_found / unauthorized / cryptographic_error).
    */

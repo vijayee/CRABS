@@ -206,7 +206,7 @@ The enum tables `TRUST_MODE`, `DATA_TYPE`, `CRDT_TYPE` are exported alongside th
 - `node.lineageChildren()` → `[{ childId, mode, status, spawnedAtMs, attestationTtlMs }]` — borrowed view over the child manifest
 - `node.lineageResidentChild(childId)` → `Node | null` — the still-resident in-process spawned child (fresh wrapper over the same machine), or `null` when unknown/dissolved. Machines spawned through the ops pipeline are owned by C's resident-children registry
 - `node.lineageAttest(childId, userId, attributes?)` → `Buffer` — parent-signed, TTL-bounded attribute grant (attestation wire image). Requires an authenticated time source (`setTime`) and an `active` manifest entry
-- `node.lineageTombstone(childId)` → `Buffer` — off-chain dissolution proof (`u8 LINEAGE_DISSOLVED tag + string16 childId` + 64-byte parent ECDSA — the exact bytes a `__receive_dissolution__` op transports). Honesty-gate refusals surface as typed errors (`resource_not_found` / `unauthorized` / `cryptographic_error`)
+- `node.lineageTombstone(childId)` → `Buffer` — off-chain dissolution proof (`u8 LINEAGE_DISSOLVED tag + string16 childId + u64le parent_key_version key-stamp` + 64-byte parent ECDSA — the exact bytes a `__receive_dissolution__` op transports; delivery verifies tip-only, so a tombstone minted before a parent key rotation must be re-minted under the current key). Honesty-gate refusals surface as typed errors (`resource_not_found` / `unauthorized` / `cryptographic_error`)
 
 Dissolution/dissolve/withdraw/revoke-attestation travel through the normal `Operation` + `node.execute()` pipeline after `lineageInstall()`; `__receive_dissolution__` runs the same way on the child machine.
 

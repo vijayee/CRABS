@@ -1825,7 +1825,8 @@ private:
   }
 
   // Off-chain dissolution proof for an already-DISSOLVED child: canonical
-  // tombstone body (`u8 LINEAGE_DISSOLVED tag + string16 childId`) + the
+  // tombstone body (`u8 LINEAGE_DISSOLVED tag + string16 childId + u64le
+  // parent_key_version key-stamp`) + the
   // 64-byte parent ECDSA — the exact bytes a __receive_dissolution__ op
   // transports. The honesty gate (never sign a tombstone for a live child)
   // maps to typed errors: resource_not_found for an unknown child,

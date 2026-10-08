@@ -138,32 +138,47 @@ envelope 0x03):
 
 ```
 attestation_t {
-  format_version = 0x01
+  format_version = 0x02        // v2 (A11-4): key-stamp appended, see below
   parent_id, child_id, user_id
   attributes[]                 // names + values from parent's registry
   not_before, expires_at       // not_before + ttl <= expires_at
+  parent_key_version           // u64le — chain key version minted under
   signature[64]                // parent node ECDSA key
 }
 ```
 
-As implemented, the wire carries no `parent_key_chain`: the bounded chain of
-accepted parent keys lives on the CHILD state (`lineage_key_chain`, entry [0]
-pinned at spawn), advanced forward-only by `__parent_key_update__` transitions
-signed by the superseded key, and verification accepts the attestation under
-ANY accepted chain entry (`lineage_verify_by_parent_key`). Advancement is
-tip-only: a transition's old_pk must be the chain's current tip, so a
-compromised retired parent key can no longer advance the chain (retired keys
-still verify historical attestations/tombstones). Format v13 persists
-the chain.
+**As-implemented amendment (2026-10-08, A11-4 key-stamp):** every attestation
+and tombstone body carries `parent_key_version` (u64le, appended after
+`expires_at`; tombstone: after the `child_id` string16), and verification is
+TIP-ONLY: the stamp must equal the child chain TIP entry's `key_version` AND
+the signature must verify under the tip's key. Retired chain keys verify
+nothing — a retired-key holder can mint no fresh attestation (its stamp never
+equals the tip) and deliver no dissolution. Honestly-minted pre-rotation
+attestations stop verifying at the rotation even inside their TTL window:
+after every rotation ALL attestations must be re-issued under the new key, and
+a tombstone re-emitted after a rotation must be re-minted under the current
+key. v1 attestation bodies fail closed (format gate), so pending stored
+attestations issued by pre-stamp builds must be re-issued after upgrade. The
+spawn pin (chain entry [0]) carries the parent's key version AT SPAWN — a
+pre-rotated parent pins the child at its current version, so genesis-minted
+attestations pass the tip gate from the start. The any-chain-key verifier
+(`lineage_verify_by_parent_key`) is removed with this change.
+
+The bounded chain of accepted parent keys lives on the CHILD state
+(`lineage_key_chain`, entry [0] pinned at spawn), advanced forward-only by
+`__parent_key_update__` transitions signed by the superseded key. Advancement
+is tip-only: a transition's old_pk must be the chain's current tip, so a
+compromised retired parent key can no longer advance the chain. Format v13
+persists the chain.
 
 - Issued by the parent (new API `crabs_issue_attestation`); carried as op
   payload in the child.
 - Child-side policy syntax gains `@parent/role:writer` (new token in
-  `condition.c` parsing): the child verifies the attestation signature
-  against ANY accepted parent key in its chain (entry [0] is the spawn pin,
-  learned from its genesis snapshot; later entries arrive via
-  `__parent_key_update__`), checks `child_id` match and validity window,
-  then treats the covered attributes as satisfied for that user.
+  `condition.c` parsing): the child verifies the attestation against the
+  chain TIP only (stamp == tip `key_version`, signature under the tip's
+  key — see the A11-4 key-stamp amendment above), checks `child_id` match
+  and validity window, then treats the covered attributes as satisfied for
+  that user.
 - Revocation = parent declines to re-sign; enforcement lag bounded by the
   TTL chosen at spawn. A `__dissolve_machine__` tombstone voids outstanding
   attestations immediately for non-sovereign children.

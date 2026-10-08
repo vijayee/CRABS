@@ -1201,7 +1201,8 @@ class Node {
   }
 
   // Mints a dissolution tombstone for a DISSOLVED manifest child: the
-  // canonical body (u8 tag LINEAGE_DISSOLVED + string16 childId) plus the
+  // canonical body (u8 tag LINEAGE_DISSOLVED + string16 childId + u64le
+  // parent_key_version key-stamp) plus the
   // 64-byte parent ECDSA signature. The wire has NO length prefix — these are
   // the exact bytes a __receive_dissolution__ op transports and verifies.
   // Refuses (throws) when the child is unknown or NOT currently dissolved —

@@ -246,7 +246,8 @@ export interface Node {
   /** Issue a parent-signed attestation; returns the transport wire bytes. */
   attest(childId: string, userId: string, attributes: string): Uint8Array;
   /** Mint a dissolution tombstone for a DISSOLVED child: canonical body
-   *  (u8 tag + string16 childId) + 64-byte parent signature, NO length
+   *  (u8 tag + string16 childId + u64le parent_key_version key-stamp) +
+   *  64-byte parent signature over the body, NO length
    *  prefix. Throws when the child is unknown or not dissolved. */
   lineageTombstone(childId: string): Uint8Array;
 
