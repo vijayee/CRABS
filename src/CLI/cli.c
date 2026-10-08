@@ -186,9 +186,21 @@ static void _cli_apply_time_source(cli_node_t* node) {
     config.max_skew_ms = CRABS_TIME_SOURCE_DEFAULT_MAX_SKEW_MS;
     crabs_time_source_ops_t* fresh = crabs_time_source_https_create(&config);
     if (fresh == NULL) {
-      // Allocation failure: leave the state on NO source (never silently on
-      // the system clock — a half-applied authenticated config must fail
-      // closed, R7-02) and drop the stale ops.
+      // Source creation failed. Accurate behavior statement (A11-L8): a NULL
+      // ops pointer is NOT a lockdown — the state's time reads simply fall
+      // back to the SYSTEM-clock behavior (halc reads the platform clock when
+      // no ops are attached). R7-02's fail-closed rule governs a LIVE HTTPS
+      // source whose fetches fail, not this allocation path. So the failure
+      // mode here is fail-closed-TO-THE-FALLBACK: no stale ops survive and no
+      // half-built HTTPS config pretends to authenticate, but the machine
+      // silently rides the unauthenticated system clock. The interactive
+      // setter caller (cli_cmd_time_source_https) notices
+      // node->https_source == NULL and reverts the node's mode/url honestly,
+      // so `time-source show` never misreports there; the init/load/
+      // load-sealed re-apply paths leave the node's mode label claiming HTTPS
+      // while the machine actually runs the fallback until the next explicit
+      // time-source selection (a latent observability gap on allocation
+      // failure; allocation failure is the ONLY failing step here).
       state_set_time_source(state, NULL);
       crabs_time_source_destroy(node->https_source);
       node->https_source = NULL;
