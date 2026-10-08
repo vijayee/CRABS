@@ -1322,8 +1322,11 @@ crabs_error_e lineage_spawn_machine(state_t* parent,
   // is the first accepted parent authority. Stamped at binding time so the
   // chain-aware verification surfaces (endorsements, tombstones) work from
   // genesis; __parent_key_update__ advances it forward-only from here. The
-  // v12 genesis serialization predates the chain (v13 persists it), so this
-  // allocation affects no signed bytes.
+  // stamp MUST precede the genesis blob serialization below: the v13
+  // serializer INCLUDES the stamped chain in the genesis blob, which is
+  // hashed (genesis_hash) and signed (genesis_signature), so the spawn pin
+  // is bound into the child's provenance rather than floating outside the
+  // signed bytes.
   child_state->lineage_key_chain =
       get_clear_memory(sizeof(lineage_key_chain_entry_t));
   if (child_state->lineage_key_chain == NULL) {
