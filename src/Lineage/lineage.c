@@ -1957,6 +1957,17 @@ static size_t _lineage_key_transition_write_body(uint64_t new_key_version,
   return offset;
 }
 
+// Reads the new_pk of a key transition record: it sits at a FIXED offset in
+// the canonical body — tag(3) + u64le new_version(8) = byte 11. Bounds-checked
+// so a truncated stash can never read out of bounds. Returns NULL when the
+// record is too short to carry a new_pk.
+static const uint8_t* _lineage_key_transition_new_pk(const uint8_t* record,
+                                                     size_t record_len) {
+  const size_t new_pk_offset = 3 + 8; // tag(3) + new_key_version(8)
+  if (record == NULL || record_len < new_pk_offset + 33) return NULL;
+  return record + new_pk_offset;
+}
+
 crabs_error_e lineage_key_rotate(state_t* parent_state,
                                  const uint8_t new_private_key[32],
                                  const uint8_t new_public_key[33],
@@ -1970,6 +1981,21 @@ crabs_error_e lineage_key_rotate(state_t* parent_state,
   }
   *transition_out = NULL;
   *transition_len = 0;
+
+  // A11-5: refuse to mint a new transition while the previous rotation's key
+  // was never installed — an unstalled rotation wedges every child's chain
+  // (tip-gate + version-gap rejections are permanent in-band). The stashed
+  // record's new_pk must equal the CURRENTLY-INSTALLED node key, i.e. the
+  // caller paired the last rotate with state_set_node_key.
+  if (parent_state->lineage_last_key_transition != NULL) {
+    const uint8_t* prior_new_pk = _lineage_key_transition_new_pk(
+        parent_state->lineage_last_key_transition,
+        parent_state->lineage_last_key_transition_len);
+    if (prior_new_pk == NULL ||
+        memcmp(prior_new_pk, parent_state->node_public_key, 33) != 0) {
+      return CRABS_ERR_INVALID_PARAM;
+    }
+  }
 
   // Validate first, mutate LAST: every refusal below leaves the lineage
   // version and the stashed transition untouched.

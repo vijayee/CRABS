@@ -3244,6 +3244,83 @@ TEST(TestLineage, KeyChainRotateRefusesBadInputs) {
   keychain_harness_destroy(&harness);
 }
 
+// A11-5: rotating twice without installing the first rotation's key wedges
+// every child's chain — the second record's old_pk is the still-installed
+// ORIGINAL key while children who accepted the first record sit at tip=v2,
+// and the tip-gate plus version-gap rejections are permanent in-band. rotate
+// must REFUSE to mint a new transition while the previous rotation's key was
+// never installed via state_set_node_key.
+TEST(TestLineage, KeyChainRotateRefusesUninstalledPriorRotation) {
+  keychain_harness_t harness;
+  keychain_harness_setup(&harness);
+
+  ecdsa_keypair_t* k3 = crypto_ecdsa_generate();
+  ASSERT_NE(k3, nullptr);
+
+  // Positive control B: a fresh parent's FIRST rotation is always allowed —
+  // no prior transition exists yet, so no wedge is possible.
+  state_t* fresh_parent = state_create();
+  ASSERT_NE(fresh_parent, nullptr);
+  ecdsa_keypair_t* fresh_key = crypto_ecdsa_generate();
+  ASSERT_NE(fresh_key, nullptr);
+  ASSERT_EQ(state_set_node_key(fresh_parent, fresh_key->private_key,
+                               fresh_key->public_key),
+            CRABS_SUCCESS);
+  uint8_t* first_record = nullptr;
+  size_t first_len = 0;
+  EXPECT_EQ(lineage_key_rotate(fresh_parent, harness.k2->private_key,
+                               harness.k2->public_key, 0, &first_record,
+                               &first_len),
+            CRABS_SUCCESS);
+  free(first_record);
+  crypto_ecdsa_keypair_destroy(fresh_key);
+  state_destroy(fresh_parent);
+
+  // Scenario 1: rotate K1 -> K2 succeeds, but the caller never installs K2.
+  uint8_t* record = nullptr;
+  size_t record_len = 0;
+  ASSERT_EQ(lineage_key_rotate(harness.parent_state,
+                               harness.k2->private_key, harness.k2->public_key,
+                               1700000000000ULL, &record, &record_len),
+            CRABS_SUCCESS);
+  free(record);
+
+  // A second rotation while K2 is uninstalled must be REFUSED — no version
+  // bump, no stash swap, no output record.
+  const uint64_t version_before = harness.parent_state->lineage_key_version;
+  const uint8_t* stash_before =
+      harness.parent_state->lineage_last_key_transition;
+  const uint32_t stash_len_before =
+      harness.parent_state->lineage_last_key_transition_len;
+  record = nullptr;
+  record_len = 0;
+  EXPECT_EQ(lineage_key_rotate(harness.parent_state, k3->private_key,
+                               k3->public_key, 1700000000001ULL, &record,
+                               &record_len),
+            CRABS_ERR_INVALID_PARAM);
+  EXPECT_EQ(harness.parent_state->lineage_key_version, version_before);
+  EXPECT_EQ(harness.parent_state->lineage_last_key_transition, stash_before);
+  EXPECT_EQ(harness.parent_state->lineage_last_key_transition_len,
+            stash_len_before);
+  EXPECT_EQ(record, nullptr);
+  EXPECT_EQ(record_len, 0u);
+
+  // Positive control A: installing the rotated key (the pairing the header
+  // documents) un-gates the next rotation — the normal flow is unaffected.
+  ASSERT_EQ(state_set_node_key(harness.parent_state, harness.k2->private_key,
+                               harness.k2->public_key),
+            CRABS_SUCCESS);
+  EXPECT_EQ(lineage_key_rotate(harness.parent_state, k3->private_key,
+                               k3->public_key, 1700000000002ULL, &record,
+                               &record_len),
+            CRABS_SUCCESS);
+  EXPECT_EQ(harness.parent_state->lineage_key_version, version_before + 1);
+  free(record);
+
+  crypto_ecdsa_keypair_destroy(k3);
+  keychain_harness_destroy(&harness);
+}
+
 TEST(TestLineage, KeyChainRollbackAndGapRejected) {
   keychain_harness_t harness;
   keychain_harness_setup(&harness);
