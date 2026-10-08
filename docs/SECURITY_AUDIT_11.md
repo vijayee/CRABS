@@ -57,4 +57,20 @@
 
 ## Remediation status
 
-*Pending. Suggested order: A11-1 (fork bounds — same patch shape as 9da0a04), A11-3 (fail-open scalars — fork), A11-2 (REPL quoting/truncation), A11-5 (wedge detection), A11-4 (README authority wording + fresh-attestation tip policy decision), then LOWs.*
+- **A11-1 — FIXED (2026-10-08).** openabe-c `c967616`: every length prefix in `oabe_params_deserialize` is bounds-checked (subtraction form); the RED test segfaulted pre-fix and passes post-fix. Sweep: no sibling wire length-prefix-then-copy sites remain in the fork. Submodule bumped to `775dd76` (`8b19240`).
+- **A11-2 — FIXED (2026-10-08).** `c9750ef`: REPL tokenizer is quote-aware (double/single spans, no escapes, unbalanced quote and empty quoted token refused, 33rd token refused rather than truncated); `policy add`, `machine blueprint policy`, `op define`, and `machine blueprint dedup` refuse surplus words with a pointer to quoting.
+- **A11-3 — FIXED (2026-10-08).** openabe-c `775dd76`: `oabe_secret_key_deserialize` rejects zero-length alpha/beta scalars (`OABE_ERROR_INVALID_KEY`) and `oabe_context_cp_keygen` fails closed on NULL master scalars. Submodule bump: `8b19240`.
+- **A11-4 — FIXED (docs, 2026-10-08).** `dc7b2d1`: README and lineage.h now state the real residual authority — retired chain keys verify fresh attestations/tombstones, only chain advancement is tip-gated; no "historical-only" understatement.
+- **A11-5 — FIXED (2026-10-08).** `3f7be69`: `lineage_key_rotate` refuses while the previous rotation's key was never installed (stashed `new_pk` must equal the currently-installed node key; bounds-checked fixed-offset read, fails closed on a truncated stash).
+- **A11-L1 — FIXED (docs, 2026-10-08).** `dc7b2d1`: rotation-delivery precondition documented (deliver each rotation before minting the next; the stash is single-slot).
+- **A11-L2 — FIXED (2026-10-08).** `54f2873`: trailing `created_at` write is cap-checked; test-only shim (`test/test_lineage_body_writer.c`) drives the static writer directly; doc comment corrected.
+- **A11-L3 — FIXED (2026-10-08).** `8972d93`: parent_id length read bounded at `CRABS_MAX_USER_ID` via the string16 writer's strnlen discipline; fails closed on an unterminated field.
+- **A11-L4 — ACCEPTED (cosmetic, 2026-10-08).** Registry holes never compact: 8 B per lifetime spawn, no correctness or security impact; noted here as a standing known-cost, no code change.
+- **A11-L5 — FIXED (2026-10-08).** `5f6deb1`: exact re-delivery of an accepted key-update (version AND new_pk match an accepted entry) returns `CRABS_ERR_ALREADY_PERFORMED`, mirroring the dissolve/withdraw/tombstone siblings; distinct records keep `CRABS_ERR_INVALID_PARAM`.
+- **A11-L6 — FIXED (docs, 2026-10-08).** `fcb7f90`: cross-wrapper time-source detach documented in the node binding README and `index.d.ts` (machine-scoped source; sibling-wrapper teardown strips it, fail-closed).
+- **A11-L7 — FIXED (2026-10-08).** `ab41c9e`: hex-decode-failure throws in the binding sign paths cleanse `priv` before throwing, matching the ser-failure exits.
+- **A11-L8 — FIXED (docs, 2026-10-08).** `ee3c2f4`: `_cli_apply_time_source` create-failure comment now states the actual behavior (fail-closed-to-the-system-clock-fallback, not R7-02 lockdown), including the latent mode-label gap on the init/load re-apply paths.
+- **A11-L9 — FIXED (2026-10-08).** Folded into the fork commits: `c967616`/`775dd76` use the subtraction-form idiom throughout the touched deserializers (incl. `oabe_zp_deserialize`).
+- **A11-L10 — FIXED (2026-10-08).** `8586366`: the protected-op regression loops now cover all six lineage ops, including `__parent_key_update__`, against both the CHANGE_POLICY and DEFINE_OPERATION guards.
+
+Verification: 1611/1611 CRABS ctest (one pre-existing skip: TimeSourceIntegration.JsonTimeApi), 59/59 node binding tests + lineage smoke, all five wasm smokes (incl. time-source), 153/153 openabe-c fork tests.
