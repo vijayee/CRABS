@@ -2256,6 +2256,24 @@ struct ShellTempFileGuard {
   ShellTempFileGuard& operator=(const ShellTempFileGuard&) = delete;
 };
 
+// A10-L8: the state blob embeds sealed key material — cli_node_save must
+// restrict the file to the owner (0600) regardless of the process umask.
+TEST(StateSave, FilePermissionsRestrictedToOwner) {
+  cli_node_t* node = cli_node_create();
+  ASSERT_NE(node, nullptr);
+  ASSERT_EQ(cli_node_init(node, "admin"), CLI_OK);
+  ASSERT_TRUE(_apply_test_seal_key(node));
+
+  ShellTempFileGuard save_file("crabs_perm_state.crabs");
+  ASSERT_EQ(cli_node_save(node, save_file.path.c_str()), CLI_OK);
+
+  struct stat st;
+  ASSERT_EQ(stat(save_file.path.c_str(), &st), 0);
+  EXPECT_EQ(static_cast<unsigned>(st.st_mode) & 0777u, 0600u);
+
+  cli_node_destroy(node);
+}
+
 TEST(ShellLine, PersistsNodeAcrossCommands) {
   cli_node_t* node = cli_node_create();
   ASSERT_NE(node, nullptr);

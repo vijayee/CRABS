@@ -12,6 +12,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 
 // ============================================================
 // Hex encode/decode utilities
@@ -617,6 +618,13 @@ cli_result_e cli_node_save(cli_node_t* node, const char* path) {
   if (f == NULL) {
     serialized_buffer_destroy(buf);
     return CLI_ERR_IO;
+  }
+  // A10-L8: the state blob embeds sealed key material — restrict to owner
+  // despite umask.
+  if (chmod(path, S_IRUSR | S_IWUSR) != 0) {
+    fclose(f);
+    serialized_buffer_destroy(buf);
+    return CLI_ERR_EXEC;
   }
 
   size_t written = fwrite(buf->data, 1, buf->len, f);
