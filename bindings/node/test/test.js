@@ -200,5 +200,40 @@ try {
 assert(adoptedTriggerRefused,
   'createTrigger on an adopted child wrapper must throw (no own node key)');
 
+// Test 19: change listeners registering/unregistering mid-emit (A10-M4).
+// A synchronous listener that calls node.on('change', …) pushes into the
+// listener vector while EmitChange iterates it (reallocating the storage);
+// dispatch must survive via the snapshot, and the new listener fires on the
+// NEXT event, not the one that spawned it.
+const lateEvents = [];
+let registeredMidEmit = false;
+let lateOff = null;
+const registrarOff = node.on('change', () => {
+  if (!registeredMidEmit) {
+    registeredMidEmit = true;
+    lateOff = node.on('change', (lateEvent) => lateEvents.push(lateEvent));
+  }
+});
+node.registerUser('dave', KeyPair.generate().publicKeyHex(), '');
+assert(lateEvents.length === 0,
+  'listener registered mid-emit must not see the event that spawned it');
+node.registerUser('erin', KeyPair.generate().publicKeyHex(), '');
+assert(lateEvents.length > 0,
+  'listener registered mid-emit must fire on the next event');
+registrarOff();
+lateOff();
+
+// Test 20: a self-unregistering listener must not break the dispatch loop —
+// every other listener still receives the event being delivered.
+const survivorEvents = [];
+let selfOffHandle = null;
+selfOffHandle = node.on('change', () => { selfOffHandle(); });
+const survivorOff = node.on('change',
+  (survivorEvent) => survivorEvents.push(survivorEvent));
+node.registerUser('frank', KeyPair.generate().publicKeyHex(), '');
+assert(survivorEvents.length > 0,
+  'listeners must still fire when an earlier listener unregisters itself');
+survivorOff();
+
 console.log(`\n${passed} passed, ${failed} failed`);
 process.exit(failed > 0 ? 1 : 0);

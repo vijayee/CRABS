@@ -786,11 +786,21 @@ public:
     obj.Set("preview", Napi::String::New(env,
                                           event->preview ? event->preview : ""));
     obj.Set("result", Napi::Number::New(env, (double)event->result));
+    // A10-M4: a synchronous listener may register or unregister listeners on
+    // this Node (push_back reallocates change_listeners_). Iterate a snapshot
+    // of live Napi::Function handles instead of the vector itself; the
+    // FunctionReference keeps each function alive within this same scope.
+    std::vector<Napi::Function> listener_snapshot;
+    listener_snapshot.reserve(change_listeners_.size());
+    for (auto& listener_reference : change_listeners_) {
+      if (!listener_reference.IsEmpty()) {
+        listener_snapshot.push_back(listener_reference.Value());
+      }
+    }
     Napi::Value undefined_value = env.Undefined();
-    for (auto& listener : change_listeners_) {
-      if (listener.IsEmpty()) continue;
+    for (auto& live_listener : listener_snapshot) {
       try {
-        listener.Call(undefined_value, {obj});
+        live_listener.Call(undefined_value, {obj});
       } catch (...) {
         // A throwing listener must never break the state machine.
       }
