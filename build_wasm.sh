@@ -126,6 +126,8 @@ BASE_EXPORTS='[
   "_crabs_time_source_https_create",
   "_crabs_time_source_https_create_with_transport",
   "_crabs_time_source_destroy",
+  "_crabs_wasm_set_time_source",
+  "_crabs_wasm_time_source_attached",
   "_crabs_wasm_lineage_blueprint_new",
   "_crabs_wasm_lineage_blueprint_destroy",
   "_crabs_wasm_lineage_blueprint_add_item",

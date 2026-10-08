@@ -79,6 +79,27 @@ function ensureChangeTrampoline(M) {
 }
 
 // ============================================================
+// Authenticated time source
+// ============================================================
+// The WASM module owns ONE time source per module instance, shared by every
+// machine that attaches to it (per-module, not per-machine — see the C
+// contract in src/Util/wasm_helpers.c): setTimeSource({mode:'https'}) on any
+// Node replaces that shared source and attaches it to that Node's machine
+// (re-attaching every other attached machine too); {mode:'system'} detaches
+// only the calling machine, and the shared ops is retired in C when the last
+// attached machine leaves. The config echo getTimeSource reports therefore
+// lives at module scope.
+const _timeSourceSelections = new WeakMap();  // M -> {url, resyncMs, timeoutMs, maxSkewMs}
+
+// CRABS_TIME_SOURCE_DEFAULT_* from src/TimeSource/time_source.h. A non-NULL
+// config's scalars are used AS-IS by crabs_time_source_https_create (0 is a
+// real override, not "use the default"), so omitted options must spell these
+// out exactly — never pass 0 hoping for the default.
+const TIME_SOURCE_DEFAULT_RESYNC_MS = 30000;
+const TIME_SOURCE_DEFAULT_TIMEOUT_MS = 1000;
+const TIME_SOURCE_DEFAULT_MAX_SKEW_MS = 5000;
+
+// ============================================================
 // Helpers
 // ============================================================
 
@@ -776,6 +797,110 @@ class Node {
 
   setTime(nowMs) { this._M._crabs_wasm_set_time(this._am, BigInt(nowMs)); }
   pruneExpiredTempAttrs() { return this._M._crabs_wasm_prune_expired_temp_attrs(this._am); }
+
+  // --- Authenticated time source (R7-01 wiring; R7-02 fail closed) ---
+  //
+  // setTimeSource({mode: 'https' | 'system', url?, resyncMs?, timeoutMs?,
+  // maxSkewMs?}) — the options shape, typed errors, and reject-before-mutating
+  // contract match the node binding exactly. One wasm-module caveat: the
+  // underlying ops is module-SHARED (one per module instance, not per
+  // machine), so selecting 'https' on any Node re-points every attached
+  // machine at the fresh source; 'system' detaches only this machine.
+  //
+  // NO fetch happens at attach time — the first query runs lazily inside
+  // authenticated-time checks (state_get_time_ms), and a fetch failure makes
+  // the machine report invalid time (fail closed), never local-clock fallback.
+  setTimeSource(options) {
+    const M = this._M;
+    if (options === null || typeof options !== 'object' || Array.isArray(options))
+      throw new TypeError(
+          'setTimeSource: expected an options object {mode, url?, ...}');
+    if (options.mode !== 'https' && options.mode !== 'system')
+      throw new TypeError("setTimeSource: mode must be 'https' or 'system'");
+
+    if (options.mode === 'system') {
+      const rc = M._crabs_wasm_set_time_source(this._am, 0, 0, 0, 0n, 0n, 0n);
+      wrapRc(rc, 'setTimeSource');
+      return;
+    }
+
+    // Validation first — a rejected call must change NOTHING on the machine.
+    let url = null;
+    let urlBytes = null;
+    if (options.url !== undefined && options.url !== null) {
+      if (typeof options.url !== 'string')
+        throw new TypeError('setTimeSource: url must be a string');
+      url = options.url;
+      // Same checks as the CLI (`time-source https <url>`): https scheme, a
+      // non-empty host (no leading '/' or ':'), max 255 chars. Count UTF-8
+      // bytes, not UTF-16 code units — the C side bounds byte length.
+      urlBytes = encodeText(url);
+      if (!url.startsWith('https://') || url.length < 9 ||
+          url[8] === '/' || url[8] === ':')
+        throw new RangeError(
+            "setTimeSource: url must be https://<host>[/path] (got '" + url + "')");
+      if (urlBytes.length > 255)
+        throw new RangeError('setTimeSource: url too long (max 255 chars)');
+    }
+
+    let resyncMs = TIME_SOURCE_DEFAULT_RESYNC_MS;
+    let timeoutMs = TIME_SOURCE_DEFAULT_TIMEOUT_MS;
+    let maxSkewMs = TIME_SOURCE_DEFAULT_MAX_SKEW_MS;
+    const millis = {};
+    for (const field of ['resyncMs', 'timeoutMs', 'maxSkewMs']) {
+      const fieldValue = options[field];
+      if (fieldValue === undefined || fieldValue === null) continue;
+      if (typeof fieldValue !== 'number')
+        throw new TypeError('setTimeSource: ' + field + ' must be a number');
+      // NaN fails the >= 0 test; values >= 2^64 cannot be cast to uint64_t
+      // without UB, so bound the range before converting to BigInt.
+      if (!(fieldValue >= 0) || !(fieldValue < 18446744073709551616))
+        throw new RangeError('setTimeSource: ' + field +
+            ' must be a non-negative number of milliseconds');
+      millis[field] = Math.trunc(fieldValue);
+    }
+    if (millis.resyncMs !== undefined) resyncMs = millis.resyncMs;
+    if (millis.timeoutMs !== undefined) timeoutMs = millis.timeoutMs;
+    if (millis.maxSkewMs !== undefined) maxSkewMs = millis.maxSkewMs;
+
+    let urlPtr = 0;
+    let urlLen = 0;
+    if (urlBytes !== null) {
+      ({ ptr: urlPtr, len: urlLen } = writeBytes(M, urlBytes));
+    }
+    const rc = M._crabs_wasm_set_time_source(this._am, 1, urlPtr, urlLen,
+        BigInt(resyncMs), BigInt(timeoutMs), BigInt(maxSkewMs));
+    if (urlPtr) M._free(urlPtr);
+    if (rc !== 0) throw crabsError(rc, 'setTimeSource');
+    _timeSourceSelections.set(M, {
+      url, resyncMs, timeoutMs, maxSkewMs,
+    });
+  }
+
+  // getTimeSource() reports {mode:'system'} or {mode:'https', url,
+  // resyncMs, timeoutMs, maxSkewMs, created}. `url` is the configured
+  // endpoint or null (default endpoint). The per-machine attached flag comes
+  // from C (never from the JS echo), so it stays honest even if another Node
+  // in this module reconfigured the shared source.
+  getTimeSource() {
+    const M = this._M;
+    if (!M._crabs_wasm_time_source_attached(this._am)) {
+      return { mode: 'system' };
+    }
+    const selection = _timeSourceSelections.get(M) || {
+      url: null, resyncMs: TIME_SOURCE_DEFAULT_RESYNC_MS,
+      timeoutMs: TIME_SOURCE_DEFAULT_TIMEOUT_MS,
+      maxSkewMs: TIME_SOURCE_DEFAULT_MAX_SKEW_MS,
+    };
+    return {
+      mode: 'https',
+      url: selection.url,
+      resyncMs: selection.resyncMs,
+      timeoutMs: selection.timeoutMs,
+      maxSkewMs: selection.maxSkewMs,
+      created: true,
+    };
+  }
 
   schedule(innerOp, executeAtMs) {
     const scheduleId = this._M._crabs_wasm_schedule(this._am, innerOp._ptr, BigInt(executeAtMs));

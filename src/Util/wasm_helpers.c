@@ -23,6 +23,7 @@
 #include "../CRDT/one_shot.h"
 #include "../Scheduler/scheduler.h"
 #include "../Lineage/lineage.h"
+#include "../TimeSource/time_source.h"
 
 #ifdef CRABS_ENABLE_DEVTOOLS
 #include "../Devtools/devtools.h"
@@ -158,6 +159,72 @@ void crabs_wasm_set_change_trampoline(void (*trampoline)(const char* json)) {
 }
 
 // ============================================================
+// Authenticated time source (module-scoped owned slot)
+// ============================================================
+// A wasm module instance owns ONE time source: every machine that selects
+// mode=https attaches to the same owned ops object (per-module, not
+// per-machine). crabs_wasm_set_time_source manages the slot:
+//   - set-https replaces the slot: the fresh ops is attached to every
+//     machine in the attached-set PLUS the target machine, and only THEN is
+//     the previous ops destroyed (attach-before-retire, so no machine ever
+//     observes a dangling ops pointer).
+//   - set-system detaches the target machine and drops it from the
+//     attached-set; when the last attached machine leaves, the owned ops is
+//     destroyed (registry empty = nothing references it).
+// The attached-set holds raw machine pointers. In the wasm build machines
+// are never truly freed (crabs_wasm_node_destroy intentionally leaks — see
+// its comment), so these pointers stay valid for the module's lifetime; the
+// destroy path still detaches the machine state and drops its registry
+// entry so the shared ops can be retired before a leaked (but destroyed)
+// machine could observe it dangling.
+
+#define CRABS_WASM_TIME_SOURCE_URL_MAX 255
+#define CRABS_WASM_TIME_SOURCE_SYSTEM  0
+#define CRABS_WASM_TIME_SOURCE_HTTPS   1
+
+static crabs_time_source_ops_t* s_time_source_ops = NULL;
+static attribute_machine_t** s_time_source_machines = NULL;
+static uint32_t s_time_source_machine_count = 0;
+static uint32_t s_time_source_machine_capacity = 0;
+
+static uint32_t _time_source_machine_index(attribute_machine_t* am) {
+  for (uint32_t index = 0; index < s_time_source_machine_count; index++) {
+    if (s_time_source_machines[index] == am) return index;
+  }
+  return UINT32_MAX;
+}
+
+static crabs_error_e _time_source_register_machine(attribute_machine_t* am) {
+  if (_time_source_machine_index(am) != UINT32_MAX) return CRABS_SUCCESS;
+  if (s_time_source_machine_count == s_time_source_machine_capacity) {
+    uint32_t fresh_capacity = s_time_source_machine_capacity == 0
+        ? 4 : s_time_source_machine_capacity * 2;
+    attribute_machine_t** fresh_registry = (attribute_machine_t**)realloc(
+        s_time_source_machines, fresh_capacity * sizeof(attribute_machine_t*));
+    if (fresh_registry == NULL) return CRABS_ERR_OOM;
+    s_time_source_machines = fresh_registry;
+    s_time_source_machine_capacity = fresh_capacity;
+  }
+  s_time_source_machines[s_time_source_machine_count++] = am;
+  return CRABS_SUCCESS;
+}
+
+// Drop a machine from the attached-set. The caller detaches the machine's
+// state FIRST; once the last attached machine leaves, the owned ops has no
+// remaining references and is destroyed.
+static void _time_source_unregister_machine(attribute_machine_t* am) {
+  uint32_t index = _time_source_machine_index(am);
+  if (index == UINT32_MAX) return;
+  s_time_source_machines[index] =
+      s_time_source_machines[s_time_source_machine_count - 1];
+  s_time_source_machine_count--;
+  if (s_time_source_machine_count == 0 && s_time_source_ops != NULL) {
+    crabs_time_source_destroy(s_time_source_ops);
+    s_time_source_ops = NULL;
+  }
+}
+
+// ============================================================
 // Node lifecycle (HLC-enabled)
 // ============================================================
 
@@ -195,12 +262,20 @@ attribute_machine_t* crabs_wasm_node_create(const char* admin_id) {
 
 EMSCRIPTEN_KEEPALIVE
 void crabs_wasm_node_destroy(attribute_machine_t* am) {
-  // Intentional no-op. Full C teardown (attribute_machine_destroy) triggers a
-  // memory-access crash in the Emscripten build during ABE/OpenABE cleanup.
-  // The browser demo creates one Node per page load; leaking it is harmless
-  // because the process ends on navigation. A future fix can safely tear down
-  // the ABE context first.
-  (void)am;
+  // Intentional near-no-op. Full C teardown (attribute_machine_destroy)
+  // triggers a memory-access crash in the Emscripten build during
+  // ABE/OpenABE cleanup. The browser demo creates one Node per page load;
+  // leaking it is harmless because the process ends on navigation. A future
+  // fix can safely tear down the ABE context first.
+  //
+  // The machine IS released from the module time-source attached-set even
+  // though its memory leaks: detaching keeps the shared ops honest about who
+  // references it (so set-system on the last live machine can retire it) and
+  // guarantees a hypothetical future full teardown cannot leave a dangling
+  // ops pointer behind.
+  if (am == NULL) return;
+  state_set_time_source(&am->base_state, NULL);
+  _time_source_unregister_machine(am);
 }
 
 // ============================================================
@@ -560,6 +635,99 @@ EMSCRIPTEN_KEEPALIVE
 uint32_t crabs_wasm_prune_expired_temp_attrs(attribute_machine_t* am) {
   if (!am) return 0;
   return attribute_machine_prune_expired_temporary(am);
+}
+
+// Select the time source for this machine (mirrors the CLI's
+// `time-source https [url]` / `time-source system` and the node binding's
+// setTimeSource). `mode` is CRABS_WASM_TIME_SOURCE_SYSTEM or
+// CRABS_WASM_TIME_SOURCE_HTTPS; anything else changes nothing. `url` is a
+// (pointer, length) byte pair — a NULL pointer or zero length selects the
+// default endpoint (the JS wrapper passes UTF-8 bytes without a NUL, so the
+// string is bounded-copied into a local buffer before use).
+//
+// The u64 scalars are passed through AS-IS: a NON-NULL config's values have
+// no defaults applied by crabs_time_source_https_create (resync 0 = re-query
+// every fetch; max_skew 0 disables the plausibility bound), so the JS
+// wrapper spells CRABS_TIME_SOURCE_DEFAULT_* out for omitted options. See
+// the module-scoped slot contract in the section comment above
+// _time_source_register_machine. No fetch happens at attach time; the first
+// query runs lazily inside authenticated-time checks, and a fetch failure
+// fails closed (R7-02) — a machine with an unreachable source reports
+// invalid time, never local-clock fallback.
+EMSCRIPTEN_KEEPALIVE
+crabs_error_e crabs_wasm_set_time_source(attribute_machine_t* am, int mode,
+                                         const uint8_t* url, uint32_t url_len,
+                                         uint64_t resync_ms,
+                                         uint64_t timeout_ms,
+                                         uint64_t max_skew_ms) {
+  if (am == NULL) return CRABS_ERR_INVALID_PARAM;
+
+  if (mode == CRABS_WASM_TIME_SOURCE_SYSTEM) {
+    state_set_time_source(&am->base_state, NULL);
+    _time_source_unregister_machine(am);
+    return CRABS_SUCCESS;
+  }
+  if (mode != CRABS_WASM_TIME_SOURCE_HTTPS) return CRABS_ERR_INVALID_PARAM;
+
+  // Defensive URL validation: the JS wrapper already rejects bad URLs before
+  // calling in, but a rejected call must change NOTHING (mirrors the CLI's
+  // reject-before-mutating contract) so the shape check is repeated here —
+  // https scheme, non-empty host, bounded length. The native transport's
+  // _parse_url is not compiled into the wasm build, so the checks must live
+  // in this helper (the JS glue's js_fetch_server_time also enforces
+  // https:// as the last line of defense).
+  char url_buffer[CRABS_WASM_TIME_SOURCE_URL_MAX + 1];
+  const char* configured_url = NULL;
+  if (url != NULL && url_len > 0) {
+    if (url_len > CRABS_WASM_TIME_SOURCE_URL_MAX) return CRABS_ERR_INVALID_PARAM;
+    memcpy(url_buffer, url, url_len);
+    url_buffer[url_len] = '\0';
+    if (strncmp(url_buffer, "https://", 8) != 0 || url_buffer[8] == '\0' ||
+        url_buffer[8] == '/' || url_buffer[8] == ':') {
+      return CRABS_ERR_INVALID_PARAM;
+    }
+    configured_url = url_buffer;
+  }
+
+  crabs_time_source_config_t config;
+  config.server_url = configured_url;  // create() copies it before returning
+  config.resync_interval_ms = resync_ms;
+  config.timeout_ms = timeout_ms;
+  config.max_skew_ms = max_skew_ms;
+  crabs_time_source_ops_t* fresh = crabs_time_source_https_create(&config);
+  if (fresh == NULL) {
+    // Allocation failure: leave the target machine on NO source rather than
+    // silently falling back to the system clock (fail closed, R7-02).
+    // Machines that were already attached keep the existing module ops.
+    state_set_time_source(&am->base_state, NULL);
+    _time_source_unregister_machine(am);
+    return CRABS_ERR_OOM;
+  }
+  crabs_error_e registered = _time_source_register_machine(am);
+  if (registered != CRABS_SUCCESS) {
+    crabs_time_source_destroy(fresh);
+    state_set_time_source(&am->base_state, NULL);
+    _time_source_unregister_machine(am);
+    return registered;
+  }
+  // Attach the fresh ops to the whole attached-set (the target machine is in
+  // it now), THEN retire the previous module-owned ops.
+  for (uint32_t index = 0; index < s_time_source_machine_count; index++) {
+    state_set_time_source(&s_time_source_machines[index]->base_state, fresh);
+  }
+  if (s_time_source_ops != NULL) {
+    crabs_time_source_destroy(s_time_source_ops);
+  }
+  s_time_source_ops = fresh;
+  return CRABS_SUCCESS;
+}
+
+// Honest per-machine view for the JS getTimeSource echo: whether this
+// machine's HLC state currently has a time source attached (in the wasm
+// build that source is always the module-owned ops).
+EMSCRIPTEN_KEEPALIVE
+bool crabs_wasm_time_source_attached(attribute_machine_t* am) {
+  return am != NULL && am->base_state.hlc_state.time_source_ops != NULL;
 }
 
 // ============================================================

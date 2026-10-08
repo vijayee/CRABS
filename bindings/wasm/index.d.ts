@@ -131,6 +131,22 @@ export interface NodeOptions {
   strategy?: 'naive' | 'bounded' | 'quorum' | 'strict' | 'trusted';
 }
 
+export interface TimeSourceOptions {
+  /** 'https' attaches the authenticated HTTPS time source; 'system' detaches (local clock). */
+  mode: 'https' | 'system';
+  /** https:// endpoint (max 255 UTF-8 bytes). Omit for the default endpoint. */
+  url?: string;
+  /** Omitted numbers use the documented defaults (30000/1000/5000); 0 is a real override. */
+  resyncMs?: number;
+  timeoutMs?: number;
+  maxSkewMs?: number;
+}
+
+export type TimeSourceInfo =
+  | { mode: 'system' }
+  | { mode: 'https'; url: string | null; resyncMs: number;
+      timeoutMs: number; maxSkewMs: number; created: boolean };
+
 export interface Node {
   getNodeKey(): NodeKey;
   registerUser(userId: string, publicKeyHex: string, initialAttrs?: string): void;
@@ -182,6 +198,18 @@ export interface Node {
 
   setTime(nowMs: number): void;
   pruneExpiredTempAttrs(): number;
+
+  // Authenticated time source (R7-01 wiring; R7-02 fail closed). WASM-module
+  // caveat: the ops object is module-SHARED — one per module instance, not
+  // per machine. setTimeSource({mode:'https'}) on any Node replaces the
+  // shared source and attaches it to this machine (re-attaching every other
+  // attached machine in the module too); {mode:'system'} detaches only this
+  // machine, and the shared ops is retired when the last attached machine
+  // leaves. No fetch happens at attach time: the first query runs lazily
+  // inside authenticated-time checks, and a fetch failure fails closed (the
+  // machine reports invalid time), never falling back to the local clock.
+  setTimeSource(options: TimeSourceOptions): void;
+  getTimeSource(): TimeSourceInfo;
 
   schedule(innerOp: Operation, executeAtMs: number): bigint;
   scheduleRecurring(innerOp: Operation, startAtMs: number, intervalMs: number,

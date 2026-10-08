@@ -217,16 +217,68 @@ Notes:
   the `__cancel_schedule__` policy can cancel any pending schedule id (admins
   retain full power).
 - `processSchedules(nowMs?)` trusts the JS-supplied clock (default
-  `Date.now()`). The WASM binding attaches no authenticated time source: all
-  timing — including the automatic tick that runs on every `execute` — runs
-  on the platform clock. Deployments needing authenticated time must attach a
-  time source (`state_set_time_source` is not yet exposed to JS).
+  `Date.now()`). Unless a time source is attached (see "Authenticated time
+  source" below) all timing — including the automatic tick that runs on
+  every `execute` — runs on the platform clock. Deployments needing
+  authenticated time must select it per machine via
+  `node.setTimeSource({ mode: 'https' })`.
 - Materialization failures (state drifted, invariant violated) are recorded
   durably as `__schedule_failed__` audit-log entries and never affect other
   operations. A schedule fires exactly once. Two nodes with skewed clocks may
   resolve the same schedule differently; CRDT-typed items reconcile via merge,
   non-CRDT items can diverge like any conflicting concurrent ops.
 - Pending schedules are part of the serialized state and survive restarts.
+
+## Authenticated time source
+
+Schedules, triggers, and attestations read the node's clock. By default that
+clock is the unauthenticated platform clock; `setTimeSource` selects the
+authenticated HTTPS time source (queries an HTTPS time endpoint, caches the
+answer, and interpolates with a monotonic clock between resyncs):
+
+```js
+// Default endpoint (https://cloudflare.com/cdn-cgi/trace), 30s resync.
+node.setTimeSource({ mode: 'https' });
+
+// Custom endpoint + tuning. Omitted numbers use the documented defaults
+// (resyncMs 30000, timeoutMs 1000, maxSkewMs 5000); an explicit 0 is a real
+// override (resyncMs 0 = re-query on every check; maxSkewMs 0 disables the
+// plausibility bound), NOT a request for the default.
+node.setTimeSource({ mode: 'https', url: 'https://time.example.com/trace',
+                     resyncMs: 60000, timeoutMs: 2000, maxSkewMs: 5000 });
+node.getTimeSource();
+// { mode: 'https', url, resyncMs, timeoutMs, maxSkewMs, created: true }
+
+node.setTimeSource({ mode: 'system' });   // back to the local clock
+```
+
+Notes:
+
+- **Sharing is module-wide in the WASM build.** The C module owns ONE time
+  source slot per module instance (per-module, not per-machine — unlike the
+  N-API binding, where each Node owns its own ops): selecting `https` on any
+  Node replaces the shared source and re-attaches every attached machine in
+  the module; selecting `system` detaches only that machine, and the shared
+  source is retired when the last attached machine leaves. A machine is only
+  attached once its own `setTimeSource({ mode: 'https' })` call runs — the
+  source is never silently imposed on unconfigured machines.
+- **Fail closed.** No fetch happens at attach time; the first query runs
+  lazily inside authenticated-time checks. If the endpoint is unreachable or
+  answers outside the `maxSkewMs` plausibility bound, the machine reports
+  INVALID time (security checks fail) — it never falls back to the local
+  clock, which is exactly the clock the time source exists to distrust.
+- **Trust boundary.** The HTTPS endpoint is part of the trust base: a
+  compromised time server can withhold time (denial) or attempt small shifts
+  bounded by `maxSkewMs` (5s default), but cannot push time arbitrarily far
+  and cannot roll time backwards. Choose an endpoint you trust and keep
+  `maxSkewMs` tight in production.
+- **Environment quirks.** The transport is the Emscripten host shim: a
+  synchronous `XMLHttpRequest` in browsers, or a synchronous `child_process`
+  HTTPS fetch under Node.js. The `timeoutMs` bound is only honored on the
+  Node path — the XHR spec does not honor `timeout` on synchronous requests,
+  so a failed check in a browser sync context can block indefinitely with no
+  timeout bound. Treat the authenticated time source accordingly for
+  browser-run machines.
 
 ## License
 
