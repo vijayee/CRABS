@@ -42,6 +42,7 @@ extern "C" {
 #include "CRDT/crdt_merge.h"
 #include "CRDT/one_shot.h"
 #include "Lineage/lineage.h"
+#include "TimeSource/time_source.h"
 #include "Util/platform.h"
 }
 
@@ -716,6 +717,9 @@ public:
       InstanceMethod("lineageResidentChild", &Node::LineageResidentChild),
       InstanceMethod("lineageAttest", &Node::LineageAttest),
       InstanceMethod("lineageTombstone", &Node::LineageTombstone),
+      // Authenticated time source (A10-L9 wiring)
+      InstanceMethod("setTimeSource", &Node::SetTimeSource),
+      InstanceMethod("getTimeSource", &Node::GetTimeSource),
     });
     auto* inst = env.GetInstanceData<NodeAddonInstanceData>();
     inst->node_ctor = Napi::Persistent(func);
@@ -790,6 +794,20 @@ public:
 
   ~Node() {
     for (auto& listener : change_listeners_) listener.Reset();
+    // Time-source cleanup FIRST: the machine's state_t references the ops
+    // object through a raw, non-owning pointer (state_set_time_source), so
+    // the ops must outlive neither the state nor the pointer stored in it.
+    // Detach from the state, then destroy the ops, before the machine is
+    // destroyed below. For an adopted wrapper the machine outlives the
+    // wrapper (parent keepalive): detaching leaves that machine WITHOUT an
+    // authenticated clock, which thereafter fails closed per R7-02 — an
+    // accepted, documented consequence of the wrapper dying.
+    if (time_source_owned_ && time_source_ops_ != nullptr) {
+      state_set_time_source(&am_->base_state, NULL);
+      crabs_time_source_destroy(time_source_ops_);
+      time_source_ops_ = nullptr;
+      time_source_owned_ = false;
+    }
     if (node_key_) crypto_ecdsa_keypair_destroy(node_key_);
     // Ownership statement (mirrors the wasm binding's resident-registry one):
     // a wrapper around a machine it did not create NEVER destroys the machine.
@@ -859,6 +877,25 @@ private:
   // A borrowed child wrapper keeps a reference to its parent object so the
   // parent (and with it the borrowed machine pointer) stays alive.
   Napi::ObjectReference parent_keepalive_;
+
+  // Authenticated time source (A10-L9 wiring, R7-01). The wrapper OWNS the
+  // ops object it created in setTimeSource({mode:'https'}); the machine's
+  // state_t references it through a raw, non-owning pointer.
+  // time_source_owned_ is set only when THIS wrapper created the ops — a
+  // wrapper (adopted or not) that never called setTimeSource must not
+  // destroy ops belonging to anyone else, so the destructor keys off the
+  // pair (owned_, ops != nullptr), not just the pointer.
+  crabs_time_source_ops_t* time_source_ops_ = nullptr;
+  bool time_source_owned_ = false;
+  // The stored selection; getTimeSource reports from this record (the
+  // configuration is machine-local and never serialized, so the wrapper's
+  // own record is the coherent source of truth). https=false / empty url /
+  // default numbers describe the system-clock state.
+  bool time_source_https_ = false;
+  std::string time_source_url_;  // "" = default endpoint (reported as null)
+  uint64_t time_source_resync_ms_ = CRABS_TIME_SOURCE_DEFAULT_RESYNC_MS;
+  uint64_t time_source_timeout_ms_ = CRABS_TIME_SOURCE_DEFAULT_TIMEOUT_MS;
+  uint64_t time_source_max_skew_ms_ = CRABS_TIME_SOURCE_DEFAULT_MAX_SKEW_MS;
 
   // Shared construction path for wrapping a borrowed child machine. The
   // adoption packet is freed by the External's finalizer (GC time), so the
@@ -1512,6 +1549,166 @@ private:
   Napi::Value PruneExpiredTempAttrs(const Napi::CallbackInfo& info) {
     attribute_machine_prune_expired_temporary(am_);
     return info.Env().Undefined();
+  }
+
+  // --- Authenticated time source (A10-L9 wiring, R7-01) ---
+  //
+  // setTimeSource({mode: 'https' | 'system', url?, resyncMs?, timeoutMs?,
+  // maxSkewMs?}). The selection is machine-local configuration: adopted
+  // child wrappers may call it too — each wrapper's machine has its own
+  // state_t, so the source attaches to THIS wrapper's machine
+  // (am_->base_state), whether or not this wrapper created that machine.
+  //
+  // 'system' detaches the machine from any authenticated source (back to
+  // the local clock) and destroys the wrapper-owned ops. 'https' attaches
+  // the built-in authenticated HTTPS time source. NO fetch happens at
+  // attach time — the first query runs lazily inside authenticated-time
+  // checks (state_get_time_ms), and a fetch failure makes the machine
+  // report invalid time (fail closed, R7-02), never local-clock fallback.
+  Napi::Value SetTimeSource(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 1 || !info[0].IsObject())
+      throw Napi::TypeError::New(env,
+          "setTimeSource: expected an options object {mode, url?, ...}");
+    Napi::Object opts = info[0].As<Napi::Object>();
+    if (!opts.Has("mode") || !opts.Get("mode").IsString())
+      throw Napi::TypeError::New(env,
+          "setTimeSource: mode must be 'https' or 'system'");
+    std::string mode = opts.Get("mode").As<Napi::String>().Utf8Value();
+
+    if (mode == "system") {
+      state_set_time_source(&am_->base_state, NULL);
+      if (time_source_owned_ && time_source_ops_ != nullptr) {
+        crabs_time_source_destroy(time_source_ops_);
+      }
+      time_source_ops_ = nullptr;
+      time_source_owned_ = false;
+      time_source_https_ = false;
+      time_source_url_.clear();
+      return env.Undefined();
+    }
+    if (mode != "https")
+      throw Napi::TypeError::New(env,
+          "setTimeSource: mode must be 'https' or 'system'");
+
+    // Validation first — a rejected call must change NOTHING on the machine
+    // (mirrors the CLI's reject-before-mutating contract).
+    std::string url;
+    bool has_url = false;
+    if (opts.Has("url") && !opts.Get("url").IsUndefined() &&
+        !opts.Get("url").IsNull()) {
+      url = require_js_string(opts.Get("url"), "setTimeSource", "url");
+      has_url = true;
+      // Same checks as the CLI (`time-source https <url>`): https scheme,
+      // a non-empty host (no leading '/' or ':'), max 255 chars.
+      if (url.compare(0, 8, "https://") != 0 || url.size() < 9 ||
+          url[8] == '/' || url[8] == ':')
+        throw Napi::RangeError::New(env,
+            "setTimeSource: url must be https://<host>[/path] (got '" + url +
+            "')");
+      if (url.size() > 255)
+        throw Napi::RangeError::New(env,
+            "setTimeSource: url too long (max 255 chars)");
+    }
+
+    // Creator-defaults subtlety (time_source.h): a NON-NULL config's scalar
+    // fields are used AS-IS — 0 is meaningful (resync 0 = re-query on every
+    // fetch; max_skew 0 disables the plausibility check), NOT "use the
+    // default". So omitted numbers must be spelled out as the documented
+    // CRABS_TIME_SOURCE_DEFAULT_* values; only server_url maps NULL -> the
+    // default endpoint. A passed-in 0 is kept as 0 (the caller asked for
+    // the chatty variant on purpose).
+    uint64_t resync_ms = CRABS_TIME_SOURCE_DEFAULT_RESYNC_MS;
+    uint64_t timeout_ms = CRABS_TIME_SOURCE_DEFAULT_TIMEOUT_MS;
+    uint64_t max_skew_ms = CRABS_TIME_SOURCE_DEFAULT_MAX_SKEW_MS;
+    struct { const char* field; uint64_t* out; } numeric_fields[] = {
+      {"resyncMs", &resync_ms},
+      {"timeoutMs", &timeout_ms},
+      {"maxSkewMs", &max_skew_ms},
+    };
+    for (const auto& numeric : numeric_fields) {
+      if (!opts.Has(numeric.field) || opts.Get(numeric.field).IsUndefined() ||
+          opts.Get(numeric.field).IsNull())
+        continue;
+      Napi::Value field_value = opts.Get(numeric.field);
+      if (!field_value.IsNumber())
+        throw Napi::TypeError::New(env,
+            std::string("setTimeSource: ") + numeric.field +
+            " must be a number");
+      double field_number = field_value.As<Napi::Number>().DoubleValue();
+      // NaN fails the >= 0 test; values >= 2^64 cannot be cast to uint64_t
+      // without UB, so bound the range before the conversion.
+      if (!(field_number >= 0.0) || !(field_number < 18446744073709551616.0))
+        throw Napi::RangeError::New(env,
+            std::string("setTimeSource: ") + numeric.field +
+            " must be a non-negative number of milliseconds");
+      *numeric.out = (uint64_t)field_number;
+    }
+
+    crabs_time_source_config_t config;
+    config.server_url = has_url ? url.c_str() : NULL;  // copied by create()
+    config.resync_interval_ms = resync_ms;
+    config.timeout_ms = timeout_ms;
+    config.max_skew_ms = max_skew_ms;
+    crabs_time_source_ops_t* fresh = crabs_time_source_https_create(&config);
+    if (fresh == nullptr) {
+      // Allocation failure: leave the machine on NO source rather than
+      // silently on the system clock (fail closed, R7-02), and drop the
+      // stale ops — mirrors the CLI's behavior on create failure.
+      state_set_time_source(&am_->base_state, NULL);
+      if (time_source_owned_ && time_source_ops_ != nullptr) {
+        crabs_time_source_destroy(time_source_ops_);
+      }
+      time_source_ops_ = nullptr;
+      time_source_owned_ = false;
+      time_source_https_ = false;
+      time_source_url_.clear();
+      throw Napi::Error::New(env,
+          "setTimeSource: could not create the HTTPS time source");
+    }
+    // Attach the fresh source, THEN retire the old owned ops (the old
+    // monotonic anchor belonged to the previous selection anyway).
+    state_set_time_source(&am_->base_state, fresh);
+    if (time_source_owned_ && time_source_ops_ != nullptr) {
+      crabs_time_source_destroy(time_source_ops_);
+    }
+    time_source_ops_ = fresh;
+    time_source_owned_ = true;
+    time_source_https_ = true;
+    time_source_url_ = has_url ? url : std::string();
+    time_source_resync_ms_ = resync_ms;
+    time_source_timeout_ms_ = timeout_ms;
+    time_source_max_skew_ms_ = max_skew_ms;
+    return env.Undefined();
+  }
+
+  // getTimeSource() reports the wrapper's stored selection:
+  //   { mode: 'system' } or
+  //   { mode: 'https', url, resyncMs, timeoutMs, maxSkewMs, created }
+  // `url` is the configured endpoint or null (default endpoint); `created`
+  // is true while the wrapper-owned ops object is live.
+  Napi::Value GetTimeSource(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    Napi::Object result = Napi::Object::New(env);
+    if (!time_source_https_) {
+      result.Set("mode", Napi::String::New(env, "system"));
+      return result;
+    }
+    result.Set("mode", Napi::String::New(env, "https"));
+    if (time_source_url_.empty()) {
+      result.Set("url", env.Null());
+    } else {
+      result.Set("url", Napi::String::New(env, time_source_url_));
+    }
+    result.Set("resyncMs",
+               Napi::Number::New(env, (double)time_source_resync_ms_));
+    result.Set("timeoutMs",
+               Napi::Number::New(env, (double)time_source_timeout_ms_));
+    result.Set("maxSkewMs",
+               Napi::Number::New(env, (double)time_source_max_skew_ms_));
+    result.Set("created",
+               Napi::Boolean::New(env, time_source_ops_ != nullptr));
+    return result;
   }
 
   // --- Lineage (v1.7: machines mint machines) ---

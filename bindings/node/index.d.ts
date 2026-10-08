@@ -124,6 +124,22 @@ export interface NodeOptions {
   strategy?: 'naive' | 'bounded' | 'quorum' | 'strict' | 'trusted';
 }
 
+export interface TimeSourceOptions {
+  /** 'https' attaches the authenticated HTTPS time source; 'system' detaches (local clock). */
+  mode: 'https' | 'system';
+  /** https:// endpoint (max 255 chars). Omit for the default endpoint. */
+  url?: string;
+  /** Omitted numbers use the documented defaults (30000/1000/5000); 0 is a real override. */
+  resyncMs?: number;
+  timeoutMs?: number;
+  maxSkewMs?: number;
+}
+
+export type TimeSourceInfo =
+  | { mode: 'system' }
+  | { mode: 'https'; url: string | null; resyncMs: number;
+      timeoutMs: number; maxSkewMs: number; created: boolean };
+
 export interface CrabsChangeEvent {
   kind: 'op' | 'schedule' | 'trigger' | 'attribute' | 'spawn' | 'lineage';
   type: string;
@@ -191,6 +207,14 @@ export interface Node {
   getHLC(): HLC | undefined;
   setTime(nowMs: number): void;
   pruneExpiredTempAttrs(): void;
+
+  // Authenticated time source (A10-L9 wiring, R7-01). Machine-local
+  // configuration — adopted child wrappers may set it on their own machine.
+  // 'https' attaches the authenticated HTTPS source; no fetch happens at
+  // attach time (queries run lazily inside authenticated-time checks, and a
+  // fetch failure fails closed per R7-02 — never a local-clock fallback).
+  setTimeSource(options: TimeSourceOptions): void;
+  getTimeSource(): TimeSourceInfo;
 
   // Lineage (v1.7: machines mint machines)
   /** Register the five __lineage__ op types, policies and handlers. Idempotent. */

@@ -258,5 +258,88 @@ expectTypeError(() => node.createTrigger({ triggerId: 1, condition: 'true',
 const typedOp = new Operation('typed');
 expectTypeError(() => { typedOp.signerId = 42; }, 'Operation.signerId = number');
 
+// Test 22: a fresh node defaults to the system clock — no authenticated
+// source attached until setTimeSource says so.
+const freshClock = node.getTimeSource();
+assert(freshClock.mode === 'system',
+  'fresh node getTimeSource should report mode system');
+
+// Test 23: switch to the authenticated HTTPS time source. No fetch happens
+// at attach time (the query runs lazily inside authenticated-time checks),
+// so this must succeed with no network dependency. getTimeSource echoes the
+// stored selection: default endpoint (url null) and the documented
+// CRABS_TIME_SOURCE_DEFAULT_* numbers (30000/1000/5000).
+node.setTimeSource({ mode: 'https' });
+const httpsDefault = node.getTimeSource();
+assert(httpsDefault.mode === 'https', 'https selection should report mode https');
+assert(httpsDefault.url === null, 'default endpoint should surface as url null');
+assert(httpsDefault.resyncMs === 30000 && httpsDefault.timeoutMs === 1000 &&
+       httpsDefault.maxSkewMs === 5000,
+  'omitted numbers should echo the documented defaults');
+assert(httpsDefault.created === true, 'https ops object should be live');
+
+// Test 24: custom url and numeric overrides are echoed; resync 0 is a real
+// value (re-query every fetch), NOT a default request.
+node.setTimeSource({ mode: 'https', url: 'https://time.example.com/trace',
+                     resyncMs: 0, timeoutMs: 2000, maxSkewMs: 9000 });
+const httpsCustom = node.getTimeSource();
+assert(httpsCustom.url === 'https://time.example.com/trace',
+  'configured url should be echoed');
+assert(httpsCustom.resyncMs === 0 && httpsCustom.timeoutMs === 2000 &&
+       httpsCustom.maxSkewMs === 9000,
+  'numeric overrides should be echoed (resync 0 kept as 0)');
+assert(httpsCustom.created === true, 'replacement ops object should be live');
+
+// Test 25: back to the system clock — detaches and destroys the owned ops.
+node.setTimeSource({ mode: 'system' });
+assert(node.getTimeSource().mode === 'system',
+  'system selection should report mode system');
+
+// Test 26: typed rejections — bogus mode / missing mode / non-object arg.
+function expectTimeSourceRejection(thunk, errorType, label) {
+  try {
+    thunk();
+    assert(false, `${label} should throw ${errorType.name}`);
+  } catch (rejection) {
+    assert(rejection instanceof errorType &&
+           rejection.message.includes('setTimeSource'),
+      `${label} should throw a typed setTimeSource error`);
+  }
+}
+expectTimeSourceRejection(() => node.setTimeSource({ mode: 'ntp' }),
+  TypeError, 'setTimeSource({mode: ntp})');
+expectTimeSourceRejection(() => node.setTimeSource({}),
+  TypeError, 'setTimeSource({}) (missing mode)');
+expectTimeSourceRejection(() => node.setTimeSource('https'),
+  TypeError, 'setTimeSource(string)');
+expectTimeSourceRejection(() => node.setTimeSource(),
+  TypeError, 'setTimeSource() (no arg)');
+expectTimeSourceRejection(() => node.setTimeSource({ mode: 'https',
+                                                     timeoutMs: 'fast' }),
+  TypeError, 'setTimeSource(string timeoutMs)');
+expectTimeSourceRejection(() => node.setTimeSource({ mode: 'https',
+                                                     resyncMs: -1 }),
+  RangeError, 'setTimeSource(negative resyncMs)');
+expectTimeSourceRejection(() => node.setTimeSource({ mode: 'https',
+                                                     maxSkewMs: NaN }),
+  RangeError, 'setTimeSource(NaN maxSkewMs)');
+
+// Test 27: url validation mirrors the CLI checks — http://, empty host and
+// over-long urls are RangeErrors and change NOTHING on the node.
+expectTimeSourceRejection(() => node.setTimeSource({ mode: 'https',
+                                                     url: 'http://example.com/t' }),
+  RangeError, 'setTimeSource(http:// url)');
+expectTimeSourceRejection(() => node.setTimeSource({ mode: 'https',
+                                                     url: 'https://' }),
+  RangeError, 'setTimeSource(empty host)');
+expectTimeSourceRejection(() => node.setTimeSource({ mode: 'https',
+                                                     url: 'https:///' }),
+  RangeError, 'setTimeSource(slash host)');
+expectTimeSourceRejection(() => node.setTimeSource({ mode: 'https',
+    url: 'https://' + 'a'.repeat(256) }),
+  RangeError, 'setTimeSource(url > 255 chars)');
+assert(node.getTimeSource().mode === 'system',
+  'rejected setTimeSource calls must leave the selection untouched');
+
 console.log(`\n${passed} passed, ${failed} failed`);
 process.exit(failed > 0 ? 1 : 0);
