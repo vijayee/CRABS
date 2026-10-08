@@ -213,6 +213,13 @@ export interface Node {
   // 'https' attaches the authenticated HTTPS source; no fetch happens at
   // attach time (queries run lazily inside authenticated-time checks, and a
   // fetch failure fails closed per R7-02 — never a local-clock fallback).
+  // A11-L6: the source rides the MACHINE, not the wrapper. When two Node
+  // wrappers wrap the same machine (lineageSpawn / lineageResidentChild),
+  // destroying EITHER wrapper detaches the machine's clock from its state —
+  // teardown always clears the ops pointer it installed first, so a sibling
+  // wrapper's live configuration is silently stripped (fail-closed from then
+  // on). Re-apply setTimeSource on the surviving wrapper if you destroy a
+  // sibling that had configured one.
   setTimeSource(options: TimeSourceOptions): void;
   getTimeSource(): TimeSourceInfo;
 

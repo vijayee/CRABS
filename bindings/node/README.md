@@ -194,6 +194,10 @@ The enum tables `TRUST_MODE`, `DATA_TYPE`, `CRDT_TYPE` are exported alongside th
 - `node.getHLC()` → `HLC | undefined` — get the current HLC timestamp
 - `node.setTime(nowMs)` — inject the wall clock (for testing temp attribute expiry)
 - `node.pruneExpiredTempAttrs()` — prune expired temporary attributes
+- `node.setTimeSource({ mode, url?, resyncMs?, timeoutMs?, maxSkewMs? })` — attach an authenticated time source (`mode: 'https'`) or revert to the platform clock (`mode: 'system'`). Machine-local: the source is attached to the underlying machine's state, not to the wrapper
+- `node.getTimeSource()` → `{ mode, url }` — inspect the current selection
+
+**Cross-wrapper caveat (A11-L6):** two Node wrappers can wrap the SAME machine (e.g. `lineageSpawn`/`lineageResidentChild` give a child wrapper while the machine is owned elsewhere). If both wrappers configure a time source, destroying EITHER wrapper detaches the machine's clock from its state — a wrapper teardown always clears the ops pointer it installed before freeing it, so the surviving wrapper's live configuration is silently stripped (the machine thereafter fails closed per R7-02, never silently reverting mid-operation). Consequence: treat the time source as machine-scoped; re-apply `setTimeSource` on the surviving wrapper if you destroy a sibling wrapper that had configured one.
 
 #### Lineage (v1.7: machines mint machines)
 
