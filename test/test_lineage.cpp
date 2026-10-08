@@ -18,6 +18,12 @@ extern "C" {
 #include "../src/StateMachine/state_machine.h"
 #include "../src/Serialization/serialization.h"
 #include "test_helpers.h"
+// Test-only shim (test_lineage_body_writer.c): direct access to the static
+// canonical key-transition body writer for its cap-refusal unit test.
+size_t crabs_test_lineage_key_transition_write_body(
+    uint64_t new_key_version, const uint8_t new_pk[33],
+    const uint8_t old_pk[33], const char* parent_id, uint64_t created_at,
+    uint8_t* out, size_t cap);
 }
 
 // ============================================================
@@ -3614,6 +3620,26 @@ TEST(TestLineage, KeyChainCapacityRefusesNinthEntry) {
   }
   state_destroy(child);
   state_destroy(parent);
+}
+
+// Regression for audit A11-L2: the canonical key-transition body writer's
+// trailing created_at write must be cap-checked — an undersized buffer must
+// yield a 0 refusal, not an out-of-bounds write. The writer is static; the
+// test shim (test_lineage_body_writer.c) recompiles lineage.c into the test
+// binary so this test can construct the call directly. A one-character
+// parent_id with cap == BODY_MIN: the string16 fits (offset 77 -> 80) but the
+// 8-byte created_at would land one byte past the buffer — the old code wrote
+// it anyway and returned 88 (> cap); the fixed code refuses with 0. (An empty
+// parent_id at cap == BODY_MIN lands EXACTLY on the boundary, so it does not
+// exercise the gap.)
+TEST(TestLineage, KeyTransitionBodyWriterRefusesUndersizedCap) {
+  uint8_t new_pk[33] = {0};
+  uint8_t old_pk[33] = {0};
+  uint8_t out[LINEAGE_KEY_TRANSITION_BODY_MIN] = {0};
+  size_t written = crabs_test_lineage_key_transition_write_body(
+      CRABS_LINEAGE_KEY_VERSION_START + 1, new_pk, old_pk, "x", 0, out,
+      sizeof(out));
+  EXPECT_EQ(written, 0u);
 }
 
 TEST(TestLineage, KeyChainVerifyByAnyChainKey) {

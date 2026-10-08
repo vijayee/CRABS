@@ -1929,8 +1929,9 @@ crabs_error_e crabs_issue_attestation(state_t* parent,
 // and verified bytes can never drift (lineage.h documents the layout):
 //   'P','K','T' + u64le new_key_version + new_pk(33) + old_pk(33)
 //   + string16 parent_id + u64le created_at
-// Returns bytes written, or 0 when cap is too small or parent_id is not
-// NUL-terminated (strlen + 1 fails closed like the tombstone writer).
+// Returns bytes written, or 0 when cap is too small — true at EVERY stage,
+// including the trailing created_at — or when parent_id is not NUL-terminated
+// (strlen + 1 fails closed like the tombstone writer).
 static size_t _lineage_key_transition_write_body(uint64_t new_key_version,
                                                  const uint8_t new_pk[33],
                                                  const uint8_t old_pk[33],
@@ -1952,6 +1953,10 @@ static size_t _lineage_key_transition_write_body(uint64_t new_key_version,
                                strlen(parent_id) + 1)) {
     return 0;
   }
+  // A11-L2: the trailing write needs its own cap check — a cap in
+  // (BODY_MIN, BODY_MIN + 8) with a long parent_id would otherwise write the
+  // created_at out of bounds.
+  if (offset + 8 > cap) return 0;
   _lineage_u64le_write(out + offset, created_at);
   offset += 8;
   return offset;
@@ -1983,7 +1988,7 @@ crabs_error_e lineage_key_rotate(state_t* parent_state,
   *transition_len = 0;
 
   // A11-5: refuse to mint a new transition while the previous rotation's key
-  // was never installed — an unstalled rotation wedges every child's chain
+  // was never installed — an uninstalled rotation wedges every child's chain
   // (tip-gate + version-gap rejections are permanent in-band). The stashed
   // record's new_pk must equal the CURRENTLY-INSTALLED node key, i.e. the
   // caller paired the last rotate with state_set_node_key.

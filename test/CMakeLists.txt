@@ -61,6 +61,7 @@ if (BUILD_TESTING)
         test_tx_manager.cpp
         test_devtools.cpp
         test_scheduler.cpp
+        test_lineage_body_writer.c
     )
 
     add_dependencies(testcrabs crabs)
