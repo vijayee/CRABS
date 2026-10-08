@@ -2053,6 +2053,16 @@ static void _warn_first_unauthenticated_mutation(cli_node_t* node, const char* c
               strcmp(sub, "revoke-attestation") == 0 ||
               strcmp(sub, "accept-tombstone") == 0)) {
     mutating = true;
+  } else if (strcmp(cmd, "machine") == 0 && sub != NULL &&
+             strcmp(sub, "blueprint") == 0) {
+    // A10-M8: every blueprint subcommand writes (or discards) the spawn
+    // draft held on this node — a mutation even though nothing is saved.
+    mutating = true;
+  } else if (strcmp(cmd, "state") == 0 && sub != NULL &&
+             strcmp(sub, "migrate") == 0) {
+    // A10-M8: 'machine migrate' is dispatched as (state, migrate) — it
+    // re-enrolls the bootstrap admin into the user registry.
+    mutating = true;
   }
   // 'machine attest' and 'machine tombstone' are deliberately NOT warnings:
   // both only mint/print off-chain transport material and change no state.

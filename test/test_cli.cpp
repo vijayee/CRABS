@@ -930,6 +930,71 @@ TEST_F(TestCLI, DispatchStateAcceptUnverifiedClearsGate) {
 }
 
 // ============================================================
+// Mutation warning coverage (A10-M8): the once-only unauthenticated-snapshot
+// warning must fire for the 'machine blueprint' draft mutations and for
+// 'state migrate' — both were missing from the warn-list.
+// ============================================================
+
+TEST_F(TestCLI, WarnsOnMachineBlueprintOverUnauthenticatedSnapshot) {
+  // Build an unsigned (legacy-shape) snapshot and load it so the node is
+  // flagged unauthenticated.
+  ASSERT_EQ(cli_node_init(node, "admin"), CLI_OK);
+  serialized_buffer_t* legacy_blob =
+      crabs_serialize_state(&node->attr_machine->base_state);
+  ASSERT_NE(legacy_blob, nullptr);
+  const char* tmp_path = "/tmp/crabs_test_warn_blueprint.bin";
+  std::vector<uint8_t> file_bytes(legacy_blob->data,
+                                  legacy_blob->data + legacy_blob->len);
+  serialized_buffer_destroy(legacy_blob);
+  ASSERT_TRUE(test_write_file_bytes(tmp_path, file_bytes));
+
+  cli_node_t* loaded_node = cli_node_create();
+  ASSERT_NE(loaded_node, nullptr);
+  ASSERT_EQ(cli_node_load(loaded_node, tmp_path), CLI_OK);
+  ASSERT_TRUE(loaded_node->loaded_unauthenticated);
+  EXPECT_FALSE(loaded_node->unauth_warning_shown);
+
+  // 'machine blueprint new' mutates the spawn draft held on the node — the
+  // warning must fire before the mutation runs.
+  const char* blueprint_argv[] = {"crabs", "machine", "blueprint", "new",
+                                  "child-x", "delegated", "admin", "60000"};
+  EXPECT_EQ(cli_dispatch(loaded_node, 8, (char**)blueprint_argv), CLI_OK);
+  EXPECT_TRUE(loaded_node->unauth_warning_shown);
+  EXPECT_NE(loaded_node->blueprint_draft, nullptr);
+
+  remove(tmp_path);
+  cli_node_destroy(loaded_node);
+}
+
+TEST_F(TestCLI, WarnsOnStateMigrateOverUnauthenticatedSnapshot) {
+  ASSERT_EQ(cli_node_init(node, "admin"), CLI_OK);
+  serialized_buffer_t* legacy_blob =
+      crabs_serialize_state(&node->attr_machine->base_state);
+  ASSERT_NE(legacy_blob, nullptr);
+  const char* tmp_path = "/tmp/crabs_test_warn_migrate.bin";
+  std::vector<uint8_t> file_bytes(legacy_blob->data,
+                                  legacy_blob->data + legacy_blob->len);
+  serialized_buffer_destroy(legacy_blob);
+  ASSERT_TRUE(test_write_file_bytes(tmp_path, file_bytes));
+
+  cli_node_t* loaded_node = cli_node_create();
+  ASSERT_NE(loaded_node, nullptr);
+  ASSERT_EQ(cli_node_load(loaded_node, tmp_path), CLI_OK);
+  ASSERT_TRUE(loaded_node->loaded_unauthenticated);
+  EXPECT_FALSE(loaded_node->unauth_warning_shown);
+
+  // 'machine migrate' is dispatched as (state, migrate); the migration itself
+  // still refuses until accept-unverified, but the mutation warning must have
+  // already fired at dispatch time.
+  const char* migrate_argv[] = {"crabs", "state", "migrate"};
+  EXPECT_NE(cli_dispatch(loaded_node, 3, (char**)migrate_argv), CLI_OK);
+  EXPECT_TRUE(loaded_node->unauth_warning_shown);
+
+  remove(tmp_path);
+  cli_node_destroy(loaded_node);
+}
+
+// ============================================================
 // ONE_SHOT item type tests
 // ============================================================
 
