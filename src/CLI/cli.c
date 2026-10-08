@@ -2070,8 +2070,9 @@ static void _warn_first_unauthenticated_mutation(cli_node_t* node, const char* c
     mutating = true;
   } else if (strcmp(cmd, "state") == 0 && sub != NULL &&
              strcmp(sub, "migrate") == 0) {
-    // A10-M8: 'machine migrate' is dispatched as (state, migrate) — it
-    // re-enrolls the bootstrap admin into the user registry.
+    // A10-M8: the operator runs this as 'state migrate' (the STATE
+    // dispatcher routes the migrate subcommand to cli_cmd_machine_migrate) —
+    // it re-enrolls the bootstrap admin into the user registry.
     mutating = true;
   }
   // 'machine attest' and 'machine tombstone' are deliberately NOT warnings:
