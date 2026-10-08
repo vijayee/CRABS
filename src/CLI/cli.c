@@ -1032,6 +1032,9 @@ cli_result_e cli_cmd_key_generate(void) {
   printf("  Public Key:  %s\n", pub_hex);
 
   crypto_ecdsa_keypair_destroy(keypair);
+  // A10-L4: custody hygiene — the printed private-key hex must not linger
+  // in a live stack buffer after the operator has custody of it.
+  OPENSSL_cleanse(priv_hex, sizeof(priv_hex));
   return CLI_OK;
 }
 
