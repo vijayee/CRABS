@@ -620,8 +620,8 @@ cli_result_e cli_node_save(cli_node_t* node, const char* path) {
     return CLI_ERR_IO;
   }
   // A10-L8: the state blob embeds sealed key material — restrict to owner
-  // despite umask.
-  if (chmod(path, S_IRUSR | S_IWUSR) != 0) {
+  // despite umask. fchmod on the open descriptor avoids a pathname TOCTOU.
+  if (fchmod(fileno(f), S_IRUSR | S_IWUSR) != 0) {
     fclose(f);
     serialized_buffer_destroy(buf);
     return CLI_ERR_EXEC;
@@ -2062,12 +2062,11 @@ static void _warn_first_unauthenticated_mutation(cli_node_t* node, const char* c
              (strcmp(sub, "spawn") == 0 || strcmp(sub, "dissolve") == 0 ||
               strcmp(sub, "withdraw") == 0 ||
               strcmp(sub, "revoke-attestation") == 0 ||
-              strcmp(sub, "accept-tombstone") == 0)) {
-    mutating = true;
-  } else if (strcmp(cmd, "machine") == 0 && sub != NULL &&
-             strcmp(sub, "blueprint") == 0) {
-    // A10-M8: every blueprint subcommand writes (or discards) the spawn
-    // draft held on this node — a mutation even though nothing is saved.
+              strcmp(sub, "accept-tombstone") == 0 ||
+              // A10-M8: every blueprint subcommand writes (or discards) the
+              // spawn draft held on this node — a mutation even though
+              // nothing is saved.
+              strcmp(sub, "blueprint") == 0)) {
     mutating = true;
   } else if (strcmp(cmd, "state") == 0 && sub != NULL &&
              strcmp(sub, "migrate") == 0) {
