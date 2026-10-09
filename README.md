@@ -234,6 +234,18 @@ Spawning child machines extends the trust boundary across machines, not just wit
 
 **The node/wasm spawn bindings are a same-process trust surface, not the audited path.** The N-API `lineageSpawn` and the wasm `lineage_spawn` call the C lineage API directly: the child spawns and the parent's manifest gains an entry, but no `__spawn_machine__` op is signed and nothing is appended to the operation log. Same-process trust only. The signed `__spawn_machine__` op path — what the CLI's `machine spawn` runs — is the durable and audited one.
 
+### Write Domains (v1)
+
+Every data item carries a write domain declared at creation (or in its machine blueprint): **free-merge** (the default — any authorized writer mutates, replicas converge by CRDT merge), **sovereign** (exactly one registered writer mutates; every op carries a signed sequence-and-digest chain prefix, so the writer's ops form a content-hashed chain per item), and **group-ordered** (writes go through an elected ordering module). v1 ships free-merge and sovereign in full; group-ordered items are a read-only seam — no ordering module exists yet, so a group item exists but every write to it fails closed (`ordering_path`) until a module is registered.
+
+**Sovereignty is custody.** A sovereign item is only as safe as its writer's key: compromise of that key cedes the item completely — new ops verify under it and the chain extends honestly from the attacker's hand. The blast radius is exactly that item (other items, other domains, and other machines are untouched), key rotation restores forward control, and the chain's content-hashing means pre-compromise history stays verifiable — but nothing undoes what the key already signed.
+
+**Equivocation quarantine stops future damage; it does not rewrite history.** When a writer signs two different continuations of the same chain sequence (the fork fact: two signed ops claiming the same `(item_seq, prev_item_digest)`), anyone holding the two signed ops can file `__report_equivocation__`; the machine verifies the evidence and quarantines the writer on that item — their later writes are rejected (`quarantined`). The signed forked history remains on record as evidence; quarantine is local enforcement, not adjudication, and there is no un-quarantine op in v1 (application policy decides what happens next).
+
+**Group-ordered items inherit their module's liveness.** Strictness is bought with coupling: if the elected ordering module halts, the group-ordered item halts with it. That coupling is per item, chosen deliberately — a halted module touches exactly that machine's group-ordered items and nothing else.
+
+**Free-merge guarantees are eventual, never strict.** A free-merge item's guarantees are exactly those of the CRDT layer (Amendment 4 §11.2): convergence under eventual delivery, with no writer exclusivity and no fork detection. If a write must be strictly ordered or single-writer, declare the item sovereign or group-ordered instead.
+
 ## License
 
 MIT

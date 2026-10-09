@@ -401,3 +401,44 @@ damage but does not rewrite signed history — history is evidence;
 that coupling is the price of strictness and it is chosen per item;
 (4) free-merge guarantees are exactly those of A4 §11.2 — eventual,
 never strict.
+## As implemented (v1)
+
+- **Fork fact = duplicate signed claim, not divergent result digests.** The
+  §"Equivocation detection" sketch compared post-op resulting digests. As
+  landed, the convictable fact is the *signed duplicate claim*: two
+  DISTINCT serialized ops from the same writer naming the same sovereign
+  item with EQUAL `(item_seq, prev_item_digest)` prefixes in their signed
+  v6 sections — two signed claims to be the one continuation of the same
+  chain head. Resulting-digest comparison would require re-executing
+  evidence; the duplicate claim is verifiable from the signatures alone.
+- **Evidence-key resolution = the writer's current key era.** Both evidence
+  ops must verify under the writer's CURRENT keyring (Mode A, empty
+  policy). A fork committed under a since-rotated key does not verify and
+  cannot convict — historical-era fork adjudication is future work (the
+  chain itself remains auditable off-band, since it is content-hashed).
+- **GROUP_ORDERED is a read-only seam in v1.** A group item mints with
+  `ordering_module == 0` (non-zero is refused at creation — no module id
+  can resolve); every write path fails closed with
+  `CRABS_ERR_ORDERING_PATH` until a module is registered (the module
+  interface registration surface is future work, not v1).
+- **Merge dispatch** (`CRDT_MERGE`): free items merge as before; sovereign
+  chains accept a clean continuation, otherwise convict-by-union
+  (replica-deterministic evidence digest: SHA-256 over min‖max of the two
+  chain heads — not a shipped report) and withhold; group items hold
+  divergences and surface them via the additive `CRABS_CHANGE_MERGE`
+  (0x07) event kind (`__merge_held__` et al.).
+- **Wire/state versions as shipped:** op format v6 (per-resource sovereign
+  prefix section, last on the wire), signing format v4 (prefixes bound,
+  field 19 at the end, count byte always written), blueprint body v2
+  (leading `CRABS_BLUEPRINT_FORMAT_VERSION` byte), state format v14 for
+  the per-item domain fields — and v15 landed on top: struct-backed
+  counter/register values serialize their deterministic logical CONTENT
+  (counter entries node-sorted; register payload+timestamp+node), which is
+  what makes the sovereign chain digest cross-replica comparable at all.
+- **v1 sovereign types:** COUNTER and REGISTER only (canonical
+  serializations); SOVEREIGN on any other type is `CRABS_ERR_TYPE_MISMATCH`
+  at authoring.
+- **Fork-set cap:** 16 entries per item (`CRABS_MAX_FORK_WRITERS`),
+  inline storage, union-only; a re-report of convicted evidence dedupes to
+  `CRABS_ERR_DUPLICATE_OPERATION` (report ≠ a quarantining write, so
+  reporting never deadlocks behind a quarantine).
