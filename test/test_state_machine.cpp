@@ -1642,10 +1642,10 @@ static uint8_t* build_report_payload(const char* item_name, const char* writer,
   return payload;
 }
 
-// Build a signed sovereign op (signed as `signer_id` with `signing_key`,
-// stamped by sign_as) on `resource_name` claiming (seq, prev_digest all
-// zero), and hand back its WIRE bytes — the (T'-style) evidence candidate.
-// The in-memory op is destroyed; only the serialized form survives.
+// Build a sovereign op SIGNED AS ALICE with `signing_key` (stamped by
+// sign_as) on `resource_name` claiming (seq, prev_digest all zero), and hand
+// back its WIRE bytes — the (T'-style) evidence candidate. The in-memory op
+// is destroyed; only the serialized form survives.
 static void make_serialized_sovereign_op(attribute_machine_t* signing_am,
                                          ecdsa_keypair_t* signing_key,
                                          uint64_t* signing_lamport,

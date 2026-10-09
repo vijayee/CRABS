@@ -968,6 +968,11 @@ static crabs_error_e _verify_co_signatures(state_t* state, const operation_t* op
 // the count must match EXACTLY the number of sovereign resources present —
 // a prefix silently assigned to the wrong item would compare against the
 // wrong chain head. Fail closed (CRABS_ERR_SEQ_MISMATCH) on any mismatch.
+//
+// Dedup mutation targets: the registered spec's MUTATION section mutates its
+// path-named item post-handler, so non-FREE_MERGE targets must be named
+// resources of the op (riding its signed chain claims) — enforced below.
+
 // The mutation target path of a dedup spec, or NULL when the spec carries
 // no resolvable mutation target (DEDUP_NONE, or DEDUP_CUSTOM with a
 // MUTATION_CUSTOM update, which has no path fields).
@@ -1044,7 +1049,6 @@ static crabs_error_e _run_domain_check(state_t* state, const operation_t* op) {
       return target_rc;
     }
   }
-
 
   uint32_t prefix_index = 0;
   for (uint32_t resource_index = 0; resource_index < op->resource_count;
@@ -2661,6 +2665,80 @@ static crabs_error_e _verify_evidence_signature(state_t* state,
   return verify_result.authorized ? CRABS_SUCCESS : verify_result.error;
 }
 
+// Conviction step: both evidence ops already parsed, the item already
+// resolved to an existing SOVEREIGN item owned by writer_id. Checks the
+// structural fork fact, re-verifies both signatures, and on success appends
+// the canonical evidence digest to the item's fork set. Owns nothing;
+// the byte strings and ops are borrowed from the caller.
+static crabs_error_e _convict_if_fork(state_t* state, data_item_t* item,
+                                      const char* writer_id,
+                                      const operation_t* op_a,
+                                      const operation_t* op_b,
+                                      const uint8_t* op_a_bytes,
+                                      uint32_t op_a_len,
+                                      const uint8_t* op_b_bytes,
+                                      uint32_t op_b_len) {
+  // Structural fork fact: both halves are Mode A ops from the named writer…
+  if (strcmp(op_a->signer_id, writer_id) != 0 ||
+      strcmp(op_b->signer_id, writer_id) != 0) {
+    return CRABS_ERR_INVALID_PARAM;
+  }
+  // …both carrying a well-formed signed prefix for the item…
+  const crabs_sovereign_op_prefix_t* prefix_a = NULL;
+  const crabs_sovereign_op_prefix_t* prefix_b = NULL;
+  if (_evidence_prefix_for_item(state, op_a, item->name, &prefix_a) !=
+          CRABS_SUCCESS ||
+      _evidence_prefix_for_item(state, op_b, item->name, &prefix_b) !=
+          CRABS_SUCCESS) {
+    return CRABS_ERR_INVALID_PARAM;
+  }
+  // …claiming the SAME chain slot: equal seq, equal prev head digest.
+  if (prefix_a->item_seq != prefix_b->item_seq ||
+      CRYPTO_memcmp(prefix_a->prev_item_digest, prefix_b->prev_item_digest,
+                    CRABS_HASH_SIZE) != 0) {
+    return CRABS_ERR_INVALID_PARAM;
+  }
+
+  // Both signatures must verify under the writer's current keyring. The
+  // cheap structural checks run first; signature failure maps to the
+  // verifier's code (UNAUTHORIZED), still setting nothing.
+  crabs_error_e verify_rc = _verify_evidence_signature(state, op_a, writer_id);
+  if (verify_rc != CRABS_SUCCESS) return verify_rc;
+  verify_rc = _verify_evidence_signature(state, op_b, writer_id);
+  if (verify_rc != CRABS_SUCCESS) return verify_rc;
+
+  // Canonical, direction-independent evidence digest: SHA256 over the
+  // lexicographically ordered concatenation of the two serialized ops, so
+  // re-reports swapping (a, b) dedupe to the same entry.
+  const uint8_t* first_bytes = op_a_bytes;
+  const uint8_t* second_bytes = op_b_bytes;
+  uint32_t first_len = op_a_len;
+  uint32_t second_len = op_b_len;
+  int order = (op_a_len == op_b_len)
+      ? memcmp(op_a_bytes, op_b_bytes, op_a_len)
+      : (op_a_len < op_b_len ? -1 : 1);
+  if (order > 0) {
+    first_bytes = op_b_bytes;
+    first_len = op_b_len;
+    second_bytes = op_a_bytes;
+    second_len = op_a_len;
+  }
+  uint8_t* joined = get_memory((size_t)first_len + (size_t)second_len);
+  memcpy(joined, first_bytes, first_len);
+  memcpy(joined + first_len, second_bytes, second_len);
+  uint8_t evidence_digest[CRABS_HASH_SIZE];
+  crabs_error_e hash_rc = crypto_sha256(joined,
+                                        (size_t)first_len + (size_t)second_len,
+                                        evidence_digest);
+  free(joined);
+  if (hash_rc != CRABS_SUCCESS) return hash_rc;
+
+  // Monotone, capped union; DUPLICATE_OPERATION on re-delivery, OOM past the
+  // cap — both surfaced to the reporter, flag untouched either way (domain
+  // check honors what is present; the audit log keeps the rest).
+  return state_append_fork_evidence(item, writer_id, evidence_digest);
+}
+
 crabs_error_e state_machine_op_report_equivocation(state_t* state,
                                                    operation_t* op) {
   if (state == NULL || op == NULL) return CRABS_ERR_INVALID_PARAM;
@@ -2700,72 +2778,10 @@ crabs_error_e state_machine_op_report_equivocation(state_t* state,
     return CRABS_ERR_SERIALIZATION_ERROR;
   }
 
-  crabs_error_e result = CRABS_SUCCESS;
-
-  // Structural fork fact: both halves are Mode A ops from the named writer…
-  if (strcmp(op_a->signer_id, writer_id) != 0 ||
-      strcmp(op_b->signer_id, writer_id) != 0) {
-    result = CRABS_ERR_INVALID_PARAM;
-    goto done;
-  }
-  // …both carrying a well-formed signed prefix for the item…
-  const crabs_sovereign_op_prefix_t* prefix_a = NULL;
-  const crabs_sovereign_op_prefix_t* prefix_b = NULL;
-  if (_evidence_prefix_for_item(state, op_a, item_name, &prefix_a) !=
-          CRABS_SUCCESS ||
-      _evidence_prefix_for_item(state, op_b, item_name, &prefix_b) !=
-          CRABS_SUCCESS) {
-    result = CRABS_ERR_INVALID_PARAM;
-    goto done;
-  }
-  // …claiming the SAME chain slot: equal seq, equal prev head digest.
-  if (prefix_a->item_seq != prefix_b->item_seq ||
-      CRYPTO_memcmp(prefix_a->prev_item_digest, prefix_b->prev_item_digest,
-                    CRABS_HASH_SIZE) != 0) {
-    result = CRABS_ERR_INVALID_PARAM;
-    goto done;
-  }
-
-  // Both signatures must verify under the writer's current keyring. The
-  // cheap structural checks run first; signature failure maps to the
-  // verifier's code (UNAUTHORIZED), still setting nothing.
-  result = _verify_evidence_signature(state, op_a, writer_id);
-  if (result != CRABS_SUCCESS) goto done;
-  result = _verify_evidence_signature(state, op_b, writer_id);
-  if (result != CRABS_SUCCESS) goto done;
-
-  // Canonical, direction-independent evidence digest: SHA256 over the
-  // lexicographically ordered concatenation of the two serialized ops, so
-  // re-reports swapping (a, b) dedupe to the same entry.
-  {
-    const uint8_t* first_bytes = op_a_bytes;
-    const uint8_t* second_bytes = op_b_bytes;
-    uint32_t first_len = op_a_len;
-    uint32_t second_len = op_b_len;
-    int order = (op_a_len == op_b_len)
-        ? memcmp(op_a_bytes, op_b_bytes, op_a_len)
-        : (op_a_len < op_b_len ? -1 : 1);
-    if (order > 0) {
-      first_bytes = op_b_bytes;
-      first_len = op_b_len;
-      second_bytes = op_a_bytes;
-      second_len = op_a_len;
-    }
-    uint8_t* joined = get_memory((size_t)first_len + (size_t)second_len);
-    memcpy(joined, first_bytes, first_len);
-    memcpy(joined + first_len, second_bytes, second_len);
-    uint8_t evidence_digest[CRABS_HASH_SIZE];
-    result = crypto_sha256(joined, (size_t)first_len + (size_t)second_len,
-                           evidence_digest);
-    free(joined);
-    if (result != CRABS_SUCCESS) goto done;
-    // Monotone, capped union; DUPLICATE_OPERATION on re-delivery, OOM past
-    // the cap — both surfaced to the reporter, flag untouched either way
-    // (domain check honors what is present; the audit log keeps the rest).
-    result = state_append_fork_evidence(item, writer_id, evidence_digest);
-  }
-
-done:
+  crabs_error_e result = _convict_if_fork(state, item, writer_id,
+                                          op_a, op_b,
+                                          op_a_bytes, op_a_len,
+                                          op_b_bytes, op_b_len);
   operation_destroy(op_a);
   operation_destroy(op_b);
   return result;
