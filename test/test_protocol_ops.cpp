@@ -10,6 +10,7 @@ extern "C" {
 #include "../src/Attribute/attribute_machine.h"
 #include "../src/Crypto/crypto.h"
 #include "../src/Serialization/serialization.h"
+#include "../src/CRDT/crdt_merge.h"
 #include "../src/TxManager/tx_manager_memory.h"
 }
 #include "test_helpers.h"
@@ -638,6 +639,93 @@ TEST_F(TestProtocolOps, RollbackFromErrorState) {
   EXPECT_EQ(item->protocol_state, PROTOCOL_IDLE);
   EXPECT_FALSE(item->lock_state.lock_token_valid);
   operation_destroy(op);
+}
+
+// ============================================================
+// Rollback of a struct-backed value (repr canonicalization)
+// ============================================================
+// A struct-backed g_counter captured at lock time snapshots its LOGICAL
+// content (the same bytes the v15 value slot carries), not the struct's
+// first 8 bytes — a heap ADDRESS under the old form, which a post-lock
+// entry-array realloc turned into a dangling pointer the 8-byte memcpy
+// rollback resurrected. Rollback now rebuilds the struct from the
+// snapshot's logical bytes; the content-only chain digest hashes back to
+// exactly what the lock captured.
+TEST_F(TestProtocolOps, RollbackStructBackedCounterRestoresContent) {
+  data_item_t* item = data_item_create("c1", DATA_TYPE_COUNTER, CRDT_G_COUNTER);
+  g_counter_t* counter = g_counter_create();
+  ASSERT_EQ(g_counter_increment(counter, "a", 3), CRABS_SUCCESS);
+  ASSERT_EQ(g_counter_increment(counter, "b", 4), CRABS_SUCCESS);
+  item->value = counter;
+  item->value_repr = DATA_VALUE_REPR_CRDT_STRUCT;
+  ASSERT_EQ(state_add_item(state, item), CRABS_SUCCESS);
+
+  uint8_t digest_before[CRABS_HASH_SIZE];
+  ASSERT_EQ(state_item_digest_compute(item, digest_before), CRABS_SUCCESS);
+
+  // Stage exactly the lock state state_machine_op_lock produces for a
+  // struct-backed item — op_lock itself accepts only DATA_TYPE_RESOURCE
+  // items, so the lock fields are staged by hand here via the same
+  // snapshot serializer the op uses.
+  uint8_t* snapshot_bytes = nullptr;
+  size_t snapshot_len = 0;
+  ASSERT_EQ(crabs_serialize_item_value_logical(item, &snapshot_bytes, &snapshot_len),
+            CRABS_SUCCESS);
+  ASSERT_NE(snapshot_bytes, nullptr);
+  memset(item->lock_state.lock_token, 0x5A, CRABS_LOCK_TOKEN_SIZE);
+  item->lock_state.lock_token_valid = true;
+  strncpy(item->lock_state.lock_owner, "alice", CRABS_MAX_USER_ID - 1);
+  item->lock_state.lock_expiry = UINT64_MAX;
+  item->lock_state.pre_lock_snapshot = snapshot_bytes;
+  item->lock_state.pre_lock_snapshot_len = snapshot_len;
+  item->protocol_state = PROTOCOL_MODIFIED;
+
+  // Post-lock mutation that REALLOCS the entries array (2 -> 3 entries) —
+  // under the pre-fix 8-byte snapshot this is where the captured "content"
+  // (the entries pointer) went dangling.
+  ASSERT_EQ(g_counter_increment((g_counter_t*)item->value, "c", 10), CRABS_SUCCESS);
+  ASSERT_EQ(g_counter_value((g_counter_t*)item->value), (int64_t)17);
+
+  operation_t* op = operation_create(CRABS_OP_ROLLBACK);
+  memset(op->uuid, 0xC1, CRABS_UUID_SIZE);
+  op->resources = (char(*)[CRABS_MAX_USER_ID])malloc(sizeof(char[CRABS_MAX_USER_ID]));
+  strncpy(op->resources[0], "c1", CRABS_MAX_USER_ID - 1);
+  op->resource_count = 1;
+  op->required_state = (protocol_state_e*)malloc(sizeof(protocol_state_e));
+  op->required_state[0] = PROTOCOL_MODIFIED;
+  op->next_state = (protocol_state_e*)malloc(sizeof(protocol_state_e));
+  op->next_state[0] = PROTOCOL_IDLE;
+  op->lock_claims = (lock_claim_t*)malloc(sizeof(lock_claim_t));
+  strncpy(op->lock_claims[0].resource, "c1", CRABS_MAX_USER_ID - 1);
+  memcpy(op->lock_claims[0].lock_token, item->lock_state.lock_token, CRABS_LOCK_TOKEN_SIZE);
+  op->lock_claim_count = 1;
+  strncpy(op->signer_id, "alice", CRABS_MAX_USER_ID - 1);
+  sign_op(op);
+
+  crabs_error_e rc = state_machine_execute(state, op);
+  EXPECT_EQ(rc, CRABS_SUCCESS);
+  operation_destroy(op);
+
+  // Content restored to the pre-lock form (a:3 + b:4 = 7, two entries).
+  ASSERT_EQ(item->value_repr, (data_value_repr_t)DATA_VALUE_REPR_CRDT_STRUCT);
+  g_counter_t* restored_counter = (g_counter_t*)item->value;
+  ASSERT_NE(restored_counter, nullptr);
+  EXPECT_EQ(restored_counter->entry_count, 2u);
+  EXPECT_EQ(g_counter_value(restored_counter), (int64_t)7);
+
+  // Digest restored too: the chain digest is content-only, so restoring the
+  // captured content restores exactly the captured digest.
+  uint8_t digest_after[CRABS_HASH_SIZE];
+  ASSERT_EQ(state_item_digest_compute(item, digest_after), CRABS_SUCCESS);
+  EXPECT_EQ(memcmp(digest_before, digest_after, CRABS_HASH_SIZE), 0)
+      << "rollback must restore the pre-lock chain digest";
+
+  // No UAF: the rebuilt struct keeps taking increments.
+  ASSERT_EQ(g_counter_increment(restored_counter, "a", 1), CRABS_SUCCESS);
+  EXPECT_EQ(g_counter_value(restored_counter), (int64_t)8);
+
+  EXPECT_EQ(item->protocol_state, PROTOCOL_IDLE);
+  EXPECT_FALSE(item->lock_state.lock_token_valid);
 }
 
 // ============================================================

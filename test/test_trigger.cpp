@@ -128,6 +128,7 @@ TEST_F(TestTrigger, TestProcessTriggersConditionTrue) {
   g_counter_t* gc = g_counter_create();
   g_counter_increment(gc, "nodeA", 100);
   views->value = gc;
+  views->value_repr = (data_value_repr_t)DATA_VALUE_REPR_CRDT_STRUCT;
   state_add_item(state, views);
 
   trigger_effect_t effect;
@@ -172,6 +173,7 @@ TEST_F(TestTrigger, TestChangePolicyRejectsEmptyAndBuiltinTargets) {
   g_counter_t* gc = g_counter_create();
   g_counter_increment(gc, "nodeA", 100);
   views->value = gc;
+  views->value_repr = (data_value_repr_t)DATA_VALUE_REPR_CRDT_STRUCT;
   state_add_item(state, views);
 
   // Case 1: empty policy_expression → rejected, trigger does not fire.
@@ -252,6 +254,7 @@ TEST_F(TestTrigger, TestChangePolicyRejectsLineageTargets) {
   g_counter_t* gc = g_counter_create();
   g_counter_increment(gc, "nodeA", 100);
   views->value = gc;
+  views->value_repr = (data_value_repr_t)DATA_VALUE_REPR_CRDT_STRUCT;
   state_add_item(state, views);
 
   for (size_t operation_index = 0; operation_index < lineage_operation_count; operation_index++) {
@@ -345,6 +348,7 @@ TEST_F(TestTrigger, TestProcessTriggersConditionFalse) {
   g_counter_t* gc = g_counter_create();
   g_counter_increment(gc, "nodeA", 10);
   views->value = gc;
+  views->value_repr = (data_value_repr_t)DATA_VALUE_REPR_CRDT_STRUCT;
   state_add_item(state, views);
 
   trigger_effect_t effect;
@@ -377,6 +381,7 @@ TEST_F(TestTrigger, TestProcessTriggersCooldown) {
   g_counter_t* gc = g_counter_create();
   g_counter_increment(gc, "nodeA", 100);
   views->value = gc;
+  views->value_repr = (data_value_repr_t)DATA_VALUE_REPR_CRDT_STRUCT;
   state_add_item(state, views);
 
   trigger_effect_t effect;
@@ -415,6 +420,7 @@ TEST_F(TestTrigger, TestProcessTriggersOneShot) {
   g_counter_t* gc = g_counter_create();
   g_counter_increment(gc, "nodeA", 100);
   views->value = gc;
+  views->value_repr = (data_value_repr_t)DATA_VALUE_REPR_CRDT_STRUCT;
   state_add_item(state, views);
 
   trigger_effect_t effect;
@@ -449,6 +455,7 @@ TEST_F(TestTrigger, TestProcessTriggersDisabled) {
   g_counter_t* gc = g_counter_create();
   g_counter_increment(gc, "nodeA", 100);
   views->value = gc;
+  views->value_repr = (data_value_repr_t)DATA_VALUE_REPR_CRDT_STRUCT;
   state_add_item(state, views);
 
   trigger_effect_t effect;
@@ -479,6 +486,7 @@ TEST_F(TestTrigger, TestProcessTriggersExpired) {
   g_counter_t* gc = g_counter_create();
   g_counter_increment(gc, "nodeA", 100);
   views->value = gc;
+  views->value_repr = (data_value_repr_t)DATA_VALUE_REPR_CRDT_STRUCT;
   state_add_item(state, views);
 
   trigger_effect_t effect;
@@ -509,6 +517,7 @@ TEST_F(TestTrigger, TestProcessTriggersNotExpired) {
   g_counter_t* gc = g_counter_create();
   g_counter_increment(gc, "nodeA", 100);
   views->value = gc;
+  views->value_repr = (data_value_repr_t)DATA_VALUE_REPR_CRDT_STRUCT;
   state_add_item(state, views);
 
   trigger_effect_t effect;
@@ -551,6 +560,7 @@ TEST_F(TestTrigger, TestProcessTriggersMultipleTriggers) {
   g_counter_t* gc = g_counter_create();
   g_counter_increment(gc, "nodeA", 100);
   views->value = gc;
+  views->value_repr = (data_value_repr_t)DATA_VALUE_REPR_CRDT_STRUCT;
   state_add_item(state, views);
 
   trigger_effect_t effect1;
@@ -782,6 +792,7 @@ TEST_F(TestTrigger, TestIssueAttributeEffect) {
   g_counter_t* gc = g_counter_create();
   g_counter_increment(gc, "nodeA", 100);
   views->value = gc;
+  views->value_repr = (data_value_repr_t)DATA_VALUE_REPR_CRDT_STRUCT;
   state_add_item(&am->base_state, views);
 
   // Create a trigger with ISSUE_ATTRIBUTE effect
@@ -863,6 +874,7 @@ TEST_F(TestTrigger, TestIssueAttributeEffectNotifiesChangeHook) {
   g_counter_t* gc = g_counter_create();
   g_counter_increment(gc, "nodeA", 100);
   views->value = gc;
+  views->value_repr = (data_value_repr_t)DATA_VALUE_REPR_CRDT_STRUCT;
   state_add_item(&am->base_state, views);
 
   // Register the change hook on the state the trigger engine notifies
@@ -995,6 +1007,7 @@ static attribute_machine_t* setup_reentrancy_state(state_t** out_state) {
   g_counter_t* gc = g_counter_create();
   g_counter_increment(gc, "nodeA", 100);
   views->value = gc;
+  views->value_repr = (data_value_repr_t)DATA_VALUE_REPR_CRDT_STRUCT;
   state_add_item(&am->base_state, views);
 
   trigger_effect_t effect;
@@ -1119,12 +1132,14 @@ TEST_F(TestTrigger, TestAndConditionTrigger) {
   g_counter_t* gc = g_counter_create();
   g_counter_increment(gc, "nodeA", 100);
   views->value = gc;
+  views->value_repr = (data_value_repr_t)DATA_VALUE_REPR_CRDT_STRUCT;
   state_add_item(state, views);
 
   data_item_t* flags = data_item_create("flags", DATA_TYPE_COUNTER, CRDT_G_COUNTER);
   g_counter_t* gc2 = g_counter_create();
   g_counter_increment(gc2, "nodeA", 5);
   flags->value = gc2;
+  flags->value_repr = (data_value_repr_t)DATA_VALUE_REPR_CRDT_STRUCT;
   state_add_item(state, flags);
 
   trigger_effect_t effect;
@@ -1153,12 +1168,14 @@ TEST_F(TestTrigger, TestOrConditionTriggerPartial) {
   g_counter_t* gc = g_counter_create();
   g_counter_increment(gc, "nodeA", 100);
   views->value = gc;
+  views->value_repr = (data_value_repr_t)DATA_VALUE_REPR_CRDT_STRUCT;
   state_add_item(state, views);
 
   data_item_t* flags = data_item_create("flags", DATA_TYPE_COUNTER, CRDT_G_COUNTER);
   g_counter_t* gc2 = g_counter_create();
   g_counter_increment(gc2, "nodeA", 1);
   flags->value = gc2;
+  flags->value_repr = (data_value_repr_t)DATA_VALUE_REPR_CRDT_STRUCT;
   state_add_item(state, flags);
 
   trigger_effect_t effect;
@@ -1266,6 +1283,7 @@ TEST_F(TestTrigger, TestChangePolicyRejectsContainsOnlyPolicyAtExecution) {
   g_counter_t* gc = g_counter_create();
   g_counter_increment(gc, "nodeA", 100);
   views->value = gc;
+  views->value_repr = (data_value_repr_t)DATA_VALUE_REPR_CRDT_STRUCT;
   state_add_item(state, views);
 
   trigger_effect_t effect;
@@ -1295,6 +1313,7 @@ TEST_F(TestTrigger, TestChangePolicyAllowsAbePolicyAtExecution) {
   g_counter_t* gc = g_counter_create();
   g_counter_increment(gc, "nodeA", 100);
   views->value = gc;
+  views->value_repr = (data_value_repr_t)DATA_VALUE_REPR_CRDT_STRUCT;
   state_add_item(state, views);
 
   trigger_effect_t effect;

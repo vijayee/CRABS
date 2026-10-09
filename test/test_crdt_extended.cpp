@@ -346,6 +346,7 @@ TEST(TestCRDTExtended, SerializeStateWithRegisterInt64) {
   int64_t register_content = 0xDEADBEEF;
   item->value = lww_register_create((const uint8_t*)&register_content,
                                     sizeof(int64_t), 12, "writer1");
+  item->value_repr = (data_value_repr_t)DATA_VALUE_REPR_CRDT_STRUCT;
   ASSERT_NE(item->value, nullptr);
   state_add_item(state, item);
 

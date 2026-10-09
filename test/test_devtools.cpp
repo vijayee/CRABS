@@ -24,6 +24,7 @@ static state_t* make_state_with_g_counter(void) {
   state_t* state = state_create();
   data_item_t* item = data_item_create("views", DATA_TYPE_COUNTER, CRDT_G_COUNTER);
   item->value = g_counter_create();
+  item->value_repr = (data_value_repr_t)DATA_VALUE_REPR_CRDT_STRUCT;
   g_counter_increment((g_counter_t*)item->value, "alice", 12);
   state_add_item(state, item);
   return state;
@@ -339,17 +340,20 @@ TEST(DevtoolsSnapshot, AllValueTypes) {
 
   data_item_t* pn = data_item_create("likes", DATA_TYPE_PN_COUNTER, CRDT_PN_COUNTER);
   pn->value = pn_counter_create();
+  pn->value_repr = (data_value_repr_t)DATA_VALUE_REPR_CRDT_STRUCT;
   pn_counter_increment((pn_counter_t*)pn->value, "bob", 3);
   pn_counter_decrement((pn_counter_t*)pn->value, "bob", 5);
   state_add_item(state, pn);
 
   data_item_t* set = data_item_create("subscribers", DATA_TYPE_SET, CRDT_OR_SET);
   set->value = or_set_create();
+  set->value_repr = (data_value_repr_t)DATA_VALUE_REPR_CRDT_STRUCT;
   or_set_add((or_set_t*)set->value, "carol", "carol:1");
   state_add_item(state, set);
 
   data_item_t* reg = data_item_create("contact", DATA_TYPE_REGISTER, CRDT_LWW_REG);
   reg->value = lww_register_create((const uint8_t*)"x", 1, 5, "alice");
+  reg->value_repr = (data_value_repr_t)DATA_VALUE_REPR_CRDT_STRUCT;
   state_add_item(state, reg);
 
   // Exactly-8-byte payloads follow the int64 register convention and must
@@ -358,6 +362,7 @@ TEST(DevtoolsSnapshot, AllValueTypes) {
   const int64_t score_value = -42;
   int64_reg->value = lww_register_create((const uint8_t*)&score_value,
                                          sizeof(score_value), 7, "bob");
+  int64_reg->value_repr = (data_value_repr_t)DATA_VALUE_REPR_CRDT_STRUCT;
   state_add_item(state, int64_reg);
 
   data_item_t* one_shot_item = data_item_create("flaggers", DATA_TYPE_ONE_SHOT_SET, CRDT_ONE_SHOT_SET);
@@ -370,6 +375,7 @@ TEST(DevtoolsSnapshot, AllValueTypes) {
 
   data_item_t* flag = data_item_create("tos_flag", DATA_TYPE_ONE_SHOT_FLAG, CRDT_ONE_SHOT_FLAG);
   flag->value = one_shot_flag_create();
+  flag->value_repr = (data_value_repr_t)DATA_VALUE_REPR_CRDT_STRUCT;
   one_shot_flag_set((one_shot_flag_t*)flag->value, "alice", 42);
   state_add_item(state, flag);
 

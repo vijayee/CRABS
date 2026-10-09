@@ -271,6 +271,16 @@ bool           state_get_time_ms(const state_t* state, uint64_t* now_ms);
 
 // Misc
 void           state_machine_generate_lock_token(uint8_t token[CRABS_LOCK_TOKEN_SIZE]);
+// Raw-value contract: `value` is a bare int64_t* for counter types. Kept for
+// legacy callers; item-aware evaluation belongs to invariant_check_item.
 bool           invariant_check(invariant_t* inv, void* value, data_type_e type);
+// Item-aware invariant evaluation: reads the LOGICAL numeric value across
+// both value representations (struct g_counter → entry sum, struct pn →
+// pos−neg, struct lww register → payload int64, raw → stored int64) via
+// data_item_logical_value, so a struct-backed counter no longer hashes its
+// heap address into the comparison. Types/reprs without a numeric value
+// skip the invariant (return true), mirroring invariant_check's historical
+// non-counter behavior.
+bool           invariant_check_item(invariant_t* inv, const data_item_t* item);
 
 #endif // CRABS_STATE_MACHINE_H

@@ -363,6 +363,7 @@ crabs_error_e crabs_compact_ot_item(
       old_set->ot_data = NULL;  // Prevent double-free
       crabs_ot_ordered_set_destroy(old_set);
       item->value = new_set;
+      item->value_repr = DATA_VALUE_REPR_CRDT_STRUCT;
       break;
     }
     case DATA_TYPE_OT_DOCUMENT: {
@@ -376,6 +377,7 @@ crabs_error_e crabs_compact_ot_item(
       old_doc->ot_data = NULL;
       crabs_ot_document_destroy(old_doc);
       item->value = visible;
+      item->value_repr = DATA_VALUE_REPR_CRDT_STRUCT;
       break;
     }
     case DATA_TYPE_OT_TREE: {
@@ -389,6 +391,7 @@ crabs_error_e crabs_compact_ot_item(
       old_tree->ot_data = NULL;
       crabs_ot_tree_destroy(old_tree);
       item->value = visible;
+      item->value_repr = DATA_VALUE_REPR_CRDT_STRUCT;
       break;
     }
     default:

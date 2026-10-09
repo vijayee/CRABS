@@ -1260,6 +1260,8 @@ private:
       item->value = lww_register_create((const uint8_t*)&initial,
                                         sizeof(int64_t), 0, "system");
     }
+    // Struct-backed value (g_counter_t / lww_register_t).
+    item->value_repr = DATA_VALUE_REPR_CRDT_STRUCT;
     rc = state_add_item(&am_->base_state, item);
     if (rc != CRABS_SUCCESS) {
       data_item_destroy(item);
@@ -1389,6 +1391,7 @@ private:
     std::string name = require_js_string(info[0], "addCounter", "name");
     data_item_t* item = data_item_create(name.c_str(), DATA_TYPE_COUNTER, CRDT_G_COUNTER);
     item->value = g_counter_create();
+    item->value_repr = DATA_VALUE_REPR_CRDT_STRUCT;  // g_counter_t struct
     crabs_error_e rc = state_add_item(&am_->base_state, item);
     if (rc != CRABS_SUCCESS) throw crabs_error(env, rc, "addCounter");
     return env.Undefined();
@@ -1399,6 +1402,7 @@ private:
     std::string name = require_js_string(info[0], "addPNCounter", "name");
     data_item_t* item = data_item_create(name.c_str(), DATA_TYPE_PN_COUNTER, CRDT_PN_COUNTER);
     item->value = pn_counter_create();
+    item->value_repr = DATA_VALUE_REPR_CRDT_STRUCT;  // pn_counter_t struct
     crabs_error_e rc = state_add_item(&am_->base_state, item);
     if (rc != CRABS_SUCCESS) throw crabs_error(env, rc, "addPNCounter");
     return env.Undefined();
@@ -1409,6 +1413,7 @@ private:
     std::string name = require_js_string(info[0], "addORSet", "name");
     data_item_t* item = data_item_create(name.c_str(), DATA_TYPE_SET, CRDT_OR_SET);
     item->value = or_set_create();
+    item->value_repr = DATA_VALUE_REPR_CRDT_STRUCT;  // or_set_t struct
     crabs_error_e rc = state_add_item(&am_->base_state, item);
     if (rc != CRABS_SUCCESS) throw crabs_error(env, rc, "addORSet");
     return env.Undefined();
@@ -1419,6 +1424,7 @@ private:
     std::string name = require_js_string(info[0], "addOneShotSet", "name");
     data_item_t* item = data_item_create(name.c_str(), DATA_TYPE_ONE_SHOT_SET, CRDT_ONE_SHOT_SET);
     item->value = one_shot_set_create();
+    item->value_repr = DATA_VALUE_REPR_CRDT_STRUCT;  // one_shot_set_t struct
     crabs_error_e rc = state_add_item(&am_->base_state, item);
     if (rc != CRABS_SUCCESS) throw crabs_error(env, rc, "addOneShotSet");
     return env.Undefined();
@@ -1429,6 +1435,7 @@ private:
     std::string name = require_js_string(info[0], "addOneShotFlag", "name");
     data_item_t* item = data_item_create(name.c_str(), DATA_TYPE_ONE_SHOT_FLAG, CRDT_ONE_SHOT_FLAG);
     item->value = one_shot_flag_create();
+    item->value_repr = DATA_VALUE_REPR_CRDT_STRUCT;  // one_shot_flag_t struct
     crabs_error_e rc = state_add_item(&am_->base_state, item);
     if (rc != CRABS_SUCCESS) throw crabs_error(env, rc, "addOneShotFlag");
     return env.Undefined();
@@ -1442,6 +1449,7 @@ private:
     if (info.Length() > 1 && info[1].IsNumber())
       initial = (int64_t)info[1].As<Napi::Number>().Int64Value();
     item->value = lww_register_create((const uint8_t*)&initial, sizeof(int64_t), 0, "system");
+    item->value_repr = DATA_VALUE_REPR_CRDT_STRUCT;  // lww_register_t struct
     crabs_error_e rc = state_add_item(&am_->base_state, item);
     if (rc != CRABS_SUCCESS) throw crabs_error(env, rc, "addRegister");
     return env.Undefined();
@@ -1451,7 +1459,12 @@ private:
     Napi::Env env = info.Env();
     std::string name = require_js_string(info[0], "addResource", "name");
     data_item_t* item = data_item_create(name.c_str(), DATA_TYPE_RESOURCE, CRDT_PN_COUNTER);
-    item->value = pn_counter_create();
+    // RESOURCE items carry a bare heap int64_t (the library contract — dedup
+    // mutations, the lock snapshot, and destroy all take the raw path for
+    // RESOURCE), never a pn_counter struct; value_repr stays RAW_INT64.
+    int64_t* initial = (int64_t*)malloc(sizeof(int64_t));
+    *initial = 0;
+    item->value = initial;
     crabs_error_e rc = state_add_item(&am_->base_state, item);
     if (rc != CRABS_SUCCESS) throw crabs_error(env, rc, "addResource");
     return env.Undefined();

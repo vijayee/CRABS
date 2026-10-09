@@ -924,25 +924,15 @@ int64_t condition_resolve_path(const state_t* state, const char* path) {
     return 0;
   }
 
-  switch (item->crdt_type) {
-    case CRDT_G_COUNTER: {
-      const g_counter_t* gc = (const g_counter_t*)item->value;
-      int64_t v = g_counter_value(gc);
-      return v;
-    }
-    case CRDT_PN_COUNTER: {
-      int64_t v = pn_counter_value((const pn_counter_t*)item->value);
-      return v;
-    }
-    default:
-      if (item->crdt_type == CRDT_LWW_REG || item->type == DATA_TYPE_REGISTER) {
-        const lww_register_t* reg = (const lww_register_t*)item->value;
-        if (reg != NULL && reg->value_size >= sizeof(int64_t)) {
-          return *(int64_t*)reg->value;
-        }
-      }
-      return 0;
+  // Repr-aware logical read (struct g_counter → entry sum, struct pn →
+  // pos−neg, struct register → payload int64, raw → stored int64);
+  // representations without a numeric value resolve to 0, mirroring the
+  // historical default arm.
+  int64_t logical = 0;
+  if (data_item_logical_value(item, &logical) == CRABS_SUCCESS) {
+    return logical;
   }
+  return 0;
 }
 
 // ============================================================

@@ -396,6 +396,116 @@ TEST(TestDataModel, InvariantCheckPNCounter) {
 }
 
 // ============================================================
+// Value repr canonicalization: logical value + item invariants
+// ============================================================
+// A struct-backed counter's value reads as the SUM of its g_counter entries.
+// Pre-fix, invariant evaluation cast the struct to int64_t* and compared a
+// heap ADDRESS: GREATER_THAN 10 on pointer bits passed (or failed) at the
+// mercy of the allocator.
+
+TEST(TestDataModel, LogicalValueStructGCounter) {
+  data_item_t* item = data_item_create("c", DATA_TYPE_COUNTER, CRDT_G_COUNTER);
+  g_counter_t* counter = g_counter_create();
+  ASSERT_EQ(g_counter_increment(counter, "a", 3), CRABS_SUCCESS);
+  ASSERT_EQ(g_counter_increment(counter, "b", 4), CRABS_SUCCESS);
+  item->value = counter;
+  item->value_repr = DATA_VALUE_REPR_CRDT_STRUCT;
+
+  int64_t logical = 0;
+  EXPECT_EQ(data_item_logical_value(item, &logical), CRABS_SUCCESS);
+  EXPECT_EQ(logical, (int64_t)7);
+
+  // Repr-aware destroy releases the struct entries (no manual workaround
+  // needed — the whole point of the tag).
+  data_item_destroy(item);
+}
+
+TEST(TestDataModel, LogicalValueStructPNCounter) {
+  data_item_t* item = data_item_create("pn", DATA_TYPE_PN_COUNTER, CRDT_PN_COUNTER);
+  pn_counter_t* counter = pn_counter_create();
+  ASSERT_EQ(pn_counter_increment(counter, "a", 5), CRABS_SUCCESS);
+  ASSERT_EQ(pn_counter_decrement(counter, "a", 2), CRABS_SUCCESS);
+  item->value = counter;
+  item->value_repr = DATA_VALUE_REPR_CRDT_STRUCT;
+
+  int64_t logical = 0;
+  EXPECT_EQ(data_item_logical_value(item, &logical), CRABS_SUCCESS);
+  EXPECT_EQ(logical, (int64_t)3);
+  data_item_destroy(item);
+}
+
+TEST(TestDataModel, LogicalValueStructRegister) {
+  data_item_t* item = data_item_create("reg", DATA_TYPE_REGISTER, CRDT_LWW_REG);
+  int64_t stored = 42;
+  item->value = lww_register_create((const uint8_t*)&stored, sizeof(int64_t),
+                                    1, "writer");
+  item->value_repr = (data_value_repr_t)DATA_VALUE_REPR_CRDT_STRUCT;
+  ASSERT_NE(item->value, nullptr);
+
+  int64_t logical = 0;
+  EXPECT_EQ(data_item_logical_value(item, &logical), CRABS_SUCCESS);
+  EXPECT_EQ(logical, (int64_t)42);
+  data_item_destroy(item);
+}
+
+TEST(TestDataModel, LogicalValueRawInt64) {
+  data_item_t* item = data_item_create("raw", DATA_TYPE_COUNTER, CRDT_G_COUNTER);
+  data_item_set_int64_value(item, 17);
+  EXPECT_FALSE(data_item_has_struct_value(item));
+
+  int64_t logical = 0;
+  // A raw int64 under a CRDT_G_COUNTER tag (the pre-v15 legacy shape) reads
+  // as the stored int64 — NOT through g_counter_value, which would treat the
+  // int64's first bytes as an entries pointer.
+  EXPECT_EQ(data_item_logical_value(item, &logical), CRABS_SUCCESS);
+  EXPECT_EQ(logical, (int64_t)17);
+  data_item_destroy(item);
+}
+
+TEST(TestDataModel, LogicalValueUnsupportedRepr) {
+  data_item_t* item = data_item_create("s", DATA_TYPE_SET, CRDT_OR_SET);
+  item->value = or_set_create();
+  item->value_repr = DATA_VALUE_REPR_CRDT_STRUCT;
+
+  int64_t logical = 99;
+  EXPECT_EQ(data_item_logical_value(item, &logical), CRABS_ERR_TYPE_MISMATCH);
+  data_item_destroy(item);
+}
+
+TEST(TestDataModel, InvariantCheckItemStructCounter) {
+  data_item_t* item = data_item_create("c", DATA_TYPE_COUNTER, CRDT_G_COUNTER);
+  g_counter_t* counter = g_counter_create();
+  ASSERT_EQ(g_counter_increment(counter, "a", 3), CRABS_SUCCESS);
+  ASSERT_EQ(g_counter_increment(counter, "b", 4), CRABS_SUCCESS);
+  item->value = counter;
+  item->value_repr = DATA_VALUE_REPR_CRDT_STRUCT;
+
+  // sum(entries)=7: passes GREATER_THAN 5, fails GREATER_THAN 10.
+  invariant_t gt5 = {INVARIANT_GREATER_THAN, 5, "must exceed 5"};
+  EXPECT_TRUE(invariant_check_item(&gt5, item));
+  invariant_t gt10 = {INVARIANT_GREATER_THAN, 10, "must exceed 10"};
+  EXPECT_FALSE(invariant_check_item(&gt10, item));
+  invariant_t eq7 = {INVARIANT_EQUAL_TO, 7, "must equal 7"};
+  EXPECT_TRUE(invariant_check_item(&eq7, item));
+  invariant_t nn = {INVARIANT_NON_NEGATIVE, 0, "non-negative"};
+  EXPECT_TRUE(invariant_check_item(&nn, item));
+  data_item_destroy(item);
+}
+
+TEST(TestDataModel, InvariantCheckItemSkipsNonNumeric) {
+  data_item_t* item = data_item_create("s", DATA_TYPE_SET, CRDT_OR_SET);
+  item->value = or_set_create();
+  item->value_repr = DATA_VALUE_REPR_CRDT_STRUCT;
+  // Sets have no logical numeric value: invariants skip, mirroring the
+  // historical non-counter behavior of invariant_check.
+  invariant_t inv = {INVARIANT_GREATER_THAN, 5, ""};
+  EXPECT_TRUE(invariant_check_item(&inv, item));
+  EXPECT_FALSE(invariant_check_item(nullptr, item));
+  EXPECT_FALSE(invariant_check_item(&inv, nullptr));
+  data_item_destroy(item);
+}
+
+// ============================================================
 // Log Entry Tracking
 // ============================================================
 
@@ -966,7 +1076,9 @@ TEST(TestDataModel, ItemDigestComputeDeterministic) {
   data_item_t* item_a = data_item_create("c", DATA_TYPE_COUNTER, CRDT_G_COUNTER);
   data_item_t* item_b = data_item_create("c", DATA_TYPE_COUNTER, CRDT_G_COUNTER);
   item_a->value = g_counter_create();
+  item_a->value_repr = (data_value_repr_t)DATA_VALUE_REPR_CRDT_STRUCT;
   item_b->value = g_counter_create();
+  item_b->value_repr = (data_value_repr_t)DATA_VALUE_REPR_CRDT_STRUCT;
   g_counter_increment((g_counter_t*)item_a->value, "node1", 3);
   g_counter_increment((g_counter_t*)item_a->value, "node2", 4);
   // Insertion order differs; logical content is the same.
@@ -1015,7 +1127,9 @@ TEST(TestDataModel, ItemDigestRegisterContentDeterministic) {
   data_item_t* item_a = data_item_create("reg", DATA_TYPE_REGISTER, CRDT_LWW_REG);
   data_item_t* item_b = data_item_create("reg", DATA_TYPE_REGISTER, CRDT_LWW_REG);
   item_a->value = lww_register_create((const uint8_t*)&stored_a, sizeof(int64_t), 7, "alice");
+  item_a->value_repr = (data_value_repr_t)DATA_VALUE_REPR_CRDT_STRUCT;
   item_b->value = lww_register_create((const uint8_t*)&stored_b, sizeof(int64_t), 7, "alice");
+  item_b->value_repr = (data_value_repr_t)DATA_VALUE_REPR_CRDT_STRUCT;
 
   uint8_t digest_a[CRABS_HASH_SIZE];
   uint8_t digest_b[CRABS_HASH_SIZE];
@@ -1042,7 +1156,9 @@ TEST(TestDataModel, ItemDigestChainPreimageIgnoresProtocolState) {
   data_item_t* item_locked = data_item_create("sov", DATA_TYPE_COUNTER, CRDT_G_COUNTER);
   data_item_t* item_idle = data_item_create("sov", DATA_TYPE_COUNTER, CRDT_G_COUNTER);
   item_locked->value = g_counter_create();
+  item_locked->value_repr = (data_value_repr_t)DATA_VALUE_REPR_CRDT_STRUCT;
   item_idle->value = g_counter_create();
+  item_idle->value_repr = (data_value_repr_t)DATA_VALUE_REPR_CRDT_STRUCT;
   g_counter_increment((g_counter_t*)item_locked->value, "node1", 42);
   g_counter_increment((g_counter_t*)item_idle->value, "node1", 42);
   item_locked->protocol_state = PROTOCOL_LOCKED;

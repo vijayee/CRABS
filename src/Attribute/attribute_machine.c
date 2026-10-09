@@ -391,15 +391,11 @@ void attribute_machine_destroy(attribute_machine_t* am) {
 
   attribute_users_destroy_all(am);
 
-  // Destroy base state items — clean up CRDT values before data_item_destroy
-  // since data_item_destroy uses free() which doesn't clean up CRDT struct internals
+  // Destroy base state items — data_item_destroy dispatches value release
+  // on the item's value_repr (struct → crdt_value_destroy, raw → free).
   data_item_t* item = am->base_state.items;
   while (item != NULL) {
     data_item_t* next = item->next;
-    if (item->value != NULL) {
-      crdt_value_destroy(item->crdt_type, item->value);
-      item->value = NULL;
-    }
     data_item_destroy(item);
     item = next;
   }

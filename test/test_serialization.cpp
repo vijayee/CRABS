@@ -105,6 +105,8 @@ TEST(TestSerialization, StructBackedCounterSurvivesStateRoundTrip) {
   ASSERT_EQ(g_counter_increment(counter, "node1", 5), CRABS_SUCCESS);
   ASSERT_EQ(g_counter_increment(counter, "node2", 7), CRABS_SUCCESS);
   item->value = counter;
+  // Struct-backed value — the repr tag every production site sets.
+  item->value_repr = DATA_VALUE_REPR_CRDT_STRUCT;
   state_add_item(original, item);
 
   uint8_t digest_before[CRABS_HASH_SIZE];
@@ -118,6 +120,8 @@ TEST(TestSerialization, StructBackedCounterSurvivesStateRoundTrip) {
   data_item_t* restored_item = state_find_item(restored, "gc");
   ASSERT_NE(restored_item, nullptr);
   ASSERT_EQ(restored_item->crdt_type, CRDT_G_COUNTER);
+  // The v15 load reconstructs the struct AND tags the repr.
+  EXPECT_EQ(restored_item->value_repr, (data_value_repr_t)DATA_VALUE_REPR_CRDT_STRUCT);
   // Logical content survived: value readable through the g-counter API...
   EXPECT_EQ(g_counter_value((g_counter_t*)restored_item->value), (int64_t)12);
   // ...and further increments on the restored replica keep working.
@@ -135,14 +139,9 @@ TEST(TestSerialization, StructBackedCounterSurvivesStateRoundTrip) {
   EXPECT_EQ(memcmp(digest_before, digest_after, CRABS_HASH_SIZE), 0)
       << "chain digest must be stable across a save/load restart";
 
-  // Struct-backed values: release properly (data_item_destroy's default arm
-  // frees only the g_counter shell — pre-existing destroy gap).
-  g_counter_destroy((g_counter_t*)state_find_item(original, "gc")->value);
-  state_find_item(original, "gc")->value = nullptr;
-  g_counter_destroy((g_counter_t*)restored_item->value);
-  restored_item->value = nullptr;
-  g_counter_destroy((g_counter_t*)restored_item2->value);
-  restored_item2->value = nullptr;
+  // The repr-aware data_item_destroy releases the struct internals itself —
+  // the pre-fix manual g_counter_destroy workaround is gone. state_destroy
+  // below is the destroy-clean check.
   serialized_buffer_destroy(buf);
   state_destroy(original);
   state_destroy(restored);
@@ -157,7 +156,10 @@ TEST(TestSerialization, StructBackedRegisterSurvivesStateRoundTrip) {
   int64_t stored = 0x1234;
   item->value = lww_register_create((const uint8_t*)&stored, sizeof(int64_t),
                                     77, "writer1");
+  item->value_repr = (data_value_repr_t)DATA_VALUE_REPR_CRDT_STRUCT;
   ASSERT_NE(item->value, nullptr);
+  // Struct-backed value — the repr tag every production site sets.
+  item->value_repr = DATA_VALUE_REPR_CRDT_STRUCT;
   state_add_item(original, item);
 
   uint8_t digest_before[CRABS_HASH_SIZE];
@@ -171,6 +173,7 @@ TEST(TestSerialization, StructBackedRegisterSurvivesStateRoundTrip) {
   data_item_t* restored_item = state_find_item(restored, "reg");
   ASSERT_NE(restored_item, nullptr);
   ASSERT_EQ(restored_item->crdt_type, CRDT_LWW_REG);
+  EXPECT_EQ(restored_item->value_repr, (data_value_repr_t)DATA_VALUE_REPR_CRDT_STRUCT);
   lww_register_t* reg = (lww_register_t*)restored_item->value;
   ASSERT_NE(reg, nullptr);
   ASSERT_EQ(reg->value_size, (uint32_t)sizeof(int64_t));
@@ -185,10 +188,8 @@ TEST(TestSerialization, StructBackedRegisterSurvivesStateRoundTrip) {
   EXPECT_EQ(memcmp(digest_before, digest_after, CRABS_HASH_SIZE), 0)
       << "register chain digest must be stable across a save/load restart";
 
-  lww_register_destroy((lww_register_t*)state_find_item(original, "reg")->value);
-  state_find_item(original, "reg")->value = nullptr;
-  lww_register_destroy((lww_register_t*)reg);
-  restored_item->value = nullptr;
+  // The repr-aware data_item_destroy releases the register payload itself —
+  // no manual lww_register_destroy workaround.
   serialized_buffer_destroy(buf);
   state_destroy(original);
   state_destroy(restored);
@@ -3486,6 +3487,7 @@ TEST(StateSerialize, V14ItemDomainRoundTrip) {
   int64_t sov_register_value = 7;
   sov_item->value = lww_register_create((const uint8_t*)&sov_register_value,
                                         sizeof(int64_t), 0, "alice");
+  sov_item->value_repr = (data_value_repr_t)DATA_VALUE_REPR_CRDT_STRUCT;
   ASSERT_NE(sov_item->value, nullptr);
   sov_item->item_seq = 9;
   for (int digest_byte = 0; digest_byte < CRABS_HASH_SIZE; digest_byte++) {
@@ -3559,6 +3561,7 @@ TEST(StateSerialize, V14ItemDigestPreimageExcludesDomainTail) {
       data_item_create("chain-item", DATA_TYPE_REGISTER, CRDT_LWW_REG);
   free_item->value = lww_register_create((const uint8_t*)&register_content,
                                          sizeof(int64_t), 0, "");
+  free_item->value_repr = (data_value_repr_t)DATA_VALUE_REPR_CRDT_STRUCT;
   ASSERT_NE(free_item->value, nullptr);
 
   data_item_t* sov_item = nullptr;
@@ -3568,6 +3571,7 @@ TEST(StateSerialize, V14ItemDigestPreimageExcludesDomainTail) {
             CRABS_SUCCESS);
   sov_item->value = lww_register_create((const uint8_t*)&register_content,
                                         sizeof(int64_t), 0, "");
+  sov_item->value_repr = (data_value_repr_t)DATA_VALUE_REPR_CRDT_STRUCT;
   ASSERT_NE(sov_item->value, nullptr);
   sov_item->item_seq = 12;
   memset(sov_item->item_digest, 0xAB, CRABS_HASH_SIZE);
@@ -3603,6 +3607,7 @@ TEST(StateSerialize, V14ChainPreimageExcludesProtocolStateAndDomainTail) {
       data_item_create("chain-item", DATA_TYPE_REGISTER, CRDT_LWW_REG);
   locked_free->value = lww_register_create((const uint8_t*)&register_content,
                                            sizeof(int64_t), 0, "");
+  locked_free->value_repr = (data_value_repr_t)DATA_VALUE_REPR_CRDT_STRUCT;
   ASSERT_NE(locked_free->value, nullptr);
   locked_free->protocol_state = PROTOCOL_LOCKED;
 
@@ -3613,6 +3618,7 @@ TEST(StateSerialize, V14ChainPreimageExcludesProtocolStateAndDomainTail) {
             CRABS_SUCCESS);
   modified_sov->value = lww_register_create((const uint8_t*)&register_content,
                                             sizeof(int64_t), 0, "");
+  modified_sov->value_repr = (data_value_repr_t)DATA_VALUE_REPR_CRDT_STRUCT;
   ASSERT_NE(modified_sov->value, nullptr);
   modified_sov->item_seq = 12;
   memset(modified_sov->item_digest, 0xAB, CRABS_HASH_SIZE);
@@ -3668,6 +3674,7 @@ TEST(StateSerialize, V13BlobLoadsAllFreeMerge) {
   int64_t v13_register_value = 900;
   register_item->value = lww_register_create((const uint8_t*)&v13_register_value,
                                              sizeof(int64_t), 0, "alice");
+  register_item->value_repr = (data_value_repr_t)DATA_VALUE_REPR_CRDT_STRUCT;
   ASSERT_NE(register_item->value, nullptr);
   ASSERT_EQ(state_add_item(state, register_item), CRABS_SUCCESS);
 

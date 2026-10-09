@@ -22,11 +22,11 @@
 //     CRDT_LWW_REG registers.
 //   - Legacy creators (state restore in serialization.c, the RESOURCE lock
 //     snapshot code in state_machine.c) store a bare heap int64_t*.
-// The item's crdt_type is the discriminator: the canonical struct CRDT type
-// for the item's data type selects the CRDT dispatch; everything else
-// (CRDT_CUSTOM / unset) selects the raw int64_t* path. DATA_TYPE_RESOURCE
-// always takes the raw int64_t* path: every RESOURCE creator stores a bare
-// int64_t even when its crdt_type is CRDT_PN_COUNTER.
+// The item's assignment-pinned value_repr tag is the discriminator (a
+// pre-v15 legacy load tags a raw int64 with CRDT_G_COUNTER, defeating any
+// crdt_type-based heuristic). DATA_TYPE_RESOURCE always takes the raw
+// int64_t* path: every RESOURCE creator stores a bare int64_t even when its
+// crdt_type is CRDT_PN_COUNTER.
 // ============================================================
 
 static const char* _mutation_node_id(const operation_t* op) {
@@ -34,11 +34,12 @@ static const char* _mutation_node_id(const operation_t* op) {
   return op->signer_id;
 }
 
-// True when the item's value is a CRDT struct (not a bare int64_t*).
-static bool _counter_is_struct_backed(const data_item_t* item) {
-  if (item->type == DATA_TYPE_COUNTER && item->crdt_type == CRDT_G_COUNTER) return true;
-  if (item->type == DATA_TYPE_PN_COUNTER && item->crdt_type == CRDT_PN_COUNTER) return true;
-  return false;
+// True when the item's value is a CRDT struct (not a bare int64_t*). The
+// assignment-pinned value_repr tag is the ONLY reliable discriminator — a
+// pre-v15 legacy load tags a raw int64 value with CRDT_G_COUNTER, so
+// type+crdt_type alone would mis-cast a raw value as a struct.
+static bool _item_is_struct_backed(const data_item_t* item) {
+  return item->value_repr == DATA_VALUE_REPR_CRDT_STRUCT;
 }
 
 // Type gate for counter mutations. COUNTER / PN_COUNTER / RESOURCE targets
@@ -53,14 +54,16 @@ static crabs_error_e _counter_target_check(const data_item_t* item) {
 
 // Non-mutating overflow/semantics check mirroring _apply_counter_mutation.
 static crabs_error_e _check_counter_delta(const data_item_t* item, int64_t delta) {
-  if (item->type == DATA_TYPE_COUNTER && item->crdt_type == CRDT_G_COUNTER) {
+  if (_item_is_struct_backed(item) &&
+      item->type == DATA_TYPE_COUNTER && item->crdt_type == CRDT_G_COUNTER) {
     // g_counter_increment rejects negative deltas (a G-Counter only grows).
     if (delta < 0) return CRABS_ERR_INVALID_PARAM;
     int64_t current = g_counter_value((const g_counter_t*)item->value);
     if (current > INT64_MAX - delta) return CRABS_ERR_INVALID_PARAM;
     return CRABS_SUCCESS;
   }
-  if (item->type == DATA_TYPE_PN_COUNTER && item->crdt_type == CRDT_PN_COUNTER) {
+  if (_item_is_struct_backed(item) &&
+      item->type == DATA_TYPE_PN_COUNTER && item->crdt_type == CRDT_PN_COUNTER) {
     int64_t current = pn_counter_value((const pn_counter_t*)item->value);
     if (delta > 0 && current > INT64_MAX - delta) return CRABS_ERR_INVALID_PARAM;
     if (delta < 0 && current < INT64_MIN - delta) return CRABS_ERR_INVALID_PARAM;
@@ -76,10 +79,12 @@ static crabs_error_e _check_counter_delta(const data_item_t* item, int64_t delta
 // Apply a counter mutation through the item's actual value representation.
 static crabs_error_e _apply_counter_mutation(data_item_t* item, int64_t delta,
                                              const operation_t* op) {
-  if (item->type == DATA_TYPE_COUNTER && item->crdt_type == CRDT_G_COUNTER) {
+  if (_item_is_struct_backed(item) &&
+      item->type == DATA_TYPE_COUNTER && item->crdt_type == CRDT_G_COUNTER) {
     return g_counter_increment((g_counter_t*)item->value, _mutation_node_id(op), delta);
   }
-  if (item->type == DATA_TYPE_PN_COUNTER && item->crdt_type == CRDT_PN_COUNTER) {
+  if (_item_is_struct_backed(item) &&
+      item->type == DATA_TYPE_PN_COUNTER && item->crdt_type == CRDT_PN_COUNTER) {
     if (delta >= 0) {
       return pn_counter_increment((pn_counter_t*)item->value, _mutation_node_id(op), delta);
     }
@@ -118,7 +123,7 @@ static crabs_error_e _apply_register_assign(state_t* state, data_item_t* item,
   if (item->type != DATA_TYPE_REGISTER) return CRABS_ERR_TYPE_MISMATCH;
   if (item->value == NULL) return CRABS_SUCCESS;
 
-  if (item->crdt_type == CRDT_LWW_REG) {
+  if (_item_is_struct_backed(item) && item->crdt_type == CRDT_LWW_REG) {
     lww_register_t* register_value = (lww_register_t*)item->value;
     int64_t new_value = atoll(value_text);
     uint8_t* new_payload = (uint8_t*)malloc(sizeof(int64_t));

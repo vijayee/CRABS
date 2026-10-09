@@ -93,16 +93,19 @@ protected:
     // Create a ONE_SHOT_SET item for tracking voters
     data_item_t* voters = data_item_create("proposal_42_voters", DATA_TYPE_ONE_SHOT_SET, CRDT_ONE_SHOT_SET);
     voters->value = one_shot_set_create();
+    voters->value_repr = (data_value_repr_t)DATA_VALUE_REPR_CRDT_STRUCT;
     state_add_item(state, voters);
 
     // Create a ONE_SHOT_FLAG item for tracking execution
     data_item_t* executed = data_item_create("proposal_42_executed", DATA_TYPE_ONE_SHOT_FLAG, CRDT_ONE_SHOT_FLAG);
     executed->value = one_shot_flag_create();
+    executed->value_repr = (data_value_repr_t)DATA_VALUE_REPR_CRDT_STRUCT;
     state_add_item(state, executed);
   }
 
   void TearDown() override {
-    // Free CRDT struct values manually since data_item_destroy uses free()
+    // Free CRDT struct values manually (predates the repr-aware
+    // data_item_destroy; harmless with the values NULLed after).
     for (data_item_t* item = state->items; item != NULL; item = item->next) {
       if (item->value != NULL) {
         crdt_value_destroy(item->crdt_type, item->value);
@@ -263,10 +266,12 @@ protected:
     state = state_create();
     voters = data_item_create("proposal_42_voters", DATA_TYPE_ONE_SHOT_SET, CRDT_ONE_SHOT_SET);
     voters->value = one_shot_set_create();
+    voters->value_repr = (data_value_repr_t)DATA_VALUE_REPR_CRDT_STRUCT;
     state_add_item(state, voters);
 
     executed = data_item_create("proposal_42_executed", DATA_TYPE_ONE_SHOT_FLAG, CRDT_ONE_SHOT_FLAG);
     executed->value = one_shot_flag_create();
+    executed->value_repr = (data_value_repr_t)DATA_VALUE_REPR_CRDT_STRUCT;
     state_add_item(state, executed);
 
     // Audit: counter items created the way wasm/CRDT helpers create them hold
@@ -276,12 +281,13 @@ protected:
     g_counter_t* seeded_counter = g_counter_create();
     EXPECT_EQ(g_counter_increment(seeded_counter, "node1", 1000), CRABS_SUCCESS);
     counter->value = seeded_counter;
+    counter->value_repr = (data_value_repr_t)DATA_VALUE_REPR_CRDT_STRUCT;
     state_add_item(state, counter);
   }
 
   void TearDown() override {
-    // Free CRDT struct values manually (data_item_destroy only free()s the
-    // value pointer, which leaks the struct internals).
+    // Free CRDT struct values manually (predates the repr-aware
+    // data_item_destroy; harmless with the values NULLed after).
     for (data_item_t* item = state->items; item != NULL; item = item->next) {
       if (item->value != NULL) {
         switch (item->crdt_type) {
@@ -521,6 +527,7 @@ TEST_F(DedupMutationTest, CounterIncrementOnPnCounterRoutesThroughCounterStruct)
   pn_counter_t* pn_value = pn_counter_create();
   EXPECT_EQ(pn_counter_increment(pn_value, "node1", 50), CRABS_SUCCESS);
   pn_item->value = pn_value;
+  pn_item->value_repr = (data_value_repr_t)DATA_VALUE_REPR_CRDT_STRUCT;
   state_add_item(state, pn_item);
 
   operation_t* op = operation_create("spend");
@@ -545,6 +552,7 @@ TEST_F(DedupMutationTest, AssignOnLwwRegisterUsesRegisterSemantics) {
   int64_t initial_value = 1;
   register_item->value =
       lww_register_create((const uint8_t*)&initial_value, sizeof(int64_t), 0, "system");
+  register_item->value_repr = (data_value_repr_t)DATA_VALUE_REPR_CRDT_STRUCT;
   state_add_item(state, register_item);
 
   operation_t* op = operation_create("set_level");
@@ -574,6 +582,7 @@ TEST_F(DedupMutationTest, SetAddRejectsOrSetTarget) {
   data_item_t* or_set_item = data_item_create("or_members", DATA_TYPE_SET, CRDT_OR_SET);
   or_set_t* set_value = or_set_create();
   or_set_item->value = set_value;
+  or_set_item->value_repr = (data_value_repr_t)DATA_VALUE_REPR_CRDT_STRUCT;
   state_add_item(state, or_set_item);
 
   operation_t* op = operation_create("join");
@@ -672,6 +681,7 @@ TEST(DedupLifecycle, PerUserVoteOnceLifecycle) {
   state_t* state = state_create();
   data_item_t* voters = data_item_create("voters", DATA_TYPE_ONE_SHOT_SET, CRDT_ONE_SHOT_SET);
   voters->value = one_shot_set_create();
+  voters->value_repr = (data_value_repr_t)DATA_VALUE_REPR_CRDT_STRUCT;
   state_add_item(state, voters);
 
   // Alice tries to vote - should pass
@@ -717,6 +727,7 @@ TEST(DedupLifecycle, GlobalExecutionOnceLifecycle) {
   state_t* state = state_create();
   data_item_t* flag_item = data_item_create("executed", DATA_TYPE_ONE_SHOT_FLAG, CRDT_ONE_SHOT_FLAG);
   flag_item->value = one_shot_flag_create();
+  flag_item->value_repr = (data_value_repr_t)DATA_VALUE_REPR_CRDT_STRUCT;
   state_add_item(state, flag_item);
 
   // Carol executes - should pass
@@ -758,6 +769,7 @@ TEST(DedupIntegration, StateMachineRejectsPerUserDuplicate) {
   state_t* state = state_create();
   data_item_t* voters = data_item_create("proposal_42_voters", DATA_TYPE_ONE_SHOT_SET, CRDT_ONE_SHOT_SET);
   voters->value = one_shot_set_create();
+  voters->value_repr = (data_value_repr_t)DATA_VALUE_REPR_CRDT_STRUCT;
   state_add_item(state, voters);
   state_add_policy(state, CRABS_OP_LOCK, "role:admin");
 
@@ -805,6 +817,7 @@ TEST(DedupIntegration, StateMachineRejectsGlobalDuplicate) {
   state_t* state = state_create();
   data_item_t* executed = data_item_create("proposal_42_executed", DATA_TYPE_ONE_SHOT_FLAG, CRDT_ONE_SHOT_FLAG);
   executed->value = one_shot_flag_create();
+  executed->value_repr = (data_value_repr_t)DATA_VALUE_REPR_CRDT_STRUCT;
   state_add_item(state, executed);
 
   operation_t* op = operation_create("custom_op");
@@ -873,11 +886,13 @@ protected:
     g_counter_t* gc = g_counter_create();
     g_counter_increment(gc, "node1", 5);
     counter->value = gc;
+    counter->value_repr = (data_value_repr_t)DATA_VALUE_REPR_CRDT_STRUCT;
     state_add_item(state, counter);
 
     // Create a set for CONTAINS evaluation
     data_item_t* voters = data_item_create("proposal_voters", DATA_TYPE_ONE_SHOT_SET, CRDT_ONE_SHOT_SET);
     voters->value = one_shot_set_create();
+    voters->value_repr = (data_value_repr_t)DATA_VALUE_REPR_CRDT_STRUCT;
     state_add_item(state, voters);
   }
 
@@ -1098,6 +1113,7 @@ TEST(DedupBuiltinOp, CheckDedupWithRegisteredSpec) {
   // Create the tracking set
   data_item_t* voters = data_item_create("voters", DATA_TYPE_ONE_SHOT_SET, CRDT_ONE_SHOT_SET);
   voters->value = one_shot_set_create();
+  voters->value_repr = (data_value_repr_t)DATA_VALUE_REPR_CRDT_STRUCT;
   state_add_item(state, voters);
 
   // Check dedup using the registered spec - should pass for new user
@@ -1132,6 +1148,7 @@ TEST(DedupBuiltinOp, CheckDedupRejectsWithRegisteredSpec) {
   // Create the tracking set with alice already in it
   data_item_t* voters = data_item_create("voters", DATA_TYPE_ONE_SHOT_SET, CRDT_ONE_SHOT_SET);
   voters->value = one_shot_set_create();
+  voters->value_repr = (data_value_repr_t)DATA_VALUE_REPR_CRDT_STRUCT;
   one_shot_set_add((one_shot_set_t*)voters->value, "alice");
   state_add_item(state, voters);
 
@@ -1185,6 +1202,7 @@ TEST(DedupBuiltinOp, CheckDedupInlineSpecOverridesRegistered) {
   // Create the tracking set with alice already in it
   data_item_t* voters = data_item_create("voters", DATA_TYPE_ONE_SHOT_SET, CRDT_ONE_SHOT_SET);
   voters->value = one_shot_set_create();
+  voters->value_repr = (data_value_repr_t)DATA_VALUE_REPR_CRDT_STRUCT;
   one_shot_set_add((one_shot_set_t*)voters->value, "alice");
   state_add_item(state, voters);
 
@@ -1243,6 +1261,7 @@ TEST(TestVectorV14, PerUserFirstVoteSucceeds) {
                                           DATA_TYPE_ONE_SHOT_SET, CRDT_ONE_SHOT_SET);
   ASSERT_NE(voters, nullptr);
   voters->value = one_shot_set_create();
+  voters->value_repr = (data_value_repr_t)DATA_VALUE_REPR_CRDT_STRUCT;
   ASSERT_NE(voters->value, nullptr);
   state_add_item(state, voters);
 
@@ -1283,6 +1302,7 @@ TEST(TestVectorV14, PerUserSecondVoteRejected) {
                                           DATA_TYPE_ONE_SHOT_SET, CRDT_ONE_SHOT_SET);
   ASSERT_NE(voters, nullptr);
   voters->value = one_shot_set_create();
+  voters->value_repr = (data_value_repr_t)DATA_VALUE_REPR_CRDT_STRUCT;
   ASSERT_NE(voters->value, nullptr);
   one_shot_set_add((one_shot_set_t*)voters->value, "alice");
   state_add_item(state, voters);
@@ -1319,6 +1339,7 @@ TEST(TestVectorV14, PerUserDifferentUserCanVote) {
                                           DATA_TYPE_ONE_SHOT_SET, CRDT_ONE_SHOT_SET);
   ASSERT_NE(voters, nullptr);
   voters->value = one_shot_set_create();
+  voters->value_repr = (data_value_repr_t)DATA_VALUE_REPR_CRDT_STRUCT;
   ASSERT_NE(voters->value, nullptr);
   one_shot_set_add((one_shot_set_t*)voters->value, "alice");
   state_add_item(state, voters);
@@ -1361,6 +1382,7 @@ TEST(TestVectorV14, GlobalFirstExecutionSucceeds) {
                                         DATA_TYPE_ONE_SHOT_FLAG, CRDT_ONE_SHOT_FLAG);
   ASSERT_NE(flag, nullptr);
   flag->value = one_shot_flag_create();
+  flag->value_repr = (data_value_repr_t)DATA_VALUE_REPR_CRDT_STRUCT;
   ASSERT_NE(flag->value, nullptr);
   state_add_item(state, flag);
 
@@ -1401,6 +1423,7 @@ TEST(TestVectorV14, GlobalSecondExecutionRejected) {
                                         DATA_TYPE_ONE_SHOT_FLAG, CRDT_ONE_SHOT_FLAG);
   ASSERT_NE(flag, nullptr);
   flag->value = one_shot_flag_create();
+  flag->value_repr = (data_value_repr_t)DATA_VALUE_REPR_CRDT_STRUCT;
   ASSERT_NE(flag->value, nullptr);
   one_shot_flag_set((one_shot_flag_t*)flag->value, "carol", 1);
   state_add_item(state, flag);
@@ -1441,6 +1464,7 @@ TEST(TestVectorV14, CrdtMergeConcurrentVotes) {
                                             DATA_TYPE_ONE_SHOT_SET, CRDT_ONE_SHOT_SET);
   ASSERT_NE(voters_a, nullptr);
   voters_a->value = one_shot_set_create();
+  voters_a->value_repr = (data_value_repr_t)DATA_VALUE_REPR_CRDT_STRUCT;
   ASSERT_NE(voters_a->value, nullptr);
   state_add_item(state_a, voters_a);
 
@@ -1449,6 +1473,7 @@ TEST(TestVectorV14, CrdtMergeConcurrentVotes) {
                                             DATA_TYPE_ONE_SHOT_SET, CRDT_ONE_SHOT_SET);
   ASSERT_NE(voters_b, nullptr);
   voters_b->value = one_shot_set_create();
+  voters_b->value_repr = (data_value_repr_t)DATA_VALUE_REPR_CRDT_STRUCT;
   ASSERT_NE(voters_b->value, nullptr);
   state_add_item(state_b, voters_b);
 
@@ -1503,6 +1528,7 @@ TEST(TestVectorV14, CrdtMergeConcurrentDifferentUsers) {
                                             DATA_TYPE_ONE_SHOT_SET, CRDT_ONE_SHOT_SET);
   ASSERT_NE(voters_a, nullptr);
   voters_a->value = one_shot_set_create();
+  voters_a->value_repr = (data_value_repr_t)DATA_VALUE_REPR_CRDT_STRUCT;
   ASSERT_NE(voters_a->value, nullptr);
   state_add_item(state_a, voters_a);
 
@@ -1511,6 +1537,7 @@ TEST(TestVectorV14, CrdtMergeConcurrentDifferentUsers) {
                                             DATA_TYPE_ONE_SHOT_SET, CRDT_ONE_SHOT_SET);
   ASSERT_NE(voters_b, nullptr);
   voters_b->value = one_shot_set_create();
+  voters_b->value_repr = (data_value_repr_t)DATA_VALUE_REPR_CRDT_STRUCT;
   ASSERT_NE(voters_b->value, nullptr);
   state_add_item(state_b, voters_b);
 

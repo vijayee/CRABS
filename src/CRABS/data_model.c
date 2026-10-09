@@ -44,6 +44,8 @@ data_item_t* data_item_create(const char* name, data_type_e type, crdt_type_e cr
   item->invariants = NULL;
   item->invariant_count = 0;
   item->value = NULL;
+  // value_repr stays DATA_VALUE_REPR_RAW_INT64 (the get_clear_memory zero)
+  // until an assignment site re-tags it with the value it installs.
   item->next = NULL;
   return item;
 }
@@ -143,18 +145,18 @@ void data_item_destroy(data_item_t* item) {
       case DATA_TYPE_ONE_SHOT_FLAG:
         one_shot_flag_destroy((one_shot_flag_t*)item->value);
         break;
-      // NOTE (adjacency, deferred): COUNTER/PN_COUNTER/REGISTER values fall
-      // into the default free() — a bare free leaks struct-backed values'
-      // internal buffers (g_counter entries, register payload). Routing
-      // these through crdt_value_destroy(item->crdt_type, ...) is NOT safe
-      // yet: the pre-v15 legacy load path produces repr-mismatched items
-      // (raw int64 value under a CRDT_G_COUNTER tag — see
-      // _deserialize_data_item's version < 15 arm), so crdt_type cannot
-      // currently discriminate the representation, and deep-destroying a
-      // raw repr would interpret its first bytes as a heap pointer. Fix
-      // requires repr canonicalization of the legacy load first.
+      // COUNTER/PN_COUNTER/REGISTER/RESOURCE (and unknown) values are
+      // representation-polymorphic: struct-backed or bare heap int64. The
+      // type+crdt_type pair cannot discriminate (pre-v15 loads tag a raw
+      // int64 with CRDT_G_COUNTER), so dispatch on the assignment-pinned
+      // value_repr: struct values release their internals through
+      // crdt_value_destroy, raw values free directly.
       default:
-        free(item->value);
+        if (item->value_repr == DATA_VALUE_REPR_CRDT_STRUCT) {
+          crdt_value_destroy(item->crdt_type, item->value);
+        } else {
+          free(item->value);
+        }
         break;
     }
   }
@@ -162,6 +164,64 @@ void data_item_destroy(data_item_t* item) {
     crabs_ot_data_item_destroy((crabs_ot_data_item_t*)item->ot_data);
   }
   free(item);
+}
+
+bool data_item_has_struct_value(const data_item_t* item) {
+  return item != NULL && item->value != NULL &&
+         item->value_repr == DATA_VALUE_REPR_CRDT_STRUCT;
+}
+
+void data_item_set_int64_value(data_item_t* item, int64_t value) {
+  if (item == NULL) return;
+  if (item->value != NULL) {
+    if (item->value_repr == DATA_VALUE_REPR_CRDT_STRUCT) {
+      crdt_value_destroy(item->crdt_type, item->value);
+    } else {
+      free(item->value);
+    }
+  }
+  int64_t* heap_value = (int64_t*)get_memory(sizeof(int64_t));
+  *heap_value = value;
+  item->value = heap_value;
+  item->value_repr = DATA_VALUE_REPR_RAW_INT64;
+}
+
+crabs_error_e data_item_logical_value(const data_item_t* item, int64_t* out) {
+  if (item == NULL || out == NULL) return CRABS_ERR_INVALID_PARAM;
+  if (item->value == NULL) return CRABS_ERR_INVALID_PARAM;
+  if (item->value_repr == DATA_VALUE_REPR_CRDT_STRUCT) {
+    switch (item->crdt_type) {
+      case CRDT_G_COUNTER:
+        *out = g_counter_value((const g_counter_t*)item->value);
+        return CRABS_SUCCESS;
+      case CRDT_PN_COUNTER:
+        *out = pn_counter_value((const pn_counter_t*)item->value);
+        return CRABS_SUCCESS;
+      case CRDT_LWW_REG: {
+        const lww_register_t* reg = (const lww_register_t*)item->value;
+        if (reg->value == NULL || reg->value_size < sizeof(int64_t)) {
+          return CRABS_ERR_TYPE_MISMATCH;
+        }
+        memcpy(out, reg->value, sizeof(int64_t));
+        return CRABS_SUCCESS;
+      }
+      default:
+        // Sets/documents/OT/... have no numeric logical value.
+        return CRABS_ERR_TYPE_MISMATCH;
+    }
+  }
+  // RAW_INT64: numeric item types store a bare heap int64_t (legacy
+  // pre-v15 loads, RESOURCE items, plain adders).
+  switch (item->type) {
+    case DATA_TYPE_COUNTER:
+    case DATA_TYPE_PN_COUNTER:
+    case DATA_TYPE_REGISTER:
+    case DATA_TYPE_RESOURCE:
+      *out = *(const int64_t*)item->value;
+      return CRABS_SUCCESS;
+    default:
+      return CRABS_ERR_TYPE_MISMATCH;
+  }
 }
 
 state_t* state_create(void) {

@@ -116,6 +116,38 @@ serialized_buffer_t* crabs_serialize_data_item_chain_preimage(
     const data_item_t* item);
 
 // ============================================================
+// Struct-value logical bytes (value repr canonicalization)
+// ============================================================
+// Serialize a CRDT_STRUCT-tagged item's value to its LOGICAL content bytes
+// — the same bytes the v15 value-slot envelope carries for struct-backed
+// items (node-sorted g_counter entries / pn pos+neg entries / register
+// payload+timestamp+node), sans the bytes32 envelope. Used by the lock
+// snapshot, which must capture CONTENT (rollback rebuilds the struct from
+// it via data_item_restore_value_from_logical_bytes) rather than the first
+// 8 bytes of the struct (a heap address). Caller owns *out_bytes (free()).
+// Errors: INVALID_PARAM on NULL args/value; TYPE_MISMATCH when the item is
+// not CRDT_STRUCT-tagged or its crdt_type has no canonical logical form.
+crabs_error_e crabs_serialize_item_value_logical(const data_item_t* item,
+                                                 uint8_t** out_bytes,
+                                                 size_t* out_len);
+
+// Reconstruct item->value from the logical content bytes produced by
+// crabs_serialize_item_value_logical, dispatched on the item's
+// type+crdt_type pair (COUNTER/G_COUNTER, PN_COUNTER/PN_COUNTER,
+// REGISTER/LWW_REG — the struct-backed shapes). Shared by the v15 state
+// deserializer and the lock rollback deep-restore. The PREVIOUS item->value
+// is NOT released here; ownership stays with the caller (the deserializer
+// loads into a fresh item; the rollback destroys the old struct only after
+// this returns success). On success item->value holds the new struct and
+// value_repr == DATA_VALUE_REPR_CRDT_STRUCT; on failure item->value and
+// value_repr are untouched. Errors: INVALID_PARAM on NULL/empty bytes;
+// TYPE_MISMATCH on a non-struct (type, crdt_type) pair; INTERNAL on
+// malformed bytes (mirrors the deserializer's rejection).
+crabs_error_e data_item_restore_value_from_logical_bytes(data_item_t* item,
+                                                         const uint8_t* bytes,
+                                                         size_t len);
+
+// ============================================================
 // Buffer helpers
 // ============================================================
 serialized_buffer_t* serialized_buffer_create(size_t len);

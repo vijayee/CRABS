@@ -160,6 +160,7 @@ TEST_F(TestIntegration, CRDTMergeBetweenReplicas) {
   g_counter_increment(gc_a, "nodeA", 5);
   g_counter_increment(gc_a, "nodeB", 3);
   item_a->value = gc_a;
+  item_a->value_repr = (data_value_repr_t)DATA_VALUE_REPR_CRDT_STRUCT;
   state_add_item(state_a, item_a);
 
   // State B: counter on nodeB=7, nodeC=2
@@ -168,6 +169,7 @@ TEST_F(TestIntegration, CRDTMergeBetweenReplicas) {
   g_counter_increment(gc_b, "nodeB", 7);
   g_counter_increment(gc_b, "nodeC", 2);
   item_b->value = gc_b;
+  item_b->value_repr = (data_value_repr_t)DATA_VALUE_REPR_CRDT_STRUCT;
   state_add_item(state_b, item_b);
 
   // Set versions to test merge takes max
@@ -297,6 +299,7 @@ TEST_F(TestIntegration, ThresholdTriggerFire) {
   g_counter_t* gc = g_counter_create();
   g_counter_increment(gc, "nodeA", 5);
   counter->value = gc;
+  counter->value_repr = (data_value_repr_t)DATA_VALUE_REPR_CRDT_STRUCT;
   state_add_item(state, counter);
 
   // Create a trigger with condition "counter >= 10"
@@ -366,6 +369,7 @@ TEST_F(TestIntegration, SerializationRoundTrip) {
   g_counter_t* counter1 = g_counter_create();
   ASSERT_EQ(g_counter_increment(counter1, "node1", 12345), CRABS_SUCCESS);
   item1->value = counter1;
+  item1->value_repr = (data_value_repr_t)DATA_VALUE_REPR_CRDT_STRUCT;
   state_add_item(state, item1);
 
   data_item_t* item2 = data_item_create("resource1", DATA_TYPE_RESOURCE, CRDT_PN_COUNTER);
@@ -632,12 +636,14 @@ TEST_F(TestIntegration, ConditionEvaluation) {
   g_counter_t* gc_flags = g_counter_create();
   g_counter_increment(gc_flags, "nodeA", 10);
   flags->value = gc_flags;
+  flags->value_repr = (data_value_repr_t)DATA_VALUE_REPR_CRDT_STRUCT;
   state_add_item(state, flags);
 
   data_item_t* score = data_item_create("resource2.score", DATA_TYPE_COUNTER, CRDT_G_COUNTER);
   g_counter_t* gc_score = g_counter_create();
   g_counter_increment(gc_score, "nodeA", 50);
   score->value = gc_score;
+  score->value_repr = (data_value_repr_t)DATA_VALUE_REPR_CRDT_STRUCT;
   state_add_item(state, score);
 
   // Evaluate — true (10 >= 5 AND 50 <= 100)

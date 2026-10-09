@@ -64,6 +64,9 @@ data_item_t* crabs_register_ot_type(state_t* state,
     data_item_destroy(item);
     return NULL;
   }
+  // OT items hold crabs_ot_*_t heap structs — repr CRDT_STRUCT (symmetry;
+  // data_item_destroy dispatches OT destruction by type).
+  item->value_repr = DATA_VALUE_REPR_CRDT_STRUCT;
 
   // Apply config to the ot_data
   if (item->ot_data != NULL) {

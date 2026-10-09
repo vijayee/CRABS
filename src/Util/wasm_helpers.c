@@ -434,6 +434,8 @@ crabs_error_e crabs_wasm_add_counter(attribute_machine_t* am, const char* name) 
   data_item_t* item = data_item_create(name, DATA_TYPE_COUNTER, CRDT_G_COUNTER);
   if (!item) return CRABS_ERR_OOM;
   item->value = g_counter_create();
+  // Struct-backed value (g_counter_t) — release via crdt_value_destroy.
+  item->value_repr = DATA_VALUE_REPR_CRDT_STRUCT;
   return state_add_item(&am->base_state, item);
 }
 
@@ -442,6 +444,8 @@ crabs_error_e crabs_wasm_add_pn_counter(attribute_machine_t* am, const char* nam
   data_item_t* item = data_item_create(name, DATA_TYPE_PN_COUNTER, CRDT_PN_COUNTER);
   if (!item) return CRABS_ERR_OOM;
   item->value = pn_counter_create();
+  // Struct-backed value (pn_counter_t) — release via crdt_value_destroy.
+  item->value_repr = DATA_VALUE_REPR_CRDT_STRUCT;
   return state_add_item(&am->base_state, item);
 }
 
@@ -450,6 +454,8 @@ crabs_error_e crabs_wasm_add_or_set(attribute_machine_t* am, const char* name) {
   data_item_t* item = data_item_create(name, DATA_TYPE_SET, CRDT_OR_SET);
   if (!item) return CRABS_ERR_OOM;
   item->value = or_set_create();
+  // Struct-backed value (or_set_t) — release via crdt_value_destroy.
+  item->value_repr = DATA_VALUE_REPR_CRDT_STRUCT;
   return state_add_item(&am->base_state, item);
 }
 
@@ -458,6 +464,8 @@ crabs_error_e crabs_wasm_add_one_shot_set(attribute_machine_t* am, const char* n
   data_item_t* item = data_item_create(name, DATA_TYPE_ONE_SHOT_SET, CRDT_ONE_SHOT_SET);
   if (!item) return CRABS_ERR_OOM;
   item->value = one_shot_set_create();
+  // Struct-backed value (one_shot_set_t) — release via crdt_value_destroy.
+  item->value_repr = DATA_VALUE_REPR_CRDT_STRUCT;
   return state_add_item(&am->base_state, item);
 }
 
@@ -466,6 +474,8 @@ crabs_error_e crabs_wasm_add_one_shot_flag(attribute_machine_t* am, const char* 
   data_item_t* item = data_item_create(name, DATA_TYPE_ONE_SHOT_FLAG, CRDT_ONE_SHOT_FLAG);
   if (!item) return CRABS_ERR_OOM;
   item->value = one_shot_flag_create();
+  // Struct-backed value (one_shot_flag_t) — release via crdt_value_destroy.
+  item->value_repr = DATA_VALUE_REPR_CRDT_STRUCT;
   return state_add_item(&am->base_state, item);
 }
 
@@ -474,6 +484,8 @@ crabs_error_e crabs_wasm_add_register(attribute_machine_t* am, const char* name,
   data_item_t* item = data_item_create(name, DATA_TYPE_REGISTER, CRDT_LWW_REG);
   if (!item) return CRABS_ERR_OOM;
   item->value = lww_register_create((const uint8_t*)&initial, sizeof(int64_t), 0, "system");
+  // Struct-backed value (lww_register_t) — release via crdt_value_destroy.
+  item->value_repr = DATA_VALUE_REPR_CRDT_STRUCT;
   return state_add_item(&am->base_state, item);
 }
 
@@ -514,6 +526,9 @@ crabs_error_e crabs_wasm_define_item(attribute_machine_t* am,
     item->value = lww_register_create((const uint8_t*)&initial,
                                       sizeof(int64_t), 0, "system");
   }
+  // Struct-backed value (g_counter_t / lww_register_t) — release via
+  // crdt_value_destroy.
+  item->value_repr = DATA_VALUE_REPR_CRDT_STRUCT;
   rc = state_add_item(&am->base_state, item);
   if (rc != CRABS_SUCCESS) data_item_destroy(item);
   return rc;

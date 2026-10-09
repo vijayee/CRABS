@@ -154,6 +154,7 @@ TEST_F(TestStateMachine, OpCarriedDedupSpecRejectedWithoutRegistration) {
   g_counter_t* counter_value = g_counter_create();
   ASSERT_EQ(g_counter_increment(counter_value, "admin", 10), CRABS_SUCCESS);
   counter_item->value = counter_value;
+  counter_item->value_repr = (data_value_repr_t)DATA_VALUE_REPR_CRDT_STRUCT;
   ASSERT_EQ(state_add_item(state, counter_item), CRABS_SUCCESS);
 
   operation_t* op = make_lock_op();
@@ -1264,6 +1265,7 @@ static data_item_t* add_sovereign_counter(state_t* target_state,
     return nullptr;
   }
   item->value = g_counter_create();
+  item->value_repr = (data_value_repr_t)DATA_VALUE_REPR_CRDT_STRUCT;
   if (state_add_item(target_state, item) != CRABS_SUCCESS) {
     data_item_destroy(item);
     return nullptr;
@@ -1471,6 +1473,7 @@ TEST_F(TestStateMachine, DomainCheckPrefixCountMustMatchSovereignResources) {
   data_item_t* free_item =
       data_item_create("free_counter", DATA_TYPE_COUNTER, CRDT_G_COUNTER);
   free_item->value = g_counter_create();
+  free_item->value_repr = (data_value_repr_t)DATA_VALUE_REPR_CRDT_STRUCT;
   ASSERT_EQ(state_add_item(state, free_item), CRABS_SUCCESS);
   operation_t* free_op = make_domain_op("sov_bump", "free_counter", 0x39);
   free_op->sovereign_prefix_count = 1;
@@ -1521,6 +1524,7 @@ TEST_F(TestStateMachine, DomainCheckFreeMergeUnchanged) {
   data_item_t* free_item =
       data_item_create("free_counter", DATA_TYPE_COUNTER, CRDT_G_COUNTER);
   free_item->value = g_counter_create();
+  free_item->value_repr = (data_value_repr_t)DATA_VALUE_REPR_CRDT_STRUCT;
   ASSERT_EQ(state_add_item(state, free_item), CRABS_SUCCESS);
 
   operation_t* op = make_domain_op("sov_bump", "free_counter", 0x3B);
@@ -1551,6 +1555,7 @@ TEST_F(TestStateMachine, DomainCheckGroupOrderedV1ReadOnly) {
                                           CRDT_G_COUNTER, &options, &group_item),
             CRABS_SUCCESS);
   group_item->value = g_counter_create();
+  group_item->value_repr = (data_value_repr_t)DATA_VALUE_REPR_CRDT_STRUCT;
   ASSERT_EQ(state_add_item(state, group_item), CRABS_SUCCESS);
 
   operation_t* op = make_domain_op("sov_bump", "group_counter", 0x3C);
@@ -1891,6 +1896,7 @@ TEST_F(TestStateMachine, ReportEquivocationTargetGuards) {
   data_item_t* free_item =
       data_item_create("free_counter", DATA_TYPE_COUNTER, CRDT_G_COUNTER);
   free_item->value = g_counter_create();
+  free_item->value_repr = (data_value_repr_t)DATA_VALUE_REPR_CRDT_STRUCT;
   ASSERT_EQ(state_add_item(state, free_item), CRABS_SUCCESS);
   data_item_t* item = add_sovereign_counter(state, "sov_counter", "alice");
   ASSERT_NE(item, nullptr);
@@ -1998,6 +2004,7 @@ TEST_F(TestStateMachine, DedupMutationSovereignTargetMustBeResource) {
   data_item_t* free_item =
       data_item_create("free_counter", DATA_TYPE_COUNTER, CRDT_G_COUNTER);
   free_item->value = g_counter_create();
+  free_item->value_repr = (data_value_repr_t)DATA_VALUE_REPR_CRDT_STRUCT;
   ASSERT_EQ(state_add_item(state, free_item), CRABS_SUCCESS);
 
   // (1) Target NOT in resources: the mutation would advance the counter
@@ -2063,11 +2070,13 @@ TEST_F(TestStateMachine, DedupMutationGroupOrderedTargetMustBeResource) {
                                           CRDT_G_COUNTER, &options, &group_item),
             CRABS_SUCCESS);
   group_item->value = g_counter_create();
+  group_item->value_repr = (data_value_repr_t)DATA_VALUE_REPR_CRDT_STRUCT;
   ASSERT_EQ(state_add_item(state, group_item), CRABS_SUCCESS);
 
   data_item_t* free_item =
       data_item_create("free_counter", DATA_TYPE_COUNTER, CRDT_G_COUNTER);
   free_item->value = g_counter_create();
+  free_item->value_repr = (data_value_repr_t)DATA_VALUE_REPR_CRDT_STRUCT;
   ASSERT_EQ(state_add_item(state, free_item), CRABS_SUCCESS);
 
   dedup_spec_t spec;
@@ -2178,6 +2187,7 @@ static writer_replica_t make_writer_replica(ecdsa_keypair_t* alice_key,
   static const uint8_t initial_payload[] = "init";
   item->value = lww_register_create(initial_payload,
                                     sizeof(initial_payload) - 1, 0, "system");
+  item->value_repr = (data_value_repr_t)DATA_VALUE_REPR_CRDT_STRUCT;
   if (item->value == NULL) { *out_status = CRABS_ERR_OOM; return replica; }
   *out_status = state_add_item(replica.state, item);
   return replica;

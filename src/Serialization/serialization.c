@@ -977,13 +977,13 @@ static bool _deserialize_g_counter_entries(read_buf_t* buf,
   return true;
 }
 
-// Value payload for a struct-backed counter/resource/register item, wrapped
-// in the bytes32 envelope the value slot already uses. RESOURCE has no
-// struct CRDT representation (dedup/state-machine treat it as raw int64),
-// so it never arrives here.
-static void _serialize_struct_value(write_buf_t* buf, const data_item_t* item) {
-  if (item->value == NULL) { _write_bytes32(buf, NULL, 0); return; }
-  write_buf_t* content = _write_buf_create(64);
+// Logical content of a struct-backed counter/register value — the bytes the
+// v15 value-slot envelope carries (node-sorted g_counter entries, PN pos+neg
+// entry lists, register payload+timestamp+node). Shared by
+// _serialize_struct_value (durable slot) and crabs_serialize_item_value_
+// logical (lock snapshot) so both forms always stay byte-identical.
+static void _serialize_struct_value_content(write_buf_t* content,
+                                            const data_item_t* item) {
   switch (item->crdt_type) {
     case CRDT_G_COUNTER:
       _serialize_g_counter_entries(content, (const g_counter_t*)item->value);
@@ -1004,9 +1004,95 @@ static void _serialize_struct_value(write_buf_t* buf, const data_item_t* item) {
     default:
       break;
   }
+}
+
+// True when data_item_restore_value_from_logical_bytes can reconstruct the
+// value for this (type, crdt_type) pair — the three struct-backed shapes.
+static bool _struct_value_has_logical_form(data_type_e type,
+                                           crdt_type_e crdt_type) {
+  return (type == DATA_TYPE_COUNTER && crdt_type == CRDT_G_COUNTER) ||
+         (type == DATA_TYPE_PN_COUNTER && crdt_type == CRDT_PN_COUNTER) ||
+         (type == DATA_TYPE_REGISTER && crdt_type == CRDT_LWW_REG);
+}
+
+// Value payload for a struct-backed counter/resource/register item, wrapped
+// in the bytes32 envelope the value slot already uses. RESOURCE has no
+// struct CRDT representation (dedup/state-machine treat it as raw int64),
+// so it never arrives here.
+static void _serialize_struct_value(write_buf_t* buf, const data_item_t* item) {
+  if (item->value == NULL) { _write_bytes32(buf, NULL, 0); return; }
+  write_buf_t* content = _write_buf_create(64);
+  _serialize_struct_value_content(content, item);
   _write_bytes32(buf, content->data, (uint32_t)content->offset);
   free(content->data);
   free(content);
+}
+
+crabs_error_e crabs_serialize_item_value_logical(const data_item_t* item,
+                                                 uint8_t** out_bytes,
+                                                 size_t* out_len) {
+  if (out_bytes == NULL || out_len == NULL) return CRABS_ERR_INVALID_PARAM;
+  *out_bytes = NULL;
+  *out_len = 0;
+  if (item == NULL || item->value == NULL) return CRABS_ERR_INVALID_PARAM;
+  if (item->value_repr != DATA_VALUE_REPR_CRDT_STRUCT) {
+    return CRABS_ERR_TYPE_MISMATCH;
+  }
+  if (!_struct_value_has_logical_form(item->type, item->crdt_type)) {
+    return CRABS_ERR_TYPE_MISMATCH;
+  }
+  write_buf_t* content = _write_buf_create(64);
+  _serialize_struct_value_content(content, item);
+  *out_bytes = content->data;
+  *out_len = content->offset;
+  free(content);
+  return CRABS_SUCCESS;
+}
+
+crabs_error_e data_item_restore_value_from_logical_bytes(data_item_t* item,
+                                                         const uint8_t* bytes,
+                                                         size_t len) {
+  if (item == NULL || bytes == NULL || len == 0) return CRABS_ERR_INVALID_PARAM;
+  if (!_struct_value_has_logical_form(item->type, item->crdt_type)) {
+    return CRABS_ERR_TYPE_MISMATCH;
+  }
+  read_buf_t value_reader;
+  value_reader.data = bytes;
+  value_reader.len = len;
+  value_reader.offset = 0;
+  void* restored = NULL;
+  if (item->crdt_type == CRDT_G_COUNTER) {
+    g_counter_t* counter = g_counter_create();
+    if (!_deserialize_g_counter_entries(&value_reader, counter)) {
+      g_counter_destroy(counter);
+      return CRABS_ERR_INTERNAL;
+    }
+    restored = counter;
+  } else if (item->crdt_type == CRDT_PN_COUNTER) {
+    pn_counter_t* counter = pn_counter_create();
+    if (!_deserialize_g_counter_entries(&value_reader, &counter->pos) ||
+        !_deserialize_g_counter_entries(&value_reader, &counter->neg)) {
+      pn_counter_destroy(counter);
+      return CRABS_ERR_INTERNAL;
+    }
+    restored = counter;
+  } else {  // CRDT_LWW_REG
+    uint8_t* payload = NULL;
+    uint32_t payload_len = 0;
+    uint64_t timestamp = 0;
+    char node_id[CRABS_MAX_USER_ID];
+    bool parsed = _read_bytes32(&value_reader, &payload, &payload_len) &&
+                  _read_uint64_le(&value_reader, &timestamp) &&
+                  _read_string16(&value_reader, node_id, sizeof(node_id));
+    if (parsed) {
+      restored = lww_register_create(payload, payload_len, timestamp, node_id);
+    }
+    if (payload != NULL) free(payload);
+    if (restored == NULL) return CRABS_ERR_INTERNAL;
+  }
+  item->value = restored;
+  item->value_repr = DATA_VALUE_REPR_CRDT_STRUCT;
+  return CRABS_SUCCESS;
 }
 
 // ============================================================
@@ -1181,42 +1267,15 @@ static bool _deserialize_data_item(read_buf_t* buf, data_item_t* item, uint32_t 
       // v15+: logical content written by _serialize_struct_value;
       // reconstruct the struct so dedup mutations / merges / further
       // increments operate on the same representation as the writer's live
-      // item. (Older versions wrote the first 8 bytes of the struct — a
-      // heap pointer; those blobs' values are discarded below via the raw
-      // int64 fallback, matching pre-fix load behavior.)
-      read_buf_t value_reader;
-      value_reader.data = val_data;
-      value_reader.len = val_len;
-      value_reader.offset = 0;
-      bool reconstructed = false;
-      if (item->crdt_type == CRDT_G_COUNTER) {
-        g_counter_t* counter = g_counter_create();
-        reconstructed = _deserialize_g_counter_entries(&value_reader, counter);
-        if (!reconstructed) g_counter_destroy(counter);
-        else item->value = counter;
-      } else if (item->crdt_type == CRDT_PN_COUNTER) {
-        pn_counter_t* counter = pn_counter_create();
-        reconstructed = _deserialize_g_counter_entries(&value_reader, &counter->pos) &&
-                        _deserialize_g_counter_entries(&value_reader, &counter->neg);
-        if (!reconstructed) pn_counter_destroy(counter);
-        else item->value = counter;
-      } else {  // CRDT_LWW_REG
-        uint8_t* payload = NULL;
-        uint32_t payload_len = 0;
-        uint64_t timestamp = 0;
-        char node_id[CRABS_MAX_USER_ID];
-        if (_read_bytes32(&value_reader, &payload, &payload_len) &&
-            _read_uint64_le(&value_reader, &timestamp) &&
-            _read_string16(&value_reader, node_id, sizeof(node_id))) {
-          lww_register_t* reg = lww_register_create(payload, payload_len,
-                                                    timestamp, node_id);
-          reconstructed = (reg != NULL);
-          if (reconstructed) item->value = reg;
-        }
-        if (payload != NULL) free(payload);
-      }
+      // item. The reconstruction helper is shared with the lock rollback
+      // deep-restore (it tags value_repr = CRDT_STRUCT on success). (Older
+      // versions wrote the first 8 bytes of the struct — a heap pointer;
+      // those blobs fall through to the raw int64 arm below, matching
+      // pre-fix load behavior.)
+      crabs_error_e restore_rc =
+        data_item_restore_value_from_logical_bytes(item, val_data, val_len);
       free(val_data);
-      if (!reconstructed) return false;
+      if (restore_rc != CRABS_SUCCESS) return false;
     } else if (item->type == DATA_TYPE_COUNTER || item->type == DATA_TYPE_PN_COUNTER ||
         item->type == DATA_TYPE_RESOURCE) {
       int64_t* val = get_memory(sizeof(int64_t));
@@ -1225,6 +1284,8 @@ static bool _deserialize_data_item(read_buf_t* buf, data_item_t* item, uint32_t 
         *val |= ((int64_t)val_data[i]) << (i * 8);
       }
       item->value = val;
+      // Raw int64 heap value (legacy load or non-struct counter/resource).
+      item->value_repr = DATA_VALUE_REPR_RAW_INT64;
       free(val_data);
     } else if (item->type == DATA_TYPE_REGISTER) {
       int64_t* val = get_memory(sizeof(int64_t));
@@ -1233,6 +1294,8 @@ static bool _deserialize_data_item(read_buf_t* buf, data_item_t* item, uint32_t 
         *val |= ((int64_t)val_data[i]) << (i * 8);
       }
       item->value = val;
+      // Raw int64 heap value (legacy load or non-struct register).
+      item->value_repr = DATA_VALUE_REPR_RAW_INT64;
       free(val_data);
     } else if (item->type >= DATA_TYPE_OT_ORDERED_SET && item->type <= DATA_TYPE_OT_ORDERED_MAP) {
       // OT type: deserialize ot_data
@@ -1275,17 +1338,27 @@ static bool _deserialize_data_item(read_buf_t* buf, data_item_t* item, uint32_t 
           item->value = NULL;
           break;
       }
+      // OT values are heap structs (crabs_ot_*_t); tag the repr for
+      // symmetry even though data_item_destroy dispatches OT by type.
+      if (item->value != NULL) {
+        item->value_repr = DATA_VALUE_REPR_CRDT_STRUCT;
+      }
     } else if (item->type == DATA_TYPE_SET || item->type == DATA_TYPE_2P_SET ||
                item->type == DATA_TYPE_ONE_SHOT_SET || item->type == DATA_TYPE_ONE_SHOT_FLAG) {
       // CRDT sets/flags: reconstruct the struct (audit M-5).
       void* v = _deserialize_crdt_value(val_data, val_len, item->type);
       free(val_data);
       item->value = v;
+      if (v != NULL) {
+        item->value_repr = DATA_VALUE_REPR_CRDT_STRUCT;
+      }
     } else {
       // Store as raw bytes for unknown types
       item->value = get_memory(val_len);
       memcpy(item->value, val_data, val_len);
       free(val_data);
+      // Raw heap blob — no struct ownership.
+      item->value_repr = DATA_VALUE_REPR_RAW_INT64;
     }
   } else {
     item->value = NULL;

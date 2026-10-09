@@ -65,6 +65,22 @@ typedef enum {
 } protocol_state_e;
 
 // ============================================================
+// Value Representation Tag (runtime only — never serialized)
+// ============================================================
+// data_item_t.value is POLYMORPHIC in practice: struct-backed
+// (g_counter_t / pn_counter_t / lww_register_t / or_set_t / ...) for values
+// produced by the wasm adders, crdt_merge_value, compaction, and the v15+
+// state deserializer, versus a bare heap int64_t for legacy pre-v15 loads
+// and plain adders. crdt_type CANNOT discriminate (a pre-v15 load tags a
+// raw int64 with CRDT_G_COUNTER), so the representation is pinned at every
+// assignment site by this tag instead.
+typedef enum {
+  DATA_VALUE_REPR_RAW_INT64   = 0,  // plain heap value (int64_t* for the
+                                    // numeric types; raw blob otherwise)
+  DATA_VALUE_REPR_CRDT_STRUCT = 1   // CRDT struct owned via crdt_value_destroy
+} data_value_repr_t;
+
+// ============================================================
 // Invariant Type (§5.3)
 // ============================================================
 typedef enum {
@@ -107,6 +123,12 @@ typedef struct {
   uint64_t lock_expiry;
   uint32_t lock_extensions;
   void*    pre_lock_snapshot;
+  // Byte length of pre_lock_snapshot. RAW_INT64 items snapshot 8 bytes (the
+  // historical form); CRDT_STRUCT items snapshot the value's serialized
+  // LOGICAL content (data_item_restore_value_from_logical_bytes bytes), so
+  // rollback rebuilds the struct instead of reviving a freed pointer through
+  // an 8-byte memcpy. Runtime only — lock state is never serialized.
+  size_t   pre_lock_snapshot_len;
   crabs_hlc_t lock_acquired_at;  // v1.6 Amd6 §8: HLC timestamp when lock was acquired
 } lock_state_t;
 
@@ -118,6 +140,13 @@ typedef struct data_item_t {
   data_type_e      type;
   crdt_type_e      crdt_type;
   void*            value;
+  // Runtime ONLY — never serialized (the wire form re-derives it: pre-v15
+  // loads are RAW_INT64, v15+ loads reconstruct structs where the shape
+  // carries them). Pins the ownership form of `value` (see
+  // data_value_repr_t); every production assignment sets it together with
+  // the pointer. crdt_type is NOT a substitute discriminator: pre-v15 loads
+  // tag a raw int64 with CRDT_G_COUNTER.
+  data_value_repr_t value_repr;
   protocol_state_e protocol_state;
   invariant_t*     invariants;
   uint32_t         invariant_count;
@@ -602,6 +631,27 @@ crabs_error_e data_item_create_with_options(const char* name,
                                             const data_item_options_t* options,
                                             data_item_t** out_item);
 void         data_item_destroy(data_item_t* item);
+
+// True when the item's value is a CRDT struct (the repr tag pinned at
+// assignment), false for raw-repr and NULL items. Consumers that need the
+// struct form (dedup mutations, condition resolution, invariants) MUST
+// consult this instead of inferring the representation from crdt_type.
+bool data_item_has_struct_value(const data_item_t* item);
+// Replace the item's value with a fresh heap int64_t and tag the item
+// RAW_INT64. Any previous value is released per ITS repr (struct values go
+// through crdt_value_destroy), so the helper is safe for re-sets too.
+void data_item_set_int64_value(data_item_t* item, int64_t value);
+// Logical numeric value of an item across BOTH value representations:
+//   struct g_counter  — sum of entry counts (g_counter_value)
+//   struct pn_counter — pos − neg (pn_counter_value)
+//   struct lww_reg    — int64 read from the payload's first 8 bytes
+//                       (payloads shorter than 8 bytes fail)
+//   RAW_INT64         — the stored int64 (numeric item types only)
+// Returns CRABS_ERR_TYPE_MISMATCH for representations with no numeric value
+// (sets/documents/OT/...), leaving *out untouched — callers skip invariants
+// and resolve conditions to 0 on such items, mirroring the historical
+// non-counter behavior.
+crabs_error_e data_item_logical_value(const data_item_t* item, int64_t* out);
 
 // ============================================================
 // State creation/destruction

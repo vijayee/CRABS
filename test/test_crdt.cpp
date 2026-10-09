@@ -625,6 +625,7 @@ static data_item_t* _make_group_register(const char* name,
   if (register_value != nullptr) {
     item->value = lww_register_create((const uint8_t*)register_value,
                                       (uint32_t)strlen(register_value), 1, "nodeA");
+    item->value_repr = (data_value_repr_t)DATA_VALUE_REPR_CRDT_STRUCT;
   }
   return item;
 }
@@ -828,6 +829,7 @@ TEST(TestCRDTMerge, TestSovereignMergeProtocolStateDivergenceIsNotFork) {
     if (item == nullptr) return (data_item_t*)nullptr;
     item->value = lww_register_create((const uint8_t*)&register_value,
                                       sizeof(int64_t), 0, writer);
+    item->value_repr = (data_value_repr_t)DATA_VALUE_REPR_CRDT_STRUCT;
     EXPECT_NE(item->value, nullptr);
     if (item->value == nullptr) { data_item_destroy(item); return (data_item_t*)nullptr; }
     item->item_seq = item_seq;
@@ -988,6 +990,7 @@ TEST(TestCRDTMerge, TestSovereignMergeAheadWithUndigestableValueHeld) {
   // Values with NULL payloads: crdt_value_destroy's default arm only frees
   // the wrapper for CRDT_RGA, so keep them payload-less to avoid a leak.
   dst_item->value = lww_register_create(nullptr, 0, 1, "nodeA");
+  dst_item->value_repr = (data_value_repr_t)DATA_VALUE_REPR_CRDT_STRUCT;
   dst_item->item_seq = 2;
   memset(dst_item->item_digest, 0x02, CRABS_HASH_SIZE);
   state_add_item(dst, dst_item);
@@ -997,6 +1000,7 @@ TEST(TestCRDTMerge, TestSovereignMergeAheadWithUndigestableValueHeld) {
                                           CRDT_RGA, &rga_options, &src_item),
             CRABS_SUCCESS);
   src_item->value = lww_register_create(nullptr, 0, 2, "nodeA");
+  src_item->value_repr = (data_value_repr_t)DATA_VALUE_REPR_CRDT_STRUCT;
   src_item->item_seq = 5;
   memset(src_item->item_digest, 0x05, CRABS_HASH_SIZE);
   state_add_item(src, src_item);

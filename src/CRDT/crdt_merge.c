@@ -498,6 +498,11 @@ static data_item_t* _data_item_deep_copy(const data_item_t* item) {
   // pointer with the source — a latent double-free if both items are destroyed.
   // The merge path does not use the snapshot, so drop it on the copy.
   copy->lock_state.pre_lock_snapshot = NULL;
+  copy->lock_state.pre_lock_snapshot_len = 0;
+  // The value pointer is copied NULL below and rebuilt by the caller; the
+  // repr nevertheless follows the source so an add-failure destroy (or any
+  // value the caller later adopts) is tagged consistently.
+  copy->value_repr = item->value_repr;
   // Write-domains v1: propagate the per-item domain fields. Without this a
   // sovereign item new to dst silently arrived as FREE_MERGE — a domain
   // downgrade on merge. The inline fork storage is copied in full (not just
@@ -639,8 +644,16 @@ static void _merge_sovereign_item(state_t* dst, data_item_t* dst_item,
       return;
     }
     if (ahead_value != NULL) {
-      crdt_value_destroy(dst_item->crdt_type, dst_item->value);
+      // Destroy per the OLD value's repr (a raw-repr legacy value must not
+      // be interpreted as a struct).
+      if (dst_item->value_repr == DATA_VALUE_REPR_CRDT_STRUCT) {
+        crdt_value_destroy(dst_item->crdt_type, dst_item->value);
+      } else {
+        free(dst_item->value);
+      }
       dst_item->value = ahead_value;
+      // ahead_value is the deep copy of src_item's value — same repr.
+      dst_item->value_repr = src_item->value_repr;
     }
     dst_item->item_seq = src_item->item_seq;
     memcpy(dst_item->item_digest, src_item->item_digest,
@@ -704,6 +717,10 @@ crabs_error_e crdt_merge_state(state_t* dst, const state_t* src) {
       // Deep copy the CRDT value
       new_item->value = crdt_merge_value(src_item->type, src_item->crdt_type,
                                           NULL, src_item->value, NULL, src_item->name);
+      if (new_item->value != NULL) {
+        // crdt_merge_value builds structs for the CRDT types it handles.
+        new_item->value_repr = DATA_VALUE_REPR_CRDT_STRUCT;
+      }
       crabs_error_e add_status = state_add_item(dst, new_item);
       if (add_status != CRABS_SUCCESS) {
         // state_add_item fails closed on a malformed domain declaration
@@ -715,7 +732,14 @@ crabs_error_e crdt_merge_state(state_t* dst, const state_t* src) {
         _merge_notify_divergence(dst, "__merge_domain_mismatch__",
                                  new_item->name, CRABS_ERR_PROTOCOL_VIOLATION);
         if (new_item->value != NULL) {
-          crdt_value_destroy(new_item->crdt_type, new_item->value);
+          // Destroy per the value's repr (mirrors data_item_destroy's
+          // dispatch; done here because the item must survive long enough
+          // for the divergence event above to read its name).
+          if (new_item->value_repr == DATA_VALUE_REPR_CRDT_STRUCT) {
+            crdt_value_destroy(new_item->crdt_type, new_item->value);
+          } else {
+            free(new_item->value);
+          }
           new_item->value = NULL;
         }
         data_item_destroy(new_item);
@@ -735,8 +759,17 @@ crabs_error_e crdt_merge_state(state_t* dst, const state_t* src) {
                                               dst_item->value, src_item->value,
                                               dst_item->name, src_item->name);
       if (merged_value != NULL) {
-        crdt_value_destroy(dst_item->crdt_type, dst_item->value);
+        // Destroy per the OLD value's repr (a raw-repr legacy value must not
+        // be interpreted as a struct).
+        if (dst_item->value_repr == DATA_VALUE_REPR_CRDT_STRUCT) {
+          crdt_value_destroy(dst_item->crdt_type, dst_item->value);
+        } else {
+          free(dst_item->value);
+        }
         dst_item->value = merged_value;
+        // Merged values are CRDT structs (every handled crdt_type merges to
+        // a heap struct).
+        dst_item->value_repr = DATA_VALUE_REPR_CRDT_STRUCT;
       }
     }
     src_item = src_item->next;

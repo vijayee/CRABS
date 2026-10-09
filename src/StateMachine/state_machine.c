@@ -11,6 +11,7 @@
 #include "../Condition/condition.h"
 #include "../Lineage/lineage.h"
 #include "../Serialization/serialization.h"
+#include "../CRDT/crdt_merge.h"
 #include "../Dedup/dedup.h"
 #include "../OT/ot_execution.h"
 #include "../Compaction/compaction_engine.h"
@@ -319,6 +320,19 @@ void state_machine_generate_lock_token(uint8_t token[CRABS_LOCK_TOKEN_SIZE]) {
 // ============================================================
 // Invariant Checking
 // ============================================================
+// The comparison itself, given the item's logical numeric value.
+static bool _invariant_eval(const invariant_t* inv, int64_t val) {
+  switch (inv->type) {
+    case INVARIANT_GREATER_THAN: return val > inv->param;
+    case INVARIANT_LESS_THAN:    return val < inv->param;
+    case INVARIANT_EQUAL_TO:     return val == inv->param;
+    case INVARIANT_NOT_EQUAL:    return val != inv->param;
+    case INVARIANT_DIVISIBLE_BY: return inv->param != 0 && (val % inv->param) == 0;
+    case INVARIANT_NON_NEGATIVE: return val >= 0;
+    default:                     return true;
+  }
+}
+
 bool invariant_check(invariant_t* inv, void* value, data_type_e type) {
   if (inv == NULL || value == NULL) return false;
 
@@ -329,15 +343,19 @@ bool invariant_check(invariant_t* inv, void* value, data_type_e type) {
     return true;
   }
 
-  switch (inv->type) {
-    case INVARIANT_GREATER_THAN: return val > inv->param;
-    case INVARIANT_LESS_THAN:    return val < inv->param;
-    case INVARIANT_EQUAL_TO:     return val == inv->param;
-    case INVARIANT_NOT_EQUAL:    return val != inv->param;
-    case INVARIANT_DIVISIBLE_BY: return inv->param != 0 && (val % inv->param) == 0;
-    case INVARIANT_NON_NEGATIVE: return val >= 0;
-    default:                     return true;
+  return _invariant_eval(inv, val);
+}
+
+bool invariant_check_item(invariant_t* inv, const data_item_t* item) {
+  if (inv == NULL || item == NULL || item->value == NULL) return false;
+
+  int64_t val = 0;
+  if (data_item_logical_value(item, &val) != CRABS_SUCCESS) {
+    // No numeric logical value (sets/documents/OT): invariants don't apply —
+    // the historical behavior for non-counter types.
+    return true;
   }
+  return _invariant_eval(inv, val);
 }
 
 // ============================================================
@@ -380,6 +398,7 @@ uint32_t state_machine_prune_expired(state_t* state, uint64_t now_ms) {
         if (item->lock_state.pre_lock_snapshot != NULL) {
           free(item->lock_state.pre_lock_snapshot);
           item->lock_state.pre_lock_snapshot = NULL;
+          item->lock_state.pre_lock_snapshot_len = 0;
         }
         item->lock_state.lock_extensions = 0;
         pruned++;
@@ -1751,34 +1770,59 @@ crabs_error_e state_machine_op_lock(state_t* state, operation_t* op, lock_respon
         if (locked->lock_state.pre_lock_snapshot != NULL) {
           free(locked->lock_state.pre_lock_snapshot);
           locked->lock_state.pre_lock_snapshot = NULL;
+          locked->lock_state.pre_lock_snapshot_len = 0;
         }
         locked->lock_state.lock_extensions = 0;
       }
       return CRABS_ERR_CRYPTOGRAPHIC_ERROR;
     }
+
+    // Capture the pre-lock snapshot BEFORE mutating lock fields: a capture
+    // failure must not hand out a token for a resource we could not roll
+    // back (fail closed, item untouched).
+    //
+    // Repr-aware: a CRDT_STRUCT value's first bytes are a heap ADDRESS —
+    // snapshotting them raw and memcpy-restoring after a post-lock entry
+    // realloc revives a freed pointer (the old UAF). Struct values snapshot
+    // their serialized LOGICAL content instead; rollback rebuilds the
+    // struct from those bytes (data_item_restore_value_from_logical_bytes).
+    // The sovereign chain digest is content-only over these same bytes, so
+    // a rollback restores exactly the content (and digest) the lock
+    // captured. RAW_INT64 values keep the historical 8-byte form.
+    uint8_t* new_snapshot = NULL;
+    size_t new_snapshot_len = 0;
+    if (item->value != NULL) {
+      if (item->value_repr == DATA_VALUE_REPR_CRDT_STRUCT) {
+        crabs_error_e snapshot_rc =
+          crabs_serialize_item_value_logical(item, &new_snapshot, &new_snapshot_len);
+        if (snapshot_rc != CRABS_SUCCESS) return snapshot_rc;
+      } else {
+        size_t value_size = 0;
+        if (item->type == DATA_TYPE_COUNTER || item->type == DATA_TYPE_PN_COUNTER ||
+            item->type == DATA_TYPE_RESOURCE) {
+          value_size = sizeof(int64_t);
+        } else if (item->type == DATA_TYPE_REGISTER) {
+          value_size = sizeof(int64_t);
+        }
+        if (value_size > 0) {
+          new_snapshot = get_memory(value_size);
+          new_snapshot_len = value_size;
+          memcpy(new_snapshot, item->value, value_size);
+        }
+      }
+    }
+    if (item->lock_state.pre_lock_snapshot != NULL) {
+      free(item->lock_state.pre_lock_snapshot);
+    }
+    item->lock_state.pre_lock_snapshot = new_snapshot;
+    item->lock_state.pre_lock_snapshot_len = new_snapshot_len;
+
     memcpy(item->lock_state.lock_token, response->lock_tokens[i], CRABS_LOCK_TOKEN_SIZE);
     item->lock_state.lock_token_valid = true;
     strncpy(item->lock_state.lock_owner, op->signer_id, CRABS_MAX_USER_ID - 1);
     item->lock_state.lock_expiry = expiry;
     item->lock_state.lock_extensions = 0;
     item->lock_state.lock_acquired_at = acquired_at;
-
-    if (item->value != NULL) {
-      size_t value_size = 0;
-      if (item->type == DATA_TYPE_COUNTER || item->type == DATA_TYPE_PN_COUNTER ||
-          item->type == DATA_TYPE_RESOURCE) {
-        value_size = sizeof(int64_t);
-      } else if (item->type == DATA_TYPE_REGISTER) {
-        value_size = sizeof(int64_t);
-      }
-      if (value_size > 0) {
-        if (item->lock_state.pre_lock_snapshot != NULL) {
-          free(item->lock_state.pre_lock_snapshot);
-        }
-        item->lock_state.pre_lock_snapshot = get_memory(value_size);
-        memcpy(item->lock_state.pre_lock_snapshot, item->value, value_size);
-      }
-    }
 
     item->protocol_state = PROTOCOL_LOCKED;
   }
@@ -1819,7 +1863,7 @@ crabs_error_e state_machine_op_verify(state_t* state, operation_t* op) {
 
     bool all_pass = true;
     for (uint32_t j = 0; j < item->invariant_count; j++) {
-      if (!invariant_check(&item->invariants[j], item->value, item->type)) {
+      if (!invariant_check_item(&item->invariants[j], item)) {
         all_pass = false;
         break;
       }
@@ -1851,15 +1895,32 @@ crabs_error_e state_machine_op_rollback(state_t* state, operation_t* op) {
       return CRABS_ERR_LOCK_OWNER_MISMATCH;
     }
     if (item->lock_state.pre_lock_snapshot != NULL && item->value != NULL) {
-      size_t value_size = 0;
-      if (item->type == DATA_TYPE_COUNTER || item->type == DATA_TYPE_PN_COUNTER ||
-          item->type == DATA_TYPE_RESOURCE) {
-        value_size = sizeof(int64_t);
-      } else if (item->type == DATA_TYPE_REGISTER) {
-        value_size = sizeof(int64_t);
-      }
-      if (value_size > 0) {
-        memcpy(item->value, item->lock_state.pre_lock_snapshot, value_size);
+      if (item->value_repr == DATA_VALUE_REPR_CRDT_STRUCT) {
+        // Deep restore: rebuild the struct from the snapshot's serialized
+        // logical content (the bytes op_lock captured). Rebuild FIRST and
+        // swap only on success — a malformed snapshot must not leave the
+        // locked item value-less. content-only digest ⇒ the restored item
+        // hashes back to exactly what the lock captured.
+        void* previous_value = item->value;
+        crabs_error_e restore_rc = data_item_restore_value_from_logical_bytes(
+            item, item->lock_state.pre_lock_snapshot,
+            item->lock_state.pre_lock_snapshot_len);
+        if (restore_rc != CRABS_SUCCESS) {
+          return restore_rc;
+        }
+        crdt_value_destroy(item->crdt_type, previous_value);
+      } else {
+        // RAW_INT64 items keep the historical 8-byte restore.
+        size_t value_size = 0;
+        if (item->type == DATA_TYPE_COUNTER || item->type == DATA_TYPE_PN_COUNTER ||
+            item->type == DATA_TYPE_RESOURCE) {
+          value_size = sizeof(int64_t);
+        } else if (item->type == DATA_TYPE_REGISTER) {
+          value_size = sizeof(int64_t);
+        }
+        if (value_size > 0) {
+          memcpy(item->value, item->lock_state.pre_lock_snapshot, value_size);
+        }
       }
     }
     item->protocol_state = PROTOCOL_IDLE;
@@ -1887,6 +1948,7 @@ crabs_error_e state_machine_op_unlock(state_t* state, operation_t* op) {
     if (item->lock_state.pre_lock_snapshot != NULL) {
       free(item->lock_state.pre_lock_snapshot);
       item->lock_state.pre_lock_snapshot = NULL;
+      item->lock_state.pre_lock_snapshot_len = 0;
     }
     item->lock_state.lock_extensions = 0;
   }
@@ -1911,6 +1973,7 @@ crabs_error_e state_machine_op_force_unlock(state_t* state, operation_t* op) {
     if (item->lock_state.pre_lock_snapshot != NULL) {
       free(item->lock_state.pre_lock_snapshot);
       item->lock_state.pre_lock_snapshot = NULL;
+      item->lock_state.pre_lock_snapshot_len = 0;
     }
     item->lock_state.lock_extensions = 0;
   }

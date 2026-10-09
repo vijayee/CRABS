@@ -195,6 +195,10 @@ crabs_compaction_result_e crabs_compact_item(
 
     crdt_value_destroy(item->crdt_type, item->value);
     item->value = visible;
+    // vtable->extract_visible returns a fresh CRDT struct for every
+    // registered type (set/2p-set/g-counter/pn), same ownership form as the
+    // value it replaced.
+    item->value_repr = DATA_VALUE_REPR_CRDT_STRUCT;
   }
 
   if (err != CRABS_SUCCESS) {

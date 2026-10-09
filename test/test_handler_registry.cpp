@@ -254,6 +254,7 @@ TEST_F(HandlerRegistryIntegration, HandlerErrorPropagates) {
 TEST_F(HandlerRegistryIntegration, FailingHandlerDoesNotBurnDedupSlot) {
   data_item_t* voters = data_item_create("proposal_voters", DATA_TYPE_ONE_SHOT_SET, CRDT_ONE_SHOT_SET);
   voters->value = one_shot_set_create();
+  voters->value_repr = (data_value_repr_t)DATA_VALUE_REPR_CRDT_STRUCT;
   state_add_item(state, voters);
 
   dedup_spec_t spec;

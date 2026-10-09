@@ -21,6 +21,7 @@ protected:
     g_counter_t* gc = g_counter_create();
     g_counter_increment(gc, "nodeA", 10);
     flags->value = gc;
+    flags->value_repr = (data_value_repr_t)DATA_VALUE_REPR_CRDT_STRUCT;
     state_add_item(state, flags);
 
     // Add a counter item "views" with value 1000
@@ -28,6 +29,7 @@ protected:
     g_counter_t* views_gc = g_counter_create();
     g_counter_increment(views_gc, "nodeA", 1000);
     views->value = views_gc;
+    views->value_repr = (data_value_repr_t)DATA_VALUE_REPR_CRDT_STRUCT;
     state_add_item(state, views);
 
     // Add a PN-counter item "user_alice" with value -50
@@ -36,6 +38,7 @@ protected:
     pn_counter_increment(pnc, "nodeA", 10);
     pn_counter_decrement(pnc, "nodeA", 60);
     rep->value = pnc;
+    rep->value_repr = (data_value_repr_t)DATA_VALUE_REPR_CRDT_STRUCT;
     state_add_item(state, rep);
 
     // Add an OR-Set item "course_enrolled" with {"alice", "bob"}
@@ -44,6 +47,7 @@ protected:
     or_set_add(enrolled_set, "alice", "nodeA:1");
     or_set_add(enrolled_set, "bob", "nodeA:2");
     enrolled->value = enrolled_set;
+    enrolled->value_repr = (data_value_repr_t)DATA_VALUE_REPR_CRDT_STRUCT;
     state_add_item(state, enrolled);
 
     // Add a 2P-Set item "mod_queue" with {"video_abc", "video_def"}
@@ -52,6 +56,7 @@ protected:
     two_p_set_add(mq_set, "video_abc");
     two_p_set_add(mq_set, "video_def");
     mod_queue->value = mq_set;
+    mod_queue->value_repr = (data_value_repr_t)DATA_VALUE_REPR_CRDT_STRUCT;
     state_add_item(state, mod_queue);
 
     // Add an OR-Set member containing a DOUBLE SPACE, so a test can observe
@@ -61,6 +66,7 @@ protected:
     or_set_t* spaced_set = or_set_create();
     or_set_add(spaced_set, "a  b", "nodeA:1");
     spaced_members->value = spaced_set;
+    spaced_members->value_repr = (data_value_repr_t)DATA_VALUE_REPR_CRDT_STRUCT;
     state_add_item(state, spaced_members);
 
     // Add an OR-Set whose member is the literal string "@parent/x", so tests
@@ -70,6 +76,7 @@ protected:
     or_set_t* tagged_set = or_set_create();
     or_set_add(tagged_set, "@parent/x", "nodeA:1");
     tagged_members->value = tagged_set;
+    tagged_members->value_repr = (data_value_repr_t)DATA_VALUE_REPR_CRDT_STRUCT;
     state_add_item(state, tagged_members);
 
     // Add a counter for BETWEEN tests
@@ -77,6 +84,7 @@ protected:
     g_counter_t* likes_gc = g_counter_create();
     g_counter_increment(likes_gc, "nodeA", 500);
     likes->value = likes_gc;
+    likes->value_repr = (data_value_repr_t)DATA_VALUE_REPR_CRDT_STRUCT;
     state_add_item(state, likes);
   }
 
@@ -580,6 +588,7 @@ TEST_F(TestCondition, MultiSegmentPathDoesNotResolveToPrefixItem) {
   g_counter_t* tenant_counter = g_counter_create();
   g_counter_increment(tenant_counter, "nodeA", 999999);
   tenant->value = tenant_counter;
+  tenant->value_repr = (data_value_repr_t)DATA_VALUE_REPR_CRDT_STRUCT;
   ASSERT_EQ(state_add_item(state, tenant), CRABS_SUCCESS);
 
   // No "tenant.quota" item exists — the path resolves as missing (0).
@@ -598,6 +607,7 @@ TEST_F(TestCondition, MultiSegmentFullPathStillResolves) {
   g_counter_t* quota_counter = g_counter_create();
   g_counter_increment(quota_counter, "nodeA", 42);
   quota->value = quota_counter;
+  quota->value_repr = (data_value_repr_t)DATA_VALUE_REPR_CRDT_STRUCT;
   ASSERT_EQ(state_add_item(state, quota), CRABS_SUCCESS);
 
   EXPECT_EQ(condition_resolve_path(state, "tenant.quota"), 42);
