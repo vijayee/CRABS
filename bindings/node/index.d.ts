@@ -33,6 +33,12 @@ export interface Operation {
   setSovereignPrefix(prefixIndex: number, seq: number, digestHex: string): this;
   /** Wire bytes of the op as currently staged (sign first, then serialize). */
   serialize(): Buffer;
+  /**
+   * Op format version this op carries. Fresh ops report the build's
+   * wireVersions.op; deserialized ops report the version declared on the
+   * wire.
+   */
+  getWireVersion(): number;
   sign(keyPair: KeyPair): this;
   signWithPrivateKey(privateKeyHex: string): this;
 }
@@ -336,4 +342,17 @@ export const CRDT_TYPE: {
   ONE_SHOT_SET: number;
   ONE_SHOT_FLAG: number;
   CUSTOM: number;
+};
+
+/**
+ * Active wire-format versions, mirrored from the C library (no JS
+ * hardcoding). Frozen at module load.
+ *   state   — CRABS_SERIAL_VERSION (state wire format)
+ *   op      — CRABS_OP_FORMAT_VERSION (op wire format)
+ *   signing — CRABS_SIGNING_FORMAT_VERSION (signing canonical form)
+ */
+export const wireVersions: {
+  readonly state: number;
+  readonly op: number;
+  readonly signing: number;
 };

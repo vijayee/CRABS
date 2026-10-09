@@ -3579,7 +3579,7 @@ serialized_buffer_t* crabs_serialize_for_signing(const operation_t* op) {
   // byte is consumed only as domain separation (nothing parses the signing
   // form), so every signer and every verifier must run the same
   // signing-format version.
-  _write_uint8(buf, 0x04);
+  _write_uint8(buf, CRABS_SIGNING_FORMAT_VERSION);
 
   // 1. op.type (length-prefixed string)
   _write_string16(buf, op->type);

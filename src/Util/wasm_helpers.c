@@ -341,10 +341,34 @@ const uint8_t* crabs_wasm_op_get_payload(operation_t* op) {
   return op ? op->payload : NULL;
 }
 
+// The op format version this op carries. Freshly created ops report the
+// build's CRABS_OP_FORMAT_VERSION; deserialized ops report the version they
+// declared on the wire (validated 1..CRABS_OP_FORMAT_VERSION at parse time).
+EMSCRIPTEN_KEEPALIVE
+uint32_t crabs_wasm_op_get_wire_version(const operation_t* op) {
+  return op ? op->op_version : 0;
+}
+
 EMSCRIPTEN_KEEPALIVE
 void crabs_wasm_op_init_uuid(operation_t* op) {
   if (!op) return;
   crypto_random_bytes(op->uuid, CRABS_UUID_SIZE);
+}
+
+// ============================================================
+// Wire-version diagnostics (consumption-fixes finding 5)
+// ============================================================
+// Mirrors the C-side constants into JS without a handwritten drift-prone
+// copy: state wire version (CRABS_SERIAL_VERSION), op format version
+// (CRABS_OP_FORMAT_VERSION), signing canonical-form version
+// (CRABS_SIGNING_FORMAT_VERSION). Caller passes a 3×u32 buffer; out[0]=state,
+// out[1]=op, out[2]=signing.
+EMSCRIPTEN_KEEPALIVE
+void crabs_wasm_wire_versions(uint32_t* out_versions) {
+  if (!out_versions) return;
+  out_versions[0] = (uint32_t)CRABS_SERIAL_VERSION;
+  out_versions[1] = (uint32_t)CRABS_OP_FORMAT_VERSION;
+  out_versions[2] = (uint32_t)CRABS_SIGNING_FORMAT_VERSION;
 }
 
 // ============================================================

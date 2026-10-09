@@ -39,6 +39,12 @@ export interface Operation {
    */
   setSovereignPrefix(prefixIndex: number, seq: number | bigint,
                      digest: string | Uint8Array): this;
+  /**
+   * Op format version this op carries. Fresh ops report the build's
+   * wireVersions.op; deserialized ops report the version declared on the
+   * wire.
+   */
+  getWireVersion(): number;
   destroy(): void;
 }
 
@@ -361,3 +367,16 @@ export namespace Node {
 }
 
 export function getModule(): Promise<any>;
+
+/**
+ * Active wire-format versions, mirrored from the C library (no JS
+ * hardcoding). Cached after first call; the resolved object is frozen.
+ *   state   — CRABS_SERIAL_VERSION (state wire format)
+ *   op      — CRABS_OP_FORMAT_VERSION (op wire format)
+ *   signing — CRABS_SIGNING_FORMAT_VERSION (signing canonical form)
+ */
+export function wireVersions(): Promise<{
+  readonly state: number;
+  readonly op: number;
+  readonly signing: number;
+}>;

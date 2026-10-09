@@ -4,7 +4,7 @@
 
 'use strict';
 
-const { Node, KeyPair, Operation, Blueprint } = require('..');
+const { Node, KeyPair, Operation, Blueprint, wireVersions } = require('..');
 
 let passed = 0;
 let failed = 0;
@@ -576,6 +576,26 @@ try {
   // Ordinary integers still set.
   node.setRegister('guard_slot', -7, 'alice');
   assert(node.getRegister('guard_slot') === -7, 'integer -7 should land');
+}
+
+// Wire-version diagnostics (consumption-fixes finding 5): the constants are
+// exposed (no JS mirror drift), frozen, and match the documented build
+// values. Operation.getWireVersion() reports the active op format on a
+// fresh op.
+{
+  assert(wireVersions && typeof wireVersions === 'object',
+    'wireVersions should be exposed');
+  assert(wireVersions.state === 15,
+    `wireVersions.state=${wireVersions.state}, expected 15`);
+  assert(wireVersions.op === 6,
+    `wireVersions.op=${wireVersions.op}, expected 6`);
+  assert(wireVersions.signing === 4,
+    `wireVersions.signing=${wireVersions.signing}, expected 4`);
+  assert(Object.isFrozen(wireVersions), 'wireVersions must be frozen');
+
+  const probe = new Operation('probe');
+  assert(probe.getWireVersion() === wireVersions.op,
+    `fresh op getWireVersion=${probe.getWireVersion()}, expected ${wireVersions.op}`);
 }
 
 console.log(`\n${passed} passed, ${failed} failed`);

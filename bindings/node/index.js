@@ -42,7 +42,11 @@ if (!nativeModule) {
 }
 
 // Re-export the native classes
-const { Node, KeyPair, Operation, Blueprint, TRUST_MODE, DATA_TYPE, CRDT_TYPE } =
-    nativeModule;
+const { Node, KeyPair, Operation, Blueprint, TRUST_MODE, DATA_TYPE, CRDT_TYPE,
+    wireVersions } = nativeModule;
 
-module.exports = { Node, KeyPair, Operation, Blueprint, TRUST_MODE, DATA_TYPE, CRDT_TYPE };
+// Mirror the wasm wrapper's frozen-object contract for the version table.
+const frozenWireVersions = Object.freeze(wireVersions);
+
+module.exports = { Node, KeyPair, Operation, Blueprint, TRUST_MODE, DATA_TYPE, CRDT_TYPE,
+    wireVersions: frozenWireVersions };

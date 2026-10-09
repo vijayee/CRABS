@@ -529,6 +529,7 @@ public:
       InstanceAccessor("nodeId", &Operation::GetNodeId, &Operation::SetNodeId),
       InstanceAccessor("payload", &Operation::GetPayload, &Operation::SetPayload),
       InstanceAccessor("lamportTime", &Operation::GetLamportTime, &Operation::SetLamportTime),
+      InstanceMethod("getWireVersion", &Operation::GetWireVersion),
     });
     exports.Set("Operation", func);
     return exports;
@@ -615,6 +616,12 @@ private:
 
   Napi::Value GetLamportTime(const Napi::CallbackInfo& info) {
     return Napi::Number::New(info.Env(), (double)op_->lamport_time);
+  }
+  // Op format version this op carries. Fresh ops report the build's
+  // CRABS_OP_FORMAT_VERSION; deserialized ops report the version declared
+  // on the wire. Compare against wireVersions.op to detect skew.
+  Napi::Value GetWireVersion(const Napi::CallbackInfo& info) {
+    return Napi::Number::New(info.Env(), (double)op_->op_version);
   }
   void SetLamportTime(const Napi::CallbackInfo& info, const Napi::Value& val) {
     op_->lamport_time = (uint64_t)val.As<Napi::Number>().DoubleValue();
@@ -2283,6 +2290,15 @@ Napi::Object Init(Napi::Env env, Napi::Object exports) {
   crdt_type.Set("ONE_SHOT_FLAG", (double)CRDT_ONE_SHOT_FLAG);
   crdt_type.Set("CUSTOM", (double)CRDT_CUSTOM);
   exports.Set("CRDT_TYPE", crdt_type);
+
+  // Wire-version diagnostics (consumption-fixes finding 5): the three
+  // active versions mirrored from the C library — no JS hardcoding, no
+  // drift between wrapper and library.
+  Napi::Object wire_versions = Napi::Object::New(env);
+  wire_versions.Set("state", (double)CRABS_SERIAL_VERSION);
+  wire_versions.Set("op", (double)CRABS_OP_FORMAT_VERSION);
+  wire_versions.Set("signing", (double)CRABS_SIGNING_FORMAT_VERSION);
+  exports.Set("wireVersions", wire_versions);
 
   return exports;
 }

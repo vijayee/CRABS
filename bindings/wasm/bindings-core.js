@@ -419,9 +419,46 @@ class Operation {
     return out;
   }
 
+  // Op format version this op carries. Fresh ops report the build's
+  // CRABS_OP_FORMAT_VERSION; deserialized ops report the version declared on
+  // the wire. Compare against wireVersions.op to detect skew.
+  getWireVersion() {
+    return this._M._crabs_wasm_op_get_wire_version(this._ptr);
+  }
+
   destroy() {
     if (this._ptr) { this._M._operation_destroy(this._ptr); this._ptr = null; }
   }
+}
+
+// ============================================================
+// Wire-version diagnostics (consumption-fixes finding 5)
+// ============================================================
+// Mirrors the three wire-format constants from C (no JS hardcoding — no
+// drift between wrapper and library). The Promise is cached so the lookup
+// happens once per process; the resolved value is frozen.
+//   state   — CRABS_SERIAL_VERSION (state wire format, serialization.h)
+//   op      — CRABS_OP_FORMAT_VERSION (op wire format, state_machine.h)
+//   signing — CRABS_SIGNING_FORMAT_VERSION (signing canonical form, §7.5)
+let _wireVersionsPromise = null;
+function wireVersions() {
+  if (!_wireVersionsPromise) {
+    _wireVersionsPromise = getModule().then((M) => {
+      const ptr = M._malloc(12);
+      try {
+        M._crabs_wasm_wire_versions(ptr);
+        const u32 = (offset) => M.HEAPU32[(ptr >> 2) + offset] >>> 0;
+        return Object.freeze({
+          state: u32(0),
+          op: u32(1),
+          signing: u32(2),
+        });
+      } finally {
+        M._free(ptr);
+      }
+    });
+  }
+  return _wireVersionsPromise;
 }
 
 // ============================================================
@@ -1570,7 +1607,7 @@ class Node {
 // Module exports
 // ============================================================
 
-  return { Node, KeyPair, Operation, Blueprint, TRUST_MODE, DATA_TYPE, CRDT_TYPE, getModule };
+  return { Node, KeyPair, Operation, Blueprint, TRUST_MODE, DATA_TYPE, CRDT_TYPE, getModule, wireVersions };
 }
 
 // UMD: CommonJS for Node/bundlers; window.CRABSWasmCore for plain <script>

@@ -20,6 +20,12 @@
 #define CRABS_SERIAL_MAGIC      0x42415243  // "CRAB" in little-endian
 #define CRABS_SERIAL_VERSION    15          // v15: struct-backed counter/register item values serialize logical content (node-sorted entries / register payload+ts+node), not the struct's first 8 bytes (a heap pointer) — fixes chain-digest determinism and struct-item restore
 
+// Canonical-form version byte emitted by crabs_serialize_for_signing (§7.5).
+// Purely domain-separation: nothing parses the signing form, so this MUST
+// change whenever the signed field set changes. v4 (write domains) adds the
+// per-resource sovereign chain prefixes to the signed bytes.
+#define CRABS_SIGNING_FORMAT_VERSION 0x04
+
 // ============================================================
 // Serialized buffer
 // ============================================================
