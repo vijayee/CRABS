@@ -468,6 +468,56 @@ static void _write_lock_state_json(json_writer_t* writer, const data_item_t* ite
   _json_writer_raw(writer, "}");
 }
 
+// Write-domain pill words (write-domains v1): the short labels the State
+// tab renders as the per-item domain pill — "free"/"sovereign"/"group".
+static const char* _write_domain_name(crabs_write_domain_e domain) {
+  switch (domain) {
+    case CRABS_DOMAIN_FREE_MERGE:    return "free";
+    case CRABS_DOMAIN_SOVEREIGN:     return "sovereign";
+    case CRABS_DOMAIN_GROUP_ORDERED: return "group";
+    default:                         return "unknown";
+  }
+}
+
+// First 8 bytes of a 32-byte digest as lowercase hex — enough to eyeball
+// chain heads and evidence without shipping full digests into the panel.
+static void _write_digest_head_json(json_writer_t* writer,
+                                    const uint8_t* digest) {
+  char head_hex[17];
+  for (uint32_t byte_index = 0; byte_index < 8; byte_index++) {
+    snprintf(head_hex + byte_index * 2, 3, "%02x", digest[byte_index]);
+  }
+  _json_writer_string(writer, head_hex);
+}
+
+// Write-domains v1 (additive): the item's declared write domain, bound
+// writer, chain sequence head, ordering module, and the quarantine set
+// (writer + evidence head per entry) built by equivocation reports.
+static void _write_domain_json(json_writer_t* writer, const data_item_t* item) {
+  _json_writer_raw(writer, "\"domain\":");
+  _json_writer_string(writer, _write_domain_name(item->write_domain));
+  _json_writer_raw(writer, ",\"writer\":");
+  _json_writer_string(writer, item->writer);
+  _json_writer_raw(writer, ",\"item_seq\":");
+  _json_writer_uint(writer, item->item_seq);
+  _json_writer_raw(writer, ",\"item_digest_head\":");
+  _write_digest_head_json(writer, item->item_digest);
+  _json_writer_raw(writer, ",\"ordering_module\":");
+  _json_writer_uint(writer, item->ordering_module);
+  _json_writer_raw(writer, ",\"fork_count\":");
+  _json_writer_uint(writer, item->fork_count);
+  _json_writer_raw(writer, ",\"forks\":[");
+  for (uint32_t fork_index = 0; fork_index < item->fork_count; fork_index++) {
+    if (fork_index > 0) _json_writer_raw(writer, ",");
+    _json_writer_raw(writer, "{\"writer\":");
+    _json_writer_string(writer, item->fork_writers[fork_index]);
+    _json_writer_raw(writer, ",\"evidence_head\":");
+    _write_digest_head_json(writer, item->fork_evidence_digests[fork_index]);
+    _json_writer_raw(writer, "}");
+  }
+  _json_writer_raw(writer, "]");
+}
+
 static void _write_item_json(json_writer_t* writer, const data_item_t* item) {
   _json_writer_raw(writer, "{\"name\":");
   _json_writer_string(writer, item->name);
@@ -481,6 +531,8 @@ static void _write_item_json(json_writer_t* writer, const data_item_t* item) {
   _write_invariants_json(writer, item);
   _json_writer_raw(writer, ",");
   _write_lock_state_json(writer, item);
+  _json_writer_raw(writer, ",");
+  _write_domain_json(writer, item);
   _json_writer_raw(writer, "}");
 }
 

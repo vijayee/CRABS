@@ -51,6 +51,16 @@
   };
   const LINEAGE_PILL_FALLBACK = ['#f3f4f6', '#374151'];
 
+  // Write-domain pill colors (write-domains v1) for the State tab's item
+  // rows: [background, text], same light-theme pastel family. The C
+  // snapshot emits domain as one of these three words (unknown/missing
+  // falls back to the shared gray, same as the lineage pills).
+  const DOMAIN_PILL_COLORS = {
+    free: ['#e5e7eb', '#374151'],
+    sovereign: ['#ccfbf1', '#0f766e'],
+    group: ['#e0e7ff', '#3730a3'],
+  };
+
   // Toggle icon: the Encryptstacean logo from the project README,
   // downscaled to 72px and inlined as a data URI so the devtools stay
   // zero-dependency and path-independent.
@@ -311,9 +321,18 @@
       const row = document.createElement('div');
       row.className = 'tree-row';
       row.style.paddingLeft = (depth * 14) + 'px';
+      // Item rows (items.<index>): the C snapshot emits additive
+      // write-domain fields (domain/writer/item_seq/item_digest_head/
+      // ordering_module/fork_count/forks). Render the domain pill plus a
+      // chain-head hint on the row; the quarantine set becomes a Forks
+      // section instead of a generic subtree. All strings land via
+      // textContent — the panel's established XSS discipline.
+      const isItemRow = /^items\.\d+$/.test(path) && value !== null &&
+                        typeof value === 'object' && value.name;
       const isObject = value !== null && typeof value === 'object';
       if (isObject && Object.keys(value).length > 0) {
-        const keys = Object.keys(value);
+        const keys = Object.keys(value).filter(
+          (key) => !(isItemRow && key === 'forks'));
         const toggle = document.createElement('span');
         toggle.className = 'tree-toggle mono';
         const expanded = expandedPaths.has(path);
@@ -329,13 +348,47 @@
         if (diffs[path]) appendBadge(row, diffs[path]);
         // Timeline rows jump here by item name (Step 5): tag each item's
         // row so focusItem can find and flash it.
-        if (/^items\.\d+$/.test(path) && value.name) {
+        if (isItemRow) {
           row.setAttribute('data-item-name', value.name);
+          if (typeof value.domain === 'string') {
+            appendPill(row, value.domain, DOMAIN_PILL_COLORS[value.domain]);
+          }
+          if (value.domain === 'sovereign') {
+            const chainHint = document.createElement('span');
+            chainHint.className = 'mono';
+            chainHint.style.color = '#9ca3af';
+            chainHint.textContent = ' · seq ' + (value.item_seq || 0) +
+              ' · head ' + (value.item_digest_head || '');
+            row.appendChild(chainHint);
+          }
         }
         container.appendChild(row);
         if (expanded) {
           for (const key of keys) {
             renderValue(value[key], path ? path + '.' + key : key, depth + 1);
+          }
+          if (isItemRow && Array.isArray(value.forks) &&
+              value.forks.length > 0) {
+            const forksHeader = document.createElement('div');
+            forksHeader.className = 'tree-row';
+            forksHeader.style.paddingLeft = ((depth + 1) * 14) + 'px';
+            const forksLabel = document.createElement('span');
+            forksLabel.className = 'mono';
+            forksLabel.textContent = 'Forks (' + value.forks.length +
+              ') — quarantined writers:';
+            forksHeader.appendChild(forksLabel);
+            container.appendChild(forksHeader);
+            for (const forkEntry of value.forks) {
+              const forkRow = document.createElement('div');
+              forkRow.className = 'tree-row';
+              forkRow.style.paddingLeft = ((depth + 2) * 14) + 'px';
+              const forkText = document.createElement('span');
+              forkText.className = 'mono';
+              forkText.textContent = String(forkEntry.writer) +
+                ' · evidence ' + String(forkEntry.evidence_head || '');
+              forkRow.appendChild(forkText);
+              container.appendChild(forkRow);
+            }
           }
         }
       } else {

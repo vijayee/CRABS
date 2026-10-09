@@ -294,6 +294,46 @@ TEST(DevtoolsSnapshot, NullStateReturnsNull) {
   EXPECT_EQ(devtools_snapshot_json(nullptr), nullptr);
 }
 
+// Write-domains v1: item rows carry the additive domain fields, and a
+// sovereign item with quarantine evidence renders the fork entries with
+// writer + evidence digest head.
+TEST(DevtoolsSnapshot, ItemRowsCarryWriteDomainFields) {
+  state_t* state = make_state_with_g_counter();
+
+  data_item_options_t options;
+  memset(&options, 0, sizeof(options));
+  options.write_domain = CRABS_DOMAIN_SOVEREIGN;
+  options.writer = (char*)"alice";
+  data_item_t* sovereign = nullptr;
+  ASSERT_EQ(data_item_create_with_options("score", DATA_TYPE_COUNTER,
+                                          CRDT_G_COUNTER, &options,
+                                          &sovereign),
+            CRABS_SUCCESS);
+  ASSERT_EQ(state_add_item(state, sovereign), CRABS_SUCCESS);
+  uint8_t evidence[CRABS_HASH_SIZE];
+  memset(evidence, 0xAB, sizeof(evidence));
+  ASSERT_EQ(state_append_fork_evidence(sovereign, "mallory", evidence),
+            CRABS_SUCCESS);
+
+  char* json = devtools_snapshot_json(state);
+  ASSERT_NE(json, nullptr);
+  std::string text = json;
+  devtools_string_destroy(json);
+  state_destroy(state);
+
+  // The pre-existing free item keeps the additive zero-default row.
+  EXPECT_TRUE(contains(text, "\"domain\":\"free\""));
+  EXPECT_TRUE(contains(text, "\"item_seq\":0"));
+  // The sovereign item carries its declaration plus the fork entry.
+  EXPECT_TRUE(contains(text, "\"domain\":\"sovereign\""));
+  EXPECT_TRUE(contains(text, "\"writer\":\"alice\""));
+  EXPECT_TRUE(contains(text, "\"fork_count\":1"));
+  EXPECT_TRUE(contains(text, "\"writer\":\"mallory\""));
+  EXPECT_TRUE(contains(text, "\"evidence_head\":\"abababababababab\""));
+  // The digest head is 16 lowercase hex chars (zeroed until the first op).
+  EXPECT_TRUE(contains(text, "\"item_digest_head\":\"0000000000000000\""));
+}
+
 TEST(DevtoolsSnapshot, AllValueTypes) {
   state_t* state = state_create();
 
