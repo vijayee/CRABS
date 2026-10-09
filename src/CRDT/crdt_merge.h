@@ -50,7 +50,11 @@ pn_counter_t*   pn_counter_merge(const pn_counter_t* a, const pn_counter_t* b);
 // ============================================================
 typedef struct {
   char* element;
-  char* tag;  // unique tag: "node_id:counter"
+  // Tag conventionally "node_id:counter". Uniqueness is by the (element, tag)
+  // PAIR, not by tag alone: two distinct elements may share a tag and both
+  // are retained (consumption finding 2). Tombstones store the same pairs;
+  // re-adding a tombstoned pair is a no-op (observed-remove).
+  char* tag;
 } or_set_entry_t;
 
 typedef struct {

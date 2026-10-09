@@ -273,6 +273,107 @@ TEST(TestORSet, TestInvalidParams) {
 }
 
 // ============================================================
+// OR-Set (element, tag) pair semantics (consumption finding 2)
+// ============================================================
+// Dedup is by the (element, tag) PAIR, not by tag alone: two distinct
+// elements sharing a tag are BOTH retained (no silent drop), while re-adding
+// the same pair stays a no-op (audit H-J: self-merge must not grow the set).
+// Tombstones also record (element, tag) pairs: re-adding a tombstoned pair
+// is an observed-remove no-op, but a DIFFERENT element under the same tag is
+// a different pair and is not covered by the tombstone.
+
+TEST(OrSetAdd, SameTagDifferentElementBothRetained) {
+  or_set_t* set = or_set_create();
+  ASSERT_NE(set, nullptr);
+
+  EXPECT_EQ(or_set_add(set, "alice", "contrib:1"), CRABS_SUCCESS);
+  EXPECT_EQ(or_set_add(set, "bob", "contrib:1"), CRABS_SUCCESS);
+  EXPECT_EQ(set->element_count, 2u);
+  EXPECT_TRUE(or_set_contains(set, "alice"));
+  EXPECT_TRUE(or_set_contains(set, "bob"));
+
+  // remove-by-element tombstones only that element's pairs; bob's entry
+  // under the shared tag stays live.
+  EXPECT_EQ(or_set_remove(set, "alice"), CRABS_SUCCESS);
+  EXPECT_FALSE(or_set_contains(set, "alice"));
+  EXPECT_TRUE(or_set_contains(set, "bob"));
+
+  or_set_destroy(set);
+}
+
+TEST(OrSetAdd, SamePairIdempotent) {
+  or_set_t* set = or_set_create();
+  ASSERT_NE(set, nullptr);
+
+  // Audit H-J invariant preserved: re-adding the same (element, tag) pair is
+  // a no-op, so merge(A, A) under gossip/replay cannot grow the set.
+  EXPECT_EQ(or_set_add(set, "alice", "nodeA:1"), CRABS_SUCCESS);
+  EXPECT_EQ(or_set_add(set, "alice", "nodeA:1"), CRABS_SUCCESS);
+  EXPECT_EQ(set->element_count, 1u);
+
+  or_set_t* merged = or_set_merge(set, set);
+  ASSERT_NE(merged, nullptr);
+  EXPECT_EQ(merged->element_count, 1u);
+  EXPECT_TRUE(or_set_contains(merged, "alice"));
+
+  or_set_destroy(set);
+  or_set_destroy(merged);
+}
+
+TEST(OrSetAdd, TombstonedPairReaddIsNoop) {
+  or_set_t* set = or_set_create();
+  ASSERT_NE(set, nullptr);
+
+  // Observed-remove: once (alice, nodeA:1) is tombstoned, re-adding that
+  // exact pair remains a no-op — CRABS_SUCCESS, no growth, still not
+  // contained. (Merges call add liberally, so this cannot be an error.)
+  EXPECT_EQ(or_set_add(set, "alice", "nodeA:1"), CRABS_SUCCESS);
+  EXPECT_EQ(or_set_remove(set, "alice"), CRABS_SUCCESS);
+  EXPECT_EQ(set->tombstone_count, 1u);
+
+  EXPECT_EQ(or_set_add(set, "alice", "nodeA:1"), CRABS_SUCCESS);
+  EXPECT_EQ(set->element_count, 1u);
+  EXPECT_FALSE(or_set_contains(set, "alice"));
+
+  // A DIFFERENT element under the same tag is a different pair: the
+  // tombstone does not cover it and the add grows the set.
+  EXPECT_EQ(or_set_add(set, "bob", "nodeA:1"), CRABS_SUCCESS);
+  EXPECT_EQ(set->element_count, 2u);
+  EXPECT_TRUE(or_set_contains(set, "bob"));
+
+  or_set_destroy(set);
+}
+
+TEST(OrSetAdd, MergeRetainsSharedTagElements) {
+  or_set_t* a = or_set_create();
+  or_set_t* b = or_set_create();
+  ASSERT_NE(a, nullptr);
+  ASSERT_NE(b, nullptr);
+
+  // Two replicas converge on the same tag carrying different elements:
+  // merge must retain both with no duplication, in either order.
+  EXPECT_EQ(or_set_add(a, "alice", "contrib:1"), CRABS_SUCCESS);
+  EXPECT_EQ(or_set_add(b, "bob", "contrib:1"), CRABS_SUCCESS);
+
+  or_set_t* merged_ab = or_set_merge(a, b);
+  ASSERT_NE(merged_ab, nullptr);
+  EXPECT_EQ(merged_ab->element_count, 2u);
+  EXPECT_TRUE(or_set_contains(merged_ab, "alice"));
+  EXPECT_TRUE(or_set_contains(merged_ab, "bob"));
+
+  or_set_t* merged_ba = or_set_merge(b, a);
+  ASSERT_NE(merged_ba, nullptr);
+  EXPECT_EQ(merged_ba->element_count, 2u);
+  EXPECT_TRUE(or_set_contains(merged_ba, "alice"));
+  EXPECT_TRUE(or_set_contains(merged_ba, "bob"));
+
+  or_set_destroy(a);
+  or_set_destroy(b);
+  or_set_destroy(merged_ab);
+  or_set_destroy(merged_ba);
+}
+
+// ============================================================
 // 2P-Set tests
 // ============================================================
 

@@ -23,12 +23,14 @@ uint64_t crabs_or_set_count_visible(const void* item) {
   if (item == NULL) return 0;
   const or_set_t* set = (const or_set_t*)item;
 
-  // Count elements that are not tombstoned
+  // Count elements whose (element, tag) pair is not tombstoned (pair
+  // semantics: a tombstone kills only its own pair — see crdt_merge.c).
   uint64_t visible = 0;
   for (uint32_t i = 0; i < set->element_count; i++) {
     bool tombstoned = false;
     for (uint32_t j = 0; j < set->tombstone_count; j++) {
-      if (strcmp(set->elements[i].tag, set->tombstones[j].tag) == 0) {
+      if (strcmp(set->elements[i].tag, set->tombstones[j].tag) == 0 &&
+          strcmp(set->elements[i].element, set->tombstones[j].element) == 0) {
         tombstoned = true;
         break;
       }
@@ -45,11 +47,12 @@ void* crabs_or_set_extract_visible(const void* item) {
   or_set_t* visible = or_set_create();
   if (visible == NULL) return NULL;
 
-  // Copy only non-tombstoned elements
+  // Copy only elements whose (element, tag) pair is not tombstoned
   for (uint32_t i = 0; i < set->element_count; i++) {
     bool tombstoned = false;
     for (uint32_t j = 0; j < set->tombstone_count; j++) {
-      if (strcmp(set->elements[i].tag, set->tombstones[j].tag) == 0) {
+      if (strcmp(set->elements[i].tag, set->tombstones[j].tag) == 0 &&
+          strcmp(set->elements[i].element, set->tombstones[j].element) == 0) {
         tombstoned = true;
         break;
       }

@@ -33,21 +33,15 @@ static const g_counter_entry_t* _g_counter_find_entry_const(const g_counter_t* c
   return NULL;
 }
 
-static bool _or_set_tag_in_tombstones(const or_set_t* set, const char* tag) {
+// Tombstones record (element, tag) pairs (or_set_remove copies both fields),
+// and membership is checked by PAIR: a removed element's tombstone kills only
+// that element's pairs. A different element sharing the tag is a different
+// pair and is NOT covered — remove-by-element never hides another element.
+static bool _or_set_pair_in_tombstones(const or_set_t* set, const char* element, const char* tag) {
   for (uint32_t i = 0; i < set->tombstone_count; i++) {
-    if (strcmp(set->tombstones[i].tag, tag) == 0) {
+    if (strcmp(set->tombstones[i].tag, tag) == 0 &&
+        strcmp(set->tombstones[i].element, element) == 0) {
       return true;
-    }
-  }
-  return false;
-}
-
-static bool _or_set_element_has_live_tag(const or_set_t* set, const char* element) {
-  for (uint32_t i = 0; i < set->element_count; i++) {
-    if (strcmp(set->elements[i].element, element) == 0) {
-      if (!_or_set_tag_in_tombstones(set, set->elements[i].tag)) {
-        return true;
-      }
     }
   }
   return false;
@@ -263,15 +257,24 @@ void or_set_destroy(or_set_t* set) {
 crabs_error_e or_set_add(or_set_t* set, const char* element, const char* tag) {
   if (set == NULL || element == NULL || tag == NULL) return CRABS_ERR_INVALID_PARAM;
 
-  // Audit H-J: dedup by tag. An OR-Set add is uniquely identified by its tag;
-  // re-adding the same tag (e.g. merge(A, A) under gossip/replay) must be
-  // idempotent. Without this, element_count doubled on every self-merge,
-  // yielding unbounded memory growth and a remote memory-exhaustion DoS.
+  // Audit H-J + consumption finding 2: dedup by the (element, tag) PAIR.
+  // Re-adding the same pair (e.g. merge(A, A) under gossip/replay) must be
+  // idempotent — without it, element_count doubled on every self-merge, an
+  // unbounded remote memory-exhaustion DoS. The historical H-J fix deduped
+  // by tag alone, which silently DROPPED a distinct element that happened to
+  // share a tag (e.g. a contributionId-as-tag scheme); pair dedup keeps the
+  // idempotence invariant and retains both elements.
   for (uint32_t i = 0; i < set->element_count; i++) {
-    if (strcmp(set->elements[i].tag, tag) == 0) return CRABS_SUCCESS;
+    if (strcmp(set->elements[i].tag, tag) == 0 &&
+        strcmp(set->elements[i].element, element) == 0) {
+      return CRABS_SUCCESS;
+    }
   }
-  // A tag that is already tombstoned should not be re-added either.
-  if (_or_set_tag_in_tombstones(set, tag)) return CRABS_SUCCESS;
+  // Observed-remove: an already-tombstoned pair stays dead — re-adding it is
+  // a CRABS_SUCCESS no-op (merges call add liberally, so this cannot be an
+  // error). A different element under the same tag is a different pair and
+  // adds normally; the tombstone does not cover it.
+  if (_or_set_pair_in_tombstones(set, element, tag)) return CRABS_SUCCESS;
 
   uint32_t new_count = set->element_count + 1;
   or_set_entry_t* new_elements = realloc(set->elements, new_count * sizeof(or_set_entry_t));
@@ -290,8 +293,9 @@ crabs_error_e or_set_remove(or_set_t* set, const char* element) {
   // Add all tags for this element to tombstones
   for (uint32_t i = 0; i < set->element_count; i++) {
     if (strcmp(set->elements[i].element, element) == 0) {
-      // Check if already tombstoned
-      if (_or_set_tag_in_tombstones(set, set->elements[i].tag)) continue;
+      // Check if already tombstoned (by pair)
+      if (_or_set_pair_in_tombstones(set, set->elements[i].element,
+                                     set->elements[i].tag)) continue;
 
       uint32_t new_ts_count = set->tombstone_count + 1;
       or_set_entry_t* new_tombstones = realloc(set->tombstones, new_ts_count * sizeof(or_set_entry_t));
@@ -310,7 +314,8 @@ bool or_set_contains(const or_set_t* set, const char* element) {
   if (set == NULL || element == NULL) return false;
   for (uint32_t i = 0; i < set->element_count; i++) {
     if (strcmp(set->elements[i].element, element) == 0) {
-      if (!_or_set_tag_in_tombstones(set, set->elements[i].tag)) {
+      if (!_or_set_pair_in_tombstones(set, set->elements[i].element,
+                                      set->elements[i].tag)) {
         return true;
       }
     }
@@ -336,8 +341,9 @@ or_set_t* or_set_merge(const or_set_t* a, const or_set_t* b) {
   for (int s = 0; s < 2; s++) {
     if (sources[s] == NULL) continue;
     for (uint32_t i = 0; i < sources[s]->tombstone_count; i++) {
-      // Avoid duplicate tombstones
-      if (!_or_set_tag_in_tombstones(result, sources[s]->tombstones[i].tag)) {
+      // Avoid duplicate tombstones (by pair — distinct elements may share a tag)
+      if (!_or_set_pair_in_tombstones(result, sources[s]->tombstones[i].element,
+                                      sources[s]->tombstones[i].tag)) {
         uint32_t new_count = result->tombstone_count + 1;
         or_set_entry_t* new_ts = realloc(result->tombstones, new_count * sizeof(or_set_entry_t));
         if (new_ts == NULL) continue;
