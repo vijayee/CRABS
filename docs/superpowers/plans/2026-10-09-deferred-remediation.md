@@ -37,5 +37,5 @@
 - [x] Commit: `feat: video platform demo gains a sovereign item — domain pills in both tabs`.
 
 ### Task D: Final verification
-- [ ] Full suites: ctest, node build+tests+smoke, wasm regen (only if wasm C changed — Task A/B are C-level: YES regen needed + `chore: regenerate wasm artifacts` commit), npm test, parity smoke, de-wonk two rounds over `acb9ab6..HEAD`.
-- [ ] `docs: deferred remedies complete` if doc closure needed.
+- [x] Full suites: ctest, node build+tests+smoke, wasm regen (only if wasm C changed — Task A/B are C-level: YES regen needed + `chore: regenerate wasm artifacts` commit), npm test, parity smoke, de-wonk two rounds over `acb9ab6..HEAD`. (As landed: ctest 1694/1694 (1 skip); node 80/80 + lineage_smoke OK; wasm `npm test` all pass; parity byte-identical across node and wasm; wasm regen folded into `010c095` so no separate regen commit was needed; de-wonk rounds 1+2 clean across the five categories.)
+- [x] `docs: deferred remedies complete` if doc closure needed. (This file's Task D ticks + the README "group-ordered until a module is registered" wording — v1 ships no registration API, so the sentence now states that directly.)
