@@ -31,10 +31,10 @@
 ### Task C: p2p demo — sovereign item + domain pills
 
 **Files:** `examples/video_platform_p2p/*` (client JS), `bindings/devtools/crabs-devtools.js` render additions if not already live.
-- [ ] Explore the demo's client structure; add ONE sovereign item (per-user counter signed only by its owner — `node.defineItem({... domain:'sovereign', writer})` on the local node) alongside the free-merge items; op flow via `setSovereignPrefix` + submit; non-writer attempt surfaces the error visibly.
-- [ ] Devtools pills: confirm the earlier render change surfaces in the demo (two tabs: both pills visible).
-- [ ] Run the demo's own smoke/playwright suite if present (`package.json` test script — read it); keep it green.
-- [ ] Commit: `feat: video platform demo gains a sovereign item — domain pills in both tabs`.
+- [x] Explore the demo's client structure; add ONE sovereign item (per-user counter signed only by its owner — `node.defineItem({... domain:'sovereign', writer})` on the local node) alongside the free-merge items; op flow via `setSovereignPrefix` + submit; non-writer attempt surfaces the error visibly.
+- [x] Devtools pills: confirm the earlier render change surfaces in the demo (two tabs: both pills visible). (Fixed first: deriveView keys items by name, so the pill regex never matched item rows.)
+- [x] Run the demo's own smoke/playwright suite if present (`package.json` test script — read it); keep it green. (Playwright 5/5 + server smoke; the demo needed un-breaking against R7-08/R7-04 and the fail-closed handler-less-op executor first.)
+- [x] Commit: `feat: video platform demo gains a sovereign item — domain pills in both tabs`.
 
 ### Task D: Final verification
 - [ ] Full suites: ctest, node build+tests+smoke, wasm regen (only if wasm C changed — Task A/B are C-level: YES regen needed + `chore: regenerate wasm artifacts` commit), npm test, parity smoke, de-wonk two rounds over `acb9ab6..HEAD`.
