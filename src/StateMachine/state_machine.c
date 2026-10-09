@@ -116,6 +116,7 @@ crabs_error_e state_machine_op_rotate_key(state_t* s, operation_t* o);
 crabs_error_e state_machine_op_compact(state_t* s, operation_t* o);
 crabs_error_e state_machine_op_schedule(state_t* s, operation_t* o);
 crabs_error_e state_machine_op_cancel_schedule(state_t* s, operation_t* o);
+crabs_error_e state_machine_op_report_equivocation(state_t* s, operation_t* o);
 
 // ============================================================
 // Transition Table (§6.3)
@@ -230,7 +231,8 @@ bool operation_is_builtin(const char* type) {
           strcmp(type, CRABS_OP_EXECUTE_OT) == 0 ||
           strcmp(type, CRABS_OP_COMPACT) == 0 ||
           strcmp(type, CRABS_OP_SCHEDULE) == 0 ||
-          strcmp(type, CRABS_OP_CANCEL_SCHEDULE) == 0);
+          strcmp(type, CRABS_OP_CANCEL_SCHEDULE) == 0 ||
+          strcmp(type, CRABS_OP_REPORT_EQUIVOCATION) == 0);
 }
 
 // v1.7: lineage operations are handler-registered custom types, but the
@@ -1309,6 +1311,9 @@ static crabs_error_e state_machine_execute_internal(state_t* state, operation_t*
     result = state_machine_op_schedule(state, op);
   } else if (strcmp(op->type, CRABS_OP_CANCEL_SCHEDULE) == 0) {
     result = state_machine_op_cancel_schedule(state, op);
+  } else if (strcmp(op->type, CRABS_OP_REPORT_EQUIVOCATION) == 0) {
+    // Write domains v1: evidence-verified equivocation report
+    result = state_machine_op_report_equivocation(state, op);
   } else {
     // Check user-defined handler registry for non-builtin operation types
     custom_handler = state_machine_find_handler(state, op->type);
@@ -1512,6 +1517,10 @@ static uint32_t _load_u32_le(const uint8_t* bytes) {
     value |= ((uint32_t)bytes[byte_index]) << (byte_index * 8);
   }
   return value;
+}
+
+static uint16_t _load_u16_le(const uint8_t* bytes) {
+  return (uint16_t)((uint16_t)bytes[0] | ((uint16_t)bytes[1] << 8));
 }
 
 // Record a failed scheduled materialization as a durable, LAMPORT-ordered log
@@ -2404,5 +2413,287 @@ crabs_error_e state_machine_op_check_dedup(state_t* state, operation_t* op) {
 
   crabs_error_e result = dedup_check_guard(state, check_op);
   operation_destroy(check_op);
+  return result;
+}
+
+// ============================================================
+// Equivocation Report Built-in Operation (write-domains v1, spec
+// 2026-10-08 §Equivocation detection and quarantine)
+// ============================================================
+// __report_equivocation__ convicts a SOVEREIGN item's writer of forking
+// their own chain. The payload carries the evidence itself; the handler
+// re-verifies everything, so no trust in the reporter is required and the
+// quarantine flag is only ever set when the proof checks out.
+//
+// Payload wire layout (v1; bounded by the op's own u32 payload size):
+//   u8       format version (0x01)
+//   string16 item_name     (u16le length + bytes; the SOVEREIGN item)
+//   string16 writer_id     (u16le length + bytes; must equal item.writer)
+//   bytes32  op_a          (u32le length + serialized op bytes)
+//   bytes32  op_b          (u32le length + serialized op bytes)
+// Full consumption required; every length is checked against the bytes
+// actually remaining before it is consumed.
+//
+// Fork fact (as implemented — the spec's "different resulting digests" is
+// derivable by applying the ops; the signed fork FACT is the duplicate
+// claim): op_a and op_b are two DISTINCT serialized ops that both
+//   - are signed by `writer_id` (Mode A: signer_id == writer_id, and the
+//     signature verifies under the writer's CURRENT keyring — v1 scope:
+//     evidence must be minted under the writer's current key era; a fork
+//     committed under a since-rotated key does not verify), and
+//   - name `item_name` among their resources with a signed sovereign prefix
+//     whose (item_seq, prev_item_digest) are EQUAL in both —
+// i.e. two signed claims to be the one continuation of the same chain head
+// at the same sequence number. Exactly one such continuation can exist.
+//
+// On success: { writer_id : SHA256(min(a,b) ‖ max(a,b)) } (lexicographic
+// order, so (a,b) and (b,a) dedupe to the same entry) is appended to the
+// item's capped fork-evidence set; DOMAIN_CHECK then rejects the writer's
+// later ops on the item (CRABS_ERR_QUARANTINED). A duplicate report returns
+// CRABS_ERR_DUPLICATE_OPERATION from state_append_fork_evidence. On ANY
+// failed check nothing is set. The report op deliberately names NO
+// resources — anyone with a policy for the op type may report, and the
+// quarantine check (which gates only ops naming sovereign resources) never
+// blocks a report.
+
+// Bounded cursor read over the report payload: fail when fewer than `count`
+// bytes remain. The cursor never exceeds payload_size, so the subtraction
+// cannot underflow.
+static bool _report_cursor_read(const uint8_t* payload, uint32_t payload_size,
+                                uint32_t* cursor, uint32_t count,
+                                const uint8_t** out_bytes) {
+  if (count > payload_size - *cursor) return false;
+  *out_bytes = payload + *cursor;
+  *cursor += count;
+  return true;
+}
+
+static crabs_error_e _report_payload_parse(const uint8_t* payload,
+                                           uint32_t payload_size,
+                                           char item_name[CRABS_MAX_USER_ID],
+                                           char writer_id[CRABS_MAX_USER_ID],
+                                           const uint8_t** op_a_bytes,
+                                           uint32_t* op_a_len,
+                                           const uint8_t** op_b_bytes,
+                                           uint32_t* op_b_len) {
+  if (payload == NULL) return CRABS_ERR_INVALID_PARAM;
+  uint32_t cursor = 0;
+  const uint8_t* field = NULL;
+  if (!_report_cursor_read(payload, payload_size, &cursor, 1, &field)) {
+    return CRABS_ERR_INVALID_PARAM;
+  }
+  if (field[0] != 0x01) return CRABS_ERR_INVALID_PARAM;  // payload version
+
+  // string16 item_name, string16 writer_id
+  for (int name_index = 0; name_index < 2; name_index++) {
+    char* name_out = (name_index == 0) ? item_name : writer_id;
+    if (!_report_cursor_read(payload, payload_size, &cursor, 2, &field)) {
+      return CRABS_ERR_INVALID_PARAM;
+    }
+    uint16_t name_len = _load_u16_le(field);
+    if (name_len == 0 || name_len >= CRABS_MAX_USER_ID) {
+      return CRABS_ERR_INVALID_PARAM;
+    }
+    if (!_report_cursor_read(payload, payload_size, &cursor, name_len,
+                             &field)) {
+      return CRABS_ERR_INVALID_PARAM;
+    }
+    memcpy(name_out, field, name_len);
+    name_out[name_len] = '\0';
+  }
+
+  // bytes32 op_a, bytes32 op_b (each length bounded by the bytes remaining)
+  for (int op_index = 0; op_index < 2; op_index++) {
+    const uint8_t** bytes_out = (op_index == 0) ? op_a_bytes : op_b_bytes;
+    uint32_t* len_out = (op_index == 0) ? op_a_len : op_b_len;
+    if (!_report_cursor_read(payload, payload_size, &cursor, 4, &field)) {
+      return CRABS_ERR_INVALID_PARAM;
+    }
+    uint32_t blob_len = _load_u32_le(field);
+    if (blob_len == 0 || blob_len > payload_size - cursor) {
+      return CRABS_ERR_INVALID_PARAM;
+    }
+    if (!_report_cursor_read(payload, payload_size, &cursor, blob_len,
+                             &field)) {
+      return CRABS_ERR_INVALID_PARAM;
+    }
+    *bytes_out = field;
+    *len_out = blob_len;
+  }
+
+  // Full consumption: trailing bytes mean a malformed or padded payload.
+  if (cursor != payload_size) return CRABS_ERR_INVALID_PARAM;
+  return CRABS_SUCCESS;
+}
+
+// Locate the signed sovereign prefix an evidence op carries for
+// `item_name`. Slot assignment mirrors DOMAIN_CHECK exactly: resources are
+// walked in order and every resource that resolves to an existing SOVEREIGN
+// item consumes one prefix slot. The op is well-formed for this machine
+// only when its prefix count equals the number of its sovereign resources —
+// the same exactness DOMAIN_CHECK would have enforced when the evidence op
+// executed; anything else is structurally invalid evidence.
+static crabs_error_e _evidence_prefix_for_item(state_t* state,
+                                               const operation_t* evidence_op,
+                                               const char* item_name,
+                                               const crabs_sovereign_op_prefix_t** out_prefix) {
+  uint32_t sovereign_total = 0;
+  for (uint32_t resource_index = 0;
+       resource_index < evidence_op->resource_count; resource_index++) {
+    const data_item_t* resource_item =
+        state_find_item(state, evidence_op->resources[resource_index]);
+    if (resource_item != NULL &&
+        resource_item->write_domain == CRABS_DOMAIN_SOVEREIGN) {
+      sovereign_total++;
+    }
+  }
+  if (evidence_op->sovereign_prefix_count != sovereign_total) {
+    return CRABS_ERR_INVALID_PARAM;
+  }
+  uint32_t prefix_slot = 0;
+  for (uint32_t resource_index = 0;
+       resource_index < evidence_op->resource_count; resource_index++) {
+    const data_item_t* resource_item =
+        state_find_item(state, evidence_op->resources[resource_index]);
+    if (resource_item == NULL ||
+        resource_item->write_domain != CRABS_DOMAIN_SOVEREIGN) {
+      continue;
+    }
+    if (strcmp(evidence_op->resources[resource_index], item_name) == 0) {
+      *out_prefix = &evidence_op->sovereign_prefixes[prefix_slot];
+      return CRABS_SUCCESS;
+    }
+    prefix_slot++;
+  }
+  return CRABS_ERR_INVALID_PARAM;
+}
+
+// Verify an evidence op's signature under the writer's CURRENT keyring —
+// the same resolution op authorization uses (keyring key_id/scheme aware;
+// R8-C-2 keeps rotated-away bootstrap keys from authorizing). The policy
+// argument is empty on purpose: the writer binding IS the requirement, no
+// attribute expression is re-evaluated against evidence.
+static crabs_error_e _verify_evidence_signature(state_t* state,
+                                                const operation_t* evidence_op,
+                                                const char* writer_id) {
+  serialized_buffer_t* canonical = crabs_serialize_for_signing(evidence_op);
+  if (canonical == NULL) return CRABS_ERR_SERIALIZATION_ERROR;
+  verify_result_t verify_result = crypto_verify_operation_auth_v2(
+      state->abe_mk, "", state->attr_machine,
+      canonical->data, canonical->len,
+      evidence_op->signature, CRABS_SIG_SIZE,
+      writer_id, evidence_op->key_id, evidence_op->sig_scheme,
+      VERIFY_MODE_A);
+  serialized_buffer_destroy(canonical);
+  return verify_result.authorized ? CRABS_SUCCESS : verify_result.error;
+}
+
+crabs_error_e state_machine_op_report_equivocation(state_t* state,
+                                                   operation_t* op) {
+  if (state == NULL || op == NULL) return CRABS_ERR_INVALID_PARAM;
+
+  char item_name[CRABS_MAX_USER_ID];
+  char writer_id[CRABS_MAX_USER_ID];
+  const uint8_t* op_a_bytes = NULL;
+  const uint8_t* op_b_bytes = NULL;
+  uint32_t op_a_len = 0;
+  uint32_t op_b_len = 0;
+  crabs_error_e parse_rc =
+      _report_payload_parse(op->payload, op->payload_size,
+                            item_name, writer_id,
+                            &op_a_bytes, &op_a_len, &op_b_bytes, &op_b_len);
+  if (parse_rc != CRABS_SUCCESS) return parse_rc;
+
+  // The target must exist, must be SOVEREIGN, and the payload must name its
+  // bound writer — the fork set is per-item evidence about THAT writer.
+  data_item_t* item = state_find_item(state, item_name);
+  if (item == NULL) return CRABS_ERR_RESOURCE_NOT_FOUND;
+  if (item->write_domain != CRABS_DOMAIN_SOVEREIGN ||
+      strcmp(writer_id, item->writer) != 0) {
+    return CRABS_ERR_INVALID_PARAM;
+  }
+
+  // Identical bytes are one op delivered twice, not two conflicting claims.
+  if (op_a_len == op_b_len &&
+      CRYPTO_memcmp(op_a_bytes, op_b_bytes, op_a_len) == 0) {
+    return CRABS_ERR_INVALID_PARAM;
+  }
+
+  operation_t* op_a = crabs_deserialize_operation(op_a_bytes, op_a_len);
+  operation_t* op_b = crabs_deserialize_operation(op_b_bytes, op_b_len);
+  if (op_a == NULL || op_b == NULL) {
+    if (op_a != NULL) operation_destroy(op_a);
+    if (op_b != NULL) operation_destroy(op_b);
+    return CRABS_ERR_SERIALIZATION_ERROR;
+  }
+
+  crabs_error_e result = CRABS_SUCCESS;
+
+  // Structural fork fact: both halves are Mode A ops from the named writer…
+  if (strcmp(op_a->signer_id, writer_id) != 0 ||
+      strcmp(op_b->signer_id, writer_id) != 0) {
+    result = CRABS_ERR_INVALID_PARAM;
+    goto done;
+  }
+  // …both carrying a well-formed signed prefix for the item…
+  const crabs_sovereign_op_prefix_t* prefix_a = NULL;
+  const crabs_sovereign_op_prefix_t* prefix_b = NULL;
+  if (_evidence_prefix_for_item(state, op_a, item_name, &prefix_a) !=
+          CRABS_SUCCESS ||
+      _evidence_prefix_for_item(state, op_b, item_name, &prefix_b) !=
+          CRABS_SUCCESS) {
+    result = CRABS_ERR_INVALID_PARAM;
+    goto done;
+  }
+  // …claiming the SAME chain slot: equal seq, equal prev head digest.
+  if (prefix_a->item_seq != prefix_b->item_seq ||
+      CRYPTO_memcmp(prefix_a->prev_item_digest, prefix_b->prev_item_digest,
+                    CRABS_HASH_SIZE) != 0) {
+    result = CRABS_ERR_INVALID_PARAM;
+    goto done;
+  }
+
+  // Both signatures must verify under the writer's current keyring. The
+  // cheap structural checks run first; signature failure maps to the
+  // verifier's code (UNAUTHORIZED), still setting nothing.
+  result = _verify_evidence_signature(state, op_a, writer_id);
+  if (result != CRABS_SUCCESS) goto done;
+  result = _verify_evidence_signature(state, op_b, writer_id);
+  if (result != CRABS_SUCCESS) goto done;
+
+  // Canonical, direction-independent evidence digest: SHA256 over the
+  // lexicographically ordered concatenation of the two serialized ops, so
+  // re-reports swapping (a, b) dedupe to the same entry.
+  {
+    const uint8_t* first_bytes = op_a_bytes;
+    const uint8_t* second_bytes = op_b_bytes;
+    uint32_t first_len = op_a_len;
+    uint32_t second_len = op_b_len;
+    int order = (op_a_len == op_b_len)
+        ? memcmp(op_a_bytes, op_b_bytes, op_a_len)
+        : (op_a_len < op_b_len ? -1 : 1);
+    if (order > 0) {
+      first_bytes = op_b_bytes;
+      first_len = op_b_len;
+      second_bytes = op_a_bytes;
+      second_len = op_a_len;
+    }
+    uint8_t* joined = get_memory((size_t)first_len + (size_t)second_len);
+    memcpy(joined, first_bytes, first_len);
+    memcpy(joined + first_len, second_bytes, second_len);
+    uint8_t evidence_digest[CRABS_HASH_SIZE];
+    result = crypto_sha256(joined, (size_t)first_len + (size_t)second_len,
+                           evidence_digest);
+    free(joined);
+    if (result != CRABS_SUCCESS) goto done;
+    // Monotone, capped union; DUPLICATE_OPERATION on re-delivery, OOM past
+    // the cap — both surfaced to the reporter, flag untouched either way
+    // (domain check honors what is present; the audit log keeps the rest).
+    result = state_append_fork_evidence(item, writer_id, evidence_digest);
+  }
+
+done:
+  operation_destroy(op_a);
+  operation_destroy(op_b);
   return result;
 }

@@ -171,4 +171,7 @@ typedef enum {
 #define CRABS_OP_SCHEDULE        "__schedule__"
 #define CRABS_OP_CANCEL_SCHEDULE "__cancel_schedule__"
 
+// Write Domains (v1): equivocation report against a SOVEREIGN item's writer
+#define CRABS_OP_REPORT_EQUIVOCATION "__report_equivocation__"
+
 #endif // CRABS_CRABS_H

@@ -33,6 +33,9 @@ void crabs_test_register_builtin_policies(state_t* state) {
   state_add_policy(state, CRABS_OP_ROTATE_KEY, "");
   // Force-unlock is intentionally open (anyone may release an expired lock).
   state_add_policy(state, CRABS_OP_FORCE_UNLOCK, "");
+  // Equivocation reports are intentionally open: evidence re-verifies inside
+  // the handler, so no trust in the reporter is required (write-domains v1).
+  state_add_policy(state, CRABS_OP_REPORT_EQUIVOCATION, "");
 }
 
 void crabs_test_env_init(crabs_test_env_t* env) {

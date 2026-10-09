@@ -447,8 +447,10 @@ crabs_error_e state_append_fork_evidence(data_item_t* item,
 }
 
 bool state_item_is_quarantined(const data_item_t* item, const char* writer) {
-  // NULL/empty writer cannot be in the set; DOMAIN_CHECK rejects
-  // unattributable signers (CRABS_ERR_NOT_ITEM_WRITER) before this lookup.
+  // NULL/empty writer cannot be in the set. DOMAIN_CHECK consults this set
+  // FIRST (cheap, before the writer-attribution check), so an unattributable
+  // signer on an item with fork evidence reports CRABS_ERR_QUARANTINED, not
+  // NOT_ITEM_WRITER — check order, not this helper, enforces attribution.
   if (item == NULL || writer == NULL || writer[0] == '\0') return false;
   for (uint32_t fork_index = 0; fork_index < item->fork_count; fork_index++) {
     if (strcmp(item->fork_writers[fork_index], writer) == 0) return true;

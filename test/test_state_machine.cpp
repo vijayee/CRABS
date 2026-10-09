@@ -1592,3 +1592,376 @@ TEST_F(TestStateMachine, DomainCheckModeBSovereignRejected) {
   operation_destroy(op);
   EXPECT_EQ(item->item_seq, (uint64_t)0);
 }
+
+// ============================================================
+// Write domains v1: __report_equivocation__ op (Task 6, spec
+// 2026-10-08 §Equivocation detection and quarantine) and the carried
+// dedup-mutation-target rule for sovereign bookkeeping.
+// ============================================================
+// Fork-fact definition (as implemented; spec doc amended in Task 8): two
+// DISTINCT serialized ops from the same writer, both naming the same
+// SOVEREIGN item with the same item_seq AND the same prev_item_digest in
+// their signed prefixes — two signed claims to be the one continuation of
+// the same chain head at the same sequence number. Both signatures must
+// verify under the writer's CURRENT keys (evidence minted under the
+// current key era; rotated-away-key eras are out of v1 scope).
+
+// Payload wire layout for __report_equivocation__ (v1):
+//   u8      format version (0x01)
+//   string16 item_name    (u16le length + bytes)
+//   string16 writer_id    (u16le length + bytes)
+//   bytes32  op_a         (u32le length + serialized op bytes)
+//   bytes32  op_b         (u32le length + serialized op bytes)
+// Full consumption required.
+static uint8_t* build_report_payload(const char* item_name, const char* writer,
+                                     const uint8_t* op_a_bytes, uint32_t op_a_len,
+                                     const uint8_t* op_b_bytes, uint32_t op_b_len,
+                                     uint32_t* out_len) {
+  uint32_t item_len = (uint32_t)strlen(item_name);
+  uint32_t writer_len = (uint32_t)strlen(writer);
+  *out_len = 1u + 2u + item_len + 2u + writer_len + 4u + op_a_len + 4u + op_b_len;
+  uint8_t* payload = (uint8_t*)malloc(*out_len);
+  if (payload == nullptr) return nullptr;
+  uint32_t offset = 0;
+  payload[offset++] = 0x01;
+  payload[offset++] = (uint8_t)(item_len & 0xFF);
+  payload[offset++] = (uint8_t)((item_len >> 8) & 0xFF);
+  memcpy(payload + offset, item_name, item_len); offset += item_len;
+  payload[offset++] = (uint8_t)(writer_len & 0xFF);
+  payload[offset++] = (uint8_t)((writer_len >> 8) & 0xFF);
+  memcpy(payload + offset, writer, writer_len); offset += writer_len;
+  for (int byte_index = 0; byte_index < 4; byte_index++) {
+    payload[offset++] = (uint8_t)((op_a_len >> (8 * byte_index)) & 0xFF);
+  }
+  memcpy(payload + offset, op_a_bytes, op_a_len); offset += op_a_len;
+  for (int byte_index = 0; byte_index < 4; byte_index++) {
+    payload[offset++] = (uint8_t)((op_b_len >> (8 * byte_index)) & 0xFF);
+  }
+  memcpy(payload + offset, op_b_bytes, op_b_len); offset += op_b_len;
+  EXPECT_EQ(offset, *out_len);
+  return payload;
+}
+
+// Build a signed sovereign op (signed as `signer_id` with `signing_key`,
+// stamped by sign_as) on `resource_name` claiming (seq, prev_digest all
+// zero), and hand back its WIRE bytes — the (T'-style) evidence candidate.
+// The in-memory op is destroyed; only the serialized form survives.
+static void make_serialized_sovereign_op(attribute_machine_t* signing_am,
+                                         ecdsa_keypair_t* signing_key,
+                                         uint64_t* signing_lamport,
+                                         const char* op_type,
+                                         const char* resource_name,
+                                         uint8_t uuid_seed, uint64_t seq,
+                                         uint8_t** out_bytes,
+                                         uint32_t* out_len) {
+  operation_t* op = make_domain_op(op_type, resource_name, uuid_seed);
+  op->sovereign_prefix_count = 1;
+  op->sovereign_prefixes[0].item_seq = seq;
+  memset(op->sovereign_prefixes[0].prev_item_digest, 0, CRABS_HASH_SIZE);
+  sign_as(op, signing_am, signing_key, "alice", signing_lamport);
+  serialized_buffer_t* serialized = crabs_serialize_operation(op);
+  ASSERT_NE(serialized, nullptr);
+  *out_len = (uint32_t)serialized->len;
+  *out_bytes = (uint8_t*)malloc(*out_len);
+  ASSERT_NE(*out_bytes, nullptr);
+  memcpy(*out_bytes, serialized->data, *out_len);
+  serialized_buffer_destroy(serialized);
+  operation_destroy(op);
+}
+
+// Assemble a __report_equivocation__ op carrying the given evidence bytes;
+// the reporter's signer_id is set but signing is the caller's job (sign_as
+// with the reporter's key + lamport state).
+static operation_t* make_report_op(const char* item_name,
+                                   const char* writer_id,
+                                   const char* reporter_id,
+                                   const uint8_t* op_a_bytes, uint32_t op_a_len,
+                                   const uint8_t* op_b_bytes, uint32_t op_b_len,
+                                   uint8_t uuid_seed) {
+  operation_t* op = operation_create(CRABS_OP_REPORT_EQUIVOCATION);
+  memset(op->uuid, uuid_seed, CRABS_UUID_SIZE);
+  op->payload = build_report_payload(item_name, writer_id,
+                                     op_a_bytes, op_a_len,
+                                     op_b_bytes, op_b_len,
+                                     &op->payload_size);
+  EXPECT_NE(op->payload, nullptr);
+  strncpy(op->signer_id, reporter_id, CRABS_MAX_USER_ID - 1);
+  return op;
+}
+
+// A genuine fork: alice signed two DISTINCT ops claiming the same (item,
+// seq 0, zero prev-digest) continuation. The first executed (chain now at
+// seq 1); the sibling never did. A reporter submits both as evidence; the
+// handler convicts and quarantines alice on the item.
+TEST_F(TestStateMachine, ReportEquivocationGenuineForkQuarantines) {
+  state_add_policy(state, "sov_bump", "role:admin");
+  ASSERT_EQ(state_machine_register_handler(state, "sov_bump", sov_bump_handler),
+            CRABS_SUCCESS);
+  state_add_policy(state, CRABS_OP_REPORT_EQUIVOCATION, "role:admin");
+  data_item_t* item = add_sovereign_counter(state, "sov_counter", "alice");
+  ASSERT_NE(item, nullptr);
+
+  const char* reporter_user = "bob";
+  uint64_t reporter_lamport = 0;
+  ecdsa_keypair_t* reporter_key = crypto_ecdsa_generate();
+  ASSERT_NE(reporter_key, nullptr);
+  ASSERT_EQ(crabs_test_register_user_with_role(am, reporter_user,
+                                               reporter_key->public_key,
+                                               "role", "admin"),
+            CRABS_SUCCESS);
+
+  // op_a: signed, and accepted — the honest chain head advance.
+  uint8_t* op_a_bytes = nullptr; uint32_t op_a_len = 0;
+  ASSERT_NO_FATAL_FAILURE(make_serialized_sovereign_op(
+      am, alice_key, &lamport_counter, "sov_bump", "sov_counter", 0x41, 0, &op_a_bytes, &op_a_len));
+  operation_t* op_a = crabs_deserialize_operation(op_a_bytes, op_a_len);
+  ASSERT_NE(op_a, nullptr);
+  ASSERT_EQ(state_machine_execute(state, op_a), CRABS_SUCCESS);
+  operation_destroy(op_a);
+  ASSERT_EQ(item->item_seq, (uint64_t)1);
+
+  // op_b: the sibling fork op — same seq (0), same zero prev digest, signed
+  // by alice after op_a (lamport advanced), never executed here.
+  uint8_t* op_b_bytes = nullptr; uint32_t op_b_len = 0;
+  ASSERT_NO_FATAL_FAILURE(make_serialized_sovereign_op(
+      am, alice_key, &lamport_counter, "sov_bump", "sov_counter", 0x42, 0, &op_b_bytes, &op_b_len));
+  ASSERT_NE(op_a_len == op_b_len &&
+            memcmp(op_a_bytes, op_b_bytes, op_a_len) == 0, true);
+
+  uint64_t version_before = state->version;
+  operation_t* report = make_report_op("sov_counter", "alice", reporter_user,
+                                                      op_a_bytes, op_a_len,
+                                       op_b_bytes, op_b_len, 0x51);
+  sign_as(report, am, reporter_key, reporter_user, &reporter_lamport);
+  EXPECT_EQ(state_machine_execute(state, report), CRABS_SUCCESS);
+  operation_destroy(report);
+
+  EXPECT_EQ(item->fork_count, 1u);
+  EXPECT_TRUE(state_item_is_quarantined(item, "alice"));
+  EXPECT_GT(state->version, version_before);
+
+  // The quarantined writer's later op on the item is rejected (Task 5
+  // interplay), while the reporter — report ≠ quarantine — can still act:
+  // a duplicate re-report reaches the handler and is deduped, not
+  // QUARANTINED-rejected.
+  operation_t* writer_op = make_domain_op("sov_bump", "sov_counter", 0x43);
+  writer_op->sovereign_prefix_count = 1;
+  writer_op->sovereign_prefixes[0].item_seq = 1;
+  {
+    uint8_t digest_copy[CRABS_HASH_SIZE];
+    memcpy(digest_copy, item->item_digest, CRABS_HASH_SIZE);
+    memcpy(writer_op->sovereign_prefixes[0].prev_item_digest, digest_copy,
+           CRABS_HASH_SIZE);
+  }
+  set_signer_key_version(writer_op);
+  sign_operation(writer_op);
+  EXPECT_EQ(state_machine_execute(state, writer_op), CRABS_ERR_QUARANTINED);
+  operation_destroy(writer_op);
+
+  operation_t* duplicate_report = make_report_op("sov_counter", "alice", reporter_user,
+                                                                op_b_bytes, op_b_len,
+                                                 op_a_bytes, op_a_len, 0x52);
+  sign_as(duplicate_report, am, reporter_key, reporter_user, &reporter_lamport);
+  EXPECT_EQ(state_machine_execute(state, duplicate_report),
+            CRABS_ERR_DUPLICATE_OPERATION);
+  operation_destroy(duplicate_report);
+  EXPECT_EQ(item->fork_count, 1u);
+
+  free(op_a_bytes);
+  free(op_b_bytes);
+  crypto_ecdsa_keypair_destroy(reporter_key);
+}
+
+// False evidence must never set the flag: broken signature, mismatched seq,
+// mismatched prev digest, and same-op-twice are all rejected with no state
+// change.
+TEST_F(TestStateMachine, ReportEquivocationFalseEvidenceRejected) {
+  state_add_policy(state, "sov_bump", "role:admin");
+  ASSERT_EQ(state_machine_register_handler(state, "sov_bump", sov_bump_handler),
+            CRABS_SUCCESS);
+  state_add_policy(state, CRABS_OP_REPORT_EQUIVOCATION, "role:admin");
+  data_item_t* item = add_sovereign_counter(state, "sov_counter", "alice");
+  ASSERT_NE(item, nullptr);
+
+  const char* reporter_user = "bob";
+  uint64_t reporter_lamport = 0;
+  ecdsa_keypair_t* reporter_key = crypto_ecdsa_generate();
+  ASSERT_NE(reporter_key, nullptr);
+  ASSERT_EQ(crabs_test_register_user_with_role(am, reporter_user,
+                                               reporter_key->public_key,
+                                               "role", "admin"),
+            CRABS_SUCCESS);
+
+  uint8_t* op_a_bytes = nullptr; uint32_t op_a_len = 0;
+  ASSERT_NO_FATAL_FAILURE(make_serialized_sovereign_op(
+      am, alice_key, &lamport_counter, "sov_bump", "sov_counter", 0x44, 0, &op_a_bytes, &op_a_len));
+  uint8_t* op_b_bytes = nullptr; uint32_t op_b_len = 0;
+  ASSERT_NO_FATAL_FAILURE(make_serialized_sovereign_op(
+      am, alice_key, &lamport_counter, "sov_bump", "sov_counter", 0x45, 0, &op_b_bytes, &op_b_len));
+
+  // (a) op_b with a broken signature → UNAUTHORIZED, flag not set.
+  {
+    operation_t* broken = crabs_deserialize_operation(op_b_bytes, op_b_len);
+    ASSERT_NE(broken, nullptr);
+    broken->signature[0] ^= 0xFF;
+    serialized_buffer_t* broken_ser = crabs_serialize_operation(broken);
+    operation_destroy(broken);
+    ASSERT_NE(broken_ser, nullptr);
+    uint64_t version_before = state->version;
+    operation_t* report = make_report_op("sov_counter", "alice", reporter_user,
+                                                        op_a_bytes, op_a_len,
+                                         (const uint8_t*)broken_ser->data,
+                                         (uint32_t)broken_ser->len, 0x53);
+    sign_as(report, am, reporter_key, reporter_user, &reporter_lamport);
+    EXPECT_EQ(state_machine_execute(state, report), CRABS_ERR_UNAUTHORIZED);
+    operation_destroy(report);
+    serialized_buffer_destroy(broken_ser);
+    EXPECT_EQ(item->fork_count, 0u);
+    EXPECT_EQ(state->version, version_before);
+  }
+
+  // (b) seq differs between the two ops → not a fork claim about one slot.
+  {
+    uint8_t* op_c_bytes = nullptr; uint32_t op_c_len = 0;
+    ASSERT_NO_FATAL_FAILURE(make_serialized_sovereign_op(
+        am, alice_key, &lamport_counter,
+        "sov_bump", "sov_counter", 0x46, 1, &op_c_bytes, &op_c_len));
+    uint64_t version_before = state->version;
+    operation_t* report = make_report_op("sov_counter", "alice", reporter_user,
+                                                        op_a_bytes, op_a_len,
+                                         op_c_bytes, op_c_len, 0x54);
+    sign_as(report, am, reporter_key, reporter_user, &reporter_lamport);
+    EXPECT_EQ(state_machine_execute(state, report), CRABS_ERR_INVALID_PARAM);
+    operation_destroy(report);
+    EXPECT_EQ(item->fork_count, 0u);
+    EXPECT_EQ(state->version, version_before);
+    free(op_c_bytes);
+  }
+
+  // (c) prev digest differs: the two ops do not claim the same chain head.
+  {
+    operation_t* divergent = make_domain_op("sov_bump", "sov_counter", 0x47);
+    divergent->sovereign_prefix_count = 1;
+    divergent->sovereign_prefixes[0].item_seq = 0;
+    memset(divergent->sovereign_prefixes[0].prev_item_digest, 0x11,
+           CRABS_HASH_SIZE);
+    set_signer_key_version(divergent);
+    sign_operation(divergent);
+    serialized_buffer_t* divergent_ser = crabs_serialize_operation(divergent);
+    operation_destroy(divergent);
+    ASSERT_NE(divergent_ser, nullptr);
+    uint64_t version_before = state->version;
+    operation_t* report = make_report_op("sov_counter", "alice", reporter_user,
+                                                        op_a_bytes, op_a_len,
+                                         (const uint8_t*)divergent_ser->data,
+                                         (uint32_t)divergent_ser->len, 0x55);
+    sign_as(report, am, reporter_key, reporter_user, &reporter_lamport);
+    EXPECT_EQ(state_machine_execute(state, report), CRABS_ERR_INVALID_PARAM);
+    operation_destroy(report);
+    serialized_buffer_destroy(divergent_ser);
+    EXPECT_EQ(item->fork_count, 0u);
+    EXPECT_EQ(state->version, version_before);
+  }
+
+  // (d) the same op twice is one claim, not a fork.
+  {
+    uint64_t version_before = state->version;
+    operation_t* report = make_report_op("sov_counter", "alice", reporter_user,
+                                                        op_a_bytes, op_a_len,
+                                         op_a_bytes, op_a_len, 0x56);
+    sign_as(report, am, reporter_key, reporter_user, &reporter_lamport);
+    EXPECT_EQ(state_machine_execute(state, report), CRABS_ERR_INVALID_PARAM);
+    operation_destroy(report);
+    EXPECT_EQ(item->fork_count, 0u);
+    EXPECT_EQ(state->version, version_before);
+  }
+
+  free(op_a_bytes);
+  free(op_b_bytes);
+  crypto_ecdsa_keypair_destroy(reporter_key);
+}
+
+// The report target must be an existing SOVEREIGN item owned by the named
+// writer; FREE_MERGE targets and missing items reject without setting flags.
+TEST_F(TestStateMachine, ReportEquivocationTargetGuards) {
+  state_add_policy(state, "sov_bump", "role:admin");
+  ASSERT_EQ(state_machine_register_handler(state, "sov_bump", sov_bump_handler),
+            CRABS_SUCCESS);
+  state_add_policy(state, CRABS_OP_REPORT_EQUIVOCATION, "role:admin");
+  data_item_t* free_item =
+      data_item_create("free_counter", DATA_TYPE_COUNTER, CRDT_G_COUNTER);
+  free_item->value = g_counter_create();
+  ASSERT_EQ(state_add_item(state, free_item), CRABS_SUCCESS);
+  data_item_t* item = add_sovereign_counter(state, "sov_counter", "alice");
+  ASSERT_NE(item, nullptr);
+
+  const char* reporter_user = "bob";
+  uint64_t reporter_lamport = 0;
+  ecdsa_keypair_t* reporter_key = crypto_ecdsa_generate();
+  ASSERT_NE(reporter_key, nullptr);
+  ASSERT_EQ(crabs_test_register_user_with_role(am, reporter_user,
+                                               reporter_key->public_key,
+                                               "role", "admin"),
+            CRABS_SUCCESS);
+
+  uint8_t* op_a_bytes = nullptr; uint32_t op_a_len = 0;
+  ASSERT_NO_FATAL_FAILURE(make_serialized_sovereign_op(
+      am, alice_key, &lamport_counter, "sov_bump", "sov_counter", 0x48, 0, &op_a_bytes, &op_a_len));
+  uint8_t* op_b_bytes = nullptr; uint32_t op_b_len = 0;
+  ASSERT_NO_FATAL_FAILURE(make_serialized_sovereign_op(
+      am, alice_key, &lamport_counter, "sov_bump", "sov_counter", 0x49, 0, &op_b_bytes, &op_b_len));
+
+  // FREE_MERGE target: INVALID_PARAM.
+  operation_t* free_target = make_report_op("free_counter", "alice", reporter_user,
+                                                           op_a_bytes, op_a_len,
+                                            op_b_bytes, op_b_len, 0x57);
+  sign_as(free_target, am, reporter_key, reporter_user, &reporter_lamport);
+  EXPECT_EQ(state_machine_execute(state, free_target), CRABS_ERR_INVALID_PARAM);
+  operation_destroy(free_target);
+
+  // Missing item: RESOURCE_NOT_FOUND.
+  operation_t* missing_target = make_report_op("no_such_item", "alice", reporter_user,
+                                                              op_a_bytes, op_a_len,
+                                               op_b_bytes, op_b_len, 0x58);
+  sign_as(missing_target, am, reporter_key, reporter_user, &reporter_lamport);
+  EXPECT_EQ(state_machine_execute(state, missing_target),
+            CRABS_ERR_RESOURCE_NOT_FOUND);
+  operation_destroy(missing_target);
+
+  // Payload writer ≠ item writer: INVALID_PARAM.
+  operation_t* wrong_writer = make_report_op("sov_counter", "bob", reporter_user,
+                                                            op_a_bytes, op_a_len,
+                                             op_b_bytes, op_b_len, 0x59);
+  sign_as(wrong_writer, am, reporter_key, reporter_user, &reporter_lamport);
+  EXPECT_EQ(state_machine_execute(state, wrong_writer), CRABS_ERR_INVALID_PARAM);
+  operation_destroy(wrong_writer);
+
+  EXPECT_EQ(item->fork_count, 0u);
+  free(op_a_bytes);
+  free(op_b_bytes);
+  crypto_ecdsa_keypair_destroy(reporter_key);
+}
+
+// The report op type is builtin + protected: not re-definable via
+// __define_operation_type__ (the A10-M1 guard covers it).
+TEST_F(TestStateMachine, ReportEquivocationIsBuiltinAndProtected) {
+  EXPECT_TRUE(operation_is_builtin(CRABS_OP_REPORT_EQUIVOCATION));
+  EXPECT_TRUE(operation_is_protected(CRABS_OP_REPORT_EQUIVOCATION));
+
+  // Direct handler invocation, mirroring the lineage protected-guard
+  // regression test (the handler's protected check precedes any spec work).
+  operation_t* define = operation_create(CRABS_OP_DEFINE_OPERATION);
+  memset(define->uuid, 0x5A, CRABS_UUID_SIZE);
+  define->resources = (char(*)[CRABS_MAX_USER_ID])malloc(CRABS_MAX_USER_ID);
+  strncpy(define->resources[0], CRABS_OP_REPORT_EQUIVOCATION,
+          CRABS_MAX_USER_ID - 1);
+  define->resource_count = 1;
+  define->dedup.type = DEDUP_PER_USER;
+  strncpy(define->dedup.tracker_path, "voters", CRABS_MAX_DEDUP_PATH - 1);
+  EXPECT_EQ(state_machine_op_define_operation(state, define),
+            CRABS_ERR_INVALID_PARAM);
+  EXPECT_EQ(state_find_op_type_def(state, CRABS_OP_REPORT_EQUIVOCATION),
+            nullptr);
+  operation_destroy(define);
+}
+
