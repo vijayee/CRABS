@@ -142,8 +142,9 @@ typedef struct data_item_t {
   // SOVEREIGN: writer-assigned monotonic sequence over this writer's ops on
   // the item; 0 before the first op, incremented on each accepted op.
   uint64_t         item_seq;
-  // SOVEREIGN: SHA-256 over the item's post-op serialized form (the same
-  // shape _serialize_data_item produces). Zeroed while item_seq == 0.
+  // SOVEREIGN: SHA-256 over the item's post-op content-only form
+  // (state_item_digest_compute over _serialize_data_item_chain_preimage —
+  // runtime protocol_state excluded). Zeroed while item_seq == 0.
   uint8_t          item_digest[CRABS_HASH_SIZE];
   // GROUP_ORDERED: attached ordering module id. 0 = unset — v1 ships no
   // modules, so a GROUP_ORDERED item with module 0 is read-only (DOMAIN_CHECK
@@ -666,9 +667,13 @@ crabs_error_e state_append_fork_evidence(data_item_t* item,
 // DOMAIN_CHECK rejects their further writes with CRABS_ERR_QUARANTINED).
 // NULL item/writer → false (attribution checks run before this lookup).
 bool state_item_is_quarantined(const data_item_t* item, const char* writer);
-// SHA-256 over the item's current serialized form (the same shape the state
-// serializer emits per item), used for the sovereign hash chain. Content-
-// comparable across replicas: identical item content ⇒ identical digest.
+// SHA-256 over the item's content-only serialized form
+// (crabs_serialize_data_item_chain_preimage), used for the sovereign hash
+// chain. Content-comparable across replicas: identical writer-mutable
+// item content ⇒ identical digest. Runtime protocol_state is EXCLUDED —
+// replica-local lock state is not chain content (pre-fix its inclusion
+// manufactured false fork evidence at merge). The state file's integrity
+// checksum still hashes the durable form including protocol_state.
 crabs_error_e state_item_digest_compute(const data_item_t* item,
                                         uint8_t out_digest[CRABS_HASH_SIZE]);
 

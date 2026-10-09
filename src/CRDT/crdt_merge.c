@@ -596,6 +596,13 @@ static void _merge_notify_divergence(state_t* dst, const char* type,
 //     FORK_DETECTED change event. Note the chain history that a full fork
 //     proof needs lives in the op log, not derivable from two snapshots —
 //     the v1 rule therefore keys on (seq, digest) alone.
+//
+// Conviction soundness rests on the digest being content-only: the preimage
+// (crabs_serialize_data_item_chain_preimage via state_item_digest_compute)
+// excludes runtime protocol_state, so a lock taken on ONE replica moves only
+// that replica's runtime state, never its chain head. If the digest moved
+// with runtime state, this branch would convict an honest writer for a
+// replica-local lock — see the fix-note in serialization.h.
 static void _merge_sovereign_item(state_t* dst, data_item_t* dst_item,
                                   const data_item_t* src_item) {
   if (strcmp(dst_item->writer, src_item->writer) != 0) {

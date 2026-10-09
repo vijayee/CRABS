@@ -998,3 +998,32 @@ TEST(TestDataModel, ItemDigestComputeDeterministic) {
   data_item_destroy(empty_a);
   data_item_destroy(empty_b);
 }
+
+// The sovereign chain digest is content-only: runtime protocol_state (replica-local
+// lock/modified state) must NOT move it. Pre-fix, digest divergence from a lock
+// taken on a single replica was a merge-time false-conviction vector (equal seq +
+// different digest convicts the writer and quarantines them).
+TEST(TestDataModel, ItemDigestChainPreimageIgnoresProtocolState) {
+  int64_t value_locked = 42;
+  int64_t value_idle = 42;
+
+  data_item_t* item_locked = data_item_create("sov", DATA_TYPE_COUNTER, CRDT_G_COUNTER);
+  data_item_t* item_idle = data_item_create("sov", DATA_TYPE_COUNTER, CRDT_G_COUNTER);
+  item_locked->value = &value_locked;
+  item_idle->value = &value_idle;
+  item_locked->protocol_state = PROTOCOL_LOCKED;
+  item_idle->protocol_state = PROTOCOL_IDLE;
+
+  uint8_t digest_locked[CRABS_HASH_SIZE];
+  uint8_t digest_idle[CRABS_HASH_SIZE];
+  ASSERT_EQ(state_item_digest_compute(item_locked, digest_locked), CRABS_SUCCESS);
+  ASSERT_EQ(state_item_digest_compute(item_idle, digest_idle), CRABS_SUCCESS);
+  // Runtime lock state is replica-local, not chain content: digests must match.
+  EXPECT_EQ(memcmp(digest_locked, digest_idle, CRABS_HASH_SIZE), 0)
+      << "chain digest must not move with protocol_state";
+
+  item_locked->value = nullptr;
+  item_idle->value = nullptr;
+  data_item_destroy(item_locked);
+  data_item_destroy(item_idle);
+}

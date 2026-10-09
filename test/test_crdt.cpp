@@ -767,6 +767,8 @@ TEST(TestCRDTMerge, TestSovereignMergeKeepsLocalWhenAhead) {
 
 // SOVEREIGN: equal seq + equal digest is an identical head — no-op, and the
 // local value object is left untouched.
+// SOVEREIGN: equal seq + equal digest is an identical head — no-op, and the
+// local value object is left untouched.
 TEST(TestCRDTMerge, TestSovereignMergeIdenticalHeadIsNoOp) {
   state_t* dst = state_create();
   state_t* src = state_create();
@@ -791,6 +793,72 @@ TEST(TestCRDTMerge, TestSovereignMergeIdenticalHeadIsNoOp) {
 
   _destroy_state_values(dst);
   _destroy_state_values(src);
+  state_destroy(dst);
+  state_destroy(src);
+}
+
+// SOVEREIGN: equal seq + equal content with DIVERGENT protocol_state on the two
+// replicas must NOT convict. The chain digest is content-only, so runtime lock
+// state on a single replica reads as an identical head — no fork evidence, no
+// event. Pre-fix the preimage included protocol_state, so a lock taken on one
+// replica alone produced false fork evidence against an honest writer.
+TEST(TestCRDTMerge, TestSovereignMergeProtocolStateDivergenceIsNotFork) {
+  state_t* dst = state_create();
+  state_t* src = state_create();
+  merge_event_capture_t capture = {};
+  state_set_change_hook(dst, _merge_event_hook, &capture);
+
+  // A LWW register with a raw int64_t value — the chain serializer covers this
+  // shape exactly (REGISTER emits the int64 bytes), so the same content pins
+  // identical digests when protocol_state is excluded from the preimage.
+  // Identical content, identical chain position, same writer; the digest cache
+  // is stamped by the same path the state machine uses post-op
+  // (state_item_digest_compute), so the test reproduces the merge-time
+  // (seq, digest) comparison exactly.
+  auto make_sovereign_register = [](const char* writer, uint64_t item_seq,
+                                    int64_t register_value) {
+    data_item_options_t options;
+    memset(&options, 0, sizeof(options));
+    options.write_domain = CRABS_DOMAIN_SOVEREIGN;
+    options.writer = writer;
+    data_item_t* item = nullptr;
+    EXPECT_EQ(data_item_create_with_options("vault", DATA_TYPE_REGISTER,
+                                            CRDT_LWW_REG, &options, &item),
+              CRABS_SUCCESS);
+    if (item == nullptr) return (data_item_t*)nullptr;
+    int64_t* value = (int64_t*)malloc(sizeof(int64_t));
+    *value = register_value;
+    item->value = value;
+    item->item_seq = item_seq;
+    return item;
+  };
+
+  data_item_t* dst_item = make_sovereign_register("alice", 4, 7);
+  data_item_t* src_item = make_sovereign_register("alice", 4, 7);
+  ASSERT_NE(dst_item, nullptr);
+  ASSERT_NE(src_item, nullptr);
+  // One replica holds a runtime lock; the other doesn't.
+  dst_item->protocol_state = PROTOCOL_LOCKED;
+  src_item->protocol_state = PROTOCOL_IDLE;
+  ASSERT_EQ(state_item_digest_compute(dst_item, dst_item->item_digest),
+            CRABS_SUCCESS);
+  ASSERT_EQ(state_item_digest_compute(src_item, src_item->item_digest),
+            CRABS_SUCCESS);
+  state_add_item(dst, dst_item);
+  state_add_item(src, src_item);
+
+  EXPECT_EQ(crdt_merge_state(dst, src), CRABS_SUCCESS);
+
+  data_item_t* merged = state_find_item(dst, "vault");
+  ASSERT_NE(merged, nullptr);
+  // No fork evidence, no quarantine conviction, no merge events.
+  EXPECT_EQ(merged->fork_count, 0u);
+  EXPECT_FALSE(state_item_is_quarantined(merged, "alice"));
+  EXPECT_EQ(capture.calls, 0)
+      << "protocol-state divergence must NOT fork-convict a legitimate writer";
+
+  // Values are raw int64_t* (not lww_register_t*), so skip _destroy_state_values
+  // and let state_destroy's data_item_destroy default-arm free() them.
   state_destroy(dst);
   state_destroy(src);
 }

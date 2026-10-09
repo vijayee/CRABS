@@ -458,15 +458,22 @@ bool state_item_is_quarantined(const data_item_t* item, const char* writer) {
   return false;
 }
 
-// Serialize the item's current form to buf (cap bytes) for hashing — the
-// exact per-item shape the state serializer emits (crabs_serialize_data_item),
-// so the sovereign chain digest is content-comparable across replicas. buf
-// may be NULL to only query the required length via out_len.
+// Serialize the item's chain-preimage form to buf (cap bytes) for hashing —
+// the content-only per-item shape (crabs_serialize_data_item_chain_preimage).
+// Runtime protocol_state is excluded: replica-local lock state must NOT move
+// the digest; only writer-mutable content distinguishes heads. buf may be
+// NULL to only query the required length via out_len.
+//
+// Distinct from the state serializer's durable integrity form (which DOES
+// include protocol_state — the state file's checksum covers durable state):
+// the chain digest answers "same content across replicas?", and any answer
+// keyed to runtime state manufactures false fork evidence at merge.
 static crabs_error_e _state_item_digest_serialize(const data_item_t* item,
                                                   uint8_t* buf, size_t cap,
                                                   size_t* out_len) {
   if (item == NULL || out_len == NULL) return CRABS_ERR_INVALID_PARAM;
-  serialized_buffer_t* serialized = crabs_serialize_data_item(item);
+  serialized_buffer_t* serialized =
+      crabs_serialize_data_item_chain_preimage(item);
   if (serialized == NULL) return CRABS_ERR_SERIALIZATION_ERROR;
   *out_len = serialized->len;
   crabs_error_e status = CRABS_SUCCESS;

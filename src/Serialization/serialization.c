@@ -913,18 +913,32 @@ static void* _deserialize_crdt_value(const uint8_t* data, uint32_t len, data_typ
 }
 
 // ============================================================
-// Data item serialization (§13.2)
+// Data item serialization (§13.2 + chain preimage, write-domains v1)
 // ============================================================
-// NOTE (write-domains v1): this function's output IS the preimage of the
-// sovereign item hash chain via crabs_serialize_data_item below. The v14
-// per-item domain tail (write_domain/writer/item_seq/item_digest/fork set)
-// is emitted by the per-item call site that versions it (the state
-// serializer's item loop), NOT folded in here — the digest preimage
-// deliberately excludes domain metadata (see serialization.h; folding
-// item_digest into its own preimage is self-referential, and folding
-// item_seq in would couple the digest to chain position rather than
-// content).
-static void _serialize_data_item(write_buf_t* buf, const data_item_t* item) {
+// The sovereign hash-chain digest (state_item_digest_compute) is content-
+// only — cross-replica COMPARABLE by content. Two fields must NOT move it:
+//   (a) the v14 per-item domain tail (write_domain/writer/item_seq/
+//       item_digest/fork set): folding item_digest into its own preimage is
+//       self-referential, and folding item_seq in would couple the digest to
+//       chain position rather than content. It is emitted by the per-item
+//       call site that versions it (the state serializer's item loop), never
+//       here.
+//   (b) runtime protocol_state (lock taken/released, IDLE→LOCKED→MODIFIED
+//       transitions): replica-local by definition. Including it lets a lock
+//       taken on ONE replica change only that replica's digest, and at merge
+//       "equal seq + different digest" convicts the writer and quarantines
+//       them — a griefing vector where a runtime lock alone creates false
+//       fork evidence. See the fix-note on
+//       crabs_serialize_data_item_chain_preimage in serialization.h.
+//
+// The interior below therefore emits name/type/crdt_type/value/invariants/
+// last_compaction_time exactly as the durable per-item shape does, with the
+// protocol_state byte gated by include_protocol_state: true only for the
+// durable-state form (_serialize_data_item / crabs_serialize_data_item),
+// false for the sovereign chain preimage
+// (_serialize_data_item_chain_preimage).
+static void _serialize_data_item_shape(write_buf_t* buf, const data_item_t* item,
+                                       bool include_protocol_state) {
   // name_length + name
   _write_string16(buf, item->name);
 
@@ -934,8 +948,12 @@ static void _serialize_data_item(write_buf_t* buf, const data_item_t* item) {
   // crdt_type_id
   _write_uint8(buf, (uint8_t)item->crdt_type);
 
-  // protocol_state
-  _write_uint8(buf, (uint8_t)item->protocol_state);
+  // protocol_state: durable-state integrity form ONLY (the state file's
+  // checksum covers the byte). The sovereign chain preimage must exclude it —
+  // runtime state is replica-local.
+  if (include_protocol_state) {
+    _write_uint8(buf, (uint8_t)item->protocol_state);
+  }
 
   // value: For simple types, serialize the value as bytes
   // For OT types, serialize the full OT data item (op_log, position_map, etc.)
@@ -999,6 +1017,22 @@ static void _serialize_data_item(write_buf_t* buf, const data_item_t* item) {
 
   // last_compaction_time (v5: v1.5.2 §7)
   _write_uint64_le(buf, item->last_compaction_time);
+}
+
+// Durable per-item shape (state-file integrity bytes + the public wrapper
+// crabs_serialize_data_item). Includes the runtime protocol_state byte.
+static void _serialize_data_item(write_buf_t* buf, const data_item_t* item) {
+  _serialize_data_item_shape(buf, item, /*include_protocol_state=*/true);
+}
+
+// Chain-digest preimage: identical to the durable per-item shape MINUS the
+// protocol_state byte. Runtime state is replica-local; folding it in would
+// let a lock taken on one replica change only that replica's digest, which
+// at cross-replica merge ("equal seq + different digest") reads as fork
+// evidence and quarantines an honest writer.
+static void _serialize_data_item_chain_preimage(write_buf_t* buf,
+                                                const data_item_t* item) {
+  _serialize_data_item_shape(buf, item, /*include_protocol_state=*/false);
 }
 
 static bool _deserialize_data_item(read_buf_t* buf, data_item_t* item, uint32_t version) {
@@ -1186,10 +1220,13 @@ static bool _deserialize_data_item(read_buf_t* buf, data_item_t* item, uint32_t 
   return true;
 }
 
-// Public single-item form (write-domains v1): delegates to
-// _serialize_data_item so the sovereign hash chain hashes exactly the shape
-// the state serializer emits per item. Deliberately covers the pre-domain
-// (v13) item form only — see the NOTE on the declaration in serialization.h.
+// Public single-item durable form (write-domains v1): delegates to
+// _serialize_data_item so the state serializer's per-item integrity bytes
+// hash exactly the shape written to the state file (protocol_state included
+// — durable state IS the file's checksum subject). Deliberately covers the
+// pre-domain (v13) item form only — see the NOTE on the declaration in
+// serialization.h. Chain digests must instead go through
+// crabs_serialize_data_item_chain_preimage below.
 serialized_buffer_t* crabs_serialize_data_item(const data_item_t* item) {
   if (item == NULL) return NULL;
   write_buf_t* buf = _write_buf_create(256);
@@ -1202,12 +1239,30 @@ serialized_buffer_t* crabs_serialize_data_item(const data_item_t* item) {
   return result;
 }
 
+// Public single-item chain-preimage form (write-domains v1): delegates to
+// _serialize_data_item_chain_preimage so the sovereign hash chain digests
+// exactly the content-only per-item shape — protocol_state excluded. See
+// the notes above _serialize_data_item_shape and the chain-preimage
+// declaration in serialization.h.
+serialized_buffer_t* crabs_serialize_data_item_chain_preimage(
+    const data_item_t* item) {
+  if (item == NULL) return NULL;
+  write_buf_t* buf = _write_buf_create(256);
+  _serialize_data_item_chain_preimage(buf, item);
+  serialized_buffer_t* result = serialized_buffer_create(buf->offset);
+  memcpy(result->data, buf->data, buf->offset);
+  result->len = buf->offset;
+  free(buf->data);
+  free(buf);
+  return result;
+}
+
 // v14 (write-domains v1): the per-item write-domain tail. Emitted by the
 // state serializer's item loop AFTER _serialize_data_item's pre-domain
-// bytes — never inside _serialize_data_item itself, because that function's
-// output is the preimage of the sovereign hash chain
-// (crabs_serialize_data_item) and folding item_seq/item_digest into their
-// own preimage is self-referential.
+// bytes — never inside either per-item shape, because neither the durable
+// form (crabs_serialize_data_item) nor the chain preimage
+// (crabs_serialize_data_item_chain_preimage) carries it; folding
+// item_seq/item_digest into the digest's own preimage is self-referential.
 //
 // Layout: u8 write_domain, then a domain-specific arm:
 //   FREE_MERGE:    nothing more — a default item's tail is one 0x00 byte.
@@ -1669,8 +1724,9 @@ static serialized_buffer_t* _serialize_state_internal(const state_t* state,
   while (item != NULL) {
     _serialize_data_item(buf, item);
     // v14: per-item write-domain tail. The tail goes HERE (the state's item
-    // stream), not into _serialize_data_item — that helper is the sovereign
-    // hash-chain preimage and must stay the pre-domain form. Fail-loud:
+    // stream), not into either per-item shape — both the durable form
+    // (_serialize_data_item) and the chain preimage share the v13 field set
+    // and must stay free of domain/chain-position metadata. Fail-loud:
     // the writer never emits a blob its own reader would reject.
     if (!_serialize_data_item_domain_tail(buf, item)) {
       free(buf->data);

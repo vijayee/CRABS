@@ -91,8 +91,8 @@ serialized_buffer_t* crabs_serialize_for_signing(const operation_t* op);
 
 // Serialize a single data item in exactly the per-item shape
 // crabs_serialize_state writes (name/type/crdt/protocol_state/value/
-// invariants/last_compaction_time). Used by the write-domains sovereign
-// hash chain so an item's digest is content-comparable across replicas.
+// invariants/last_compaction_time). Used by the state serializer's per-item
+// integrity path — protocol_state IS part of the durable snapshot.
 // NOTE (v14): this preimage MUST keep covering the pre-domain (v13) item
 // form only — the v14 domain tail (write_domain/writer/item_seq/
 // item_digest/fork set) is emitted by the state serializer's per-item loop,
@@ -100,6 +100,20 @@ serialized_buffer_t* crabs_serialize_for_signing(const operation_t* op);
 // self-referential and folding item_seq in would couple the digest to chain
 // position rather than content.
 serialized_buffer_t* crabs_serialize_data_item(const data_item_t* item);
+
+// Sovereign chain-digest preimage (write-domains v1): identical field set
+// to crabs_serialize_data_item MINUS the runtime protocol_state byte — the
+// chain digest must be content-only. Runtime lock/MODIFIED state diverges
+// across replicas (a lock taken on one replica); pre-fix that alone moved
+// the digest, and at merge the equal-seq/different-digest rule convicted the
+// writer and appended quarantine evidence. Excluding the byte keeps merge
+// conviction as strong as digest determinism — only writer-mutable content
+// (name/type/crdt_type/value/invariants/last_compaction_time) distinguishes
+// heads. The v14 domain tail is excluded here for the same reason as the
+// durable form: chain position and chain digest cannot be their own
+// preimage.
+serialized_buffer_t* crabs_serialize_data_item_chain_preimage(
+    const data_item_t* item);
 
 // ============================================================
 // Buffer helpers

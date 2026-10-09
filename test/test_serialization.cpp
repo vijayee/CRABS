@@ -3481,6 +3481,59 @@ TEST(StateSerialize, V14ItemDigestPreimageExcludesDomainTail) {
   data_item_destroy(sov_item);
 }
 
+// The chain preimage (crabs_serialize_data_item_chain_preimage, what the
+// sovereign digest actually hashes) emits the SAME field set as the durable
+// per-item form MINUS the runtime protocol_state byte — and, like the durable
+// form, excludes the v14 domain tail. Two items whose ONLY differences are
+// runtime protocol_state plus domain metadata must produce byte-identical
+// chain preimages; and a chain preimage is exactly one byte shorter than the
+// durable form of an otherwise-identical item.
+TEST(StateSerialize, V14ChainPreimageExcludesProtocolStateAndDomainTail) {
+  data_item_t* locked_free =
+      data_item_create("chain-item", DATA_TYPE_REGISTER, CRDT_LWW_REG);
+  int64_t* locked_val = (int64_t*)malloc(sizeof(int64_t));
+  *locked_val = 42;
+  locked_free->value = locked_val;
+  locked_free->protocol_state = PROTOCOL_LOCKED;
+
+  data_item_t* modified_sov = nullptr;
+  data_item_options_t sov_opts = {CRABS_DOMAIN_SOVEREIGN, "alice", 0};
+  ASSERT_EQ(data_item_create_with_options("chain-item", DATA_TYPE_REGISTER,
+                                          CRDT_LWW_REG, &sov_opts, &modified_sov),
+            CRABS_SUCCESS);
+  int64_t* modified_val = (int64_t*)malloc(sizeof(int64_t));
+  *modified_val = 42;
+  modified_sov->value = modified_val;
+  modified_sov->item_seq = 12;
+  memset(modified_sov->item_digest, 0xAB, CRABS_HASH_SIZE);
+  modified_sov->protocol_state = PROTOCOL_MODIFIED;
+
+  serialized_buffer_t* locked_form =
+      crabs_serialize_data_item_chain_preimage(locked_free);
+  serialized_buffer_t* modified_form =
+      crabs_serialize_data_item_chain_preimage(modified_sov);
+  ASSERT_NE(locked_form, nullptr);
+  ASSERT_NE(modified_form, nullptr);
+  ASSERT_EQ(locked_form->len, modified_form->len);
+  EXPECT_EQ(memcmp(locked_form->data, modified_form->data, locked_form->len), 0)
+      << "chain preimage must not move with protocol_state or domain fields";
+
+  // The chain preimage differs from the durable form of an otherwise identical
+  // item by exactly one byte: the protocol_state byte.
+  serialized_buffer_t* durable_form = crabs_serialize_data_item(locked_free);
+  ASSERT_NE(durable_form, nullptr);
+  EXPECT_EQ(durable_form->len, locked_form->len + 1)
+      << "chain preimage = durable form minus the protocol_state byte";
+
+  EXPECT_EQ(crabs_serialize_data_item_chain_preimage(nullptr), nullptr);
+
+  serialized_buffer_destroy(locked_form);
+  serialized_buffer_destroy(modified_form);
+  serialized_buffer_destroy(durable_form);
+  data_item_destroy(locked_free);
+  data_item_destroy(modified_sov);
+}
+
 // Pre-v14 loads: a v13 blob carries no domain tail; every item restores as
 // FREE_MERGE with zeroed chain/quarantine fields. Surgery: the v14 tail for
 // a default item is exactly one 0x00 byte — strip each one (the strip points

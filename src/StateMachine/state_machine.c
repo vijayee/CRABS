@@ -1101,8 +1101,9 @@ static crabs_error_e _run_domain_check(state_t* state, const operation_t* op) {
 
 // Post-handler sovereign chain bookkeeping: advance each touched SOVEREIGN
 // item (item_seq + 1) and recompute item_digest over the item's post-op
-// serialized form (state_item_digest_compute — the same per-item shape the
-// state serializer emits). Runs only on the success path, after the handler
+// content-only form (state_item_digest_compute — protocol_state excluded;
+// runtime lock state is replica-local and must not change the digest).
+// Runs only on the success path, after the handler
 // / step-7b transitions / dedup mutation and BEFORE append_log — the same
 // placement as the other per-op in-memory bookkeeping (R8-S-4 context):
 // there is no rollback machinery for op mutations, and an append_log failure
