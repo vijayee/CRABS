@@ -10,6 +10,7 @@ extern "C" {
 #include "../src/Attribute/attribute_machine.h"
 #include "../src/Crypto/crypto.h"
 #include "../src/Serialization/serialization.h"
+#include "../src/CRDT/crdt_merge.h"
 #include "test_helpers.h"
 }
 
@@ -957,13 +958,20 @@ TEST(TestDataModel, AppendForkEvidenceDedupeAndCap) {
 }
 
 TEST(TestDataModel, ItemDigestComputeDeterministic) {
-  int64_t value_a = 7;
-  int64_t value_b = 7;
-
+  // Struct-backed representation: two independently allocated g_counters
+  // holding the same logical content must digest alike. Pre-fix the chain
+  // preimage hashed the first 8 bytes of the struct (the entries heap
+  // POINTER), so independent allocations of identical content digested
+  // differently — a cross-replica false-fork vector.
   data_item_t* item_a = data_item_create("c", DATA_TYPE_COUNTER, CRDT_G_COUNTER);
   data_item_t* item_b = data_item_create("c", DATA_TYPE_COUNTER, CRDT_G_COUNTER);
-  item_a->value = &value_a;
-  item_b->value = &value_b;
+  item_a->value = g_counter_create();
+  item_b->value = g_counter_create();
+  g_counter_increment((g_counter_t*)item_a->value, "node1", 3);
+  g_counter_increment((g_counter_t*)item_a->value, "node2", 4);
+  // Insertion order differs; logical content is the same.
+  g_counter_increment((g_counter_t*)item_b->value, "node2", 4);
+  g_counter_increment((g_counter_t*)item_b->value, "node1", 3);
 
   uint8_t digest_a[CRABS_HASH_SIZE];
   uint8_t digest_b[CRABS_HASH_SIZE];
@@ -973,7 +981,7 @@ TEST(TestDataModel, ItemDigestComputeDeterministic) {
   EXPECT_EQ(memcmp(digest_a, digest_b, CRABS_HASH_SIZE), 0);
 
   // Different content → different digest.
-  value_b = 8;
+  g_counter_increment((g_counter_t*)item_b->value, "node2", 1);
   ASSERT_EQ(state_item_digest_compute(item_b, digest_b), CRABS_SUCCESS);
   EXPECT_NE(memcmp(digest_a, digest_b, CRABS_HASH_SIZE), 0);
 
@@ -990,13 +998,40 @@ TEST(TestDataModel, ItemDigestComputeDeterministic) {
   EXPECT_EQ(state_item_digest_compute(nullptr, digest_a), CRABS_ERR_INVALID_PARAM);
   EXPECT_EQ(state_item_digest_compute(item_a, nullptr), CRABS_ERR_INVALID_PARAM);
 
-  // Values point into test-owned storage — detach before destroy.
-  item_a->value = nullptr;
-  item_b->value = nullptr;
+  g_counter_destroy((g_counter_t*)item_a->value); item_a->value = nullptr;
+  g_counter_destroy((g_counter_t*)item_b->value); item_b->value = nullptr;
   data_item_destroy(item_a);
   data_item_destroy(item_b);
   data_item_destroy(empty_a);
   data_item_destroy(empty_b);
+}
+
+// LWW-register equivalent of the counter determinism property: independent
+// allocations with identical (value, timestamp, node) content must digest
+// alike; pre-fix the preimage hashed the register's value-pointer field.
+TEST(TestDataModel, ItemDigestRegisterContentDeterministic) {
+  int64_t stored_a = 99;
+  int64_t stored_b = 99;
+  data_item_t* item_a = data_item_create("reg", DATA_TYPE_REGISTER, CRDT_LWW_REG);
+  data_item_t* item_b = data_item_create("reg", DATA_TYPE_REGISTER, CRDT_LWW_REG);
+  item_a->value = lww_register_create((const uint8_t*)&stored_a, sizeof(int64_t), 7, "alice");
+  item_b->value = lww_register_create((const uint8_t*)&stored_b, sizeof(int64_t), 7, "alice");
+
+  uint8_t digest_a[CRABS_HASH_SIZE];
+  uint8_t digest_b[CRABS_HASH_SIZE];
+  ASSERT_EQ(state_item_digest_compute(item_a, digest_a), CRABS_SUCCESS);
+  ASSERT_EQ(state_item_digest_compute(item_b, digest_b), CRABS_SUCCESS);
+  EXPECT_EQ(memcmp(digest_a, digest_b, CRABS_HASH_SIZE), 0);
+
+  // A different logical value must move the digest.
+  ((lww_register_t*)item_b->value)->timestamp = 8;
+  ASSERT_EQ(state_item_digest_compute(item_b, digest_b), CRABS_SUCCESS);
+  EXPECT_NE(memcmp(digest_a, digest_b, CRABS_HASH_SIZE), 0);
+
+  lww_register_destroy((lww_register_t*)item_a->value); item_a->value = nullptr;
+  lww_register_destroy((lww_register_t*)item_b->value); item_b->value = nullptr;
+  data_item_destroy(item_a);
+  data_item_destroy(item_b);
 }
 
 // The sovereign chain digest is content-only: runtime protocol_state (replica-local
@@ -1004,13 +1039,12 @@ TEST(TestDataModel, ItemDigestComputeDeterministic) {
 // taken on a single replica was a merge-time false-conviction vector (equal seq +
 // different digest convicts the writer and quarantines them).
 TEST(TestDataModel, ItemDigestChainPreimageIgnoresProtocolState) {
-  int64_t value_locked = 42;
-  int64_t value_idle = 42;
-
   data_item_t* item_locked = data_item_create("sov", DATA_TYPE_COUNTER, CRDT_G_COUNTER);
   data_item_t* item_idle = data_item_create("sov", DATA_TYPE_COUNTER, CRDT_G_COUNTER);
-  item_locked->value = &value_locked;
-  item_idle->value = &value_idle;
+  item_locked->value = g_counter_create();
+  item_idle->value = g_counter_create();
+  g_counter_increment((g_counter_t*)item_locked->value, "node1", 42);
+  g_counter_increment((g_counter_t*)item_idle->value, "node1", 42);
   item_locked->protocol_state = PROTOCOL_LOCKED;
   item_idle->protocol_state = PROTOCOL_IDLE;
 
@@ -1033,8 +1067,8 @@ TEST(TestDataModel, ItemDigestChainPreimageIgnoresProtocolState) {
   EXPECT_EQ(memcmp(digest_locked, digest_idle, CRABS_HASH_SIZE), 0)
       << "chain digest must not move with last_compaction_time";
 
-  item_locked->value = nullptr;
-  item_idle->value = nullptr;
+  g_counter_destroy((g_counter_t*)item_locked->value); item_locked->value = nullptr;
+  g_counter_destroy((g_counter_t*)item_idle->value); item_idle->value = nullptr;
   data_item_destroy(item_locked);
   data_item_destroy(item_idle);
 }

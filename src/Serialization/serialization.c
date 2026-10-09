@@ -14,6 +14,7 @@
 #include "../Condition/condition.h"
 #include "../Lineage/lineage.h"
 #include <string.h>
+#include <stdlib.h>
 #include <openssl/sha.h>
 #include <openssl/crypto.h>
 
@@ -913,6 +914,102 @@ static void* _deserialize_crdt_value(const uint8_t* data, uint32_t len, data_typ
 }
 
 // ============================================================
+// CRDT counter/register value serialization (chain-digest determinism,
+// state-file durability). Counter/register items are struct-backed in
+// production (g_counter_t / pn_counter_t / lww_register_t — created by
+// crabs_wasm_add_counter et al., rebuilt by crdt_merge_value, stamped by
+// compaction). Serializing the first 8 bytes of the struct writes the
+// entries heap POINTER: the chain digest then hashes an address
+// (cross-replica false forks; unstable across restart) and the state file
+// deserializes it into a bare int64 whose re-cast to g_counter_t on the
+// next increment dereferences stale memory. Serialize the LOGICAL content
+// instead, canonically: entries sorted by node_id so insertion order on a
+// replica does not move the digest.
+// ============================================================
+
+static int _g_counter_entry_cmp(const void* lhs, const void* rhs) {
+  const g_counter_entry_t* entry_lhs = (const g_counter_entry_t*)lhs;
+  const g_counter_entry_t* entry_rhs = (const g_counter_entry_t*)rhs;
+  return strcmp(entry_lhs->node_id, entry_rhs->node_id);
+}
+
+static void _serialize_g_counter_entries(write_buf_t* buf,
+                                         const g_counter_t* counter) {
+  // Sort a copy — never reorder the live counter (its physical order is
+  // insertion order; mutating it from a serializer breaks the caller's
+  // invariants for free).
+  uint32_t entry_count = counter != NULL ? counter->entry_count : 0;
+  _write_uint32_le(buf, entry_count);
+  if (entry_count == 0) return;
+  g_counter_entry_t* sorted_entries =
+      get_memory(entry_count * sizeof(g_counter_entry_t));
+  memcpy(sorted_entries, counter->entries,
+         entry_count * sizeof(g_counter_entry_t));
+  qsort(sorted_entries, entry_count, sizeof(g_counter_entry_t),
+        _g_counter_entry_cmp);
+  for (uint32_t entry_index = 0; entry_index < entry_count; entry_index++) {
+    _write_string16(buf, sorted_entries[entry_index].node_id);
+    _write_int64_le(buf, sorted_entries[entry_index].count);
+  }
+  free(sorted_entries);
+}
+
+static bool _deserialize_g_counter_entries(read_buf_t* buf,
+                                           g_counter_t* counter) {
+  uint32_t entry_count = 0;
+  if (!_read_uint32_le(buf, &entry_count)) return false;
+  // Bound the attacker-controlled count against the remaining buffer before
+  // looping: each entry is at least an empty string16 (2) + int64 (8).
+  if ((uint64_t)entry_count * 10u > buf->len - buf->offset) return false;
+  for (uint32_t entry_index = 0; entry_index < entry_count; entry_index++) {
+    char node_id[CRABS_MAX_USER_ID];
+    uint64_t raw_count = 0;
+    if (!_read_string16(buf, node_id, sizeof(node_id))) return false;
+    if (!_read_uint64_le(buf, &raw_count)) return false;
+    int64_t count = (int64_t)raw_count;
+    // g_counter_increment rejects negative deltas — the on-wire count of a
+    // well-formed counter entry is non-negative, so a negative wire value
+    // fails the load here rather than smuggling in a malformed map.
+    if (g_counter_increment(counter, node_id, count) != CRABS_SUCCESS) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// Value payload for a struct-backed counter/resource/register item, wrapped
+// in the bytes32 envelope the value slot already uses. RESOURCE has no
+// struct CRDT representation (dedup/state-machine treat it as raw int64),
+// so it never arrives here.
+static void _serialize_struct_value(write_buf_t* buf, const data_item_t* item) {
+  if (item->value == NULL) { _write_bytes32(buf, NULL, 0); return; }
+  write_buf_t* content = _write_buf_create(64);
+  switch (item->crdt_type) {
+    case CRDT_G_COUNTER:
+      _serialize_g_counter_entries(content, (const g_counter_t*)item->value);
+      break;
+    case CRDT_PN_COUNTER: {
+      const pn_counter_t* counter = (const pn_counter_t*)item->value;
+      _serialize_g_counter_entries(content, &counter->pos);
+      _serialize_g_counter_entries(content, &counter->neg);
+      break;
+    }
+    case CRDT_LWW_REG: {
+      const lww_register_t* reg = (const lww_register_t*)item->value;
+      _write_bytes32(content, reg->value, reg->value_size);
+      _write_uint64_le(content, reg->timestamp);
+      _write_string16(content, reg->node_id);
+      break;
+    }
+    default:
+      break;
+  }
+  _write_bytes32(buf, content->data, (uint32_t)content->offset);
+  free(content->data);
+  free(content);
+}
+
+// ============================================================
 // Data item serialization (§13.2 + chain preimage, write-domains v1)
 // ============================================================
 // The sovereign hash-chain digest (state_item_digest_compute) is content-
@@ -955,12 +1052,21 @@ static void _serialize_data_item_shape(write_buf_t* buf, const data_item_t* item
     _write_uint8(buf, (uint8_t)item->protocol_state);
   }
 
-  // value: For simple types, serialize the value as bytes
-  // For OT types, serialize the full OT data item (op_log, position_map, etc.)
+  // value: struct-backed counters/registers serialize their LOGICAL content
+  // (canonical node-sorted entries / register payload+timestamp+node — see
+  // _serialize_struct_value); RESOURCE items and legacy raw-int64 values
+  // keep the plain int64 form. For OT types, serialize the full OT data
+  // item (op_log, position_map, etc.)
   if (item->value != NULL) {
-    if (item->type == DATA_TYPE_COUNTER || item->type == DATA_TYPE_PN_COUNTER ||
+    bool struct_backed =
+      (item->type == DATA_TYPE_COUNTER && item->crdt_type == CRDT_G_COUNTER) ||
+      (item->type == DATA_TYPE_PN_COUNTER && item->crdt_type == CRDT_PN_COUNTER) ||
+      (item->type == DATA_TYPE_REGISTER && item->crdt_type == CRDT_LWW_REG);
+    if (struct_backed) {
+      _serialize_struct_value(buf, item);
+    } else if (item->type == DATA_TYPE_COUNTER || item->type == DATA_TYPE_PN_COUNTER ||
         item->type == DATA_TYPE_RESOURCE) {
-      // int64_t value
+      // Legacy raw int64_t value (RESOURCE items carry no CRDT struct).
       uint8_t val_bytes[sizeof(int64_t)];
       int64_t val = *(int64_t*)item->value;
       for (int i = 0; i < 8; i++) {
@@ -968,7 +1074,7 @@ static void _serialize_data_item_shape(write_buf_t* buf, const data_item_t* item
       }
       _write_bytes32(buf, val_bytes, sizeof(int64_t));
     } else if (item->type == DATA_TYPE_REGISTER) {
-      // int64_t value
+      // Legacy raw int64_t register value (no LWW struct).
       uint8_t val_bytes[sizeof(int64_t)];
       int64_t val = *(int64_t*)item->value;
       for (int i = 0; i < 8; i++) {
@@ -1067,7 +1173,51 @@ static bool _deserialize_data_item(read_buf_t* buf, data_item_t* item, uint32_t 
   if (!_read_bytes32(buf, &val_data, &val_len)) return false;
 
   if (val_data != NULL && val_len > 0) {
-    if (item->type == DATA_TYPE_COUNTER || item->type == DATA_TYPE_PN_COUNTER ||
+    bool struct_backed = version >= 15 &&
+      ((item->type == DATA_TYPE_COUNTER && item->crdt_type == CRDT_G_COUNTER) ||
+       (item->type == DATA_TYPE_PN_COUNTER && item->crdt_type == CRDT_PN_COUNTER) ||
+       (item->type == DATA_TYPE_REGISTER && item->crdt_type == CRDT_LWW_REG));
+    if (struct_backed) {
+      // v15+: logical content written by _serialize_struct_value;
+      // reconstruct the struct so dedup mutations / merges / further
+      // increments operate on the same representation as the writer's live
+      // item. (Older versions wrote the first 8 bytes of the struct — a
+      // heap pointer; those blobs' values are discarded below via the raw
+      // int64 fallback, matching pre-fix load behavior.)
+      read_buf_t value_reader;
+      value_reader.data = val_data;
+      value_reader.len = val_len;
+      value_reader.offset = 0;
+      bool reconstructed = false;
+      if (item->crdt_type == CRDT_G_COUNTER) {
+        g_counter_t* counter = g_counter_create();
+        reconstructed = _deserialize_g_counter_entries(&value_reader, counter);
+        if (!reconstructed) g_counter_destroy(counter);
+        else item->value = counter;
+      } else if (item->crdt_type == CRDT_PN_COUNTER) {
+        pn_counter_t* counter = pn_counter_create();
+        reconstructed = _deserialize_g_counter_entries(&value_reader, &counter->pos) &&
+                        _deserialize_g_counter_entries(&value_reader, &counter->neg);
+        if (!reconstructed) pn_counter_destroy(counter);
+        else item->value = counter;
+      } else {  // CRDT_LWW_REG
+        uint8_t* payload = NULL;
+        uint32_t payload_len = 0;
+        uint64_t timestamp = 0;
+        char node_id[CRABS_MAX_USER_ID];
+        if (_read_bytes32(&value_reader, &payload, &payload_len) &&
+            _read_uint64_le(&value_reader, &timestamp) &&
+            _read_string16(&value_reader, node_id, sizeof(node_id))) {
+          lww_register_t* reg = lww_register_create(payload, payload_len,
+                                                    timestamp, node_id);
+          reconstructed = (reg != NULL);
+          if (reconstructed) item->value = reg;
+        }
+        if (payload != NULL) free(payload);
+      }
+      free(val_data);
+      if (!reconstructed) return false;
+    } else if (item->type == DATA_TYPE_COUNTER || item->type == DATA_TYPE_PN_COUNTER ||
         item->type == DATA_TYPE_RESOURCE) {
       int64_t* val = get_memory(sizeof(int64_t));
       *val = 0;

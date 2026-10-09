@@ -78,11 +78,12 @@ crabs_error_e data_item_create_with_options(const char* name,
   if (write_domain == CRABS_DOMAIN_SOVEREIGN) {
     if (!writer_set) return CRABS_ERR_INVALID_PARAM;
     if (strlen(writer) >= CRABS_MAX_USER_ID) return CRABS_ERR_INVALID_PARAM;
-    // v1 restricts SOVEREIGN to COUNTER/REGISTER: their serialized post-state
-    // is a fixed-width scalar under the existing per-item serializer, so the
+    // v1 restricts SOVEREIGN to COUNTER/REGISTER: the v15 per-item
+    // serializer emits their struct content in a canonical order (counter
+    // entries sorted by node_id; register payload+timestamp+node), so the
     // hash-chain digest is well-defined and content-comparable. Set/document
-    // types carry unbounded, order-sensitive serializations whose canonical
-    // form is not yet pinned for the chain — widen only after defining one.
+    // types carry unbounded serializations whose canonical chain order is
+    // not pinned for v1 — widen only after defining one.
     if (type != DATA_TYPE_COUNTER && type != DATA_TYPE_REGISTER) {
       return CRABS_ERR_TYPE_MISMATCH;
     }

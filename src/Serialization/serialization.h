@@ -18,7 +18,7 @@
 // Magic bytes and format version (§13.1)
 // ============================================================
 #define CRABS_SERIAL_MAGIC      0x42415243  // "CRAB" in little-endian
-#define CRABS_SERIAL_VERSION    14          // v14: per-item write-domain tail (write_domain + SOVEREIGN chain/quarantine fields + GROUP_ORDERED module)
+#define CRABS_SERIAL_VERSION    15          // v15: struct-backed counter/register item values serialize logical content (node-sorted entries / register payload+ts+node), not the struct's first 8 bytes (a heap pointer) — fixes chain-digest determinism and struct-item restore
 
 // ============================================================
 // Serialized buffer

@@ -808,11 +808,11 @@ TEST(TestCRDTMerge, TestSovereignMergeProtocolStateDivergenceIsNotFork) {
   merge_event_capture_t capture = {};
   state_set_change_hook(dst, _merge_event_hook, &capture);
 
-  // A LWW register with a raw int64_t value — the chain serializer covers this
-  // shape exactly (REGISTER emits the int64 bytes), so the same content pins
-  // identical digests when protocol_state is excluded from the preimage.
-  // Identical content, identical chain position, same writer; the digest cache
-  // is stamped by the same path the state machine uses post-op
+  // A struct-backed LWW register — the chain serializer now emits the
+  // register's logical content (payload + timestamp + node), so the same
+  // content pins identical digests when protocol_state is excluded from the
+  // preimage. Identical content, identical chain position, same writer; the
+  // digest cache is stamped by the same path the state machine uses post-op
   // (state_item_digest_compute), so the test reproduces the merge-time
   // (seq, digest) comparison exactly.
   auto make_sovereign_register = [](const char* writer, uint64_t item_seq,
@@ -826,9 +826,10 @@ TEST(TestCRDTMerge, TestSovereignMergeProtocolStateDivergenceIsNotFork) {
                                             CRDT_LWW_REG, &options, &item),
               CRABS_SUCCESS);
     if (item == nullptr) return (data_item_t*)nullptr;
-    int64_t* value = (int64_t*)malloc(sizeof(int64_t));
-    *value = register_value;
-    item->value = value;
+    item->value = lww_register_create((const uint8_t*)&register_value,
+                                      sizeof(int64_t), 0, writer);
+    EXPECT_NE(item->value, nullptr);
+    if (item->value == nullptr) { data_item_destroy(item); return (data_item_t*)nullptr; }
     item->item_seq = item_seq;
     return item;
   };
@@ -857,8 +858,15 @@ TEST(TestCRDTMerge, TestSovereignMergeProtocolStateDivergenceIsNotFork) {
   EXPECT_EQ(capture.calls, 0)
       << "protocol-state divergence must NOT fork-convict a legitimate writer";
 
-  // Values are raw int64_t* (not lww_register_t*), so skip _destroy_state_values
-  // and let state_destroy's data_item_destroy default-arm free() them.
+  // The registers are lww_register_t-backed here, and data_item_destroy's
+  // default arm would free only the struct shell (pre-existing destroy gap —
+  // no register case). Destroy the values explicitly, then the states.
+  lww_register_t* dst_reg = (lww_register_t*)state_find_item(dst, "vault")->value;
+  state_find_item(dst, "vault")->value = nullptr;
+  lww_register_destroy(dst_reg);
+  lww_register_t* src_reg = (lww_register_t*)state_find_item(src, "vault")->value;
+  state_find_item(src, "vault")->value = nullptr;
+  lww_register_destroy(src_reg);
   state_destroy(dst);
   state_destroy(src);
 }
