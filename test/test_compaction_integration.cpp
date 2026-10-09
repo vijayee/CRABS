@@ -117,9 +117,9 @@ TEST(CompactionIntegration, SerializeLastCompactionTime) {
   state_t* state = state_create();
 
   data_item_t* item = data_item_create("counter", DATA_TYPE_COUNTER, CRDT_G_COUNTER);
-  int64_t* val = (int64_t*)malloc(sizeof(int64_t));
-  *val = 42;
-  item->value = val;
+  g_counter_t* counter = g_counter_create();
+  ASSERT_EQ(g_counter_increment(counter, "node1", 42), CRABS_SUCCESS);
+  item->value = counter;
   item->last_compaction_time = 12345;
   state_add_item(state, item);
 

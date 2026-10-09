@@ -20,6 +20,7 @@ extern "C" {
 #include "../src/OT/ot_execution.h"
 #include "../src/OT/position_map.h"
 #include "../src/OT/ot_transform.h"
+#include "../src/CRDT/crdt_merge.h"
 }
 
 // ============================================================
@@ -506,11 +507,12 @@ TEST(OTSerialization, BackwardCompatibilityV3) {
   state_t* original = state_create();
   original->version = 42;
 
-  // Create a simple counter item (non-OT type)
+  // Create a simple counter item (non-OT type, struct-backed per the
+  // production representation)
   data_item_t* item = data_item_create("counter1", DATA_TYPE_COUNTER, CRDT_G_COUNTER);
-  int64_t* val = (int64_t*)malloc(sizeof(int64_t));
-  *val = 12345;
-  item->value = val;
+  g_counter_t* counter = g_counter_create();
+  ASSERT_EQ(g_counter_increment(counter, "node1", 12345), CRABS_SUCCESS);
+  item->value = counter;
   state_add_item(original, item);
 
   serialized_buffer_t* buf = crabs_serialize_state(original);
@@ -524,7 +526,7 @@ TEST(OTSerialization, BackwardCompatibilityV3) {
   ASSERT_NE(r_item, nullptr);
   EXPECT_EQ(r_item->type, DATA_TYPE_COUNTER);
   EXPECT_NE(r_item->value, nullptr);
-  EXPECT_EQ(*(int64_t*)r_item->value, 12345);
+  EXPECT_EQ(g_counter_value((g_counter_t*)r_item->value), 12345);
 
   state_destroy(restored);
   state_destroy(original);

@@ -47,9 +47,9 @@ TEST(TestSerialization, TestSerializeDeserializeStateRoundTrip) {
 
   // Add a data item
   data_item_t* item = data_item_create("counter1", DATA_TYPE_COUNTER, CRDT_G_COUNTER);
-  int64_t* val = (int64_t*)malloc(sizeof(int64_t));
-  *val = 12345;
-  item->value = val;
+  g_counter_t* counter = g_counter_create();
+  ASSERT_EQ(g_counter_increment(counter, "node1", 12345), CRABS_SUCCESS);
+  item->value = counter;
   state_add_item(original, item);
 
   // Add a policy
@@ -74,7 +74,7 @@ TEST(TestSerialization, TestSerializeDeserializeStateRoundTrip) {
   EXPECT_EQ(restored_item->crdt_type, CRDT_G_COUNTER);
   EXPECT_EQ(restored_item->protocol_state, PROTOCOL_IDLE);
   ASSERT_NE(restored_item->value, nullptr);
-  EXPECT_EQ(*(int64_t*)restored_item->value, (int64_t)12345);
+  EXPECT_EQ(g_counter_value((g_counter_t*)restored_item->value), (int64_t)12345);
 
   // Verify policy
   const char* policy = state_find_policy(restored, CRABS_OP_LOCK);
@@ -86,6 +86,109 @@ TEST(TestSerialization, TestSerializeDeserializeStateRoundTrip) {
   EXPECT_EQ(restored->config.max_lock_extensions, original->config.max_lock_extensions);
   EXPECT_EQ(restored->config.allow_force_unlock, original->config.allow_force_unlock);
 
+  serialized_buffer_destroy(buf);
+  state_destroy(original);
+  state_destroy(restored);
+}
+
+// Struct-backed counter items must survive a state save/load: pre-fix the
+// serializer wrote the first 8 bytes of the g_counter struct (the entries
+// heap pointer) and the deserializer rebuilt a bare int64 from them, so a
+// restored counter was a dangling-pointer-as-int that the first
+// g_counter_increment dereferenced as a g_counter — heap corruption. The
+// chain digest also hashed those pointer bytes, so it was unstable across a
+// restart even for unchanged content.
+TEST(TestSerialization, StructBackedCounterSurvivesStateRoundTrip) {
+  state_t* original = state_create();
+  data_item_t* item = data_item_create("gc", DATA_TYPE_COUNTER, CRDT_G_COUNTER);
+  g_counter_t* counter = g_counter_create();
+  ASSERT_EQ(g_counter_increment(counter, "node1", 5), CRABS_SUCCESS);
+  ASSERT_EQ(g_counter_increment(counter, "node2", 7), CRABS_SUCCESS);
+  item->value = counter;
+  state_add_item(original, item);
+
+  uint8_t digest_before[CRABS_HASH_SIZE];
+  ASSERT_EQ(state_item_digest_compute(item, digest_before), CRABS_SUCCESS);
+
+  serialized_buffer_t* buf = crabs_serialize_state(original);
+  ASSERT_NE(buf, nullptr);
+  state_t* restored = crabs_deserialize_state(buf->data, buf->len);
+  ASSERT_NE(restored, nullptr);
+
+  data_item_t* restored_item = state_find_item(restored, "gc");
+  ASSERT_NE(restored_item, nullptr);
+  ASSERT_EQ(restored_item->crdt_type, CRDT_G_COUNTER);
+  // Logical content survived: value readable through the g-counter API...
+  EXPECT_EQ(g_counter_value((g_counter_t*)restored_item->value), (int64_t)12);
+  // ...and further increments on the restored replica keep working.
+  ASSERT_EQ(g_counter_increment((g_counter_t*)restored_item->value, "node1", 3),
+            CRABS_SUCCESS);
+  EXPECT_EQ(g_counter_value((g_counter_t*)restored_item->value), (int64_t)15);
+
+  // Restart with unchanged content must NOT move the chain digest.
+  state_t* restored2 = crabs_deserialize_state(buf->data, buf->len);
+  ASSERT_NE(restored2, nullptr);
+  data_item_t* restored_item2 = state_find_item(restored2, "gc");
+  ASSERT_NE(restored_item2, nullptr);
+  uint8_t digest_after[CRABS_HASH_SIZE];
+  ASSERT_EQ(state_item_digest_compute(restored_item2, digest_after), CRABS_SUCCESS);
+  EXPECT_EQ(memcmp(digest_before, digest_after, CRABS_HASH_SIZE), 0)
+      << "chain digest must be stable across a save/load restart";
+
+  // Struct-backed values: release properly (data_item_destroy's default arm
+  // frees only the g_counter shell — pre-existing destroy gap).
+  g_counter_destroy((g_counter_t*)state_find_item(original, "gc")->value);
+  state_find_item(original, "gc")->value = nullptr;
+  g_counter_destroy((g_counter_t*)restored_item->value);
+  restored_item->value = nullptr;
+  g_counter_destroy((g_counter_t*)restored_item2->value);
+  restored_item2->value = nullptr;
+  serialized_buffer_destroy(buf);
+  state_destroy(original);
+  state_destroy(restored);
+  state_destroy(restored2);
+}
+
+// Struct-backed LWW register items must likewise survive a state round-trip
+// with their (value, timestamp, node) content intact.
+TEST(TestSerialization, StructBackedRegisterSurvivesStateRoundTrip) {
+  state_t* original = state_create();
+  data_item_t* item = data_item_create("reg", DATA_TYPE_REGISTER, CRDT_LWW_REG);
+  int64_t stored = 0x1234;
+  item->value = lww_register_create((const uint8_t*)&stored, sizeof(int64_t),
+                                    77, "writer1");
+  ASSERT_NE(item->value, nullptr);
+  state_add_item(original, item);
+
+  uint8_t digest_before[CRABS_HASH_SIZE];
+  ASSERT_EQ(state_item_digest_compute(item, digest_before), CRABS_SUCCESS);
+
+  serialized_buffer_t* buf = crabs_serialize_state(original);
+  ASSERT_NE(buf, nullptr);
+  state_t* restored = crabs_deserialize_state(buf->data, buf->len);
+  ASSERT_NE(restored, nullptr);
+
+  data_item_t* restored_item = state_find_item(restored, "reg");
+  ASSERT_NE(restored_item, nullptr);
+  ASSERT_EQ(restored_item->crdt_type, CRDT_LWW_REG);
+  lww_register_t* reg = (lww_register_t*)restored_item->value;
+  ASSERT_NE(reg, nullptr);
+  ASSERT_EQ(reg->value_size, (uint32_t)sizeof(int64_t));
+  int64_t round_value = 0;
+  memcpy(&round_value, reg->value, sizeof(int64_t));
+  EXPECT_EQ(round_value, (int64_t)0x1234);
+  EXPECT_EQ(reg->timestamp, (uint64_t)77);
+  EXPECT_STREQ(reg->node_id, "writer1");
+
+  uint8_t digest_after[CRABS_HASH_SIZE];
+  ASSERT_EQ(state_item_digest_compute(restored_item, digest_after), CRABS_SUCCESS);
+  EXPECT_EQ(memcmp(digest_before, digest_after, CRABS_HASH_SIZE), 0)
+      << "register chain digest must be stable across a save/load restart";
+
+  lww_register_destroy((lww_register_t*)state_find_item(original, "reg")->value);
+  state_find_item(original, "reg")->value = nullptr;
+  lww_register_destroy((lww_register_t*)reg);
+  restored_item->value = nullptr;
   serialized_buffer_destroy(buf);
   state_destroy(original);
   state_destroy(restored);
@@ -104,9 +207,9 @@ TEST(TestSerialization, TestSerializeStateWithItems) {
   state_add_item(state, item1);
 
   data_item_t* item2 = data_item_create("res2", DATA_TYPE_COUNTER, CRDT_G_COUNTER);
-  int64_t* val2 = (int64_t*)malloc(sizeof(int64_t));
-  *val2 = -42;
-  item2->value = val2;
+  g_counter_t* counter2 = g_counter_create();
+  ASSERT_EQ(g_counter_increment(counter2, "node1", 42), CRABS_SUCCESS);
+  item2->value = counter2;
   state_add_item(state, item2);
 
   // Add policies
@@ -142,7 +245,7 @@ TEST(TestSerialization, TestSerializeStateWithItems) {
   data_item_t* r2 = state_find_item(restored, "res2");
   ASSERT_NE(r2, nullptr);
   EXPECT_EQ(r2->type, DATA_TYPE_COUNTER);
-  EXPECT_EQ(*(int64_t*)r2->value, (int64_t)-42);
+  EXPECT_EQ(g_counter_value((g_counter_t*)r2->value), (int64_t)42);
 
   // Verify policies
   EXPECT_EQ(restored->policy_count, (uint32_t)2);
@@ -475,9 +578,9 @@ TEST(TestSerialization, TestSignedStateRoundTrip) {
   state->version = 5;
 
   data_item_t* item = data_item_create("counter1", DATA_TYPE_COUNTER, CRDT_G_COUNTER);
-  int64_t* val = (int64_t*)malloc(sizeof(int64_t));
-  *val = 100;
-  item->value = val;
+  g_counter_t* counter = g_counter_create();
+  ASSERT_EQ(g_counter_increment(counter, "node1", 100), CRABS_SUCCESS);
+  item->value = counter;
   state_add_item(state, item);
 
   ecdsa_keypair_t* node_key = crypto_ecdsa_generate();
@@ -493,7 +596,7 @@ TEST(TestSerialization, TestSignedStateRoundTrip) {
   ASSERT_NE(restored, nullptr);
   data_item_t* restored_item = state_find_item(restored, "counter1");
   ASSERT_NE(restored_item, nullptr);
-  EXPECT_EQ(*(int64_t*)restored_item->value, (int64_t)100);
+  EXPECT_EQ(g_counter_value((g_counter_t*)restored_item->value), (int64_t)100);
   state_destroy(restored);
 
   // Wrong key → rejected.
@@ -962,9 +1065,9 @@ TEST(StateDeserialize, RejectsTrailingBytes) {
   state->version = 42;
 
   data_item_t* item = data_item_create("counter1", DATA_TYPE_COUNTER, CRDT_G_COUNTER);
-  int64_t* val = (int64_t*)malloc(sizeof(int64_t));
-  *val = 12345;
-  item->value = val;
+  g_counter_t* counter_tmp = g_counter_create();
+  ASSERT_EQ(g_counter_increment(counter_tmp, "node1", 12345), CRABS_SUCCESS);
+  item->value = counter_tmp;
   state_add_item(state, item);
 
   serialized_buffer_t* buf = crabs_serialize_state(state);
@@ -1064,9 +1167,9 @@ TEST(TestSerialization, TestSerializeStateWithInvariants) {
   state->version = 5;
 
   data_item_t* item = data_item_create("counter1", DATA_TYPE_COUNTER, CRDT_G_COUNTER);
-  int64_t* val = (int64_t*)malloc(sizeof(int64_t));
-  *val = 100;
-  item->value = val;
+  g_counter_t* counter_tmp = g_counter_create();
+  ASSERT_EQ(g_counter_increment(counter_tmp, "node1", 100), CRABS_SUCCESS);
+  item->value = counter_tmp;
 
   // Add invariants (heap-allocated for proper cleanup)
   invariant_t* invs = (invariant_t*)malloc(2 * sizeof(invariant_t));
@@ -1113,9 +1216,9 @@ TEST(TestSerialization, TestDeserializeInvariantOutOfBoundsMsgLenNoCrash) {
   state->version = 5;
 
   data_item_t* item = data_item_create("counter1", DATA_TYPE_COUNTER, CRDT_G_COUNTER);
-  int64_t* val = (int64_t*)malloc(sizeof(int64_t));
-  *val = 100;
-  item->value = val;
+  g_counter_t* counter_tmp = g_counter_create();
+  ASSERT_EQ(g_counter_increment(counter_tmp, "node1", 100), CRABS_SUCCESS);
+  item->value = counter_tmp;
 
   invariant_t* invs = (invariant_t*)malloc(2 * sizeof(invariant_t));
   invs[0].type = INVARIANT_GREATER_THAN;
@@ -3370,9 +3473,9 @@ TEST(StateSerialize, V14ItemDomainRoundTrip) {
 
   data_item_t* free_item =
       data_item_create("free-counter", DATA_TYPE_COUNTER, CRDT_G_COUNTER);
-  int64_t* free_val = (int64_t*)malloc(sizeof(int64_t));
-  *free_val = 123;
-  free_item->value = free_val;
+  g_counter_t* free_counter = g_counter_create();
+  ASSERT_EQ(g_counter_increment(free_counter, "node1", 123), CRABS_SUCCESS);
+  free_item->value = free_counter;
   ASSERT_EQ(state_add_item(original, free_item), CRABS_SUCCESS);
 
   data_item_t* sov_item = nullptr;
@@ -3380,9 +3483,10 @@ TEST(StateSerialize, V14ItemDomainRoundTrip) {
   ASSERT_EQ(data_item_create_with_options("sov-register", DATA_TYPE_REGISTER,
                                           CRDT_LWW_REG, &sov_opts, &sov_item),
             CRABS_SUCCESS);
-  int64_t* sov_val = (int64_t*)malloc(sizeof(int64_t));
-  *sov_val = 7;
-  sov_item->value = sov_val;
+  int64_t sov_register_value = 7;
+  sov_item->value = lww_register_create((const uint8_t*)&sov_register_value,
+                                        sizeof(int64_t), 0, "alice");
+  ASSERT_NE(sov_item->value, nullptr);
   sov_item->item_seq = 9;
   for (int digest_byte = 0; digest_byte < CRABS_HASH_SIZE; digest_byte++) {
     sov_item->item_digest[digest_byte] = (uint8_t)(0x40 + digest_byte);
@@ -3400,14 +3504,14 @@ TEST(StateSerialize, V14ItemDomainRoundTrip) {
   ASSERT_EQ(data_item_create_with_options("grp-counter", DATA_TYPE_COUNTER,
                                           CRDT_G_COUNTER, &group_opts, &group_item),
             CRABS_SUCCESS);
-  int64_t* group_val = (int64_t*)malloc(sizeof(int64_t));
-  *group_val = 999;
-  group_item->value = group_val;
+  g_counter_t* group_counter = g_counter_create();
+  ASSERT_EQ(g_counter_increment(group_counter, "node1", 999), CRABS_SUCCESS);
+  group_item->value = group_counter;
   ASSERT_EQ(state_add_item(original, group_item), CRABS_SUCCESS);
 
   serialized_buffer_t* buf = crabs_serialize_state(original);
   ASSERT_NE(buf, nullptr);
-  ASSERT_EQ((uint32_t)CRABS_SERIAL_VERSION, 14u);
+  ASSERT_EQ((uint32_t)CRABS_SERIAL_VERSION, 15u);
 
   state_t* restored = crabs_deserialize_state(buf->data, buf->len);
   ASSERT_NE(restored, nullptr);
@@ -3450,20 +3554,21 @@ TEST(StateSerialize, V14ItemDomainRoundTrip) {
 // two items identical in the v13-covered fields but differing in every
 // domain field serialize to byte-identical crabs_serialize_data_item output.
 TEST(StateSerialize, V14ItemDigestPreimageExcludesDomainTail) {
+  int64_t register_content = 42;
   data_item_t* free_item =
       data_item_create("chain-item", DATA_TYPE_REGISTER, CRDT_LWW_REG);
-  int64_t* free_val = (int64_t*)malloc(sizeof(int64_t));
-  *free_val = 42;
-  free_item->value = free_val;
+  free_item->value = lww_register_create((const uint8_t*)&register_content,
+                                         sizeof(int64_t), 0, "");
+  ASSERT_NE(free_item->value, nullptr);
 
   data_item_t* sov_item = nullptr;
   data_item_options_t sov_opts = {CRABS_DOMAIN_SOVEREIGN, "alice", 0};
   ASSERT_EQ(data_item_create_with_options("chain-item", DATA_TYPE_REGISTER,
                                           CRDT_LWW_REG, &sov_opts, &sov_item),
             CRABS_SUCCESS);
-  int64_t* sov_val = (int64_t*)malloc(sizeof(int64_t));
-  *sov_val = 42;
-  sov_item->value = sov_val;
+  sov_item->value = lww_register_create((const uint8_t*)&register_content,
+                                        sizeof(int64_t), 0, "");
+  ASSERT_NE(sov_item->value, nullptr);
   sov_item->item_seq = 12;
   memset(sov_item->item_digest, 0xAB, CRABS_HASH_SIZE);
 
@@ -3477,6 +3582,10 @@ TEST(StateSerialize, V14ItemDigestPreimageExcludesDomainTail) {
 
   serialized_buffer_destroy(free_form);
   serialized_buffer_destroy(sov_form);
+  // Struct-backed values: data_item_destroy's default arm frees only the
+  // struct shell (no register destroy case), so release properly first.
+  lww_register_destroy((lww_register_t*)free_item->value); free_item->value = nullptr;
+  lww_register_destroy((lww_register_t*)sov_item->value); sov_item->value = nullptr;
   data_item_destroy(free_item);
   data_item_destroy(sov_item);
 }
@@ -3489,11 +3598,12 @@ TEST(StateSerialize, V14ItemDigestPreimageExcludesDomainTail) {
 // chain preimages; and a chain preimage is exactly one byte shorter than the
 // durable form of an otherwise-identical item.
 TEST(StateSerialize, V14ChainPreimageExcludesProtocolStateAndDomainTail) {
+  int64_t register_content = 42;
   data_item_t* locked_free =
       data_item_create("chain-item", DATA_TYPE_REGISTER, CRDT_LWW_REG);
-  int64_t* locked_val = (int64_t*)malloc(sizeof(int64_t));
-  *locked_val = 42;
-  locked_free->value = locked_val;
+  locked_free->value = lww_register_create((const uint8_t*)&register_content,
+                                           sizeof(int64_t), 0, "");
+  ASSERT_NE(locked_free->value, nullptr);
   locked_free->protocol_state = PROTOCOL_LOCKED;
 
   data_item_t* modified_sov = nullptr;
@@ -3501,9 +3611,9 @@ TEST(StateSerialize, V14ChainPreimageExcludesProtocolStateAndDomainTail) {
   ASSERT_EQ(data_item_create_with_options("chain-item", DATA_TYPE_REGISTER,
                                           CRDT_LWW_REG, &sov_opts, &modified_sov),
             CRABS_SUCCESS);
-  int64_t* modified_val = (int64_t*)malloc(sizeof(int64_t));
-  *modified_val = 42;
-  modified_sov->value = modified_val;
+  modified_sov->value = lww_register_create((const uint8_t*)&register_content,
+                                            sizeof(int64_t), 0, "");
+  ASSERT_NE(modified_sov->value, nullptr);
   modified_sov->item_seq = 12;
   memset(modified_sov->item_digest, 0xAB, CRABS_HASH_SIZE);
   modified_sov->protocol_state = PROTOCOL_MODIFIED;
@@ -3532,6 +3642,8 @@ TEST(StateSerialize, V14ChainPreimageExcludesProtocolStateAndDomainTail) {
   serialized_buffer_destroy(locked_form);
   serialized_buffer_destroy(modified_form);
   serialized_buffer_destroy(durable_form);
+  lww_register_destroy((lww_register_t*)locked_free->value); locked_free->value = nullptr;
+  lww_register_destroy((lww_register_t*)modified_sov->value); modified_sov->value = nullptr;
   data_item_destroy(locked_free);
   data_item_destroy(modified_sov);
 }
@@ -3547,15 +3659,16 @@ TEST(StateSerialize, V13BlobLoadsAllFreeMerge) {
   state->version = 55;
   data_item_t* counter_item =
       data_item_create("v13-counter", DATA_TYPE_COUNTER, CRDT_G_COUNTER);
-  int64_t* counter_val = (int64_t*)malloc(sizeof(int64_t));
-  *counter_val = -4;
-  counter_item->value = counter_val;
+  g_counter_t* v13_counter = g_counter_create();
+  ASSERT_EQ(g_counter_increment(v13_counter, "node1", 4), CRABS_SUCCESS);
+  counter_item->value = v13_counter;
   ASSERT_EQ(state_add_item(state, counter_item), CRABS_SUCCESS);
   data_item_t* register_item =
       data_item_create("v13-register", DATA_TYPE_REGISTER, CRDT_LWW_REG);
-  int64_t* register_val = (int64_t*)malloc(sizeof(int64_t));
-  *register_val = 900;
-  register_item->value = register_val;
+  int64_t v13_register_value = 900;
+  register_item->value = lww_register_create((const uint8_t*)&v13_register_value,
+                                             sizeof(int64_t), 0, "alice");
+  ASSERT_NE(register_item->value, nullptr);
   ASSERT_EQ(state_add_item(state, register_item), CRABS_SUCCESS);
 
   serialized_buffer_t* buf = crabs_serialize_state(state);
@@ -3579,7 +3692,9 @@ TEST(StateSerialize, V13BlobLoadsAllFreeMerge) {
   }
   state_destroy(state);
 
-  // Version 14 -> 13.
+  // Version 15 -> 13 (pre-domain-tail). The downgraded blob's item values
+  // load through the legacy raw-int64 path regardless of content shape —
+  // this test asserts only domain-field defaults.
   buf->data[4] = 13;
   v14_rehash(buf);
 
@@ -3598,7 +3713,11 @@ TEST(StateSerialize, V13BlobLoadsAllFreeMerge) {
   }
   ASSERT_NE(state_find_item(restored, "v13-counter"), nullptr);
   ASSERT_NE(state_find_item(restored, "v13-register"), nullptr);
-  EXPECT_EQ(*(int64_t*)state_find_item(restored, "v13-register")->value, 900);
+  // Value assertions deliberately dropped: the v15 writer emits struct
+  // content (not the v13 raw int64), so a version-downgraded blob read
+  // through the legacy raw-int64 path no longer recovers them — the same
+  // class of value-loss as real pre-v15 files with struct-backed values (a
+  // pre-existing bug this work fixes going forward, not backward).
 
   serialized_buffer_destroy(buf);
   state_destroy(restored);
@@ -3611,9 +3730,9 @@ TEST(StateSerialize, V13BlobLoadsAllFreeMerge) {
 TEST(StateSerialize, V14RejectsUnknownDomainByte) {
   state_t* state = state_create();
   data_item_t* item = data_item_create("item", DATA_TYPE_COUNTER, CRDT_G_COUNTER);
-  int64_t* val = (int64_t*)malloc(sizeof(int64_t));
-  *val = 1;
-  item->value = val;
+  g_counter_t* counter_tmp = g_counter_create();
+  ASSERT_EQ(g_counter_increment(counter_tmp, "node1", 1), CRABS_SUCCESS);
+  item->value = counter_tmp;
   state_add_item(state, item);
 
   serialized_buffer_t* buf = crabs_serialize_state(state);

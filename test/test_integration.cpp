@@ -363,9 +363,9 @@ TEST_F(TestIntegration, SerializationRoundTrip) {
 
   // Add items
   data_item_t* item1 = data_item_create("counter1", DATA_TYPE_COUNTER, CRDT_G_COUNTER);
-  int64_t* val1 = (int64_t*)malloc(sizeof(int64_t));
-  *val1 = 12345;
-  item1->value = val1;
+  g_counter_t* counter1 = g_counter_create();
+  ASSERT_EQ(g_counter_increment(counter1, "node1", 12345), CRABS_SUCCESS);
+  item1->value = counter1;
   state_add_item(state, item1);
 
   data_item_t* item2 = data_item_create("resource1", DATA_TYPE_RESOURCE, CRDT_PN_COUNTER);
@@ -404,7 +404,7 @@ TEST_F(TestIntegration, SerializationRoundTrip) {
   ASSERT_NE(r_item1, nullptr);
   EXPECT_EQ(r_item1->type, DATA_TYPE_COUNTER);
   EXPECT_EQ(r_item1->crdt_type, CRDT_G_COUNTER);
-  EXPECT_EQ(*(int64_t*)r_item1->value, (int64_t)12345);
+  EXPECT_EQ(g_counter_value((g_counter_t*)r_item1->value), (int64_t)12345);
   EXPECT_EQ(r_item1->invariant_count, (uint32_t)1);
   EXPECT_EQ(r_item1->invariants[0].type, INVARIANT_GREATER_THAN);
 
@@ -426,7 +426,14 @@ TEST_F(TestIntegration, SerializationRoundTrip) {
 
   free((void*)invs[0].error_message);
   serialized_buffer_destroy(buf);
-  // Items store raw int64_t values, properly handled by data_item_destroy's free()
+  // item1's value is struct-backed: data_item_destroy's default free() arm
+  // releases only the g_counter shell (no counter destroy case — pre-existing
+  // gap), so release it properly first. item2 (RESOURCE) keeps the raw int64
+  // representation state_destroy handles.
+  g_counter_destroy((g_counter_t*)state_find_item(state, "counter1")->value);
+  state_find_item(state, "counter1")->value = nullptr;
+  g_counter_destroy((g_counter_t*)state_find_item(restored, "counter1")->value);
+  state_find_item(restored, "counter1")->value = nullptr;
   state_destroy(state);
   state_destroy(restored);
 }

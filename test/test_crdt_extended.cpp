@@ -281,15 +281,20 @@ TEST(TestCRDTExtended, StateMergeWithPNCounter) {
 
 // ============================================================
 // Serialization Extended Tests
-// (Serializer treats counter values as int64_t*, not CRDT structs)
+// (v15: struct-backed counter/register values serialize their LOGICAL
+// content — a node-sorted entry map for counters, payload+timestamp+node
+// for registers — and the deserializer reconstructs the struct. A bare
+// int64 tagged with a CRDT counter/register type is no longer a valid
+// serialization fixture; RESOURCE items still carry a raw int64.)
 // ============================================================
 
 TEST(TestCRDTExtended, SerializeStateWithPNCounterInt64) {
   state_t* state = state_create();
   data_item_t* item = data_item_create("pn1", DATA_TYPE_PN_COUNTER, CRDT_PN_COUNTER);
-  int64_t* val = (int64_t*)malloc(sizeof(int64_t));
-  *val = 70;
-  item->value = val;
+  pn_counter_t* pn = pn_counter_create();
+  ASSERT_EQ(pn_counter_increment(pn, "node1", 100), CRABS_SUCCESS);
+  ASSERT_EQ(pn_counter_decrement(pn, "node1", 30), CRABS_SUCCESS);
+  item->value = pn;
   state_add_item(state, item);
 
   serialized_buffer_t* buf = crabs_serialize_state(state);
@@ -302,7 +307,11 @@ TEST(TestCRDTExtended, SerializeStateWithPNCounterInt64) {
   ASSERT_NE(r, nullptr);
   EXPECT_EQ(r->type, DATA_TYPE_PN_COUNTER);
   ASSERT_NE(r->value, nullptr);
-  EXPECT_EQ(*(int64_t*)r->value, 70);
+  EXPECT_EQ(pn_counter_value((pn_counter_t*)r->value), 70);
+  // The restored struct is functional: further mutation works post-load.
+  ASSERT_EQ(pn_counter_increment((pn_counter_t*)r->value, "node2", 5),
+            CRABS_SUCCESS);
+  EXPECT_EQ(pn_counter_value((pn_counter_t*)r->value), 75);
 
   serialized_buffer_destroy(buf);
   state_destroy(state);
@@ -334,9 +343,10 @@ TEST(TestCRDTExtended, SerializeStateWithSetType) {
 TEST(TestCRDTExtended, SerializeStateWithRegisterInt64) {
   state_t* state = state_create();
   data_item_t* item = data_item_create("reg1", DATA_TYPE_REGISTER, CRDT_LWW_REG);
-  int64_t* val = (int64_t*)malloc(sizeof(int64_t));
-  *val = 0xDEADBEEF;
-  item->value = val;
+  int64_t register_content = 0xDEADBEEF;
+  item->value = lww_register_create((const uint8_t*)&register_content,
+                                    sizeof(int64_t), 12, "writer1");
+  ASSERT_NE(item->value, nullptr);
   state_add_item(state, item);
 
   serialized_buffer_t* buf = crabs_serialize_state(state);
@@ -349,7 +359,13 @@ TEST(TestCRDTExtended, SerializeStateWithRegisterInt64) {
   ASSERT_NE(r, nullptr);
   EXPECT_EQ(r->type, DATA_TYPE_REGISTER);
   ASSERT_NE(r->value, nullptr);
-  EXPECT_EQ(*(int64_t*)r->value, (int64_t)0xDEADBEEF);
+  lww_register_t* restored_reg = (lww_register_t*)r->value;
+  ASSERT_EQ(restored_reg->value_size, (uint32_t)sizeof(int64_t));
+  int64_t restored_content = 0;
+  memcpy(&restored_content, restored_reg->value, sizeof(int64_t));
+  EXPECT_EQ(restored_content, (int64_t)0xDEADBEEF);
+  EXPECT_EQ(restored_reg->timestamp, (uint64_t)12);
+  EXPECT_STREQ(restored_reg->node_id, "writer1");
 
   serialized_buffer_destroy(buf);
   state_destroy(state);
@@ -360,11 +376,11 @@ TEST(TestCRDTExtended, SerializeMultipleItemsRoundTrip) {
   state_t* state = state_create();
   state->version = 42;
 
-  // Counter as int64_t
+  // Counter (struct-backed per the production representation)
   data_item_t* c = data_item_create("c1", DATA_TYPE_COUNTER, CRDT_G_COUNTER);
-  int64_t* cv = (int64_t*)malloc(sizeof(int64_t));
-  *cv = 7;
-  c->value = cv;
+  g_counter_t* counter = g_counter_create();
+  ASSERT_EQ(g_counter_increment(counter, "node1", 7), CRABS_SUCCESS);
+  c->value = counter;
   state_add_item(state, c);
 
   // Resource as int64_t
@@ -385,7 +401,7 @@ TEST(TestCRDTExtended, SerializeMultipleItemsRoundTrip) {
   ASSERT_NE(rc, nullptr);
   EXPECT_EQ(rc->type, DATA_TYPE_COUNTER);
   ASSERT_NE(rc->value, nullptr);
-  EXPECT_EQ(*(int64_t*)rc->value, 7);
+  EXPECT_EQ(g_counter_value((g_counter_t*)rc->value), 7);
 
   data_item_t* rr = state_find_item(restored, "r1");
   ASSERT_NE(rr, nullptr);
