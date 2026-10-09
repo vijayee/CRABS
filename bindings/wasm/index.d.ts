@@ -85,6 +85,14 @@ export interface ChildManifestView {
   spawnedAt: number;
 }
 
+/** Pagination options for getSetElements (Node and HandlerState). */
+export interface GetSetElementsOptions {
+  /** 0-based start index into the sorted distinct-element list. Default 0. */
+  offset?: number;
+  /** Page size, integer in [1, 256]. Default 256. Anything larger throws. */
+  limit?: number;
+}
+
 export interface HandlerState {
   incrementCounter(name: string, delta?: number, nodeId?: string): void;
   incrementPNCounter(name: string, delta?: number, nodeId?: string): void;
@@ -96,13 +104,31 @@ export interface HandlerState {
    * (e.g. store 12.5% as 125 per-mille).
    */
   setRegister(name: string, value: number | bigint, nodeId?: string): void;
+  /** Byte-exact inverse of getRegisterBytes — opaque payload storage. */
+  setRegisterBytes(name: string, bytes: Uint8Array, nodeId?: string): void;
   setAdd(name: string, element: string, tag?: string): void;
   setRemove(name: string, element: string): void;
   flagSet(name: string, setBy: string, setAt?: number): void;
   getCounter(name: string): number;
   getPNCounter(name: string): number;
   getRegister(name: string): number;
+  /** Raw bytes of an LWW register; empty register → empty Uint8Array. */
+  getRegisterBytes(name: string): Uint8Array;
   setContains(name: string, element: string): boolean;
+  /**
+   * Distinct visible element count (alive after tombstones, deduped at the
+   * element level). Pair with getSetElements for pagination math.
+   */
+  getSetSize(name: string): number;
+  /**
+   * Bounded enumerator: returns a page of DISTINCT LIVE elements sorted
+   * ascending by byte-wise strcmp (OR-set insertion order is not stable
+   * across replicas; the sort is). Hard cap 256 per call — larger limit
+   * throws; use getSetSize + successive offsets to paginate bigger sets.
+   */
+  getSetElements(name: string, options?: GetSetElementsOptions): string[];
+  /** LIVE tags of `element` of an OR-set (sorted ascending). */
+  getSetTags(name: string, element: string): string[];
 }
 
 export interface HandlerOperation {
@@ -227,7 +253,23 @@ export interface Node {
    */
   setRegister(name: string, value: number | bigint, nodeId?: string): void;
   setRegisterBytes(name: string, bytes: Uint8Array, nodeId?: string): void;
+  /** Raw bytes of an LWW register; empty register → empty Uint8Array. */
+  getRegisterBytes(name: string): Uint8Array;
   setContains(name: string, element: string): boolean;
+  /**
+   * Distinct visible element count (alive after tombstones, deduped at the
+   * element level). Pair with getSetElements for pagination math.
+   */
+  getSetSize(name: string): number;
+  /**
+   * Bounded enumerator: returns a page of DISTINCT LIVE elements sorted
+   * ascending by byte-wise strcmp (OR-set insertion order is not stable
+   * across replicas; the sort is). Hard cap 256 per call — larger limit
+   * throws; use getSetSize + successive offsets to paginate bigger sets.
+   */
+  getSetElements(name: string, options?: GetSetElementsOptions): string[];
+  /** LIVE tags of `element` of an OR-set (sorted ascending). */
+  getSetTags(name: string, element: string): string[];
 
   incrementCounter(name: string, delta?: number, nodeId?: string): void;
   incrementPNCounter(name: string, delta?: number, nodeId?: string): void;

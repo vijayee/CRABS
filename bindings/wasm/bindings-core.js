@@ -135,6 +135,33 @@ function writeBytes(M, bytes) {
   return { ptr, len: bytes.length };
 }
 
+// Page cap for set enumerators (mirrors the C-side
+// CRABS_WASM_HANDLER_SET_PAGE_CAP in src/Util/wasm_helpers.c — keep the two
+// in lockstep, the JS guard is UX-first so callers get a descriptive throw
+// before the wasm round-trip; the C check is the belt-and-braces floor).
+const HANDLER_SET_PAGE_CAP = 256;
+
+// Decode the flat string-list protocol emitted by the handler read helpers
+// (u16le count, then u16le byte_length + raw bytes per entry; see
+// src/Util/wasm_helpers.c for the C-side producer).
+function parseStringList(bytes) {
+  if (bytes.length < 2) throw new Error('malformed string-list buffer');
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const count = view.getUint16(0, true);
+  const out = new Array(count);
+  const decoder = new TextDecoder();
+  let offset = 2;
+  for (let i = 0; i < count; i++) {
+    if (offset + 2 > bytes.length) throw new Error('malformed string-list buffer');
+    const entryLength = view.getUint16(offset, true);
+    offset += 2;
+    if (offset + entryLength > bytes.length) throw new Error('malformed string-list buffer');
+    out[i] = decoder.decode(bytes.subarray(offset, offset + entryLength));
+    offset += entryLength;
+  }
+  return out;
+}
+
 function encodeText(str) {
   if (typeof TextEncoder !== 'undefined') {
     return new TextEncoder().encode(str);
@@ -825,6 +852,13 @@ class Node {
     wrapRc(rc, 'setRegisterBytes');
   }
 
+  // Raw bytes of an LWW register (byte-exact inverse of setRegisterBytes).
+  // Throws resource_not_found for an unknown name, type_mismatch for a
+  // non-register item. An empty register returns an empty Uint8Array.
+  getRegisterBytes(name) {
+    return this._callGetRegisterBytesFromAm(this._M, this._am, name);
+  }
+
   setContains(name, element) {
     const M = this._M;
     const nPtr = writeString(M, name);
@@ -832,6 +866,43 @@ class Node {
     const out = M._crabs_wasm_set_contains(this._am, nPtr, ePtr);
     freeAll(M, nPtr, ePtr);
     return out;
+  }
+
+  // Distinct visible element count of an OR-set/one-shot set — alive after
+  // tombstones, deduped at the element level (the same element may be carried
+  // by multiple live tags post-Task-1; it counts once here). Pair with
+  // getSetElements for pagination math. Returns 0 for unknown/non-set items.
+  getSetSize(name) {
+    const M = this._M;
+    const nPtr = writeString(M, name);
+    const out = M._crabs_wasm_handler_set_size(this._am, nPtr);
+    if (nPtr) M._free(nPtr);
+    return out;
+  }
+
+  // Bounded enumerator over the DISTINCT LIVE elements of `name`. The page
+  // is sorted ascending by byte-wise strcmp so pagination is stable across
+  // replicas (OR-set insertion order is NOT cross-replica deterministic).
+  // `limit` defaults to 256 and is HARD-capped at 256 — anything larger
+  // throws before the wasm round-trip. Mirrors the C-side cap in
+  // wasm_helpers.c (CRABS_WASM_HANDLER_SET_PAGE_CAP).
+  getSetElements(name, options = {}) {
+    const offset = options.offset === undefined ? 0 : options.offset >>> 0;
+    const limit = options.limit === undefined ? HANDLER_SET_PAGE_CAP : options.limit;
+    if (!Number.isInteger(limit) || limit < 1 || limit > HANDLER_SET_PAGE_CAP) {
+      throw new Error(
+        `getSetElements: limit must be an integer in [1, ${HANDLER_SET_PAGE_CAP}]`
+      );
+    }
+    return this._callGetSetElementsFromAm(this._M, this._am, name, offset, limit);
+  }
+
+  // LIVE tags of a single element of an OR-set (post-Task-1 a single element
+  // may be carried by several tags). Sorted ascending for cross-replica
+  // stability. Throws type_mismatch for non-OR-set items, resource_not_found
+  // for an unknown name; an element with no live tags returns [].
+  getSetTags(name, element) {
+    return this._callGetSetTagsFromAm(this._M, this._am, name, element);
   }
 
   setAdd(name, element, tag = element) {
@@ -1192,6 +1263,27 @@ class Node {
         getPNCounter(name) { return node._callCounterGetFromAm(M, amPtr, M._crabs_wasm_get_pn_counter, name); },
         getRegister(name) { return node._callCounterGetFromAm(M, amPtr, M._crabs_wasm_get_register, name); },
         setContains(name, element) { return node._callSetContainsFromAm(M, amPtr, name, element); },
+        // Consumption findings 3-4 read APIs — see Node.getSetSize et al for
+        // the bounded/cap/sort contracts.
+        getSetSize(name) {
+          const nPtr = writeString(M, name);
+          const out = M._crabs_wasm_handler_set_size(amPtr, nPtr);
+          if (nPtr) M._free(nPtr);
+          return out;
+        },
+        getSetElements(name, options = {}) {
+          const offset = options.offset === undefined ? 0 : options.offset >>> 0;
+          const limit = options.limit === undefined ? HANDLER_SET_PAGE_CAP : options.limit;
+          if (!Number.isInteger(limit) || limit < 1 || limit > HANDLER_SET_PAGE_CAP) {
+            throw new Error(
+              `handler getSetElements: limit must be an integer in [1, ${HANDLER_SET_PAGE_CAP}]`
+            );
+          }
+          return node._callGetSetElementsFromAm(M, amPtr, name, offset, limit);
+        },
+        getSetTags(name, element) { return node._callGetSetTagsFromAm(M, amPtr, name, element); },
+        getRegisterBytes(name) { return node._callGetRegisterBytesFromAm(M, amPtr, name); },
+        setRegisterBytes(name, bytes, nodeId = 'system') { return node._callSetRegisterBytesFromAm(M, amPtr, name, bytes, nodeId); },
         incrementCounter(name, delta = 1, nodeId = 'system') { return node._callCounterFromAm(M, amPtr, M._crabs_wasm_increment_counter, name, delta, nodeId); },
         incrementPNCounter(name, delta = 1, nodeId = 'system') { return node._callCounterFromAm(M, amPtr, M._crabs_wasm_increment_pn_counter, name, delta, nodeId); },
         decrementPNCounter(name, delta = 1, nodeId = 'system') { return node._callCounterFromAm(M, amPtr, M._crabs_wasm_decrement_pn_counter, name, delta, nodeId); },
@@ -1276,6 +1368,75 @@ class Node {
     const rc = M._crabs_wasm_one_shot_flag_set(amPtr, nPtr, sPtr, BigInt(setAt));
     freeAll(M, nPtr, sPtr);
     if (rc !== 0) throw crabsError(rc, 'handler flagSet');
+    return 0;
+  }
+
+  // Invoke a read helper that hands back a serialized_buffer_t on success
+  // and a u32 crabs_error_e via an out-param on failure. `buildArgs` returns
+  // `{ ptrs, extras }`: `ptrs` are the wasm-pointer arguments to free after
+  // the call, `extras` are all C-side arguments in order (including the
+  // pointer values from `ptrs`). `ctx` ends up in the thrown crabsError.
+  // Returns the raw buffer bytes; the buffer is destroyed before return.
+  _callHandlerReadBufferFromAm(M, amPtr, cfn, buildArgs, ctx) {
+    const rcPtr = M._malloc(4);
+    M.setValue(rcPtr, 0, 'i32');
+    const { ptrs, extras } = buildArgs();
+    const bufferPtr = cfn(amPtr, ...extras, rcPtr);
+    freeAll(M, ...ptrs);
+    const rc = M.getValue(rcPtr, 'i32') >>> 0;
+    if (rcPtr) M._free(rcPtr);
+    if (rc !== 0) throw crabsError(rc, ctx);
+    if (!bufferPtr) throw new Error(`${ctx}: empty result buffer`);
+    const data = M._crabs_wasm_buffer_data(bufferPtr);
+    const len = M._crabs_wasm_buffer_len(bufferPtr);
+    const bytes = new Uint8Array(M.HEAPU8.subarray(data, data + len));
+    M._crabs_wasm_buffer_destroy(bufferPtr);
+    return bytes;
+  }
+
+  _callGetSetElementsFromAm(M, amPtr, name, offset, limit) {
+    const bytes = this._callHandlerReadBufferFromAm(
+      M, amPtr, M._crabs_wasm_handler_set_elements,
+      () => {
+        const nPtr = writeString(M, name);
+        return { ptrs: [nPtr], extras: [nPtr, offset, limit] };
+      },
+      'getSetElements'
+    );
+    return parseStringList(bytes);
+  }
+
+  _callGetSetTagsFromAm(M, amPtr, name, element) {
+    const bytes = this._callHandlerReadBufferFromAm(
+      M, amPtr, M._crabs_wasm_handler_set_tags,
+      () => {
+        const nPtr = writeString(M, name);
+        const ePtr = writeString(M, element);
+        return { ptrs: [nPtr, ePtr], extras: [nPtr, ePtr] };
+      },
+      'getSetTags'
+    );
+    return parseStringList(bytes);
+  }
+
+  _callGetRegisterBytesFromAm(M, amPtr, name) {
+    return this._callHandlerReadBufferFromAm(
+      M, amPtr, M._crabs_wasm_handler_get_register_bytes,
+      () => {
+        const nPtr = writeString(M, name);
+        return { ptrs: [nPtr], extras: [nPtr] };
+      },
+      'getRegisterBytes'
+    );
+  }
+
+  _callSetRegisterBytesFromAm(M, amPtr, name, bytes, nodeId) {
+    const nPtr = writeString(M, name);
+    const { ptr: dPtr, len: dLen } = writeBytes(M, bytes || new Uint8Array(0));
+    const idPtr = writeString(M, nodeId || 'system');
+    const rc = M._crabs_wasm_set_register_bytes(amPtr, nPtr, dPtr, dLen, idPtr);
+    freeAll(M, nPtr, dPtr, idPtr);
+    if (rc !== 0) throw crabsError(rc, 'handler setRegisterBytes');
     return 0;
   }
 

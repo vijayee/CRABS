@@ -1054,6 +1054,284 @@ const char* crabs_wasm_handler_op_get_payload_str(operation_t* op) {
 }
 
 // ============================================================
+// Handler-state read APIs (consumption findings 3-4)
+//
+// Bounded, paged enumerators for OR-sets / one-shot sets from handler
+// context, plus byte-register access. The C helpers hand results back
+// through the existing serialized_buffer_t idiom so the JS side can reuse
+// _crabs_wasm_buffer_data/_crabs_wasm_buffer_len/_crabs_wasm_buffer_destroy
+// verbatim.
+//
+// String-list wire protocol (used by _set_elements and _set_tags):
+//   u16le  count
+//   then `count` entries of: u16le byte_length + raw bytes (no NUL).
+// Element byte length is capped at CRABS_MAX_ELEMENT (u16-safe).
+//
+// Visibility: an OR-set (element, tag) pair is LIVE iff it is not present
+// in the set's tombstone list. Enumeration is at the ELEMENT level — i.e.
+// DISTINCT visible elements, sorted ascending by byte-wise strcmp for
+// cross-replica pagination stability (OR-set insertion order is per-replica
+// and is NOT stable under merge). `getSetSize` is the total of that
+// distinct-visible-element list, for pagination math.
+// ============================================================
+
+#define CRABS_WASM_HANDLER_SET_PAGE_CAP 256u
+
+// One-shot sets already store unique elements; OR-sets may carry the same
+// element under several tags (post-Task-1 pair semantics), so the
+// distinct-element pass dedupes by element string after tombstone filtering.
+static uint32_t _handler_set_live_distinct(const data_item_t* item,
+                                           const char*** out_elements) {
+  *out_elements = NULL;
+  if (item == NULL) return 0;
+
+  uint32_t capacity = 0;
+  if (item->crdt_type == CRDT_OR_SET) {
+    capacity = ((or_set_t*)item->value)->element_count;
+  } else if (item->crdt_type == CRDT_ONE_SHOT_SET) {
+    capacity = ((one_shot_set_t*)item->value)->element_count;
+  } else {
+    return 0;
+  }
+  if (capacity == 0) return 0;
+
+  const char** elements = (const char**)malloc(capacity * sizeof(const char*));
+  if (elements == NULL) return 0;
+  uint32_t count = 0;
+
+  if (item->crdt_type == CRDT_OR_SET) {
+    const or_set_t* set = (const or_set_t*)item->value;
+    for (uint32_t i = 0; i < set->element_count; i++) {
+      const char* element = set->elements[i].element;
+      const char* tag = set->elements[i].tag;
+      // Pair-tombstoned entries are invisible.
+      bool tombstoned = false;
+      for (uint32_t t = 0; t < set->tombstone_count; t++) {
+        if (strcmp(set->tombstones[t].element, element) == 0 &&
+            strcmp(set->tombstones[t].tag, tag) == 0) {
+          tombstoned = true;
+          break;
+        }
+      }
+      if (tombstoned) continue;
+      bool seen = false;
+      for (uint32_t j = 0; j < count; j++) {
+        if (strcmp(elements[j], element) == 0) { seen = true; break; }
+      }
+      if (!seen) elements[count++] = element;
+    }
+  } else { // CRDT_ONE_SHOT_SET
+    const one_shot_set_t* set = (const one_shot_set_t*)item->value;
+    for (uint32_t i = 0; i < set->element_count; i++) {
+      bool seen = false;
+      for (uint32_t j = 0; j < count; j++) {
+        if (strcmp(elements[j], set->elements[i]) == 0) { seen = true; break; }
+      }
+      if (!seen) elements[count++] = set->elements[i];
+    }
+  }
+
+  if (count == 0) {
+    free(elements);
+    return 0;
+  }
+  *out_elements = elements;
+  return count;
+}
+
+static int _handler_cstr_cmp(const void* a, const void* b) {
+  return strcmp(*(const char* const*)a, *(const char* const*)b);
+}
+
+// Encode a string list using the u16-count prefix + u16-length-prefixed
+// entries protocol documented above. Returns NULL on allocation failure.
+static serialized_buffer_t* _handler_encode_string_list(const char** strings,
+                                                        uint32_t count) {
+  size_t total = 2;
+  for (uint32_t i = 0; i < count; i++) {
+    total += 2 + strlen(strings[i]);
+  }
+  serialized_buffer_t* buffer = serialized_buffer_create(total);
+  if (buffer == NULL) return NULL;
+  uint8_t* cursor = (uint8_t*)buffer->data;
+  cursor[0] = (uint8_t)(count & 0xFF);
+  cursor[1] = (uint8_t)((count >> 8) & 0xFF);
+  cursor += 2;
+  for (uint32_t i = 0; i < count; i++) {
+    const size_t length = strlen(strings[i]);
+    cursor[0] = (uint8_t)(length & 0xFF);
+    cursor[1] = (uint8_t)((length >> 8) & 0xFF);
+    cursor += 2;
+    memcpy(cursor, strings[i], length);
+    cursor += length;
+  }
+  buffer->len = total;
+  return buffer;
+}
+
+EMSCRIPTEN_KEEPALIVE
+uint32_t crabs_wasm_handler_set_size(attribute_machine_t* am, const char* name) {
+  if (am == NULL || name == NULL) return 0;
+  data_item_t* item = state_find_item(&am->base_state, name);
+  if (item == NULL) return 0;
+  const char** elements = NULL;
+  const uint32_t count = _handler_set_live_distinct(item, &elements);
+  if (elements != NULL) free(elements);
+  return count;
+}
+
+EMSCRIPTEN_KEEPALIVE
+serialized_buffer_t* crabs_wasm_handler_set_elements(attribute_machine_t* am,
+                                                     const char* name,
+                                                     uint32_t offset,
+                                                     uint32_t limit,
+                                                     uint32_t* out_rc) {
+  if (out_rc == NULL) return NULL;
+  *out_rc = CRABS_ERR_INTERNAL;
+  if (am == NULL || name == NULL) {
+    *out_rc = CRABS_ERR_INVALID_PARAM;
+    return NULL;
+  }
+  if (limit == 0 || limit > CRABS_WASM_HANDLER_SET_PAGE_CAP) {
+    *out_rc = CRABS_ERR_INVALID_PARAM;
+    return NULL;
+  }
+  data_item_t* item = state_find_item(&am->base_state, name);
+  if (item == NULL) {
+    *out_rc = CRABS_ERR_RESOURCE_NOT_FOUND;
+    return NULL;
+  }
+  if (item->crdt_type != CRDT_OR_SET && item->crdt_type != CRDT_ONE_SHOT_SET) {
+    *out_rc = CRABS_ERR_TYPE_MISMATCH;
+    return NULL;
+  }
+
+  const char** elements = NULL;
+  const uint32_t total = _handler_set_live_distinct(item, &elements);
+  if (total == 0) {
+    // Empty (or unallocatable) set — encode an empty page.
+    *out_rc = CRABS_SUCCESS;
+    return _handler_encode_string_list(NULL, 0);
+  }
+  qsort(elements, total, sizeof(const char*), _handler_cstr_cmp);
+
+  const uint32_t start = offset < total ? offset : total;
+  const uint32_t remaining = total - start;
+  const uint32_t page_count = remaining < limit ? remaining : limit;
+
+  serialized_buffer_t* buffer =
+      _handler_encode_string_list(elements + start, page_count);
+  free(elements);
+  if (buffer == NULL) {
+    *out_rc = CRABS_ERR_OOM;
+    return NULL;
+  }
+  *out_rc = CRABS_SUCCESS;
+  return buffer;
+}
+
+EMSCRIPTEN_KEEPALIVE
+serialized_buffer_t* crabs_wasm_handler_set_tags(attribute_machine_t* am,
+                                                 const char* name,
+                                                 const char* element,
+                                                 uint32_t* out_rc) {
+  if (out_rc == NULL) return NULL;
+  *out_rc = CRABS_ERR_INTERNAL;
+  if (am == NULL || name == NULL || element == NULL) {
+    *out_rc = CRABS_ERR_INVALID_PARAM;
+    return NULL;
+  }
+  data_item_t* item = state_find_item(&am->base_state, name);
+  if (item == NULL) {
+    *out_rc = CRABS_ERR_RESOURCE_NOT_FOUND;
+    return NULL;
+  }
+  if (item->crdt_type != CRDT_OR_SET) {
+    // Tags are pair-semantics data: only OR-sets carry them. A one-shot set
+    // has an element list but no tag axis, so the call is a type mismatch.
+    *out_rc = CRABS_ERR_TYPE_MISMATCH;
+    return NULL;
+  }
+  const or_set_t* set = (const or_set_t*)item->value;
+
+  const char** tags = (const char**)malloc(
+      (set->element_count ? set->element_count : 1) * sizeof(const char*));
+  if (tags == NULL) {
+    *out_rc = CRABS_ERR_OOM;
+    return NULL;
+  }
+  uint32_t count = 0;
+  for (uint32_t i = 0; i < set->element_count; i++) {
+    if (strcmp(set->elements[i].element, element) != 0) continue;
+    const char* tag = set->elements[i].tag;
+    bool tombstoned = false;
+    for (uint32_t t = 0; t < set->tombstone_count; t++) {
+      if (strcmp(set->tombstones[t].element, element) == 0 &&
+          strcmp(set->tombstones[t].tag, tag) == 0) {
+        tombstoned = true;
+        break;
+      }
+    }
+    if (tombstoned) continue;
+    tags[count++] = tag;
+  }
+  // Sort ascending so a JS consumer can compare tag lists across replicas
+  // without depending on insertion order.
+  if (count > 1) qsort(tags, count, sizeof(const char*), _handler_cstr_cmp);
+  serialized_buffer_t* buffer = _handler_encode_string_list(tags, count);
+  free(tags);
+  if (buffer == NULL) {
+    *out_rc = CRABS_ERR_OOM;
+    return NULL;
+  }
+  *out_rc = CRABS_SUCCESS;
+  return buffer;
+}
+
+EMSCRIPTEN_KEEPALIVE
+serialized_buffer_t* crabs_wasm_handler_get_register_bytes(
+    attribute_machine_t* am, const char* name, uint32_t* out_rc) {
+  if (out_rc == NULL) return NULL;
+  *out_rc = CRABS_ERR_INTERNAL;
+  if (am == NULL || name == NULL) {
+    *out_rc = CRABS_ERR_INVALID_PARAM;
+    return NULL;
+  }
+  data_item_t* item = state_find_item(&am->base_state, name);
+  if (item == NULL) {
+    *out_rc = CRABS_ERR_RESOURCE_NOT_FOUND;
+    return NULL;
+  }
+  if (item->crdt_type != CRDT_LWW_REG) {
+    *out_rc = CRABS_ERR_TYPE_MISMATCH;
+    return NULL;
+  }
+  const lww_register_t* reg = (const lww_register_t*)item->value;
+  if (reg == NULL) {
+    *out_rc = CRABS_ERR_INTERNAL;
+    return NULL;
+  }
+  if (reg->value_size == 0) {
+    serialized_buffer_t* empty = serialized_buffer_create(0);
+    if (empty == NULL) {
+      *out_rc = CRABS_ERR_OOM;
+      return NULL;
+    }
+    *out_rc = CRABS_SUCCESS;
+    return empty;
+  }
+  serialized_buffer_t* buffer = serialized_buffer_create(reg->value_size);
+  if (buffer == NULL) {
+    *out_rc = CRABS_ERR_OOM;
+    return NULL;
+  }
+  memcpy(buffer->data, reg->value, reg->value_size);
+  buffer->len = reg->value_size;
+  *out_rc = CRABS_SUCCESS;
+  return buffer;
+}
+
+// ============================================================
 // Timed transactions (v1)
 // ============================================================
 
