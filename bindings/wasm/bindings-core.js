@@ -318,6 +318,15 @@ class Operation {
   // signing; the signature binds the prefixes. Chainable.
   setSovereignPrefix(prefixIndex, seq, digest) {
     const M = this._M;
+    // BigInt(seq) throws on fractional numbers but silently wraps negatives
+    // through the unsigned i64 wire; refuse both loudly.
+    const seqIsValid = typeof seq === 'bigint'
+      ? seq >= 0n
+      : Number.isInteger(seq) && seq >= 0;
+    if (!seqIsValid) {
+      throw new RangeError(
+        'setSovereignPrefix: seq must be a non-negative integer');
+    }
     let digestBytes;
     if (typeof digest === 'string') {
       if (!/^[0-9a-fA-F]{64}$/.test(digest)) {
@@ -629,11 +638,22 @@ class Node {
     if (domainNum === undefined) {
       throw new Error("defineItem: domain must be 'free' | 'sovereign' | 'group'");
     }
+    // The C export narrows the module to uint8 — refuse out-of-range or
+    // non-integer values here instead of letting 256 truncate to "unset".
+    let orderingModule = 0;
+    if (opts.orderingModule !== undefined) {
+      if (!Number.isInteger(opts.orderingModule) ||
+          opts.orderingModule < 0 || opts.orderingModule > 255) {
+        throw new RangeError(
+          'defineItem: orderingModule must be an integer 0..255');
+      }
+      orderingModule = opts.orderingModule;
+    }
     const namePtr = writeString(M, name);
     const writerPtr = opts.writer ? writeString(M, opts.writer) : 0;
     const rc = M._crabs_wasm_define_item(
         this._am, namePtr, dataTypeNum, crdtTypeNum, domainNum, writerPtr,
-        opts.orderingModule || 0);
+        orderingModule);
     freeAll(M, namePtr, writerPtr);
     wrapRc(rc, 'defineItem');
   }

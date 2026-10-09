@@ -400,6 +400,17 @@ try {
   assert(digestRejection instanceof TypeError,
     'non-hex digestHex should throw a TypeError');
 }
+// A fractional seq or one past JS's exact-integer range would truncate
+// silently on the double → uint64 conversion; refuse loudly instead.
+for (const badSeq of [1.5, -2, Number.MAX_SAFE_INTEGER + 1]) {
+  try {
+    guardOp.setSovereignPrefix(0, badSeq, '0'.repeat(64));
+    assert(false, `seq ${badSeq} should throw`);
+  } catch (seqRejection) {
+    assert(seqRejection instanceof RangeError,
+      `seq ${badSeq} should throw a RangeError`);
+  }
+}
 
 // The writer's first op on the fresh chain: seq 0 with the all-zero
 // initial digest. Signed by alice; the DOMAIN_CHECK matches the prefix

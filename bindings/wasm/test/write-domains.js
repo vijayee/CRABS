@@ -48,6 +48,17 @@ async function main() {
     /digest/, 'short digest hex should throw');
   assert.throws(() => guardOp.setSovereignPrefix(0, 0, 'z'.repeat(64)),
     /digest/, 'non-hex digest should throw');
+  // A negative BigInt would wrap silently through the unsigned i64 wire;
+  // fractional numbers fail BigInt() conversion. Refuse both loudly.
+  for (const badSeq of [1.5, -2, -1n]) {
+    assert.throws(() => guardOp.setSovereignPrefix(0, badSeq, '0'.repeat(64)),
+      /seq must be/, `seq ${badSeq} should throw`);
+  }
+  // orderingModule narrowing: 256 would truncate to 0 (unset) at the C
+  // export — the wrapper refuses instead.
+  assert.throws(() => node.defineItem('mod', 'counter', 'g_counter',
+    { domain: 'group', orderingModule: 256 }), /orderingModule/,
+    'orderingModule 256 should throw a RangeError at the wrapper');
   guardOp.destroy();
 
   // The writer's first op on the fresh chain: seq 0 with the all-zero

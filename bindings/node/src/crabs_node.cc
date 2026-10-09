@@ -27,6 +27,7 @@
 #include <openssl/crypto.h>
 #include <string.h>
 #include <stdlib.h>
+#include <cmath>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -682,8 +683,12 @@ private:
           "setSovereignPrefix: prefixIndex must be 0..7");
     uint32_t prefix_index = (uint32_t)index_value;
     double seq_value = info[1].As<Napi::Number>().DoubleValue();
-    if (seq_value < 0)
-      throw Napi::RangeError::New(env, "setSovereignPrefix: seq must be >= 0");
+    // A non-integer or a value past JS's exact-integer range (2^53) would
+    // truncate silently on the double → uint64 conversion; refuse loudly.
+    if (seq_value < 0 || seq_value >= 9007199254740992.0 ||
+        seq_value != floor(seq_value))
+      throw Napi::RangeError::New(env,
+          "setSovereignPrefix: seq must be an integer 0..2^53-1");
     std::string digest_hex = info[2].As<Napi::String>().Utf8Value();
     if (digest_hex.length() != CRABS_HASH_SIZE * 2)
       throw Napi::RangeError::New(env,
@@ -1234,9 +1239,10 @@ private:
       if (opts.Has("orderingModule")) {
         double module_value =
             opts.Get("orderingModule").As<Napi::Number>().DoubleValue();
-        if (module_value < 0 || module_value > 255)
+        if (module_value < 0 || module_value > 255 ||
+            module_value != floor(module_value))
           throw Napi::RangeError::New(env,
-              "defineItem: orderingModule must be 0..255");
+              "defineItem: orderingModule must be an integer 0..255");
         options.ordering_module = (uint8_t)module_value;
       }
     }
