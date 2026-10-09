@@ -22,6 +22,17 @@ export interface Operation {
   nodeId: string;
   payload: Buffer | string | undefined;
   lamportTime: number;
+  /** Append a resource name to the op (capacity 8). */
+  addResource(name: string): this;
+  /**
+   * Write-domains v1: set the sovereign chain prefix (item_seq, prev digest
+   * as 64 hex chars) at prefixIndex — parallel to the op's sovereign
+   * resources in declaration order. Signed (format v4) and wire-carried
+   * (op format v6).
+   */
+  setSovereignPrefix(prefixIndex: number, seq: number, digestHex: string): this;
+  /** Wire bytes of the op as currently staged (sign first, then serialize). */
+  serialize(): Buffer;
   sign(keyPair: KeyPair): this;
   signWithPrivateKey(privateKeyHex: string): this;
 }
@@ -102,6 +113,16 @@ export interface HLC {
   formatted: string;
 }
 
+/** Write-domains v1 item options for Node.defineItem. */
+export interface DefineItemOptions {
+  /** Write domain declared at mint; immutable on a live item in v1. */
+  domain?: 'free' | 'sovereign' | 'group';
+  /** Required for 'sovereign': the item's single-writer user id. */
+  writer?: string;
+  /** 'group' only; v1 ships no ordering modules, so only 0 is legal. */
+  orderingModule?: number;
+}
+
 export interface TriggerConfig {
   triggerId: string;
   condition: string;
@@ -170,6 +191,21 @@ export interface Node {
   addOneShotFlag(name: string): void;
   addRegister(name: string, initialValue?: number): void;
   addResource(name: string): void;
+  /**
+   * Write-domains v1: item creation with an explicit write-domain
+   * declaration. v1 supports 'counter'/'register' (the SOVEREIGN-legal
+   * types; other shapes keep their dedicated add* methods).
+   */
+  defineItem(name: string, dataType: string | number,
+             crdtType: string | number, options?: DefineItemOptions): void;
+  /**
+   * Write-domains v1: file a __report_equivocation__ op against the
+   * SOVEREIGN item `itemName`, carrying two serialized writer ops as the
+   * evidence pair. Submitted through the node's sign path (admin signer,
+   * node key). On success the writer is quarantined on the item; failures
+   * throw typed crabs errors and set nothing.
+   */
+  reportEquivocation(itemName: string, opABytes: Buffer, opBBytes: Buffer): void;
 
   // Queries
   getCounter(name: string): number | undefined;

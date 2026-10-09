@@ -341,5 +341,162 @@ expectTimeSourceRejection(() => node.setTimeSource({ mode: 'https',
 assert(node.getTimeSource().mode === 'system',
   'rejected setTimeSource calls must leave the selection untouched');
 
+// Test 28: write-domains v1 — defineItem with the sovereign domain, a
+// writer op accepted through setSovereignPrefix, a non-writer op rejected
+// with not_item_writer.
+const domainNode = new Node('dom-admin');
+const aliceDomKey = KeyPair.generate();
+domainNode.registerUser('alice', aliceDomKey.publicKeyHex(), '');
+domainNode.grantRole('alice', 'role', 'member', 'dom-admin');
+const malloryDomKey = KeyPair.generate();
+domainNode.registerUser('mallory', malloryDomKey.publicKeyHex(), '');
+domainNode.grantRole('mallory', 'role', 'member', 'dom-admin');
+
+domainNode.defineItem('score', 'counter', 'g_counter',
+  { domain: 'sovereign', writer: 'alice' });
+domainNode.addCounter('free-counter');  // untouched free-merge default
+domainNode.setPolicy('bump', 'role:member');
+
+// defineItem argument checking: sovereign without a writer, a writer on a
+// non-sovereign domain, an unknown domain word, and a non-legal type are
+// all refused before anything reaches state.
+function expectDefineItemRejection(errorType, thunk, label) {
+  try {
+    thunk();
+    assert(false, `${label} should throw`);
+  } catch (defineRejection) {
+    assert(defineRejection instanceof errorType,
+      `${label} should throw ${errorType.name}, got ${defineRejection}`);
+  }
+}
+expectDefineItemRejection(Error, () =>
+  domainNode.defineItem('orphan', 'counter', 'g_counter',
+    { domain: 'sovereign' }), 'sovereign without writer');
+expectDefineItemRejection(Error, () =>
+  domainNode.defineItem('mixed', 'counter', 'g_counter',
+    { domain: 'free', writer: 'alice' }), 'writer on free item');
+expectDefineItemRejection(TypeError, () =>
+  domainNode.defineItem('odd', 'counter', 'g_counter',
+    { domain: 'feudal' }), 'unknown domain word');
+expectDefineItemRejection(Error, () =>
+  domainNode.defineItem('doc', 'set', 'or_set',
+    { domain: 'sovereign', writer: 'alice' }), 'sovereign on set (v1 type bound)');
+
+// setSovereignPrefix argument checking: the digest is exactly 64 hex
+// chars, the index is bounded by the op's resource capacity.
+const guardOp = new Operation('bump');
+guardOp.addResource('score');
+try {
+  guardOp.setSovereignPrefix(0, 0, 'abcd');
+  assert(false, 'short digestHex should throw');
+} catch (digestRejection) {
+  assert(digestRejection instanceof RangeError,
+    'short digestHex should throw a RangeError');
+}
+try {
+  guardOp.setSovereignPrefix(0, 0, 'z'.repeat(64));
+  assert(false, 'non-hex digestHex should throw');
+} catch (digestRejection) {
+  assert(digestRejection instanceof TypeError,
+    'non-hex digestHex should throw a TypeError');
+}
+
+// The writer's first op on the fresh chain: seq 0 with the all-zero
+// initial digest. Signed by alice; the DOMAIN_CHECK matches the prefix
+// against the item and the wildcard apply accepts it (no handler needed).
+const ZERO_DIGEST = '0'.repeat(64);
+const writerOp = new Operation('bump');
+writerOp.signerId = 'alice';
+writerOp.addResource('score');
+writerOp.setSovereignPrefix(0, 0, ZERO_DIGEST);
+domainNode.sign(writerOp, aliceDomKey);
+const opAWire = writerOp.serialize();
+domainNode.execute(writerOp);
+
+// A non-writer op on the sovereign item is rejected with not_item_writer
+// even though mallory holds the authorizing role.
+const rogueOp = new Operation('bump');
+rogueOp.signerId = 'mallory';
+rogueOp.addResource('score');
+rogueOp.setSovereignPrefix(0, 1, ZERO_DIGEST);
+domainNode.sign(rogueOp, malloryDomKey);
+try {
+  domainNode.execute(rogueOp);
+  assert(false, 'non-writer op on a sovereign item should throw');
+} catch (rogueRejection) {
+  assert(rogueRejection.message.includes('not_item_writer'),
+    'non-writer rejection should be typed not_item_writer, got: ' +
+    rogueRejection.message);
+}
+
+// Test 29: write-domains v1 — a genuine fork reported through
+// reportEquivocation quarantines the writer; false evidence sets nothing.
+// The fork: op_b is a second alice-signed claim to the same chain head
+// (seq 0, zero digest) that never executed here — minted fresh (random uuid)
+// so it is provably distinct from op_a's wire bytes.
+const forkOp = new Operation('bump');
+forkOp.signerId = 'alice';
+forkOp.addResource('score');
+forkOp.setSovereignPrefix(0, 0, ZERO_DIGEST);
+domainNode.sign(forkOp, aliceDomKey);
+const opBWire = forkOp.serialize();
+assert(Buffer.compare(Buffer.from(opAWire), Buffer.from(opBWire)) !== 0,
+  'fork evidence must be two distinct serialized ops');
+
+domainNode.setPolicy('__report_equivocation__', 'role:admin');
+domainNode.reportEquivocation('score', opAWire, opBWire);
+
+// The quarantined writer's later op is rejected with 'quarantined'.
+const quarantinedOp = new Operation('bump');
+quarantinedOp.signerId = 'alice';
+quarantinedOp.addResource('score');
+quarantinedOp.setSovereignPrefix(0, 1, ZERO_DIGEST);
+domainNode.sign(quarantinedOp, aliceDomKey);
+try {
+  domainNode.execute(quarantinedOp);
+  assert(false, 'quarantined writer op should throw');
+} catch (quarantineRejection) {
+  assert(quarantineRejection.message.includes('quarantined'),
+    'quarantined writer rejection should be typed quarantined, got: ' +
+    quarantineRejection.message);
+}
+
+// Failure paths: same-op-twice is invalid evidence (nothing changes), a
+// non-sovereign target is refused up front, and an unknown item is
+// resource_not_found.
+try {
+  domainNode.reportEquivocation('score', opAWire, opAWire);
+  assert(false, 'same-op-twice report should throw');
+} catch (sameEvidence) {
+  assert(sameEvidence.message.includes('invalid_param'),
+    'same-op-twice should be typed invalid_param, got: ' +
+    sameEvidence.message);
+}
+try {
+  domainNode.reportEquivocation('free-counter', opAWire, opBWire);
+  assert(false, 'report against a free-merge item should throw');
+} catch (nonSovereign) {
+  assert(nonSovereign.message.includes('invalid_param'),
+    'free-merge target should be typed invalid_param');
+}
+try {
+  domainNode.reportEquivocation('ghost', opAWire, opBWire);
+  assert(false, 'report against an unknown item should throw');
+} catch (unknownItem) {
+  assert(unknownItem.message.includes('resource_not_found'),
+    'unknown item should be typed resource_not_found');
+}
+
+// A duplicate re-report is idempotently deduped (report ≠ a new fork).
+try {
+  domainNode.reportEquivocation('score', opBWire, opAWire);
+  assert(false, 'swapped duplicate report should throw');
+} catch (duplicateReport) {
+  assert(duplicateReport.message.includes('duplicate_operation'),
+    're-report should be typed duplicate_operation, got: ' +
+    duplicateReport.message);
+}
+
+
 console.log(`\n${passed} passed, ${failed} failed`);
 process.exit(failed > 0 ? 1 : 0);

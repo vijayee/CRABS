@@ -107,6 +107,11 @@ static Napi::Error crabs_error(Napi::Env env, crabs_error_e err, const char* ctx
     case CRABS_ERR_INTERNAL:               msg = "internal_error"; break;
     case CRABS_ERR_OOM:                    msg = "out_of_memory"; break;
     case CRABS_ERR_INVALID_PARAM:          msg = "invalid_param"; break;
+    case CRABS_ERR_NOT_ITEM_WRITER:        msg = "not_item_writer"; break;
+    case CRABS_ERR_SEQ_MISMATCH:           msg = "seq_mismatch"; break;
+    case CRABS_ERR_FORK_DETECTED:          msg = "fork_detected"; break;
+    case CRABS_ERR_ORDERING_PATH:          msg = "ordering_path"; break;
+    case CRABS_ERR_QUARANTINED:            msg = "quarantined"; break;
     default:                               msg = "unknown_error"; break;
   }
   std::string full = std::string(ctx) + ": " + msg;
@@ -515,6 +520,9 @@ public:
     Napi::Function func = DefineClass(env, "Operation", {
       InstanceMethod("sign", &Operation::Sign),
       InstanceMethod("signWithPrivateKey", &Operation::SignWithPrivateKey),
+      InstanceMethod("addResource", &Operation::AddResource),
+      InstanceMethod("setSovereignPrefix", &Operation::SetSovereignPrefix),
+      InstanceMethod("serialize", &Operation::SerializeOp),
       InstanceAccessor("type", &Operation::GetType, &Operation::SetType),
       InstanceAccessor("signerId", &Operation::GetSignerId, &Operation::SetSignerId),
       InstanceAccessor("nodeId", &Operation::GetNodeId, &Operation::SetNodeId),
@@ -611,6 +619,100 @@ private:
     op_->lamport_time = (uint64_t)val.As<Napi::Number>().DoubleValue();
   }
 
+  // Append a resource name to the op (the wire array is heap-grown one slot
+  // at a time; capacity CRABS_MAX_RESOURCES). Write-domains v1: an op naming
+  // a SOVEREIGN item among its resources must carry a matching sovereign
+  // prefix per sovereign resource (DOMAIN_CHECK enforces the exact count).
+  // The required_state / next_state arrays are per-resource too — the
+  // signing canonical form and the executor index them up to resource_count,
+  // so all three grow together (zeroed states = PROTOCOL_IDLE, matching the
+  // deserializer's default for a state-unconstrained resource).
+  Napi::Value AddResource(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    std::string name = require_js_string(info[0], "addResource", "name");
+    if (name.empty() || name.length() >= CRABS_MAX_USER_ID)
+      throw Napi::RangeError::New(env,
+          "addResource: name must be 1..63 characters");
+    if (op_->resource_count >= CRABS_MAX_RESOURCES)
+      throw Napi::RangeError::New(env,
+          "addResource: resource capacity reached");
+    uint32_t grown_count = op_->resource_count + 1;
+    auto grown_resources = (char(*)[CRABS_MAX_USER_ID])realloc(
+        op_->resources, grown_count * CRABS_MAX_USER_ID);
+    if (grown_resources == NULL) {
+      throw crabs_error(env, CRABS_ERR_OOM, "addResource");
+    }
+    op_->resources = grown_resources;
+    auto grown_required = (protocol_state_e*)realloc(
+        op_->required_state, grown_count * sizeof(protocol_state_e));
+    if (grown_required == NULL) {
+      throw crabs_error(env, CRABS_ERR_OOM, "addResource");
+    }
+    op_->required_state = grown_required;
+    auto grown_next = (protocol_state_e*)realloc(
+        op_->next_state, grown_count * sizeof(protocol_state_e));
+    if (grown_next == NULL) {
+      throw crabs_error(env, CRABS_ERR_OOM, "addResource");
+    }
+    op_->next_state = grown_next;
+    memset(op_->resources[op_->resource_count], 0, CRABS_MAX_USER_ID);
+    strncpy(op_->resources[op_->resource_count], name.c_str(),
+            CRABS_MAX_USER_ID - 1);
+    op_->required_state[op_->resource_count] = PROTOCOL_IDLE;
+    op_->next_state[op_->resource_count] = PROTOCOL_IDLE;
+    op_->resource_count = grown_count;
+    return info.This();
+  }
+
+  // Write-domains v1 (op format v6, signing format v4): set the sovereign
+  // chain prefix at `prefixIndex` — the item_seq the writer believes is
+  // current and the digest of the item at that sequence (64 hex chars).
+  // The prefix array is parallel to the op's sovereign resources in
+  // declaration order; setting index i grows the count to i + 1.
+  Napi::Value SetSovereignPrefix(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 3 || !info[0].IsNumber() || !info[1].IsNumber() ||
+        !info[2].IsString())
+      throw Napi::TypeError::New(env,
+          "Expected setSovereignPrefix(prefixIndex, seq, digestHex)");
+    double index_value = info[0].As<Napi::Number>().DoubleValue();
+    if (index_value < 0 || index_value >= CRABS_MAX_RESOURCES ||
+        index_value != (double)(uint32_t)index_value)
+      throw Napi::RangeError::New(env,
+          "setSovereignPrefix: prefixIndex must be 0..7");
+    uint32_t prefix_index = (uint32_t)index_value;
+    double seq_value = info[1].As<Napi::Number>().DoubleValue();
+    if (seq_value < 0)
+      throw Napi::RangeError::New(env, "setSovereignPrefix: seq must be >= 0");
+    std::string digest_hex = info[2].As<Napi::String>().Utf8Value();
+    if (digest_hex.length() != CRABS_HASH_SIZE * 2)
+      throw Napi::RangeError::New(env,
+          "setSovereignPrefix: digestHex must be 64 hex chars");
+    if (!hex_decode(digest_hex,
+                    op_->sovereign_prefixes[prefix_index].prev_item_digest,
+                    CRABS_HASH_SIZE))
+      throw Napi::TypeError::New(env,
+          "setSovereignPrefix: digestHex is not valid hex");
+    op_->sovereign_prefixes[prefix_index].item_seq = (uint64_t)seq_value;
+    if (op_->sovereign_prefix_count < prefix_index + 1)
+      op_->sovereign_prefix_count = prefix_index + 1;
+    return info.This();
+  }
+
+  // Wire bytes of the op as currently staged — equivocation evidence and
+  // cross-process relays ship this form.
+  Napi::Value SerializeOp(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    serialized_buffer_t* ser = crabs_serialize_operation(op_);
+    if (!ser)
+      throw crabs_error(env, CRABS_ERR_SERIALIZATION_ERROR,
+                        "Operation.serialize");
+    Napi::Buffer<uint8_t> out =
+        Napi::Buffer<uint8_t>::Copy(env, ser->data, ser->len);
+    serialized_buffer_destroy(ser);
+    return out;
+  }
+
   Napi::Value Sign(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
     if (info.Length() < 1 || !info[0].IsObject())
@@ -687,6 +789,8 @@ public:
       InstanceMethod("getUser", &Node::GetUser),
       InstanceMethod("getNodeKey", &Node::GetNodeKey),
       InstanceMethod("addCounter", &Node::AddCounter),
+      InstanceMethod("defineItem", &Node::DefineItem),
+      InstanceMethod("reportEquivocation", &Node::ReportEquivocation),
       InstanceMethod("addPNCounter", &Node::AddPNCounter),
       InstanceMethod("addORSet", &Node::AddORSet),
       InstanceMethod("addOneShotSet", &Node::AddOneShotSet),
@@ -1073,6 +1177,206 @@ private:
   }
 
   // --- Data items ---
+
+  // Write-domains v1: item creation with an explicit write-domain
+  // declaration. Types are restricted to counter/register in v1 — the two
+  // domains that need value initialization here are the only types a
+  // SOVEREIGN item may have (the hash-chain digest is defined only over
+  // their canonical serializations), and FREE-MERGE items of other shapes
+  // keep their dedicated add* methods.
+  //   opts.domain: 'free' (default) | 'sovereign' | 'group'
+  //   opts.writer: string — required for 'sovereign'
+  //   opts.orderingModule: number — only legal for 'group' and only 0 in v1
+  Napi::Value DefineItem(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 3 || !info[0].IsString())
+      throw Napi::TypeError::New(env,
+          "Expected defineItem(name, dataType, crdtType, opts?)");
+    std::string name = require_js_string(info[0], "defineItem", "name");
+    data_type_e data_type;
+    crdt_type_e crdt_type;
+    if (!data_type_from_js(info[1], &data_type))
+      throw Napi::TypeError::New(env,
+          "defineItem: dataType must be a DATA_TYPE word ('counter', "
+          "'register') or number");
+    if (!crdt_type_from_js(info[2], &crdt_type))
+      throw Napi::TypeError::New(env,
+          "defineItem: crdtType must be a CRDT_TYPE word ('g_counter', "
+          "'lww_reg') or number");
+    if (data_type != DATA_TYPE_COUNTER && data_type != DATA_TYPE_REGISTER)
+      throw crabs_error(env, CRABS_ERR_TYPE_MISMATCH,
+          "defineItem: v1 supports only counter and register (use the "
+          "dedicated add* methods for other types)");
+
+    data_item_options_t options;
+    memset(&options, 0, sizeof(options));
+    std::string writer;
+    if (info.Length() > 3 && info[3].IsObject()) {
+      Napi::Object opts = info[3].As<Napi::Object>();
+      if (opts.Has("domain")) {
+        std::string domain_word = to_lower_ascii(
+            require_js_string(opts.Get("domain"), "defineItem", "domain"));
+        if (domain_word == "free") {
+          options.write_domain = CRABS_DOMAIN_FREE_MERGE;
+        } else if (domain_word == "sovereign") {
+          options.write_domain = CRABS_DOMAIN_SOVEREIGN;
+        } else if (domain_word == "group") {
+          options.write_domain = CRABS_DOMAIN_GROUP_ORDERED;
+        } else {
+          throw Napi::TypeError::New(env,
+              "defineItem: domain must be 'free' | 'sovereign' | 'group'");
+        }
+      }
+      if (opts.Has("writer")) {
+        writer = require_js_string(opts.Get("writer"), "defineItem", "writer");
+        options.writer = writer.c_str();
+      }
+      if (opts.Has("orderingModule")) {
+        double module_value =
+            opts.Get("orderingModule").As<Napi::Number>().DoubleValue();
+        if (module_value < 0 || module_value > 255)
+          throw Napi::RangeError::New(env,
+              "defineItem: orderingModule must be 0..255");
+        options.ordering_module = (uint8_t)module_value;
+      }
+    }
+
+    data_item_t* item = NULL;
+    crabs_error_e rc = data_item_create_with_options(
+        name.c_str(), data_type, crdt_type, &options, &item);
+    if (rc != CRABS_SUCCESS) throw crabs_error(env, rc, "defineItem");
+    // Value initialization matches the dedicated adders: g_counter for
+    // counters, a zeroed int64 LWW register for registers.
+    if (data_type == DATA_TYPE_COUNTER) {
+      item->value = g_counter_create();
+    } else {
+      int64_t initial = 0;
+      item->value = lww_register_create((const uint8_t*)&initial,
+                                        sizeof(int64_t), 0, "system");
+    }
+    rc = state_add_item(&am_->base_state, item);
+    if (rc != CRABS_SUCCESS) {
+      data_item_destroy(item);
+      throw crabs_error(env, rc, "defineItem");
+    }
+    return env.Undefined();
+  }
+
+  // Write-domains v1: file a __report_equivocation__ op against the
+  // SOVEREIGN item `itemName`, carrying two serialized writer ops as the
+  // evidence pair. The handler re-verifies everything (both signatures
+  // under the writer's current keyring, equal (item_seq, prev_item_digest)
+  // claims); on success the writer is quarantined on the item. Signed by
+  // the node's admin with the node key — the same submission idiom as
+  // createTrigger (anyone with a policy for the op type may report).
+  Napi::Value ReportEquivocation(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 3 || !info[0].IsString() || !info[1].IsBuffer() ||
+        !info[2].IsBuffer())
+      throw Napi::TypeError::New(env,
+          "Expected reportEquivocation(itemName, opABytes, opBBytes)");
+    std::string item_name =
+        require_js_string(info[0], "reportEquivocation", "itemName");
+    auto op_a = info[1].As<Napi::Buffer<uint8_t>>();
+    auto op_b = info[2].As<Napi::Buffer<uint8_t>>();
+    if (op_a.Length() == 0 || op_b.Length() == 0)
+      throw Napi::RangeError::New(env,
+          "reportEquivocation: evidence ops must be non-empty");
+
+    data_item_t* item =
+        state_find_item(&am_->base_state, item_name.c_str());
+    if (item == NULL)
+      throw crabs_error(env, CRABS_ERR_RESOURCE_NOT_FOUND,
+                        "reportEquivocation");
+    if (item->write_domain != CRABS_DOMAIN_SOVEREIGN ||
+        item->writer[0] == '\0')
+      throw crabs_error(env, CRABS_ERR_INVALID_PARAM,
+          "reportEquivocation: item is not a sovereign item with a writer");
+    if (node_key_ == nullptr)
+      throw Napi::Error::New(env,
+          "reportEquivocation: this machine carries no own node key");
+
+    // Payload v1: u8 version + string16 item + string16 writer +
+    // bytes32 op_a + bytes32 op_b (the handler's parser contract).
+    uint32_t item_len = (uint32_t)item_name.length();
+    uint32_t writer_len = (uint32_t)strlen(item->writer);
+    if (item_len > UINT16_MAX || writer_len > UINT16_MAX)
+      throw Napi::RangeError::New(env,
+          "reportEquivocation: names too long");
+    uint64_t payload_len64 = 1ull + 2 + item_len + 2 + writer_len +
+                             4 + op_a.Length() + 4 + op_b.Length();
+    if (payload_len64 > UINT32_MAX)
+      throw Napi::RangeError::New(env,
+          "reportEquivocation: evidence exceeds payload capacity");
+    uint32_t payload_len = (uint32_t)payload_len64;
+    uint8_t* payload = (uint8_t*)malloc(payload_len);
+    if (payload == NULL) throw crabs_error(env, CRABS_ERR_OOM,
+                                           "reportEquivocation");
+    uint32_t offset = 0;
+    payload[offset++] = 0x01;
+    payload[offset++] = (uint8_t)(item_len & 0xFF);
+    payload[offset++] = (uint8_t)((item_len >> 8) & 0xFF);
+    memcpy(payload + offset, item_name.c_str(), item_len);
+    offset += item_len;
+    payload[offset++] = (uint8_t)(writer_len & 0xFF);
+    payload[offset++] = (uint8_t)((writer_len >> 8) & 0xFF);
+    memcpy(payload + offset, item->writer, writer_len);
+    offset += writer_len;
+    for (int byte_index = 0; byte_index < 4; byte_index++) {
+      payload[offset++] = (uint8_t)((op_a.Length() >> (8 * byte_index)) & 0xFF);
+    }
+    memcpy(payload + offset, op_a.Data(), op_a.Length());
+    offset += (uint32_t)op_a.Length();
+    for (int byte_index = 0; byte_index < 4; byte_index++) {
+      payload[offset++] = (uint8_t)((op_b.Length() >> (8 * byte_index)) & 0xFF);
+    }
+    memcpy(payload + offset, op_b.Data(), op_b.Length());
+    offset += (uint32_t)op_b.Length();
+
+    operation_t* op = operation_create(CRABS_OP_REPORT_EQUIVOCATION);
+    if (op == NULL) {
+      free(payload);
+      throw crabs_error(env, CRABS_ERR_OOM, "reportEquivocation");
+    }
+    crypto_random_bytes(op->uuid, CRABS_UUID_SIZE);
+    op->payload = payload;
+    op->payload_size = payload_len;
+    strncpy(op->signer_id, admin_id_.c_str(), CRABS_MAX_USER_ID - 1);
+    strncpy(op->node_id, admin_id_.c_str(), CRABS_MAX_USER_ID - 1);
+
+    // Stamp the signer's current key version (R7-04) and HLC when the
+    // machine is HLC-ordered, then sign — the same pre-sign stamping
+    // node.sign() performs.
+    if (am_->base_state.hlc_state_initialized) {
+      op->ordering_system = CRABS_ORDERING_HLC;
+      op->hlc = crabs_hlc_next(&am_->base_state.hlc_state);
+      strncpy(op->node_id, am_->base_state.hlc_state.last.node_id,
+              CRABS_MAX_USER_ID - 1);
+    }
+    user_t* signer_user = attribute_machine_find_user(am_, op->signer_id);
+    if (signer_user != NULL) {
+      op->signer_key_version = signer_user->key_version;
+    }
+    serialized_buffer_t* ser = crabs_serialize_for_signing(op);
+    if (ser == NULL) {
+      operation_destroy(op);
+      throw crabs_error(env, CRABS_ERR_SERIALIZATION_ERROR,
+                        "reportEquivocation");
+    }
+    crabs_error_e rc = crypto_ecdsa_sign(node_key_->private_key, ser->data,
+                                         ser->len, op->signature);
+    serialized_buffer_destroy(ser);
+    if (rc != CRABS_SUCCESS) {
+      operation_destroy(op);
+      throw crabs_error(env, rc, "reportEquivocation");
+    }
+
+    rc = state_machine_execute(&am_->base_state, op);
+    operation_destroy(op);
+    if (rc != CRABS_SUCCESS) throw crabs_error(env, rc,
+                                               "reportEquivocation");
+    return env.Undefined();
+  }
 
   Napi::Value AddCounter(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
