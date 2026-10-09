@@ -89,7 +89,13 @@ export interface HandlerState {
   incrementCounter(name: string, delta?: number, nodeId?: string): void;
   incrementPNCounter(name: string, delta?: number, nodeId?: string): void;
   decrementPNCounter(name: string, delta?: number, nodeId?: string): void;
-  setRegister(name: string, value: number, nodeId?: string): void;
+  /**
+   * Integer-only: a register carries an int64. Numbers must be integers
+   * within ±Number.MAX_SAFE_INTEGER; for the full int64 range pass a BigInt.
+   * Fractional values are rejected — encode scaled units instead
+   * (e.g. store 12.5% as 125 per-mille).
+   */
+  setRegister(name: string, value: number | bigint, nodeId?: string): void;
   setAdd(name: string, element: string, tag?: string): void;
   setRemove(name: string, element: string): void;
   flagSet(name: string, setBy: string, setAt?: number): void;
@@ -213,7 +219,13 @@ export interface Node {
   getCounter(name: string): number;
   getPNCounter(name: string): number;
   getRegister(name: string): number;
-  setRegister(name: string, value: number, nodeId?: string): void;
+  /**
+   * Integer-only: a register carries an int64. Numbers must be integers
+   * within ±Number.MAX_SAFE_INTEGER; for the full int64 range pass a BigInt.
+   * Fractional values are rejected — encode scaled units instead
+   * (e.g. store 12.5% as 125 per-mille).
+   */
+  setRegister(name: string, value: number | bigint, nodeId?: string): void;
   setRegisterBytes(name: string, bytes: Uint8Array, nodeId?: string): void;
   setContains(name: string, element: string): boolean;
 

@@ -218,6 +218,13 @@ export interface Node {
   getCounter(name: string): number | undefined;
   getPNCounter(name: string): number | undefined;
   getRegister(name: string): number | undefined;
+  /**
+   * Integer-only: a register carries an int64. Numbers must be integers
+   * within ±Number.MAX_SAFE_INTEGER (the node binding accepts numbers only;
+   * for full int64 range use crabs-wasm's BigInt acceptance). Fractional
+   * values are rejected — encode scaled units instead
+   * (e.g. store 12.5% as 125 per-mille).
+   */
   setRegister(name: string, value: number, nodeId?: string): void;
   setContains(name: string, element: string): boolean;
 

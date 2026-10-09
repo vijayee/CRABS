@@ -174,6 +174,25 @@ function freeAll(M, ...ptrs) {
   for (const p of ptrs) { if (p) M._free(p); }
 }
 
+// Integer-only guard for register writes (consumption finding 1). Registers
+// carry an int64 in C; BigInt(non-integer) would throw a generic RangeError
+// and numbers past ±2^53 silently lose precision. Reject early with an
+// instructive message so callers encode fractional quantities as scaled
+// integers (per-mille pattern) or pass a BigInt for the full int64 range.
+function validateRegisterInt(value, ctx) {
+  if (typeof value === 'bigint') return value;
+  if (typeof value === 'number') {
+    if (!Number.isInteger(value)) {
+      throw new Error(`${ctx}: registers are integer-only; encode fractional values in register units (e.g. per-mille)`);
+    }
+    if (Math.abs(value) > Number.MAX_SAFE_INTEGER) {
+      throw new Error(`${ctx}: registers are integer-only; |value| exceeds Number.MAX_SAFE_INTEGER — pass a BigInt for exact int64 precision`);
+    }
+    return BigInt(value);
+  }
+  throw new Error(`${ctx}: registers are integer-only; value must be an integer number or a BigInt (encode fractional values in register units, e.g. per-mille)`);
+}
+
 // ============================================================
 // KeyPair
 // ============================================================
@@ -784,10 +803,11 @@ class Node {
   }
 
   setRegister(name, value, nodeId = 'system') {
+    const intValue = validateRegisterInt(value, 'setRegister');
     const M = this._M;
     const nPtr = writeString(M, name);
     const idPtr = writeString(M, nodeId);
-    const rc = M._crabs_wasm_set_register(this._am, nPtr, BigInt(value), idPtr);
+    const rc = M._crabs_wasm_set_register(this._am, nPtr, intValue, idPtr);
     freeAll(M, nPtr, idPtr);
     wrapRc(rc, 'setRegister');
   }
@@ -1222,9 +1242,10 @@ class Node {
   }
 
   _callSetRegisterFromAm(M, amPtr, name, value, nodeId) {
+    const intValue = validateRegisterInt(value, 'handler setRegister');
     const nPtr = writeString(M, name);
     const idPtr = writeString(M, nodeId);
-    const rc = M._crabs_wasm_set_register(amPtr, nPtr, BigInt(value), idPtr);
+    const rc = M._crabs_wasm_set_register(amPtr, nPtr, intValue, idPtr);
     freeAll(M, nPtr, idPtr);
     if (rc !== 0) throw crabsError(rc, 'handler setRegister');
     return 0;

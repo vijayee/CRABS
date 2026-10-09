@@ -70,6 +70,78 @@ The API mirrors `crabs-node` (the N-API bindings). See `../node/index.d.ts` for 
 - **`KeyPair`** — ECDSA secp256k1 keypair
 - **`Operation`** — A signed state-machine operation
 
+## Registers
+
+A register (`addRegister` / `setRegister` / `getRegister`) is a last-writer-wins
+**int64**. The JavaScript surface is integer-only:
+
+- `setRegister(name, value[, nodeId])` accepts an integer `number` within
+  `±Number.MAX_SAFE_INTEGER`, **or** a `BigInt` for the full int64 range.
+- Non-integer numbers (fractional values, `NaN`, `±Infinity`) throw
+  `"setRegister: registers are integer-only; encode fractional values in
+  register units (e.g. per-mille)"`.
+- Numbers past `±Number.MAX_SAFE_INTEGER` throw and point at the BigInt path,
+  because doubles lose precision beyond 2^53.
+
+**Per-mille pattern for fractional quantities.** Encode fractional values as
+scaled integers rather than trying to push a float through. Pick a base
+(per-mille is a common choice) and document it on the register name or in
+the app schema:
+
+```js
+// Store 12.5% as 125 per-mille (125 / 1000 = 0.125).
+node.setRegister('vote_share_pm', 125);
+const share = node.getRegister('vote_share_pm') / 1000;  // 0.125
+
+// Currency: store cents, never dollars-and-cents as a float.
+node.setRegister('balance_cents', 420049);  // $4200.49
+
+// Full int64 range needs BigInt.
+node.setRegister('large_units', 9007199254740991n * 4n);
+```
+
+The same guard runs on the handler-context `state.setRegister(...)` inside
+`registerHandlerJs`. For opaque payloads (ciphertext, serialized structs),
+use `setRegisterBytes` — the int convention is for counters-of-record, not
+byte storage.
+
+## OR-Sets
+
+An OR-Set (`addORSet` / `setAdd` / `setRemove` / `setContains`) stores
+**(element, tag) pairs**, observed-remove style. The pair is the unit of
+identity; neither field alone is unique.
+
+```js
+node.setAdd('subscribers', 'alice', 'tag-1');
+node.setAdd('subscribers', 'bob',   'tag-1');  // distinct pair: BOTH kept
+node.setContains('subscribers', 'alice');       // true
+node.setContains('subscribers', 'bob');         // true
+```
+
+Contract:
+
+- **Same tag, different element → both retained.** Distinct pairs are
+  independent entries; two elements CAN share a tag and both stay in the
+  set. (Pre-1.7 this silently dropped the second element — fixed; see
+  `docs/CONSUMPTION_FINDINGS_2026-10-09.md` §2.)
+- **Same (element, tag) re-add is idempotent.** Re-appending the pair is a
+  no-op, which is what makes gossip/replay self-merge safe.
+- **`setRemove(name, element)` tombstones that element's tags as pairs.**
+  The tombstone covers only the specific (element, tag) entries that
+  existed at remove time.
+- **Re-adding the SAME element under a tombstoned tag is a no-op.**
+  Observed-remove semantics: the tombstoned pair stays dead, even on
+  re-add. This is the deliberate "remove wins over concurrent add of the
+  same observed pair" guarantee.
+- **A different element under a tombstoned tag adds normally.** The
+  tombstone is pair-scoped, not tag-scoped — it does not block other
+  elements from using the same tag later.
+
+Merge behavior: `or_set_merge` unions live pairs and unions tombstone
+pairs; a live pair whose pair is tombstoned is excluded from the merged
+result. Concurrent `(add e, remove e)` resolves as remove when the remove
+observed the add (the usual observed-remove bias).
+
 ## Differences from crabs-node
 
 | | crabs-node (N-API) | crabs-wasm (this package) |

@@ -535,6 +535,48 @@ try {
     duplicateReport.message);
 }
 
+// Test: setRegister is integer-only (consumption finding 1). NaN, Infinity,
+// fractional values, and |value| > Number.MAX_SAFE_INTEGER reject BEFORE the
+// C conversion can silently truncate. The node binding takes numbers only.
+{
+  node.addRegister('guard_slot', 0);
+  const INTEGER_ONLY =
+    'registers are integer-only; encode fractional values in register units (e.g. per-mille)';
+  const SAFE_INTEGER =
+    'registers are integer-only; |value| exceeds Number.MAX_SAFE_INTEGER';
+  const mustThrowWith = (invoke, fragment, label) => {
+    let caught = null;
+    try { invoke(); } catch (caughtError) { caught = caughtError; }
+    assert(caught !== null, `${label}: expected a throw`);
+    assert(caught && caught.message.includes(fragment),
+      `${label}: expected message containing "${fragment}", got "${caught && caught.message}"`);
+  };
+
+  mustThrowWith(() => node.setRegister('guard_slot', 1.5), INTEGER_ONLY, 'fractional 1.5');
+  mustThrowWith(() => node.setRegister('guard_slot', -0.25), INTEGER_ONLY, 'fractional -0.25');
+  mustThrowWith(() => node.setRegister('guard_slot', NaN), INTEGER_ONLY, 'NaN');
+  mustThrowWith(() => node.setRegister('guard_slot', Infinity), INTEGER_ONLY, '+Infinity');
+  mustThrowWith(() => node.setRegister('guard_slot', -Infinity), INTEGER_ONLY, '-Infinity');
+
+  mustThrowWith(() => node.setRegister('guard_slot', Number.MAX_SAFE_INTEGER + 1),
+    SAFE_INTEGER, 'MAX_SAFE_INTEGER + 1');
+  mustThrowWith(() => node.setRegister('guard_slot', -(Number.MAX_SAFE_INTEGER + 1)),
+    SAFE_INTEGER, '-(MAX_SAFE_INTEGER + 1)');
+  mustThrowWith(() => node.setRegister('guard_slot', 2 ** 60),
+    SAFE_INTEGER, '2^60');
+
+  // Boundaries pass through verbatim.
+  node.setRegister('guard_slot', Number.MAX_SAFE_INTEGER);
+  assert(node.getRegister('guard_slot') === Number.MAX_SAFE_INTEGER,
+    '+MAX_SAFE_INTEGER should round-trip');
+  node.setRegister('guard_slot', -Number.MAX_SAFE_INTEGER);
+  assert(node.getRegister('guard_slot') === -Number.MAX_SAFE_INTEGER,
+    '-MAX_SAFE_INTEGER should round-trip');
+
+  // Ordinary integers still set.
+  node.setRegister('guard_slot', -7, 'alice');
+  assert(node.getRegister('guard_slot') === -7, 'integer -7 should land');
+}
 
 console.log(`\n${passed} passed, ${failed} failed`);
 process.exit(failed > 0 ? 1 : 0);

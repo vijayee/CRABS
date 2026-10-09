@@ -1583,7 +1583,21 @@ private:
     if (info.Length() < 2)
       throw Napi::TypeError::New(env, "Expected (name, value[, nodeId])");
     std::string name = require_js_string(info[0], "setRegister", "name");
-    int64_t value = (int64_t)info[1].As<Napi::Number>().Int64Value();
+    // Consumption finding 1: registers are integer-only (int64 in C). Reject
+    // NaN, Infinity, fractional values, and unsafe integers before the C call
+    // — mirroring the wasm wrapper — so fractional quantities are encoded as
+    // scaled integers (per-mille pattern) instead of silently truncated.
+    if (!info[1].IsNumber())
+      throw Napi::TypeError::New(env,
+        "setRegister: registers are integer-only; value must be an integer number (encode fractional values in register units, e.g. per-mille)");
+    double num_value = info[1].As<Napi::Number>().DoubleValue();
+    if (!std::isfinite(num_value) || std::floor(num_value) != num_value)
+      throw Napi::TypeError::New(env,
+        "setRegister: registers are integer-only; encode fractional values in register units (e.g. per-mille)");
+    if (std::fabs(num_value) > 9007199254740991.0 /* 2^53 - 1 */)
+      throw Napi::TypeError::New(env,
+        "setRegister: registers are integer-only; |value| exceeds Number.MAX_SAFE_INTEGER — the node binding accepts safe-integer numbers only");
+    int64_t value = (int64_t)num_value;
     std::string node_id = info.Length() > 2
         ? require_js_string(info[2], "setRegister", "nodeId") : "system";
     data_item_t* item = state_find_item(&am_->base_state, name.c_str());

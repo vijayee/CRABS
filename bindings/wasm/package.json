@@ -17,7 +17,7 @@
   },
   "scripts": {
     "build": "cd ../.. && OPENSSL_SRC=/tmp/openssl-3.4.0 bash build_wasm.sh",
-    "test": "node test/smoke.js && node test/change-events.js && node test/devtools.js && node test/schedules.js && node test/time-source.js && node test/write-domains.js"
+    "test": "node test/smoke.js && node test/change-events.js && node test/devtools.js && node test/registers.js && node test/schedules.js && node test/time-source.js && node test/write-domains.js"
   },
   "files": [
     "crabs.wasm",
