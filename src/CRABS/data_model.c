@@ -143,6 +143,16 @@ void data_item_destroy(data_item_t* item) {
       case DATA_TYPE_ONE_SHOT_FLAG:
         one_shot_flag_destroy((one_shot_flag_t*)item->value);
         break;
+      // NOTE (adjacency, deferred): COUNTER/PN_COUNTER/REGISTER values fall
+      // into the default free() — a bare free leaks struct-backed values'
+      // internal buffers (g_counter entries, register payload). Routing
+      // these through crdt_value_destroy(item->crdt_type, ...) is NOT safe
+      // yet: the pre-v15 legacy load path produces repr-mismatched items
+      // (raw int64 value under a CRDT_G_COUNTER tag — see
+      // _deserialize_data_item's version < 15 arm), so crdt_type cannot
+      // currently discriminate the representation, and deep-destroying a
+      // raw repr would interpret its first bytes as a heap pointer. Fix
+      // requires repr canonicalization of the legacy load first.
       default:
         free(item->value);
         break;

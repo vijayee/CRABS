@@ -2087,3 +2087,238 @@ TEST_F(TestStateMachine, DedupMutationGroupOrderedTargetMustBeResource) {
   operation_destroy(uncovered);
   EXPECT_EQ(g_counter_value((g_counter_t*)group_item->value), 0);
 }
+
+// ============================================================
+// Guarantee-regression test (spec 2026-10-08 §Testing — "Guarantee
+// regression test", Amendment 4 §13.6): the same concurrent same-writer
+// write race must produce DIFFERENT outcomes per domain class. Under
+// FREE_MERGE the race is silently absorbed at merge (eventual — A4 §11.2
+// stands). Under SOVEREIGN the same race is signed equivocation: both
+// writer ops claim the same chain head with divergent results, so merge
+// convicts the writer and DOMAIN_CHECK blocks further writes (strict).
+// A class that behaved identically in both races would be the other class
+// renamed — the divergent outcome is what demonstrates the taxonomy is
+// real. (GROUP_ORDERED's arm is trivial in v1: every direct write is
+// ORDERING_PATH — see DomainCheckGroupOrderedV1ReadOnly.)
+// ============================================================
+
+// Handler: assign the op's payload bytes into the REGISTER resource (LWW
+// semantics mirroring crabs_wasm_set_register). The payload is what makes
+// two concurrent writer ops diverge on the same item.
+static crabs_error_e tag_assign_handler(state_t* handler_state,
+                                        operation_t* op) {
+  if (op->resource_count == 0) return CRABS_ERR_RESOURCE_NOT_FOUND;
+  data_item_t* item = state_find_item(handler_state, op->resources[0]);
+  if (item == NULL || item->type != DATA_TYPE_REGISTER) {
+    return CRABS_ERR_RESOURCE_NOT_FOUND;
+  }
+  lww_register_t* register_value = (lww_register_t*)item->value;
+  uint8_t* new_payload = (uint8_t*)malloc(op->payload_size);
+  if (new_payload == NULL) return CRABS_ERR_OOM;
+  memcpy(new_payload, op->payload, op->payload_size);
+  free(register_value->value);
+  register_value->value = new_payload;
+  register_value->value_size = (uint32_t)op->payload_size;
+  register_value->timestamp = handler_state->version + 1;
+  strncpy(register_value->node_id, op->signer_id, CRABS_MAX_USER_ID - 1);
+  register_value->node_id[CRABS_MAX_USER_ID - 1] = '\0';
+  return CRABS_SUCCESS;
+}
+
+// A second replica sharing the fixture's alice identity: own state, own
+// attribute machine (alice registered under the same public key), own node
+// key, "tag_assign" policy + handler, and one REGISTER item named "slot"
+// with the requested write domain.
+typedef struct {
+  state_t* state;
+  attribute_machine_t* am;
+} writer_replica_t;
+
+static writer_replica_t make_writer_replica(ecdsa_keypair_t* alice_key,
+                                            crabs_write_domain_e domain,
+                                            crabs_error_e* out_status) {
+  writer_replica_t replica = {NULL, NULL};
+  *out_status = CRABS_SUCCESS;
+  replica.state = state_create();
+  uint8_t admin_pk[33];
+  memset(admin_pk, 0xAA, 33);
+  admin_pk[0] = 0x02;
+  replica.am = attribute_machine_create("admin", admin_pk);
+  if (replica.state == NULL || replica.am == NULL) {
+    *out_status = CRABS_ERR_OOM;
+    return replica;
+  }
+  if (crabs_test_register_user_with_role(replica.am, "alice",
+                                         alice_key->public_key, "role",
+                                         "admin") != CRABS_SUCCESS) {
+    *out_status = CRABS_ERR_CRYPTOGRAPHIC_ERROR;
+    return replica;
+  }
+  replica.state->attr_machine = replica.am;
+  ecdsa_keypair_t* node_key = crypto_ecdsa_generate();
+  if (node_key == NULL) { *out_status = CRABS_ERR_OOM; return replica; }
+  state_set_node_key(replica.state, node_key->private_key,
+                     node_key->public_key);
+  crypto_ecdsa_keypair_destroy(node_key);
+  state_add_policy(replica.state, "tag_assign", "role:admin");
+  if (state_machine_register_handler(replica.state, "tag_assign",
+                                     tag_assign_handler) != CRABS_SUCCESS) {
+    *out_status = CRABS_ERR_PROTOCOL_VIOLATION;
+    return replica;
+  }
+
+  data_item_options_t options = {};
+  options.write_domain = domain;
+  const char writer_alice[] = "alice";
+  if (domain == CRABS_DOMAIN_SOVEREIGN) options.writer = writer_alice;
+  data_item_t* item = NULL;
+  *out_status = data_item_create_with_options("slot", DATA_TYPE_REGISTER,
+                                              CRDT_LWW_REG, &options, &item);
+  if (*out_status != CRABS_SUCCESS) return replica;
+  static const uint8_t initial_payload[] = "init";
+  item->value = lww_register_create(initial_payload,
+                                    sizeof(initial_payload) - 1, 0, "system");
+  if (item->value == NULL) { *out_status = CRABS_ERR_OOM; return replica; }
+  *out_status = state_add_item(replica.state, item);
+  return replica;
+}
+
+static void destroy_writer_replica(writer_replica_t* replica) {
+  replica->state->attr_machine = NULL;
+  state_destroy(replica->state);
+  attribute_machine_destroy(replica->am);
+}
+
+// Build an alice-signed "tag_assign" op on resource "slot" carrying `tag`
+// as its payload. `replica_am` resolves the signer key_version; the lamport
+// counter is the caller's (must stay strictly increasing per signer). For
+// sovereign items the caller sets op->sovereign_prefixes BEFORE this signs.
+static operation_t* make_tag_op(const char* tag, uint8_t uuid_seed,
+                                attribute_machine_t* replica_am,
+                                ecdsa_keypair_t* alice_key,
+                                uint64_t* signer_lamport) {
+  operation_t* op = make_domain_op("tag_assign", "slot", uuid_seed);
+  op->payload_size = strlen(tag);
+  op->payload = (uint8_t*)malloc(op->payload_size);
+  memcpy(op->payload, tag, op->payload_size);
+  sign_as(op, replica_am, alice_key, "alice", signer_lamport);
+  return op;
+}
+
+TEST_F(TestStateMachine, ConcurrentSameWriterRaceOutcomeDiffersByDomain) {
+  crabs_error_e build_status = CRABS_SUCCESS;
+
+  // ---------- FREE_MERGE arm: the race is absorbed (A4 §11.2) ----------
+  writer_replica_t free_a =
+      make_writer_replica(alice_key, CRABS_DOMAIN_FREE_MERGE, &build_status);
+  ASSERT_EQ(build_status, CRABS_SUCCESS);
+  writer_replica_t free_b =
+      make_writer_replica(alice_key, CRABS_DOMAIN_FREE_MERGE, &build_status);
+  ASSERT_EQ(build_status, CRABS_SUCCESS);
+
+  operation_t* free_op_red = make_tag_op("red", 0x71, free_a.am, alice_key,
+                                         &lamport_counter);
+  EXPECT_EQ(state_machine_execute(free_a.state, free_op_red), CRABS_SUCCESS);
+  operation_destroy(free_op_red);
+  operation_t* free_op_blue = make_tag_op("blue", 0x72, free_b.am,
+                                          alice_key, &lamport_counter);
+  EXPECT_EQ(state_machine_execute(free_b.state, free_op_blue),
+            CRABS_SUCCESS);
+  operation_destroy(free_op_blue);
+
+  // Merge: the concurrent writes converge silently. Equal timestamp and
+  // node_id tie-break in dst's favor, so the absorbed value is "red".
+  EXPECT_EQ(crdt_merge_state(free_a.state, free_b.state), CRABS_SUCCESS);
+  data_item_t* free_slot = state_find_item(free_a.state, "slot");
+  ASSERT_NE(free_slot, nullptr);
+  lww_register_t* free_reg = (lww_register_t*)free_slot->value;
+  ASSERT_NE(free_reg, nullptr);
+  EXPECT_EQ(free_reg->value_size, strlen("red"));
+  EXPECT_EQ(memcmp(free_reg->value, "red", free_reg->value_size), 0);
+
+  // Eventual means nothing is blocked: a further write lands without any
+  // chain check.
+  operation_t* free_op_green = make_tag_op("green", 0x73, free_a.am,
+                                           alice_key, &lamport_counter);
+  EXPECT_EQ(state_machine_execute(free_a.state, free_op_green),
+            CRABS_SUCCESS);
+  operation_destroy(free_op_green);
+  destroy_writer_replica(&free_a);
+  destroy_writer_replica(&free_b);
+
+  // ---------- SOVEREIGN arm: the race convicts the writer ----------
+  writer_replica_t sov_a =
+      make_writer_replica(alice_key, CRABS_DOMAIN_SOVEREIGN, &build_status);
+  ASSERT_EQ(build_status, CRABS_SUCCESS);
+  writer_replica_t sov_b =
+      make_writer_replica(alice_key, CRABS_DOMAIN_SOVEREIGN, &build_status);
+  ASSERT_EQ(build_status, CRABS_SUCCESS);
+
+  // Alice signs two DISTINCT ops both claiming chain head (seq 0, zero
+  // digest) — the same concurrent-write race as the free arm, but under
+  // sovereignty it is signed equivocation by construction.
+  operation_t* sov_op_red = make_domain_op("tag_assign", "slot", 0x81);
+  sov_op_red->payload_size = strlen("red");
+  sov_op_red->payload = (uint8_t*)malloc(sov_op_red->payload_size);
+  memcpy(sov_op_red->payload, "red", sov_op_red->payload_size);
+  sov_op_red->sovereign_prefix_count = 1;
+  sov_op_red->sovereign_prefixes[0].item_seq = 0;
+  memset(sov_op_red->sovereign_prefixes[0].prev_item_digest, 0,
+         CRABS_HASH_SIZE);
+  sign_as(sov_op_red, sov_a.am, alice_key, "alice", &lamport_counter);
+  EXPECT_EQ(state_machine_execute(sov_a.state, sov_op_red), CRABS_SUCCESS);
+  operation_destroy(sov_op_red);
+
+  operation_t* sov_op_blue = make_domain_op("tag_assign", "slot", 0x82);
+  sov_op_blue->payload_size = strlen("blue");
+  sov_op_blue->payload = (uint8_t*)malloc(sov_op_blue->payload_size);
+  memcpy(sov_op_blue->payload, "blue", sov_op_blue->payload_size);
+  sov_op_blue->sovereign_prefix_count = 1;
+  sov_op_blue->sovereign_prefixes[0].item_seq = 0;
+  memset(sov_op_blue->sovereign_prefixes[0].prev_item_digest, 0,
+         CRABS_HASH_SIZE);
+  sign_as(sov_op_blue, sov_b.am, alice_key, "alice", &lamport_counter);
+  EXPECT_EQ(state_machine_execute(sov_b.state, sov_op_blue), CRABS_SUCCESS);
+  operation_destroy(sov_op_blue);
+
+  data_item_t* slot_a = state_find_item(sov_a.state, "slot");
+  data_item_t* slot_b = state_find_item(sov_b.state, "slot");
+  ASSERT_NE(slot_a, nullptr);
+  ASSERT_NE(slot_b, nullptr);
+  ASSERT_EQ(slot_a->item_seq, (uint64_t)1);
+  ASSERT_EQ(slot_b->item_seq, (uint64_t)1);
+  // Divergent post-op content ⇒ divergent chain heads on the same seq.
+  ASSERT_NE(memcmp(slot_a->item_digest, slot_b->item_digest,
+                   CRABS_HASH_SIZE),
+            0);
+
+  // Merge: equal seq + different digest = fork. Item_a's content is kept
+  // (quarantine semantics — the race must NOT merge), and alice is
+  // convicted on the receiving replica.
+  EXPECT_EQ(crdt_merge_state(sov_a.state, sov_b.state), CRABS_SUCCESS);
+  lww_register_t* sov_reg = (lww_register_t*)slot_a->value;
+  ASSERT_NE(sov_reg, nullptr);
+  EXPECT_EQ(sov_reg->value_size, strlen("red"));
+  EXPECT_EQ(memcmp(sov_reg->value, "red", sov_reg->value_size), 0);
+  EXPECT_TRUE(state_item_is_quarantined(slot_a, "alice"));
+
+  // Strict means blocked: the convicted writer's next op — even with the
+  // current, honest chain prefix — is rejected at DOMAIN_CHECK.
+  operation_t* sov_op_next = make_domain_op("tag_assign", "slot", 0x83);
+  sov_op_next->payload_size = strlen("late");
+  sov_op_next->payload = (uint8_t*)malloc(sov_op_next->payload_size);
+  memcpy(sov_op_next->payload, "late", sov_op_next->payload_size);
+  sov_op_next->sovereign_prefix_count = 1;
+  sov_op_next->sovereign_prefixes[0].item_seq = slot_a->item_seq;
+  memcpy(sov_op_next->sovereign_prefixes[0].prev_item_digest,
+         slot_a->item_digest, CRABS_HASH_SIZE);
+  sign_as(sov_op_next, sov_a.am, alice_key, "alice", &lamport_counter);
+  EXPECT_EQ(state_machine_validate(sov_a.state, sov_op_next),
+            CRABS_ERR_QUARANTINED);
+  EXPECT_EQ(state_machine_execute(sov_a.state, sov_op_next),
+            CRABS_ERR_QUARANTINED);
+  operation_destroy(sov_op_next);
+  EXPECT_EQ(slot_a->item_seq, (uint64_t)1);
+  destroy_writer_replica(&sov_a);
+  destroy_writer_replica(&sov_b);
+}
