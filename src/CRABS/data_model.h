@@ -131,9 +131,56 @@ typedef struct data_item_t {
   // Compaction tracking (v1.5.2 §4)
   uint64_t         last_compaction_time;  // Timestamp of last successful compaction
 
+  // Write domain (write-domains v1, spec 2026-10-08). FREE_MERGE (0) for
+  // items created without options and for items loaded from pre-v14 states —
+  // zero default means zero behavioral change on upgrade. Declared at
+  // creation, immutable on a live item in v1.
+  crabs_write_domain_e write_domain;
+  // SOVEREIGN only: the user_id of the item's single writer ("" otherwise).
+  // char (not uint8_t) to match every other user-id field in this header.
+  char             writer[CRABS_MAX_USER_ID];
+  // SOVEREIGN: writer-assigned monotonic sequence over this writer's ops on
+  // the item; 0 before the first op, incremented on each accepted op.
+  uint64_t         item_seq;
+  // SOVEREIGN: SHA-256 over the item's post-op serialized form (the same
+  // shape _serialize_data_item produces). Zeroed while item_seq == 0.
+  uint8_t          item_digest[CRABS_HASH_SIZE];
+  // GROUP_ORDERED: attached ordering module id. 0 = unset — v1 ships no
+  // modules, so a GROUP_ORDERED item with module 0 is read-only (DOMAIN_CHECK
+  // fails closed with CRABS_ERR_ORDERING_PATH) until a module is registered.
+  uint8_t          ordering_module;
+  // SOVEREIGN quarantine: fork evidence accumulated for this item, stored
+  // inline (no allocation), capped at CRABS_MAX_FORK_WRITERS. Entries are
+  // appended by the equivocation-report handler and by merge as a monotone
+  // union (union-only, never evicted); a writer present here has all future
+  // writes on this item rejected (CRABS_ERR_QUARANTINED). Runtime-populated;
+  // serialized from v14 onward.
+  char             fork_writers[CRABS_MAX_FORK_WRITERS][CRABS_MAX_USER_ID];
+  uint8_t          fork_evidence_digests[CRABS_MAX_FORK_WRITERS][CRABS_HASH_SIZE];
+  uint32_t         fork_count;  // ≤ CRABS_MAX_FORK_WRITERS
+
   // Pointer-based linking
   struct data_item_t* next;
 } data_item_t;
+
+// ============================================================
+// Write-domain creation options (write-domains v1)
+// ============================================================
+// All-optional parameters for data_item_create_with_options. NULL options or
+// a zeroed struct reproduces data_item_create's behavior exactly:
+// FREE_MERGE, no writer, no ordering module.
+//
+// v1 restrictions (see data_item_create_with_options):
+//   - SOVEREIGN requires a non-empty writer and a type among
+//     DATA_TYPE_COUNTER / DATA_TYPE_REGISTER.
+//   - GROUP_ORDERED requires ordering_module == 0 (no modules exist yet).
+//   - writer is meaningful only for SOVEREIGN; ordering_module only for
+//     GROUP_ORDERED.
+typedef struct {
+  crabs_write_domain_e write_domain;    // 0 = CRABS_DOMAIN_FREE_MERGE (default)
+  const char*          writer;          // SOVEREIGN only; NULL = none
+  uint8_t              ordering_module; // GROUP_ORDERED; 0 = unset (v1-only state)
+} data_item_options_t;
 
 // ============================================================
 // Policy (§4.3 + v1.3 §7)
@@ -529,6 +576,24 @@ extern const data_type_definition_t CRABS_BUILTIN_TYPES[10];
 // DataItem creation/destruction
 // ============================================================
 data_item_t* data_item_create(const char* name, data_type_e type, crdt_type_e crdt_type);
+// Create a data item with write-domain options (write-domains v1). NULL
+// options (or a zeroed struct) is exactly data_item_create: FREE_MERGE, no
+// writer. On success *out_item takes ownership of the new item; on failure
+// returns the error and leaves *out_item NULL:
+//   CRABS_ERR_INVALID_PARAM — NULL out_item; unknown domain; SOVEREIGN
+//     without a non-empty writer; writer set on a non-SOVEREIGN domain;
+//     ordering_module set on a non-GROUP_ORDERED domain; ordering_module
+//     non-zero on GROUP_ORDERED (v1 ships no ordering modules, so no module
+//     id can resolve — fail closed at creation).
+//   CRABS_ERR_TYPE_MISMATCH — SOVEREIGN on a type other than
+//     DATA_TYPE_COUNTER / DATA_TYPE_REGISTER (only those types have a
+//     well-defined serialized post-state for the sovereign hash-chain digest;
+//     widening the set requires defining a canonical serialized form first).
+crabs_error_e data_item_create_with_options(const char* name,
+                                            data_type_e type,
+                                            crdt_type_e crdt_type,
+                                            const data_item_options_t* options,
+                                            data_item_t** out_item);
 void         data_item_destroy(data_item_t* item);
 
 // ============================================================
@@ -564,9 +629,42 @@ crabs_error_e state_set_node_key(state_t* state,
 // State query helpers
 // ============================================================
 data_item_t* state_find_item(state_t* state, const char* name);
+// Adds a heap item created by data_item_create[_with_options]; on success the
+// state owns it. Fails closed (CRABS_ERR_INVALID_PARAM) on a malformed domain
+// declaration (unknown domain value, or SOVEREIGN with an empty writer) so a
+// hand-built item cannot bypass data_item_create_with_options validation —
+// on failure the CALLER still owns the item.
 crabs_error_e state_add_item(state_t* state, data_item_t* item);
 crabs_error_e state_add_policy(state_t* state, const char* operation, const char* expression);
 const char*  state_find_policy(state_t* state, const char* operation);
+
+// ============================================================
+// Write-domain item helpers (write-domains v1)
+// ============================================================
+// The item's declared write domain. A NULL item reports FREE_MERGE (the
+// zero/default domain), matching the pre-v14 load semantics.
+crabs_write_domain_e state_item_domain(const data_item_t* item);
+// Append one fork-evidence entry (writer + SHA-256 of the two forking op
+// bytes) to the item's quarantine set. Monotone-union semantics: an entry
+// whose writer OR evidence digest is already present is a duplicate
+// (CRABS_ERR_DUPLICATE_OPERATION) — idempotent re-delivery of the same
+// report is not an error, just a no-op signal. At CRABS_MAX_FORK_WRITERS the
+// set is full: returns CRABS_ERR_OOM (capacity exhaustion, mirroring
+// state_register_op_type_def; the cap bounds griefing and the audit log
+// remains the authoritative evidence store). Intended for SOVEREIGN items;
+// the callers (equivocation handler, merge) enforce that.
+crabs_error_e state_append_fork_evidence(data_item_t* item,
+                                         const char* writer,
+                                         const uint8_t evidence_digest[CRABS_HASH_SIZE]);
+// True when writer appears in the item's fork set (a quarantined writer —
+// DOMAIN_CHECK rejects their further writes with CRABS_ERR_QUARANTINED).
+// NULL item/writer → false (attribution checks run before this lookup).
+bool state_item_is_quarantined(const data_item_t* item, const char* writer);
+// SHA-256 over the item's current serialized form (the same shape the state
+// serializer emits per item), used for the sovereign hash chain. Content-
+// comparable across replicas: identical item content ⇒ identical digest.
+crabs_error_e state_item_digest_compute(const data_item_t* item,
+                                        uint8_t out_digest[CRABS_HASH_SIZE]);
 
 // Operation type definition registry (v1.4 §7)
 const dedup_spec_t* state_find_op_type_def(const state_t* state, const char* op_type);

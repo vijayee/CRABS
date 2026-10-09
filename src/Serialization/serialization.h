@@ -89,6 +89,18 @@ operation_t*         crabs_deserialize_operation(const uint8_t* data, size_t len
 // ============================================================
 serialized_buffer_t* crabs_serialize_for_signing(const operation_t* op);
 
+// Serialize a single data item in exactly the per-item shape
+// crabs_serialize_state writes (name/type/crdt/protocol_state/value/
+// invariants/last_compaction_time). Used by the write-domains sovereign
+// hash chain so an item's digest is content-comparable across replicas.
+// NOTE (v14): this preimage MUST keep covering the pre-domain (v13) item
+// form only — the v14 domain tail (write_domain/writer/item_seq/
+// item_digest/fork set) is emitted by the state serializer's per-item loop,
+// not here, because folding item_digest into its own preimage is
+// self-referential and folding item_seq in would couple the digest to chain
+// position rather than content.
+serialized_buffer_t* crabs_serialize_data_item(const data_item_t* item);
+
 // ============================================================
 // Buffer helpers
 // ============================================================

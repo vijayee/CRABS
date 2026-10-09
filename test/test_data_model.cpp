@@ -746,3 +746,255 @@ TEST(TestDataModel, ConfigRoundTrip) {
   state_destroy(state);
   state_destroy(restored);
 }
+
+// ============================================================
+// Write Domains (v1): creation options, fork evidence, digest
+// ============================================================
+
+TEST(TestDataModel, ItemCreateWithOptionsNullIsFreeMergeDefault) {
+  data_item_t* item = nullptr;
+  EXPECT_EQ(data_item_create_with_options("sovereignless", DATA_TYPE_COUNTER,
+                                          CRDT_G_COUNTER, nullptr, &item),
+            CRABS_SUCCESS);
+  ASSERT_NE(item, nullptr);
+  EXPECT_EQ(item->write_domain, CRABS_DOMAIN_FREE_MERGE);
+  EXPECT_STREQ(item->writer, "");
+  EXPECT_EQ(item->item_seq, (uint64_t)0);
+  EXPECT_EQ(item->ordering_module, (uint8_t)0);
+  EXPECT_EQ(item->fork_count, (uint32_t)0);
+  uint8_t zero_digest[CRABS_HASH_SIZE] = {0};
+  EXPECT_EQ(memcmp(item->item_digest, zero_digest, CRABS_HASH_SIZE), 0);
+  EXPECT_EQ(state_item_domain(item), CRABS_DOMAIN_FREE_MERGE);
+  data_item_destroy(item);
+
+  // A zeroed options struct must behave identically to NULL.
+  data_item_options_t zeroed = {};
+  data_item_t* item2 = nullptr;
+  EXPECT_EQ(data_item_create_with_options("zeroed", DATA_TYPE_COUNTER,
+                                          CRDT_G_COUNTER, &zeroed, &item2),
+            CRABS_SUCCESS);
+  ASSERT_NE(item2, nullptr);
+  EXPECT_EQ(item2->write_domain, CRABS_DOMAIN_FREE_MERGE);
+  EXPECT_STREQ(item2->writer, "");
+  data_item_destroy(item2);
+}
+
+TEST(TestDataModel, ItemCreateWithOptionsSovereign) {
+  data_item_options_t options = {};
+  options.write_domain = CRABS_DOMAIN_SOVEREIGN;
+  options.writer = "alice";
+
+  data_item_t* item = nullptr;
+  EXPECT_EQ(data_item_create_with_options("alice_counter", DATA_TYPE_COUNTER,
+                                          CRDT_G_COUNTER, &options, &item),
+            CRABS_SUCCESS);
+  ASSERT_NE(item, nullptr);
+  EXPECT_EQ(item->write_domain, CRABS_DOMAIN_SOVEREIGN);
+  EXPECT_STREQ(item->writer, "alice");
+  EXPECT_EQ(item->item_seq, (uint64_t)0);
+  EXPECT_EQ(state_item_domain(item), CRABS_DOMAIN_SOVEREIGN);
+  data_item_destroy(item);
+
+  // REGISTER is the other v1-supported sovereign type.
+  data_item_t* reg = nullptr;
+  EXPECT_EQ(data_item_create_with_options("alice_reg", DATA_TYPE_REGISTER,
+                                          CRDT_LWW_REG, &options, &reg),
+            CRABS_SUCCESS);
+  ASSERT_NE(reg, nullptr);
+  EXPECT_EQ(reg->write_domain, CRABS_DOMAIN_SOVEREIGN);
+  EXPECT_STREQ(reg->writer, "alice");
+  data_item_destroy(reg);
+}
+
+TEST(TestDataModel, ItemCreateWithOptionsSovereignRequiresWriter) {
+  data_item_options_t options = {};
+  options.write_domain = CRABS_DOMAIN_SOVEREIGN;
+
+  data_item_t* item = nullptr;
+  // NULL writer
+  EXPECT_EQ(data_item_create_with_options("c", DATA_TYPE_COUNTER,
+                                          CRDT_G_COUNTER, &options, &item),
+            CRABS_ERR_INVALID_PARAM);
+  EXPECT_EQ(item, nullptr);
+  // Empty writer
+  options.writer = "";
+  EXPECT_EQ(data_item_create_with_options("c", DATA_TYPE_COUNTER,
+                                          CRDT_G_COUNTER, &options, &item),
+            CRABS_ERR_INVALID_PARAM);
+  EXPECT_EQ(item, nullptr);
+}
+
+TEST(TestDataModel, ItemCreateWithOptionsSovereignTypeRestricted) {
+  data_item_options_t options = {};
+  options.write_domain = CRABS_DOMAIN_SOVEREIGN;
+  options.writer = "alice";
+
+  // v1 restricts SOVEREIGN to COUNTER/REGISTER: only those types have a
+  // well-defined serialized post-state for the hash-chain digest.
+  data_item_t* item = nullptr;
+  EXPECT_EQ(data_item_create_with_options("s", DATA_TYPE_SET,
+                                          CRDT_OR_SET, &options, &item),
+            CRABS_ERR_TYPE_MISMATCH);
+  EXPECT_EQ(item, nullptr);
+  EXPECT_EQ(data_item_create_with_options("d", DATA_TYPE_DOCUMENT,
+                                          CRDT_RGA, &options, &item),
+            CRABS_ERR_TYPE_MISMATCH);
+  EXPECT_EQ(item, nullptr);
+}
+
+TEST(TestDataModel, ItemCreateWithOptionsWriterOnlyForSovereign) {
+  data_item_options_t options = {};
+  options.write_domain = CRABS_DOMAIN_FREE_MERGE;
+  options.writer = "alice";
+
+  data_item_t* item = nullptr;
+  EXPECT_EQ(data_item_create_with_options("c", DATA_TYPE_COUNTER,
+                                          CRDT_G_COUNTER, &options, &item),
+            CRABS_ERR_INVALID_PARAM);
+  EXPECT_EQ(item, nullptr);
+}
+
+TEST(TestDataModel, ItemCreateWithOptionsUnknownDomainRejected) {
+  data_item_options_t options = {};
+  options.write_domain = (crabs_write_domain_e)0x7F;
+
+  data_item_t* item = nullptr;
+  EXPECT_EQ(data_item_create_with_options("c", DATA_TYPE_COUNTER,
+                                          CRDT_G_COUNTER, &options, &item),
+            CRABS_ERR_INVALID_PARAM);
+  EXPECT_EQ(item, nullptr);
+}
+
+TEST(TestDataModel, ItemCreateWithOptionsGroupOrderedV1Seam) {
+  data_item_options_t options = {};
+  options.write_domain = CRABS_DOMAIN_GROUP_ORDERED;
+
+  // v1 ships no ordering modules: module id 0 (unset) is creatable and the
+  // item is read-only until a module is registered (DOMAIN_CHECK fail-closed).
+  data_item_t* item = nullptr;
+  EXPECT_EQ(data_item_create_with_options("g", DATA_TYPE_COUNTER,
+                                          CRDT_G_COUNTER, &options, &item),
+            CRABS_SUCCESS);
+  ASSERT_NE(item, nullptr);
+  EXPECT_EQ(item->write_domain, CRABS_DOMAIN_GROUP_ORDERED);
+  EXPECT_EQ(item->ordering_module, (uint8_t)0);
+  data_item_destroy(item);
+
+  // A non-zero module id cannot resolve in v1 (no module registry yet) and
+  // must fail closed at creation.
+  options.ordering_module = 1;
+  item = nullptr;
+  EXPECT_EQ(data_item_create_with_options("g", DATA_TYPE_COUNTER,
+                                          CRDT_G_COUNTER, &options, &item),
+            CRABS_ERR_INVALID_PARAM);
+  EXPECT_EQ(item, nullptr);
+}
+
+TEST(TestDataModel, StateAddItemRejectsMalformedSovereign) {
+  // Hand-built item (not via data_item_create_with_options) claiming
+  // SOVEREIGN without a writer: state_add_item fails closed.
+  state_t* state = state_create();
+  data_item_t* item = data_item_create("handmade", DATA_TYPE_COUNTER, CRDT_G_COUNTER);
+  item->write_domain = CRABS_DOMAIN_SOVEREIGN;  // writer left empty
+  EXPECT_EQ(state_add_item(state, item), CRABS_ERR_INVALID_PARAM);
+  data_item_destroy(item);
+  state_destroy(state);
+}
+
+TEST(TestDataModel, AppendForkEvidenceDedupeAndCap) {
+  data_item_options_t options = {};
+  options.write_domain = CRABS_DOMAIN_SOVEREIGN;
+  options.writer = "alice";
+  data_item_t* item = nullptr;
+  ASSERT_EQ(data_item_create_with_options("c", DATA_TYPE_COUNTER,
+                                          CRDT_G_COUNTER, &options, &item),
+            CRABS_SUCCESS);
+
+  uint8_t evidence[CRABS_HASH_SIZE];
+  memset(evidence, 0x11, CRABS_HASH_SIZE);
+  EXPECT_EQ(state_append_fork_evidence(item, "mallory", evidence), CRABS_SUCCESS);
+  EXPECT_EQ(item->fork_count, (uint32_t)1);
+  EXPECT_STREQ(item->fork_writers[0], "mallory");
+  EXPECT_EQ(memcmp(item->fork_evidence_digests[0], evidence, CRABS_HASH_SIZE), 0);
+  EXPECT_TRUE(state_item_is_quarantined(item, "mallory"));
+  EXPECT_FALSE(state_item_is_quarantined(item, "alice"));
+
+  // Monotone-union: duplicate writer rejected even with different evidence.
+  uint8_t evidence2[CRABS_HASH_SIZE];
+  memset(evidence2, 0x22, CRABS_HASH_SIZE);
+  EXPECT_EQ(state_append_fork_evidence(item, "mallory", evidence2),
+            CRABS_ERR_DUPLICATE_OPERATION);
+  // Different writer reusing the same evidence digest is also a duplicate.
+  EXPECT_EQ(state_append_fork_evidence(item, "sybil", evidence),
+            CRABS_ERR_DUPLICATE_OPERATION);
+  EXPECT_EQ(item->fork_count, (uint32_t)1);
+
+  // Cap: fill to CRABS_MAX_FORK_WRITERS, then one more must fail.
+  for (uint32_t i = (uint32_t)item->fork_count; i < CRABS_MAX_FORK_WRITERS; i++) {
+    char fork_writer[CRABS_MAX_USER_ID];
+    snprintf(fork_writer, sizeof(fork_writer), "forker_%u", i);
+    uint8_t fork_evidence[CRABS_HASH_SIZE];
+    memset(fork_evidence, 0, CRABS_HASH_SIZE);
+    fork_evidence[0] = (uint8_t)(0xA0 + i);
+    EXPECT_EQ(state_append_fork_evidence(item, fork_writer, fork_evidence),
+              CRABS_SUCCESS) << "i=" << i;
+  }
+  EXPECT_EQ(item->fork_count, (uint32_t)CRABS_MAX_FORK_WRITERS);
+  uint8_t extra_evidence[CRABS_HASH_SIZE];
+  memset(extra_evidence, 0xFF, CRABS_HASH_SIZE);
+  EXPECT_EQ(state_append_fork_evidence(item, "overflow", extra_evidence),
+            CRABS_ERR_OOM);
+  EXPECT_EQ(item->fork_count, (uint32_t)CRABS_MAX_FORK_WRITERS);
+  EXPECT_FALSE(state_item_is_quarantined(item, "overflow"));
+
+  // Null params
+  EXPECT_EQ(state_append_fork_evidence(nullptr, "x", evidence), CRABS_ERR_INVALID_PARAM);
+  EXPECT_EQ(state_append_fork_evidence(item, nullptr, evidence), CRABS_ERR_INVALID_PARAM);
+  EXPECT_EQ(state_append_fork_evidence(item, "", evidence), CRABS_ERR_INVALID_PARAM);
+  EXPECT_EQ(state_append_fork_evidence(item, "x", nullptr), CRABS_ERR_INVALID_PARAM);
+
+  data_item_destroy(item);
+}
+
+TEST(TestDataModel, ItemDigestComputeDeterministic) {
+  int64_t value_a = 7;
+  int64_t value_b = 7;
+
+  data_item_t* item_a = data_item_create("c", DATA_TYPE_COUNTER, CRDT_G_COUNTER);
+  data_item_t* item_b = data_item_create("c", DATA_TYPE_COUNTER, CRDT_G_COUNTER);
+  item_a->value = &value_a;
+  item_b->value = &value_b;
+
+  uint8_t digest_a[CRABS_HASH_SIZE];
+  uint8_t digest_b[CRABS_HASH_SIZE];
+  ASSERT_EQ(state_item_digest_compute(item_a, digest_a), CRABS_SUCCESS);
+  ASSERT_EQ(state_item_digest_compute(item_b, digest_b), CRABS_SUCCESS);
+  // Same content → same digest (content-comparable across replicas).
+  EXPECT_EQ(memcmp(digest_a, digest_b, CRABS_HASH_SIZE), 0);
+
+  // Different content → different digest.
+  value_b = 8;
+  ASSERT_EQ(state_item_digest_compute(item_b, digest_b), CRABS_SUCCESS);
+  EXPECT_NE(memcmp(digest_a, digest_b, CRABS_HASH_SIZE), 0);
+
+  // A freshly created (value-less) item still digests deterministically.
+  data_item_t* empty_a = data_item_create("c", DATA_TYPE_COUNTER, CRDT_G_COUNTER);
+  data_item_t* empty_b = data_item_create("c", DATA_TYPE_COUNTER, CRDT_G_COUNTER);
+  uint8_t digest_ea[CRABS_HASH_SIZE];
+  uint8_t digest_eb[CRABS_HASH_SIZE];
+  ASSERT_EQ(state_item_digest_compute(empty_a, digest_ea), CRABS_SUCCESS);
+  ASSERT_EQ(state_item_digest_compute(empty_b, digest_eb), CRABS_SUCCESS);
+  EXPECT_EQ(memcmp(digest_ea, digest_eb, CRABS_HASH_SIZE), 0);
+  EXPECT_NE(memcmp(digest_a, digest_ea, CRABS_HASH_SIZE), 0);
+
+  EXPECT_EQ(state_item_digest_compute(nullptr, digest_a), CRABS_ERR_INVALID_PARAM);
+  EXPECT_EQ(state_item_digest_compute(item_a, nullptr), CRABS_ERR_INVALID_PARAM);
+
+  // Values point into test-owned storage — detach before destroy.
+  item_a->value = nullptr;
+  item_b->value = nullptr;
+  data_item_destroy(item_a);
+  data_item_destroy(item_b);
+  data_item_destroy(empty_a);
+  data_item_destroy(empty_b);
+}

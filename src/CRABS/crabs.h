@@ -38,6 +38,24 @@
 #define CRABS_MAX_LOCK_EXTENDS  3    // Maximum lock extensions
 #define CRABS_LOCK_TOKEN_SIZE   32   // Lock token byte length
 #define CRABS_UUID_SIZE         16   // UUID v4 byte length
+// Write domains (2026-10-08 spec): cap on per-item sovereign fork-evidence
+// entries. The fork set is a monotone union: a capped set truncates future
+// appends but never evicts, and the audit log retains the full evidence ops.
+#define CRABS_MAX_FORK_WRITERS  16
+
+// ============================================================
+// Write Domains (write-domains v1, spec 2026-10-08)
+// ============================================================
+// Every data item belongs to exactly one write domain, declared at creation
+// and immutable in v1. FREE_MERGE (0) is the default — it carries exactly
+// today's semantics, so pre-v14 states and options-less creation need no
+// migration. GROUP_ORDERED has no registered ordering module in v1: such
+// items are creatable but reject all writes (fail-closed seam).
+typedef enum {
+  CRABS_DOMAIN_FREE_MERGE    = 0x00,   // any authorized writer; CRDT merge
+  CRABS_DOMAIN_SOVEREIGN     = 0x01,   // single registered writer, hash-chained
+  CRABS_DOMAIN_GROUP_ORDERED = 0x02    // ordering module governs writes
+} crabs_write_domain_e;
 
 // ============================================================
 // Error Codes (Appendix B)
@@ -101,7 +119,14 @@ typedef enum {
   // 0x9xxx: Compaction errors (v1.6 §6)
   CRABS_ERR_COMPACTION_NOT_SUPPORTED = 0x9001,
   CRABS_ERR_COMPACTION_NOT_SAFE     = 0x9002,
-  CRABS_ERR_COMPACTION_IN_PROGRESS  = 0x9003
+  CRABS_ERR_COMPACTION_IN_PROGRESS  = 0x9003,
+
+  // 0xAxxx: Write domain errors (write-domains v1, spec 2026-10-08)
+  CRABS_ERR_NOT_ITEM_WRITER  = 0xA001,  // op on a SOVEREIGN item from a non-writer (or unattributable signer)
+  CRABS_ERR_SEQ_MISMATCH     = 0xA002,  // stale/duplicate item_seq on a SOVEREIGN op
+  CRABS_ERR_FORK_DETECTED    = 0xA003,  // same item_seq, different digest — writer equivocation
+  CRABS_ERR_ORDERING_PATH    = 0xA004,  // direct write to a GROUP_ORDERED item (module propose path required)
+  CRABS_ERR_QUARANTINED      = 0xA005   // writer present in the item's fork-evidence set
 } crabs_error_e;
 
 // ============================================================

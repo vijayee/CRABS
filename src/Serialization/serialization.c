@@ -910,6 +910,12 @@ static void* _deserialize_crdt_value(const uint8_t* data, uint32_t len, data_typ
 // ============================================================
 // Data item serialization (§13.2)
 // ============================================================
+// NOTE (write-domains v1): this function's output IS the preimage of the
+// sovereign item hash chain via crabs_serialize_data_item below. When the
+// v14 per-item domain tail (write_domain/writer/item_seq/item_digest/fork
+// set) lands, it must be emitted by the per-item call site that versions it
+// (the state serializer), NOT folded in here unconditionally — the digest
+// preimage deliberately excludes domain metadata (see serialization.h).
 static void _serialize_data_item(write_buf_t* buf, const data_item_t* item) {
   // name_length + name
   _write_string16(buf, item->name);
@@ -1170,6 +1176,22 @@ static bool _deserialize_data_item(read_buf_t* buf, data_item_t* item, uint32_t 
   }
 
   return true;
+}
+
+// Public single-item form (write-domains v1): delegates to
+// _serialize_data_item so the sovereign hash chain hashes exactly the shape
+// the state serializer emits per item. Deliberately covers the pre-domain
+// (v13) item form only — see the NOTE on the declaration in serialization.h.
+serialized_buffer_t* crabs_serialize_data_item(const data_item_t* item) {
+  if (item == NULL) return NULL;
+  write_buf_t* buf = _write_buf_create(256);
+  _serialize_data_item(buf, item);
+  serialized_buffer_t* result = serialized_buffer_create(buf->offset);
+  memcpy(result->data, buf->data, buf->offset);
+  result->len = buf->offset;
+  free(buf->data);
+  free(buf);
+  return result;
 }
 
 // ============================================================

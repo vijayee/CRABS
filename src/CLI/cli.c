@@ -79,6 +79,11 @@ const char* cli_error_string(crabs_error_e err) {
     case CRABS_ERR_INTERNAL:              return "internal_error";
     case CRABS_ERR_OOM:                   return "out_of_memory";
     case CRABS_ERR_INVALID_PARAM:         return "invalid_param";
+    case CRABS_ERR_NOT_ITEM_WRITER:       return "not_item_writer";
+    case CRABS_ERR_SEQ_MISMATCH:          return "seq_mismatch";
+    case CRABS_ERR_FORK_DETECTED:         return "fork_detected";
+    case CRABS_ERR_ORDERING_PATH:         return "ordering_path";
+    case CRABS_ERR_QUARANTINED:           return "quarantined";
     default:                              return "unknown";
   }
 }
