@@ -968,6 +968,58 @@ static crabs_error_e _verify_co_signatures(state_t* state, const operation_t* op
 // the count must match EXACTLY the number of sovereign resources present —
 // a prefix silently assigned to the wrong item would compare against the
 // wrong chain head. Fail closed (CRABS_ERR_SEQ_MISMATCH) on any mismatch.
+// The mutation target path of a dedup spec, or NULL when the spec carries
+// no resolvable mutation target (DEDUP_NONE, or DEDUP_CUSTOM with a
+// MUTATION_CUSTOM update, which has no path fields).
+static const char* _dedup_mutation_target_path(const dedup_spec_t* spec) {
+  switch (spec->type) {
+    case DEDUP_PER_USER: return spec->tracker_path;
+    case DEDUP_GLOBAL:   return spec->flag_path;
+    case DEDUP_CUSTOM:
+      switch (spec->update.type) {
+        case MUTATION_SET_ADD:           return spec->update.set_path;
+        case MUTATION_FLAG_SET:          return spec->update.flag_path;
+        case MUTATION_COUNTER_INCREMENT: return spec->update.counter_path;
+        case MUTATION_ASSIGN:            return spec->update.target_path;
+        default:                         return NULL;
+      }
+    default: return NULL;
+  }
+}
+
+// Dedup mutation targets obey the same domain rules as named resources.
+// The registered spec's MUTATION section runs post-handler (R7-13) on
+// whatever item its path names — including a SOVEREIGN/GROUP_ORDERED item
+// absent from op->resources, which the post-op bookkeeping
+// (_apply_sovereign_bookkeeping) would then fail to chain-advance: the
+// item's content moves while its stored digest goes stale. v1 rule: every
+// existing, non-FREE_MERGE mutation target must be a NAMED resource of the
+// op, so the SOVEREIGN arm below (writer binding + signed chain prefix) and
+// the GROUP_ORDERED arm (v1 read-only) cover mutation targets too. Fail
+// closed with CRABS_ERR_SEQ_MISMATCH: the op's chain claims are incomplete
+// for the items it mutates. (SOVEREIGN targets cannot be ONE_SHOT types in
+// v1 — creation restricts SOVEREIGN to COUNTER/REGISTER — so only the
+// COUNTER_INCREMENT/ASSIGN arms of DEDUP_CUSTOM can actually resolve to one;
+// the check is uniform regardless.)
+static crabs_error_e _check_mutation_target_in_resources(state_t* state,
+                                                         const dedup_spec_t* spec,
+                                                         const operation_t* op) {
+  const char* target_path = _dedup_mutation_target_path(spec);
+  if (target_path == NULL || target_path[0] == '\0') return CRABS_SUCCESS;
+  // A missing target fails earlier: dedup_validate_mutation_spec runs before
+  // this step and reports TRACKER_NOT_FOUND/FLAG_NOT_FOUND/NOT_FOUND.
+  const data_item_t* target_item = state_find_item(state, target_path);
+  if (target_item == NULL) return CRABS_SUCCESS;
+  if (target_item->write_domain == CRABS_DOMAIN_FREE_MERGE) return CRABS_SUCCESS;
+  for (uint32_t resource_index = 0; resource_index < op->resource_count;
+       resource_index++) {
+    if (strcmp(op->resources[resource_index], target_path) == 0) {
+      return CRABS_SUCCESS;
+    }
+  }
+  return CRABS_ERR_SEQ_MISMATCH;
+}
+
 static crabs_error_e _run_domain_check(state_t* state, const operation_t* op) {
   uint32_t sovereign_count = 0;
   for (uint32_t resource_index = 0; resource_index < op->resource_count;
@@ -980,6 +1032,19 @@ static crabs_error_e _run_domain_check(state_t* state, const operation_t* op) {
   if (op->sovereign_prefix_count != sovereign_count) {
     return CRABS_ERR_SEQ_MISMATCH;
   }
+
+  // Registered dedup specs only (never the op-carried, signer-authored one —
+  // the pipeline rejects those for op types without a registered def before
+  // this step): the mutation target must ride the op's chain claims.
+  const dedup_spec_t* registered_spec = state_find_op_type_def(state, op->type);
+  if (registered_spec != NULL) {
+    crabs_error_e target_rc =
+        _check_mutation_target_in_resources(state, registered_spec, op);
+    if (target_rc != CRABS_SUCCESS) {
+      return target_rc;
+    }
+  }
+
 
   uint32_t prefix_index = 0;
   for (uint32_t resource_index = 0; resource_index < op->resource_count;
@@ -1042,6 +1107,14 @@ static crabs_error_e _run_domain_check(state_t* state, const operation_t* op) {
 // mutations keeps it in lockstep with the op's other effects; advancing it
 // only AFTER append_log would expose the opposite inconsistency (a log entry
 // whose chain never moved) if the digest computation failed.
+//
+// Coverage: walking op->resources is EXHAUSTIVE for sovereign mutations
+// because (a) DOMAIN_CHECK requires every non-FREE_MERGE dedup mutation
+// target to be a named resource (_check_mutation_target_in_resources) — the
+// dedup mutation runs immediately above and is the only other mutation the
+// pipeline applies — and (b) trigger effects that would touch sovereign
+// items are rejected at install time (spec §Triggers). Handler-internal
+// mutations are the writer's own and land on the named resources.
 static crabs_error_e _apply_sovereign_bookkeeping(state_t* state,
                                                   const operation_t* op) {
   for (uint32_t resource_index = 0; resource_index < op->resource_count;

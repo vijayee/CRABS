@@ -1965,3 +1965,125 @@ TEST_F(TestStateMachine, ReportEquivocationIsBuiltinAndProtected) {
   operation_destroy(define);
 }
 
+// Carried Task-5 gap: a dedup mutation targeting a SOVEREIGN item that is
+// NOT among op->resources would mutate the item without advancing its hash
+// chain (stale digest vs content). v1 rule: DOMAIN_CHECK requires every
+// non-FREE_MERGE dedup mutation target to be a named resource (so its
+// prefix is carried and verified); otherwise the op is SEQ_MISMATCH. When
+// the target IS a resource, the post-handler bookkeeping recomputes the
+// digest over the post-MUTATION state.
+TEST_F(TestStateMachine, DedupMutationSovereignTargetMustBeResource) {
+  state_add_policy(state, "vote_bump", "role:admin");
+  ASSERT_EQ(state_machine_register_handler(state, "vote_bump",
+                                           sov_bump_handler),
+            CRABS_SUCCESS);
+  data_item_t* item = add_sovereign_counter(state, "sov_counter", "alice");
+  ASSERT_NE(item, nullptr);
+
+  // Register a dedup spec on "vote_bump" whose mutation increments the
+  // sovereign counter — the target chain the op's claims must cover.
+  dedup_spec_t spec;
+  memset(&spec, 0, sizeof(spec));
+  spec.type = DEDUP_CUSTOM;
+  strncpy(spec.condition, "free_counter >= 0", CRABS_MAX_POLICY_EXPR - 1);
+  spec.update.type = MUTATION_COUNTER_INCREMENT;
+  strncpy(spec.update.counter_path, "sov_counter", CRABS_MAX_DEDUP_PATH - 1);
+  spec.update.delta = 1;
+  ASSERT_EQ(state_register_op_type_def(state, "vote_bump", &spec),
+            CRABS_SUCCESS);
+
+  // The handler requires resources[0] to exist; use a separate free-merge
+  // item as the handler's target so the op can run WITHOUT naming the
+  // sovereign counter at all.
+  data_item_t* free_item =
+      data_item_create("free_counter", DATA_TYPE_COUNTER, CRDT_G_COUNTER);
+  free_item->value = g_counter_create();
+  ASSERT_EQ(state_add_item(state, free_item), CRABS_SUCCESS);
+
+  // (1) Target NOT in resources: the mutation would advance the counter
+  // without a chain step. Fail closed.
+  operation_t* uncovered = make_domain_op("vote_bump", "free_counter", 0x61);
+  set_signer_key_version(uncovered);
+  sign_operation(uncovered);
+  EXPECT_EQ(state_machine_validate(state, uncovered), CRABS_ERR_SEQ_MISMATCH);
+  EXPECT_EQ(state_machine_execute(state, uncovered), CRABS_ERR_SEQ_MISMATCH);
+  operation_destroy(uncovered);
+  EXPECT_EQ(g_counter_value((g_counter_t*)item->value), 0);
+  EXPECT_EQ(item->item_seq, (uint64_t)0);
+
+  // (2) Target IS in resources with a correct prefix: accepted, and the
+  // chain bookkeeping covers the dedup mutation (digest recomputed over
+  // the post-increment state).
+  operation_t* covered = operation_create("vote_bump");
+  memset(covered->uuid, 0x62, CRABS_UUID_SIZE);
+  covered->resources =
+      (char(*)[CRABS_MAX_USER_ID])malloc(2 * sizeof(char[CRABS_MAX_USER_ID]));
+  strncpy(covered->resources[0], "free_counter", CRABS_MAX_USER_ID - 1);
+  strncpy(covered->resources[1], "sov_counter", CRABS_MAX_USER_ID - 1);
+  covered->resource_count = 2;
+  covered->required_state =
+      (protocol_state_e*)malloc(2 * sizeof(protocol_state_e));
+  covered->next_state = (protocol_state_e*)malloc(2 * sizeof(protocol_state_e));
+  covered->required_state[0] = PROTOCOL_IDLE;
+  covered->next_state[0] = PROTOCOL_IDLE;
+  covered->required_state[1] = PROTOCOL_IDLE;
+  covered->next_state[1] = PROTOCOL_IDLE;
+  covered->sovereign_prefix_count = 1;
+  covered->sovereign_prefixes[0].item_seq = 0;
+  memset(covered->sovereign_prefixes[0].prev_item_digest, 0, CRABS_HASH_SIZE);
+  covered->dedup = spec;  // op-carried value is ignored; the registered spec wins
+  strncpy(covered->signer_id, "alice", CRABS_MAX_USER_ID - 1);
+  set_signer_key_version(covered);
+  sign_operation(covered);
+  EXPECT_EQ(state_machine_execute(state, covered), CRABS_SUCCESS);
+  operation_destroy(covered);
+
+  // The handler bumped free_counter once; the dedup mutation bumped the
+  // sovereign counter once; the chain advanced exactly once and the stored
+  // digest matches the item's current content.
+  EXPECT_EQ(g_counter_value((g_counter_t*)item->value), 1);
+  EXPECT_EQ(item->item_seq, (uint64_t)1);
+  uint8_t recomputed[CRABS_HASH_SIZE];
+  ASSERT_EQ(state_item_digest_compute(item, recomputed), CRABS_SUCCESS);
+  EXPECT_EQ(memcmp(item->item_digest, recomputed, CRABS_HASH_SIZE), 0);
+}
+
+// Same carried-gap rule for a GROUP_ORDERED dedup mutation target outside
+// the resource list: v1 has no module to order through, so it fails closed
+// (SEQ_MISMATCH) rather than silently mutating an off-path item.
+TEST_F(TestStateMachine, DedupMutationGroupOrderedTargetMustBeResource) {
+  state_add_policy(state, "vote_bump", "role:admin");
+  ASSERT_EQ(state_machine_register_handler(state, "vote_bump",
+                                           sov_bump_handler),
+            CRABS_SUCCESS);
+  data_item_options_t options = {};
+  options.write_domain = CRABS_DOMAIN_GROUP_ORDERED;
+  data_item_t* group_item = nullptr;
+  ASSERT_EQ(data_item_create_with_options("group_counter", DATA_TYPE_COUNTER,
+                                          CRDT_G_COUNTER, &options, &group_item),
+            CRABS_SUCCESS);
+  group_item->value = g_counter_create();
+  ASSERT_EQ(state_add_item(state, group_item), CRABS_SUCCESS);
+
+  data_item_t* free_item =
+      data_item_create("free_counter", DATA_TYPE_COUNTER, CRDT_G_COUNTER);
+  free_item->value = g_counter_create();
+  ASSERT_EQ(state_add_item(state, free_item), CRABS_SUCCESS);
+
+  dedup_spec_t spec;
+  memset(&spec, 0, sizeof(spec));
+  spec.type = DEDUP_CUSTOM;
+  strncpy(spec.condition, "free_counter >= 0", CRABS_MAX_POLICY_EXPR - 1);
+  spec.update.type = MUTATION_COUNTER_INCREMENT;
+  strncpy(spec.update.counter_path, "group_counter", CRABS_MAX_DEDUP_PATH - 1);
+  spec.update.delta = 1;
+  ASSERT_EQ(state_register_op_type_def(state, "vote_bump", &spec),
+            CRABS_SUCCESS);
+
+  operation_t* uncovered = make_domain_op("vote_bump", "free_counter", 0x63);
+  set_signer_key_version(uncovered);
+  sign_operation(uncovered);
+  EXPECT_EQ(state_machine_execute(state, uncovered), CRABS_ERR_SEQ_MISMATCH);
+  operation_destroy(uncovered);
+  EXPECT_EQ(g_counter_value((g_counter_t*)group_item->value), 0);
+}
