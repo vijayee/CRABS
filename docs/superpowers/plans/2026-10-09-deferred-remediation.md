@@ -23,9 +23,10 @@
 ### Task B: Merge adopt recomputes the chain head
 
 **Files:** `src/CRDT/crdt_merge.c`, tests.
-- [ ] `_merge_sovereign_item`: when adopting ahead item_b, recompute `state_item_digest_compute` over the ADOPTED content and use the COMPUTED digest as the merged head (carried digest is advisory); if computed ≠ carried → that's a tampered/divergent snapshot: hold (keep dst), emit the existing merge divergence event, union evidence — fail closed rather than planting a mismatched head.
-- [ ] Also recompute the equal-seq comparison path's heads from content, not carried fields.
-- [ ] Tests: tampered carried digest on an ahead snapshot → held + event, dst chain intact; honest ahead snapshot → adopted with computed digest == carried. Commit: `fix: merge recomputes adopted sovereign chain heads from content`.
+- [x] `_merge_sovereign_item`: when adopting ahead item_b, recompute `state_item_digest_compute` over the ADOPTED content and use the COMPUTED digest as the merged head (carried digest is advisory); if computed ≠ carried → that's a tampered/divergent snapshot: hold (keep dst), emit the existing merge divergence event, union evidence — fail closed rather than planting a mismatched head.
+- [x] Also recompute the equal-seq comparison path's heads from content, not carried fields.
+- [x] Canonical (type, crdt) pairing table (`data_item_canonical_crdt_for_type` next to CRABS_BUILTIN_TYPES) — fail-closed in `data_item_create_with_options`, checked explicitly in `crabs_wasm_define_item` and the node defineItem binding (the reviewed wasm define_item miscast hole, folded in).
+- [x] Tests: tampered carried digest on an ahead snapshot → held + event, dst chain intact; honest ahead snapshot → adopted with computed digest == carried; equal-seq content-equal + corrupted carried → converges, no conviction; pairing rejection C tests. Commit: `fix: merge recomputes adopted sovereign chain heads from content`.
 
 ### Task C: p2p demo — sovereign item + domain pills
 
