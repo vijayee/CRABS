@@ -1022,6 +1022,17 @@ TEST(TestDataModel, ItemDigestChainPreimageIgnoresProtocolState) {
   EXPECT_EQ(memcmp(digest_locked, digest_idle, CRABS_HASH_SIZE), 0)
       << "chain digest must not move with protocol_state";
 
+  // Same for last_compaction_time: two replicas compacting identical content
+  // at different times must not split the chain head.
+  item_locked->last_compaction_time = 1000;
+  item_idle->last_compaction_time = 999999;
+  item_locked->protocol_state = PROTOCOL_IDLE;
+  item_idle->protocol_state = PROTOCOL_IDLE;
+  ASSERT_EQ(state_item_digest_compute(item_locked, digest_locked), CRABS_SUCCESS);
+  ASSERT_EQ(state_item_digest_compute(item_idle, digest_idle), CRABS_SUCCESS);
+  EXPECT_EQ(memcmp(digest_locked, digest_idle, CRABS_HASH_SIZE), 0)
+      << "chain digest must not move with last_compaction_time";
+
   item_locked->value = nullptr;
   item_idle->value = nullptr;
   data_item_destroy(item_locked);

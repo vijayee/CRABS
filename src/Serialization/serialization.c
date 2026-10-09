@@ -931,12 +931,12 @@ static void* _deserialize_crdt_value(const uint8_t* data, uint32_t len, data_typ
 //       fork evidence. See the fix-note on
 //       crabs_serialize_data_item_chain_preimage in serialization.h.
 //
-// The interior below therefore emits name/type/crdt_type/value/invariants/
-// last_compaction_time exactly as the durable per-item shape does, with the
-// protocol_state byte gated by include_protocol_state: true only for the
-// durable-state form (_serialize_data_item / crabs_serialize_data_item),
-// false for the sovereign chain preimage
-// (_serialize_data_item_chain_preimage).
+// The interior below emits name/type/crdt_type/value/invariants always, and
+// gates BOTH replica-local metadata fields behind include_protocol_state:
+// the protocol_state byte and last_compaction_time. True only for the
+// durable-state form (_serialize_data_item / crabs_serialize_data_item);
+// false for the sovereign chain preimage (_serialize_data_item_chain_
+// preimage).
 static void _serialize_data_item_shape(write_buf_t* buf, const data_item_t* item,
                                        bool include_protocol_state) {
   // name_length + name
@@ -1015,8 +1015,14 @@ static void _serialize_data_item_shape(write_buf_t* buf, const data_item_t* item
     _write_string16(buf, item->invariants[i].error_message);
   }
 
-  // last_compaction_time (v5: v1.5.2 §7)
-  _write_uint64_le(buf, item->last_compaction_time);
+  // last_compaction_time (v5: v1.5.2 §7): durable-state integrity form ONLY.
+  // Like protocol_state it is replica-local runtime metadata (two compacted
+  // replicas can stamp different times on identical content), so the
+  // sovereign chain preimage excludes it — otherwise divergent compaction
+  // timestamps alone would fabricate fork evidence at merge.
+  if (include_protocol_state) {
+    _write_uint64_le(buf, item->last_compaction_time);
+  }
 }
 
 // Durable per-item shape (state-file integrity bytes + the public wrapper
@@ -1026,10 +1032,11 @@ static void _serialize_data_item(write_buf_t* buf, const data_item_t* item) {
 }
 
 // Chain-digest preimage: identical to the durable per-item shape MINUS the
-// protocol_state byte. Runtime state is replica-local; folding it in would
-// let a lock taken on one replica change only that replica's digest, which
-// at cross-replica merge ("equal seq + different digest") reads as fork
-// evidence and quarantines an honest writer.
+// protocol_state byte and last_compaction_time. Runtime metadata is
+// replica-local; folding it in would let a lock taken (or a compaction
+// timestamp stamped) on one replica change only that replica's digest,
+// which at cross-replica merge ("equal seq + different digest") reads as
+// fork evidence and quarantines an honest writer.
 static void _serialize_data_item_chain_preimage(write_buf_t* buf,
                                                 const data_item_t* item) {
   _serialize_data_item_shape(buf, item, /*include_protocol_state=*/false);
