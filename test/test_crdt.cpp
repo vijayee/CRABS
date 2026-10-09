@@ -585,11 +585,15 @@ TEST(TestCRDTMerge, TestStateMergeInvalidParams) {
 // Write-domain merge dispatch tests (write-domains v1)
 // ============================================================
 
-// Build a sovereign counter item directly (writer/seq/digest stamped) — the
-// merge dispatch reasons over the stored chain head fields, so tests pin them
-// explicitly instead of executing sovereign ops.
+// Build a sovereign counter item directly (writer/seq stamped, digest
+// COMPUTED from content the same way the post-op bookkeeping stamps it —
+// state_item_digest_compute), so an honest snapshot's carried head always
+// matches its content. The merge dispatch treats the carried digest as
+// advisory and reasons over content-derived heads (write-domains deferred
+// Task B), so tests that need a forged head corrupt item->item_digest AFTER
+// creation instead of seeding one here.
 static data_item_t* _make_sovereign_counter(const char* name, const char* writer,
-                                            uint64_t item_seq, uint8_t digest_seed,
+                                            uint64_t item_seq,
                                             int64_t increments) {
   data_item_options_t options;
   memset(&options, 0, sizeof(options));
@@ -597,17 +601,18 @@ static data_item_t* _make_sovereign_counter(const char* name, const char* writer
   options.writer = writer;
   data_item_t* item = nullptr;
   crabs_error_e create_err =
-      data_item_create_with_options(name, DATA_TYPE_COUNTER, CRDT_PN_COUNTER,
+      data_item_create_with_options(name, DATA_TYPE_COUNTER, CRDT_G_COUNTER,
                                     &options, &item);
   EXPECT_EQ(create_err, CRABS_SUCCESS);
   if (item == nullptr) return nullptr;
-  pn_counter_t* counter = pn_counter_create();
+  g_counter_t* counter = g_counter_create();
   if (increments > 0) {
-    pn_counter_increment(counter, writer, increments);
+    g_counter_increment(counter, writer, increments);
   }
   item->value = counter;
+  item->value_repr = (data_value_repr_t)DATA_VALUE_REPR_CRDT_STRUCT;
   item->item_seq = item_seq;
-  memset(item->item_digest, digest_seed, CRABS_HASH_SIZE);
+  EXPECT_EQ(state_item_digest_compute(item, item->item_digest), CRABS_SUCCESS);
   return item;
 }
 
@@ -673,8 +678,10 @@ TEST(TestCRDTMerge, TestMergeDeepCopyPropagatesDomainFields) {
   state_t* dst = state_create();
   state_t* src = state_create();
 
-  data_item_t* src_item = _make_sovereign_counter("vault", "alice", 7, 0x5A, 9);
+  data_item_t* src_item = _make_sovereign_counter("vault", "alice", 7, 9);
   ASSERT_NE(src_item, nullptr);
+  uint8_t src_digest[CRABS_HASH_SIZE];
+  memcpy(src_digest, src_item->item_digest, CRABS_HASH_SIZE);
   uint8_t fork_evidence[CRABS_HASH_SIZE];
   memset(fork_evidence, 0xF0, sizeof(fork_evidence));
   EXPECT_EQ(state_append_fork_evidence(src_item, "mallory", fork_evidence),
@@ -688,16 +695,14 @@ TEST(TestCRDTMerge, TestMergeDeepCopyPropagatesDomainFields) {
   EXPECT_EQ(dst_item->write_domain, CRABS_DOMAIN_SOVEREIGN);
   EXPECT_STREQ(dst_item->writer, "alice");
   EXPECT_EQ(dst_item->item_seq, 7u);
-  uint8_t expected_digest[CRABS_HASH_SIZE];
-  memset(expected_digest, 0x5A, sizeof(expected_digest));
-  EXPECT_EQ(memcmp(dst_item->item_digest, expected_digest, CRABS_HASH_SIZE), 0);
+  EXPECT_EQ(memcmp(dst_item->item_digest, src_digest, CRABS_HASH_SIZE), 0);
   EXPECT_EQ(dst_item->ordering_module, 0);
   ASSERT_EQ(dst_item->fork_count, 1u);
   EXPECT_STREQ(dst_item->fork_writers[0], "mallory");
   EXPECT_EQ(memcmp(dst_item->fork_evidence_digests[0], fork_evidence,
                    CRABS_HASH_SIZE), 0);
   // content carried too
-  EXPECT_EQ(pn_counter_value((pn_counter_t*)dst_item->value), 9);
+  EXPECT_EQ(g_counter_value((g_counter_t*)dst_item->value), 9);
 
   _destroy_state_values(dst);
   _destroy_state_values(src);
@@ -706,16 +711,21 @@ TEST(TestCRDTMerge, TestMergeDeepCopyPropagatesDomainFields) {
 }
 
 // SOVEREIGN: the remote chain head is ahead with the same writer — accept it.
+// Adopt sets the merged head to the RECOMPUTED digest of the adopted content;
+// for an honest snapshot carried == computed (sanity half of the recompute
+// rule — the tampered half is TestSovereignMergeTamperedCarriedDigestHeld).
 TEST(TestCRDTMerge, TestSovereignMergeAcceptsAheadSnapshot) {
   state_t* dst = state_create();
   state_t* src = state_create();
   merge_event_capture_t capture = {};
   state_set_change_hook(dst, _merge_event_hook, &capture);
 
-  data_item_t* dst_item = _make_sovereign_counter("vault", "alice", 3, 0x11, 2);
-  data_item_t* src_item = _make_sovereign_counter("vault", "alice", 5, 0x22, 9);
+  data_item_t* dst_item = _make_sovereign_counter("vault", "alice", 3, 2);
+  data_item_t* src_item = _make_sovereign_counter("vault", "alice", 5, 9);
   ASSERT_NE(dst_item, nullptr);
   ASSERT_NE(src_item, nullptr);
+  uint8_t src_digest[CRABS_HASH_SIZE];
+  memcpy(src_digest, src_item->item_digest, CRABS_HASH_SIZE);
   state_add_item(dst, dst_item);
   state_add_item(src, src_item);
 
@@ -723,14 +733,61 @@ TEST(TestCRDTMerge, TestSovereignMergeAcceptsAheadSnapshot) {
 
   data_item_t* merged = state_find_item(dst, "vault");
   ASSERT_NE(merged, nullptr);
-  EXPECT_EQ(pn_counter_value((pn_counter_t*)merged->value), 9);
+  EXPECT_EQ(g_counter_value((g_counter_t*)merged->value), 9);
   EXPECT_EQ(merged->item_seq, 5u);
-  uint8_t expected_digest[CRABS_HASH_SIZE];
-  memset(expected_digest, 0x22, sizeof(expected_digest));
-  EXPECT_EQ(memcmp(merged->item_digest, expected_digest, CRABS_HASH_SIZE), 0);
+  EXPECT_EQ(memcmp(merged->item_digest, src_digest, CRABS_HASH_SIZE), 0);
   EXPECT_STREQ(merged->writer, "alice");
+  // The adopted head is exactly the digest of the adopted content — the merge
+  // recomputed it rather than trusting src's carried field.
+  uint8_t recomputed[CRABS_HASH_SIZE];
+  ASSERT_EQ(state_item_digest_compute(merged, recomputed), CRABS_SUCCESS);
+  EXPECT_EQ(memcmp(recomputed, src_digest, CRABS_HASH_SIZE), 0);
   // a clean continuation is silent
   EXPECT_EQ(capture.calls, 0);
+
+  _destroy_state_values(dst);
+  _destroy_state_values(src);
+  state_destroy(dst);
+  state_destroy(src);
+}
+
+// SOVEREIGN: an ahead snapshot whose CARRIED digest disagrees with its own
+// content (in-flight tamper — the content is honest, the chain head is
+// fabricated). The digest preimage is content-only, so the recompute cannot
+// reproduce the forged head: fail closed — keep dst's content AND chain head
+// whole, surface a held divergence, and do NOT convict the writer (a relay
+// forging a head carries no equivocation evidence).
+TEST(TestCRDTMerge, TestSovereignMergeTamperedCarriedDigestHeld) {
+  state_t* dst = state_create();
+  state_t* src = state_create();
+  merge_event_capture_t capture = {};
+  state_set_change_hook(dst, _merge_event_hook, &capture);
+
+  data_item_t* dst_item = _make_sovereign_counter("vault", "alice", 3, 2);
+  data_item_t* src_item = _make_sovereign_counter("vault", "alice", 5, 9);
+  ASSERT_NE(dst_item, nullptr);
+  ASSERT_NE(src_item, nullptr);
+  src_item->item_digest[0] ^= 0xFF;  // forge the carried head, keep content
+  uint8_t dst_digest[CRABS_HASH_SIZE];
+  memcpy(dst_digest, dst_item->item_digest, CRABS_HASH_SIZE);
+  state_add_item(dst, dst_item);
+  state_add_item(src, src_item);
+
+  EXPECT_EQ(crdt_merge_state(dst, src), CRABS_SUCCESS);
+
+  data_item_t* merged = state_find_item(dst, "vault");
+  ASSERT_NE(merged, nullptr);
+  // Nothing adopted: content, seq, and the stored head all stay item_a's.
+  EXPECT_EQ(g_counter_value((g_counter_t*)merged->value), 2);
+  EXPECT_EQ(merged->item_seq, 3u);
+  EXPECT_EQ(memcmp(merged->item_digest, dst_digest, CRABS_HASH_SIZE), 0);
+  EXPECT_EQ(merged->fork_count, 0u);
+  EXPECT_FALSE(state_item_is_quarantined(merged, "alice"));
+  ASSERT_EQ(capture.calls, 1);
+  EXPECT_EQ(capture.kind, CRABS_CHANGE_MERGE);
+  EXPECT_STREQ(capture.type, "__merge_held__");
+  EXPECT_STREQ(capture.target, "vault");
+  EXPECT_EQ(capture.result, CRABS_ERR_PROTOCOL_VIOLATION);
 
   _destroy_state_values(dst);
   _destroy_state_values(src);
@@ -745,8 +802,8 @@ TEST(TestCRDTMerge, TestSovereignMergeKeepsLocalWhenAhead) {
   merge_event_capture_t capture = {};
   state_set_change_hook(dst, _merge_event_hook, &capture);
 
-  data_item_t* dst_item = _make_sovereign_counter("vault", "alice", 6, 0x33, 4);
-  data_item_t* src_item = _make_sovereign_counter("vault", "alice", 2, 0x44, 100);
+  data_item_t* dst_item = _make_sovereign_counter("vault", "alice", 6, 4);
+  data_item_t* src_item = _make_sovereign_counter("vault", "alice", 2, 100);
   ASSERT_NE(dst_item, nullptr);
   ASSERT_NE(src_item, nullptr);
   state_add_item(dst, dst_item);
@@ -756,7 +813,7 @@ TEST(TestCRDTMerge, TestSovereignMergeKeepsLocalWhenAhead) {
 
   data_item_t* merged = state_find_item(dst, "vault");
   ASSERT_NE(merged, nullptr);
-  EXPECT_EQ(pn_counter_value((pn_counter_t*)merged->value), 4);
+  EXPECT_EQ(g_counter_value((g_counter_t*)merged->value), 4);
   EXPECT_EQ(merged->item_seq, 6u);
   EXPECT_EQ(capture.calls, 0);
 
@@ -776,8 +833,8 @@ TEST(TestCRDTMerge, TestSovereignMergeIdenticalHeadIsNoOp) {
   merge_event_capture_t capture = {};
   state_set_change_hook(dst, _merge_event_hook, &capture);
 
-  data_item_t* dst_item = _make_sovereign_counter("vault", "alice", 4, 0x55, 3);
-  data_item_t* src_item = _make_sovereign_counter("vault", "alice", 4, 0x55, 3);
+  data_item_t* dst_item = _make_sovereign_counter("vault", "alice", 4, 3);
+  data_item_t* src_item = _make_sovereign_counter("vault", "alice", 4, 3);
   ASSERT_NE(dst_item, nullptr);
   ASSERT_NE(src_item, nullptr);
   state_add_item(dst, dst_item);
@@ -791,6 +848,48 @@ TEST(TestCRDTMerge, TestSovereignMergeIdenticalHeadIsNoOp) {
   EXPECT_EQ(merged->value, original_value);
   EXPECT_EQ(merged->item_seq, 4u);
   EXPECT_EQ(capture.calls, 0);
+
+  _destroy_state_values(dst);
+  _destroy_state_values(src);
+  state_destroy(dst);
+  state_destroy(src);
+}
+
+// SOVEREIGN: equal seq + CONTENT-equal snapshots CONVERGE even when one
+// replica's carried digest was corrupted in flight. The fork judgment keys on
+// content-derived heads, so a forged carried field can neither convict an
+// honest writer nor plant fork evidence (pre-fix behavior: the carried-field
+// comparison convicted alice and quarantined her on a content-identical
+// snapshot — a false conviction a relay could manufacture).
+TEST(TestCRDTMerge, TestSovereignMergeEqualSeqCorruptedCarriedDigestConverges) {
+  state_t* dst = state_create();
+  state_t* src = state_create();
+  merge_event_capture_t capture = {};
+  state_set_change_hook(dst, _merge_event_hook, &capture);
+
+  data_item_t* dst_item = _make_sovereign_counter("vault", "alice", 4, 3);
+  data_item_t* src_item = _make_sovereign_counter("vault", "alice", 4, 3);
+  ASSERT_NE(dst_item, nullptr);
+  ASSERT_NE(src_item, nullptr);
+  src_item->item_digest[0] ^= 0xFF;  // corrupt the carried head only
+  uint8_t dst_digest[CRABS_HASH_SIZE];
+  memcpy(dst_digest, dst_item->item_digest, CRABS_HASH_SIZE);
+  state_add_item(dst, dst_item);
+  state_add_item(src, src_item);
+  void* original_value = dst_item->value;
+
+  EXPECT_EQ(crdt_merge_state(dst, src), CRABS_SUCCESS);
+
+  data_item_t* merged = state_find_item(dst, "vault");
+  ASSERT_NE(merged, nullptr);
+  // Convergence, not fork: identical content is the identical-head no-op arm.
+  EXPECT_EQ(merged->value, original_value);
+  EXPECT_EQ(merged->item_seq, 4u);
+  EXPECT_EQ(memcmp(merged->item_digest, dst_digest, CRABS_HASH_SIZE), 0);
+  EXPECT_EQ(merged->fork_count, 0u);
+  EXPECT_FALSE(state_item_is_quarantined(merged, "alice"));
+  EXPECT_EQ(capture.calls, 0)
+      << "a corrupted carried digest must NOT fork-convict an honest writer";
 
   _destroy_state_values(dst);
   _destroy_state_values(src);
@@ -873,19 +972,22 @@ TEST(TestCRDTMerge, TestSovereignMergeProtocolStateDivergenceIsNotFork) {
   state_destroy(src);
 }
 
-// SOVEREIGN: equal seq + different digest is a fork — neither side's content
-// applies, the fork sets union monotonically, the writer is convicted, and a
-// merge change event surfaces the divergence.
+// SOVEREIGN: equal seq + different content (hence different content-derived
+// head) is a fork — neither side's content applies, the fork sets union
+// monotonically, the writer is convicted, and a merge change event surfaces
+// the divergence.
 TEST(TestCRDTMerge, TestSovereignMergeForkUnionsEvidenceWithoutOverwriting) {
   state_t* dst = state_create();
   state_t* src = state_create();
   merge_event_capture_t capture = {};
   state_set_change_hook(dst, _merge_event_hook, &capture);
 
-  data_item_t* dst_item = _make_sovereign_counter("vault", "alice", 4, 0xAA, 3);
-  data_item_t* src_item = _make_sovereign_counter("vault", "alice", 4, 0xBB, 99);
+  data_item_t* dst_item = _make_sovereign_counter("vault", "alice", 4, 3);
+  data_item_t* src_item = _make_sovereign_counter("vault", "alice", 4, 99);
   ASSERT_NE(dst_item, nullptr);
   ASSERT_NE(src_item, nullptr);
+  uint8_t dst_digest[CRABS_HASH_SIZE];
+  memcpy(dst_digest, dst_item->item_digest, CRABS_HASH_SIZE);
   // src carries prior quarantine evidence for another writer — unioned in.
   uint8_t prior_evidence[CRABS_HASH_SIZE];
   memset(prior_evidence, 0xE1, sizeof(prior_evidence));
@@ -899,11 +1001,9 @@ TEST(TestCRDTMerge, TestSovereignMergeForkUnionsEvidenceWithoutOverwriting) {
   data_item_t* merged = state_find_item(dst, "vault");
   ASSERT_NE(merged, nullptr);
   // content NOT overwritten by the forking side
-  EXPECT_EQ(pn_counter_value((pn_counter_t*)merged->value), 3);
+  EXPECT_EQ(g_counter_value((g_counter_t*)merged->value), 3);
   EXPECT_EQ(merged->item_seq, 4u);
-  uint8_t expected_digest[CRABS_HASH_SIZE];
-  memset(expected_digest, 0xAA, sizeof(expected_digest));
-  EXPECT_EQ(memcmp(merged->item_digest, expected_digest, CRABS_HASH_SIZE), 0);
+  EXPECT_EQ(memcmp(merged->item_digest, dst_digest, CRABS_HASH_SIZE), 0);
   // fork set: the forking writer convicted + src's prior evidence unioned
   EXPECT_TRUE(state_item_is_quarantined(merged, "alice"));
   EXPECT_TRUE(state_item_is_quarantined(merged, "mallory"));
@@ -924,7 +1024,7 @@ TEST(TestCRDTMerge, TestSovereignMergeForkUnionsEvidenceWithoutOverwriting) {
   merged = state_find_item(dst, "vault");
   ASSERT_NE(merged, nullptr);
   EXPECT_EQ(merged->fork_count, 2u);
-  EXPECT_EQ(pn_counter_value((pn_counter_t*)merged->value), 3);
+  EXPECT_EQ(g_counter_value((g_counter_t*)merged->value), 3);
   ASSERT_EQ(second_capture.calls, 1);
   EXPECT_EQ(second_capture.result, CRABS_ERR_FORK_DETECTED);
 
@@ -942,8 +1042,8 @@ TEST(TestCRDTMerge, TestSovereignMergeWriterMismatchHeld) {
   merge_event_capture_t capture = {};
   state_set_change_hook(dst, _merge_event_hook, &capture);
 
-  data_item_t* dst_item = _make_sovereign_counter("vault", "alice", 1, 0x01, 5);
-  data_item_t* src_item = _make_sovereign_counter("vault", "eve", 9, 0x09, 50);
+  data_item_t* dst_item = _make_sovereign_counter("vault", "alice", 1, 5);
+  data_item_t* src_item = _make_sovereign_counter("vault", "eve", 9, 50);
   ASSERT_NE(dst_item, nullptr);
   ASSERT_NE(src_item, nullptr);
   state_add_item(dst, dst_item);
@@ -954,7 +1054,7 @@ TEST(TestCRDTMerge, TestSovereignMergeWriterMismatchHeld) {
   data_item_t* merged = state_find_item(dst, "vault");
   ASSERT_NE(merged, nullptr);
   EXPECT_STREQ(merged->writer, "alice");
-  EXPECT_EQ(pn_counter_value((pn_counter_t*)merged->value), 5);
+  EXPECT_EQ(g_counter_value((g_counter_t*)merged->value), 5);
   EXPECT_EQ(merged->item_seq, 1u);
   ASSERT_EQ(capture.calls, 1);
   EXPECT_EQ(capture.kind, CRABS_CHANGE_MERGE);
@@ -968,42 +1068,40 @@ TEST(TestCRDTMerge, TestSovereignMergeWriterMismatchHeld) {
 }
 
 // SOVEREIGN: an ahead snapshot whose value cannot be deep-copied (unsupported
-// CRDT type, only reachable on wire-shaped items — v1 sovereign types are
-// always COUNTER/REGISTER values, but CREATE validates the data type, not the
-// crdt_type) must NOT split content from chain head: item_a is kept whole and
-// a hold event fires.
+// CRDT type) must NOT split content from chain head: item_a is kept whole and
+// a hold event fires. The items are hand-built wire-shapes: the validating
+// creation path (data_item_create_with_options) now rejects a non-canonical
+// (type, crdt_type) pair outright, so REGISTER tagged CRDT_RGA can only
+// arrive off the wire. The carried digests are opaque seeds — this branch
+// holds on the value deep-copy failure BEFORE any digest comparison, so the
+// heads never enter the rule.
 TEST(TestCRDTMerge, TestSovereignMergeAheadWithUndigestableValueHeld) {
   state_t* dst = state_create();
   state_t* src = state_create();
   merge_event_capture_t capture = {};
   state_set_change_hook(dst, _merge_event_hook, &capture);
 
-  data_item_options_t rga_options;
-  memset(&rga_options, 0, sizeof(rga_options));
-  rga_options.write_domain = CRABS_DOMAIN_SOVEREIGN;
-  rga_options.writer = "alice";
-
-  data_item_t* dst_item = nullptr;
-  ASSERT_EQ(data_item_create_with_options("vault", DATA_TYPE_REGISTER,
-                                          CRDT_RGA, &rga_options, &dst_item),
-            CRABS_SUCCESS);
+  data_item_t* dst_item = data_item_create("vault", DATA_TYPE_REGISTER, CRDT_RGA);
+  ASSERT_NE(dst_item, nullptr);
+  dst_item->write_domain = CRABS_DOMAIN_SOVEREIGN;
+  strncpy(dst_item->writer, "alice", CRABS_MAX_USER_ID - 1);
   // Values with NULL payloads: crdt_value_destroy's default arm only frees
   // the wrapper for CRDT_RGA, so keep them payload-less to avoid a leak.
   dst_item->value = lww_register_create(nullptr, 0, 1, "nodeA");
   dst_item->value_repr = (data_value_repr_t)DATA_VALUE_REPR_CRDT_STRUCT;
   dst_item->item_seq = 2;
   memset(dst_item->item_digest, 0x02, CRABS_HASH_SIZE);
-  state_add_item(dst, dst_item);
+  ASSERT_EQ(state_add_item(dst, dst_item), CRABS_SUCCESS);
 
-  data_item_t* src_item = nullptr;
-  ASSERT_EQ(data_item_create_with_options("vault", DATA_TYPE_REGISTER,
-                                          CRDT_RGA, &rga_options, &src_item),
-            CRABS_SUCCESS);
+  data_item_t* src_item = data_item_create("vault", DATA_TYPE_REGISTER, CRDT_RGA);
+  ASSERT_NE(src_item, nullptr);
+  src_item->write_domain = CRABS_DOMAIN_SOVEREIGN;
+  strncpy(src_item->writer, "alice", CRABS_MAX_USER_ID - 1);
   src_item->value = lww_register_create(nullptr, 0, 2, "nodeA");
   src_item->value_repr = (data_value_repr_t)DATA_VALUE_REPR_CRDT_STRUCT;
   src_item->item_seq = 5;
   memset(src_item->item_digest, 0x05, CRABS_HASH_SIZE);
-  state_add_item(src, src_item);
+  ASSERT_EQ(state_add_item(src, src_item), CRABS_SUCCESS);
 
   EXPECT_EQ(crdt_merge_state(dst, src), CRABS_SUCCESS);
 
@@ -1034,7 +1132,7 @@ TEST(TestCRDTMerge, TestSovereignMergeTypeMismatchHeld) {
   merge_event_capture_t capture = {};
   state_set_change_hook(dst, _merge_event_hook, &capture);
 
-  data_item_t* dst_item = _make_sovereign_counter("vault", "alice", 2, 0x02, 7);
+  data_item_t* dst_item = _make_sovereign_counter("vault", "alice", 2, 7);
   ASSERT_NE(dst_item, nullptr);
   state_add_item(dst, dst_item);
 
@@ -1056,7 +1154,7 @@ TEST(TestCRDTMerge, TestSovereignMergeTypeMismatchHeld) {
   data_item_t* merged = state_find_item(dst, "vault");
   ASSERT_NE(merged, nullptr);
   EXPECT_EQ(merged->item_seq, 2u);
-  EXPECT_EQ(pn_counter_value((pn_counter_t*)merged->value), 7);
+  EXPECT_EQ(g_counter_value((g_counter_t*)merged->value), 7);
   ASSERT_EQ(capture.calls, 1);
   EXPECT_EQ(capture.kind, CRABS_CHANGE_MERGE);
   EXPECT_STREQ(capture.type, "__merge_type_mismatch__");

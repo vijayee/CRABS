@@ -1001,6 +1001,90 @@ TEST(TestDataModel, ItemCreateWithOptionsGroupOrderedV1Seam) {
   EXPECT_EQ(item, nullptr);
 }
 
+// Canonical (type, crdt_type) pairing — the reviewed miscast hole (a JS
+// defineItem 'counter' with the pn_counter word minted a g_counter value
+// tagged CRDT_PN_COUNTER, which destroy/miscast consumers then cast as
+// pn_counter_t). data_item_create_with_options is the fail-closed backstop
+// every creation surface routes through, and it rejects a non-canonical pair
+// for EVERY domain, before any domain rule.
+TEST(TestDataModel, ItemCreateWithOptionsRejectsNonCanonicalTypeCrdtPair) {
+  data_item_options_t options = {};  // FREE_MERGE
+  data_item_t* item = nullptr;
+  // The hole's exact mismatch: COUNTER value shape, PN crdt tag.
+  EXPECT_EQ(data_item_create_with_options("c", DATA_TYPE_COUNTER,
+                                          CRDT_PN_COUNTER, &options, &item),
+            CRABS_ERR_TYPE_MISMATCH);
+  EXPECT_EQ(item, nullptr);
+  // The converse arm: register shape, g-counter tag.
+  EXPECT_EQ(data_item_create_with_options("r", DATA_TYPE_REGISTER,
+                                          CRDT_G_COUNTER, &options, &item),
+            CRABS_ERR_TYPE_MISMATCH);
+  EXPECT_EQ(item, nullptr);
+  // An unknown type id has no table entry (type ids are wire/JS input).
+  EXPECT_EQ(data_item_create_with_options("u", (data_type_e)0x42,
+                                          CRDT_G_COUNTER, &options, &item),
+            CRABS_ERR_TYPE_MISMATCH);
+  EXPECT_EQ(item, nullptr);
+  // The pairing check binds on SOVEREIGN too (writer present, valid domain).
+  options.write_domain = CRABS_DOMAIN_SOVEREIGN;
+  options.writer = "alice";
+  EXPECT_EQ(data_item_create_with_options("s", DATA_TYPE_COUNTER,
+                                          CRDT_PN_COUNTER, &options, &item),
+            CRABS_ERR_TYPE_MISMATCH);
+  EXPECT_EQ(item, nullptr);
+  // And the canonical pairs still create on every creatable domain.
+  memset(&options, 0, sizeof(options));
+  EXPECT_EQ(data_item_create_with_options("ok", DATA_TYPE_COUNTER,
+                                          CRDT_G_COUNTER, &options, &item),
+            CRABS_SUCCESS);
+  data_item_destroy(item);
+}
+
+TEST(TestDataModel, CanonicalTypeCrdtMapping) {
+  const struct {
+    data_type_e type;
+    crdt_type_e crdt;
+  } expected_pairs[] = {
+    {DATA_TYPE_COUNTER,        CRDT_G_COUNTER},
+    {DATA_TYPE_PN_COUNTER,     CRDT_PN_COUNTER},
+    {DATA_TYPE_SET,            CRDT_OR_SET},
+    {DATA_TYPE_2P_SET,         CRDT_2P_SET},
+    {DATA_TYPE_REGISTER,       CRDT_LWW_REG},
+    {DATA_TYPE_DOCUMENT,       CRDT_RGA},
+    {DATA_TYPE_RESOURCE,       CRDT_PN_COUNTER},
+    {DATA_TYPE_ONE_SHOT_SET,   CRDT_ONE_SHOT_SET},
+    {DATA_TYPE_ONE_SHOT_FLAG,  CRDT_ONE_SHOT_FLAG},
+    {DATA_TYPE_OT_ORDERED_SET, CRDT_CUSTOM},
+    {DATA_TYPE_OT_DOCUMENT,    CRDT_CUSTOM},
+    {DATA_TYPE_OT_TABLE,       CRDT_CUSTOM},
+    {DATA_TYPE_OT_TREE,        CRDT_CUSTOM},
+    {DATA_TYPE_OT_ORDERED_MAP, CRDT_CUSTOM},
+    {DATA_TYPE_CUSTOM,         CRDT_CUSTOM},
+  };
+  for (const auto& expected : expected_pairs) {
+    crdt_type_e resolved = CRDT_RGA;  // deliberately wrong sentinel
+    EXPECT_EQ(data_item_canonical_crdt_for_type(expected.type, &resolved),
+              CRABS_SUCCESS);
+    EXPECT_EQ(resolved, expected.crdt);
+    EXPECT_TRUE(data_item_type_crdt_pair_canonical(expected.type,
+                                                   expected.crdt));
+    // Every pairing OTHER than the canonical one must be rejected. CRDT_RGA
+    // is distinct from every expected.crdt except DOCUMENT's — use a
+    // definitely-wrong tag per row.
+    crdt_type_e wrong =
+        (expected.crdt == CRDT_CUSTOM) ? CRDT_G_COUNTER : CRDT_CUSTOM;
+    EXPECT_FALSE(data_item_type_crdt_pair_canonical(expected.type, wrong));
+  }
+  // Unknown types and a NULL out-param fail closed.
+  crdt_type_e resolved = CRDT_G_COUNTER;
+  EXPECT_EQ(data_item_canonical_crdt_for_type((data_type_e)0x42, &resolved),
+            CRABS_ERR_TYPE_MISMATCH);
+  EXPECT_EQ(data_item_canonical_crdt_for_type(DATA_TYPE_COUNTER, nullptr),
+            CRABS_ERR_INVALID_PARAM);
+  EXPECT_FALSE(data_item_type_crdt_pair_canonical((data_type_e)0x42,
+                                                  CRDT_G_COUNTER));
+}
+
 TEST(TestDataModel, StateAddItemRejectsMalformedSovereign) {
   // Hand-built item (not via data_item_create_with_options) claiming
   // SOVEREIGN without a writer: state_add_item fails closed.

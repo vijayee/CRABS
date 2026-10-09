@@ -609,6 +609,28 @@ typedef struct state_t {
 extern const data_type_definition_t CRABS_BUILTIN_TYPES[10];
 
 // ============================================================
+// Canonical (data_type, crdt_type) pairing
+// ============================================================
+// Every built-in type is backed by exactly ONE CRDT shape (the map lives in
+// data_model.c next to CRABS_BUILTIN_TYPES). A mismatched pair is not a
+// "different strategy": a value built for one shape but tagged with
+// another's crdt_type miscasts on every repr/crdt-dispatched consumer
+// (data_item_destroy, state_item_digest_compute, crdt_merge_value) — the
+// reviewed wasm define_item hole minted a g_counter value tagged
+// CRDT_PN_COUNTER and destroy cast it to pn_counter_t. The validating
+// creation surfaces (data_item_create_with_options, and through it
+// crabs_wasm_define_item / the node defineItem binding) fail closed on any
+// non-canonical pair.
+// Resolve a type's canonical crdt_type. Returns CRABS_ERR_TYPE_MISMATCH for
+// a type with no table entry (unknown type ids are wire/JS input) and
+// CRABS_ERR_INVALID_PARAM for a NULL out-param.
+crabs_error_e data_item_canonical_crdt_for_type(data_type_e type,
+                                                crdt_type_e* out_crdt);
+// True exactly when (type, crdt_type) is the canonical pair.
+bool data_item_type_crdt_pair_canonical(data_type_e type,
+                                        crdt_type_e crdt_type);
+
+// ============================================================
 // DataItem creation/destruction
 // ============================================================
 data_item_t* data_item_create(const char* name, data_type_e type, crdt_type_e crdt_type);
@@ -624,7 +646,10 @@ data_item_t* data_item_create(const char* name, data_type_e type, crdt_type_e cr
 //   CRABS_ERR_TYPE_MISMATCH — SOVEREIGN on a type other than
 //     DATA_TYPE_COUNTER / DATA_TYPE_REGISTER (only those types have a
 //     well-defined serialized post-state for the sovereign hash-chain digest;
-//     widening the set requires defining a canonical serialized form first).
+//     widening the set requires defining a canonical serialized form first); or
+//     a (type, crdt_type) pair that is not the canonical pairing
+//     (data_item_type_crdt_pair_canonical — enforced for EVERY domain so a
+//     miscast value can never be minted).
 crabs_error_e data_item_create_with_options(const char* name,
                                             data_type_e type,
                                             crdt_type_e crdt_type,

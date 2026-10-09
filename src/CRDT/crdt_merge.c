@@ -586,21 +586,33 @@ static void _merge_notify_divergence(state_t* dst, const char* type,
 }
 
 // SOVEREIGN v1 merge rule over two chain-head snapshots (item_a = local,
-// item_b = remote):
+// item_b = remote). The carried item_digest in a snapshot is ADVISORY wire
+// input: every judgment below keys on heads RECOMPUTED from content
+// (state_item_digest_compute — the preimage is content-only, protocol_state
+// excluded), so a tampered or corrupted carried field can neither plant a
+// head the content never produced nor fabricate a fork conviction:
 //   - writer mismatch: the writer is creation-immutable, so a same-named
 //     sovereign item under another writer is corrupted lineage — keep
 //     item_a's content, union fork evidence, and surface an event.
-//   - item_b seq ahead (same writer): its digest chain continues item_a's —
-//     accept item_b's snapshot wholesale (value + head fields).
+//   - item_b seq ahead (same writer): recompute the digest of item_b's
+//     content and require it to match item_b's carried head — an honest
+//     writer stamps exactly this digest, so a mismatch means the snapshot's
+//     content and chain disagree (tampered/divergent in flight): hold
+//     item_a whole and surface the divergence rather than adopt a head no
+//     honest content produces (which could false-convict later). On match,
+//     accept item_b's snapshot wholesale (value + head fields), stamping
+//     the COMPUTED digest as the merged head.
 //   - item_a seq ahead: keep item_a; item_b is a stale tail.
-//   - equal seq, equal digest: identical head — no-op.
-//   - equal seq, DIFFERENT digest: a fork. Do NOT apply either side's new
-//     content (quarantine semantics — merge-time forks must not overwrite),
-//     monotone-union the fork sets, convict the writer with a content-derived
-//     evidence digest so DOMAIN_CHECK blocks further writes, and surface a
-//     FORK_DETECTED change event. Note the chain history that a full fork
-//     proof needs lives in the op log, not derivable from two snapshots —
-//     the v1 rule therefore keys on (seq, digest) alone.
+//   - equal seq, equal RECOMPUTED digest: identical content — no-op,
+//     regardless of what the carried fields claim.
+//   - equal seq, DIFFERENT recomputed digest: a fork. Do NOT apply either
+//     side's new content (quarantine semantics — merge-time forks must not
+//     overwrite), monotone-union the fork sets, convict the writer with a
+//     content-derived evidence digest so DOMAIN_CHECK blocks further
+//     writes, and surface a FORK_DETECTED change event. Note the chain
+//     history that a full fork proof needs lives in the op log, not
+//     derivable from two snapshots — the v1 rule therefore keys on
+//     (seq, content digest) alone.
 //
 // Conviction soundness rests on the digest being content-only: the preimage
 // (crabs_serialize_data_item_chain_preimage via state_item_digest_compute)
@@ -643,6 +655,23 @@ static void _merge_sovereign_item(state_t* dst, data_item_t* dst_item,
                                CRABS_ERR_PROTOCOL_VIOLATION);
       return;
     }
+    // Recompute the chain head from the snapshot's own content: the carried
+    // item_digest is advisory wire input, and an honest writer stamps exactly
+    // the content digest (the preimage is content-only — protocol_state
+    // excluded). A mismatch splits content from chain: a tampered/divergent
+    // in-flight snapshot. Fail closed — keep item_a (content AND head) whole,
+    // surface the hold, rely on the evidence union above. A relay forging a
+    // head carries no equivocation evidence, so the writer is NOT convicted.
+    uint8_t computed_digest[CRABS_HASH_SIZE];
+    if (state_item_digest_compute(src_item, computed_digest) != CRABS_SUCCESS ||
+        memcmp(computed_digest, src_item->item_digest, CRABS_HASH_SIZE) != 0) {
+      if (ahead_value != NULL) {
+        crdt_value_destroy(dst_item->crdt_type, ahead_value);
+      }
+      _merge_notify_divergence(dst, "__merge_held__", dst_item->name,
+                               CRABS_ERR_PROTOCOL_VIOLATION);
+      return;
+    }
     if (ahead_value != NULL) {
       // Destroy per the OLD value's repr (a raw-repr legacy value must not
       // be interpreted as a struct).
@@ -656,22 +685,37 @@ static void _merge_sovereign_item(state_t* dst, data_item_t* dst_item,
       dst_item->value_repr = src_item->value_repr;
     }
     dst_item->item_seq = src_item->item_seq;
-    memcpy(dst_item->item_digest, src_item->item_digest,
+    // The merged head is the COMPUTED digest (== the carried one on any
+    // snapshot that reached this point), never the carried field itself.
+    memcpy(dst_item->item_digest, computed_digest,
            sizeof(dst_item->item_digest));
     return;
   }
   if (src_item->item_seq < dst_item->item_seq) {
     return; // local head is ahead — keep
   }
-  if (memcmp(dst_item->item_digest, src_item->item_digest,
-             CRABS_HASH_SIZE) == 0) {
-    return; // identical head — no-op
+  // Equal seq: compare CONTENT-derived heads, never the carried digest
+  // fields — those are wire input, so a corrupted carried digest must not
+  // convict an honest writer when the content is identical, and a fabricated
+  // digest must not be laundered into fork evidence.
+  uint8_t digest_a[CRABS_HASH_SIZE];
+  uint8_t digest_b[CRABS_HASH_SIZE];
+  if (state_item_digest_compute(dst_item, digest_a) != CRABS_SUCCESS ||
+      state_item_digest_compute(src_item, digest_b) != CRABS_SUCCESS) {
+    // An undigestable side cannot be compared — hold rather than guess.
+    _merge_notify_divergence(dst, "__merge_held__", dst_item->name,
+                             CRABS_ERR_PROTOCOL_VIOLATION);
+    return;
   }
-  // Fork: pin quarantine on the writer; content stays item_a's.
+  if (memcmp(digest_a, digest_b, CRABS_HASH_SIZE) == 0) {
+    return; // identical content — no-op
+  }
+  // Fork: pin quarantine on the writer; content stays item_a's. The evidence
+  // digest is derived from the two RECOMPUTED heads, so replicas merging the
+  // same content derive the same entry regardless of the carried fields.
   if (!state_item_is_quarantined(dst_item, dst_item->writer)) {
     uint8_t evidence_digest[CRABS_HASH_SIZE];
-    if (_merge_fork_evidence_digest(dst_item->item_digest,
-                                    src_item->item_digest,
+    if (_merge_fork_evidence_digest(digest_a, digest_b,
                                     evidence_digest) == CRABS_SUCCESS) {
       (void)state_append_fork_evidence(dst_item, dst_item->writer,
                                        evidence_digest);

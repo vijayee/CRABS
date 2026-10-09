@@ -33,6 +33,65 @@ const data_type_definition_t CRABS_BUILTIN_TYPES[10] = {
   {0xFF, "CUSTOM",         false},
 };
 
+// Canonical (data_type, crdt_type) pairs — each built-in type has exactly
+// ONE backing CRDT shape (RESOURCE is PN-Counter + lock per §5.1). The three
+// struct-backed pairs (COUNTER/G, PN_COUNTER/PN, REGISTER/LWW) are also the
+// arms the v15 serializer and the lock-rollback rebuild treat as having a
+// logical content form; the mapping there and HERE must stay in lockstep.
+// A pair outside this table is never valid — a value built for one shape and
+// tagged with another's crdt_type miscasts on every repr/crdt-dispatched
+// consumer (destroy, chain digest, merge), which is exactly the reviewed
+// wasm define_item hole (COUNTER + CRDT_PN_COUNTER minted a g_counter value
+// that destroy cast to pn_counter_t).
+typedef struct {
+  data_type_e data_type;
+  crdt_type_e crdt_type;
+} data_type_crdt_pair_t;
+
+static const data_type_crdt_pair_t CRABS_CANONICAL_TYPE_CRDT_PAIRS[] = {
+  {DATA_TYPE_COUNTER,        CRDT_G_COUNTER},
+  {DATA_TYPE_PN_COUNTER,     CRDT_PN_COUNTER},
+  {DATA_TYPE_SET,            CRDT_OR_SET},
+  {DATA_TYPE_2P_SET,         CRDT_2P_SET},
+  {DATA_TYPE_REGISTER,       CRDT_LWW_REG},
+  {DATA_TYPE_DOCUMENT,       CRDT_RGA},
+  {DATA_TYPE_RESOURCE,       CRDT_PN_COUNTER},
+  {DATA_TYPE_ONE_SHOT_SET,   CRDT_ONE_SHOT_SET},
+  {DATA_TYPE_ONE_SHOT_FLAG,  CRDT_ONE_SHOT_FLAG},
+  // OT types carry their own value objects (crabs_ot_*_t); no basic CRDT
+  // merge applies, so the crdt_type slot is CRDT_CUSTOM (the value the OT
+  // execution path already creates them with).
+  {DATA_TYPE_OT_ORDERED_SET, CRDT_CUSTOM},
+  {DATA_TYPE_OT_DOCUMENT,    CRDT_CUSTOM},
+  {DATA_TYPE_OT_TABLE,       CRDT_CUSTOM},
+  {DATA_TYPE_OT_TREE,        CRDT_CUSTOM},
+  {DATA_TYPE_OT_ORDERED_MAP, CRDT_CUSTOM},
+  {DATA_TYPE_CUSTOM,         CRDT_CUSTOM},
+};
+
+crabs_error_e data_item_canonical_crdt_for_type(data_type_e type,
+                                                crdt_type_e* out_crdt) {
+  if (out_crdt == NULL) return CRABS_ERR_INVALID_PARAM;
+  for (size_t pair_index = 0;
+       pair_index < sizeof(CRABS_CANONICAL_TYPE_CRDT_PAIRS) /
+                    sizeof(CRABS_CANONICAL_TYPE_CRDT_PAIRS[0]);
+       pair_index++) {
+    if (CRABS_CANONICAL_TYPE_CRDT_PAIRS[pair_index].data_type == type) {
+      *out_crdt = CRABS_CANONICAL_TYPE_CRDT_PAIRS[pair_index].crdt_type;
+      return CRABS_SUCCESS;
+    }
+  }
+  return CRABS_ERR_TYPE_MISMATCH;
+}
+
+bool data_item_type_crdt_pair_canonical(data_type_e type,
+                                        crdt_type_e crdt_type) {
+  crdt_type_e canonical_crdt;
+  return data_item_canonical_crdt_for_type(type, &canonical_crdt) ==
+             CRABS_SUCCESS &&
+         canonical_crdt == crdt_type;
+}
+
 data_item_t* data_item_create(const char* name, data_type_e type, crdt_type_e crdt_type) {
   data_item_t* item = get_clear_memory(sizeof(data_item_t));
   if (name != NULL) {
@@ -67,6 +126,14 @@ crabs_error_e data_item_create_with_options(const char* name,
     write_domain = options->write_domain;
     writer = options->writer;
     ordering_module = options->ordering_module;
+  }
+  // Canonical (type, crdt_type) pairing, checked for EVERY domain before any
+  // domain rule: crdt_type arrives as an attacker-chosen int on the wire/JS
+  // creation surfaces, and a non-canonical pair means every later value
+  // install and every repr/crdt-dispatched consumer miscasts. Fail closed
+  // (final-review carry-in of the crabs_wasm_define_item miscast hole).
+  if (!data_item_type_crdt_pair_canonical(type, crdt_type)) {
+    return CRABS_ERR_TYPE_MISMATCH;
   }
   if (write_domain != CRABS_DOMAIN_FREE_MERGE &&
       write_domain != CRABS_DOMAIN_SOVEREIGN &&

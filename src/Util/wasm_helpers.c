@@ -510,6 +510,17 @@ crabs_error_e crabs_wasm_define_item(attribute_machine_t* am,
   if (data_type != DATA_TYPE_COUNTER && data_type != DATA_TYPE_REGISTER) {
     return CRABS_ERR_TYPE_MISMATCH;
   }
+  // Final-review fix: the JS caller picks the crdt_type word freely, and the
+  // value install below keys on data_type ALONE — COUNTER + CRDT_PN_COUNTER
+  // minted a g_counter value tagged CRDT_PN_COUNTER, which destroy (and
+  // every other repr/crdt-dispatched consumer) miscast as pn_counter_t.
+  // Refuse any non-canonical (data_type, crdt_type) pair BEFORE allocating;
+  // data_item_create_with_options enforces the same pairing as the
+  // fail-closed backstop for every other caller.
+  if (!data_item_type_crdt_pair_canonical((data_type_e)data_type,
+                                          (crdt_type_e)crdt_type)) {
+    return CRABS_ERR_TYPE_MISMATCH;
+  }
   data_item_options_t options;
   memset(&options, 0, sizeof(options));
   options.write_domain = (crabs_write_domain_e)write_domain;

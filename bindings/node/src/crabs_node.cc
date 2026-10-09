@@ -1212,6 +1212,15 @@ private:
       throw crabs_error(env, CRABS_ERR_TYPE_MISMATCH,
           "defineItem: v1 supports only counter and register (use the "
           "dedicated add* methods for other types)");
+    // The value install below keys on data_type ALONE, so a mismatched
+    // crdt_type word would mint a value of one shape tagged with another's
+    // crdt_type — every repr/crdt-dispatched consumer then miscasts it (the
+    // reviewed wasm define_item hole, folded in here). Create with the
+    // canonical pairing only.
+    if (!data_item_type_crdt_pair_canonical(data_type, crdt_type))
+      throw crabs_error(env, CRABS_ERR_TYPE_MISMATCH,
+          "defineItem: dataType/crdtType must be the canonical pair "
+          "('counter'+'g_counter', 'register'+'lww_reg')");
 
     data_item_options_t options;
     memset(&options, 0, sizeof(options));
