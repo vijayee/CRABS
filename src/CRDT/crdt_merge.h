@@ -113,6 +113,11 @@ lww_register_t*  lww_register_merge(const lww_register_t* a, const lww_register_
 //     fires on dst's change hook. A same-named item under a different writer
 //     is held with a "__merge_writer_mismatch__" event; a same-named item
 //     declaring a different domain is held with "__merge_domain_mismatch__".
+//     The carried item_digest is advisory everywhere: heads are RECOMPUTED
+//     from content (state_item_digest_compute) for every judgment, and a
+//     first-arrival (fresh-adopt) snapshot is adopted with its recomputed
+//     head stamped — a carried/computed mismatch there fires
+//     "__merge_digest_mismatch__" (CRABS_ERR_PROTOCOL_VIOLATION).
 //   GROUP_ORDERED — v1 ships no ordering modules, so any content divergence
 //     is held (item_a kept) with a CRABS_CHANGE_MERGE "__merge_held__" event
 //     (CRABS_ERR_ORDERING_PATH); identical items are a no-op.

@@ -268,6 +268,27 @@ TEST_F(TestCLI, ItemAddUninitialized) {
   EXPECT_EQ(cli_cmd_item_add(node, "name", "counter"), CLI_ERR_NOT_INIT);
 }
 
+// Write-domains follow-up: 'item add' mints the canonical (data_type,
+// crdt_type) pair through the gated creation path — the old arm fed the
+// single type word to the crdt table too, so every non-one-shot word fell
+// through to CRDT_CUSTOM and silently minted a mismatched pair (e.g.
+// counter/CRDT_CUSTOM). An unrecognized type word is now an argument error
+// instead of a silent DATA_TYPE_CUSTOM mint.
+TEST_F(TestCLI, ItemAddMintsCanonicalPairAndRejectsUnknownType) {
+  cli_node_init(node, "admin");
+
+  EXPECT_EQ(cli_cmd_item_add(node, "counter1", "counter"), CLI_OK);
+  data_item_t* item = state_find_item(&node->attr_machine->base_state,
+                                      "counter1");
+  ASSERT_NE(item, nullptr);
+  EXPECT_EQ(item->type, DATA_TYPE_COUNTER);
+  EXPECT_EQ(item->crdt_type, CRDT_G_COUNTER);  // canonical, not CRDT_CUSTOM
+
+  EXPECT_EQ(cli_cmd_item_add(node, "mystery", "bogus_word"), CLI_ERR_ARGS);
+  EXPECT_EQ(state_find_item(&node->attr_machine->base_state, "mystery"),
+            nullptr);
+}
+
 // ============================================================
 // Policy Tests
 // ============================================================

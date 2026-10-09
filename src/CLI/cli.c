@@ -1070,10 +1070,38 @@ cli_result_e cli_cmd_item_add(cli_node_t* node, const char* name,
   if (name == NULL || type_str == NULL) return CLI_ERR_ARGS;
 
   data_type_e dtype = _parse_data_type(type_str);
-  crdt_type_e crdt = _parse_crdt_type(type_str);
+  // Write-domains follow-up: route creation through the gated
+  // data_item_create_with_options. The single <type> word pins the data
+  // type; the backing CRDT is the CANONICAL pair for it. The old arm fed
+  // the same word to the crdt table too, where every data word except the
+  // one-shots fell through to CRDT_CUSTOM — silently minting mismatched
+  // pairs (e.g. counter/CRDT_CUSTOM) whose values every crdt-dispatched
+  // consumer miscasts (the hole the canonical-pair gate in data_model.c
+  // exists to close; mirrored by lineage_blueprint_validate for blueprints).
+  if (dtype == DATA_TYPE_CUSTOM) {
+    // _parse_data_type's fall-through means "unrecognized word" — the CLI
+    // has no vocabulary to author a real custom item, so an unknown word is
+    // an argument error with a clear message, not a silent custom mint.
+    printf("Error: unknown item type '%s' "
+           "(counter|pn_counter|set|2p_set|register|document|resource|"
+           "one_shot_set|one_shot_flag).\n", type_str);
+    return CLI_ERR_ARGS;
+  }
+  crdt_type_e crdt = CRDT_CUSTOM;
+  if (data_item_canonical_crdt_for_type(dtype, &crdt) != CRABS_SUCCESS) {
+    // Unreachable while _parse_data_type and the canonical table stay in
+    // lockstep; fail closed anyway — never mint a pair the table rejects.
+    printf("Error: %s\n", cli_error_string(CRABS_ERR_TYPE_MISMATCH));
+    return CLI_ERR_ARGS;
+  }
 
-  data_item_t* item = data_item_create(name, dtype, crdt);
-  if (item == NULL) return CLI_ERR_EXEC;
+  data_item_t* item = NULL;
+  crabs_error_e create_err =
+      data_item_create_with_options(name, dtype, crdt, NULL, &item);
+  if (create_err != CRABS_SUCCESS) {
+    printf("Error: %s\n", cli_error_string(create_err));
+    return create_err == CRABS_ERR_TYPE_MISMATCH ? CLI_ERR_ARGS : CLI_ERR_EXEC;
+  }
 
   crabs_error_e err = state_add_item(&node->attr_machine->base_state, item);
   if (err != CRABS_SUCCESS) {

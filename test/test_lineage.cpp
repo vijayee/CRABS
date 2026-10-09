@@ -1389,6 +1389,36 @@ TEST(TestLineage, BlueprintValidateRejectsOutOfRangeCrdtType) {
   machine_blueprint_destroy(blueprint);
 }
 
+// Write-domains follow-up: canonical (type, crdt_type) pairing is enforced at
+// BOTH the struct-level validator (hand-built blueprints) and the wire
+// deserializer (A10-L2 pattern) — an enum-range-valid but cross-paired item
+// (COUNTER + CRDT_LWW_REG) must never reach spawn.
+TEST(TestLineage, BlueprintRejectsNonCanonicalPair) {
+  machine_blueprint_t* blueprint = make_valid_blueprint();
+  ASSERT_NE(blueprint, nullptr);
+  blueprint->items[0].crdt_type = CRDT_LWW_REG;  // in range, wrong pair
+  EXPECT_EQ(lineage_blueprint_validate(blueprint), CRABS_ERR_TYPE_MISMATCH);
+  machine_blueprint_destroy(blueprint);
+
+  // Wire path: the same flip inside a serialized image, hash re-stamped so
+  // only the pairing differs — the load must fail closed.
+  machine_blueprint_t* wire_source = make_valid_blueprint();
+  ASSERT_NE(wire_source, nullptr);
+  uint8_t wire[CRABS_BLUEPRINT_WIRE_MAX];
+  size_t wire_len = blueprint_serialize(wire_source, wire, sizeof(wire));
+  ASSERT_GT(wire_len, 0u);
+  size_t item_end = blueprint_wire_find_string_end(wire, wire_len, "counter");
+  ASSERT_NE(item_end, SIZE_MAX);
+  ASSERT_LT(item_end + 1, wire_len);
+  ASSERT_EQ(wire[item_end], (uint8_t)DATA_TYPE_COUNTER);
+  ASSERT_EQ(wire[item_end + 1], (uint8_t)CRDT_G_COUNTER);
+  wire[item_end + 1] = (uint8_t)CRDT_LWW_REG;  // in range, non-canonical
+  blueprint_wire_restamp_hash(wire, wire_len);
+  EXPECT_EQ(blueprint_deserialize(wire, wire_len), nullptr);
+
+  machine_blueprint_destroy(wire_source);
+}
+
 // ============================================================
 // Blueprint-declared write domains (write-domains v1, format v2)
 // ============================================================

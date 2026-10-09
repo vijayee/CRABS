@@ -723,7 +723,13 @@ machine_blueprint_t* blueprint_deserialize(const uint8_t* buf, size_t len) {
              offset + 3 <= len &&
              _lineage_enum_valid_data_type(buf[offset]) &&
              _lineage_enum_valid_crdt_type(buf[offset + 1]) &&
-             _lineage_enum_valid_write_domain(buf[offset + 2]);
+             _lineage_enum_valid_write_domain(buf[offset + 2]) &&
+             // Canonical pairing too (write-domains follow-up): an in-range
+             // but cross-paired (type, crdt_type) would spawn an item whose
+             // value every crdt-dispatched consumer miscasts — fail closed
+             // at LOAD, same as the range bytes above (A10-L2).
+             data_item_type_crdt_pair_canonical((data_type_e)buf[offset],
+                                                (crdt_type_e)buf[offset + 1]);
     if (parsed) {
       item->type = (data_type_e)buf[offset++];
       item->crdt_type = (crdt_type_e)buf[offset++];
@@ -1164,6 +1170,15 @@ crabs_error_e lineage_blueprint_validate(const machine_blueprint_t* blueprint) {
     if (!_lineage_enum_valid_data_type((uint8_t)item->type) ||
         !_lineage_enum_valid_crdt_type((uint8_t)item->crdt_type)) {
       return CRABS_ERR_INVALID_PARAM;
+    }
+    // Canonical (type, crdt_type) pairing (write-domains follow-up): range
+    // whitelists alone admit cross-paired shapes (COUNTER + CRDT_LWW_REG),
+    // and spawning such an item would mint a value every crdt-dispatched
+    // consumer miscasts — the hole data_item_create_with_options closes for
+    // direct creation. Mirror it here and at parse (deserializer item loop)
+    // so no surface reaches spawn with a non-canonical pair.
+    if (!data_item_type_crdt_pair_canonical(item->type, item->crdt_type)) {
+      return CRABS_ERR_TYPE_MISMATCH;
     }
     // Write-domain declaration (write-domains v1): the same whitelist plus
     // the data_item_create_with_options presence rules, mirrored for the

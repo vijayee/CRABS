@@ -710,6 +710,75 @@ TEST(TestCRDTMerge, TestMergeDeepCopyPropagatesDomainFields) {
   state_destroy(src);
 }
 
+// Fresh adopt (write-domains follow-up): a sovereign item NEW to dst takes
+// its chain head from RECOMPUTED content, not from the tampered carried
+// item_digest. First arrival has no prior chain to judge against, so the
+// content is adopted (the arriving snapshot is the authority) with the
+// COMPUTED head stamped, and the carried/computed mismatch surfaces as a
+// divergence event.
+TEST(TestCRDTMerge, TestFreshAdoptRecomputesTamperedCarriedDigest) {
+  state_t* dst = state_create();
+  state_t* src = state_create();
+  merge_event_capture_t capture = {};
+  state_set_change_hook(dst, _merge_event_hook, &capture);
+
+  data_item_t* src_item = _make_sovereign_counter("vault", "alice", 4, 9);
+  ASSERT_NE(src_item, nullptr);
+  uint8_t honest_digest[CRABS_HASH_SIZE];
+  memcpy(honest_digest, src_item->item_digest, CRABS_HASH_SIZE);
+  src_item->item_digest[0] ^= 0xFF;  // tamper the carried head after stamping
+  state_add_item(src, src_item);
+
+  EXPECT_EQ(crdt_merge_state(dst, src), CRABS_SUCCESS);
+
+  data_item_t* adopted = state_find_item(dst, "vault");
+  ASSERT_NE(adopted, nullptr);
+  EXPECT_EQ(adopted->write_domain, CRABS_DOMAIN_SOVEREIGN);
+  EXPECT_STREQ(adopted->writer, "alice");
+  EXPECT_EQ(adopted->item_seq, 4u);
+  EXPECT_EQ(g_counter_value((g_counter_t*)adopted->value), 9);
+  // The adopted head is the RECOMPUTED (= honest) digest, not the tampered
+  // carry the snapshot arrived with.
+  EXPECT_EQ(memcmp(adopted->item_digest, honest_digest, CRABS_HASH_SIZE), 0);
+  uint8_t recomputed[CRABS_HASH_SIZE];
+  ASSERT_EQ(state_item_digest_compute(adopted, recomputed), CRABS_SUCCESS);
+  EXPECT_EQ(memcmp(adopted->item_digest, recomputed, CRABS_HASH_SIZE), 0);
+  // And the mismatch was documented.
+  EXPECT_EQ(capture.calls, 1);
+  EXPECT_EQ(capture.kind, CRABS_CHANGE_MERGE);
+  EXPECT_STREQ(capture.target, "vault");
+  EXPECT_STREQ(capture.type, "__merge_digest_mismatch__");
+  EXPECT_EQ(capture.result, CRABS_ERR_PROTOCOL_VIOLATION);
+
+  _destroy_state_values(dst);
+  _destroy_state_values(src);
+  state_destroy(dst);
+  state_destroy(src);
+
+  // Control: an honest carry (== computed) adopts silently — no event.
+  state_t* dst_honest = state_create();
+  state_t* src_honest = state_create();
+  merge_event_capture_t honest_capture = {};
+  state_set_change_hook(dst_honest, _merge_event_hook, &honest_capture);
+  data_item_t* honest_item = _make_sovereign_counter("cache", "bob", 2, 3);
+  ASSERT_NE(honest_item, nullptr);
+  uint8_t honest_carry[CRABS_HASH_SIZE];
+  memcpy(honest_carry, honest_item->item_digest, CRABS_HASH_SIZE);
+  state_add_item(src_honest, honest_item);
+
+  EXPECT_EQ(crdt_merge_state(dst_honest, src_honest), CRABS_SUCCESS);
+  EXPECT_EQ(honest_capture.calls, 0);
+  data_item_t* honest_adopted = state_find_item(dst_honest, "cache");
+  ASSERT_NE(honest_adopted, nullptr);
+  EXPECT_EQ(memcmp(honest_adopted->item_digest, honest_carry,
+                   CRABS_HASH_SIZE), 0);
+
+  _destroy_state_values(dst_honest);
+  _destroy_state_values(src_honest);
+  state_destroy(dst_honest);
+  state_destroy(src_honest);
+}
+
 // SOVEREIGN: the remote chain head is ahead with the same writer — accept it.
 // Adopt sets the merged head to the RECOMPUTED digest of the adopted content;
 // for an honest snapshot carried == computed (sanity half of the recompute

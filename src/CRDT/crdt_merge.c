@@ -765,20 +765,59 @@ crabs_error_e crdt_merge_state(state_t* dst, const state_t* src) {
         // crdt_merge_value builds structs for the CRDT types it handles.
         new_item->value_repr = DATA_VALUE_REPR_CRDT_STRUCT;
       }
-      crabs_error_e add_status = state_add_item(dst, new_item);
-      if (add_status != CRABS_SUCCESS) {
-        // state_add_item fails closed on a malformed domain declaration
-        // (write-domains v1) — hold the item out of dst, surface the
-        // rejection, then free the copy. The event borrows new_item->name
-        // only for the duration of the hook call. (data_item_destroy only
-        // frees the wrapper for counter/register types, so destroy the value
-        // first.)
-        _merge_notify_divergence(dst, "__merge_domain_mismatch__",
-                                 new_item->name, CRABS_ERR_PROTOCOL_VIOLATION);
+      // Fresh adopt of a SOVEREIGN item (write-domains v1 follow-up): the
+      // chain head must come from the arriving CONTENT, not the carried
+      // item_digest field — a tampered first-arrival snapshot must not plant
+      // a head its content never produced (bounded griefing, but closable).
+      // There is no prior chain on dst to judge against, so first arrival
+      // ADOPTS the content either way; a carried/computed mismatch surfaces
+      // as a divergence event instead of a hold. item_seq == 0 keeps the
+      // spec's representation (digest stays zeroed while the chain has not
+      // started) — nothing honest to recompute against yet.
+      bool hold_item = false;
+      bool carried_digest_mismatch = false;
+      if (new_item->write_domain == CRABS_DOMAIN_SOVEREIGN &&
+          new_item->item_seq > 0) {
+        uint8_t computed_digest[CRABS_HASH_SIZE];
+        if (state_item_digest_compute(new_item, computed_digest) !=
+            CRABS_SUCCESS) {
+          // Undigestable content: fail closed like the other holds — keep
+          // the item out of dst and surface why.
+          _merge_notify_divergence(dst, "__merge_held__", new_item->name,
+                                   CRABS_ERR_PROTOCOL_VIOLATION);
+          hold_item = true;
+        } else {
+          carried_digest_mismatch =
+              memcmp(computed_digest, new_item->item_digest,
+                     CRABS_HASH_SIZE) != 0;
+          memcpy(new_item->item_digest, computed_digest,
+                 sizeof(new_item->item_digest));
+        }
+      }
+      crabs_error_e add_status = CRABS_SUCCESS;
+      if (!hold_item) {
+        add_status = state_add_item(dst, new_item);
+        if (add_status != CRABS_SUCCESS) {
+          // state_add_item fails closed on a malformed domain declaration
+          // (write-domains v1) — hold the item out of dst, surface the
+          // rejection, then free the copy below. The event borrows
+          // new_item->name only for the duration of the hook call.
+          _merge_notify_divergence(dst, "__merge_domain_mismatch__",
+                                   new_item->name, CRABS_ERR_PROTOCOL_VIOLATION);
+        } else if (carried_digest_mismatch) {
+          // Adopted with a tampered carry: content is the authority, the
+          // recomputed head is stamped, and the mismatch is documented.
+          _merge_notify_divergence(dst, "__merge_digest_mismatch__",
+                                   new_item->name, CRABS_ERR_PROTOCOL_VIOLATION);
+        }
+      }
+      if (hold_item || add_status != CRABS_SUCCESS) {
+        // (data_item_destroy only frees the wrapper for counter/register
+        // types, so destroy the value first — per its repr, mirroring
+        // data_item_destroy's dispatch; done here because the item must
+        // survive long enough for any divergence event above to read its
+        // name.)
         if (new_item->value != NULL) {
-          // Destroy per the value's repr (mirrors data_item_destroy's
-          // dispatch; done here because the item must survive long enough
-          // for the divergence event above to read its name).
           if (new_item->value_repr == DATA_VALUE_REPR_CRDT_STRUCT) {
             crdt_value_destroy(new_item->crdt_type, new_item->value);
           } else {
