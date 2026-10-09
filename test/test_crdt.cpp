@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 extern "C" {
 #include "../src/CRDT/crdt_merge.h"
+#include "../src/StateMachine/state_machine.h"
 }
 
 // ============================================================
@@ -578,4 +579,472 @@ TEST(TestCRDTMerge, TestStateMergeInvalidParams) {
   err = crdt_merge_state(nullptr, s);
   EXPECT_EQ(err, CRABS_ERR_INVALID_PARAM);
   state_destroy(s);
+}
+
+// ============================================================
+// Write-domain merge dispatch tests (write-domains v1)
+// ============================================================
+
+// Build a sovereign counter item directly (writer/seq/digest stamped) — the
+// merge dispatch reasons over the stored chain head fields, so tests pin them
+// explicitly instead of executing sovereign ops.
+static data_item_t* _make_sovereign_counter(const char* name, const char* writer,
+                                            uint64_t item_seq, uint8_t digest_seed,
+                                            int64_t increments) {
+  data_item_options_t options;
+  memset(&options, 0, sizeof(options));
+  options.write_domain = CRABS_DOMAIN_SOVEREIGN;
+  options.writer = writer;
+  data_item_t* item = nullptr;
+  crabs_error_e create_err =
+      data_item_create_with_options(name, DATA_TYPE_COUNTER, CRDT_PN_COUNTER,
+                                    &options, &item);
+  EXPECT_EQ(create_err, CRABS_SUCCESS);
+  if (item == nullptr) return nullptr;
+  pn_counter_t* counter = pn_counter_create();
+  if (increments > 0) {
+    pn_counter_increment(counter, writer, increments);
+  }
+  item->value = counter;
+  item->item_seq = item_seq;
+  memset(item->item_digest, digest_seed, CRABS_HASH_SIZE);
+  return item;
+}
+
+static data_item_t* _make_group_register(const char* name,
+                                         const char* register_value) {
+  data_item_options_t options;
+  memset(&options, 0, sizeof(options));
+  options.write_domain = CRABS_DOMAIN_GROUP_ORDERED;
+  data_item_t* item = nullptr;
+  crabs_error_e create_err =
+      data_item_create_with_options(name, DATA_TYPE_REGISTER, CRDT_LWW_REG,
+                                    &options, &item);
+  EXPECT_EQ(create_err, CRABS_SUCCESS);
+  if (item == nullptr) return nullptr;
+  if (register_value != nullptr) {
+    item->value = lww_register_create((const uint8_t*)register_value,
+                                      (uint32_t)strlen(register_value), 1, "nodeA");
+  }
+  return item;
+}
+
+// Capture of the last change event emitted during a merge.
+typedef struct {
+  int                 calls;
+  crabs_change_kind_e kind;
+  char                type[CRABS_MAX_USER_ID];
+  char                target[CRABS_MAX_USER_ID];
+  crabs_error_e       result;
+} merge_event_capture_t;
+
+static void _merge_event_hook(state_t* state, const crabs_change_event_t* event,
+                              void* user_data) {
+  (void)state;
+  merge_event_capture_t* capture = (merge_event_capture_t*)user_data;
+  capture->calls++;
+  capture->kind = event->kind;
+  memset(capture->type, 0, sizeof(capture->type));
+  if (event->type != NULL) {
+    strncpy(capture->type, event->type, sizeof(capture->type) - 1);
+  }
+  memset(capture->target, 0, sizeof(capture->target));
+  if (event->target != NULL) {
+    strncpy(capture->target, event->target, sizeof(capture->target) - 1);
+  }
+  capture->result = event->result;
+}
+
+// Free every item value of a state via crdt_value_destroy (data_item_destroy's
+// default arm only frees the wrapper for counter/register types).
+static void _destroy_state_values(state_t* state) {
+  for (data_item_t* item = state->items; item != NULL; item = item->next) {
+    if (item->value != NULL) {
+      crdt_value_destroy(item->crdt_type, item->value);
+      item->value = NULL;
+    }
+  }
+}
+
+// Carried Task-1 review fix: the merge deep-copy path must propagate the
+// write-domain fields — a sovereign item new to dst must arrive whole.
+TEST(TestCRDTMerge, TestMergeDeepCopyPropagatesDomainFields) {
+  state_t* dst = state_create();
+  state_t* src = state_create();
+
+  data_item_t* src_item = _make_sovereign_counter("vault", "alice", 7, 0x5A, 9);
+  ASSERT_NE(src_item, nullptr);
+  uint8_t fork_evidence[CRABS_HASH_SIZE];
+  memset(fork_evidence, 0xF0, sizeof(fork_evidence));
+  EXPECT_EQ(state_append_fork_evidence(src_item, "mallory", fork_evidence),
+            CRABS_SUCCESS);
+  state_add_item(src, src_item);
+
+  EXPECT_EQ(crdt_merge_state(dst, src), CRABS_SUCCESS);
+
+  data_item_t* dst_item = state_find_item(dst, "vault");
+  ASSERT_NE(dst_item, nullptr);
+  EXPECT_EQ(dst_item->write_domain, CRABS_DOMAIN_SOVEREIGN);
+  EXPECT_STREQ(dst_item->writer, "alice");
+  EXPECT_EQ(dst_item->item_seq, 7u);
+  uint8_t expected_digest[CRABS_HASH_SIZE];
+  memset(expected_digest, 0x5A, sizeof(expected_digest));
+  EXPECT_EQ(memcmp(dst_item->item_digest, expected_digest, CRABS_HASH_SIZE), 0);
+  EXPECT_EQ(dst_item->ordering_module, 0);
+  ASSERT_EQ(dst_item->fork_count, 1u);
+  EXPECT_STREQ(dst_item->fork_writers[0], "mallory");
+  EXPECT_EQ(memcmp(dst_item->fork_evidence_digests[0], fork_evidence,
+                   CRABS_HASH_SIZE), 0);
+  // content carried too
+  EXPECT_EQ(pn_counter_value((pn_counter_t*)dst_item->value), 9);
+
+  _destroy_state_values(dst);
+  _destroy_state_values(src);
+  state_destroy(dst);
+  state_destroy(src);
+}
+
+// SOVEREIGN: the remote chain head is ahead with the same writer — accept it.
+TEST(TestCRDTMerge, TestSovereignMergeAcceptsAheadSnapshot) {
+  state_t* dst = state_create();
+  state_t* src = state_create();
+  merge_event_capture_t capture = {};
+  state_set_change_hook(dst, _merge_event_hook, &capture);
+
+  data_item_t* dst_item = _make_sovereign_counter("vault", "alice", 3, 0x11, 2);
+  data_item_t* src_item = _make_sovereign_counter("vault", "alice", 5, 0x22, 9);
+  ASSERT_NE(dst_item, nullptr);
+  ASSERT_NE(src_item, nullptr);
+  state_add_item(dst, dst_item);
+  state_add_item(src, src_item);
+
+  EXPECT_EQ(crdt_merge_state(dst, src), CRABS_SUCCESS);
+
+  data_item_t* merged = state_find_item(dst, "vault");
+  ASSERT_NE(merged, nullptr);
+  EXPECT_EQ(pn_counter_value((pn_counter_t*)merged->value), 9);
+  EXPECT_EQ(merged->item_seq, 5u);
+  uint8_t expected_digest[CRABS_HASH_SIZE];
+  memset(expected_digest, 0x22, sizeof(expected_digest));
+  EXPECT_EQ(memcmp(merged->item_digest, expected_digest, CRABS_HASH_SIZE), 0);
+  EXPECT_STREQ(merged->writer, "alice");
+  // a clean continuation is silent
+  EXPECT_EQ(capture.calls, 0);
+
+  _destroy_state_values(dst);
+  _destroy_state_values(src);
+  state_destroy(dst);
+  state_destroy(src);
+}
+
+// SOVEREIGN: the local chain head is ahead — keep it, ignore the stale tail.
+TEST(TestCRDTMerge, TestSovereignMergeKeepsLocalWhenAhead) {
+  state_t* dst = state_create();
+  state_t* src = state_create();
+  merge_event_capture_t capture = {};
+  state_set_change_hook(dst, _merge_event_hook, &capture);
+
+  data_item_t* dst_item = _make_sovereign_counter("vault", "alice", 6, 0x33, 4);
+  data_item_t* src_item = _make_sovereign_counter("vault", "alice", 2, 0x44, 100);
+  ASSERT_NE(dst_item, nullptr);
+  ASSERT_NE(src_item, nullptr);
+  state_add_item(dst, dst_item);
+  state_add_item(src, src_item);
+
+  EXPECT_EQ(crdt_merge_state(dst, src), CRABS_SUCCESS);
+
+  data_item_t* merged = state_find_item(dst, "vault");
+  ASSERT_NE(merged, nullptr);
+  EXPECT_EQ(pn_counter_value((pn_counter_t*)merged->value), 4);
+  EXPECT_EQ(merged->item_seq, 6u);
+  EXPECT_EQ(capture.calls, 0);
+
+  _destroy_state_values(dst);
+  _destroy_state_values(src);
+  state_destroy(dst);
+  state_destroy(src);
+}
+
+// SOVEREIGN: equal seq + equal digest is an identical head — no-op, and the
+// local value object is left untouched.
+TEST(TestCRDTMerge, TestSovereignMergeIdenticalHeadIsNoOp) {
+  state_t* dst = state_create();
+  state_t* src = state_create();
+  merge_event_capture_t capture = {};
+  state_set_change_hook(dst, _merge_event_hook, &capture);
+
+  data_item_t* dst_item = _make_sovereign_counter("vault", "alice", 4, 0x55, 3);
+  data_item_t* src_item = _make_sovereign_counter("vault", "alice", 4, 0x55, 3);
+  ASSERT_NE(dst_item, nullptr);
+  ASSERT_NE(src_item, nullptr);
+  state_add_item(dst, dst_item);
+  state_add_item(src, src_item);
+  void* original_value = dst_item->value;
+
+  EXPECT_EQ(crdt_merge_state(dst, src), CRABS_SUCCESS);
+
+  data_item_t* merged = state_find_item(dst, "vault");
+  ASSERT_NE(merged, nullptr);
+  EXPECT_EQ(merged->value, original_value);
+  EXPECT_EQ(merged->item_seq, 4u);
+  EXPECT_EQ(capture.calls, 0);
+
+  _destroy_state_values(dst);
+  _destroy_state_values(src);
+  state_destroy(dst);
+  state_destroy(src);
+}
+
+// SOVEREIGN: equal seq + different digest is a fork — neither side's content
+// applies, the fork sets union monotonically, the writer is convicted, and a
+// merge change event surfaces the divergence.
+TEST(TestCRDTMerge, TestSovereignMergeForkUnionsEvidenceWithoutOverwriting) {
+  state_t* dst = state_create();
+  state_t* src = state_create();
+  merge_event_capture_t capture = {};
+  state_set_change_hook(dst, _merge_event_hook, &capture);
+
+  data_item_t* dst_item = _make_sovereign_counter("vault", "alice", 4, 0xAA, 3);
+  data_item_t* src_item = _make_sovereign_counter("vault", "alice", 4, 0xBB, 99);
+  ASSERT_NE(dst_item, nullptr);
+  ASSERT_NE(src_item, nullptr);
+  // src carries prior quarantine evidence for another writer — unioned in.
+  uint8_t prior_evidence[CRABS_HASH_SIZE];
+  memset(prior_evidence, 0xE1, sizeof(prior_evidence));
+  EXPECT_EQ(state_append_fork_evidence(src_item, "mallory", prior_evidence),
+            CRABS_SUCCESS);
+  state_add_item(dst, dst_item);
+  state_add_item(src, src_item);
+
+  EXPECT_EQ(crdt_merge_state(dst, src), CRABS_SUCCESS);
+
+  data_item_t* merged = state_find_item(dst, "vault");
+  ASSERT_NE(merged, nullptr);
+  // content NOT overwritten by the forking side
+  EXPECT_EQ(pn_counter_value((pn_counter_t*)merged->value), 3);
+  EXPECT_EQ(merged->item_seq, 4u);
+  uint8_t expected_digest[CRABS_HASH_SIZE];
+  memset(expected_digest, 0xAA, sizeof(expected_digest));
+  EXPECT_EQ(memcmp(merged->item_digest, expected_digest, CRABS_HASH_SIZE), 0);
+  // fork set: the forking writer convicted + src's prior evidence unioned
+  EXPECT_TRUE(state_item_is_quarantined(merged, "alice"));
+  EXPECT_TRUE(state_item_is_quarantined(merged, "mallory"));
+  EXPECT_EQ(merged->fork_count, 2u);
+  // event surfaced the divergence
+  ASSERT_EQ(capture.calls, 1);
+  EXPECT_EQ(capture.kind, CRABS_CHANGE_MERGE);
+  EXPECT_STREQ(capture.type, "__merge_fork__");
+  EXPECT_STREQ(capture.target, "vault");
+  EXPECT_EQ(capture.result, CRABS_ERR_FORK_DETECTED);
+
+  // re-merging the same src is idempotent in evidence (no fork-set growth)
+  // but surfaces the fork event again — the divergence persists until the
+  // application resolves it, so every merge with the forking replica fires.
+  merge_event_capture_t second_capture = {};
+  state_set_change_hook(dst, _merge_event_hook, &second_capture);
+  EXPECT_EQ(crdt_merge_state(dst, src), CRABS_SUCCESS);
+  merged = state_find_item(dst, "vault");
+  ASSERT_NE(merged, nullptr);
+  EXPECT_EQ(merged->fork_count, 2u);
+  EXPECT_EQ(pn_counter_value((pn_counter_t*)merged->value), 3);
+  ASSERT_EQ(second_capture.calls, 1);
+  EXPECT_EQ(second_capture.result, CRABS_ERR_FORK_DETECTED);
+
+  _destroy_state_values(dst);
+  _destroy_state_values(src);
+  state_destroy(dst);
+  state_destroy(src);
+}
+
+// SOVEREIGN: the same item name with a different writer is creation-immutable
+// lineage corruption — keep item_a's content and surface an event.
+TEST(TestCRDTMerge, TestSovereignMergeWriterMismatchHeld) {
+  state_t* dst = state_create();
+  state_t* src = state_create();
+  merge_event_capture_t capture = {};
+  state_set_change_hook(dst, _merge_event_hook, &capture);
+
+  data_item_t* dst_item = _make_sovereign_counter("vault", "alice", 1, 0x01, 5);
+  data_item_t* src_item = _make_sovereign_counter("vault", "eve", 9, 0x09, 50);
+  ASSERT_NE(dst_item, nullptr);
+  ASSERT_NE(src_item, nullptr);
+  state_add_item(dst, dst_item);
+  state_add_item(src, src_item);
+
+  EXPECT_EQ(crdt_merge_state(dst, src), CRABS_SUCCESS);
+
+  data_item_t* merged = state_find_item(dst, "vault");
+  ASSERT_NE(merged, nullptr);
+  EXPECT_STREQ(merged->writer, "alice");
+  EXPECT_EQ(pn_counter_value((pn_counter_t*)merged->value), 5);
+  EXPECT_EQ(merged->item_seq, 1u);
+  ASSERT_EQ(capture.calls, 1);
+  EXPECT_EQ(capture.kind, CRABS_CHANGE_MERGE);
+  EXPECT_STREQ(capture.type, "__merge_writer_mismatch__");
+  EXPECT_EQ(capture.result, CRABS_ERR_PROTOCOL_VIOLATION);
+
+  _destroy_state_values(dst);
+  _destroy_state_values(src);
+  state_destroy(dst);
+  state_destroy(src);
+}
+
+// SOVEREIGN: an ahead snapshot whose value cannot be deep-copied (unsupported
+// CRDT type, only reachable on wire-shaped items — v1 sovereign types are
+// always COUNTER/REGISTER values, but CREATE validates the data type, not the
+// crdt_type) must NOT split content from chain head: item_a is kept whole and
+// a hold event fires.
+TEST(TestCRDTMerge, TestSovereignMergeAheadWithUndigestableValueHeld) {
+  state_t* dst = state_create();
+  state_t* src = state_create();
+  merge_event_capture_t capture = {};
+  state_set_change_hook(dst, _merge_event_hook, &capture);
+
+  data_item_options_t rga_options;
+  memset(&rga_options, 0, sizeof(rga_options));
+  rga_options.write_domain = CRABS_DOMAIN_SOVEREIGN;
+  rga_options.writer = "alice";
+
+  data_item_t* dst_item = nullptr;
+  ASSERT_EQ(data_item_create_with_options("vault", DATA_TYPE_REGISTER,
+                                          CRDT_RGA, &rga_options, &dst_item),
+            CRABS_SUCCESS);
+  // Values with NULL payloads: crdt_value_destroy's default arm only frees
+  // the wrapper for CRDT_RGA, so keep them payload-less to avoid a leak.
+  dst_item->value = lww_register_create(nullptr, 0, 1, "nodeA");
+  dst_item->item_seq = 2;
+  memset(dst_item->item_digest, 0x02, CRABS_HASH_SIZE);
+  state_add_item(dst, dst_item);
+
+  data_item_t* src_item = nullptr;
+  ASSERT_EQ(data_item_create_with_options("vault", DATA_TYPE_REGISTER,
+                                          CRDT_RGA, &rga_options, &src_item),
+            CRABS_SUCCESS);
+  src_item->value = lww_register_create(nullptr, 0, 2, "nodeA");
+  src_item->item_seq = 5;
+  memset(src_item->item_digest, 0x05, CRABS_HASH_SIZE);
+  state_add_item(src, src_item);
+
+  EXPECT_EQ(crdt_merge_state(dst, src), CRABS_SUCCESS);
+
+  data_item_t* merged = state_find_item(dst, "vault");
+  ASSERT_NE(merged, nullptr);
+  // head NOT adopted: seq/digest/value all stay item_a's
+  EXPECT_EQ(merged->item_seq, 2u);
+  lww_register_t* merged_reg = (lww_register_t*)merged->value;
+  ASSERT_NE(merged_reg, nullptr);
+  EXPECT_EQ(merged_reg->timestamp, 1u);
+  ASSERT_EQ(capture.calls, 1);
+  EXPECT_EQ(capture.kind, CRABS_CHANGE_MERGE);
+  EXPECT_STREQ(capture.type, "__merge_held__");
+  EXPECT_EQ(capture.result, CRABS_ERR_PROTOCOL_VIOLATION);
+
+  _destroy_state_values(dst);
+  _destroy_state_values(src);
+  state_destroy(dst);
+  state_destroy(src);
+}
+
+// SOVEREIGN: a same-named item of a different type/crdt_type is corrupted
+// lineage — merging values across shapes would cast across incompatible
+// structs, so item_a is held whole and an event fires.
+TEST(TestCRDTMerge, TestSovereignMergeTypeMismatchHeld) {
+  state_t* dst = state_create();
+  state_t* src = state_create();
+  merge_event_capture_t capture = {};
+  state_set_change_hook(dst, _merge_event_hook, &capture);
+
+  data_item_t* dst_item = _make_sovereign_counter("vault", "alice", 2, 0x02, 7);
+  ASSERT_NE(dst_item, nullptr);
+  state_add_item(dst, dst_item);
+
+  // Same name, same domain, same writer — but a register, not a counter.
+  data_item_options_t src_options;
+  memset(&src_options, 0, sizeof(src_options));
+  src_options.write_domain = CRABS_DOMAIN_SOVEREIGN;
+  src_options.writer = "alice";
+  data_item_t* src_item = nullptr;
+  ASSERT_EQ(data_item_create_with_options("vault", DATA_TYPE_REGISTER,
+                                          CRDT_LWW_REG, &src_options,
+                                          &src_item),
+            CRABS_SUCCESS);
+  src_item->item_seq = 9;
+  state_add_item(src, src_item);
+
+  EXPECT_EQ(crdt_merge_state(dst, src), CRABS_SUCCESS);
+
+  data_item_t* merged = state_find_item(dst, "vault");
+  ASSERT_NE(merged, nullptr);
+  EXPECT_EQ(merged->item_seq, 2u);
+  EXPECT_EQ(pn_counter_value((pn_counter_t*)merged->value), 7);
+  ASSERT_EQ(capture.calls, 1);
+  EXPECT_EQ(capture.kind, CRABS_CHANGE_MERGE);
+  EXPECT_STREQ(capture.type, "__merge_type_mismatch__");
+  EXPECT_EQ(capture.result, CRABS_ERR_PROTOCOL_VIOLATION);
+
+  _destroy_state_values(dst);
+  _destroy_state_values(src);
+  state_destroy(dst);
+  state_destroy(src);
+}
+
+// GROUP_ORDERED (v1, no modules): any content divergence is held — keep
+// item_a and surface a held-divergence event; identical items are a no-op.
+TEST(TestCRDTMerge, TestGroupOrderedMergeHoldsDivergence) {
+  state_t* dst = state_create();
+  state_t* src = state_create();
+  merge_event_capture_t capture = {};
+  state_set_change_hook(dst, _merge_event_hook, &capture);
+
+  data_item_t* dst_item = _make_group_register("council", "alpha");
+  data_item_t* src_item = _make_group_register("council", "beta");
+  ASSERT_NE(dst_item, nullptr);
+  ASSERT_NE(src_item, nullptr);
+  state_add_item(dst, dst_item);
+  state_add_item(src, src_item);
+
+  EXPECT_EQ(crdt_merge_state(dst, src), CRABS_SUCCESS);
+
+  data_item_t* merged = state_find_item(dst, "council");
+  ASSERT_NE(merged, nullptr);
+  // item_a's content kept; the held side did not overwrite
+  lww_register_t* merged_reg = (lww_register_t*)merged->value;
+  ASSERT_NE(merged_reg, nullptr);
+  EXPECT_EQ(memcmp(merged_reg->value, "alpha", 5), 0);
+  ASSERT_EQ(capture.calls, 1);
+  EXPECT_EQ(capture.kind, CRABS_CHANGE_MERGE);
+  EXPECT_STREQ(capture.type, "__merge_held__");
+  EXPECT_STREQ(capture.target, "council");
+  EXPECT_EQ(capture.result, CRABS_ERR_ORDERING_PATH);
+
+  _destroy_state_values(dst);
+  _destroy_state_values(src);
+  state_destroy(dst);
+  state_destroy(src);
+}
+
+TEST(TestCRDTMerge, TestGroupOrderedMergeIdenticalNoOp) {
+  state_t* dst = state_create();
+  state_t* src = state_create();
+  merge_event_capture_t capture = {};
+  state_set_change_hook(dst, _merge_event_hook, &capture);
+
+  data_item_t* dst_item = _make_group_register("council", nullptr);
+  data_item_t* src_item = _make_group_register("council", nullptr);
+  ASSERT_NE(dst_item, nullptr);
+  ASSERT_NE(src_item, nullptr);
+  state_add_item(dst, dst_item);
+  state_add_item(src, src_item);
+
+  EXPECT_EQ(crdt_merge_state(dst, src), CRABS_SUCCESS);
+
+  data_item_t* merged = state_find_item(dst, "council");
+  ASSERT_NE(merged, nullptr);
+  EXPECT_EQ(merged->value, nullptr);
+  EXPECT_EQ(capture.calls, 0);
+
+  _destroy_state_values(dst);
+  _destroy_state_values(src);
+  state_destroy(dst);
+  state_destroy(src);
 }

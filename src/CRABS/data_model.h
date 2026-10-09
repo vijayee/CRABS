@@ -267,7 +267,13 @@ typedef enum {
   CRABS_CHANGE_TRIGGER   = 0x03,  // trigger-fired mutation
   CRABS_CHANGE_ATTRIBUTE = 0x04,  // attribute-machine user mutation
   CRABS_CHANGE_SPAWN     = 0x05,  // machine spawned from a blueprint (lineage)
-  CRABS_CHANGE_LINEAGE   = 0x06   // lineage lifecycle op (revoke/dissolve/withdraw)
+  CRABS_CHANGE_LINEAGE   = 0x06,  // lineage lifecycle op (revoke/dissolve/withdraw)
+  // Merge-dispatch divergence (write-domains v1): a sovereign fork unioned
+  // into the quarantine set, a held group-ordered divergence, or a rejected
+  // lineage-inconsistent item. Merge still converges; this event surfaces
+  // what was withheld. result carries the reason (CRABS_ERR_FORK_DETECTED,
+  // CRABS_ERR_ORDERING_PATH, CRABS_ERR_PROTOCOL_VIOLATION).
+  CRABS_CHANGE_MERGE     = 0x07
 } crabs_change_kind_e;
 
 typedef struct {

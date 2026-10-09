@@ -6,6 +6,8 @@
 #include "../Util/platform.h"
 #include "one_shot.h"
 #include "../Util/allocator.h"
+#include "../Crypto/crypto.h"
+#include "../StateMachine/state_machine.h"
 #include <string.h>
 #include <stdlib.h>
 
@@ -496,6 +498,19 @@ static data_item_t* _data_item_deep_copy(const data_item_t* item) {
   // pointer with the source — a latent double-free if both items are destroyed.
   // The merge path does not use the snapshot, so drop it on the copy.
   copy->lock_state.pre_lock_snapshot = NULL;
+  // Write-domains v1: propagate the per-item domain fields. Without this a
+  // sovereign item new to dst silently arrived as FREE_MERGE — a domain
+  // downgrade on merge. The inline fork storage is copied in full (not just
+  // fork_count entries) for deterministic bytes; fork_count carries the bound.
+  copy->write_domain = item->write_domain;
+  copy->ordering_module = item->ordering_module;
+  memcpy(copy->writer, item->writer, sizeof(copy->writer));
+  copy->item_seq = item->item_seq;
+  memcpy(copy->item_digest, item->item_digest, sizeof(copy->item_digest));
+  memcpy(copy->fork_writers, item->fork_writers, sizeof(copy->fork_writers));
+  memcpy(copy->fork_evidence_digests, item->fork_evidence_digests,
+         sizeof(copy->fork_evidence_digests));
+  copy->fork_count = item->fork_count;
   // Deep copy value pointer - the caller must handle CRDT-specific deep copies
   if (item->value != NULL) {
     // We do not deep copy CRDT values here; the merge function handles that
@@ -512,6 +527,162 @@ static int _compare_log_entries(const void* a, const void* b) {
   return strcmp(ea->node_id, eb->node_id);
 }
 
+// ============================================================
+// Write-domain merge dispatch (write-domains v1, spec 2026-10-08
+// §Merge dispatch)
+// ============================================================
+// FREE_MERGE items keep the A5 type-merge below unchanged. SOVEREIGN items
+// merge by chain-head comparison (item_seq/item_digest) — never by type
+// merge: two sovereign snapshots of different content are a divergence, not
+// a CRDT to combine. GROUP_ORDERED (v1 ships no modules) holds any
+// divergence. Divergence is NOT a merge failure — merge still converges and
+// returns CRABS_SUCCESS; what was withheld surfaces through the dst state's
+// change hook as a CRABS_CHANGE_MERGE event.
+
+// Propagate src's quarantine evidence into dst by monotone union. Union-only:
+// an entry is never evicted and duplicates (same writer OR same evidence
+// digest) are the idempotent no-op signal. A full set (CRABS_MAX_FORK_WRITERS)
+// is also non-fatal: the audit log is the authoritative evidence store and
+// DOMAIN_CHECK honors what is present (spec §Error handling — merge union
+// truncated).
+static void _merge_union_fork_evidence(data_item_t* dst_item,
+                                       const data_item_t* src_item) {
+  for (uint32_t fork_index = 0; fork_index < src_item->fork_count; fork_index++) {
+    (void)state_append_fork_evidence(dst_item,
+                                     src_item->fork_writers[fork_index],
+                                     src_item->fork_evidence_digests[fork_index]);
+  }
+}
+
+// Evidence digest for a merge-detected fork: SHA-256 over the two forking
+// chain-head digests in lexicographic order (min ‖ max). Content-derived, so
+// any replica merging the same two heads derives the same entry and the
+// dedupe in state_append_fork_evidence keeps the union idempotent. The full
+// op bytes stay the durable evidence in the log; this digest only convicts.
+static crabs_error_e _merge_fork_evidence_digest(
+    const uint8_t digest_a[CRABS_HASH_SIZE],
+    const uint8_t digest_b[CRABS_HASH_SIZE],
+    uint8_t out_digest[CRABS_HASH_SIZE]) {
+  uint8_t pair[2 * CRABS_HASH_SIZE];
+  if (memcmp(digest_a, digest_b, CRABS_HASH_SIZE) < 0) {
+    memcpy(pair, digest_a, CRABS_HASH_SIZE);
+    memcpy(pair + CRABS_HASH_SIZE, digest_b, CRABS_HASH_SIZE);
+  } else {
+    memcpy(pair, digest_b, CRABS_HASH_SIZE);
+    memcpy(pair + CRABS_HASH_SIZE, digest_a, CRABS_HASH_SIZE);
+  }
+  return crypto_sha256(pair, sizeof(pair), out_digest);
+}
+
+static void _merge_notify_divergence(state_t* dst, const char* type,
+                                     const char* target, crabs_error_e reason) {
+  state_notify_change(dst, CRABS_CHANGE_MERGE, type, NULL, NULL, NULL,
+                      target, NULL, reason);
+}
+
+// SOVEREIGN v1 merge rule over two chain-head snapshots (item_a = local,
+// item_b = remote):
+//   - writer mismatch: the writer is creation-immutable, so a same-named
+//     sovereign item under another writer is corrupted lineage — keep
+//     item_a's content, union fork evidence, and surface an event.
+//   - item_b seq ahead (same writer): its digest chain continues item_a's —
+//     accept item_b's snapshot wholesale (value + head fields).
+//   - item_a seq ahead: keep item_a; item_b is a stale tail.
+//   - equal seq, equal digest: identical head — no-op.
+//   - equal seq, DIFFERENT digest: a fork. Do NOT apply either side's new
+//     content (quarantine semantics — merge-time forks must not overwrite),
+//     monotone-union the fork sets, convict the writer with a content-derived
+//     evidence digest so DOMAIN_CHECK blocks further writes, and surface a
+//     FORK_DETECTED change event. Note the chain history that a full fork
+//     proof needs lives in the op log, not derivable from two snapshots —
+//     the v1 rule therefore keys on (seq, digest) alone.
+static void _merge_sovereign_item(state_t* dst, data_item_t* dst_item,
+                                  const data_item_t* src_item) {
+  if (strcmp(dst_item->writer, src_item->writer) != 0) {
+    _merge_union_fork_evidence(dst_item, src_item);
+    _merge_notify_divergence(dst, "__merge_writer_mismatch__", dst_item->name,
+                             CRABS_ERR_PROTOCOL_VIOLATION);
+    return;
+  }
+  // A same-named item of a different shape is corrupted lineage too — and
+  // merging values across differing types would cast across incompatible
+  // structs. Hold item_a whole.
+  if (src_item->type != dst_item->type ||
+      src_item->crdt_type != dst_item->crdt_type) {
+    _merge_union_fork_evidence(dst_item, src_item);
+    _merge_notify_divergence(dst, "__merge_type_mismatch__", dst_item->name,
+                             CRABS_ERR_PROTOCOL_VIOLATION);
+    return;
+  }
+  // Quarantine evidence propagates in every branch (union-only, monotone).
+  _merge_union_fork_evidence(dst_item, src_item);
+
+  if (src_item->item_seq > dst_item->item_seq) {
+    // Accept the ahead snapshot: value plus chain-head fields.
+    void* ahead_value = crdt_merge_value(dst_item->type, dst_item->crdt_type,
+                                         NULL, src_item->value,
+                                         dst_item->name, src_item->name);
+    if (ahead_value == NULL && src_item->value != NULL) {
+      // The value deep-copy failed (unsupported CRDT type — unreachable for
+      // the v1 sovereign types COUNTER/REGISTER, but src states come from
+      // the wire). Adopting the head without the content would split content
+      // from chain: fail closed, keep item_a whole, surface it.
+      _merge_notify_divergence(dst, "__merge_held__", dst_item->name,
+                               CRABS_ERR_PROTOCOL_VIOLATION);
+      return;
+    }
+    if (ahead_value != NULL) {
+      crdt_value_destroy(dst_item->crdt_type, dst_item->value);
+      dst_item->value = ahead_value;
+    }
+    dst_item->item_seq = src_item->item_seq;
+    memcpy(dst_item->item_digest, src_item->item_digest,
+           sizeof(dst_item->item_digest));
+    return;
+  }
+  if (src_item->item_seq < dst_item->item_seq) {
+    return; // local head is ahead — keep
+  }
+  if (memcmp(dst_item->item_digest, src_item->item_digest,
+             CRABS_HASH_SIZE) == 0) {
+    return; // identical head — no-op
+  }
+  // Fork: pin quarantine on the writer; content stays item_a's.
+  if (!state_item_is_quarantined(dst_item, dst_item->writer)) {
+    uint8_t evidence_digest[CRABS_HASH_SIZE];
+    if (_merge_fork_evidence_digest(dst_item->item_digest,
+                                    src_item->item_digest,
+                                    evidence_digest) == CRABS_SUCCESS) {
+      (void)state_append_fork_evidence(dst_item, dst_item->writer,
+                                       evidence_digest);
+    }
+  }
+  _merge_notify_divergence(dst, "__merge_fork__", dst_item->name,
+                           CRABS_ERR_FORK_DETECTED);
+}
+
+// GROUP_ORDERED v1: no ordering modules ship, so there is no committed-prefix
+// log to adopt from and a module-less item is read-only under DOMAIN_CHECK.
+// ANY content divergence between two replicas is therefore unresolvable in
+// v1 — keep item_a unchanged and surface a held-divergence event. Identity is
+// proven by comparing digests of the serialized item form (content-comparable
+// across replicas). Real committed-prefix logic is future work that arrives
+// with ordering modules.
+static void _merge_group_ordered_item(state_t* dst, data_item_t* dst_item,
+                                      const data_item_t* src_item) {
+  uint8_t digest_a[CRABS_HASH_SIZE];
+  uint8_t digest_b[CRABS_HASH_SIZE];
+  crabs_error_e status_a = state_item_digest_compute(dst_item, digest_a);
+  crabs_error_e status_b = state_item_digest_compute(src_item, digest_b);
+  bool identical = (status_a == CRABS_SUCCESS && status_b == CRABS_SUCCESS &&
+                    memcmp(digest_a, digest_b, CRABS_HASH_SIZE) == 0);
+  if (!identical) {
+    // Fail closed on an undigestable item too: hold, hold, hold.
+    _merge_notify_divergence(dst, "__merge_held__", dst_item->name,
+                             CRABS_ERR_ORDERING_PATH);
+  }
+}
+
 crabs_error_e crdt_merge_state(state_t* dst, const state_t* src) {
   if (dst == NULL || src == NULL) return CRABS_ERR_INVALID_PARAM;
 
@@ -526,9 +697,33 @@ crabs_error_e crdt_merge_state(state_t* dst, const state_t* src) {
       // Deep copy the CRDT value
       new_item->value = crdt_merge_value(src_item->type, src_item->crdt_type,
                                           NULL, src_item->value, NULL, src_item->name);
-      state_add_item(dst, new_item);
+      crabs_error_e add_status = state_add_item(dst, new_item);
+      if (add_status != CRABS_SUCCESS) {
+        // state_add_item fails closed on a malformed domain declaration
+        // (write-domains v1) — hold the item out of dst, surface the
+        // rejection, then free the copy. The event borrows new_item->name
+        // only for the duration of the hook call. (data_item_destroy only
+        // frees the wrapper for counter/register types, so destroy the value
+        // first.)
+        _merge_notify_divergence(dst, "__merge_domain_mismatch__",
+                                 new_item->name, CRABS_ERR_PROTOCOL_VIOLATION);
+        if (new_item->value != NULL) {
+          crdt_value_destroy(new_item->crdt_type, new_item->value);
+          new_item->value = NULL;
+        }
+        data_item_destroy(new_item);
+      }
+    } else if (src_item->write_domain != dst_item->write_domain) {
+      // The write domain is creation-immutable: a same-named item declaring a
+      // different domain is lineage corruption. Keep item_a and surface it.
+      _merge_notify_divergence(dst, "__merge_domain_mismatch__",
+                               dst_item->name, CRABS_ERR_PROTOCOL_VIOLATION);
+    } else if (dst_item->write_domain == CRABS_DOMAIN_SOVEREIGN) {
+      _merge_sovereign_item(dst, dst_item, src_item);
+    } else if (dst_item->write_domain == CRABS_DOMAIN_GROUP_ORDERED) {
+      _merge_group_ordered_item(dst, dst_item, src_item);
     } else {
-      // Item exists in dst, merge values
+      // FREE_MERGE: Item exists in dst, merge values (A5 type merge)
       void* merged_value = crdt_merge_value(dst_item->type, dst_item->crdt_type,
                                               dst_item->value, src_item->value,
                                               dst_item->name, src_item->name);

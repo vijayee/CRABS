@@ -101,6 +101,24 @@ lww_register_t*  lww_register_merge(const lww_register_t* a, const lww_register_
 // ============================================================
 // State-level merge (12.1)
 // ============================================================
+// Merges src into dst per item, dispatched on the item's write domain
+// (write-domains v1, spec 2026-10-08 §Merge dispatch):
+//   FREE_MERGE    — existing type merge / transform (A5), unchanged.
+//   SOVEREIGN     — chain-head comparison over (item_seq, item_digest): an
+//     ahead snapshot from the same writer is accepted wholesale; a stale tail
+//     is ignored; equal seq + equal digest is a no-op; equal seq + different
+//     digest is a fork — neither side's new content applies, the fork sets
+//     union monotonically, the writer is convicted in the quarantine set, and
+//     a CRABS_CHANGE_MERGE "__merge_fork__" event (CRABS_ERR_FORK_DETECTED)
+//     fires on dst's change hook. A same-named item under a different writer
+//     is held with a "__merge_writer_mismatch__" event; a same-named item
+//     declaring a different domain is held with "__merge_domain_mismatch__".
+//   GROUP_ORDERED — v1 ships no ordering modules, so any content divergence
+//     is held (item_a kept) with a CRABS_CHANGE_MERGE "__merge_held__" event
+//     (CRABS_ERR_ORDERING_PATH); identical items are a no-op.
+// Domain divergence is NOT a merge failure: merge converges and returns
+// CRABS_SUCCESS; what was withheld surfaces on dst's change hook. Errors are
+// only the pre-existing CRABS_ERR_INVALID_PARAM / CRABS_ERR_OOM.
 crabs_error_e crdt_merge_state(state_t* dst, const state_t* src);
 
 // ============================================================
