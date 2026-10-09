@@ -28,6 +28,9 @@
 
 // Forward declaration: defined below (Policy expression parsing checks).
 static bool _lineage_policy_expression_is_valid(const char* expression);
+// Forward declaration: defined below (Blueprint validation); the
+// deserializer's SOVEREIGN writer check needs it.
+static bool _blueprint_id_field_is_safe(const char* field, size_t capacity);
 
 // ============================================================
 // Attestations: issue / verify / wire transport
@@ -402,6 +405,10 @@ static size_t _blueprint_write_body(const machine_blueprint_t* blueprint,
       (blueprint->op_type_def_count > 0 && blueprint->op_type_defs == NULL)) {
     return 0;
   }
+  // Format v2 (write-domains v1): the version byte heads the body so the
+  // deserializer can gate the layout (per-item domain fields) — pre-v2
+  // bodies were unversioned and are rejected outright.
+  out[offset++] = (uint8_t)CRABS_BLUEPRINT_FORMAT_VERSION;
   out[offset++] = (uint8_t)blueprint->trust_mode;
   if (!_lineage_string16_write(out, cap, &offset, blueprint->child_id,
                                sizeof(blueprint->child_id)) ||
@@ -423,9 +430,24 @@ static size_t _blueprint_write_body(const machine_blueprint_t* blueprint,
                                  sizeof(item->name))) {
       return 0;
     }
-    if (cap < offset + 2) return 0;
+    if (cap < offset + 3) return 0;
     out[offset++] = (uint8_t)item->type;
     out[offset++] = (uint8_t)item->crdt_type;
+    out[offset++] = (uint8_t)item->write_domain;
+    // Conditional domain payload (v2): SOVEREIGN carries its writer id;
+    // GROUP_ORDERED carries the ordering module. Fork sets are NOT in
+    // blueprints — quarantine is runtime state, serialized from v14 onward
+    // on the item itself, never declared at mint.
+    if ((uint8_t)item->write_domain == (uint8_t)CRABS_DOMAIN_SOVEREIGN) {
+      if (!_lineage_string16_write(out, cap, &offset, item->writer,
+                                   sizeof(item->writer))) {
+        return 0;
+      }
+    } else if ((uint8_t)item->write_domain ==
+               (uint8_t)CRABS_DOMAIN_GROUP_ORDERED) {
+      if (cap < offset + 1) return 0;
+      out[offset++] = item->ordering_module;
+    }
   }
 
   if (cap < offset + 4) return 0;
@@ -538,6 +560,21 @@ static bool _lineage_enum_valid_crdt_type(uint8_t raw) {
   }
 }
 
+// Write-domain whitelist (write-domains v1): the enum has exactly three
+// defined values, so anything else must be rejected before the cast — an
+// admin-signed blueprint could otherwise plant an unrecognized domain in a
+// child's state (same A10-L2 argument as the type whitelists above).
+static bool _lineage_enum_valid_write_domain(uint8_t raw) {
+  switch ((crabs_write_domain_e)raw) {
+    case CRABS_DOMAIN_FREE_MERGE:
+    case CRABS_DOMAIN_SOVEREIGN:
+    case CRABS_DOMAIN_GROUP_ORDERED:
+      return true;
+    default:
+      return false;
+  }
+}
+
 static bool _lineage_enum_valid_dedup_type(uint8_t raw) {
   switch ((dedup_type_e)raw) {
     case DEDUP_NONE:
@@ -634,18 +671,23 @@ machine_blueprint_t* blueprint_deserialize(const uint8_t* buf, size_t len) {
   uint8_t recomputed_hash[CRABS_HASH_SIZE];
 
   // The prefix must claim exactly the bytes that follow it, and the smallest
-  // possible body (trust mode + two empty strings16 + ttl + three zero
-  // counts) is 24 bytes before the hash.
+  // possible v2 body (format version + trust mode + two empty strings16 +
+  // ttl + three zero counts) is 26 bytes before the hash.
   if (!_lineage_u32le_read(buf, len, &offset, &total_len) ||
       total_len != len - 4 ||
-      total_len < 24 + CRABS_HASH_SIZE) {
+      total_len < 26 + CRABS_HASH_SIZE) {
     return NULL;
   }
   body_len = total_len - CRABS_HASH_SIZE;
 
   blueprint = get_clear_memory(sizeof(*blueprint));
-  parsed = offset + 1 <= len;
+  // Format version gate: v2 bodies lead with the version byte; pre-v2
+  // (unversioned) bodies and unknown future versions fail closed here
+  // (established posture) rather than being parsed under a layout guess.
+  parsed = offset + 2 <= len &&
+           buf[offset] == (uint8_t)CRABS_BLUEPRINT_FORMAT_VERSION;
   if (parsed) {
+    offset++;
     blueprint->trust_mode = (lineage_trust_mode_e)buf[offset++];
     parsed = blueprint->trust_mode == LINEAGE_SHARED_ROOT ||
              blueprint->trust_mode == LINEAGE_DELEGATED_COPY ||
@@ -672,18 +714,33 @@ machine_blueprint_t* blueprint_deserialize(const uint8_t* buf, size_t len) {
   for (uint32_t item_index = 0; parsed && item_index < item_count;
        item_index++) {
     blueprint_item_t* item = &blueprint->items[item_index];
-    // The two enum bytes are whitelisted BEFORE the offset advances past them
-    // or the type fields are cast/assigned — and any earlier stop on a bad
-    // byte leaves parsed=false, so the partially read blueprint is destroyed
-    // below with no partial state escaping (A10-L2).
+    // The three enum bytes are whitelisted BEFORE the offset advances past
+    // them or the type fields are cast/assigned — and any earlier stop on a
+    // bad byte leaves parsed=false, so the partially read blueprint is
+    // destroyed below with no partial state escaping (A10-L2).
     parsed = _lineage_string16_read(buf, len, &offset, item->name,
                                     sizeof(item->name)) &&
-             offset + 2 <= len &&
+             offset + 3 <= len &&
              _lineage_enum_valid_data_type(buf[offset]) &&
-             _lineage_enum_valid_crdt_type(buf[offset + 1]);
+             _lineage_enum_valid_crdt_type(buf[offset + 1]) &&
+             _lineage_enum_valid_write_domain(buf[offset + 2]);
     if (parsed) {
       item->type = (data_type_e)buf[offset++];
       item->crdt_type = (crdt_type_e)buf[offset++];
+      item->write_domain = (crabs_write_domain_e)buf[offset++];
+      // Conditional domain payload (v2). SOVEREIGN without a writer is
+      // un-spawnable (creation requires one), so the parse fails closed at
+      // LOAD rather than at spawn; the writer must also be a safe id.
+      if (item->write_domain == CRABS_DOMAIN_SOVEREIGN) {
+        parsed = _lineage_string16_read(buf, len, &offset, item->writer,
+                                        sizeof(item->writer)) &&
+                 item->writer[0] != '\0' &&
+                 _blueprint_id_field_is_safe(item->writer,
+                                             sizeof(item->writer));
+      } else if (item->write_domain == CRABS_DOMAIN_GROUP_ORDERED) {
+        parsed = offset + 1 <= len;
+        if (parsed) item->ordering_module = buf[offset++];
+      }
     }
   }
 
@@ -788,8 +845,45 @@ static crabs_error_e _blueprint_array_append(void** array_slot,
 crabs_error_e blueprint_add_item(machine_blueprint_t* blueprint,
                                  const char* name, data_type_e type,
                                  crdt_type_e crdt_type) {
+  // FREE_MERGE shorthand: same pre-v2 behavior for every legacy caller.
+  return blueprint_add_item_with_domain(blueprint, name, type, crdt_type,
+                                        CRABS_DOMAIN_FREE_MERGE, NULL, 0);
+}
+
+crabs_error_e blueprint_add_item_with_domain(
+    machine_blueprint_t* blueprint, const char* name, data_type_e type,
+    crdt_type_e crdt_type, crabs_write_domain_e write_domain,
+    const char* writer, uint8_t ordering_module) {
   if (blueprint == NULL || !attribute_machine_is_safe_user_id(name)) {
     return CRABS_ERR_INVALID_PARAM;
+  }
+  // Mirror data_item_create_with_options' domain rules (data_model.c) so
+  // authoring fails with the SAME errors lineage_blueprint_validate / spawn
+  // would return — no blueprint can be authored that the spawn pipeline
+  // would refuse later.
+  if (!_lineage_enum_valid_write_domain((uint8_t)write_domain)) {
+    return CRABS_ERR_INVALID_PARAM;
+  }
+  bool writer_set = (writer != NULL && writer[0] != '\0');
+  if (ordering_module != 0 && write_domain != CRABS_DOMAIN_GROUP_ORDERED) {
+    return CRABS_ERR_INVALID_PARAM;
+  }
+  if (write_domain == CRABS_DOMAIN_SOVEREIGN) {
+    if (!writer_set || !attribute_machine_is_safe_user_id(writer)) {
+      return CRABS_ERR_INVALID_PARAM;
+    }
+    // v1 restricts SOVEREIGN to COUNTER/REGISTER (well-defined serialized
+    // post-state for the hash-chain digest — see data_model.c).
+    if (type != DATA_TYPE_COUNTER && type != DATA_TYPE_REGISTER) {
+      return CRABS_ERR_TYPE_MISMATCH;
+    }
+  } else {
+    if (writer_set) return CRABS_ERR_INVALID_PARAM;
+    // GROUP_ORDERED v1 seam: no ordering modules are registered, so only
+    // module 0 (unset) is legal — a non-zero id could never resolve. The
+    // spawned item is read-only until a module registers (DOMAIN_CHECK
+    // fails closed with CRABS_ERR_ORDERING_PATH).
+    if (ordering_module != 0) return CRABS_ERR_INVALID_PARAM;
   }
   for (uint32_t item_index = 0; item_index < blueprint->item_count;
        item_index++) {
@@ -806,6 +900,11 @@ crabs_error_e blueprint_add_item(machine_blueprint_t* blueprint,
   strncpy(appended->name, name, sizeof(appended->name) - 1);
   appended->type = type;
   appended->crdt_type = crdt_type;
+  appended->write_domain = write_domain;
+  appended->ordering_module = ordering_module;
+  if (writer_set) {
+    strncpy(appended->writer, writer, sizeof(appended->writer) - 1);
+  }
   return CRABS_SUCCESS;
 }
 
@@ -1066,6 +1165,34 @@ crabs_error_e lineage_blueprint_validate(const machine_blueprint_t* blueprint) {
         !_lineage_enum_valid_crdt_type((uint8_t)item->crdt_type)) {
       return CRABS_ERR_INVALID_PARAM;
     }
+    // Write-domain declaration (write-domains v1): the same whitelist plus
+    // the data_item_create_with_options presence rules, mirrored for the
+    // hand-built-struct path.
+    if (!_lineage_enum_valid_write_domain((uint8_t)item->write_domain)) {
+      return CRABS_ERR_INVALID_PARAM;
+    }
+    if (item->write_domain == CRABS_DOMAIN_SOVEREIGN) {
+      // v1 rule: the writer must be a safe, non-empty registered-id-SHAPED
+      // string. Active-user enforcement happens at DOMAIN_CHECK (Task 1's
+      // deferral) — the blueprint is minted before the child registry
+      // exists, so validate can only require field safety here.
+      if (!_blueprint_id_field_is_safe(item->writer, sizeof(item->writer))) {
+        return CRABS_ERR_INVALID_PARAM;
+      }
+      if (item->ordering_module != 0) return CRABS_ERR_INVALID_PARAM;
+      // v1 restriction (mirrors data_model.c): only COUNTER/REGISTER have a
+      // well-defined serialized post-state for the sovereign hash-chain.
+      if (item->type != DATA_TYPE_COUNTER &&
+          item->type != DATA_TYPE_REGISTER) {
+        return CRABS_ERR_TYPE_MISMATCH;
+      }
+    } else {
+      if (item->writer[0] != '\0') return CRABS_ERR_INVALID_PARAM;
+      // GROUP_ORDERED v1 seam: no ordering modules exist yet, so only module
+      // 0 (unset) is legal — a non-zero id could never resolve. Non-GROUP
+      // domains carry no module at all; either way non-zero is invalid here.
+      if (item->ordering_module != 0) return CRABS_ERR_INVALID_PARAM;
+    }
     for (uint32_t earlier_index = 0; earlier_index < item_index;
          earlier_index++) {
       if (strcmp(blueprint->items[item_index].name,
@@ -1220,13 +1347,22 @@ static crabs_error_e _spawn_apply_blueprint(state_t* child_state,
   for (uint32_t item_index = 0; item_index < blueprint->item_count;
        item_index++) {
     const blueprint_item_t* item = &blueprint->items[item_index];
-    // Genesis items are valueless shells: the blueprint carries name, type,
-    // and CRDT strategy only (initial value is the empty CRDT, materialized
-    // by the first authorized mutation).
-    data_item_t* created = data_item_create(item->name, item->type,
-                                            item->crdt_type);
-    if (created == NULL) return CRABS_ERR_OOM;
-    crabs_error_e status = state_add_item(child_state, created);
+    // Genesis items are valueless shells: the initial value is the empty
+    // CRDT, materialized by the first authorized mutation. The blueprint's
+    // write-domain declaration (write-domains v1) rides the creation
+    // options through, so a SOVEREIGN item is minted with its writer (and
+    // the zeroed hash-chain head) from genesis. Validate ran before any
+    // child allocation, so a rejection here is defensive coding only — the
+    // error is propagated as-is.
+    data_item_options_t options;
+    options.write_domain = item->write_domain;
+    options.writer = item->writer[0] != '\0' ? item->writer : NULL;
+    options.ordering_module = item->ordering_module;
+    data_item_t* created = NULL;
+    crabs_error_e status = data_item_create_with_options(
+        item->name, item->type, item->crdt_type, &options, &created);
+    if (status != CRABS_SUCCESS) return status;
+    status = state_add_item(child_state, created);
     if (status != CRABS_SUCCESS) {
       data_item_destroy(created);
       return status;

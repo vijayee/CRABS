@@ -30,9 +30,9 @@
 ### Task 3: Blueprint wiring (domains are declared at mint)
 
 **Files:** `src/Lineage/lineage.{c,h}`, `test/test_lineage.cpp`.
-- [ ] `data_item_blueprint_t` gains `write_domain`/`writer`/`ordering_module`; blueprint wire version bumps; the blueprint hash-stamp naturally covers the new fields (verify the hash covers the serialized body — it does).
-- [ ] Deserialize: enum whitelists (`write_domain`) mirroring the A10-L2 pattern — before offset advance; SOVEREIGN blueprint item requires writer. `lineage_blueprint_validate` checks domain/writer legality (writer must be the spawned child's bootstrap admin or a declared user id — v1 rule: any registered id string; validate field-safety).
-- [ ] Spawn passes item options → child items carry domains. Tests: blueprint round-trip with a sovereign item; tampered domain byte (restamped hash) → rejected. Commit: `feat: blueprint-declared write domains (v1: sovereign/free; group reads-only pre-module)`.
+- [x] `data_item_blueprint_t` gains `write_domain`/`writer`/`ordering_module`; blueprint wire version bumps; the blueprint hash-stamp naturally covers the new fields (verify the hash covers the serialized body — it does). (As landed: the struct is `blueprint_item_t`; the body previously had NO version byte, so this step INTRODUCES `CRABS_BLUEPRINT_FORMAT_VERSION` = 0x02 as a leading body byte, gated exactly — pre-v2 unversioned bodies fail closed. New `blueprint_add_item_with_domain` authoring helper; `blueprint_add_item` is now a FREE_MERGE shorthand.)
+- [x] Deserialize: enum whitelists (`write_domain`) mirroring the A10-L2 pattern — before offset advance; SOVEREIGN blueprint item requires writer. `lineage_blueprint_validate` checks domain/writer legality (writer must be the spawned child's bootstrap admin or a declared user id — v1 rule: any registered id string; validate field-safety).
+- [x] Spawn passes item options → child items carry domains. Tests: blueprint round-trip with a sovereign item; tampered domain byte (restamped hash) → rejected. Commit: `feat: blueprint-declared write domains (v1: sovereign/free; group reads-only pre-module)`.
 
 ### Task 4: Sovereign op prefix + signing v4 + op v6
 

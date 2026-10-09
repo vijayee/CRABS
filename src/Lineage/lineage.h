@@ -39,8 +39,9 @@
 #define CRABS_ATTESTATION_WIRE_MAX  (4 + CRABS_ATTESTATION_BODY_MAX + CRABS_SIG_SIZE)
 
 // Canonical blueprint body cap. The worst-case body (lineage.c's
-// _blueprint_write_body) is 1 + 2*(2+63) + 8 + 4 + 64*(2+63+2) + 4 +
-// 64*(2+63+2+255) + 4 + 32*(2+63+1567) = 77271 bytes, where 1567 is the
+// _blueprint_write_body, format v2) is 1 + 1 + 2*(2+63) + 8 + 4 +
+// 64*(2+63+2+1+65) + 4 + 64*(2+63+2+255) + 4 + 32*(2+63+1567) = 81560 bytes,
+// where 65 is the worst-case SOVEREIGN writer string16 and 1567 is the
 // worst-case dedup_spec image (1 + 2*(2+127) + (2+255) + 1 + 2*(2+127) +
 // (2+63) + 2*(2+127) + 8 + (2+255) — mirroring serialization.c's
 // _serialize_dedup_spec). The wire image adds a u32le length prefix and the
@@ -48,11 +49,29 @@
 #define CRABS_BLUEPRINT_BODY_MAX  81920
 #define CRABS_BLUEPRINT_WIRE_MAX  (4 + CRABS_BLUEPRINT_BODY_MAX + CRABS_HASH_SIZE)
 
-// One blueprint data item: name + data type + CRDT strategy.
+// Blueprint wire body format version. v1 (pre-write-domains) bodies were
+// unversioned and began directly with the trust_mode byte; v2 (write-domains
+// v1) prepends this version byte to the canonical body and appends per-item
+// domain fields (u8 write_domain; SOVEREIGN → string16 writer; GROUP_ORDERED
+// → u8 ordering_module). The deserializer requires this EXACT version —
+// pre-v2 images fail closed (established posture). The hash stamp covers the
+// version byte and the new fields because it covers the whole body.
+#define CRABS_BLUEPRINT_FORMAT_VERSION 0x02
+
+// One blueprint data item: name + data type + CRDT strategy, plus its
+// write-domain declaration (write-domains v1 — domains are declared at mint).
+// write_domain defaults FREE_MERGE (0) for blueprint_add_item; SOVEREIGN (1)
+// requires `writer` (the item's single-writer user id); GROUP_ORDERED (2)
+// carries `ordering_module` — v1 ships no ordering modules, so only module 0
+// (unset) is legal and the spawned item is read-only until a module registers
+// (DOMAIN_CHECK fails closed with CRABS_ERR_ORDERING_PATH).
 typedef struct {
   char        name[CRABS_MAX_USER_ID];
   data_type_e type;
   crdt_type_e crdt_type;
+  crabs_write_domain_e write_domain;
+  char        writer[CRABS_MAX_USER_ID];  // SOVEREIGN only ("" otherwise)
+  uint8_t     ordering_module;            // GROUP_ORDERED only (0 = unset)
 } blueprint_item_t;
 
 // One blueprint policy: the op it guards + its authorization expression.
@@ -115,6 +134,23 @@ void                 machine_blueprint_destroy(machine_blueprint_t* blueprint);
 crabs_error_e blueprint_add_item(machine_blueprint_t* blueprint,
                                  const char* name, data_type_e type,
                                  crdt_type_e crdt_type);
+// blueprint_add_item with an explicit write-domain declaration (write-domains
+// v1). Same structural checks as blueprint_add_item, plus the
+// data_item_create_with_options domain rules (authoring fails early with the
+// same errors hand-built structs would hit at lineage_blueprint_validate):
+//   CRABS_ERR_INVALID_PARAM — unknown domain; SOVEREIGN without a safe,
+//     non-empty writer; writer set on a non-SOVEREIGN domain; ordering_module
+//     set on a non-GROUP_ORDERED domain; non-zero module in v1 (no ordering
+//     modules exist yet, so none can resolve — fail closed at authoring).
+//   CRABS_ERR_TYPE_MISMATCH — SOVEREIGN on a type other than
+//     DATA_TYPE_COUNTER / DATA_TYPE_REGISTER (mirrors data_model.c).
+crabs_error_e blueprint_add_item_with_domain(machine_blueprint_t* blueprint,
+                                             const char* name,
+                                             data_type_e type,
+                                             crdt_type_e crdt_type,
+                                             crabs_write_domain_e write_domain,
+                                             const char* writer,
+                                             uint8_t ordering_module);
 crabs_error_e blueprint_add_policy(machine_blueprint_t* blueprint,
                                    const char* operation,
                                    const char* expression);
@@ -136,6 +172,12 @@ crabs_error_e blueprint_add_op_type_def(machine_blueprint_t* blueprint,
 //   - item data/CRDT types and dedup spec dedup/mutation types within their
 //     enum ranges (A10-L2 — hand-built structs bypass the deserializer, so
 //     the wire whitelists run here too)
+//   - item write_domain within crabs_write_domain_e; SOVEREIGN requires a
+//     safe non-empty writer (v1 rule: any registered-id-SHAPED string —
+//     active-user enforcement happens at DOMAIN_CHECK, which can see the
+//     child state's live registry; validate only requires the field be a
+//     legal id) and a COUNTER/REGISTER type; writer empty and
+//     ordering_module zero on the domains that don't carry them
 //   - operation/op_type names non-empty and within their capacity
 crabs_error_e lineage_blueprint_validate(const machine_blueprint_t* blueprint);
 
@@ -163,8 +205,10 @@ size_t blueprint_serialize(machine_blueprint_t* blueprint,
 // Parse a wire image back into a heap blueprint (free with
 // machine_blueprint_destroy). Verifies the embedded hash over the body and
 // rejects ANY mismatch, plus structural bounds: counts within the blueprint
-// caps, and trust_mode / item / CRDT / dedup / mutation bytes whitelisted
-// against their enums (A10-L2).
+// caps, trust_mode / item / CRDT / dedup / mutation bytes whitelisted against
+// their enums (A10-L2), the body's leading format version byte exactly equal
+// to CRABS_BLUEPRINT_FORMAT_VERSION, and per-item write_domain whitelisted
+// with SOVEREIGN requiring a safe non-empty writer (write-domains v1).
 // NOTE: the hash is an integrity check recomputed at serialize time; a
 // deliberate tamperer can re-stamp it. Provenance/authenticity comes from
 // the signed __spawn_machine__ op, not from this hash.

@@ -1242,14 +1242,14 @@ TEST(TestLineage, BlueprintDeserializeRejectsHashMismatch) {
   size_t wire_len = blueprint_serialize(blueprint, wire, sizeof(wire));
   ASSERT_GT(wire_len, 0u);
 
-  // Flip a byte INSIDE the body (child_id field, offset 4 prefix + 1 mode + 2
-  // string16 length) without touching the stored hash — deserialize must
-  // reject, not silently accept a tampered body.
-  wire[7] ^= 0x01;
+  // Flip a byte INSIDE the body (child_id field, offset 4 prefix + 1 format
+  // version + 1 mode + 2 string16 length) without touching the stored hash —
+  // deserialize must reject, not silently accept a tampered body.
+  wire[8] ^= 0x01;
   EXPECT_EQ(blueprint_deserialize(wire, wire_len), nullptr);
 
   // A wire image truncated by one byte is malformed too.
-  wire[7] ^= 0x01;
+  wire[8] ^= 0x01;
   EXPECT_EQ(blueprint_deserialize(wire, wire_len - 1), nullptr);
 
   // NULL/zero-size arguments never parse.
@@ -1387,6 +1387,298 @@ TEST(TestLineage, BlueprintValidateRejectsOutOfRangeCrdtType) {
   // Sanity: the untouched fixture still validates.
   EXPECT_EQ(lineage_blueprint_validate(blueprint), CRABS_SUCCESS);
   machine_blueprint_destroy(blueprint);
+}
+
+// ============================================================
+// Blueprint-declared write domains (write-domains v1, format v2)
+// ============================================================
+
+// Round-trip: domain fields survive serialize/deserialize and the restored
+// blueprint re-serializes byte-identically (the hash covers them because it
+// covers the whole body).
+TEST(TestLineage, BlueprintWriteDomainRoundTrip) {
+  machine_blueprint_t* blueprint = make_valid_blueprint();
+  ASSERT_NE(blueprint, nullptr);
+  // The fixture's "counter" item is FREE_MERGE (blueprint_add_item defaults).
+  EXPECT_EQ(blueprint_add_item_with_domain(blueprint, "meter", DATA_TYPE_COUNTER,
+                                           CRDT_G_COUNTER,
+                                           CRABS_DOMAIN_SOVEREIGN, "alice", 0),
+            CRABS_SUCCESS);
+  EXPECT_EQ(blueprint_add_item_with_domain(blueprint, "votes", DATA_TYPE_REGISTER,
+                                           CRDT_LWW_REG,
+                                           CRABS_DOMAIN_GROUP_ORDERED, nullptr,
+                                           0),
+            CRABS_SUCCESS);
+  EXPECT_EQ(lineage_blueprint_validate(blueprint), CRABS_SUCCESS);
+
+  uint8_t wire[CRABS_BLUEPRINT_WIRE_MAX];
+  size_t wire_len = blueprint_serialize(blueprint, wire, sizeof(wire));
+  ASSERT_GT(wire_len, 0u);
+  // v2 bodies begin with the format version byte (offset 4 = the u32le length
+  // prefix, then the body).
+  EXPECT_EQ(wire[4], (uint8_t)CRABS_BLUEPRINT_FORMAT_VERSION);
+
+  machine_blueprint_t* restored = blueprint_deserialize(wire, wire_len);
+  ASSERT_NE(restored, nullptr);
+  ASSERT_EQ(restored->item_count, 3u);
+  // Free item: zero domain, no writer, no module.
+  EXPECT_EQ(restored->items[0].write_domain, CRABS_DOMAIN_FREE_MERGE);
+  EXPECT_STREQ(restored->items[0].writer, "");
+  EXPECT_EQ(restored->items[0].ordering_module, 0);
+  // Sovereign item: writer survives the wire.
+  EXPECT_EQ(restored->items[1].write_domain, CRABS_DOMAIN_SOVEREIGN);
+  EXPECT_STREQ(restored->items[1].writer, "alice");
+  // Group-ordered seam: module round-trips (v1: only 0 is legal).
+  EXPECT_EQ(restored->items[2].write_domain, CRABS_DOMAIN_GROUP_ORDERED);
+  EXPECT_EQ(restored->items[2].ordering_module, 0);
+  EXPECT_STREQ(restored->items[2].writer, "");
+
+  EXPECT_EQ(lineage_blueprint_validate(restored), CRABS_SUCCESS);
+  uint8_t wire_again[CRABS_BLUEPRINT_WIRE_MAX];
+  size_t wire_again_len = blueprint_serialize(restored, wire_again,
+                                              sizeof(wire_again));
+  ASSERT_EQ(wire_again_len, wire_len);
+  EXPECT_EQ(memcmp(wire_again, wire, wire_len), 0);
+
+  machine_blueprint_destroy(restored);
+  machine_blueprint_destroy(blueprint);
+}
+
+// The write_domain byte is whitelisted before the cast (A10-L2 pattern) —
+// hash re-stamped so ONLY the domain byte differs.
+TEST(TestLineage, BlueprintDeserializeRejectsUnknownWriteDomain) {
+  machine_blueprint_t* blueprint = make_valid_blueprint();
+  ASSERT_NE(blueprint, nullptr);
+
+  uint8_t wire[CRABS_BLUEPRINT_WIRE_MAX];
+  size_t wire_len = blueprint_serialize(blueprint, wire, sizeof(wire));
+  ASSERT_GT(wire_len, 0u);
+
+  // Item layout past the name string16: u8 type | u8 crdt_type | u8
+  // write_domain.
+  size_t item_end = blueprint_wire_find_string_end(wire, wire_len, "counter");
+  ASSERT_NE(item_end, SIZE_MAX);
+  size_t domain_offset = item_end + 2;
+  ASSERT_LT(domain_offset, wire_len);
+  ASSERT_EQ(wire[domain_offset], (uint8_t)CRABS_DOMAIN_FREE_MERGE);
+
+  wire[domain_offset] = 0xEE;  // no such crabs_write_domain_e (0x00-0x02)
+  blueprint_wire_restamp_hash(wire, wire_len);
+  EXPECT_EQ(blueprint_deserialize(wire, wire_len), nullptr);
+
+  // Domain 0x01 (SOVEREIGN) with no writer bytes following: the reader
+  // consumes the next bytes as the writer's string16 and the image no longer
+  // parses to its exact length — fail closed either way.
+  wire[domain_offset] = (uint8_t)CRABS_DOMAIN_SOVEREIGN;
+  blueprint_wire_restamp_hash(wire, wire_len);
+  EXPECT_EQ(blueprint_deserialize(wire, wire_len), nullptr);
+
+  machine_blueprint_destroy(blueprint);
+}
+
+// A SOVEREIGN blueprint item without a writer is un-spawnable (creation
+// requires one); the deserializer fails closed at parse, not later.
+TEST(TestLineage, BlueprintDeserializeRejectsSovereignWithoutWriter) {
+  machine_blueprint_t* blueprint = make_valid_blueprint();
+  ASSERT_NE(blueprint, nullptr);
+  // Bypass the append helper (which refuses this shape): set the fields on
+  // the fixture's item directly, as a hand-built struct would.
+  blueprint->items[0].write_domain = CRABS_DOMAIN_SOVEREIGN;
+
+  uint8_t wire[CRABS_BLUEPRINT_WIRE_MAX];
+  size_t wire_len = blueprint_serialize(blueprint, wire, sizeof(wire));
+  ASSERT_GT(wire_len, 0u);  // writer field serializes as an EMPTY string16
+  EXPECT_EQ(blueprint_deserialize(wire, wire_len), nullptr);
+
+  machine_blueprint_destroy(blueprint);
+}
+
+// The body's leading format version byte is gated EXACTLY: pre-v2
+// (unversioned) images and any unknown future version fail closed.
+TEST(TestLineage, BlueprintDeserializeRejectsUnknownFormatVersion) {
+  machine_blueprint_t* blueprint = make_valid_blueprint();
+  ASSERT_NE(blueprint, nullptr);
+
+  uint8_t wire[CRABS_BLUEPRINT_WIRE_MAX];
+  size_t wire_len = blueprint_serialize(blueprint, wire, sizeof(wire));
+  ASSERT_GT(wire_len, 0u);
+  ASSERT_EQ(wire[4], (uint8_t)CRABS_BLUEPRINT_FORMAT_VERSION);
+
+  wire[4] = 0x01;  // the pre-write-domains unversioned body
+  blueprint_wire_restamp_hash(wire, wire_len);
+  EXPECT_EQ(blueprint_deserialize(wire, wire_len), nullptr);
+
+  wire[4] = 0x03;  // unknown future version
+  blueprint_wire_restamp_hash(wire, wire_len);
+  EXPECT_EQ(blueprint_deserialize(wire, wire_len), nullptr);
+
+  machine_blueprint_destroy(blueprint);
+}
+
+// Struct-level validation re-checks every domain rule — a hand-built
+// blueprint never touches the deserializer (A10-L2 defense in depth).
+TEST(TestLineage, BlueprintValidateRejectsBadWriteDomain) {
+  machine_blueprint_t* blueprint = make_valid_blueprint();
+  ASSERT_NE(blueprint, nullptr);
+
+  // Out-of-range domain.
+  machine_blueprint_t* bad_domain = make_valid_blueprint();
+  ASSERT_NE(bad_domain, nullptr);
+  bad_domain->items[0].write_domain = (crabs_write_domain_e)0x07;
+  EXPECT_EQ(lineage_blueprint_validate(bad_domain), CRABS_ERR_INVALID_PARAM);
+  machine_blueprint_destroy(bad_domain);
+
+  // SOVEREIGN without a writer.
+  machine_blueprint_t* no_writer = make_valid_blueprint();
+  ASSERT_NE(no_writer, nullptr);
+  no_writer->items[0].write_domain = CRABS_DOMAIN_SOVEREIGN;
+  EXPECT_EQ(lineage_blueprint_validate(no_writer), CRABS_ERR_INVALID_PARAM);
+  machine_blueprint_destroy(no_writer);
+
+  // SOVEREIGN with an unsafe writer id (space is outside the safe charset).
+  machine_blueprint_t* unsafe_writer = make_valid_blueprint();
+  ASSERT_NE(unsafe_writer, nullptr);
+  unsafe_writer->items[0].write_domain = CRABS_DOMAIN_SOVEREIGN;
+  strncpy(unsafe_writer->items[0].writer, "al ice",
+          sizeof(unsafe_writer->items[0].writer) - 1);
+  EXPECT_EQ(lineage_blueprint_validate(unsafe_writer), CRABS_ERR_INVALID_PARAM);
+  machine_blueprint_destroy(unsafe_writer);
+
+  // SOVEREIGN on a SET: only COUNTER/REGISTER have the well-defined
+  // serialized post-state the sovereign hash-chain digest needs (v1).
+  machine_blueprint_t* bad_type = make_valid_blueprint();
+  ASSERT_NE(bad_type, nullptr);
+  bad_type->items[0].write_domain = CRABS_DOMAIN_SOVEREIGN;
+  strncpy(bad_type->items[0].writer, "alice",
+          sizeof(bad_type->items[0].writer) - 1);
+  bad_type->items[0].type = DATA_TYPE_SET;
+  bad_type->items[0].crdt_type = CRDT_OR_SET;
+  EXPECT_EQ(lineage_blueprint_validate(bad_type), CRABS_ERR_TYPE_MISMATCH);
+  machine_blueprint_destroy(bad_type);
+
+  // Writer on FREE_MERGE: the field is meaningful only for SOVEREIGN.
+  machine_blueprint_t* free_with_writer = make_valid_blueprint();
+  ASSERT_NE(free_with_writer, nullptr);
+  strncpy(free_with_writer->items[0].writer, "alice",
+          sizeof(free_with_writer->items[0].writer) - 1);
+  EXPECT_EQ(lineage_blueprint_validate(free_with_writer),
+            CRABS_ERR_INVALID_PARAM);
+  machine_blueprint_destroy(free_with_writer);
+
+  // GROUP_ORDERED with a non-zero module in v1: no ordering modules exist
+  // yet, so none can resolve — fail closed (the seam Task 5 hangs
+  // CRABS_ERR_ORDERING_PATH on for module 0).
+  machine_blueprint_t* bad_module = make_valid_blueprint();
+  ASSERT_NE(bad_module, nullptr);
+  bad_module->items[0].write_domain = CRABS_DOMAIN_GROUP_ORDERED;
+  bad_module->items[0].ordering_module = 7;
+  EXPECT_EQ(lineage_blueprint_validate(bad_module), CRABS_ERR_INVALID_PARAM);
+  machine_blueprint_destroy(bad_module);
+
+  // Sanity: the untouched fixture still validates.
+  EXPECT_EQ(lineage_blueprint_validate(blueprint), CRABS_SUCCESS);
+  machine_blueprint_destroy(blueprint);
+}
+
+// The authoring helper enforces the same rules up front (and
+// blueprint_add_item stays a FREE_MERGE shorthand).
+TEST(TestLineage, BlueprintAddItemWithDomainValidates) {
+  machine_blueprint_t* blueprint = machine_blueprint_create();
+  ASSERT_NE(blueprint, nullptr);
+  strncpy(blueprint->child_id, "child-red", sizeof(blueprint->child_id) - 1);
+  blueprint->trust_mode = LINEAGE_SHARED_ROOT;
+  strncpy(blueprint->bootstrap_admin, "parent-admin",
+          sizeof(blueprint->bootstrap_admin) - 1);
+
+  EXPECT_EQ(blueprint_add_item_with_domain(blueprint, "x", DATA_TYPE_COUNTER,
+                                           CRDT_G_COUNTER,
+                                           (crabs_write_domain_e)0x07, nullptr,
+                                           0),
+            CRABS_ERR_INVALID_PARAM);
+  EXPECT_EQ(blueprint_add_item_with_domain(blueprint, "x", DATA_TYPE_COUNTER,
+                                           CRDT_G_COUNTER,
+                                           CRABS_DOMAIN_SOVEREIGN, nullptr, 0),
+            CRABS_ERR_INVALID_PARAM);
+  EXPECT_EQ(blueprint_add_item_with_domain(blueprint, "x", DATA_TYPE_COUNTER,
+                                           CRDT_G_COUNTER,
+                                           CRABS_DOMAIN_SOVEREIGN, "", 0),
+            CRABS_ERR_INVALID_PARAM);
+  EXPECT_EQ(blueprint_add_item_with_domain(blueprint, "x", DATA_TYPE_SET,
+                                           CRDT_OR_SET, CRABS_DOMAIN_SOVEREIGN,
+                                           "alice", 0),
+            CRABS_ERR_TYPE_MISMATCH);
+  EXPECT_EQ(blueprint_add_item_with_domain(blueprint, "x", DATA_TYPE_COUNTER,
+                                           CRDT_G_COUNTER,
+                                           CRABS_DOMAIN_FREE_MERGE, "alice",
+                                           0),
+            CRABS_ERR_INVALID_PARAM);
+  EXPECT_EQ(blueprint_add_item_with_domain(blueprint, "x", DATA_TYPE_COUNTER,
+                                           CRDT_G_COUNTER,
+                                           CRABS_DOMAIN_GROUP_ORDERED, nullptr,
+                                           7),
+            CRABS_ERR_INVALID_PARAM);
+  // Nothing landed from the rejected calls.
+  EXPECT_EQ(blueprint->item_count, 0u);
+
+  EXPECT_EQ(blueprint_add_item(blueprint, "plain", DATA_TYPE_COUNTER,
+                               CRDT_G_COUNTER), CRABS_SUCCESS);
+  EXPECT_EQ(blueprint->items[0].write_domain, CRABS_DOMAIN_FREE_MERGE);
+  EXPECT_EQ(blueprint_add_item_with_domain(blueprint, "meter",
+                                           DATA_TYPE_COUNTER, CRDT_G_COUNTER,
+                                           CRABS_DOMAIN_SOVEREIGN, "alice", 0),
+            CRABS_SUCCESS);
+  EXPECT_STREQ(blueprint->items[1].writer, "alice");
+  EXPECT_EQ(blueprint->item_count, 2u);
+  machine_blueprint_destroy(blueprint);
+}
+
+// Spawn: blueprint-declared domains land on the child's data items — and the
+// validate gate rejects a bad domain struct BEFORE any child allocation.
+TEST(TestLineage, SpawnAppliesBlueprintWriteDomains) {
+  spawn_parent_harness_t harness;
+  spawn_parent_setup(&harness);
+  state_t* parent = &harness.am->base_state;
+
+  // A domain-corrupted blueprint never reaches the child: the validate gate
+  // ahead of any child allocation fails — no manifest residue, no registry
+  // entry.
+  machine_blueprint_t* bad = make_valid_blueprint();
+  ASSERT_NE(bad, nullptr);
+  bad->items[0].write_domain = CRABS_DOMAIN_SOVEREIGN;  // no writer
+  attribute_machine_t* child = nullptr;
+  EXPECT_EQ(lineage_spawn_machine(parent, bad, &child),
+            CRABS_ERR_INVALID_PARAM);
+  EXPECT_EQ(child, nullptr);
+  EXPECT_EQ(parent->child_count, 0u);
+  EXPECT_EQ(parent->resident_child_count, 0u);
+  machine_blueprint_destroy(bad);
+
+  machine_blueprint_t* blueprint = make_valid_blueprint();
+  ASSERT_NE(blueprint, nullptr);
+  ASSERT_EQ(blueprint_add_item_with_domain(blueprint, "meter",
+                                           DATA_TYPE_COUNTER, CRDT_G_COUNTER,
+                                           CRABS_DOMAIN_SOVEREIGN, "alice", 0),
+            CRABS_SUCCESS);
+  ASSERT_EQ(lineage_blueprint_validate(blueprint), CRABS_SUCCESS);
+
+  ASSERT_EQ(lineage_spawn_machine(parent, blueprint, &child), CRABS_SUCCESS);
+  ASSERT_NE(child, nullptr);
+
+  data_item_t* meter = state_find_item(&child->base_state, "meter");
+  ASSERT_NE(meter, nullptr);
+  EXPECT_EQ(state_item_domain(meter), CRABS_DOMAIN_SOVEREIGN);
+  EXPECT_STREQ(meter->writer, "alice");
+  // Pre-first-op: no sequence, zeroed digest chain head.
+  EXPECT_EQ(meter->item_seq, 0u);
+
+  data_item_t* counter = state_find_item(&child->base_state, "counter");
+  ASSERT_NE(counter, nullptr);
+  EXPECT_EQ(state_item_domain(counter), CRABS_DOMAIN_FREE_MERGE);
+  EXPECT_STREQ(counter->writer, "");
+
+  attribute_machine_destroy(child);
+  machine_blueprint_destroy(blueprint);
+  spawn_parent_destroy(&harness);
 }
 
 // A hand-built struct with count>0 but a NULL section array must be rejected
