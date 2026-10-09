@@ -3519,11 +3519,13 @@ TEST(StateSerialize, V14ChainPreimageExcludesProtocolStateAndDomainTail) {
       << "chain preimage must not move with protocol_state or domain fields";
 
   // The chain preimage differs from the durable form of an otherwise identical
-  // item by exactly one byte: the protocol_state byte.
+  // item by exactly nine bytes: the protocol_state byte (1) plus
+  // last_compaction_time (8) — both replica-local metadata excluded from the
+  // chain digest.
   serialized_buffer_t* durable_form = crabs_serialize_data_item(locked_free);
   ASSERT_NE(durable_form, nullptr);
-  EXPECT_EQ(durable_form->len, locked_form->len + 1)
-      << "chain preimage = durable form minus the protocol_state byte";
+  EXPECT_EQ(durable_form->len, locked_form->len + 9)
+      << "chain preimage = durable form minus protocol_state and compaction time";
 
   EXPECT_EQ(crabs_serialize_data_item_chain_preimage(nullptr), nullptr);
 
