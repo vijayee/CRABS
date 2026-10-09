@@ -99,6 +99,17 @@ const char* cli_protocol_state_string(protocol_state_e state) {
   }
 }
 
+// Write-domain pill words (write-domains v1): the short labels the item
+// list/info and devtools pill render — "free"/"sovereign"/"group".
+static const char* _write_domain_word(crabs_write_domain_e domain) {
+  switch (domain) {
+    case CRABS_DOMAIN_FREE_MERGE:    return "free";
+    case CRABS_DOMAIN_SOVEREIGN:     return "sovereign";
+    case CRABS_DOMAIN_GROUP_ORDERED: return "group";
+    default:                         return "unknown";
+  }
+}
+
 // ============================================================
 // Node Lifecycle
 // ============================================================
@@ -1079,6 +1090,33 @@ cli_result_e cli_cmd_item_list(cli_node_t* node) {
   return cli_cmd_state_items(node);
 }
 
+// Write-domains v1 surface: per-item domain inspection. Prints the domain
+// pill word, the declared writer (SOVEREIGN), the chain sequence head, the
+// ordering module id (GROUP_ORDERED), and the quarantined-writer list the
+// item has accumulated from equivocation reports.
+cli_result_e cli_cmd_item_info(cli_node_t* node, const char* name) {
+  if (node == NULL || !node->initialized) return CLI_ERR_NOT_INIT;
+  if (name == NULL) return CLI_ERR_ARGS;
+
+  data_item_t* item = state_find_item(&node->attr_machine->base_state, name);
+  if (item == NULL) {
+    printf("Error: no data item named '%s'.\n", name);
+    return CLI_ERR_EXEC;
+  }
+
+  printf("Data item '%s'\n", item->name);
+  printf("  domain:          %s\n", _write_domain_word(item->write_domain));
+  printf("  writer:          %s\n",
+         item->writer[0] != '\0' ? item->writer : "(none)");
+  printf("  item_seq:        %llu\n", (unsigned long long)item->item_seq);
+  printf("  ordering_module: %u\n", (unsigned)item->ordering_module);
+  printf("  forks:           %u\n", item->fork_count);
+  for (uint32_t fork_index = 0; fork_index < item->fork_count; fork_index++) {
+    printf("    quarantined:   %s\n", item->fork_writers[fork_index]);
+  }
+  return CLI_OK;
+}
+
 // ============================================================
 // Policy Management
 // ============================================================
@@ -1643,7 +1681,10 @@ static cli_result_e _machine_blueprint_require_draft(cli_node_t* node) {
 static cli_result_e _machine_blueprint_cmd_item(cli_node_t* node,
                                                 const char* name,
                                                 const char* data_type_word,
-                                                const char* crdt_type_word) {
+                                                const char* crdt_type_word,
+                                                const char* domain_word,
+                                                const char* writer_word,
+                                                const char* module_word) {
   cli_result_e draft_result = _machine_blueprint_require_draft(node);
   if (draft_result != CLI_OK) return draft_result;
   if (name == NULL || data_type_word == NULL || crdt_type_word == NULL) {
@@ -1655,14 +1696,73 @@ static cli_result_e _machine_blueprint_cmd_item(cli_node_t* node,
   data_type_e data_type = _parse_data_type(data_type_word);
   crdt_type_e crdt_type = _parse_crdt_type(crdt_type_word);
 
-  crabs_error_e err = blueprint_add_item(node->blueprint_draft, name,
-                                         data_type, crdt_type);
+  // Write-domain declaration (write-domains v1): omitting the domain word
+  // reproduces blueprint_add_item (FREE_MERGE, no writer) exactly. The
+  // writer slot takes "-" for none; the module slot is decimal, 0 = unset
+  // (the only legal value — v1 ships no ordering modules).
+  if (domain_word == NULL || strcmp(domain_word, "free") == 0) {
+    if (writer_word != NULL && strcmp(writer_word, "-") != 0) {
+      printf("Error: writer requires the sovereign domain.\n");
+      return CLI_ERR_ARGS;
+    }
+    crabs_error_e err = blueprint_add_item(node->blueprint_draft, name,
+                                           data_type, crdt_type);
+    if (err != CRABS_SUCCESS) {
+      printf("Error: %s\n", cli_error_string(err));
+      return CLI_ERR_EXEC;
+    }
+    printf("Blueprint item '%s' added (type 0x%02x, crdt 0x%02x, free).\n",
+           name, data_type, crdt_type);
+    return CLI_OK;
+  }
+
+  crabs_write_domain_e write_domain;
+  if (strcmp(domain_word, "sovereign") == 0) {
+    write_domain = CRABS_DOMAIN_SOVEREIGN;
+  } else if (strcmp(domain_word, "group") == 0) {
+    write_domain = CRABS_DOMAIN_GROUP_ORDERED;
+  } else {
+    printf("Error: unknown domain '%s' (free|sovereign|group).\n",
+           domain_word);
+    return CLI_ERR_ARGS;
+  }
+  const char* writer = NULL;
+  if (writer_word != NULL && strcmp(writer_word, "-") != 0) {
+    writer = writer_word;
+  }
+  if (write_domain == CRABS_DOMAIN_SOVEREIGN && writer == NULL) {
+    printf("Error: sovereign domain requires a <writer> (the item's "
+           "single-writer user id).\n");
+    return CLI_ERR_ARGS;
+  }
+  uint8_t ordering_module = 0;
+  if (module_word != NULL) {
+    char* parse_end = NULL;
+    unsigned long parsed = strtoul(module_word, &parse_end, 10);
+    if (parse_end == module_word || *parse_end != '\0' || parsed > 255) {
+      printf("Error: ordering module must be a number 0..255 ('-' or omit "
+             "for unset).\n");
+      return CLI_ERR_ARGS;
+    }
+    ordering_module = (uint8_t)parsed;
+  } else if (write_domain == CRABS_DOMAIN_GROUP_ORDERED) {
+    // A domain word alone cannot declare a group item ambiguously — the
+    // module slot must be explicit (even though only 0 is legal in v1).
+    printf("Error: group domain requires the <module> argument "
+           "(0 = unset; v1 ships no ordering modules).\n");
+    return CLI_ERR_ARGS;
+  }
+
+  crabs_error_e err = blueprint_add_item_with_domain(node->blueprint_draft,
+                                                     name, data_type,
+                                                     crdt_type, write_domain,
+                                                     writer, ordering_module);
   if (err != CRABS_SUCCESS) {
     printf("Error: %s\n", cli_error_string(err));
     return CLI_ERR_EXEC;
   }
-  printf("Blueprint item '%s' added (type 0x%02x, crdt 0x%02x).\n",
-         name, data_type, crdt_type);
+  printf("Blueprint item '%s' added (type 0x%02x, crdt 0x%02x, %s).\n",
+         name, data_type, crdt_type, _write_domain_word(write_domain));
   return CLI_OK;
 }
 
@@ -2248,6 +2348,7 @@ static void _print_user_usage(void) {
 static void _print_item_usage(void) {
   printf("  item add <name> <type>   Add a data item (counter|pn_counter|set|2p_set|register|document|resource|one_shot_set|one_shot_flag)\n");
   printf("  item list                 List data items\n");
+  printf("  item info <name>          Show an item's write domain (free|sovereign|group), writer, chain seq, module, forks\n");
 }
 
 static void _print_policy_usage(void) {
@@ -2281,7 +2382,8 @@ static void _print_op_usage(void) {
 static void _print_machine_usage(void) {
   printf("  machine blueprint new <child_id> <shared|delegated|sovereign> <bootstrap_admin> <attestation_ttl_ms>\n");
   printf("                                       Open a machine blueprint draft on this node\n");
-  printf("  machine blueprint item <name> <data_type> <crdt_type>  Append a data item to the draft\n");
+  printf("  machine blueprint item <name> <data_type> <crdt_type> [free|sovereign|group] [writer|-] [module]\n");
+  printf("                                       Append a data item (write domain declared at mint; '-' = no writer)\n");
   printf("  machine blueprint policy <operation> <expression>      Append an authorization policy\n");
   printf("  machine blueprint dedup <op_type> <dedup_type> [tracker_path|flag_path|condition] [rejection_message]\n");
   printf("                                       Append an operation type definition\n");
@@ -2318,11 +2420,15 @@ static cli_result_e _dispatch_machine_blueprint(cli_node_t* node, int argc,
                                       argv[7]);
   }
   if (strcmp(sub, "item") == 0) {
-    if (argc < 7) {
-      printf("Usage: machine blueprint item <name> <data_type> <crdt_type>\n");
+    if (argc < 7 || argc > 10) {
+      printf("Usage: machine blueprint item <name> <data_type> <crdt_type> "
+             "[free|sovereign|group] [writer|-] [module]\n");
       return CLI_ERR_ARGS;
     }
-    return _machine_blueprint_cmd_item(node, argv[4], argv[5], argv[6]);
+    return _machine_blueprint_cmd_item(node, argv[4], argv[5], argv[6],
+                                       argc > 7 ? argv[7] : NULL,
+                                       argc > 8 ? argv[8] : NULL,
+                                       argc > 9 ? argv[9] : NULL);
   }
   if (strcmp(sub, "policy") == 0) {
     if (argc < 6) {
@@ -2666,6 +2772,13 @@ cli_result_e cli_dispatch(cli_node_t* node, int argc, char** argv) {
       return cli_cmd_item_add(node, argv[3], argv[4]);
     }
     if (strcmp(sub, "list") == 0) return cli_cmd_item_list(node);
+    if (strcmp(sub, "info") == 0) {
+      if (argc < 4) {
+        printf("Usage: item info <name>\n");
+        return CLI_ERR_ARGS;
+      }
+      return cli_cmd_item_info(node, argv[3]);
+    }
     printf("Unknown item subcommand: %s\n", sub);
     _print_item_usage();
     return CLI_ERR_ARGS;

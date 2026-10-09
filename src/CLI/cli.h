@@ -164,6 +164,9 @@ cli_result_e cli_cmd_user_suspend(cli_node_t* node, const char* user_id);
 cli_result_e cli_cmd_item_add(cli_node_t* node, const char* name,
                                 const char* type_str);
 cli_result_e cli_cmd_item_list(cli_node_t* node);
+// Write-domains v1: domain pill word, writer, chain seq, ordering module,
+// and quarantined writers for one item.
+cli_result_e cli_cmd_item_info(cli_node_t* node, const char* name);
 
 // ============================================================
 // Policy Management

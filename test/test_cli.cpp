@@ -1655,6 +1655,195 @@ TEST(TestCliDurability, MachineBlueprintDropAndReplace) {
 }
 
 // ============================================================
+// Write domains (v1) — CLI surfaces: 'item info' domain inspection and
+// 'machine blueprint item' domain authoring.
+// ============================================================
+
+// Capture one command's stdout to a string (the attest test's redirect
+// idiom, lifted into a helper so the info assertions stay readable).
+static bool test_capture_dispatch_stdout(cli_node_t* node, int argc,
+                                         char** argv, cli_result_e* out_result,
+                                         std::string* out_text,
+                                         const char* capture_path) {
+  FILE* captured_stream = fopen(capture_path, "w");
+  if (captured_stream == nullptr) return false;
+  FILE* saved_stdout = stdout;
+  stdout = captured_stream;
+  *out_result = cli_dispatch(node, argc, argv);
+  fflush(captured_stream);
+  fclose(captured_stream);
+  stdout = saved_stdout;
+  std::vector<uint8_t> captured_bytes;
+  if (!test_read_file_bytes(capture_path, captured_bytes)) return false;
+  out_text->assign(captured_bytes.begin(), captured_bytes.end());
+  return true;
+}
+
+TEST(TestCliWriteDomains, ItemInfoPrintsDomainFields) {
+  cli_node_t* node = cli_node_create();
+  ASSERT_EQ(cli_node_init(node, "admin"), CLI_OK);
+  state_t* state = &node->attr_machine->base_state;
+
+  // A plain free-merge counter through the normal 'item add' path.
+  char* add_argv[] = {(char*)"crabs_node", (char*)"item", (char*)"add",
+                      (char*)"views", (char*)"counter"};
+  ASSERT_EQ(cli_dispatch(node, 5, add_argv), CLI_OK);
+
+  // The CLI's only domain-authoring surface is the machine blueprint; a
+  // sovereign item on the live node is declared directly at the data-model
+  // layer (as the spawn path does) so 'item info' has a non-default row.
+  data_item_options_t options;
+  memset(&options, 0, sizeof(options));
+  options.write_domain = CRABS_DOMAIN_SOVEREIGN;
+  options.writer = (char*)"alice";
+  data_item_t* sovereign = nullptr;
+  ASSERT_EQ(data_item_create_with_options("score", DATA_TYPE_COUNTER,
+                                          CRDT_G_COUNTER, &options,
+                                          &sovereign),
+            CRABS_SUCCESS);
+  ASSERT_EQ(state_add_item(state, sovereign), CRABS_SUCCESS);
+  uint8_t evidence[CRABS_HASH_SIZE];
+  memset(evidence, 0xAA, sizeof(evidence));
+  ASSERT_EQ(state_append_fork_evidence(sovereign, "mallory", evidence),
+            CRABS_SUCCESS);
+
+  const char* capture_path = "/tmp/crabs-item-info-captured.log";
+  cli_result_e info_result = CLI_ERR_ARGS;
+  std::string info_text;
+  char* info_argv[] = {(char*)"crabs_node", (char*)"item", (char*)"info",
+                       (char*)"score"};
+  ASSERT_TRUE(test_capture_dispatch_stdout(node, 4, info_argv, &info_result,
+                                           &info_text, capture_path));
+  EXPECT_EQ(info_result, CLI_OK);
+  EXPECT_NE(info_text.find("sovereign"), std::string::npos);
+  EXPECT_NE(info_text.find("alice"), std::string::npos);
+  EXPECT_NE(info_text.find("item_seq"), std::string::npos);
+  EXPECT_NE(info_text.find("mallory"), std::string::npos)
+      << "quarantined writers should be listed";
+
+  // The free-merge item prints its zero-default row: free pill, no writer,
+  // no forks.
+  cli_result_e free_result = CLI_ERR_ARGS;
+  std::string free_text;
+  char* free_argv[] = {(char*)"crabs_node", (char*)"item", (char*)"info",
+                       (char*)"views"};
+  ASSERT_TRUE(test_capture_dispatch_stdout(node, 4, free_argv, &free_result,
+                                           &free_text, capture_path));
+  EXPECT_EQ(free_result, CLI_OK);
+  EXPECT_NE(free_text.find("free"), std::string::npos);
+  EXPECT_NE(free_text.find("(none)"), std::string::npos);
+  EXPECT_NE(free_text.find("forks:           0"), std::string::npos);
+  EXPECT_EQ(free_text.find("quarantined"), std::string::npos);
+
+  // Unknown item is an execution failure; a missing name is an argument
+  // error.
+  char* ghost_argv[] = {(char*)"crabs_node", (char*)"item", (char*)"info",
+                        (char*)"ghost"};
+  EXPECT_EQ(cli_dispatch(node, 4, ghost_argv), CLI_ERR_EXEC);
+  char* short_argv[] = {(char*)"crabs_node", (char*)"item", (char*)"info"};
+  EXPECT_EQ(cli_dispatch(node, 3, short_argv), CLI_ERR_ARGS);
+
+  remove(capture_path);
+  cli_node_destroy(node);
+}
+
+// Blueprint authoring accepts the write-domain fields and the spawned
+// child's item carries the declared domain (round-trip through the wire
+// format + spawn path).
+TEST(TestCliWriteDomains, BlueprintDomainItemSurvivesSpawn) {
+  cli_node_t* author = cli_node_create();
+  ASSERT_EQ(cli_node_init(author, "admin"), CLI_OK);
+  lineage_install(&author->attr_machine->base_state);
+
+  char* new_argv[] = {(char*)"crabs_node", (char*)"machine",
+                      (char*)"blueprint", (char*)"new", (char*)"child-dom",
+                      (char*)"delegated", (char*)"child-admin",
+                      (char*)"3600000"};
+  ASSERT_EQ(cli_dispatch(author, 8, new_argv), CLI_OK);
+
+  // Sovereign item with an explicit writer.
+  char* sov_argv[] = {(char*)"crabs_node", (char*)"machine",
+                      (char*)"blueprint", (char*)"item", (char*)"score",
+                      (char*)"counter", (char*)"g_counter",
+                      (char*)"sovereign", (char*)"alice"};
+  ASSERT_EQ(cli_dispatch(author, 9, sov_argv), CLI_OK);
+  ASSERT_EQ(author->blueprint_draft->item_count, 1u);
+  EXPECT_EQ(author->blueprint_draft->items[0].write_domain,
+            CRABS_DOMAIN_SOVEREIGN);
+  EXPECT_STREQ(author->blueprint_draft->items[0].writer, "alice");
+
+  // The bare form is unchanged: FREE_MERGE, no writer, module unset.
+  char* free_argv[] = {(char*)"crabs_node", (char*)"machine",
+                       (char*)"blueprint", (char*)"item", (char*)"views",
+                       (char*)"counter", (char*)"g_counter"};
+  ASSERT_EQ(cli_dispatch(author, 7, free_argv), CLI_OK);
+  ASSERT_EQ(author->blueprint_draft->item_count, 2u);
+  EXPECT_EQ(author->blueprint_draft->items[1].write_domain,
+            CRABS_DOMAIN_FREE_MERGE);
+  EXPECT_EQ(author->blueprint_draft->items[1].writer[0], '\0');
+
+  // Sovereign without a writer is an argument error (not a latent draft
+  // that only fails at save).
+  char* no_writer_argv[] = {(char*)"crabs_node", (char*)"machine",
+                            (char*)"blueprint", (char*)"item",
+                            (char*)"orphan", (char*)"counter",
+                            (char*)"g_counter", (char*)"sovereign"};
+  EXPECT_EQ(cli_dispatch(author, 8, no_writer_argv), CLI_ERR_ARGS);
+
+  // A writer on a non-sovereign item is an argument error too.
+  char* free_writer_argv[] = {(char*)"crabs_node", (char*)"machine",
+                              (char*)"blueprint", (char*)"item",
+                              (char*)"mixed", (char*)"counter",
+                              (char*)"g_counter", (char*)"free",
+                              (char*)"alice"};
+  EXPECT_EQ(cli_dispatch(author, 9, free_writer_argv), CLI_ERR_ARGS);
+
+  // Group domain requires the explicit module slot (only 0 is legal in v1);
+  // a non-zero module fails closed at authoring.
+  char* group_argv[] = {(char*)"crabs_node", (char*)"machine",
+                        (char*)"blueprint", (char*)"item", (char*)"grouped",
+                        (char*)"counter", (char*)"g_counter",
+                        (char*)"group", (char*)"-", (char*)"0"};
+  EXPECT_EQ(cli_dispatch(author, 10, group_argv), CLI_OK);
+  EXPECT_EQ(author->blueprint_draft->items[2].write_domain,
+            CRABS_DOMAIN_GROUP_ORDERED);
+  char* group_bad_argv[] = {(char*)"crabs_node", (char*)"machine",
+                            (char*)"blueprint", (char*)"item",
+                            (char*)"grouped2", (char*)"counter",
+                            (char*)"g_counter", (char*)"group", (char*)"-",
+                            (char*)"7"};
+  EXPECT_EQ(cli_dispatch(author, 10, group_bad_argv), CLI_ERR_EXEC);
+
+  char* save_argv[] = {(char*)"crabs_node", (char*)"machine",
+                       (char*)"blueprint", (char*)"save",
+                       (char*)"/tmp/crabs-bp-domains.cbp"};
+  ASSERT_EQ(cli_dispatch(author, 5, save_argv), CLI_OK);
+
+  // Spawn: the child's items carry the declared domains.
+  state_t* parent = &author->attr_machine->base_state;
+  char* spawn_argv[] = {(char*)"crabs_node", (char*)"machine",
+                        (char*)"spawn", (char*)"/tmp/crabs-bp-domains.cbp"};
+  ASSERT_EQ(cli_dispatch(author, 4, spawn_argv), CLI_OK);
+  attribute_machine_t* child = lineage_query_resident_child(parent,
+                                                            "child-dom");
+  ASSERT_NE(child, nullptr);
+  data_item_t* child_score = state_find_item(&child->base_state, "score");
+  ASSERT_NE(child_score, nullptr);
+  EXPECT_EQ(child_score->write_domain, CRABS_DOMAIN_SOVEREIGN);
+  EXPECT_STREQ(child_score->writer, "alice");
+  data_item_t* child_views = state_find_item(&child->base_state, "views");
+  ASSERT_NE(child_views, nullptr);
+  EXPECT_EQ(child_views->write_domain, CRABS_DOMAIN_FREE_MERGE);
+  data_item_t* child_grouped = state_find_item(&child->base_state, "grouped");
+  ASSERT_NE(child_grouped, nullptr);
+  EXPECT_EQ(child_grouped->write_domain, CRABS_DOMAIN_GROUP_ORDERED);
+  EXPECT_EQ(child_grouped->ordering_module, 0u);
+
+  remove("/tmp/crabs-bp-domains.cbp");
+  cli_node_destroy(author);
+}
+
+// ============================================================
 // Machine lifecycle (lineage v1.7): spawn / children / dissolve /
 // withdraw / revoke-attestation — every mutating command goes through the
 // operation pipeline ("__spawn_machine__", "__dissolve_machine__", ...)
