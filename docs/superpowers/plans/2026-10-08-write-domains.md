@@ -61,9 +61,9 @@
 
 ### Task 7: crdt_merge domain dispatch
 
-**Files:** `src/CRDT/crdt_merge.c`, `test/test_crdt_merge.cpp` (find the right test file name).
-- [ ] Per-item dispatch before type merge: FREE_MERGE → unchanged; SOVEREIGN → chains continue cleanly (item_b ahead, same writer) → accept item_b; chain fork (same seq, different digest) → do NOT apply, monotone-union the fork sets, surface a change event; GROUP_ORDERED (v1, no modules) → keep local item_a, emit a held-divergence change event (module-less prefix logic is future work — document in the function).
-- [ ] Tests per branch. Commit: `feat: domain-aware crdt_merge dispatch (sovereign chain accept/fork; group holds)`.
+**Files:** `src/CRDT/crdt_merge.c` (+`.h`), `test/test_crdt.cpp` (the merge tests live there, not a separate file).
+- [x] Per-item dispatch before type merge: FREE_MERGE → unchanged; SOVEREIGN → chains continue cleanly (item_b ahead, same writer) → accept item_b; chain fork (same seq, different digest) → do NOT apply, monotone-union the fork sets, surface a change event; GROUP_ORDERED (v1, no modules) → keep local item_a, emit a held-divergence change event (module-less prefix logic is future work — document in the function). As landed: divergence is not a merge failure — merge returns CRABS_SUCCESS and surfaces withheld content via a new additive CRABS_CHANGE_MERGE kind (0x07) on dst's change hook (`__merge_fork__` / `__merge_held__` / `__merge_writer_mismatch__` / `__merge_type_mismatch__` / `__merge_domain_mismatch__`, result carries FORK_DETECTED / ORDERING_PATH / PROTOCOL_VIOLATION); fork conviction uses a content-derived evidence digest (SHA-256 over min‖max of the two chain-head digests) so it is replica-deterministic and dedupes via state_append_fork_evidence. Carried Task-1 fix landed with it: `_data_item_deep_copy` propagates all domain fields + full inline fork storage (no silent FREE_MERGE downgrade), and the new-item path now checks state_add_item's fail-closed result instead of leaking.
+- [x] Tests per branch (deep-copy propagation; accept-ahead; keep-local; identical no-op; fork union without overwrite + idempotent re-merge; writer mismatch; type mismatch; undigestable-value hold; group hold + identical no-op) — ctest 1669/1669. Commit: `feat: domain-aware crdt_merge dispatch + deep-copy domain propagation` (5652d8f).
 
 ### Task 8: Surfaces — CLI, bindings, devtools, docs
 
