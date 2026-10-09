@@ -62,6 +62,23 @@ index.js            ←  High-level JavaScript API (this package)
 
 The `.wasm` binary is platform-agnostic — the same file runs everywhere.
 
+## Wrapper/WASM compatibility
+
+`crabs.wasm`/`crabs.js` and the wrapper (`bindings-core.js` re-exported by
+`index.js`) are regenerated TOGETHER by `build_wasm.sh` on every wire-relevant
+change — always use files from the same release; they expose no mixed-version
+mode. Your client can check what it is wired against at runtime:
+
+```js
+await wireVersions()   // { state, op, signing } — mirror of the C library's live values
+```
+
+A server/client pair built from the same commit always matches. If you maintain
+any hand-written wrapper (e.g. a TS port), its generation is pinned to the
+`crabs.js`/`crabs.wasm` files it was written against — re-verify after every
+wasm upgrade (the shipped wrapper is the single source of truth; a
+generated-TS wrapper is planned future work, not shipped).
+
 ## API
 
 The API mirrors `crabs-node` (the N-API bindings). See `../node/index.d.ts` for the full type definitions. Key classes:
