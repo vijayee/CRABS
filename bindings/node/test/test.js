@@ -424,6 +424,33 @@ domainNode.sign(writerOp, aliceDomKey);
 const opAWire = writerOp.serialize();
 domainNode.execute(writerOp);
 
+// The writer's SECOND op must claim the live chain head; itemChainHead is
+// the binding-side read for it. seq advances to 2 on accept.
+const headAfterFirst = domainNode.itemChainHead('score');
+assert(headAfterFirst.seq === 1,
+  'head seq should advance to 1 after the first accepted write');
+assert(/^[0-9a-f]{64}$/.test(headAfterFirst.digestHex),
+  'head digest should be a full 32-byte hex string');
+assert(headAfterFirst.digestHex !== ZERO_DIGEST,
+  'head digest should be recomputed after the first op');
+try {
+  domainNode.itemChainHead('ghost');
+  assert(false, 'itemChainHead on an unknown item should throw');
+} catch (unknownItem) {
+  assert(unknownItem.message.includes('resource_not_found'),
+    'unknown-item head read should be typed resource_not_found, got: ' +
+    unknownItem.message);
+}
+const secondWriterOp = new Operation('bump');
+secondWriterOp.signerId = 'alice';
+secondWriterOp.addResource('score');
+secondWriterOp.setSovereignPrefix(0, headAfterFirst.seq,
+                                  headAfterFirst.digestHex);
+domainNode.sign(secondWriterOp, aliceDomKey);
+domainNode.execute(secondWriterOp);
+assert(domainNode.itemChainHead('score').seq === 2,
+  'head seq should advance to 2 after the second accepted write');
+
 // A non-writer op on the sovereign item is rejected with not_item_writer
 // even though mallory holds the authorizing role.
 const rogueOp = new Operation('bump');

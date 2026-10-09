@@ -194,6 +194,14 @@ export interface Node {
   defineItem(name: string, dataType: string | number,
              crdtType: string | number, options?: DefineItemOptions): void;
   /**
+   * Write-domains v1: the live chain head of a SOVEREIGN item — what the
+   * writer's next op must claim in its signed prefix. digestHex is the
+   * FULL 32-byte digest as 64 hex chars (the devtools snapshot's
+   * item_digest_head is only the first 8 bytes). Throws resource_not_found
+   * for an unknown item.
+   */
+  itemChainHead(name: string): { seq: number; digestHex: string };
+  /**
    * Write-domains v1: file a __report_equivocation__ op against the
    * SOVEREIGN item `itemName`, carrying two serialized writer ops as the
    * evidence pair. Signed by this node's admin with the node key; failures

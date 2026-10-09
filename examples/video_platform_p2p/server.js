@@ -36,10 +36,14 @@ const MIME = {
 // ============================================================
 const node = new Node('admin', { ordering: 'hlc' });
 
-// Demo moderator account used for the ABE contact gate.
+// Demo moderator account used for the ABE contact gate. R7-08: privileged
+// attribute names (role/member/…) can't be minted via registerUser — they
+// come from the admin grantRole path instead.
 const modKey = KeyPair.fromPrivateHex(DEMO_KEYS.mod1);
 const mod1UserId = modKey.publicKeyHex().slice(0, 32);
-node.registerUser(mod1UserId, modKey.publicKeyHex(), 'role:member|clearance:moderator|adult');
+node.registerUser(mod1UserId, modKey.publicKeyHex(), 'adult');
+node.grantRole(mod1UserId, 'role', 'member', 'admin');
+node.grantRole(mod1UserId, 'clearance', 'moderator', 'admin');
 
 node.addCounter('flag_count');
 node.addOneShotSet('flaggers');
@@ -66,14 +70,17 @@ const nodeKey = node.getNodeKey();
 const encryptedContact = node.encrypt(Buffer.from(CONTACT_INFO), 'tos_investigator');
 console.log('ABE contact info encrypted');
 
-// Trigger evaluation only runs inside state_machine_execute. We use a signed
-// admin "noop" operation as a safe way to re-evaluate triggers after direct
-// state changes such as flag_event handling.
+// Trigger evaluation only runs inside state_machine_execute. A signed admin
+// "noop" operation re-evaluates triggers after direct state changes such as
+// flag_event handling. The op carries a free-merge resource so it takes the
+// wildcard success path — a handler-less, resource-less op is the executor's
+// "declared-but-unimplemented" case and fails closed (resource_not_found).
 function evaluateTriggers() {
   try {
     const op = new Operation('noop');
     op.signerId = 'admin';
     op.nodeId = 'admin';
+    op.addResource('flaggers');
     node.sign(op, nodeKey.privateKeyHex);
     node.execute(op);
   } catch (e) {
@@ -160,10 +167,9 @@ wss.on('connection', ws => {
 
     // Keep the server state in sync so the ABE gate can check attributes.
     if (msg.type === 'register_user') {
-      const attrs = ['role:member'];
-      if (msg.age >= 13) attrs.push('adult');
       try {
-        node.registerUser(msg.userId, msg.publicKeyHex, attrs.join('|'));
+        node.registerUser(msg.userId, msg.publicKeyHex, msg.age >= 13 ? 'adult' : '');
+        node.grantRole(msg.userId, 'role', 'member', 'admin');
       } catch (e) {
         // User may already be registered (e.g., duplicate broadcast).
       }

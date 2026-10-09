@@ -795,6 +795,7 @@ public:
       InstanceMethod("getNodeKey", &Node::GetNodeKey),
       InstanceMethod("addCounter", &Node::AddCounter),
       InstanceMethod("defineItem", &Node::DefineItem),
+      InstanceMethod("itemChainHead", &Node::ItemChainHead),
       InstanceMethod("reportEquivocation", &Node::ReportEquivocation),
       InstanceMethod("addPNCounter", &Node::AddPNCounter),
       InstanceMethod("addORSet", &Node::AddORSet),
@@ -1277,6 +1278,30 @@ private:
       throw crabs_error(env, rc, "defineItem");
     }
     return env.Undefined();
+  }
+
+  // Write-domains v1: the live chain head (item_seq + FULL 32-byte
+  // item_digest as hex) of item `name` — what a SOVEREIGN writer's next op
+  // must claim in its signed prefix (DOMAIN_CHECK compares both). Throws
+  // resource_not_found for an unknown item.
+  Napi::Value ItemChainHead(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 1 || !info[0].IsString())
+      throw Napi::TypeError::New(env, "Expected itemChainHead(name)");
+    std::string name = require_js_string(info[0], "itemChainHead", "name");
+    data_item_t* item = state_find_item(&am_->base_state, name.c_str());
+    if (!item)
+      throw crabs_error(env, CRABS_ERR_RESOURCE_NOT_FOUND, "itemChainHead");
+    char digest_hex[CRABS_HASH_SIZE * 2 + 1];
+    for (uint32_t byte_index = 0; byte_index < CRABS_HASH_SIZE; byte_index++) {
+      snprintf(digest_hex + byte_index * 2, 3, "%02x",
+               item->item_digest[byte_index]);
+    }
+    digest_hex[CRABS_HASH_SIZE * 2] = '\0';
+    Napi::Object head = Napi::Object::New(env);
+    head.Set("seq", Napi::Number::New(env, (double)item->item_seq));
+    head.Set("digestHex", Napi::String::New(env, digest_hex));
+    return head;
   }
 
   // Write-domains v1: file a __report_equivocation__ op against the
@@ -1799,6 +1824,21 @@ private:
     op->payload_size = (uint32_t)strlen(payload) + 1;
     strncpy(op->signer_id, "admin", CRABS_MAX_USER_ID - 1);
     strncpy(op->node_id, "admin", CRABS_MAX_USER_ID - 1);
+
+    // Stamp BEFORE signing so the signature covers them (mirrors SignOp):
+    // HLC when the machine runs HLC ordering, and the signer's current
+    // key_version — execute()'s mandatory staleness gate (R7-04) rejects
+    // ops declaring a rotated-out (or unstamped) version with key_stale.
+    if (am_->base_state.hlc_state_initialized) {
+      op->ordering_system = CRABS_ORDERING_HLC;
+      op->hlc = crabs_hlc_next(&am_->base_state.hlc_state);
+      strncpy(op->node_id, am_->base_state.hlc_state.last.node_id,
+              CRABS_MAX_USER_ID - 1);
+    }
+    user_t* signer_user = attribute_machine_find_user(am_, op->signer_id);
+    if (signer_user != NULL) {
+      op->signer_key_version = signer_user->key_version;
+    }
 
     // Sign with node key — adopted child wrappers carry no own key (A10-M3).
     if (node_key_ == nullptr) {

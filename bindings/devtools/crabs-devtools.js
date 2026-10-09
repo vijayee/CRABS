@@ -321,13 +321,14 @@
       const row = document.createElement('div');
       row.className = 'tree-row';
       row.style.paddingLeft = (depth * 14) + 'px';
-      // Item rows (items.<index>): the C snapshot emits additive
-      // write-domain fields (domain/writer/item_seq/item_digest_head/
-      // ordering_module/fork_count/forks). Render the domain pill plus a
-      // chain-head hint on the row; the quarantine set becomes a Forks
-      // section instead of a generic subtree. All strings land via
-      // textContent — the panel's established XSS discipline.
-      const isItemRow = /^items\.\d+$/.test(path) && value !== null &&
+      // Item rows (items.<name> — deriveView keys items by their natural
+      // name, not array index): the C snapshot emits additive write-domain
+      // fields (domain/writer/item_seq/item_digest_head/ordering_module/
+      // fork_count/forks). Render the domain pill plus a chain-head hint on
+      // the row; the quarantine set becomes a Forks section instead of a
+      // generic subtree. All strings land via textContent — the panel's
+      // established XSS discipline.
+      const isItemRow = /^items\.[^.]+$/.test(path) && value !== null &&
                         typeof value === 'object' && value.name;
       const isObject = value !== null && typeof value === 'object';
       if (isObject && Object.keys(value).length > 0) {

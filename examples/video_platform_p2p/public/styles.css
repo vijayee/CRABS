@@ -251,6 +251,62 @@ video {
   margin-top: 8px;
 }
 
+/* Sovereign check-in panel (write-domains v1 demo surface). */
+.checkin-card {
+  border-top: 1px solid #f0f0f0;
+  padding: 12px 20px 20px;
+}
+.checkin-card h3 { font-size: 15px; margin-bottom: 8px; }
+.domain-pill {
+  display: inline-block;
+  border-radius: 999px;
+  font-size: 10px;
+  line-height: 15px;
+  padding: 0 8px;
+  vertical-align: middle;
+  background: #ccfbf1;
+  color: #0f766e;
+  font-weight: 600;
+}
+.checkin-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.checkin-row #myCheckins { font-weight: 600; }
+.checkin-row #checkinBtn {
+  padding: 8px 16px;
+  background: #0066cc;
+  color: #fff;
+  border: none;
+  border-radius: 20px;
+  cursor: pointer;
+  font-weight: 600;
+}
+.attack-btn {
+  padding: 8px 16px;
+  background: #fff;
+  border: 1px dashed #b32d2d;
+  color: #b32d2d;
+  border-radius: 20px;
+  cursor: pointer;
+}
+.checkin-card .hint {
+  font-size: 12px;
+  color: #888;
+  margin-top: 8px;
+}
+.drawer-pill {
+  display: inline-block;
+  border-radius: 999px;
+  font-size: 10px;
+  line-height: 15px;
+  padding: 0 6px;
+  background: #ccfbf1;
+  color: #0f766e;
+  font-weight: 600;
+}
+
 button:disabled {
   opacity: 0.5;
   cursor: not-allowed;
@@ -374,3 +430,5 @@ button:disabled {
 .drawer-dl dd ul { list-style: none; padding: 0; }
 .drawer-dl dd li { margin-bottom: 2px; }
 .drawer-placeholder { color: #888; font-size: 14px; }
+.drawer-dl .mono { font-family: ui-monospace, Menlo, monospace; font-size: 11px; }
+.drawer-dl .muted { color: #999; }

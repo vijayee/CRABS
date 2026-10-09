@@ -74,6 +74,28 @@ async function main() {
   node.execute(writerOp);
   writerOp.destroy();
 
+  // The writer's SECOND op must claim the live chain head; itemChainHead is
+  // the binding-side read for it (the devtools snapshot's digest head is
+  // only 8 bytes — too short to sign with).
+  const head = node.itemChainHead('score');
+  assert.strictEqual(head.seq, 1, 'head seq should advance to 1');
+  assert.match(head.digestHex, /^[0-9a-f]{64}$/,
+    'head digest should be a full 32-byte hex string');
+  assert.notStrictEqual(head.digestHex, ZERO_DIGEST,
+    'head digest should be recomputed after the first op');
+  assert.throws(() => node.itemChainHead('ghost'), /resource_not_found/,
+    'itemChainHead on an unknown item should throw resource_not_found');
+
+  const secondOp = await Operation.create('bump');
+  secondOp.signerId = 'alice';
+  secondOp.addResource('score');
+  secondOp.setSovereignPrefix(0, head.seq, head.digestHex);
+  node.sign(secondOp, aliceKey);
+  node.execute(secondOp);
+  secondOp.destroy();
+  assert.strictEqual(node.itemChainHead('score').seq, 2,
+    'head seq should advance to 2 after the second accepted write');
+
   // A non-writer op on the sovereign item is rejected with not_item_writer
   // even though mallory holds the authorizing role.
   const rogueOp = await Operation.create('bump');

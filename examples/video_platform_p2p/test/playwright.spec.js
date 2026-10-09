@@ -184,3 +184,49 @@ test('debug drawer shows current user and CRABS video state', async ({ page }) =
   await page.locator('#debugClose').click();
   await expect(page.locator('#debugDrawer')).toHaveClass(/hidden/);
 });
+
+test('sovereign check-ins: owner writes, impersonation is rejected, domain pill renders in both tabs', async ({ browser }) => {
+  const alice = await browser.newPage();
+  const bob = await browser.newPage();
+  try {
+    await login(alice, 'alice', 25);
+    await login(bob, 'bob', 30);
+
+    // The owner's signed ops claim the live chain head each time and advance
+    // the per-user sovereign counter.
+    await expect(alice.locator('#myCheckins')).toHaveText('0 check-ins');
+    await alice.locator('#checkinBtn').click();
+    await expect(alice.locator('#myCheckins')).toHaveText('1 check-in');
+    await alice.locator('#checkinBtn').click();
+    await expect(alice.locator('#myCheckins')).toHaveText('2 check-ins');
+
+    // A well-formed check-in naming another user's item is rejected with
+    // not_item_writer; the typed error surfaces in the UI.
+    await alice.locator('#attackCheckinBtn').click();
+    await expect(alice.locator('#checkinError')).toContainText('not_item_writer');
+
+    // Devtools (CRABS launcher, bottom-right): every checkins_* item row
+    // carries the domain pill with its chain seq — in BOTH tabs, since the
+    // relayed ops advance bob's machine too.
+    await alice.locator('crabs-devtools .toggle').click();
+    await bob.locator('crabs-devtools .toggle').click();
+
+    const alicePills = alice.locator('crabs-devtools .layer-pill').filter({ hasText: /^sovereign$/ });
+    await expect(alicePills.first()).toBeVisible();
+    // Alice's own row reads seq 2 after her two accepted writes.
+    const aliceChainRow = alice.locator('crabs-devtools [data-item-name^="checkins_"]')
+      .filter({ hasText: 'seq 2' });
+    await expect(aliceChainRow).toHaveCount(1);
+
+    // Bob's tab renders the same pills, and alice's chain there reaches
+    // seq 2 once her ops have replicated through the relay.
+    const bobPills = bob.locator('crabs-devtools .layer-pill').filter({ hasText: /^sovereign$/ });
+    await expect(bobPills.first()).toBeVisible();
+    const bobChainRow = bob.locator('crabs-devtools [data-item-name^="checkins_"]')
+      .filter({ hasText: 'seq 2' });
+    await expect(bobChainRow).toHaveCount(1, { timeout: 10000 });
+  } finally {
+    await alice.close();
+    await bob.close();
+  }
+});

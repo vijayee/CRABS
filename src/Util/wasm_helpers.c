@@ -596,6 +596,31 @@ crabs_error_e crabs_wasm_op_set_sovereign_prefix(operation_t* op,
   return CRABS_SUCCESS;
 }
 
+// Chain-head read pair for SOVEREIGN writers composing their next op: a
+// signed prefix must claim the item's CURRENT item_seq and item_digest
+// (DOMAIN_CHECK compares both). The devtools snapshot ships only the first
+// 8 digest bytes (an eyeball head), so the full 32 bytes come from here.
+// crabs_wasm_item_chain_seq returns -1 for an unknown item (the digest
+// getter reports the failure as CRABS_ERR_RESOURCE_NOT_FOUND).
+EMSCRIPTEN_KEEPALIVE
+int64_t crabs_wasm_item_chain_seq(attribute_machine_t* am, const char* name) {
+  if (!am || !name) return -1;
+  data_item_t* item = state_find_item(&am->base_state, name);
+  if (!item) return -1;
+  return (int64_t)item->item_seq;
+}
+
+EMSCRIPTEN_KEEPALIVE
+crabs_error_e crabs_wasm_item_chain_digest(attribute_machine_t* am,
+                                           const char* name,
+                                           uint8_t* out_digest) {
+  if (!am || !name || !out_digest) return CRABS_ERR_INVALID_PARAM;
+  data_item_t* item = state_find_item(&am->base_state, name);
+  if (!item) return CRABS_ERR_RESOURCE_NOT_FOUND;
+  memcpy(out_digest, item->item_digest, CRABS_HASH_SIZE);
+  return CRABS_SUCCESS;
+}
+
 // Fill a caller-created __report_equivocation__ op with the evidence
 // payload for `item_name`: u8 version + string16 item + string16 writer
 // (read from the item — a forged writer field can never parse) + bytes32

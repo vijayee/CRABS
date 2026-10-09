@@ -2,6 +2,8 @@ node_modules/
 public/client_bundle.js
 public/crabs.js
 public/crabs.wasm
+public/crabs.dev.js
+public/crabs.dev.wasm
 public/penguin.mp4
 test-results/
 package-lock.json

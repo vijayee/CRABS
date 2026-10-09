@@ -7,8 +7,14 @@
 
 'use strict';
 
-const { Node, KeyPair, Operation } = require('crabs-wasm');
+// The dev variant of crabs-wasm (window.createCRABSModuleDev, served as
+// /crabs.dev.js) carries the devtools snapshot/drain exports the
+// <crabs-devtools> panel needs; both scripts below register themselves on
+// window (CRABSDevtoolsApi / CRABSDevtools) and are bundled as side effects.
+const { Node, KeyPair, Operation } = require('crabs-wasm/dev');
 const { DEMO_KEYS } = require('./demo_keys');
+require('../../bindings/devtools/devtools-api.js');
+require('../../bindings/devtools/crabs-devtools.js');
 
 const FLAG_THRESHOLD = 3;
 
@@ -82,6 +88,12 @@ async function init() {
     node = await Node.create('admin', { ordering: 'hlc' });
     await registerDemoUsers();
     initStateMachine();
+    // Per-tab devtools overlay (CRABS launcher button, bottom-right): the
+    // State tab renders each item's write-domain pill, and sovereign rows
+    // carry the live chain seq + digest head — visible in BOTH demo tabs.
+    if (window.CRABSDevtools) {
+      window.CRABSDevtools.attach(node, { nodeId: node.adminId });
+    }
     connectWebSocket();
     bindAuth();
     bindDebugDrawer();
@@ -120,21 +132,30 @@ async function registerDemoUsers() {
   }
 }
 
-function buildAttrs(age, isModerator) {
-  const attrs = ['role:member'];
-  if (age >= 13) attrs.push('adult');
-  if (isModerator) attrs.push('clearance:moderator');
-  return attrs.join('|');
+// R7-08: privileged attribute names (role/member/…) must never be minted
+// via register_user — only the admin grantRole path may. Registrations carry
+// the public attrs ('adult'); roles are then granted as the node's admin.
+function plainAttrs(age) {
+  return age >= 13 ? 'adult' : '';
+}
+
+function grantDemoRoles(userId, isModerator) {
+  try { node.grantRole(userId, 'role', 'member', node.adminId); }
+  catch (e) { if (!/duplicate/i.test(e.message)) throw e; }
+  if (isModerator) {
+    try { node.grantRole(userId, 'clearance', 'moderator', node.adminId); }
+    catch (e) { if (!/duplicate/i.test(e.message)) throw e; }
+  }
 }
 
 async function registerUserInNode(user) {
-  const attrs = buildAttrs(user.age, user.name === 'mod1');
   try {
-    await node.registerUser(user.userId, user.publicKeyHex, attrs);
+    await node.registerUser(user.userId, user.publicKeyHex, plainAttrs(user.age));
   } catch (e) {
     // Duplicate registrations are harmless in this demo.
     if (!/duplicate/i.test(e.message)) throw e;
   }
+  grantDemoRoles(user.userId, user.name === 'mod1');
 }
 
 const CRABS_SUCCESS = 0;
@@ -159,6 +180,7 @@ function initStateMachine() {
   node.setPolicy('unsubscribe', adultPolicy);
   node.setPolicy('comment', adultPolicy);
   node.setPolicy('flag', adultPolicy);
+  node.setPolicy('check_in', adultPolicy);
 
   node.setPolicy('__create_trigger__', 'role:admin');
   node.setPolicy('__change_config__', 'role:admin');
@@ -182,6 +204,11 @@ function initStateMachine() {
 }
 
 function registerOperationHandlers() {
+  // 'noop' is the trigger-revaluation trampoline (evaluateTriggers composes
+  // a signed admin noop). The state machine fails closed on policy-authorized
+  // op types with no handler, so register an explicit empty handler.
+  node.registerHandlerJs('noop', () => CRABS_SUCCESS);
+
   node.registerHandlerJs('view', (state, op) => {
     state.incrementCounter('views', 1, op.signerId);
     return CRABS_SUCCESS;
@@ -234,11 +261,28 @@ function registerOperationHandlers() {
     }
     return CRABS_SUCCESS;
   });
+
+  // The op names checkins_<signer> as its only resource; DOMAIN_CHECK has
+  // already enforced the sovereign writer binding (signer === item writer)
+  // before this handler runs, so the handler increments the signer's own
+  // counter unconditionally.
+  node.registerHandlerJs('check_in', (state, op) => {
+    state.incrementCounter(`checkins_${op.signerId}`, 1, op.signerId);
+    return CRABS_SUCCESS;
+  });
 }
 
 function ensureUserState(userId) {
   try { node.addRegister(`vote_${userId}`, 0); } catch (e) { /* exists */ }
   try { node.addCounter(`comments_made_${userId}`); } catch (e) { /* exists */ }
+  // Write-domains: every user's check-in counter is a SOVEREIGN item whose
+  // only writer is the user themselves. Mints are deterministic across
+  // tabs (same name/type/domain/writer per user), so all peers hold the
+  // same definition and reject the same non-writer ops.
+  try {
+    node.defineItem(`checkins_${userId}`, 'counter', 'g_counter',
+                    { domain: 'sovereign', writer: userId });
+  } catch (e) { /* exists */ }
 }
 
 // ============================================================
@@ -284,9 +328,9 @@ async function handleMessage(evt) {
 
   if (msg.type === 'register_user') {
     ensureUserState(msg.userId);
-    const attrs = buildAttrs(msg.age, msg.name === 'mod1');
     try {
-      await node.registerUser(msg.userId, msg.publicKeyHex, attrs);
+      await node.registerUser(msg.userId, msg.publicKeyHex, plainAttrs(msg.age));
+      grantDemoRoles(msg.userId, msg.name === 'mod1');
     } catch (e) {
       if (!/duplicate/i.test(e.message)) console.warn('register_user failed', e);
     }
@@ -453,7 +497,8 @@ function blockUnderagePlayback(e) {
 
 function updateEngagementDisabled() {
   const underage = currentUser && currentUser.age < 13;
-  const ids = ['likeBtn', 'dislikeBtn', 'subscribeBtn', 'flagBtn', 'postCommentBtn', 'commentText'];
+  const ids = ['likeBtn', 'dislikeBtn', 'subscribeBtn', 'flagBtn', 'postCommentBtn', 'commentText',
+               'checkinBtn', 'attackCheckinBtn'];
   for (const id of ids) {
     const el = document.getElementById(id);
     if (el) el.disabled = underage;
@@ -480,6 +525,8 @@ function bindEngagement() {
   document.getElementById('flagBtn').addEventListener('click', () => doFlag());
   document.getElementById('contactBtn').addEventListener('click', () => viewContact());
   document.getElementById('postCommentBtn').addEventListener('click', () => doComment());
+  document.getElementById('checkinBtn').addEventListener('click', () => doCheckIn());
+  document.getElementById('attackCheckinBtn').addEventListener('click', () => doAttackCheckIn());
   document.getElementById('videoPlayer').addEventListener('play', () => doView());
 }
 
@@ -542,6 +589,67 @@ async function doComment() {
   applyLocalComment(comment);
   input.value = '';
   document.getElementById('commentError').textContent = '';
+  refreshUI();
+}
+
+// ============================================================
+// Sovereign check-ins (write-domains v1)
+// ============================================================
+
+// A check-in op names exactly one SOVEREIGN resource and must carry a
+// signed chain prefix: the item's CURRENT (seq, digest head) read via
+// itemChainHead — then sign (format v4 binds the prefix), execute, relay.
+// destroy runs in finally: the attack path's rejection is by design, and a
+// thrown execute must not leak the op's WASM allocation.
+async function runSovereignCheckIn(itemName) {
+  const head = node.itemChainHead(itemName);
+  const op = await Operation.create('check_in');
+  try {
+    op.signerId = currentUser.userId;
+    op.nodeId = currentUser.userId;
+    op.addResource(itemName);
+    op.setSovereignPrefix(0, head.seq, head.digestHex);
+    node.sign(op, currentUser.keyPair);
+    node.execute(op);
+    broadcastOperation(op.serialize());
+  } finally {
+    op.destroy();
+  }
+}
+
+function showCheckinError(msg) {
+  const el = document.getElementById('checkinError');
+  if (el) el.textContent = msg;
+}
+
+async function doCheckIn() {
+  if (!canAct()) return;
+  try {
+    await runSovereignCheckIn(`checkins_${currentUser.userId}`);
+    showCheckinError('');
+  } catch (e) {
+    showCheckinError(e.message);
+  }
+  refreshUI();
+}
+
+// Demonstration of the sovereign write boundary: sign a check_in op as the
+// CURRENT user but name someone else's item. The op is well-formed (valid
+// chain head, valid signature) but the signer is not the item's writer, so
+// DOMAIN_CHECK rejects it with not_item_writer — surfaced visibly here.
+async function doAttackCheckIn() {
+  if (!canAct()) return;
+  const victim = [...localUsers.values()].find(u => u.userId !== currentUser.userId);
+  if (!victim) {
+    showCheckinError('No other user to impersonate');
+    return;
+  }
+  try {
+    await runSovereignCheckIn(`checkins_${victim.userId}`);
+    showCheckinError('UNEXPECTED: impersonated check-in was accepted');
+  } catch (e) {
+    showCheckinError(`Rejected as expected: ${e.message}`);
+  }
   refreshUI();
 }
 
@@ -640,6 +748,11 @@ function renderDebugDrawer() {
     const attrs = u?.attributes?.map(a => a.value).join(', ') || 'none';
     const subscribed = safeGet(() => node.setContains('subscribers', currentUser.userId), false);
     const flagged = safeGet(() => node.setContains('flaggers', currentUser.userId), false);
+    const checkins = safeGet(() => node.getCounter(`checkins_${currentUser.userId}`), 0);
+    const checkinHead = safeGet(() => node.itemChainHead(`checkins_${currentUser.userId}`), null);
+    const headHint = checkinHead
+      ? `sovereign · seq ${checkinHead.seq} · head ${checkinHead.digestHex.slice(0, 16)}…`
+      : 'unavailable';
     userHtml = `
       <div class="drawer-section">
         <h3>Current User</h3>
@@ -651,6 +764,7 @@ function renderDebugDrawer() {
           <dt>Attributes</dt><dd>${escapeHtml(attrs)}</dd>
           <dt>Subscribed</dt><dd>${subscribed ? 'yes' : 'no'}</dd>
           <dt>Flagged</dt><dd>${flagged ? 'yes' : 'no'}</dd>
+          <dt>Check-ins</dt><dd>${checkins} <span class="drawer-pill">sovereign</span> <span class="mono muted">${escapeHtml(headHint)}</span></dd>
         </dl>
       </div>
     `;
@@ -747,6 +861,10 @@ function refreshUI() {
     const vote = node.getRegister(`vote_${currentUser.userId}`) || 0;
     document.getElementById('likeBtn').classList.toggle('active', vote === 1);
     document.getElementById('dislikeBtn').classList.toggle('active', vote === -1);
+
+    const checkins = node.getCounter(`checkins_${currentUser.userId}`) || 0;
+    document.getElementById('myCheckins').textContent =
+      `${checkins} check-in${checkins === 1 ? '' : 's'}`;
 
     const subscribed = node.setContains('subscribers', currentUser.userId);
     const subBtn = document.getElementById('subscribeBtn');

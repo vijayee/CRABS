@@ -658,6 +658,32 @@ class Node {
     wrapRc(rc, 'defineItem');
   }
 
+  // Write-domains v1: the live chain head (seq + full 32-byte digest hex)
+  // of item `name` — exactly what a SOVEREIGN writer's next op must claim
+  // in its signed prefix (DOMAIN_CHECK compares both). The devtools
+  // snapshot's item_digest_head is only the first 8 bytes; signing needs
+  // the full digest. Throws resource_not_found for an unknown item.
+  itemChainHead(name) {
+    const M = this._M;
+    const namePtr = writeString(M, name);
+    const seq = M._crabs_wasm_item_chain_seq(this._am, namePtr);
+    if (seq < 0n) {
+      freeAll(M, namePtr);
+      // Match the wrapRc message shape: 'itemChainHead: resource_not_found'.
+      throw crabsError(0x3002, 'itemChainHead');
+    }
+    const digestPtr = M._malloc(32);
+    const rc = M._crabs_wasm_item_chain_digest(this._am, namePtr, digestPtr);
+    const digestHex = rc === 0
+      ? hexEncode(M.HEAPU8.subarray(digestPtr, digestPtr + 32), 32)
+      : null;
+    freeAll(M, namePtr, digestPtr);
+    wrapRc(rc, 'itemChainHead');
+    // i64 arrives as a BigInt; seq fits comfortably in a JS number for any
+    // realistic chain (and matches setSovereignPrefix's number arm).
+    return { seq: Number(seq), digestHex };
+  }
+
   // Write-domains v1: file a __report_equivocation__ op against the
   // SOVEREIGN item `itemName`, carrying two serialized writer ops as the
   // evidence pair. The C helper builds the payload (the writer field is

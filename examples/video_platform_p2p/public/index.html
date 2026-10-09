@@ -80,6 +80,18 @@
             <h3>Decrypted contact info</h3>
             <pre id="contactData"></pre>
           </div>
+          <div class="checkin-card">
+            <h3>My check-ins <span class="domain-pill sovereign">sovereign</span></h3>
+            <div class="checkin-row">
+              <span id="myCheckins">0 check-ins</span>
+              <button id="checkinBtn">Check in</button>
+              <button id="attackCheckinBtn" class="attack-btn">Impersonate a check-in</button>
+            </div>
+            <p class="hint">Your check-in counter is a <b>sovereign</b> item: a single-writer
+              chain only you can sign. The attack button submits a well-formed check-in naming
+              another user's item — the state machine rejects it with not_item_writer.</p>
+            <div id="checkinError" class="error"></div>
+          </div>
         </div>
 
         <div class="comments-card">
@@ -106,7 +118,9 @@
     </aside>
   </div>
 
-  <script src="/crabs.js"></script>
+  <!-- Dev variant: carries the devtools snapshot/drain exports the
+       <crabs-devtools> overlay panel consumes (CRABS launcher, bottom-right). -->
+  <script src="/crabs.dev.js"></script>
   <script src="/client_bundle.js"></script>
   <script>CRABSClient.init();</script>
 </body>

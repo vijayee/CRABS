@@ -86,6 +86,22 @@ async function main() {
   const opAWire = opA.serialize();
   await outcomeOf('writer first op', () => nodeRoot.execute(opA));
 
+  // The writer's second op must claim the live chain head; itemChainHead is
+  // the binding-side read for it. The trace records side-invariant facts
+  // only (seq number, digest shape) — the digest itself must be identical
+  // across sides but asserting that here would double as the diff.
+  await outcomeOf('head after first op', () => {
+    const head = nodeRoot.itemChainHead('score');
+    return `seq=${head.seq} digest=${/^[0-9a-f]{64}$/.test(head.digestHex) ? 'hex64' : 'bad'}`
+      + ` nonzero=${head.digestHex !== ZERO_DIGEST}`;
+  });
+  const head = nodeRoot.itemChainHead('score');
+  const opSecond = await stagedOp('alice', head.seq, head.digestHex);
+  await outcomeOf('writer second op (head-claimed)', () => nodeRoot.execute(opSecond));
+  await outcomeOf('head after second op', () =>
+    `seq=${nodeRoot.itemChainHead('score').seq}`);
+  await outcomeOf('head of unknown item', () => nodeRoot.itemChainHead('ghost'));
+
   const rogue = await stagedOp('mallory', 1, ZERO_DIGEST);
   await outcomeOf('non-writer op', () => nodeRoot.execute(rogue));
 
