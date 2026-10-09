@@ -3092,3 +3092,468 @@ TEST(LineageKeyChainWire, WriterRejectsInvalidParentSideFields) {
 
   keychain_wire_fixture_destroy(&fixture);
 }
+
+// ============================================================
+// v14 (write-domains): per-item domain tail
+// ============================================================
+// The state header is magic(4) + version(4) + state_version(8) +
+// item_count(4) + policy_count(4) + log_count(4), then items in list order.
+// crabs_serialize_data_item yields exactly the pre-domain (v13) per-item
+// form, so a v14 item's domain tail begins at item_start + pre_domain_len
+// and the tail length is computable from the in-memory item. Layout:
+//   [u8 write_domain]
+//   SOVEREIGN:     [u16 wlen][writer][u64 seq][32B digest][u8 fork_count]
+//                  + per entry [u16 flen][fork_writer][32B evidence]
+//   GROUP_ORDERED: [u8 ordering_module]
+//   FREE_MERGE:    nothing more.
+
+static const size_t kV14ItemsOffset = 4 + 4 + 8 + 4 + 4 + 4;
+
+static size_t v14_tail_len(const data_item_t* item) {
+  if (item->write_domain == CRABS_DOMAIN_SOVEREIGN) {
+    size_t tail_len = 1 + 2 + strlen(item->writer) + 8 + CRABS_HASH_SIZE + 1;
+    for (uint32_t fork_index = 0; fork_index < item->fork_count; fork_index++) {
+      tail_len += 2 + strlen(item->fork_writers[fork_index]) + CRABS_HASH_SIZE;
+    }
+    return tail_len;
+  }
+  if (item->write_domain == CRABS_DOMAIN_GROUP_ORDERED) {
+    return 2;
+  }
+  return 1;
+}
+
+// Offset of item `name`'s v14 domain tail inside the serialized state blob;
+// verifies along the way that the blob's item stream prefixes each tail with
+// exactly the pre-domain bytes (the hash-chain preimage contract).
+static size_t v14_find_tail_offset(state_t* state, const serialized_buffer_t* buf,
+                                   const char* name) {
+  size_t offset = kV14ItemsOffset;
+  for (data_item_t* item = state->items; item != nullptr; item = item->next) {
+    serialized_buffer_t* pre_domain = crabs_serialize_data_item(item);
+    EXPECT_EQ(memcmp(buf->data + offset, pre_domain->data, pre_domain->len), 0);
+    bool wanted = (strcmp(item->name, name) == 0);
+    offset += pre_domain->len;
+    serialized_buffer_destroy(pre_domain);
+    if (wanted) return offset;
+    offset += v14_tail_len(item);
+  }
+  ADD_FAILURE() << "item not found: " << name;
+  return 0;
+}
+
+static void v14_rehash(serialized_buffer_t* buf) {
+  uint8_t recomputed_hash[CRABS_HASH_SIZE];
+  SHA256(buf->data, buf->len - CRABS_HASH_SIZE, recomputed_hash);
+  memcpy(buf->data + buf->len - CRABS_HASH_SIZE, recomputed_hash, CRABS_HASH_SIZE);
+}
+
+// Round-trip every domain field exactly: a FREE_MERGE counter, a SOVEREIGN
+// register with a live chain head (seq + digest) and one quarantined fork
+// writer, and a GROUP_ORDERED counter at the v1 seam (module 0, read-only).
+TEST(StateSerialize, V14ItemDomainRoundTrip) {
+  state_t* original = state_create();
+  ASSERT_NE(original, nullptr);
+  original->version = 77;
+
+  data_item_t* free_item =
+      data_item_create("free-counter", DATA_TYPE_COUNTER, CRDT_G_COUNTER);
+  int64_t* free_val = (int64_t*)malloc(sizeof(int64_t));
+  *free_val = 123;
+  free_item->value = free_val;
+  ASSERT_EQ(state_add_item(original, free_item), CRABS_SUCCESS);
+
+  data_item_t* sov_item = nullptr;
+  data_item_options_t sov_opts = {CRABS_DOMAIN_SOVEREIGN, "alice", 0};
+  ASSERT_EQ(data_item_create_with_options("sov-register", DATA_TYPE_REGISTER,
+                                          CRDT_LWW_REG, &sov_opts, &sov_item),
+            CRABS_SUCCESS);
+  int64_t* sov_val = (int64_t*)malloc(sizeof(int64_t));
+  *sov_val = 7;
+  sov_item->value = sov_val;
+  sov_item->item_seq = 9;
+  for (int digest_byte = 0; digest_byte < CRABS_HASH_SIZE; digest_byte++) {
+    sov_item->item_digest[digest_byte] = (uint8_t)(0x40 + digest_byte);
+  }
+  uint8_t evidence_digest[CRABS_HASH_SIZE];
+  for (int evidence_byte = 0; evidence_byte < CRABS_HASH_SIZE; evidence_byte++) {
+    evidence_digest[evidence_byte] = (uint8_t)(0xC0 ^ evidence_byte);
+  }
+  ASSERT_EQ(state_append_fork_evidence(sov_item, "mallory", evidence_digest),
+            CRABS_SUCCESS);
+  ASSERT_EQ(state_add_item(original, sov_item), CRABS_SUCCESS);
+
+  data_item_t* group_item = nullptr;
+  data_item_options_t group_opts = {CRABS_DOMAIN_GROUP_ORDERED, nullptr, 0};
+  ASSERT_EQ(data_item_create_with_options("grp-counter", DATA_TYPE_COUNTER,
+                                          CRDT_G_COUNTER, &group_opts, &group_item),
+            CRABS_SUCCESS);
+  int64_t* group_val = (int64_t*)malloc(sizeof(int64_t));
+  *group_val = 999;
+  group_item->value = group_val;
+  ASSERT_EQ(state_add_item(original, group_item), CRABS_SUCCESS);
+
+  serialized_buffer_t* buf = crabs_serialize_state(original);
+  ASSERT_NE(buf, nullptr);
+  ASSERT_EQ((uint32_t)CRABS_SERIAL_VERSION, 14u);
+
+  state_t* restored = crabs_deserialize_state(buf->data, buf->len);
+  ASSERT_NE(restored, nullptr);
+  EXPECT_EQ(restored->version, original->version);
+
+  data_item_t* restored_free = state_find_item(restored, "free-counter");
+  ASSERT_NE(restored_free, nullptr);
+  EXPECT_EQ(restored_free->write_domain, CRABS_DOMAIN_FREE_MERGE);
+  EXPECT_STREQ(restored_free->writer, "");
+  EXPECT_EQ(restored_free->item_seq, (uint64_t)0);
+  EXPECT_EQ(restored_free->ordering_module, 0);
+  EXPECT_EQ(restored_free->fork_count, 0u);
+
+  data_item_t* restored_sov = state_find_item(restored, "sov-register");
+  ASSERT_NE(restored_sov, nullptr);
+  EXPECT_EQ(restored_sov->write_domain, CRABS_DOMAIN_SOVEREIGN);
+  EXPECT_STREQ(restored_sov->writer, "alice");
+  EXPECT_EQ(restored_sov->item_seq, (uint64_t)9);
+  EXPECT_EQ(memcmp(restored_sov->item_digest, sov_item->item_digest,
+                   CRABS_HASH_SIZE), 0);
+  EXPECT_EQ(restored_sov->ordering_module, 0);
+  ASSERT_EQ(restored_sov->fork_count, 1u);
+  EXPECT_STREQ(restored_sov->fork_writers[0], "mallory");
+  EXPECT_EQ(memcmp(restored_sov->fork_evidence_digests[0], evidence_digest,
+                   CRABS_HASH_SIZE), 0);
+
+  data_item_t* restored_group = state_find_item(restored, "grp-counter");
+  ASSERT_NE(restored_group, nullptr);
+  EXPECT_EQ(restored_group->write_domain, CRABS_DOMAIN_GROUP_ORDERED);
+  EXPECT_EQ(restored_group->ordering_module, 0);
+  EXPECT_STREQ(restored_group->writer, "");
+  EXPECT_EQ(restored_group->fork_count, 0u);
+
+  serialized_buffer_destroy(buf);
+  state_destroy(original);
+  state_destroy(restored);
+}
+
+// The sovereign-chain digest preimage covers ONLY the pre-domain item form:
+// two items identical in the v13-covered fields but differing in every
+// domain field serialize to byte-identical crabs_serialize_data_item output.
+TEST(StateSerialize, V14ItemDigestPreimageExcludesDomainTail) {
+  data_item_t* free_item =
+      data_item_create("chain-item", DATA_TYPE_REGISTER, CRDT_LWW_REG);
+  int64_t* free_val = (int64_t*)malloc(sizeof(int64_t));
+  *free_val = 42;
+  free_item->value = free_val;
+
+  data_item_t* sov_item = nullptr;
+  data_item_options_t sov_opts = {CRABS_DOMAIN_SOVEREIGN, "alice", 0};
+  ASSERT_EQ(data_item_create_with_options("chain-item", DATA_TYPE_REGISTER,
+                                          CRDT_LWW_REG, &sov_opts, &sov_item),
+            CRABS_SUCCESS);
+  int64_t* sov_val = (int64_t*)malloc(sizeof(int64_t));
+  *sov_val = 42;
+  sov_item->value = sov_val;
+  sov_item->item_seq = 12;
+  memset(sov_item->item_digest, 0xAB, CRABS_HASH_SIZE);
+
+  serialized_buffer_t* free_form = crabs_serialize_data_item(free_item);
+  serialized_buffer_t* sov_form = crabs_serialize_data_item(sov_item);
+  ASSERT_NE(free_form, nullptr);
+  ASSERT_NE(sov_form, nullptr);
+  ASSERT_EQ(free_form->len, sov_form->len);
+  EXPECT_EQ(memcmp(free_form->data, sov_form->data, free_form->len), 0)
+      << "the hash-chain preimage must not move with domain fields";
+
+  serialized_buffer_destroy(free_form);
+  serialized_buffer_destroy(sov_form);
+  data_item_destroy(free_item);
+  data_item_destroy(sov_item);
+}
+
+// Pre-v14 loads: a v13 blob carries no domain tail; every item restores as
+// FREE_MERGE with zeroed chain/quarantine fields. Surgery: the v14 tail for
+// a default item is exactly one 0x00 byte — strip each one (the strip points
+// are located via the pre-domain helper bytes), patch the version field
+// 14->13, and re-fix the checksum.
+TEST(StateSerialize, V13BlobLoadsAllFreeMerge) {
+  state_t* state = state_create();
+  ASSERT_NE(state, nullptr);
+  state->version = 55;
+  data_item_t* counter_item =
+      data_item_create("v13-counter", DATA_TYPE_COUNTER, CRDT_G_COUNTER);
+  int64_t* counter_val = (int64_t*)malloc(sizeof(int64_t));
+  *counter_val = -4;
+  counter_item->value = counter_val;
+  ASSERT_EQ(state_add_item(state, counter_item), CRABS_SUCCESS);
+  data_item_t* register_item =
+      data_item_create("v13-register", DATA_TYPE_REGISTER, CRDT_LWW_REG);
+  int64_t* register_val = (int64_t*)malloc(sizeof(int64_t));
+  *register_val = 900;
+  register_item->value = register_val;
+  ASSERT_EQ(state_add_item(state, register_item), CRABS_SUCCESS);
+
+  serialized_buffer_t* buf = crabs_serialize_state(state);
+  ASSERT_NE(buf, nullptr);
+
+  // Strip the per-item tail byte (must be 0x00 for every default item). The
+  // walk order matches the writer's, so each strip shifts only the bytes
+  // AFTER the current item — no offset recomputation needed mid-walk.
+  size_t offset = kV14ItemsOffset;
+  for (data_item_t* item = state->items; item != nullptr; item = item->next) {
+    serialized_buffer_t* pre_domain = crabs_serialize_data_item(item);
+    EXPECT_EQ(memcmp(buf->data + offset, pre_domain->data, pre_domain->len), 0);
+    offset += pre_domain->len;
+    serialized_buffer_destroy(pre_domain);
+    ASSERT_EQ(buf->data[offset], 0x00)
+        << "v14 tail of default item " << item->name
+        << " must be exactly one free-merge byte";
+    memmove(buf->data + offset, buf->data + offset + 1,
+            buf->len - offset - 1);
+    buf->len -= 1;
+  }
+  state_destroy(state);
+
+  // Version 14 -> 13.
+  buf->data[4] = 13;
+  v14_rehash(buf);
+
+  state_t* restored = crabs_deserialize_state(buf->data, buf->len);
+  ASSERT_NE(restored, nullptr);
+  EXPECT_EQ(restored->version, (uint64_t)55);
+  for (data_item_t* item = restored->items; item != nullptr; item = item->next) {
+    EXPECT_EQ(item->write_domain, CRABS_DOMAIN_FREE_MERGE)
+        << "pre-v14 item " << item->name << " must restore as FREE_MERGE";
+    EXPECT_STREQ(item->writer, "");
+    EXPECT_EQ(item->item_seq, (uint64_t)0);
+    EXPECT_EQ(item->ordering_module, 0);
+    EXPECT_EQ(item->fork_count, 0u);
+    uint8_t zero_digest[CRABS_HASH_SIZE] = {0};
+    EXPECT_EQ(memcmp(item->item_digest, zero_digest, CRABS_HASH_SIZE), 0);
+  }
+  ASSERT_NE(state_find_item(restored, "v13-counter"), nullptr);
+  ASSERT_NE(state_find_item(restored, "v13-register"), nullptr);
+  EXPECT_EQ(*(int64_t*)state_find_item(restored, "v13-register")->value, 900);
+
+  serialized_buffer_destroy(buf);
+  state_destroy(restored);
+}
+
+// Corruption matrix: each case serializes an honest v14 blob, applies byte
+// surgery, re-fixes the checksum, and requires the load to fail.
+
+// Enum whitelist: a domain byte between no known values rejects the load.
+TEST(StateSerialize, V14RejectsUnknownDomainByte) {
+  state_t* state = state_create();
+  data_item_t* item = data_item_create("item", DATA_TYPE_COUNTER, CRDT_G_COUNTER);
+  int64_t* val = (int64_t*)malloc(sizeof(int64_t));
+  *val = 1;
+  item->value = val;
+  state_add_item(state, item);
+
+  serialized_buffer_t* buf = crabs_serialize_state(state);
+  ASSERT_NE(buf, nullptr);
+  size_t tail_offset = v14_find_tail_offset(state, buf, "item");
+  ASSERT_EQ(buf->data[tail_offset], 0x00);
+  buf->data[tail_offset] = 0x03;   // one past CRABS_DOMAIN_GROUP_ORDERED
+  v14_rehash(buf);
+  EXPECT_EQ(crabs_deserialize_state(buf->data, buf->len), nullptr);
+
+  serialized_buffer_destroy(buf);
+  state_destroy(state);
+}
+
+// A SOVEREIGN tail whose writer string is empty must fail (the item would
+// have no bound writer — DOMAIN_CHECK could never accept a write).
+TEST(StateSerialize, V14RejectsSovereignEmptyWriter) {
+  state_t* state = state_create();
+  data_item_t* item = nullptr;
+  data_item_options_t opts = {CRABS_DOMAIN_SOVEREIGN, "alice", 0};
+  ASSERT_EQ(data_item_create_with_options("sov", DATA_TYPE_REGISTER, CRDT_LWW_REG,
+                                          &opts, &item), CRABS_SUCCESS);
+  state_add_item(state, item);
+
+  serialized_buffer_t* buf = crabs_serialize_state(state);
+  ASSERT_NE(buf, nullptr);
+  size_t tail_offset = v14_find_tail_offset(state, buf, "sov");
+  ASSERT_EQ(buf->data[tail_offset], (uint8_t)CRABS_DOMAIN_SOVEREIGN);
+  // Shrink the string16 prefix to 0; the leftover "alice" bytes misalign the
+  // rest of the parse, but the empty-writer gate fires first.
+  buf->data[tail_offset + 1] = 0;
+  buf->data[tail_offset + 2] = 0;
+  v14_rehash(buf);
+  EXPECT_EQ(crabs_deserialize_state(buf->data, buf->len), nullptr);
+
+  serialized_buffer_destroy(buf);
+  state_destroy(state);
+}
+
+// Consistency: item_seq == 0 exactly when item_digest is all-zero. Surgery
+// in both directions must fail the load.
+TEST(StateSerialize, V14RejectsSeqDigestMismatch) {
+  for (int direction = 0; direction < 2; direction++) {
+    state_t* state = state_create();
+    data_item_t* item = nullptr;
+    data_item_options_t opts = {CRABS_DOMAIN_SOVEREIGN, "alice", 0};
+    ASSERT_EQ(data_item_create_with_options("sov", DATA_TYPE_REGISTER,
+                                            CRDT_LWW_REG, &opts, &item),
+              CRABS_SUCCESS);
+    item->item_seq = 6;
+    memset(item->item_digest, 0x5A, CRABS_HASH_SIZE);
+    state_add_item(state, item);
+
+    serialized_buffer_t* buf = crabs_serialize_state(state);
+    ASSERT_NE(buf, nullptr);
+    size_t tail_offset = v14_find_tail_offset(state, buf, "sov");
+    size_t writer_len = strlen("alice");
+    size_t seq_offset = tail_offset + 1 + 2 + writer_len;
+    size_t digest_offset = seq_offset + 8;
+    if (direction == 0) {
+      memset(buf->data + seq_offset, 0, 8);        // seq 0, digest non-zero
+    } else {
+      memset(buf->data + digest_offset, 0, CRABS_HASH_SIZE);  // seq 6, digest zero
+    }
+    v14_rehash(buf);
+    EXPECT_EQ(crabs_deserialize_state(buf->data, buf->len), nullptr)
+        << "direction " << direction;
+
+    serialized_buffer_destroy(buf);
+    state_destroy(state);
+  }
+}
+
+// fork_count is attacker-controlled: above CRABS_MAX_FORK_WRITERS the load
+// fails (the in-memory fork set is inline and capped).
+TEST(StateSerialize, V14RejectsForkCountOverCap) {
+  state_t* state = state_create();
+  data_item_t* item = nullptr;
+  data_item_options_t opts = {CRABS_DOMAIN_SOVEREIGN, "alice", 0};
+  ASSERT_EQ(data_item_create_with_options("sov", DATA_TYPE_REGISTER, CRDT_LWW_REG,
+                                          &opts, &item), CRABS_SUCCESS);
+  uint8_t evidence_digest[CRABS_HASH_SIZE];
+  memset(evidence_digest, 0x11, CRABS_HASH_SIZE);
+  ASSERT_EQ(state_append_fork_evidence(item, "mallory", evidence_digest),
+            CRABS_SUCCESS);
+  state_add_item(state, item);
+
+  serialized_buffer_t* buf = crabs_serialize_state(state);
+  ASSERT_NE(buf, nullptr);
+  size_t tail_offset = v14_find_tail_offset(state, buf, "sov");
+  size_t count_offset = tail_offset + 1 + 2 + strlen("alice") + 8 + CRABS_HASH_SIZE;
+  ASSERT_EQ(buf->data[count_offset], 0x01);
+  buf->data[count_offset] = CRABS_MAX_FORK_WRITERS + 1;
+  v14_rehash(buf);
+  EXPECT_EQ(crabs_deserialize_state(buf->data, buf->len), nullptr);
+
+  serialized_buffer_destroy(buf);
+  state_destroy(state);
+}
+
+// Same count channel, second bound: in-cap but unsatisfiable by the bytes
+// actually remaining (each entry needs at least an empty string16 + 32
+// digest bytes). The patched count is derived from the blob so this test
+// exercises the remaining-bytes path, never the cap path.
+TEST(StateSerialize, V14RejectsForkCountBeyondRemainingBytes) {
+  state_t* state = state_create();
+  data_item_t* item = nullptr;
+  data_item_options_t opts = {CRABS_DOMAIN_SOVEREIGN, "alice", 0};
+  ASSERT_EQ(data_item_create_with_options("sov", DATA_TYPE_REGISTER, CRDT_LWW_REG,
+                                          &opts, &item), CRABS_SUCCESS);
+  uint8_t evidence_digest[CRABS_HASH_SIZE];
+  memset(evidence_digest, 0x22, CRABS_HASH_SIZE);
+  ASSERT_EQ(state_append_fork_evidence(item, "m", evidence_digest), CRABS_SUCCESS);
+  state_add_item(state, item);
+
+  serialized_buffer_t* buf = crabs_serialize_state(state);
+  ASSERT_NE(buf, nullptr);
+  size_t tail_offset = v14_find_tail_offset(state, buf, "sov");
+  size_t count_offset = tail_offset + 1 + 2 + strlen("alice") + 8 + CRABS_HASH_SIZE;
+  ASSERT_EQ(buf->data[count_offset], 0x01);
+  // After the count byte there are real bytes (one entry + later sections +
+  // checksum); bound the count against exactly what remains.
+  size_t entry_wire_min = 2 + CRABS_HASH_SIZE;
+  size_t remaining = buf->len - (count_offset + 1);
+  uint8_t patched_count = (uint8_t)(remaining / entry_wire_min + 1);
+  ASSERT_LE(patched_count, CRABS_MAX_FORK_WRITERS)
+      << "test no longer exercises the remaining-bytes bound";
+  buf->data[count_offset] = patched_count;
+  v14_rehash(buf);
+  EXPECT_EQ(crabs_deserialize_state(buf->data, buf->len), nullptr);
+
+  serialized_buffer_destroy(buf);
+  state_destroy(state);
+}
+
+// Writer/reader lockstep (the writer never emits a blob its own reader
+// rejects): inconsistent domain fields fail the serialize, not the load.
+TEST(StateSerialize, V14WriterRefusesInconsistentDomainFields) {
+  state_t* state = state_create();
+  data_item_t* item = nullptr;
+  data_item_options_t opts = {CRABS_DOMAIN_SOVEREIGN, "alice", 0};
+  ASSERT_EQ(data_item_create_with_options("sov", DATA_TYPE_REGISTER, CRDT_LWW_REG,
+                                          &opts, &item), CRABS_SUCCESS);
+  state_add_item(state, item);
+
+  // seq advanced but digest still zero.
+  item->item_seq = 1;
+  serialized_buffer_t* buf = crabs_serialize_state(state);
+  EXPECT_EQ(buf, nullptr);
+  if (buf != nullptr) serialized_buffer_destroy(buf);
+  memset(item->item_digest, 0x5A, CRABS_HASH_SIZE);
+
+  // seq rewound to 0 with a live digest.
+  item->item_seq = 0;
+  buf = crabs_serialize_state(state);
+  EXPECT_EQ(buf, nullptr);
+  if (buf != nullptr) serialized_buffer_destroy(buf);
+
+  // Healthy again — control.
+  item->item_seq = 3;
+  buf = crabs_serialize_state(state);
+  ASSERT_NE(buf, nullptr);
+  serialized_buffer_destroy(buf);
+
+  // Over-cap fork count (above the inline array's wire allowance).
+  item->fork_count = CRABS_MAX_FORK_WRITERS + 1;
+  buf = crabs_serialize_state(state);
+  EXPECT_EQ(buf, nullptr);
+  if (buf != nullptr) serialized_buffer_destroy(buf);
+  item->fork_count = 0;
+
+  // Fork evidence on a non-sovereign item carries no wire home.
+  item->write_domain = CRABS_DOMAIN_FREE_MERGE;
+  uint8_t evidence_digest[CRABS_HASH_SIZE];
+  memset(evidence_digest, 0x33, CRABS_HASH_SIZE);
+  ASSERT_EQ(state_append_fork_evidence(item, "mallory", evidence_digest),
+            CRABS_SUCCESS);
+  buf = crabs_serialize_state(state);
+  EXPECT_EQ(buf, nullptr);
+  if (buf != nullptr) serialized_buffer_destroy(buf);
+
+  // Sovereign chain fields (writer/seq/digest) without the fork set still
+  // have no wire home on a non-sovereign item.
+  item->fork_count = 0;
+  item->fork_writers[0][0] = '\0';
+  item->writer[0] = '\0';
+  item->item_seq = 0;
+  memset(item->item_digest, 0, CRABS_HASH_SIZE);
+  buf = crabs_serialize_state(state);
+  ASSERT_NE(buf, nullptr) << "zeroed domain fields serialize cleanly";
+  serialized_buffer_destroy(buf);
+  item->item_seq = 3;
+  buf = crabs_serialize_state(state);
+  EXPECT_EQ(buf, nullptr);
+  if (buf != nullptr) serialized_buffer_destroy(buf);
+  item->item_seq = 0;
+  strncpy(item->writer, "alice", CRABS_MAX_USER_ID - 1);
+  buf = crabs_serialize_state(state);
+  EXPECT_EQ(buf, nullptr);
+  if (buf != nullptr) serialized_buffer_destroy(buf);
+
+  // Unterminated writer string: never reaches the wire (strlen-guard).
+  item->write_domain = CRABS_DOMAIN_SOVEREIGN;
+  memset(item->writer, 'x', CRABS_MAX_USER_ID);
+  buf = crabs_serialize_state(state);
+  EXPECT_EQ(buf, nullptr);
+  if (buf != nullptr) serialized_buffer_destroy(buf);
+
+  state_destroy(state);
+}

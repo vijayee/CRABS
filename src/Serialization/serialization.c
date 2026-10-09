@@ -63,6 +63,11 @@
 // compressed public key. Bounds the attacker-controlled chain count against
 // the remaining buffer (same audit A-3/A-5 pattern as the sections above).
 #define CRABS_DESER_LINEAGE_CHAIN_ENTRY_WIRE_BYTES (sizeof(uint64_t) + 33)
+// v14: minimum wire size of one sovereign fork-evidence entry: an empty
+// string16 writer (2) + a 32-byte evidence digest. Bounds the
+// attacker-controlled fork count against the remaining buffer (same audit
+// A-3/A-5 pattern as the sections above).
+#define CRABS_DESER_FORK_ENTRY_WIRE_BYTES (2 + CRABS_HASH_SIZE)
 
 // ============================================================
 // Write buffer helper
@@ -911,11 +916,14 @@ static void* _deserialize_crdt_value(const uint8_t* data, uint32_t len, data_typ
 // Data item serialization (§13.2)
 // ============================================================
 // NOTE (write-domains v1): this function's output IS the preimage of the
-// sovereign item hash chain via crabs_serialize_data_item below. When the
-// v14 per-item domain tail (write_domain/writer/item_seq/item_digest/fork
-// set) lands, it must be emitted by the per-item call site that versions it
-// (the state serializer), NOT folded in here unconditionally — the digest
-// preimage deliberately excludes domain metadata (see serialization.h).
+// sovereign item hash chain via crabs_serialize_data_item below. The v14
+// per-item domain tail (write_domain/writer/item_seq/item_digest/fork set)
+// is emitted by the per-item call site that versions it (the state
+// serializer's item loop), NOT folded in here — the digest preimage
+// deliberately excludes domain metadata (see serialization.h; folding
+// item_digest into its own preimage is self-referential, and folding
+// item_seq in would couple the digest to chain position rather than
+// content).
 static void _serialize_data_item(write_buf_t* buf, const data_item_t* item) {
   // name_length + name
   _write_string16(buf, item->name);
@@ -1192,6 +1200,129 @@ serialized_buffer_t* crabs_serialize_data_item(const data_item_t* item) {
   free(buf->data);
   free(buf);
   return result;
+}
+
+// v14 (write-domains v1): the per-item write-domain tail. Emitted by the
+// state serializer's item loop AFTER _serialize_data_item's pre-domain
+// bytes — never inside _serialize_data_item itself, because that function's
+// output is the preimage of the sovereign hash chain
+// (crabs_serialize_data_item) and folding item_seq/item_digest into their
+// own preimage is self-referential.
+//
+// Layout: u8 write_domain, then a domain-specific arm:
+//   FREE_MERGE:    nothing more — a default item's tail is one 0x00 byte.
+//   SOVEREIGN:     string16 writer + u64le item_seq + 32B item_digest +
+//                  u8 fork_count + per entry string16 fork_writer + 32B
+//                  evidence digest. The fork (quarantine) block lives inside
+//                  the SOVEREIGN arm — quarantine is a sovereign-item
+//                  property — and its count byte is ALWAYS present (the
+//                  entry bytes exist only when fork_count > 0), so the
+//                  reader never needs a separate presence signal.
+//   GROUP_ORDERED: u8 ordering_module.
+//
+// Fail-loud validation (the writer never emits a blob its own reader
+// rejects — same discipline as the v13 lineage key chain): an unknown
+// domain, a SOVEREIGN item with an empty writer, an item_seq/item_digest
+// pair violating "seq == 0 exactly when the digest is all-zero", an
+// over-cap or empty-writer fork set, fork evidence (or any sovereign chain
+// field) on a non-sovereign item — each would either be rejected by the
+// reader or silently lost on reload — all return false and abort the whole
+// serialize.
+static bool _serialize_data_item_domain_tail(write_buf_t* buf,
+                                             const data_item_t* item) {
+  static const uint8_t zero_digest[CRABS_HASH_SIZE] = {0};
+  bool digest_is_zero =
+      (memcmp(item->item_digest, zero_digest, CRABS_HASH_SIZE) == 0);
+  if (item->write_domain != CRABS_DOMAIN_FREE_MERGE &&
+      item->write_domain != CRABS_DOMAIN_SOVEREIGN &&
+      item->write_domain != CRABS_DOMAIN_GROUP_ORDERED) return false;
+  if (item->write_domain == CRABS_DOMAIN_SOVEREIGN) {
+    // No unterminated field may reach _write_string16's strlen: the reader
+    // caps strings at CRABS_MAX_USER_ID - 1 and always NUL-terminates, so a
+    // non-terminated in-memory string can't round-trip.
+    if (memchr(item->writer, '\0', CRABS_MAX_USER_ID) == NULL) return false;
+    if (item->writer[0] == '\0') return false;
+    if ((item->item_seq == 0) != digest_is_zero) return false;
+    if (item->fork_count > CRABS_MAX_FORK_WRITERS) return false;
+    for (uint32_t fork_index = 0; fork_index < item->fork_count; fork_index++) {
+      if (memchr(item->fork_writers[fork_index], '\0',
+                 CRABS_MAX_USER_ID) == NULL ||
+          item->fork_writers[fork_index][0] == '\0') {
+        return false;
+      }
+    }
+  } else {
+    // writer/item_seq/item_digest and the fork set are SOVEREIGN-only: no
+    // wire arm writes them for other domains, so carrying them silently
+    // would lose data on reload. Refuse and abort the serialize.
+    if (item->writer[0] != '\0' || item->item_seq != 0 || !digest_is_zero ||
+        item->fork_count > 0) {
+      return false;
+    }
+  }
+
+  _write_uint8(buf, (uint8_t)item->write_domain);
+  if (item->write_domain == CRABS_DOMAIN_SOVEREIGN) {
+    _write_string16(buf, item->writer);
+    _write_uint64_le(buf, item->item_seq);
+    _write_bytes(buf, item->item_digest, CRABS_HASH_SIZE);
+    _write_uint8(buf, (uint8_t)item->fork_count);
+    for (uint32_t fork_index = 0; fork_index < item->fork_count; fork_index++) {
+      _write_string16(buf, item->fork_writers[fork_index]);
+      _write_bytes(buf, item->fork_evidence_digests[fork_index],
+                   CRABS_HASH_SIZE);
+    }
+  } else if (item->write_domain == CRABS_DOMAIN_GROUP_ORDERED) {
+    _write_uint8(buf, item->ordering_module);
+  }
+  return true;
+}
+
+// v14 reader arm, mirroring _serialize_data_item_domain_tail exactly. Every
+// validation fires BEFORE committing to the value (fail-closed, A10-L2
+// pattern): an unknown-domain byte, an empty SOVEREIGN writer, a violated
+// seq/digest consistency rule, an over-cap fork count, or a fork count the
+// remaining bytes cannot satisfy all refuse the load. An item deserialized
+// from a pre-v14 blob never passes through here and keeps the zeroed
+// (FREE_MERGE) defaults from get_clear_memory.
+static bool _deserialize_data_item_domain_tail(read_buf_t* buf,
+                                               data_item_t* item) {
+  uint8_t domain_byte;
+  if (!_read_uint8(buf, &domain_byte)) return false;
+  if (domain_byte > (uint8_t)CRABS_DOMAIN_GROUP_ORDERED) return false;
+  item->write_domain = (crabs_write_domain_e)domain_byte;
+
+  if (item->write_domain == CRABS_DOMAIN_SOVEREIGN) {
+    if (!_read_string16(buf, item->writer, CRABS_MAX_USER_ID)) return false;
+    if (item->writer[0] == '\0') return false;
+    if (!_read_uint64_le(buf, &item->item_seq)) return false;
+    if (!_read_bytes(buf, item->item_digest, CRABS_HASH_SIZE)) return false;
+    static const uint8_t zero_digest[CRABS_HASH_SIZE] = {0};
+    bool digest_is_zero =
+        (memcmp(item->item_digest, zero_digest, CRABS_HASH_SIZE) == 0);
+    // A hand-created sovereign item (never written) has seq 0 with a zero
+    // digest; the chain advances both together. One moving without the
+    // other is corruption.
+    if ((item->item_seq == 0) != digest_is_zero) return false;
+    uint8_t fork_count;
+    if (!_read_uint8(buf, &fork_count)) return false;
+    if (fork_count > CRABS_MAX_FORK_WRITERS) return false;
+    if (fork_count >
+        (buf->len - buf->offset) / CRABS_DESER_FORK_ENTRY_WIRE_BYTES) {
+      return false;
+    }
+    item->fork_count = fork_count;
+    for (uint32_t fork_index = 0; fork_index < fork_count; fork_index++) {
+      if (!_read_string16(buf, item->fork_writers[fork_index],
+                          CRABS_MAX_USER_ID)) return false;
+      if (item->fork_writers[fork_index][0] == '\0') return false;
+      if (!_read_bytes(buf, item->fork_evidence_digests[fork_index],
+                       CRABS_HASH_SIZE)) return false;
+    }
+  } else if (item->write_domain == CRABS_DOMAIN_GROUP_ORDERED) {
+    if (!_read_uint8(buf, &item->ordering_module)) return false;
+  }
+  return true;
 }
 
 // ============================================================
@@ -1537,6 +1668,15 @@ static serialized_buffer_t* _serialize_state_internal(const state_t* state,
   item = state->items;
   while (item != NULL) {
     _serialize_data_item(buf, item);
+    // v14: per-item write-domain tail. The tail goes HERE (the state's item
+    // stream), not into _serialize_data_item — that helper is the sovereign
+    // hash-chain preimage and must stay the pre-domain form. Fail-loud:
+    // the writer never emits a blob its own reader would reject.
+    if (!_serialize_data_item_domain_tail(buf, item)) {
+      free(buf->data);
+      free(buf);
+      return NULL;
+    }
     item = item->next;
   }
 
@@ -1918,6 +2058,16 @@ static state_t* _deserialize_state_internal(const uint8_t* data, size_t len,
     if (!_deserialize_data_item(&buf, item, version)) {
       data_item_destroy(item);
       goto fail;
+    }
+    // v14: per-item write-domain tail, read exactly as the writer emits it.
+    // Pre-v14 blobs carry no tail and keep the zeroed defaults the item was
+    // allocated with (FREE_MERGE, empty writer, seq 0) — the upgrade path
+    // is a zero-default additive section, same as v11->v13.
+    if (version >= 14) {
+      if (!_deserialize_data_item_domain_tail(&buf, item)) {
+        data_item_destroy(item);
+        goto fail;
+      }
     }
     if (state->items == NULL) {
       state->items = item;

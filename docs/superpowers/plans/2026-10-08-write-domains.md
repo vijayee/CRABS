@@ -22,10 +22,10 @@
 ### Task 2: Serialization v14 — per-item domain fields
 
 **Files:** `src/Serialization/serialization.{h,c}`, `test/test_serialization.cpp`.
-- [ ] Bump `CRABS_SERIAL_VERSION` 14 (comment). Writer: per item, emit domain fields ONLY for non-default: `u8 write_domain`; SOVEREIGN → `string16 writer` + `u64 item_seq` + `bytes32 item_digest`; fork set (`u8 count` + per-entry string16 writer + bytes32 evidence); GROUP_ORDERED → `u8 module`. Default (FREE_MERGE, no writer) = single `0x00` byte per item (keeps blob sizes for existing items at +1 byte).
-- [ ] Reader gated `version >= 14`: same optional layout; **enum whitelist** (`write_domain ≤ 2`); writer bounds; count cap `CRABS_MAX_FORK_WRITERS` + remaining-bytes bound; SOVEREIGN requires non-empty writer + `item_seq ≥ 1` consistency (`item_seq==0 ⇒ digest all-zero`); full-consumption check unchanged (len-32).
-- [ ] Pre-v14 loads: all items FREE_MERGE (assert in a test with a v13 fixture — reuse the existing version-surgery test pattern).
-- [ ] Tests: round-trip with a sovereign item + fork entry; corrupt domain enum → reject; corrupt fork count → reject. Commit: `feat: v14 state format — per-item write domains and fork evidence`.
+- [x] Bump `CRABS_SERIAL_VERSION` 14 (comment). Writer: per item, emit domain fields ONLY for non-default: `u8 write_domain`; SOVEREIGN → `string16 writer` + `u64 item_seq` + `bytes32 item_digest`; fork set (`u8 count` + per-entry string16 writer + bytes32 evidence); GROUP_ORDERED → `u8 module`. Default (FREE_MERGE, no writer) = single `0x00` byte per item (keeps blob sizes for existing items at +1 byte). (As landed: the fork block lives inside the SOVEREIGN arm with an ALWAYS-present count byte so the reader needs no presence signal; entries exist only when count > 0.)
+- [x] Reader gated `version >= 14`: same optional layout; **enum whitelist** (`write_domain ≤ 2`); writer bounds; count cap `CRABS_MAX_FORK_WRITERS` + remaining-bytes bound; SOVEREIGN requires non-empty writer + `item_seq ≥ 1` consistency (`item_seq==0 ⇒ digest all-zero`); full-consumption check unchanged (len-32).
+- [x] Pre-v14 loads: all items FREE_MERGE (assert in a test with a v13 fixture — reuse the existing version-surgery test pattern).
+- [x] Tests: round-trip with a sovereign item + fork entry; corrupt domain enum → reject; corrupt fork count → reject. Commit: `feat: v14 state format — per-item write domains and fork evidence`.
 
 ### Task 3: Blueprint wiring (domains are declared at mint)
 

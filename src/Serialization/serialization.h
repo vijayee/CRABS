@@ -18,7 +18,7 @@
 // Magic bytes and format version (§13.1)
 // ============================================================
 #define CRABS_SERIAL_MAGIC      0x42415243  // "CRAB" in little-endian
-#define CRABS_SERIAL_VERSION    13          // v13: lineage parent key chain (child side) + key version / last transition (parent side)
+#define CRABS_SERIAL_VERSION    14          // v14: per-item write-domain tail (write_domain + SOVEREIGN chain/quarantine fields + GROUP_ORDERED module)
 
 // ============================================================
 // Serialized buffer
