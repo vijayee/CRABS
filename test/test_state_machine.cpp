@@ -1231,3 +1231,364 @@ TEST_F(TestStateMachine, RegisteredHandlerCustomOpWithZeroResourcesSucceeds) {
   EXPECT_EQ(g_zero_resource_handler_calls, 1);
   EXPECT_EQ(state->log_count, log_count_before + 1);
 }
+
+// ============================================================
+// Write domains v1: DOMAIN_CHECK pipeline step (spec 2026-10-08,
+// §Execution pipeline change) and the post-handler sovereign chain
+// bookkeeping (item_seq advance + item_digest recompute).
+// ============================================================
+
+// Handler that bumps a G_COUNTER item — gives a sovereign op a real content
+// mutation so the post-op chain digest actually changes (the digest preimage
+// deliberately excludes item_seq, so a no-op op would not move it).
+static crabs_error_e sov_bump_handler(state_t* handler_state, operation_t* op) {
+  if (op->resource_count == 0) return CRABS_ERR_RESOURCE_NOT_FOUND;
+  data_item_t* item = state_find_item(handler_state, op->resources[0]);
+  if (item == NULL || item->type != DATA_TYPE_COUNTER) {
+    return CRABS_ERR_RESOURCE_NOT_FOUND;
+  }
+  return g_counter_increment((g_counter_t*)item->value, op->signer_id, 1);
+}
+
+// Add a SOVEREIGN G_COUNTER item to the state. Returns the state's item
+// pointer (state owns it after state_add_item).
+static data_item_t* add_sovereign_counter(state_t* target_state,
+                                          const char* name,
+                                          const char* writer) {
+  data_item_options_t options = {};
+  options.write_domain = CRABS_DOMAIN_SOVEREIGN;
+  options.writer = writer;
+  data_item_t* item = nullptr;
+  if (data_item_create_with_options(name, DATA_TYPE_COUNTER, CRDT_G_COUNTER,
+                                    &options, &item) != CRABS_SUCCESS) {
+    return nullptr;
+  }
+  item->value = g_counter_create();
+  if (state_add_item(target_state, item) != CRABS_SUCCESS) {
+    data_item_destroy(item);
+    return nullptr;
+  }
+  return state_find_item(target_state, name);
+}
+
+// Build a one-resource custom op of `op_type` touching `resource_name`
+// (PROTOCOL_IDLE expectations match a fresh item). uuid is fixed-pattern.
+// signer_id defaults to alice (the fixture's sign_operation signs with her
+// key); sign_as overwrites it for other signers, and the Mode B test clears
+// it explicitly.
+static operation_t* make_domain_op(const char* op_type, const char* resource_name,
+                                   uint8_t uuid_seed) {
+  operation_t* op = operation_create(op_type);
+  memset(op->uuid, uuid_seed, CRABS_UUID_SIZE);
+  op->resources = (char(*)[CRABS_MAX_USER_ID])malloc(sizeof(char[CRABS_MAX_USER_ID]));
+  strncpy(op->resources[0], resource_name, CRABS_MAX_USER_ID - 1);
+  op->resource_count = 1;
+  op->required_state = (protocol_state_e*)malloc(sizeof(protocol_state_e));
+  op->required_state[0] = PROTOCOL_IDLE;
+  op->next_state = (protocol_state_e*)malloc(sizeof(protocol_state_e));
+  op->next_state[0] = PROTOCOL_IDLE;
+  strncpy(op->signer_id, "alice", CRABS_MAX_USER_ID - 1);
+  return op;
+}
+
+// Sign `op` with `key` as `signer_id`, stamping the R7-11/R7-04 fields the
+// gates require (per-signer monotone lamport, current key_version). Set
+// op->sovereign_prefixes before calling: the signed canonical form (v4)
+// binds them.
+static void sign_as(operation_t* op, attribute_machine_t* signing_am,
+                    ecdsa_keypair_t* key, const char* signer_id,
+                    uint64_t* signer_lamport) {
+  strncpy(op->signer_id, signer_id, CRABS_MAX_USER_ID - 1);
+  user_t* signer = attribute_machine_find_user(signing_am, signer_id);
+  if (signer != NULL) op->signer_key_version = signer->key_version;
+  op->lamport_time = ++(*signer_lamport);
+  serialized_buffer_t* ser = crabs_serialize_for_signing(op);
+  if (ser != NULL) {
+    crypto_sign_operation(key->private_key, ser->data, ser->len, op->signature);
+    serialized_buffer_destroy(ser);
+  }
+}
+
+// A non-writer's validly-signed op on a SOVEREIGN item is rejected at
+// DOMAIN_CHECK with NOT_ITEM_WRITER and changes nothing.
+TEST_F(TestStateMachine, DomainCheckSovereignWriterOnly) {
+  state_add_policy(state, "sov_bump", "role:admin");
+  ASSERT_EQ(state_machine_register_handler(state, "sov_bump", sov_bump_handler),
+            CRABS_SUCCESS);
+  data_item_t* item = add_sovereign_counter(state, "sov_counter", "alice");
+  ASSERT_NE(item, nullptr);
+
+  ecdsa_keypair_t* bob_key = crypto_ecdsa_generate();
+  ASSERT_NE(bob_key, nullptr);
+  ASSERT_EQ(crabs_test_register_user_with_role(am, "bob", bob_key->public_key,
+                                               "role", "admin"),
+            CRABS_SUCCESS);
+
+  operation_t* op = make_domain_op("sov_bump", "sov_counter", 0x31);
+  // Correct prefix for a fresh item (seq 0, zero digest) — only the WRITER is
+  // wrong, so any rejection must be the attribution check.
+  op->sovereign_prefix_count = 1;
+  op->sovereign_prefixes[0].item_seq = 0;
+  memset(op->sovereign_prefixes[0].prev_item_digest, 0, CRABS_HASH_SIZE);
+  uint64_t bob_lamport = 0;
+  sign_as(op, am, bob_key, "bob", &bob_lamport);
+
+  uint64_t version_before = state->version;
+  uint64_t log_count_before = state->log_count;
+  EXPECT_EQ(state_machine_validate(state, op), CRABS_ERR_NOT_ITEM_WRITER);
+  EXPECT_EQ(state_machine_execute(state, op), CRABS_ERR_NOT_ITEM_WRITER);
+  operation_destroy(op);
+  crypto_ecdsa_keypair_destroy(bob_key);
+
+  EXPECT_EQ(state->version, version_before);
+  EXPECT_EQ(state->log_count, log_count_before);
+  EXPECT_EQ(item->item_seq, (uint64_t)0);
+}
+
+// The prefix's item_seq must equal the item's current seq: ahead-of-current
+// is rejected; current is accepted and the post-op bookkeeping advances the
+// chain (seq + 1, digest recomputed over the post-op serialized form).
+TEST_F(TestStateMachine, DomainCheckSeqMustBeCurrent) {
+  state_add_policy(state, "sov_bump", "role:admin");
+  ASSERT_EQ(state_machine_register_handler(state, "sov_bump", sov_bump_handler),
+            CRABS_SUCCESS);
+  data_item_t* item = add_sovereign_counter(state, "sov_counter", "alice");
+  ASSERT_NE(item, nullptr);
+
+  // Stale/ahead seq: item_seq 1 while the item is at 0.
+  operation_t* ahead_op = make_domain_op("sov_bump", "sov_counter", 0x32);
+  ahead_op->sovereign_prefix_count = 1;
+  ahead_op->sovereign_prefixes[0].item_seq = 1;
+  memset(ahead_op->sovereign_prefixes[0].prev_item_digest, 0, CRABS_HASH_SIZE);
+  set_signer_key_version(ahead_op);
+  sign_operation(ahead_op);
+  EXPECT_EQ(state_machine_execute(state, ahead_op), CRABS_ERR_SEQ_MISMATCH);
+  operation_destroy(ahead_op);
+  EXPECT_EQ(item->item_seq, (uint64_t)0);
+
+  // Current seq accepted; bookkeeping advances the chain.
+  uint8_t old_digest[CRABS_HASH_SIZE];
+  memcpy(old_digest, item->item_digest, CRABS_HASH_SIZE);
+  operation_t* good_op = make_domain_op("sov_bump", "sov_counter", 0x33);
+  good_op->sovereign_prefix_count = 1;
+  good_op->sovereign_prefixes[0].item_seq = 0;
+  memset(good_op->sovereign_prefixes[0].prev_item_digest, 0, CRABS_HASH_SIZE);
+  set_signer_key_version(good_op);
+  sign_operation(good_op);
+  EXPECT_EQ(state_machine_validate(state, good_op), CRABS_SUCCESS);
+  EXPECT_EQ(state_machine_execute(state, good_op), CRABS_SUCCESS);
+  operation_destroy(good_op);
+
+  EXPECT_EQ(item->item_seq, (uint64_t)1);
+  EXPECT_NE(memcmp(item->item_digest, old_digest, CRABS_HASH_SIZE), 0);
+  uint8_t recomputed[CRABS_HASH_SIZE];
+  ASSERT_EQ(state_item_digest_compute(item, recomputed), CRABS_SUCCESS);
+  EXPECT_EQ(memcmp(item->item_digest, recomputed, CRABS_HASH_SIZE), 0);
+
+  // Replaying the accepted prefix is stale now (seq moved): SEQ_MISMATCH.
+  operation_t* replay_op = make_domain_op("sov_bump", "sov_counter", 0x34);
+  replay_op->sovereign_prefix_count = 1;
+  replay_op->sovereign_prefixes[0].item_seq = 0;
+  memset(replay_op->sovereign_prefixes[0].prev_item_digest, 0, CRABS_HASH_SIZE);
+  set_signer_key_version(replay_op);
+  sign_operation(replay_op);
+  EXPECT_EQ(state_machine_execute(state, replay_op), CRABS_ERR_SEQ_MISMATCH);
+  operation_destroy(replay_op);
+  EXPECT_EQ(item->item_seq, (uint64_t)1);
+}
+
+// Same seq, wrong digest: the writer equivocated. FORK_DETECTED, and nothing
+// is applied (no log entry, no version bump, chain untouched). The report
+// path that would quarantine this writer is Task 6; here we only detect.
+TEST_F(TestStateMachine, DomainCheckDigestMismatchForks) {
+  state_add_policy(state, "sov_bump", "role:admin");
+  ASSERT_EQ(state_machine_register_handler(state, "sov_bump", sov_bump_handler),
+            CRABS_SUCCESS);
+  data_item_t* item = add_sovereign_counter(state, "sov_counter", "alice");
+  ASSERT_NE(item, nullptr);
+
+  operation_t* good_op = make_domain_op("sov_bump", "sov_counter", 0x35);
+  good_op->sovereign_prefix_count = 1;
+  good_op->sovereign_prefixes[0].item_seq = 0;
+  memset(good_op->sovereign_prefixes[0].prev_item_digest, 0, CRABS_HASH_SIZE);
+  set_signer_key_version(good_op);
+  sign_operation(good_op);
+  ASSERT_EQ(state_machine_execute(state, good_op), CRABS_SUCCESS);
+  operation_destroy(good_op);
+  ASSERT_EQ(item->item_seq, (uint64_t)1);
+
+  uint64_t version_before = state->version;
+  uint64_t log_count_before = state->log_count;
+  uint8_t chain_digest[CRABS_HASH_SIZE];
+  memcpy(chain_digest, item->item_digest, CRABS_HASH_SIZE);
+
+  operation_t* fork_op = make_domain_op("sov_bump", "sov_counter", 0x36);
+  fork_op->sovereign_prefix_count = 1;
+  fork_op->sovereign_prefixes[0].item_seq = 1;  // current seq passes...
+  memset(fork_op->sovereign_prefixes[0].prev_item_digest, 0xFF,
+         CRABS_HASH_SIZE);                       // ...but the digest lies
+  set_signer_key_version(fork_op);
+  sign_operation(fork_op);
+  EXPECT_EQ(state_machine_validate(state, fork_op), CRABS_ERR_FORK_DETECTED);
+  EXPECT_EQ(state_machine_execute(state, fork_op), CRABS_ERR_FORK_DETECTED);
+  operation_destroy(fork_op);
+
+  EXPECT_EQ(state->version, version_before);
+  EXPECT_EQ(state->log_count, log_count_before);
+  EXPECT_EQ(item->item_seq, (uint64_t)1);
+  EXPECT_EQ(memcmp(item->item_digest, chain_digest, CRABS_HASH_SIZE), 0);
+}
+
+// The prefix slots are indexed per SOVEREIGN resource in resource order —
+// the count must match exactly. Too few, too many, or prefixes on an op
+// whose resources are all FREE_MERGE are fail-closed SEQ_MISMATCH.
+TEST_F(TestStateMachine, DomainCheckPrefixCountMustMatchSovereignResources) {
+  state_add_policy(state, "sov_bump", "role:admin");
+  ASSERT_EQ(state_machine_register_handler(state, "sov_bump", sov_bump_handler),
+            CRABS_SUCCESS);
+  data_item_t* item = add_sovereign_counter(state, "sov_counter", "alice");
+  ASSERT_NE(item, nullptr);
+
+  // Missing prefix for the one sovereign resource.
+  operation_t* missing_op = make_domain_op("sov_bump", "sov_counter", 0x37);
+  set_signer_key_version(missing_op);
+  sign_operation(missing_op);
+  EXPECT_EQ(state_machine_execute(state, missing_op),
+            CRABS_ERR_SEQ_MISMATCH);
+  operation_destroy(missing_op);
+
+  // Extra prefix beyond the sovereign resources present.
+  operation_t* extra_op = make_domain_op("sov_bump", "sov_counter", 0x38);
+  extra_op->sovereign_prefix_count = 2;
+  extra_op->sovereign_prefixes[0].item_seq = 0;
+  extra_op->sovereign_prefixes[1].item_seq = 0;
+  set_signer_key_version(extra_op);
+  sign_operation(extra_op);
+  EXPECT_EQ(state_machine_execute(state, extra_op), CRABS_ERR_SEQ_MISMATCH);
+  operation_destroy(extra_op);
+
+  // Prefixes on an all-FREE_MERGE op: no slot to assign them to.
+  data_item_t* free_item =
+      data_item_create("free_counter", DATA_TYPE_COUNTER, CRDT_G_COUNTER);
+  free_item->value = g_counter_create();
+  ASSERT_EQ(state_add_item(state, free_item), CRABS_SUCCESS);
+  operation_t* free_op = make_domain_op("sov_bump", "free_counter", 0x39);
+  free_op->sovereign_prefix_count = 1;
+  free_op->sovereign_prefixes[0].item_seq = 0;
+  set_signer_key_version(free_op);
+  sign_operation(free_op);
+  EXPECT_EQ(state_machine_execute(state, free_op), CRABS_ERR_SEQ_MISMATCH);
+  operation_destroy(free_op);
+
+  EXPECT_EQ(item->item_seq, (uint64_t)0);
+}
+
+// A quarantined writer's VALID-signature op is rejected QUARANTINED. The op
+// is authentically signed (authorization passes first — the rejection is the
+// domain step, not the crypto), and the deliberately wrong seq pins the
+// check order: quarantine is examined before the chain prefix.
+TEST_F(TestStateMachine, DomainCheckQuarantinedWriterRejected) {
+  state_add_policy(state, "sov_bump", "role:admin");
+  ASSERT_EQ(state_machine_register_handler(state, "sov_bump", sov_bump_handler),
+            CRABS_SUCCESS);
+  data_item_t* item = add_sovereign_counter(state, "sov_counter", "alice");
+  ASSERT_NE(item, nullptr);
+
+  uint8_t evidence[CRABS_HASH_SIZE];
+  memset(evidence, 0x5A, CRABS_HASH_SIZE);
+  ASSERT_EQ(state_append_fork_evidence(item, "alice", evidence), CRABS_SUCCESS);
+  ASSERT_TRUE(state_item_is_quarantined(item, "alice"));
+
+  operation_t* op = make_domain_op("sov_bump", "sov_counter", 0x3A);
+  op->sovereign_prefix_count = 1;
+  op->sovereign_prefixes[0].item_seq = 7;  // wrong on purpose
+  memset(op->sovereign_prefixes[0].prev_item_digest, 0, CRABS_HASH_SIZE);
+  set_signer_key_version(op);
+  sign_operation(op);
+  EXPECT_EQ(state_machine_execute(state, op), CRABS_ERR_QUARANTINED);
+  operation_destroy(op);
+
+  EXPECT_EQ(item->item_seq, (uint64_t)0);
+}
+
+// FREE_MERGE items (the default) are untouched by the new step: an
+// authorized op with no prefixes succeeds exactly as before and no chain
+// fields move.
+TEST_F(TestStateMachine, DomainCheckFreeMergeUnchanged) {
+  state_add_policy(state, "sov_bump", "role:admin");
+  ASSERT_EQ(state_machine_register_handler(state, "sov_bump", sov_bump_handler),
+            CRABS_SUCCESS);
+  data_item_t* free_item =
+      data_item_create("free_counter", DATA_TYPE_COUNTER, CRDT_G_COUNTER);
+  free_item->value = g_counter_create();
+  ASSERT_EQ(state_add_item(state, free_item), CRABS_SUCCESS);
+
+  operation_t* op = make_domain_op("sov_bump", "free_counter", 0x3B);
+  set_signer_key_version(op);
+  sign_operation(op);
+  EXPECT_EQ(state_machine_execute(state, op), CRABS_SUCCESS);
+  operation_destroy(op);
+
+  data_item_t* item = state_find_item(state, "free_counter");
+  ASSERT_NE(item, nullptr);
+  EXPECT_EQ(item->write_domain, CRABS_DOMAIN_FREE_MERGE);
+  EXPECT_EQ(item->item_seq, (uint64_t)0);
+  uint8_t zero_digest[CRABS_HASH_SIZE];
+  memset(zero_digest, 0, CRABS_HASH_SIZE);
+  EXPECT_EQ(memcmp(item->item_digest, zero_digest, CRABS_HASH_SIZE), 0);
+}
+
+// v1 seam: GROUP_ORDERED items exist but no ordering module can be
+// registered, so every direct write is off-path (fail closed).
+TEST_F(TestStateMachine, DomainCheckGroupOrderedV1ReadOnly) {
+  state_add_policy(state, "sov_bump", "role:admin");
+  ASSERT_EQ(state_machine_register_handler(state, "sov_bump", sov_bump_handler),
+            CRABS_SUCCESS);
+  data_item_options_t options = {};
+  options.write_domain = CRABS_DOMAIN_GROUP_ORDERED;
+  data_item_t* group_item = nullptr;
+  ASSERT_EQ(data_item_create_with_options("group_counter", DATA_TYPE_COUNTER,
+                                          CRDT_G_COUNTER, &options, &group_item),
+            CRABS_SUCCESS);
+  group_item->value = g_counter_create();
+  ASSERT_EQ(state_add_item(state, group_item), CRABS_SUCCESS);
+
+  operation_t* op = make_domain_op("sov_bump", "group_counter", 0x3C);
+  set_signer_key_version(op);
+  sign_operation(op);
+  EXPECT_EQ(state_machine_validate(state, op), CRABS_ERR_ORDERING_PATH);
+  EXPECT_EQ(state_machine_execute(state, op), CRABS_ERR_ORDERING_PATH);
+  operation_destroy(op);
+}
+
+// Mode B (signer omitted, resolved via the keyring) is incompatible with the
+// sovereignty check by definition: the writer must be attributable, so an
+// anonymous op touching a SOVEREIGN item is NOT_ITEM_WRITER even when the
+// key IS the writer's.
+TEST_F(TestStateMachine, DomainCheckModeBSovereignRejected) {
+  state_add_policy(state, "sov_bump", "role:admin");
+  ASSERT_EQ(state_machine_register_handler(state, "sov_bump", sov_bump_handler),
+            CRABS_SUCCESS);
+  data_item_t* item = add_sovereign_counter(state, "sov_counter", "alice");
+  ASSERT_NE(item, nullptr);
+
+  operation_t* op = make_domain_op("sov_bump", "sov_counter", 0x3D);
+  op->sovereign_prefix_count = 1;
+  op->sovereign_prefixes[0].item_seq = 0;
+  memset(op->sovereign_prefixes[0].prev_item_digest, 0, CRABS_HASH_SIZE);
+  // Anonymous: signer_id left empty; signed with alice's key so the keyring
+  // resolves the signer (Mode B) — still rejected at the domain step.
+  op->signer_id[0] = '\0';
+  user_t* signer = attribute_machine_find_user(am, "alice");
+  if (signer != NULL) op->signer_key_version = signer->key_version;
+  op->lamport_time = ++lamport_counter;
+  serialized_buffer_t* ser = crabs_serialize_for_signing(op);
+  ASSERT_NE(ser, nullptr);
+  crypto_sign_operation(alice_key->private_key, ser->data, ser->len,
+                        op->signature);
+  serialized_buffer_destroy(ser);
+
+  EXPECT_EQ(state_machine_execute(state, op), CRABS_ERR_NOT_ITEM_WRITER);
+  operation_destroy(op);
+  EXPECT_EQ(item->item_seq, (uint64_t)0);
+}

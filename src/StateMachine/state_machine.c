@@ -954,6 +954,125 @@ static crabs_error_e _verify_co_signatures(state_t* state, const operation_t* op
   return CRABS_SUCCESS;
 }
 
+// Step 6d: DOMAIN_CHECK (write-domains v1, spec 2026-10-08 §Execution
+// pipeline change). Runs post-dedup/post-key-scheme-co-sig/pre-handler —
+// after authorization has made op->signer_id authoritative, before any
+// mutation. Only EXISTING items are examined: a missing resource is reported
+// by the step-7b/handler convention (CRABS_ERR_RESOURCE_NOT_FOUND), not by
+// this check.
+//
+// Prefix alignment: op->sovereign_prefixes walks the op's SOVEREIGN
+// resources in resource order (non-sovereign resources consume no slot), so
+// the count must match EXACTLY the number of sovereign resources present —
+// a prefix silently assigned to the wrong item would compare against the
+// wrong chain head. Fail closed (CRABS_ERR_SEQ_MISMATCH) on any mismatch.
+static crabs_error_e _run_domain_check(state_t* state, const operation_t* op) {
+  uint32_t sovereign_count = 0;
+  for (uint32_t resource_index = 0; resource_index < op->resource_count;
+       resource_index++) {
+    const data_item_t* item = state_find_item(state, op->resources[resource_index]);
+    if (item != NULL && item->write_domain == CRABS_DOMAIN_SOVEREIGN) {
+      sovereign_count++;
+    }
+  }
+  if (op->sovereign_prefix_count != sovereign_count) {
+    return CRABS_ERR_SEQ_MISMATCH;
+  }
+
+  uint32_t prefix_index = 0;
+  for (uint32_t resource_index = 0; resource_index < op->resource_count;
+       resource_index++) {
+    const data_item_t* item = state_find_item(state, op->resources[resource_index]);
+    if (item == NULL) continue;
+    switch (item->write_domain) {
+      case CRABS_DOMAIN_GROUP_ORDERED:
+        // v1 seam: no ordering module can be registered (creation refuses a
+        // nonzero ordering_module, so it is always 0), and writes are only
+        // legal through a module's propose path — every direct write is
+        // off-path.
+        return CRABS_ERR_ORDERING_PATH;
+      case CRABS_DOMAIN_SOVEREIGN: {
+        // Cheap checks first: quarantine set membership, then writer
+        // attribution, then the chain prefix. The Task 6
+        // __report_equivocation__ handler populates the fork set with
+        // re-verified evidence; here we only consult it.
+        if (state_item_is_quarantined(item, op->signer_id)) {
+          return CRABS_ERR_QUARANTINED;
+        }
+        // Mode B (empty signer_id) is unattributable by definition — the
+        // writer binding is to a user_id, so sovereignty requires Mode A.
+        if (op->signer_id[0] == '\0' ||
+            strcmp(op->signer_id, item->writer) != 0) {
+          return CRABS_ERR_NOT_ITEM_WRITER;
+        }
+        const crabs_sovereign_op_prefix_t* prefix =
+            &op->sovereign_prefixes[prefix_index++];
+        if (prefix->item_seq != item->item_seq) {
+          return CRABS_ERR_SEQ_MISMATCH;
+        }
+        if (CRYPTO_memcmp(prefix->prev_item_digest, item->item_digest,
+                          CRABS_HASH_SIZE) != 0) {
+          // Same seq, different digest: the writer equivocated. Nothing is
+          // applied (this return precedes every mutation); the Task 6 report
+          // path constructs the __report_equivocation__ evidence from the
+          // two conflicting log entries.
+          return CRABS_ERR_FORK_DETECTED;
+        }
+        break;
+      }
+      case CRABS_DOMAIN_FREE_MERGE:
+      default:
+        break;
+    }
+  }
+  return CRABS_SUCCESS;
+}
+
+// Post-handler sovereign chain bookkeeping: advance each touched SOVEREIGN
+// item (item_seq + 1) and recompute item_digest over the item's post-op
+// serialized form (state_item_digest_compute — the same per-item shape the
+// state serializer emits). Runs only on the success path, after the handler
+// / step-7b transitions / dedup mutation and BEFORE append_log — the same
+// placement as the other per-op in-memory bookkeeping (R8-S-4 context):
+// there is no rollback machinery for op mutations, and an append_log failure
+// (OOM) already leaves the handler's own mutations committed while failing
+// the op before version++/tx-commit. Advancing the chain alongside those
+// mutations keeps it in lockstep with the op's other effects; advancing it
+// only AFTER append_log would expose the opposite inconsistency (a log entry
+// whose chain never moved) if the digest computation failed.
+static crabs_error_e _apply_sovereign_bookkeeping(state_t* state,
+                                                  const operation_t* op) {
+  for (uint32_t resource_index = 0; resource_index < op->resource_count;
+       resource_index++) {
+    data_item_t* item = state_find_item(state, op->resources[resource_index]);
+    if (item == NULL || item->write_domain != CRABS_DOMAIN_SOVEREIGN) {
+      continue;
+    }
+    // An op may name the same item in two resource slots; the chain advance
+    // must still be exactly-once per op (a duplicate slot consumed a second
+    // prefix in DOMAIN_CHECK, but must not bump seq twice — a seq jump is a
+    // gap another honest op's prefix can't span).
+    bool already_advanced = false;
+    for (uint32_t earlier_index = 0; earlier_index < resource_index;
+         earlier_index++) {
+      if (strcmp(op->resources[earlier_index],
+                 op->resources[resource_index]) == 0) {
+        already_advanced = true;
+        break;
+      }
+    }
+    if (already_advanced) {
+      continue;
+    }
+    item->item_seq += 1;
+    crabs_error_e digest_rc = state_item_digest_compute(item, item->item_digest);
+    if (digest_rc != CRABS_SUCCESS) {
+      return digest_rc;
+    }
+  }
+  return CRABS_SUCCESS;
+}
+
 static crabs_error_e state_machine_execute_internal(state_t* state, operation_t* op,
                                                     bool skip_authorization,
                                                     bool process_schedules) {
@@ -1119,6 +1238,19 @@ static crabs_error_e state_machine_execute_internal(state_t* state, operation_t*
     }
   }
 
+  // Step 6d: DOMAIN_CHECK (write-domains v1). Placement: post-dedup and
+  // post-authorization (op->signer_id is authoritative; for scheduled
+  // materializations it was authorized at submission), pre-handler (no
+  // mutation has happened yet). Runs unconditionally — including for
+  // skip_authorization materializations, whose chain prefixes must still be
+  // current at fire time: the item's chain may have advanced since
+  // submission, and applying a stale prefix silently would corrupt the
+  // chain (a failing materialization is recorded as __schedule_failed__).
+  crabs_error_e domain_rc = _run_domain_check(state, op);
+  if (domain_rc != CRABS_SUCCESS) {
+    return domain_rc;
+  }
+
   // Step 7: Execute operation handler
   crabs_error_e result;
   op_handler_fn custom_handler = NULL;
@@ -1234,6 +1366,16 @@ static crabs_error_e state_machine_execute_internal(state_t* state, operation_t*
     }
   }
 
+  // Write domains v1: advance the sovereign hash chain for every SOVEREIGN
+  // resource this op touched. Success-only and exactly-once (this runs after
+  // the handler's success return above and cannot run twice for one op);
+  // placement alongside the other per-op bookkeeping, before append_log, is
+  // documented on _apply_sovereign_bookkeeping.
+  crabs_error_e chain_rc = _apply_sovereign_bookkeeping(state, op);
+  if (chain_rc != CRABS_SUCCESS) {
+    return chain_rc;
+  }
+
   // Step 8: Auto-compaction check after OT operations (v1.5.2 §4)
   if (state->compaction_config != NULL &&
       strcmp(op->type, CRABS_OP_EXECUTE_OT) == 0) {
@@ -1338,6 +1480,14 @@ crabs_error_e state_machine_validate(state_t* state, const operation_t* op) {
   rc = _check_scheme_constraints(state, op, resolved_signer);
   if (rc != CRABS_SUCCESS) return rc;
   rc = _verify_co_signatures(state, op, &pp, resolved_signer);
+  if (rc != CRABS_SUCCESS) return rc;
+  // DOMAIN_CHECK runs here too (write-domains v1): this pass mirrors the
+  // execute path's pre-handler gates so a scheduled submission whose
+  // sovereign prefix / writer binding / quarantine state would be rejected
+  // at fire time fails BEFORE anyone co-signs or schedules it. Read-only —
+  // the check never mutates items, and the chain is re-checked at
+  // materialization (stale prefixes fail there too).
+  rc = _run_domain_check(state, op);
   if (rc != CRABS_SUCCESS) return rc;
   return CRABS_SUCCESS;
 }
