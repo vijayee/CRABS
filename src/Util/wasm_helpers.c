@@ -477,6 +477,163 @@ crabs_error_e crabs_wasm_add_register(attribute_machine_t* am, const char* name,
   return state_add_item(&am->base_state, item);
 }
 
+// ============================================================
+// Write-domains v1 surfaces
+// ============================================================
+
+// Item creation with an explicit write-domain declaration. The options
+// mirror data_item_options_t as scalars: write_domain is the
+// crabs_write_domain_e wire number (0 free / 1 sovereign / 2 group), writer
+// is NULL-or-empty for none, ordering_module 0 for unset. v1 restricts this
+// surface to COUNTER/REGISTER — the SOVEREIGN-legal types (their canonical
+// serializations back the hash-chain digest); other shapes keep their
+// dedicated add exports. On failure the item is destroyed, not leaked.
+EMSCRIPTEN_KEEPALIVE
+crabs_error_e crabs_wasm_define_item(attribute_machine_t* am,
+                                     const char* name, int data_type,
+                                     int crdt_type, int write_domain,
+                                     const char* writer,
+                                     int ordering_module) {
+  if (!am || !name) return CRABS_ERR_INVALID_PARAM;
+  if (data_type != DATA_TYPE_COUNTER && data_type != DATA_TYPE_REGISTER) {
+    return CRABS_ERR_TYPE_MISMATCH;
+  }
+  data_item_options_t options;
+  memset(&options, 0, sizeof(options));
+  options.write_domain = (crabs_write_domain_e)write_domain;
+  options.writer = (writer != NULL && writer[0] != '\0') ? writer : NULL;
+  options.ordering_module = (uint8_t)ordering_module;
+  data_item_t* item = NULL;
+  crabs_error_e rc = data_item_create_with_options(
+      name, (data_type_e)data_type, (crdt_type_e)crdt_type, &options, &item);
+  if (rc != CRABS_SUCCESS) return rc;
+  if (data_type == DATA_TYPE_COUNTER) {
+    item->value = g_counter_create();
+  } else {
+    int64_t initial = 0;
+    item->value = lww_register_create((const uint8_t*)&initial,
+                                      sizeof(int64_t), 0, "system");
+  }
+  rc = state_add_item(&am->base_state, item);
+  if (rc != CRABS_SUCCESS) data_item_destroy(item);
+  return rc;
+}
+
+// Append a resource name to an op, growing the three per-resource arrays
+// (resources / required_state / next_state) in lockstep — the signing
+// canonical form and the executor index them all up to resource_count.
+// Zeroed states = PROTOCOL_IDLE, matching the deserializer's default.
+EMSCRIPTEN_KEEPALIVE
+crabs_error_e crabs_wasm_op_add_resource(operation_t* op, const char* name) {
+  if (!op || !name || name[0] == '\0' || strlen(name) >= CRABS_MAX_USER_ID) {
+    return CRABS_ERR_INVALID_PARAM;
+  }
+  if (op->resource_count >= CRABS_MAX_RESOURCES) return CRABS_ERR_OOM;
+  uint32_t grown_count = op->resource_count + 1;
+  char (*grown_resources)[CRABS_MAX_USER_ID] = realloc(
+      op->resources, grown_count * CRABS_MAX_USER_ID);
+  if (grown_resources == NULL) return CRABS_ERR_OOM;
+  op->resources = grown_resources;
+  protocol_state_e* grown_required = realloc(
+      op->required_state, grown_count * sizeof(protocol_state_e));
+  if (grown_required == NULL) return CRABS_ERR_OOM;
+  op->required_state = grown_required;
+  protocol_state_e* grown_next = realloc(
+      op->next_state, grown_count * sizeof(protocol_state_e));
+  if (grown_next == NULL) return CRABS_ERR_OOM;
+  op->next_state = grown_next;
+  memset(op->resources[op->resource_count], 0, CRABS_MAX_USER_ID);
+  strncpy(op->resources[op->resource_count], name, CRABS_MAX_USER_ID - 1);
+  op->required_state[op->resource_count] = PROTOCOL_IDLE;
+  op->next_state[op->resource_count] = PROTOCOL_IDLE;
+  op->resource_count = grown_count;
+  return CRABS_SUCCESS;
+}
+
+// Set the sovereign chain prefix at `prefix_index` (item_seq + 32-byte
+// prev_item_digest). The prefix array is parallel to the op's sovereign
+// resources in declaration order; setting index i grows the count to i + 1.
+// Sign AFTER setting — signing format v4 binds the prefixes.
+EMSCRIPTEN_KEEPALIVE
+crabs_error_e crabs_wasm_op_set_sovereign_prefix(operation_t* op,
+                                                 uint32_t prefix_index,
+                                                 uint64_t item_seq,
+                                                 const uint8_t* digest) {
+  if (!op || !digest) return CRABS_ERR_INVALID_PARAM;
+  if (prefix_index >= CRABS_MAX_RESOURCES) return CRABS_ERR_INVALID_PARAM;
+  op->sovereign_prefixes[prefix_index].item_seq = item_seq;
+  memcpy(op->sovereign_prefixes[prefix_index].prev_item_digest, digest,
+         CRABS_HASH_SIZE);
+  if (op->sovereign_prefix_count < prefix_index + 1) {
+    op->sovereign_prefix_count = prefix_index + 1;
+  }
+  return CRABS_SUCCESS;
+}
+
+// Fill a caller-created __report_equivocation__ op with the evidence
+// payload for `item_name`: u8 version + string16 item + string16 writer
+// (read from the item — a forged writer field can never parse) + bytes32
+// op_a + bytes32 op_b, plus a fresh uuid. The caller then sets the signer,
+// signs (crabs_wasm_sign_with_node_key or a KeyPair) and executes — the
+// same compose/sign/execute idiom as every other wasm op.
+EMSCRIPTEN_KEEPALIVE
+crabs_error_e crabs_wasm_report_equivocation(attribute_machine_t* am,
+                                             operation_t* op,
+                                             const char* item_name,
+                                             const uint8_t* op_a,
+                                             uint32_t op_a_len,
+                                             const uint8_t* op_b,
+                                             uint32_t op_b_len) {
+  if (!am || !op || !item_name || !op_a || !op_b) {
+    return CRABS_ERR_INVALID_PARAM;
+  }
+  if (op_a_len == 0 || op_b_len == 0) return CRABS_ERR_INVALID_PARAM;
+  data_item_t* item = state_find_item(&am->base_state, item_name);
+  if (item == NULL) return CRABS_ERR_RESOURCE_NOT_FOUND;
+  if (item->write_domain != CRABS_DOMAIN_SOVEREIGN ||
+      item->writer[0] == '\0') {
+    return CRABS_ERR_INVALID_PARAM;
+  }
+
+  uint32_t item_len = (uint32_t)strlen(item_name);
+  uint32_t writer_len = (uint32_t)strlen(item->writer);
+  if (item_len == 0 || item_len > UINT16_MAX || writer_len > UINT16_MAX) {
+    return CRABS_ERR_INVALID_PARAM;
+  }
+  uint64_t payload_len64 = 1ull + 2 + item_len + 2 + writer_len +
+                           4 + op_a_len + 4 + op_b_len;
+  if (payload_len64 > UINT32_MAX) return CRABS_ERR_OOM;
+  uint32_t payload_len = (uint32_t)payload_len64;
+  uint8_t* payload = (uint8_t*)malloc(payload_len);
+  if (payload == NULL) return CRABS_ERR_OOM;
+  uint32_t offset = 0;
+  payload[offset++] = 0x01;
+  payload[offset++] = (uint8_t)(item_len & 0xFF);
+  payload[offset++] = (uint8_t)((item_len >> 8) & 0xFF);
+  memcpy(payload + offset, item_name, item_len);
+  offset += item_len;
+  payload[offset++] = (uint8_t)(writer_len & 0xFF);
+  payload[offset++] = (uint8_t)((writer_len >> 8) & 0xFF);
+  memcpy(payload + offset, item->writer, writer_len);
+  offset += writer_len;
+  for (int byte_index = 0; byte_index < 4; byte_index++) {
+    payload[offset++] = (uint8_t)((op_a_len >> (8 * byte_index)) & 0xFF);
+  }
+  memcpy(payload + offset, op_a, op_a_len);
+  offset += op_a_len;
+  for (int byte_index = 0; byte_index < 4; byte_index++) {
+    payload[offset++] = (uint8_t)((op_b_len >> (8 * byte_index)) & 0xFF);
+  }
+  memcpy(payload + offset, op_b, op_b_len);
+  offset += op_b_len;
+
+  crypto_random_bytes(op->uuid, CRABS_UUID_SIZE);
+  if (op->payload != NULL) free(op->payload);
+  op->payload = payload;
+  op->payload_size = payload_len;
+  return CRABS_SUCCESS;
+}
+
 EMSCRIPTEN_KEEPALIVE
 crabs_error_e crabs_wasm_set_policy(attribute_machine_t* am, const char* op_type, const char* expr) {
   return state_add_policy(&am->base_state, op_type, expr);

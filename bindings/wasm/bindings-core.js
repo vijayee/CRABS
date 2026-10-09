@@ -157,6 +157,8 @@ const ERROR_MESSAGES = {
   0x6005: 'vault_unavailable',
   0x7001: 'already_performed', 0x7002: 'already_executed', 0x7003: 'condition_not_met',
   0x7004: 'tracker_not_found', 0x7005: 'flag_not_found',
+  0xA001: 'not_item_writer', 0xA002: 'seq_mismatch', 0xA003: 'fork_detected',
+  0xA004: 'ordering_path', 0xA005: 'quarantined',
 };
 
 function crabsError(code, ctx) {
@@ -296,6 +298,51 @@ class Operation {
     const { ptr, len } = writeBytes(M, b);
     M._crabs_wasm_op_set_payload(this._ptr, ptr, len);
     if (ptr) M._free(ptr);
+  }
+
+  // Append a resource name to the op (capacity 8). An op naming a SOVEREIGN
+  // item among its resources must carry a matching sovereign prefix per
+  // sovereign resource — DOMAIN_CHECK enforces the exact count.
+  addResource(name) {
+    const M = this._M;
+    const namePtr = writeString(M, name);
+    const rc = M._crabs_wasm_op_add_resource(this._ptr, namePtr);
+    if (namePtr) M._free(namePtr);
+    wrapRc(rc, 'addResource');
+    return this;
+  }
+
+  // Write-domains v1 (op format v6, signing format v4): the sovereign chain
+  // prefix at prefixIndex — item_seq plus the 32-byte digest of the item at
+  // that sequence, either as 64 hex chars or 32 raw bytes. Set BEFORE
+  // signing; the signature binds the prefixes. Chainable.
+  setSovereignPrefix(prefixIndex, seq, digest) {
+    const M = this._M;
+    let digestBytes;
+    if (typeof digest === 'string') {
+      if (!/^[0-9a-fA-F]{64}$/.test(digest)) {
+        throw new Error('setSovereignPrefix: digest hex must be 64 hex chars');
+      }
+      const digestPtr = M._malloc(32);
+      const decoded = hexDecode(M, digest, digestPtr, 32);
+      if (decoded !== 32) {
+        M._free(digestPtr);
+        throw new Error('setSovereignPrefix: digest hex decode failed');
+      }
+      digestBytes = new Uint8Array(M.HEAPU8.subarray(digestPtr, digestPtr + 32));
+      M._free(digestPtr);
+    } else {
+      digestBytes = digest;
+      if (!digestBytes || digestBytes.length !== 32) {
+        throw new Error('setSovereignPrefix: digest must be 32 bytes');
+      }
+    }
+    const { ptr, len } = writeBytes(M, digestBytes);
+    const rc = M._crabs_wasm_op_set_sovereign_prefix(
+        this._ptr, prefixIndex, BigInt(seq), ptr);
+    if (ptr) M._free(ptr);
+    wrapRc(rc, 'setSovereignPrefix');
+    return this;
   }
 
   get payload() {
@@ -560,6 +607,72 @@ class Node {
       status: 'active',
       attributes: attrs,
     };
+  }
+
+  // Write-domains v1: item creation with an explicit write-domain
+  // declaration. v1 supports 'counter'/'register' (or the DATA_TYPE numbers)
+  // — the SOVEREIGN-legal types; other shapes keep their dedicated add*
+  // methods. opts: { domain: 'free'|'sovereign'|'group' (default 'free'),
+  // writer: string (required for 'sovereign'), orderingModule: number
+  // ('group' only; only 0 is legal in v1 — no ordering modules exist) }.
+  defineItem(name, dataType, crdtType, opts = {}) {
+    const M = this._M;
+    const DOMAIN_NUMBERS = { free: 0, sovereign: 1, group: 2 };
+    const DATA_TYPE_WORDS = { counter: DATA_TYPE.COUNTER, register: DATA_TYPE.REGISTER };
+    const CRDT_TYPE_WORDS = { g_counter: CRDT_TYPE.G_COUNTER, lww_reg: CRDT_TYPE.LWW_REG };
+    const dataTypeNum = typeof dataType === 'string' ? DATA_TYPE_WORDS[dataType] : dataType;
+    const crdtTypeNum = typeof crdtType === 'string' ? CRDT_TYPE_WORDS[crdtType] : crdtType;
+    if (dataTypeNum === undefined || crdtTypeNum === undefined) {
+      throw new Error('defineItem: unknown dataType/crdtType word (v1 supports counter/register)');
+    }
+    const domainNum = DOMAIN_NUMBERS[opts.domain || 'free'];
+    if (domainNum === undefined) {
+      throw new Error("defineItem: domain must be 'free' | 'sovereign' | 'group'");
+    }
+    const namePtr = writeString(M, name);
+    const writerPtr = opts.writer ? writeString(M, opts.writer) : 0;
+    const rc = M._crabs_wasm_define_item(
+        this._am, namePtr, dataTypeNum, crdtTypeNum, domainNum, writerPtr,
+        opts.orderingModule || 0);
+    freeAll(M, namePtr, writerPtr);
+    wrapRc(rc, 'defineItem');
+  }
+
+  // Write-domains v1: file a __report_equivocation__ op against the
+  // SOVEREIGN item `itemName`, carrying two serialized writer ops as the
+  // evidence pair. The C helper builds the payload (the writer field is
+  // read from the ITEM, so a forged writer string can never parse); the op
+  // is then signed by this node's admin with the node key and executed —
+  // the same compose/sign/execute idiom as createTrigger.
+  reportEquivocation(itemName, opABytes, opBBytes) {
+    const M = this._M;
+    const typePtr = writeString(M, '__report_equivocation__');
+    const opPtr = M._operation_create(typePtr);
+    if (typePtr) M._free(typePtr);
+    if (!opPtr) throw new Error('reportEquivocation: operation_create failed');
+    const namePtr = writeString(M, itemName);
+    const { ptr: aPtr, len: aLen } = writeBytes(M, opABytes);
+    const { ptr: bPtr, len: bLen } = writeBytes(M, opBBytes);
+    const rcFill = M._crabs_wasm_report_equivocation(
+        this._am, opPtr, namePtr, aPtr, aLen, bPtr, bLen);
+    freeAll(M, namePtr, aPtr, bPtr);
+    if (rcFill !== 0) {
+      M._operation_destroy(opPtr);
+      throw crabsError(rcFill, 'reportEquivocation');
+    }
+    const signerPtr = writeString(M, this.adminId || 'admin');
+    const nodePtr = writeString(M, this.adminId || 'admin');
+    M._crabs_wasm_op_set_signer(opPtr, signerPtr);
+    M._crabs_wasm_op_set_node(opPtr, nodePtr);
+    freeAll(M, signerPtr, nodePtr);
+    const rcSign = M._crabs_wasm_sign_with_node_key(this._am, opPtr);
+    if (rcSign !== 0) {
+      M._operation_destroy(opPtr);
+      throw crabsError(rcSign, 'reportEquivocation sign');
+    }
+    const rcExec = M._crabs_wasm_execute(this._am, opPtr);
+    M._operation_destroy(opPtr);
+    wrapRc(rcExec, 'reportEquivocation execute');
   }
 
   addCounter(name) { this._callAdd(this._M._crabs_wasm_add_counter, name, 'addCounter'); }
