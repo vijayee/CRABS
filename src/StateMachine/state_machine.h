@@ -42,11 +42,25 @@ typedef struct {
 } co_signature_t;
 
 // ============================================================
+// Sovereign op prefix (write domains v1, spec §Sovereign op payload
+// envelope). Every op whose resources include a SOVEREIGN item carries a
+// per-resource chain prefix: the item_seq the writer believes is current
+// and the digest of the item state at that sequence. The DOMAIN_CHECK
+// pipeline step matches these against the item at execute time; the wire
+// and signing formats bind them so a relay cannot rewire them.
+// ============================================================
+typedef struct {
+  uint64_t item_seq;                               // expected: == item.item_seq
+  uint8_t  prev_item_digest[CRABS_HASH_SIZE];      // expected: == item.item_digest
+} crabs_sovereign_op_prefix_t;
+
+// ============================================================
 // Operation (§7.1 + v1.3 §4.2)
 // ============================================================
 // Current operation wire format version (the u32le heading every serialized
-// op). v3: dedup_spec; v4: ordering_system + HLC; v5: parent attestations.
-#define CRABS_OP_FORMAT_VERSION  5
+// op). v3: dedup_spec; v4: ordering_system + HLC; v5: parent attestations;
+// v6: per-resource sovereign op prefixes (write domains).
+#define CRABS_OP_FORMAT_VERSION  6
 
 // Tagged so lineage.h can forward-declare the name for its op handlers
 // (those declarations land before this header's own definition of the type).
@@ -93,6 +107,16 @@ typedef struct crabs_operation {
   // cannot strip the attestation/dedup/HLC tail by downgrading the version
   // byte — the rewritten op re-serializes to different signed bytes.
   uint32_t           op_version;
+  // Write domains (op format v6, signing format v4): per-resource sovereign
+  // chain prefixes, parallel to `resources` (index i of the array
+  // corresponds to a sovereign resource; DOMAIN_CHECK enforces the exact
+  // correspondence at execute time — here the prefixes are just
+  // signed/wire-carried).
+  // Inline array mirroring the per-resource capacity; zero-initialized by
+  // operation_create (count 0 = not a sovereign op). No heap ownership, so
+  // operation_destroy needs no change.
+  crabs_sovereign_op_prefix_t sovereign_prefixes[CRABS_MAX_RESOURCES];
+  uint32_t                    sovereign_prefix_count;
 } operation_t;
 
 // ============================================================

@@ -2588,7 +2588,11 @@ serialized_buffer_t* crabs_serialize_operation(const operation_t* op) {
   uint32_t wire_version = _op_format_version(op);
   if ((wire_version < 3 && op->dedup.type != DEDUP_NONE) ||
       (wire_version < 4 && op->ordering_system != CRABS_ORDERING_LAMPORT) ||
-      (wire_version < 5 && op->attestation_count > 0)) {
+      (wire_version < 5 && op->attestation_count > 0) ||
+      // Write domains: an op declaring v<=5 cannot represent sovereign
+      // prefixes on the wire (the reader of that version would not parse the
+      // section) — refuse rather than silently drop signed content.
+      (wire_version < 6 && op->sovereign_prefix_count > 0)) {
     return NULL;
   }
 
@@ -2597,7 +2601,8 @@ serialized_buffer_t* crabs_serialize_operation(const operation_t* op) {
   // Operation format version
   _write_uint32_le(buf, wire_version);
   // v3: adds dedup_spec; v4: adds ordering_system + HLC;
-  // v5: adds the parent-attestation section
+  // v5: adds the parent-attestation section; v6: adds the per-resource
+  // sovereign chain prefix section
 
   // type (length-prefixed string)
   _write_string16(buf, op->type);
@@ -2741,6 +2746,30 @@ serialized_buffer_t* crabs_serialize_operation(const operation_t* op) {
       }
       _write_uint32_le(buf, (uint32_t)attestation_wire_len);
       _write_bytes(buf, attestation_wire, attestation_wire_len);
+    }
+  }
+
+  // v6 (write domains): per-resource sovereign chain prefixes. This is the
+  // LAST section on the wire. Presence convention mirrors the attestation
+  // section: the u8 count is ALWAYS written under the version gate (no
+  // absence flag), so a v6 reader consumes exactly one byte even for a
+  // non-sovereign op. Unlike attestations, the prefixes ARE part of the
+  // canonical signing form (v4) — they are DOMAIN_CHECK inputs, so a relay
+  // must not be able to rewire them. Symmetric with the reader's count cap:
+  // an over-cap op would serialize into wire the deserializer fail-closes
+  // on, so refuse it here instead.
+  if (wire_version >= 6) {
+    if (op->sovereign_prefix_count > CRABS_MAX_RESOURCES) {
+      free(buf->data);
+      free(buf);
+      return NULL;
+    }
+    _write_uint8(buf, (uint8_t)op->sovereign_prefix_count);
+    for (uint32_t prefix_index = 0;
+         prefix_index < op->sovereign_prefix_count; prefix_index++) {
+      _write_uint64_le(buf, op->sovereign_prefixes[prefix_index].item_seq);
+      _write_bytes(buf, op->sovereign_prefixes[prefix_index].prev_item_digest,
+                   CRABS_HASH_SIZE);
     }
   }
 
@@ -2981,6 +3010,30 @@ operation_t* crabs_deserialize_operation(const uint8_t* data, size_t len) {
     }
   }
 
+  // v6 (write domains): per-resource sovereign chain prefixes. Older
+  // versions carry none (zero-init). The u8 count is always present under
+  // the version gate (writer mirrors this), so there is no absence flag.
+  if (op_version >= 6) {
+    uint8_t prefix_count;
+    if (!_read_uint8(&buf, &prefix_count)) goto fail;
+    if (prefix_count > CRABS_MAX_RESOURCES) goto fail;
+    // Bound the section against remaining bytes before consuming entries:
+    // each entry costs 8 (u64le item_seq) + CRABS_HASH_SIZE wire bytes.
+    if (prefix_count >
+        (buf.len - buf.offset) / (sizeof(uint64_t) + CRABS_HASH_SIZE)) {
+      goto fail;
+    }
+    op->sovereign_prefix_count = prefix_count;
+    for (uint32_t prefix_index = 0; prefix_index < prefix_count;
+         prefix_index++) {
+      if (!_read_uint64_le(&buf,
+              &op->sovereign_prefixes[prefix_index].item_seq)) goto fail;
+      if (!_read_bytes(&buf,
+              op->sovereign_prefixes[prefix_index].prev_item_digest,
+              CRABS_HASH_SIZE)) goto fail;
+    }
+  }
+
   // R7-L-6: require full consumption of the buffer. Trailing bytes would let
   // arbitrary data be appended to a signed op without invalidating it.
   if (buf.offset != buf.len) goto fail;
@@ -3217,6 +3270,9 @@ fail:
 // ============================================================
 serialized_buffer_t* crabs_serialize_for_signing(const operation_t* op) {
   if (op == NULL) return NULL;
+  // An over-cap prefix count would index past the inline array on
+  // operation_t — refuse, mirroring the wire serializer's discipline.
+  if (op->sovereign_prefix_count > CRABS_MAX_RESOURCES) return NULL;
 
   write_buf_t* buf = _write_buf_create(1024);
 
@@ -3227,15 +3283,17 @@ serialized_buffer_t* crabs_serialize_for_signing(const operation_t* op) {
   _write_uint8(buf, 0x52); // 'R'
   _write_uint8(buf, 0x41); // 'A'
   _write_uint8(buf, 0x42); // 'B'
-  // signing-format version 3 (A10-L7): adds op_version to the signed bytes.
-  // Under version 2, op_version was absent from the canonical form, so a
-  // relay could strip the attestation/dedup/HLC tail by downgrading the op's
-  // wire version (5→1) and the original signature still verified against the
-  // truncated op. Signatures minted under version 2 no longer verify — the
-  // version byte is consumed only as domain separation (nothing parses the
-  // signing form), so every signer and every verifier must run the same
+  // signing-format version 4 (write domains): adds the per-resource
+  // sovereign chain prefixes to the signed bytes (field 19 below). Under
+  // version 4's predecessor, a writer could sign an op and then rewire its
+  // item_seq prefix — the same rewind-to-strip class the version-3 bump
+  // closed for op_version. v3 (A10-L7) had added op_version to the signed
+  // bytes for the analogous attestation/dedup/HLC downgrade-strip attack.
+  // Signatures minted under earlier versions no longer verify — the version
+  // byte is consumed only as domain separation (nothing parses the signing
+  // form), so every signer and every verifier must run the same
   // signing-format version.
-  _write_uint8(buf, 0x03);
+  _write_uint8(buf, 0x04);
 
   // 1. op.type (length-prefixed string)
   _write_string16(buf, op->type);
@@ -3332,6 +3390,21 @@ serialized_buffer_t* crabs_serialize_for_signing(const operation_t* op) {
     _write_string16(buf, op->hlc.node_id);
   }
   // Lamport: lamport_time is already included at position 12
+
+  // 19. op.sovereign_prefixes (write domains, op format v6): per-resource
+  // chain prefixes. Signed unconditionally — the prefixes are part of the
+  // op's identity as DOMAIN_CHECK inputs regardless of the declared wire
+  // version (the WIRE serializer refuses to emit a v<=5 op carrying prefix
+  // content; the canonical form always covers what the op carries). The
+  // count byte is always written, mirroring fields 5..8, so a non-sovereign
+  // op contributes exactly one 0x00 byte here.
+  _write_uint8(buf, (uint8_t)op->sovereign_prefix_count);
+  for (uint32_t prefix_index = 0;
+       prefix_index < op->sovereign_prefix_count; prefix_index++) {
+    _write_uint64_le(buf, op->sovereign_prefixes[prefix_index].item_seq);
+    _write_bytes(buf, op->sovereign_prefixes[prefix_index].prev_item_digest,
+                 CRABS_HASH_SIZE);
+  }
 
   // Create output
   serialized_buffer_t* result = serialized_buffer_create(buf->offset);

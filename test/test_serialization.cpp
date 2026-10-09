@@ -403,14 +403,15 @@ TEST(TestSerialization, TestOperationAttestationCountBoundAndTruncation) {
   ASSERT_NE(wire, nullptr);
 
   // Locate the per-entry length prefix (u32le, directly before the blob it
-  // describes: the attestation section is the last section on the wire) and
-  // inflate it beyond the wire cap.
+  // describes). The v6 sovereign-prefix section (a single u8 count, 0 here)
+  // trails the attestation section on the wire, so walk back past it too.
   uint8_t scratch[CRABS_ATTESTATION_WIRE_MAX];
   size_t attestation_wire_len =
       attestation_serialize(&attestation, scratch, sizeof(scratch));
   ASSERT_GT(attestation_wire_len, 0u);
+  ASSERT_EQ(wire->data[wire->len - 1], 0u); // sovereign_prefix_count == 0
   uint8_t* length_prefix =
-      wire->data + wire->len - attestation_wire_len - 4;
+      wire->data + wire->len - 1 - attestation_wire_len - 4;
   // Sanity: the blob the prefix describes re-parses on its own.
   attestation_t* direct = attestation_deserialize(length_prefix + 4,
                                                   attestation_wire_len);
@@ -576,7 +577,7 @@ TEST(TestSerialization, TestCanonicalEncodingFieldOrder) {
   EXPECT_EQ(buf->data[1], 0x52);
   EXPECT_EQ(buf->data[2], 0x41);
   EXPECT_EQ(buf->data[3], 0x42);
-  EXPECT_EQ(buf->data[4], 0x03); // signing-format version 3 (A10-L7)
+  EXPECT_EQ(buf->data[4], 0x04); // signing-format version 4 (write domains)
 
   // After the domain tag, the first field is the type string (length-prefixed).
   // "__lock__" is 8 chars → uint16 length prefix = 8, then the bytes.
@@ -610,51 +611,51 @@ TEST(TestSerialization, TestCanonicalEncodingFieldOrder) {
 // attestation/dedup/HLC tail; pre-fix the signature still verified because
 // op_version never entered the canonical form.
 TEST(TestSerialization, TestCanonicalSigningBindsOpVersion) {
-  operation_t* op_v5 = operation_create(CRABS_OP_LOCK);
-  ASSERT_NE(op_v5, nullptr);
-  memset(op_v5->uuid, 0x11, CRABS_UUID_SIZE);
-  strncpy(op_v5->signer_id, "alice", CRABS_MAX_USER_ID - 1);
-  op_v5->signer_key_version = 1;
-  op_v5->lamport_time = 7;
-  strncpy(op_v5->node_id, "node1", CRABS_MAX_USER_ID - 1);
-  ASSERT_EQ(op_v5->op_version, (uint32_t)CRABS_OP_FORMAT_VERSION);
+  operation_t* op_current = operation_create(CRABS_OP_LOCK);
+  ASSERT_NE(op_current, nullptr);
+  memset(op_current->uuid, 0x11, CRABS_UUID_SIZE);
+  strncpy(op_current->signer_id, "alice", CRABS_MAX_USER_ID - 1);
+  op_current->signer_key_version = 1;
+  op_current->lamport_time = 7;
+  strncpy(op_current->node_id, "node1", CRABS_MAX_USER_ID - 1);
+  ASSERT_EQ(op_current->op_version, (uint32_t)CRABS_OP_FORMAT_VERSION);
 
   // Twin op: identical field-for-field, differing only in op_version —
   // exactly what the stripped/re-parsed op looks like to a verifier.
-  operation_t op_v1 = *op_v5;
+  operation_t op_v1 = *op_current;
   op_v1.op_version = 1;
 
-  serialized_buffer_t* buf_v5 = crabs_serialize_for_signing(op_v5);
+  serialized_buffer_t* buf_current = crabs_serialize_for_signing(op_current);
   serialized_buffer_t* buf_v1 = crabs_serialize_for_signing(&op_v1);
-  ASSERT_NE(buf_v5, nullptr);
+  ASSERT_NE(buf_current, nullptr);
   ASSERT_NE(buf_v1, nullptr);
 
   // Canonical forms must differ.
-  bool identical = (buf_v5->len == buf_v1->len) &&
-                   (memcmp(buf_v5->data, buf_v1->data, buf_v5->len) == 0);
+  bool identical = (buf_current->len == buf_v1->len) &&
+                   (memcmp(buf_current->data, buf_v1->data, buf_current->len) == 0);
   EXPECT_FALSE(identical)
       << "op_version is not bound into the signed canonical form: a "
          "version-downgrade strip keeps the signature valid (A10-L7)";
 
-  // A signature over the version-5 canonical form verifies there, and MUST
-  // NOT verify against the version-1 canonical form.
+  // A signature over the current-version canonical form verifies there, and
+  // MUST NOT verify against the version-1 canonical form.
   ecdsa_keypair_t* keypair = crypto_ecdsa_generate();
   ASSERT_NE(keypair, nullptr);
   uint8_t signature[CRABS_SIG_SIZE];
-  ASSERT_EQ(crypto_ecdsa_sign(keypair->private_key, buf_v5->data,
-                              buf_v5->len, signature),
+  ASSERT_EQ(crypto_ecdsa_sign(keypair->private_key, buf_current->data,
+                              buf_current->len, signature),
             CRABS_SUCCESS);
-  EXPECT_TRUE(crypto_ecdsa_verify(keypair->public_key, buf_v5->data,
-                                  buf_v5->len, signature));
+  EXPECT_TRUE(crypto_ecdsa_verify(keypair->public_key, buf_current->data,
+                                  buf_current->len, signature));
   EXPECT_FALSE(crypto_ecdsa_verify(keypair->public_key, buf_v1->data,
                                    buf_v1->len, signature))
-      << "signature minted at op_version 5 still verifies after a "
-         "downgrade to op_version 1 (A10-L7)";
+      << "signature minted at the current op_version still verifies after "
+         "a downgrade to op_version 1 (A10-L7)";
 
   crypto_ecdsa_keypair_destroy(keypair);
-  serialized_buffer_destroy(buf_v5);
+  serialized_buffer_destroy(buf_current);
   serialized_buffer_destroy(buf_v1);
-  operation_destroy(op_v5);
+  operation_destroy(op_current);
 }
 
 // A10-L7: the wire round-trip preserves op_version. The serializer emits the
@@ -698,6 +699,217 @@ TEST(TestSerialization, TestOpVersionRoundTrip) {
   serialized_buffer_destroy(canon_original);
   serialized_buffer_destroy(canon_restored);
   operation_destroy(restored);
+  serialized_buffer_destroy(wire);
+  operation_destroy(op);
+}
+
+// Write domains (op format v6): per-resource sovereign chain prefixes
+// round-trip through the op serializer/deserializer with every field exact,
+// and the canonical signing form is identical before and after the wire —
+// required for a gossiped sovereign op to still verify.
+TEST(TestSerialization, SovereignPrefixRoundTrip) {
+  operation_t* original = operation_create(CRABS_OP_LOCK);
+  memset(original->uuid, 0x66, CRABS_UUID_SIZE);
+  strncpy(original->signer_id, "alice", CRABS_MAX_USER_ID - 1);
+  original->lamport_time = 17;
+
+  original->resource_count = 2;
+  original->resources = (char(*)[CRABS_MAX_USER_ID])malloc(2 * CRABS_MAX_USER_ID);
+  strncpy(original->resources[0], "tally", CRABS_MAX_USER_ID - 1);
+  strncpy(original->resources[1], "profile", CRABS_MAX_USER_ID - 1);
+  original->required_state = (protocol_state_e*)malloc(2 * sizeof(protocol_state_e));
+  original->required_state[0] = PROTOCOL_IDLE;
+  original->required_state[1] = PROTOCOL_IDLE;
+  original->next_state = (protocol_state_e*)malloc(2 * sizeof(protocol_state_e));
+  original->next_state[0] = PROTOCOL_LOCKED;
+  original->next_state[1] = PROTOCOL_LOCKED;
+
+  original->sovereign_prefix_count = 2;
+  original->sovereign_prefixes[0].item_seq = 7;
+  for (uint32_t byte_index = 0; byte_index < CRABS_HASH_SIZE; byte_index++) {
+    original->sovereign_prefixes[0].prev_item_digest[byte_index] =
+        (uint8_t)(0xA0 + byte_index);
+  }
+  original->sovereign_prefixes[1].item_seq = 42;
+  for (uint32_t byte_index = 0; byte_index < CRABS_HASH_SIZE; byte_index++) {
+    original->sovereign_prefixes[1].prev_item_digest[byte_index] =
+        (uint8_t)(0xB0 + byte_index);
+  }
+
+  serialized_buffer_t* wire = crabs_serialize_operation(original);
+  ASSERT_NE(wire, nullptr);
+
+  operation_t* restored = crabs_deserialize_operation(wire->data, wire->len);
+  ASSERT_NE(restored, nullptr);
+  EXPECT_EQ(restored->op_version, (uint32_t)CRABS_OP_FORMAT_VERSION);
+  ASSERT_EQ(restored->sovereign_prefix_count, (uint32_t)2);
+  EXPECT_EQ(restored->sovereign_prefixes[0].item_seq, (uint64_t)7);
+  EXPECT_EQ(memcmp(restored->sovereign_prefixes[0].prev_item_digest,
+                   original->sovereign_prefixes[0].prev_item_digest,
+                   CRABS_HASH_SIZE), 0);
+  EXPECT_EQ(restored->sovereign_prefixes[1].item_seq, (uint64_t)42);
+  EXPECT_EQ(memcmp(restored->sovereign_prefixes[1].prev_item_digest,
+                   original->sovereign_prefixes[1].prev_item_digest,
+                   CRABS_HASH_SIZE), 0);
+
+  // The canonical signing form must be identical before and after gossip.
+  serialized_buffer_t* sig1 = crabs_serialize_for_signing(original);
+  serialized_buffer_t* sig2 = crabs_serialize_for_signing(restored);
+  ASSERT_NE(sig1, nullptr);
+  ASSERT_NE(sig2, nullptr);
+  EXPECT_EQ(sig1->len, sig2->len);
+  EXPECT_EQ(memcmp(sig1->data, sig2->data, sig1->len), 0);
+
+  serialized_buffer_destroy(sig1);
+  serialized_buffer_destroy(sig2);
+  serialized_buffer_destroy(wire);
+  operation_destroy(original);
+  operation_destroy(restored);
+}
+
+// Write domains (signing format v4): the sovereign prefixes are part of the
+// signed canonical form. Two ops identical except one prefix's item_seq must
+// serialize to different signing bytes, and a signature over one must NOT
+// verify against the other's form — otherwise a relay could rewire the chain
+// prefix a writer signed (the rewind class the v3 bump closed for op_version).
+TEST(TestSerialization, SigningBindsSovereignPrefix) {
+  operation_t* op_seq7 = operation_create(CRABS_OP_LOCK);
+  ASSERT_NE(op_seq7, nullptr);
+  memset(op_seq7->uuid, 0x33, CRABS_UUID_SIZE);
+  strncpy(op_seq7->signer_id, "alice", CRABS_MAX_USER_ID - 1);
+  op_seq7->signer_key_version = 1;
+  op_seq7->lamport_time = 9;
+  strncpy(op_seq7->node_id, "node1", CRABS_MAX_USER_ID - 1);
+  op_seq7->sovereign_prefix_count = 1;
+  op_seq7->sovereign_prefixes[0].item_seq = 7;
+  memset(op_seq7->sovereign_prefixes[0].prev_item_digest, 0x5A,
+         CRABS_HASH_SIZE);
+
+  // Twin op: identical field-for-field, differing only in the prefix's
+  // item_seq — exactly what a rewired sovereign op looks like to a verifier.
+  operation_t op_seq8 = *op_seq7;
+  op_seq8.sovereign_prefixes[0].item_seq = 8;
+
+  serialized_buffer_t* buf_seq7 = crabs_serialize_for_signing(op_seq7);
+  serialized_buffer_t* buf_seq8 = crabs_serialize_for_signing(&op_seq8);
+  ASSERT_NE(buf_seq7, nullptr);
+  ASSERT_NE(buf_seq8, nullptr);
+
+  // Canonical forms must differ.
+  bool identical = (buf_seq7->len == buf_seq8->len) &&
+                   (memcmp(buf_seq7->data, buf_seq8->data, buf_seq7->len) == 0);
+  EXPECT_FALSE(identical)
+      << "sovereign prefixes are not bound into the signed canonical form: "
+         "a relay can rewire a signed op's item_seq prefix without "
+         "invalidating the signature";
+
+  // A signature over the seq-7 canonical form verifies there, and MUST NOT
+  // verify against the seq-8 canonical form.
+  ecdsa_keypair_t* keypair = crypto_ecdsa_generate();
+  ASSERT_NE(keypair, nullptr);
+  uint8_t signature[CRABS_SIG_SIZE];
+  ASSERT_EQ(crypto_ecdsa_sign(keypair->private_key, buf_seq7->data,
+                              buf_seq7->len, signature),
+            CRABS_SUCCESS);
+  EXPECT_TRUE(crypto_ecdsa_verify(keypair->public_key, buf_seq7->data,
+                                  buf_seq7->len, signature));
+  EXPECT_FALSE(crypto_ecdsa_verify(keypair->public_key, buf_seq8->data,
+                                   buf_seq8->len, signature))
+      << "signature over one sovereign prefix still verifies after the "
+         "prefix's item_seq is rewired";
+
+  crypto_ecdsa_keypair_destroy(keypair);
+  serialized_buffer_destroy(buf_seq7);
+  serialized_buffer_destroy(buf_seq8);
+  operation_destroy(op_seq7);
+}
+
+// Refuse discipline (op format v6): an op declaring op_version < 6 cannot
+// represent sovereign prefixes on the wire — the reader of that version
+// would not parse the section, so the serializer must refuse rather than
+// silently truncate signed content. The canonical signing form still covers
+// the prefixes regardless of op_version (they are part of the op's
+// identity), so a low-version op is simply unsendable, never mis-signed.
+TEST(TestSerialization, LowVersionOpWithPrefixesRefusedOnWire) {
+  operation_t* op = operation_create(CRABS_OP_LOCK);
+  ASSERT_NE(op, nullptr);
+  memset(op->uuid, 0x44, CRABS_UUID_SIZE);
+  strncpy(op->signer_id, "alice", CRABS_MAX_USER_ID - 1);
+  op->sovereign_prefix_count = 1;
+  op->sovereign_prefixes[0].item_seq = 3;
+  memset(op->sovereign_prefixes[0].prev_item_digest, 0x77, CRABS_HASH_SIZE);
+
+  // At the default (current) version the op serializes...
+  serialized_buffer_t* wire = crabs_serialize_operation(op);
+  ASSERT_NE(wire, nullptr);
+  serialized_buffer_destroy(wire);
+
+  // ...but downgraded to v5 the wire serializer must refuse.
+  op->op_version = 5;
+  EXPECT_EQ(crabs_serialize_operation(op), nullptr);
+
+  // The signing form still includes the prefix content at any op_version.
+  operation_t no_prefix = *op;
+  no_prefix.sovereign_prefix_count = 0;
+  serialized_buffer_t* sig_with = crabs_serialize_for_signing(op);
+  serialized_buffer_t* sig_without = crabs_serialize_for_signing(&no_prefix);
+  ASSERT_NE(sig_with, nullptr);
+  ASSERT_NE(sig_without, nullptr);
+  EXPECT_GT(sig_with->len, sig_without->len);
+  serialized_buffer_destroy(sig_with);
+  serialized_buffer_destroy(sig_without);
+
+  operation_destroy(op);
+}
+
+// Symmetry with the reader (op format v6): the writer refuses
+// sovereign_prefix_count beyond CRABS_MAX_RESOURCES (such wire could never
+// parse back), and the reader rejects an inflated or truncated prefix
+// section.
+TEST(TestSerialization, SovereignPrefixCountBoundAndTruncation) {
+  operation_t* op = operation_create(CRABS_OP_LOCK);
+  ASSERT_NE(op, nullptr);
+  memset(op->uuid, 0x88, CRABS_UUID_SIZE);
+  strncpy(op->signer_id, "alice", CRABS_MAX_USER_ID - 1);
+
+  // At the cap the op still serializes; one over it the writer refuses
+  // (the cap check precedes the entry loop, so the over-cap write attempt
+  // never reads past the inline array).
+  op->sovereign_prefix_count = CRABS_MAX_RESOURCES;
+  serialized_buffer_t* wire = crabs_serialize_operation(op);
+  ASSERT_NE(wire, nullptr);
+  serialized_buffer_destroy(wire);
+  wire = NULL;
+
+  op->sovereign_prefix_count = CRABS_MAX_RESOURCES + 1;
+  EXPECT_EQ(crabs_serialize_operation(op), nullptr);
+
+  // A single-prefix op: the v6 section is the LAST section on the wire —
+  // u8 count followed by 8 + CRABS_HASH_SIZE bytes per entry.
+  op->sovereign_prefix_count = 1;
+  op->sovereign_prefixes[0].item_seq = 5;
+  memset(op->sovereign_prefixes[0].prev_item_digest, 0x99, CRABS_HASH_SIZE);
+  wire = crabs_serialize_operation(op);
+  ASSERT_NE(wire, nullptr);
+  const size_t entry_size = sizeof(uint64_t) + CRABS_HASH_SIZE;
+  ASSERT_GT(wire->len, entry_size + 1);
+
+  // Inflated count byte → rejected.
+  uint8_t* count_byte = wire->data + wire->len - entry_size - 1;
+  ASSERT_EQ(*count_byte, 1u);
+  *count_byte = 0xFF;
+  EXPECT_EQ(crabs_deserialize_operation(wire->data, wire->len), nullptr);
+
+  // Restore the count; truncation of the section tail → rejected.
+  *count_byte = 1;
+  EXPECT_EQ(crabs_deserialize_operation(wire->data, wire->len - 1), nullptr);
+
+  // Sanity: the unmodified wire still parses.
+  operation_t* restored = crabs_deserialize_operation(wire->data, wire->len);
+  ASSERT_NE(restored, nullptr);
+  EXPECT_EQ(restored->sovereign_prefix_count, (uint32_t)1);
+  operation_destroy(restored);
+
   serialized_buffer_destroy(wire);
   operation_destroy(op);
 }
