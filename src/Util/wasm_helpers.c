@@ -1089,7 +1089,11 @@ const char* crabs_wasm_handler_op_get_payload_str(operation_t* op) {
 // String-list wire protocol (used by _set_elements and _set_tags):
 //   u16le  count
 //   then `count` entries of: u16le byte_length + raw bytes (no NUL).
-// Element byte length is capped at CRABS_MAX_ELEMENT (u16-safe).
+// Both u16 fields bound the payload: lists longer than 65535 entries and
+// strings longer than 65535 bytes are REJECTED by the encoder
+// (_handler_encode_string_list returns NULL and the caller surfaces an
+// error) rather than silently truncated or mis-decoded JS-side. Strings
+// arriving over the wire are already u16-bounded by _write_string16.
 //
 // Visibility: an OR-set (element, tag) pair is LIVE iff it is not present
 // in the set's tombstone list. Enumeration is at the ELEMENT level — i.e.
@@ -1125,33 +1129,37 @@ static uint32_t _handler_set_live_distinct(const data_item_t* item,
 
   if (item->crdt_type == CRDT_OR_SET) {
     const or_set_t* set = (const or_set_t*)item->value;
-    for (uint32_t i = 0; i < set->element_count; i++) {
-      const char* element = set->elements[i].element;
-      const char* tag = set->elements[i].tag;
+    for (uint32_t entry_index = 0; entry_index < set->element_count; entry_index++) {
+      const char* element = set->elements[entry_index].element;
+      const char* tag = set->elements[entry_index].tag;
       // Pair-tombstoned entries are invisible.
       bool tombstoned = false;
-      for (uint32_t t = 0; t < set->tombstone_count; t++) {
-        if (strcmp(set->tombstones[t].element, element) == 0 &&
-            strcmp(set->tombstones[t].tag, tag) == 0) {
+      for (uint32_t tombstone_index = 0; tombstone_index < set->tombstone_count;
+           tombstone_index++) {
+        if (strcmp(set->tombstones[tombstone_index].element, element) == 0 &&
+            strcmp(set->tombstones[tombstone_index].tag, tag) == 0) {
           tombstoned = true;
           break;
         }
       }
       if (tombstoned) continue;
       bool seen = false;
-      for (uint32_t j = 0; j < count; j++) {
-        if (strcmp(elements[j], element) == 0) { seen = true; break; }
+      for (uint32_t seen_index = 0; seen_index < count; seen_index++) {
+        if (strcmp(elements[seen_index], element) == 0) { seen = true; break; }
       }
       if (!seen) elements[count++] = element;
     }
   } else { // CRDT_ONE_SHOT_SET
     const one_shot_set_t* set = (const one_shot_set_t*)item->value;
-    for (uint32_t i = 0; i < set->element_count; i++) {
+    for (uint32_t entry_index = 0; entry_index < set->element_count; entry_index++) {
       bool seen = false;
-      for (uint32_t j = 0; j < count; j++) {
-        if (strcmp(elements[j], set->elements[i]) == 0) { seen = true; break; }
+      for (uint32_t seen_index = 0; seen_index < count; seen_index++) {
+        if (strcmp(elements[seen_index], set->elements[entry_index]) == 0) {
+          seen = true;
+          break;
+        }
       }
-      if (!seen) elements[count++] = set->elements[i];
+      if (!seen) elements[count++] = set->elements[entry_index];
     }
   }
 
@@ -1168,25 +1176,42 @@ static int _handler_cstr_cmp(const void* a, const void* b) {
 }
 
 // Encode a string list using the u16-count prefix + u16-length-prefixed
-// entries protocol documented above. Returns NULL on allocation failure.
+// entries protocol documented above. Returns NULL on failure with *out_rc
+// set: CRABS_ERR_SERIALIZATION_ERROR on u16 overflow (count > 65535, any
+// string longer than 65535 bytes — overflowing the u16 fields would produce
+// a list the JS decoder mis-parses, so oversize is a hard failure, not a
+// truncation) or CRABS_ERR_OOM on allocation failure.
 static serialized_buffer_t* _handler_encode_string_list(const char** strings,
-                                                        uint32_t count) {
+                                                        uint32_t count,
+                                                        uint32_t* out_rc) {
+  if (count > 0xFFFF) {
+    *out_rc = CRABS_ERR_SERIALIZATION_ERROR;
+    return NULL;
+  }
   size_t total = 2;
-  for (uint32_t i = 0; i < count; i++) {
-    total += 2 + strlen(strings[i]);
+  for (uint32_t entry_index = 0; entry_index < count; entry_index++) {
+    const size_t length = strlen(strings[entry_index]);
+    if (length > 0xFFFF) {
+      *out_rc = CRABS_ERR_SERIALIZATION_ERROR;
+      return NULL;
+    }
+    total += 2 + length;
   }
   serialized_buffer_t* buffer = serialized_buffer_create(total);
-  if (buffer == NULL) return NULL;
+  if (buffer == NULL) {
+    *out_rc = CRABS_ERR_OOM;
+    return NULL;
+  }
   uint8_t* cursor = (uint8_t*)buffer->data;
   cursor[0] = (uint8_t)(count & 0xFF);
   cursor[1] = (uint8_t)((count >> 8) & 0xFF);
   cursor += 2;
-  for (uint32_t i = 0; i < count; i++) {
-    const size_t length = strlen(strings[i]);
+  for (uint32_t entry_index = 0; entry_index < count; entry_index++) {
+    const size_t length = strlen(strings[entry_index]);
     cursor[0] = (uint8_t)(length & 0xFF);
     cursor[1] = (uint8_t)((length >> 8) & 0xFF);
     cursor += 2;
-    memcpy(cursor, strings[i], length);
+    memcpy(cursor, strings[entry_index], length);
     cursor += length;
   }
   buffer->len = total;
@@ -1234,8 +1259,7 @@ serialized_buffer_t* crabs_wasm_handler_set_elements(attribute_machine_t* am,
   const uint32_t total = _handler_set_live_distinct(item, &elements);
   if (total == 0) {
     // Empty (or unallocatable) set — encode an empty page.
-    *out_rc = CRABS_SUCCESS;
-    return _handler_encode_string_list(NULL, 0);
+    return _handler_encode_string_list(NULL, 0, out_rc);
   }
   qsort(elements, total, sizeof(const char*), _handler_cstr_cmp);
 
@@ -1244,12 +1268,9 @@ serialized_buffer_t* crabs_wasm_handler_set_elements(attribute_machine_t* am,
   const uint32_t page_count = remaining < limit ? remaining : limit;
 
   serialized_buffer_t* buffer =
-      _handler_encode_string_list(elements + start, page_count);
+      _handler_encode_string_list(elements + start, page_count, out_rc);
   free(elements);
-  if (buffer == NULL) {
-    *out_rc = CRABS_ERR_OOM;
-    return NULL;
-  }
+  if (buffer == NULL) return NULL;
   *out_rc = CRABS_SUCCESS;
   return buffer;
 }
@@ -1285,13 +1306,14 @@ serialized_buffer_t* crabs_wasm_handler_set_tags(attribute_machine_t* am,
     return NULL;
   }
   uint32_t count = 0;
-  for (uint32_t i = 0; i < set->element_count; i++) {
-    if (strcmp(set->elements[i].element, element) != 0) continue;
-    const char* tag = set->elements[i].tag;
+  for (uint32_t entry_index = 0; entry_index < set->element_count; entry_index++) {
+    if (strcmp(set->elements[entry_index].element, element) != 0) continue;
+    const char* tag = set->elements[entry_index].tag;
     bool tombstoned = false;
-    for (uint32_t t = 0; t < set->tombstone_count; t++) {
-      if (strcmp(set->tombstones[t].element, element) == 0 &&
-          strcmp(set->tombstones[t].tag, tag) == 0) {
+    for (uint32_t tombstone_index = 0; tombstone_index < set->tombstone_count;
+         tombstone_index++) {
+      if (strcmp(set->tombstones[tombstone_index].element, element) == 0 &&
+          strcmp(set->tombstones[tombstone_index].tag, tag) == 0) {
         tombstoned = true;
         break;
       }
@@ -1302,12 +1324,9 @@ serialized_buffer_t* crabs_wasm_handler_set_tags(attribute_machine_t* am,
   // Sort ascending so a JS consumer can compare tag lists across replicas
   // without depending on insertion order.
   if (count > 1) qsort(tags, count, sizeof(const char*), _handler_cstr_cmp);
-  serialized_buffer_t* buffer = _handler_encode_string_list(tags, count);
+  serialized_buffer_t* buffer = _handler_encode_string_list(tags, count, out_rc);
   free(tags);
-  if (buffer == NULL) {
-    *out_rc = CRABS_ERR_OOM;
-    return NULL;
-  }
+  if (buffer == NULL) return NULL;
   *out_rc = CRABS_SUCCESS;
   return buffer;
 }

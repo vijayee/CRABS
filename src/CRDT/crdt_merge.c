@@ -38,9 +38,10 @@ static const g_counter_entry_t* _g_counter_find_entry_const(const g_counter_t* c
 // that element's pairs. A different element sharing the tag is a different
 // pair and is NOT covered — remove-by-element never hides another element.
 static bool _or_set_pair_in_tombstones(const or_set_t* set, const char* element, const char* tag) {
-  for (uint32_t i = 0; i < set->tombstone_count; i++) {
-    if (strcmp(set->tombstones[i].tag, tag) == 0 &&
-        strcmp(set->tombstones[i].element, element) == 0) {
+  for (uint32_t tombstone_index = 0; tombstone_index < set->tombstone_count;
+       tombstone_index++) {
+    if (strcmp(set->tombstones[tombstone_index].tag, tag) == 0 &&
+        strcmp(set->tombstones[tombstone_index].element, element) == 0) {
       return true;
     }
   }
