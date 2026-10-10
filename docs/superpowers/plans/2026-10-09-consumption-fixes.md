@@ -46,4 +46,4 @@
 - [x] Commit: `docs: wrapper generation compatibility matrix (finding 6)`. *(89a42a1)*
 
 ### Task 6: Final verification
-- [ ] Full suites (ctest/node/wasm/parity); regen wasm artifacts (C changed in Tasks 1/3/4): `chore: regenerate wasm artifacts`; de-wonk two rounds; update `CONSUMPTION_FINDINGS` doc with a short REMEDIATION status block mirroring the audit-doc style. Commit closure.
+- [x] Full suites (ctest/node/wasm/parity); regen wasm artifacts (C changed in Tasks 1/3/4): `chore: regenerate wasm artifacts`; de-wonk two rounds; update `CONSUMPTION_FINDINGS` doc with a short REMEDIATION status block mirroring the audit-doc style. Commit closure. *(As landed: ctest 1698/1698, node 105/105, wasm npm chain green, parity byte-identical. De-wonk follow-ups: f05738c (encoder u16-overflow hardening + naming), a24dac2 (status-block re-key + docs accuracy), 002c37d (wasm regen — required rebuilding the wasm openssl at linux-generic32; the generic64 BN path traps under emscripten).)*
