@@ -131,6 +131,9 @@ export interface HandlerState {
    * ascending by byte-wise strcmp (OR-set insertion order is not stable
    * across replicas; the sort is). Hard cap 256 per call — larger limit
    * throws; use getSetSize + successive offsets to paginate bigger sets.
+   * Each call is an independent point-in-time snapshot, not a cursor — if
+   * elements are added/removed between page calls, offsets shift (re-read
+   * getSetSize when paginating a set that may be changing).
    */
   getSetElements(name: string, options?: GetSetElementsOptions): string[];
   /** LIVE tags of `element` of an OR-set (sorted ascending). */
@@ -272,6 +275,9 @@ export interface Node {
    * ascending by byte-wise strcmp (OR-set insertion order is not stable
    * across replicas; the sort is). Hard cap 256 per call — larger limit
    * throws; use getSetSize + successive offsets to paginate bigger sets.
+   * Each call is an independent point-in-time snapshot, not a cursor — if
+   * elements are added/removed between page calls, offsets shift (re-read
+   * getSetSize when paginating a set that may be changing).
    */
   getSetElements(name: string, options?: GetSetElementsOptions): string[];
   /** LIVE tags of `element` of an OR-set (sorted ascending). */

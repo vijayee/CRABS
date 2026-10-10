@@ -154,10 +154,12 @@ Contract:
   tombstone is pair-scoped, not tag-scoped — it does not block other
   elements from using the same tag later.
 
-Merge behavior: `or_set_merge` unions live pairs and unions tombstone
-pairs; a live pair whose pair is tombstoned is excluded from the merged
-result. Concurrent `(add e, remove e)` resolves as remove when the remove
-observed the add (the usual observed-remove bias).
+Merge behavior: `or_set_merge` unions the element/pair entries and unions
+the tombstone pairs; reads (`setContains`, `getSetElements`) then filter a
+pair out whenever its pair is present in the merged tombstone set, so a
+pair tombstoned on either replica is invisible after merge. Concurrent
+`(add e, remove e)` resolves as remove when the remove observed the add
+(the usual observed-remove bias).
 
 ## Differences from crabs-node
 

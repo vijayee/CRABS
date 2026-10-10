@@ -70,11 +70,14 @@ For balance, things the library team got right that made the consumer phases lan
 ## Suggested acceptance order
 
 1 and 2 (document + fail loudly — days of consumer pain each) → 3/4 (read APIs — removes the biggest consumer-side trust hack) → 5/6 (diagnostics + wrapper unification).
+
 ## Remediation status (2026-10-09, same day)
 
-1. **FIXED.** OR-set add dedupes by `(element, tag)` pair (worktree commit `ba17e66`): shared-tag different elements both retained; same-pair re-add idempotent (H-J preserved); tombstones are pair-scoped (a remove no longer hides a different element sharing a tag). Documented in the wasm README's OR-Sets section.
-2. **FIXED.** `4e1c801`: integer-only register guards in both wrappers + handler context (descriptive error, BigInt accepted, |n| > 2^53 rejected on wasm) + Registers/OR-Sets documentation + typed contracts.
-3. **FIXED.** `08f72f0`: handler-state read APIs — `getSetSize`/`getSetElements` (deterministic sorted, paged, cap 256)/`getSetTags` (pair semantics)/`getRegisterBytes` + `setRegisterBytes` on `HandlerState`.
-4. **FIXED.** `4b4e515`: `wireVersions()` diagnostics + `Operation.getWireVersion()`; the C constants are exposed (no JS mirror to drift); signing version now a named define (`CRABS_SIGNING_FORMAT_VERSION`).
-5. **FIXED.** `89a42a1`: wrapper/WASM compatibility matrix in the wasm README; generated-TS single-source wrapper documented as planned future work.
-6. Demo/parity side work landed with these fixes (video-platform sovereign item, two-tab pills, extended parity smoke). Full suites green after each commit; de-wonk in the final verification pass.
+All six findings fixed in worktree `consumption-fixes` (items below keyed by finding number, commit SHAs are worktree-local):
+
+- **§2 FIXED** (`ba17e66`): OR-set add dedupes by `(element, tag)` pair — shared-tag different elements both retained; same-pair re-add idempotent (H-J preserved); tombstones are pair-scoped (a remove no longer hides a different element sharing a tag). Documented in the wasm README's OR-Sets section.
+- **§1 FIXED** (`4e1c801`): integer-only register guards in both wrappers + handler context (descriptive error, BigInt accepted, |n| > 2^53 rejected on wasm) + Registers/OR-Sets documentation + typed contracts.
+- **§3+§4 FIXED** (`08f72f0`): handler-state read APIs — `getSetSize`/`getSetElements` (deterministic sorted, paged, cap 256)/`getSetTags` (pair semantics)/`getRegisterBytes` + `setRegisterBytes` on `HandlerState`.
+- **§5 FIXED** (`4b4e515`): `wireVersions()` diagnostics + `Operation.getWireVersion()`; the C constants are exposed (no JS mirror to drift); signing version now a named define (`CRABS_SIGNING_FORMAT_VERSION`).
+- **§6 FIXED** (`89a42a1`): wrapper/WASM compatibility matrix in the wasm README; generated-TS single-source wrapper documented as planned future work.
+- Demo/parity side work landed with these fixes (video-platform sovereign item, two-tab pills, extended parity smoke). Full suites green after each commit; de-wonk in the final verification pass.
