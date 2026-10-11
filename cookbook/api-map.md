@@ -175,7 +175,7 @@ Machines mint machines (v1.7). **The biggest wasm/node divergence:** wasm `linea
 
 | symbol | kind | signature | source | maturity |
 |---|---|---|---|---|
-| `Blueprint.create` | factory | `create(childId, trustMode, bootstrapAdmin, ttlMs) -> Promise<Blueprint>` (wasm) | `bindings/wasm/index.d.ts:79-81` | STABLE (`lineage_smoke.mjs:54`) |
+| `Blueprint.create` | factory | `create(childId, trustMode, bootstrapAdmin, ttlMs) -> Promise<Blueprint>`  (wasm + node: `bindings/node/index.d.ts:100`) | `bindings/wasm/index.d.ts:79-81` | STABLE (`lineage_smoke.mjs:54`) |
 | `new Blueprint` | constructor (node only) | `new Blueprint(childId, trustMode, bootstrapAdmin, ttlMs)` or `new Blueprint(wire)` | `bindings/node/index.d.ts:97-100` | STABLE (`test/test.js:132`) |
 | `Blueprint.deserialize` | static | wasm: `Promise<Blueprint>`; node: sync | wasm :81, node :102 | STABLE (`lineage_smoke.mjs:62`) |
 | `Blueprint.addItem` | method | `addItem(name, dataType, crdtType)` — wasm takes numbers only (`bindings/wasm/index.d.ts:68`); node accepts words or numbers (`bindings/node/index.d.ts:86`) | both | STABLE (`wasm lineage_smoke.mjs:43`) |
@@ -206,7 +206,7 @@ Write-domains v1: items declare a domain at mint — `'free' | 'sovereign' | 'gr
 | `Operation.setSovereignPrefix` | method | `setSovereignPrefix(prefixIndex, seq, digest: 64-hex \| 32 raw bytes (wasm))` — signed in format v4, wire-carried in op format v6; set BEFORE signing | wasm :40-41, node :33 | STABLE (`write-domains.js:71-104`) |
 | `Node.itemChainHead` | query | `itemChainHead(name) -> {seq, digestHex}` — full 32-byte hex; `resource_not_found` on unknown item | wasm :244, node :213 | STABLE (`write-domains.js:80-96`) |
 | `Node.reportEquivocation` | method | `reportEquivocation(itemName, opABytes, opBBytes)` — files `__report_equivocation__`; quarantines the writer; failure modes typed (`invalid_param`, `resource_not_found`, `duplicate_operation`) | wasm :251-252, node :221 | STABLE (`write-domains.js:124-145`, node `test/test.js:493-540`) |
-| quarantine enforcement | contract | a quarantined writer's next op throws `quarantined`; a non-writer op throws `not_item_writer` | `write-domains.js:106,132`; node `test/test.js:462,506` | STABLE |
+| quarantine enforcement | contract | a quarantined writer's next op throws `quarantined`; a non-writer op throws `not_item_writer` | `write-domains.js:106,132`; node `test/test.js:462,493` | STABLE |
 
 Domain error taxonomy (`CRABS_ERR_NOT_ITEM_WRITER` etc.) maps in `bindings/node/src/crabs_node.cc:111`.
 
@@ -246,7 +246,7 @@ Domain error taxonomy (`CRABS_ERR_NOT_ITEM_WRITER` etc.) maps in `bindings/node/
 |---|---|---|---|---|
 | `Node.on` | method | `on('change', listener) -> unsubscribe()` | wasm :218, node :188 | STABLE (`change-events.js:16`; node `test/test.js:124`) |
 | `Node.off` | method (**wasm only**; node `.d.ts` documents the off() returned by `on()` instead, :187) | `off('change', listener)` | `bindings/wasm/index.d.ts:220` | STABLE (`change-events.js:59-60`) |
-| `CrabsChangeEvent` | interface | kinds `op|schedule|trigger|attribute|spawn|lineage`; wasm adds a `uuid` field and non-null `signer`/`node`; node makes `signer`/`node` nullable (`bindings/node/index.d.ts:174-175`) and has no `uuid` | wasm :3-12, node :170-178 | STABLE (`change-events.js:44-52`) |
+| `CrabsChangeEvent` | interface | kinds `op|schedule|trigger|attribute|spawn|lineage`; wasm adds a `uuid` field and non-null `signer`/`node`; node makes `signer`/`node` nullable (`bindings/node/index.d.ts:173-175`) and has no `uuid` | wasm :3-12, node :170-178 | STABLE (`change-events.js:44-52`) |
 
 Mid-emit re-entrancy and self-unregistering listeners are safe and tested (node `test/test.js:204-240`).
 
@@ -280,7 +280,7 @@ Where a recipe capability has **no JS map entry**, that fact is recorded here �
 | R6 | triggers, threshold attributes, ABE | `createTrigger` / `TriggerConfig` (§7, STABLE); threshold conditions live in the C condition grammar `src/Condition/` (PRESENT in C, surface tested via `createTrigger`); `Node.encrypt` (§9, STABLE) |
 | R7 | schedules, `setTimeSource`, HLC | §6; schedules wasm-only (STABLE), HLC via node `getHLC` (STABLE) + C `src/HLC/hlc.h` (PRESENT) |
 | R8 | OT ordered set surface | **Not JS-bound.** C source `src/OT/ot_ordered_set.h:63-117` (`crabs_ot_ordered_set_create/destroy/merge_position_maps`, elements via `crabs_ordered_element_destroy`). The node binding *parses* the `ot_ordered_set` data-type word (`bindings/node/src/crabs_node.cc:212`) and `DATA_TYPE_OT_ORDERED_SET = 0x10` exists (`src/CRABS/data_model.h:33`), but no `d.ts` export, test, or example exercises OT items → recipe R8 is PARTIAL; map entries marked DESIGNED |
-| R9 | resources, locks / transaction manager | **Not JS-bound.** C: `src/TxManager/tx_manager.h:19-42` — vtable-based `crabs_tx_manager_t` with `accept/commit/destroy` and `crabs_tx_manager_none()` (accept-everything). Typed lock errors exist (`CRABS_ERR_LOCK_NOT_EXPIRED`, `bindings/node/src/crabs_node.cc:90`) but no lock API surface found in C headers or bindings → recipe R9 is PARTIAL; DESIGNED |
+| R9 | resources, locks / transaction manager | **Not JS-bound.** C: `src/TxManager/tx_manager.h:19-41` — vtable-based `crabs_tx_manager_t` with `accept/commit/destroy` and `crabs_tx_manager_none()` (accept-everything). Typed lock errors exist (`CRABS_ERR_LOCK_NOT_EXPIRED`, `bindings/node/src/crabs_node.cc:90`) but no lock API surface found in C headers or bindings → recipe R9 is PARTIAL; DESIGNED |
 | R10 | op signing modes / sovereign prefixes | `Operation.setSovereignPrefix` + signing format v4 (§11/§12), STABLE |
 | R11 | Blueprint + spawn + attenuation | §10, STABLE (wasm pointer vs node wrapper divergence documented) |
 | R12 | attestations, parent key chain | `attest`/`lineageAttest`, `lineageTombstone`, `TRUST_MODE` (§10, STABLE); verify-side C functions PRESENT |
@@ -291,7 +291,7 @@ Where a recipe capability has **no JS map entry**, that fact is recorded here �
 
 ### Known wasm/node differences (full list found while mapping)
 
-1. Construction: `Node.create` (wasm) vs `new Node` (node). `Operation.create` vs `new Operation`. `KeyPair.generate` async vs sync. `Blueprint.create` vs `new Blueprint`.
+1. Construction: `Node.create` (wasm) vs `new Node` (node). `Operation.create` vs `new Operation`. `KeyPair.generate` async vs sync. `Blueprint.create` exists in both bindings (node also has `new Blueprint`).
 2. Handlers: `registerHandlerJs` / `unregisterHandler` / low-level `registerHandler` / `HandlerState` / `HandlerOperation` are wasm-only — node has **no custom-handler surface**.
 3. Schedules are entirely wasm-only. HLC: node `getHLC()`, wasm none.
 4. OR-set pagination (`getSetSize`/`getSetElements`/`getSetTags`) and register byte API (`setRegisterBytes`/`getRegisterBytes`) are wasm-only.
