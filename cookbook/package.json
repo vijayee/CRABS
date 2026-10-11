@@ -1,0 +1,17 @@
+{
+  "name": "crabs-cookbook",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "node site/build.mjs",
+    "test:snippets": "node tests/run-snippets.mjs",
+    "test:c": "bash tests/run-c.sh",
+    "test:browser": "node tests/browser.js",
+    "test": "npm run test:snippets && npm run test:c && npm run test:browser"
+  },
+  "devDependencies": {
+    "marked": "^14.0.0",
+    "playwright": "^1.47.0"
+  }
+}
