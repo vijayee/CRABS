@@ -69,6 +69,21 @@ without a leader, but count attribution is per node, not per event. If you
 need "this specific event, exactly once, from anywhere", that is dedup, and
 it is Recipe 3's problem, not the counter's.
 
+## Variations
+
+- Need decrements too? Swap `addCounter`/`incrementCounter` for
+  `addPNCounter`/`incrementPNCounter` and use `decrementPNCounter` to add
+  negative attribution — the merge keeps the per-node maximum on each side of
+  the entry, so decrements converge the same way. (Note the maturity split:
+  `decrementPNCounter` is declared but not exercised by any test we found —
+  see the Notes below.)
+- Same shape across process boundaries: attribution is by whatever node id
+  string you pass, so two processes each with their own `Node` and distinct
+  ids merge without coordination — nothing about the counter is per-machine.
+- Watch instead of poll: the change event stream (`on('change')`,
+  `bindings/wasm/test/change-events.js`) fires for counter mutations, so a
+  UI can render the count without polling `getCounter`.
+
 ## Recipe
 
 ### crabs-wasm (browser / Node / edge)
