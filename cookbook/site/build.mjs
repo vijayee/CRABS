@@ -11,6 +11,11 @@ const cookbook = resolve(here, '..');
 const repoRoot = resolve(cookbook, '..');
 const dist = join(cookbook, 'site', 'dist');
 
+function escapeHtml(text) {
+  return text.replace(/&/g, '&amp;').replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
 function frontmatterOf(text) {
   const match = text.match(/^---\n([\s\S]*?)\n---\n/);
   const data = {};
@@ -43,20 +48,28 @@ const pages = readdirSync(join(cookbook, 'recipes')).sort()
   });
 pages.sort((a, b) => (a.meta.number - b.meta.number));
 
+const REQUIRED_META_KEYS = ['number', 'slug', 'title', 'section', 'status', 'maturity'];
+for (const page of pages) {
+  const missing = REQUIRED_META_KEYS.filter(key => !page.meta[key]);
+  if (missing.length) {
+    throw new Error(`recipe ${page.file}: missing frontmatter keys: ${missing.join(', ')}`);
+  }
+}
+
 // --- cookbook hub index table ---
-const statusBadge = status => `<span class="badge ${status}">${status}</span>`;
+const statusBadge = status => `<span class="badge ${status}">${escapeHtml(status)}</span>`;
 const indexTable = ['<table class="recipe-index">',
   '<tr><th>#</th><th>Recipe</th><th>Status</th><th>Maturity</th><th>Languages</th><th>Section</th></tr>'];
 for (const page of pages) {
   const languages = (page.meta.languages || '').split(/\s+/).filter(Boolean).join(' · ');
   indexTable.push(
-    `<tr><td>${page.meta.number}</td><td><a href="/cookbook/${page.meta.slug}/">${page.meta.title}</a></td><td>${statusBadge(page.meta.status)}</td><td>${page.meta.maturity}</td><td>${languages}</td><td>${page.meta.section}</td></tr>`);
+    `<tr><td>${page.meta.number}</td><td><a href="/cookbook/${escapeHtml(page.meta.slug)}/">${escapeHtml(page.meta.title)}</a></td><td>${statusBadge(page.meta.status)}</td><td>${escapeHtml(page.meta.maturity)}</td><td>${escapeHtml(languages)}</td><td>${escapeHtml(page.meta.section)}</td></tr>`);
 }
 indexTable.push('</table>');
 
 // --- sidebar (shared across cookbook pages) ---
 const sidebarLinks = pages.map(page =>
-  `<a href="/cookbook/${page.meta.slug}/">${String(page.meta.number).padStart(2, '0')} ${page.meta.title}<span class="badge ${page.meta.status}">${page.meta.status.slice(0, 4).toUpperCase()}</span></a>`).join('\n');
+  `<a href="/cookbook/${escapeHtml(page.meta.slug)}/">${String(page.meta.number).padStart(2, '0')} ${escapeHtml(page.meta.title)}<span class="badge ${page.meta.status}">${escapeHtml(page.meta.status.slice(0, 4).toUpperCase())}</span></a>`).join('\n');
 
 function sidebarFor() {
   return `<div class="sidebar">
@@ -117,7 +130,7 @@ for (const page of pages) {
   const outDir = join(dist, 'cookbook', page.meta.slug);
   mkdirSync(outDir, { recursive: true });
   writeFileSync(join(outDir, 'index.html'), pageShell({
-    title: `${page.meta.number} — ${page.meta.title} — CRABS Cookbook`,
+    title: `${escapeHtml(page.meta.number)} — ${escapeHtml(page.meta.title)} — CRABS Cookbook`,
     mainHtml: renderProse(page.body),
   }));
 }
