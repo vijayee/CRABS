@@ -7,6 +7,7 @@ cd "$(dirname "$0")/../.."
 BUILD_DIR=build
 SNIPPETS=cookbook/snippets/c
 OUT=cookbook/snippets/.c-out
+rm -rf "$OUT"
 mkdir -p "$OUT"
 
 cmake -S . -B "$BUILD_DIR" >/dev/null
