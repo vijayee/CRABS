@@ -13,3 +13,5 @@ node.incrementCounter('opens', 1, 'counter');
 const reads = node.getCounter('opens');
 if (reads !== 2) throw new Error(`expected opens=2, got ${reads}`);
 console.log(`opens=${reads}`);
+// Node/KeyPair expose no destroy() — native cleanup is process-exit driven.
+// (Only Blueprint tears down explicitly; see bindings/node/index.d.ts.)
