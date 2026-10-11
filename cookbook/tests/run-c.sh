@@ -15,7 +15,7 @@ cmake --build "$BUILD_DIR" -j >/dev/null
 for snippet in "$SNIPPETS"/*.c; do
   name=$(basename "$snippet" .c)
   cc -std=c11 -Wall -Werror \
-    -I src -I deps/openabe-c/include \
+    -I src -I deps/openabe-c/include -I test -I cookbook/prelude/c \
     "$snippet" build/libcrabs.a \
     deps/openabe-c/build/liboabe_c.a \
     deps/openabe-c/deps/relic/build/lib/librelic_s.a \
