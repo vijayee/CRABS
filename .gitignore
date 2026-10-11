@@ -2,6 +2,7 @@
 .claude
 .idea/
 build*
+!cookbook/site/build.mjs
 cmake-build-debug
 
 # LaTeX build artifacts
@@ -19,3 +20,6 @@ Testing/
 
 # Node deps
 node_modules/
+
+# Cookbook site build output
+cookbook/site/dist/
