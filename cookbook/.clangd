@@ -1,0 +1,2 @@
+CompileFlags:
+  Add: [-I../../src, -I../../test, -Iprelude/c, -I../../deps/openabe-c/include, -std=c11]
