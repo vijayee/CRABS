@@ -35,6 +35,9 @@ a { color: #B36A00; }
 .toc { border-left: 3px solid var(--baby); padding-left: 14px; font-size: 14px;
        position: fixed; left: calc(50% + 430px); top: 40px; max-width: 220px; }
 .toc a { color: #3E6BC0; text-decoration: none; display: block; }
+@media (max-width: 1460px) {
+  .toc { display: none; }
+}
 pre {
   background: var(--baby); border: 2px solid var(--steel); border-radius: 10px;
   padding: 14px 16px; overflow-x: auto;
@@ -59,6 +62,7 @@ footer.provenance {
 .section-cards .card { background: var(--panel); border: 2px solid var(--steel);
                        border-radius: 12px; padding: 20px; }
 .section-cards .card h2 { margin-top: 0; }
+a.card { text-decoration: none; color: inherit; }
 .callout { display: flex; gap: 16px; align-items: center; background: var(--baby);
            border-radius: 12px; padding: 14px 20px; margin: 24px 0; }
 .callout img { width: 90px; height: auto; }
@@ -72,3 +76,10 @@ table.recipe-index a { text-decoration: none; }
   padding: 8px 16px; border-radius: 999px; font-weight: 600; cursor: pointer;
   margin-right: 8px; }
 .interactive pre { border: none; margin: 8px 0 0; }
+@media (max-width: 900px) {
+  .layout { grid-template-columns: 1fr; grid-template-areas: "sidebar" "main"; }
+  .sidebar { position: static; height: auto; border-right: none; border-bottom: 3px solid var(--steel); }
+  .landing .hero { flex-direction: column; }
+  .landing .hero img { max-width: 100%; }
+  .main { padding: 24px 18px; }
+}
