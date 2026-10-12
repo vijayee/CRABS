@@ -127,7 +127,8 @@ Not guaranteed — say this before building on it:
 
 - *The lock is machine-local, not a distributed lease.* Lock state is
   runtime-only and never serialized (`src/CRABS/data_model.h:126-131`,
-  `:749`); two replicas do not negotiate a shared lease. The lock protocol
+  the chain digest excludes lock state, `:749`); two replicas do not negotiate
+  a shared lease. The lock protocol
   coordinates *one machine's* operators — e.g. a validator process holding
   the treasury — while replica convergence is still CRDT merge after the
   fact. There is no cross-replica atomic commit here.

@@ -149,7 +149,7 @@ Not guaranteed — and this is the honesty this recipe owes its name:
   `bindings/wasm/index.d.ts:186-187`), so a multi-item, machine-enforced
   total order for the leader's moves does not exist yet (api-map §17, R14).
 - *v1's type ceiling*: sovereign items are counters and registers only
-  (`write-domains.js:39-41` — other shapes `type_mismatch`). A "leader's
+  (`write-domains.js:28-31` — the v1 scope comment; other shapes hit `type_mismatch` in the block below it). A "leader's
   list" (Recipe 8) cannot be made sovereign today.
 
 ## Variations
