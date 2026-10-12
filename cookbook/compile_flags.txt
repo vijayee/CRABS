@@ -1,0 +1,8 @@
+-x
+c
+-std=c11
+-Wall
+-I../src
+-I../test
+-Iprelude/c
+-I../deps/openabe-c/include
