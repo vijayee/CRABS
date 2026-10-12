@@ -1,8 +1,12 @@
 /* Recipe 7 — timed actions (C core): the scheduler engine the wasm binding
- * wraps. The embedded op is signed AT SUBMISSION; every tick
- * (scheduler_process_due) materializes what is due through the machine's
- * FULL authorization — policy, signature, staleness — and records failures
- * instead of propagating them. Covers a one-off mint (not due / due /
+ * wraps. The embedded op is signed AND validated AT SUBMISSION (policy,
+ * signature, key version — state_machine_validate on the __schedule__/wasm
+ * path). A tick (scheduler_process_due) materializes what is due through the
+ * executor with authorization SKIPPED — that check already happened, and a
+ * changed policy is not re-judged at fire time — so a fire re-runs the
+ * domain check and the engine guards, not a signature/policy check.
+ * Failures (e.g. a missing handler) are recorded as __schedule_failed__
+ * entries instead of propagating. Covers a one-off mint (not due / due /
  * idempotent), a cancel, a recurring series exhausted by catch-up, and the
  * per-tick occurrence budget, mirroring:
  *   test/test_scheduler.cpp:485-529  (due op materialized exactly once)
@@ -59,8 +63,10 @@ int main(void) {
   state_t* state = &am->base_state;
 
   /* Scheduling is an AUTHORIZED pipeline for the embedded op, not a free
-   * side channel: the mint type needs a policy, and the signature + key
-   * version are checked at materialization time. */
+   * side channel: the mint type needs a policy, and the policy + signature
+   * + key-version checks happen at SUBMISSION (the __schedule__/wasm path
+   * runs state_machine_validate before queueing). Materialization skips the
+   * re-check; the fire still runs the domain check and needs the handler. */
   assert(state_add_policy(state, "mint", "role:admin") == CRABS_SUCCESS);
   assert(state_machine_register_handler(state, "mint", mint_handler)
          == CRABS_SUCCESS);
@@ -84,8 +90,9 @@ int main(void) {
   assert(scheduler_count(state) == 1u);
   assert(landed_mints == 0u);
 
-  /* Due: materializes exactly once — the embedded op runs through the FULL
-   * executor (auth checked at submission policy, signature re-verified). */
+  /* Due: materializes exactly once — the executor runs with authorization
+   * skipped (it was enforced at submission); the domain check and the
+   * engine's guards still run. */
   assert(scheduler_process_due(state, base + 1000) == CRABS_SUCCESS);
   assert(scheduler_count(state) == 0u);
   assert(landed_mints == 1u);

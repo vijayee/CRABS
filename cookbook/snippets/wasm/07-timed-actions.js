@@ -1,8 +1,11 @@
 'use strict';
 // Recipe 7 — timed actions (crabs-wasm, run in Node).
 // Schedules are a wasm-only surface (api-map §6): a signed op is queued with
-// a due time; every tick materializes what's due — through the machine's full
-// authorization (the embedded op was signed, so nothing is bypassed).
+// a due time; schedule() validates it AT SUBMISSION (policy + signature +
+// key version, via state_machine_validate), so no signer needs to be online
+// at fire time. A tick materializes what's due with the authorization step
+// SKIPPED — fires re-run only the domain check and the engine's guards, not
+// a signature/policy check.
 // Ticks are EXPLICIT in this demo: processSchedules(nowMs) is the machine's
 // clock poke, mirroring bindings/wasm/test/schedules.js. A one-off mint,
 // a cancel, a recurring 3-fire series, and the per-tick occurrence budget.
@@ -25,10 +28,11 @@ async function main() {
     return 0;
   });
 
-  // The signing happens NOW, at submission; materialization replays the
-  // signed bytes. A zero-payload sign with a stale/no policy would fail at
-  // materialization (recorded, not propagated), so the op is fully
-  // authorized here: signer + policy + handler.
+  // Authorization happens NOW, at submission: schedule() validates the op —
+  // signer, policy, key version — before it is queued (crabs_wasm_schedule).
+  // Materialization deliberately skips signature/policy re-checks; a fire
+  // still needs a registered handler and still runs the engine's guards, so
+  // the full setup (signer + policy + handler) is in place before scheduling.
   const scheduleMint = async (executeAtMs) => {
     const inner = await Operation.create('mint');
     inner.signerId = 'alice';
@@ -71,6 +75,11 @@ async function main() {
   const cancelId = await scheduleMint(now + 120000);
   node.cancelSchedule(cancelId);
   assert.strictEqual(node.pendingSchedules().length, 0);
+  // And it must stay materialized-away: tick past the would-be due time.
+  node.processSchedules(now + 120001);
+  if (node.getCounter('tokens') !== 1) {
+    throw new Error('a cancelled schedule must never materialize');
+  }
 
   // Recurring: 3 fires at 1s intervals, driven by injected ticks. The whole
   // catch-up fires IN ORDER in one tick, then the series is exhausted.

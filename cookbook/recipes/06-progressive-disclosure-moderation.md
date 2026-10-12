@@ -78,8 +78,9 @@ attribute policy.
   produces the ciphertext, so a container can leave the machine without
   the payload travelling at all. Layout:
   u16le policy byte length + policy bytes + u32le ciphertext length +
-  ciphertext (`bindings/wasm/index.d.ts:306` prose, exercised
-  `bindings/wasm/test/smoke.js:111-130`).
+  ciphertext (exercised `bindings/wasm/test/smoke.js:111-130`, which pins
+  the round-trip; `Node.encrypt`'s signature is
+  `bindings/wasm/index.d.ts:306`).
 
 ## What it guarantees / what it doesn't
 

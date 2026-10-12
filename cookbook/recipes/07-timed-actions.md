@@ -6,7 +6,7 @@ section: Conditions
 status: PARTIAL
 maturity: STABLE
 target: crabs-wasm
-languages: c wasm node
+languages: c wasm
 ---
 ## Intent
 
@@ -14,8 +14,9 @@ You want an action that must happen *when the clock says so*, not when a
 caller remembers to send it: a token that must not count toward anything
 until a release time T, a recurring mint every interval, a deadline that
 either fires or is cancelled. The submission happens now, by someone
-online; the effect happens later, by the machine — with the same
-authorization either way.
+online; the effect happens later, by the machine — and the authorization
+happens exactly once, at submission, when the machine can still reject
+you.
 
 ## The naive version, and where it breaks
 
@@ -29,9 +30,9 @@ it.
 
 A server-side cron is the usual answer, and it reintroduces the trusted
 middleman: the cron holds credentials, decides ordering, and can skip.
-What you want is the *schedule itself* as machine state — an op signed at
-submission, queued with its due time, and materialized by the machine's
-own tick through the full authorization pipeline.
+What you want is the *schedule itself* as machine state — an op signed and
+validated at submission, queued with its due time, and materialized by the
+machine's own tick with no signer online at fire time.
 
 ## The shape
 
@@ -50,14 +51,16 @@ own tick through the full authorization pipeline.
 - Ticking: `processSchedules(nowMs)`. This is an EXPLICIT clock poke — the
   demo passes a fixed `now` and never depends on the wall clock; the
   default argument is `Date.now()`
-  (`bindings/wasm/bindings-core.js:1210`). Every due entry
-  materializes through the machine's full executor — signature,
-  policy, staleness — and a failed materialization is recorded as an
-  `__schedule_failed__` entry and never propagated to the caller
-  (`src/Scheduler/scheduler.h:42-50`). Catch-up after downtime fires all
-  missed slots IN ORDER; a schedule that already executed re-materializes
-  nothing (idempotent skip on `CRABS_ERR_ALREADY_EXECUTED`,
-  `scheduler.c:257`).
+  (`bindings/wasm/bindings-core.js:1210`). Every due entry materializes
+  through the machine's executor with the authorization step *skipped* —
+  signature and policy were checked when you submitted, so the fire re-runs
+  only the domain check and the engine's guards (transitions, locks, dedup,
+  tx-manager) — and a failed materialization (e.g. the op's handler no
+  longer resolving) is recorded as an `__schedule_failed__` entry and never
+  propagated to the caller (`src/Scheduler/scheduler.h:42-50`). Catch-up
+  after downtime fires all missed slots IN ORDER; a schedule that already
+  executed re-materializes nothing (idempotent skip on
+  `CRABS_ERR_ALREADY_EXECUTED`, `scheduler.c:257`).
 - Burst control: `setScheduleOccurrenceBudget(maxPerTick)` bounds the
   per-tick catch-up burst; deferred slots carry over and keep their exact
   slots; `0` is unlimited (:330-331, `schedules.js:84-93`).
@@ -67,12 +70,18 @@ own tick through the full authorization pipeline.
 
 ## What it guarantees / what it doesn't
 
-Guaranteed: a materialized op ran through the same verification an
-interactive op would have — the embedded op was fully signed at
-submission, and authorization is enforced at fire time, so a policy that
-changed between submission and fire is honored *at fire* — and it lands
-exactly once (the materialization guard keys on the op uuid;
-`test/test_scheduler.cpp:485-529`). Cancelled schedules never
+Guaranteed: the op you scheduled was validated *at submission* — policy,
+signature and key version (plus co-signatures) are checked by the machine
+before the entry is queued (`src/Util/wasm_helpers.c:1382-1392`), and the
+fire then deliberately skips a second authorization pass
+(`src/StateMachine/state_machine.c:1199-1201`). That cuts both ways: a
+schedule whose signer loses the required policy *after* submission still
+fires — the machine does not re-evaluate policy at fire time. If you need
+the policy consulted *then*, that is the trigger-with-a-condition shape
+(Recipe 6), not a schedule. What *is* re-run at fire time is narrower: the
+domain check and the engine's guards (transitions, locks, dedup,
+tx-manager), plus the exactly-once guard that keys the materialization on
+the op uuid (`test/test_scheduler.cpp:485-529`). Cancelled schedules never
 materialize; recurring series hold their cadence; the budget bounds how
 much a single tick can do, with carry-over rather than loss. The whole
 queue is replicated state — another replica loading the machine gets the
@@ -101,7 +110,7 @@ gap below; node carries time plumbing only (`setTime`, `setTimeSource`,
 - Composed with triggers: a *condition* (Recipe 6) decides `whether`, a
   *schedule* decides `when` — e.g. a recurring escalation tick whose
   embedded op is itself policy-gated. Both run through Step 9/9b of the
-  same execute pipeline (`src/StateMachine/state_machine.c:1508-1520`).
+  same execute pipeline (`src/StateMachine/state_machine.c:1508-1527`).
 - Time-ordered reads: `getHLC()` (node only, `bindings/node/index.d.ts:263`)
   exposes the machine's hybrid logical clock for reasoning about event
   order — the C surface (`src/HLC/hlc.h`) implements the same timestamps
@@ -217,14 +226,20 @@ test_ref: test/test_scheduler.cpp:485-529 (exactly-once materialization) + :877-
 
 ## Notes
 
-- The wasm `schedule()` call is binding-level sugar over the direct C
-  library entry (`crabs_wasm_schedule` → `scheduler_schedule`); it does
-  not consult authorization itself. Materialization does: the embedded op
-  is executed through `state_machine_execute`, so it must be *fully
-  authorized* — a policy-gated type whose registered handler exists, or
-  the fire records `resource_not_found` (the engine refuses a
-  zero-resource custom op with a valid policy but no handler,
-  `test_scheduler.cpp:239-256`).
+- The wasm `schedule()` call wraps `crabs_wasm_schedule`, which validates
+  the op AT SUBMISSION — policy, signature, key version, co-signatures,
+  plus a read-only domain check — via `state_machine_validate` before
+  handing it to `scheduler_schedule` (`src/Util/wasm_helpers.c:1382-1392`,
+  mirroring the `__schedule__` op path). Materialization deliberately does
+  NOT re-run that authorization: the executor is entered with
+  `skip_authorization` set ("authorization was already enforced at
+  submission time", `src/StateMachine/state_machine.c:1199-1201`;
+  "materialization skips signature verification — authorization happened
+  at submission", `src/Scheduler/scheduler.c:337-338`). What a fire still
+  demands is a *handler and resolvable resources*: a policy-gated type
+  whose registered handler exists, or the fire records
+  `resource_not_found` (the engine refuses a zero-resource custom op with
+  a valid policy but no handler, `test_scheduler.cpp:239-256`).
 - `processSchedules(nowMs?)` defaults to the system clock, but the demo
   always passes `nowMs` explicitly — in production, decide this
   consciously: `setTimeSource({mode:'https'})` for authenticated wall

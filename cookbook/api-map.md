@@ -165,7 +165,7 @@ Timing semantics of the authenticated HTTPS time source (defaults 30000/1000/500
 | symbol | kind | signature | source | maturity |
 |---|---|---|---|---|
 | `Node.encrypt` | method | `encrypt(payload: Uint8Array\|string (wasm) / Buffer (node), policy: string) -> ABE container` | wasm :306, node :257 | STABLE (`smoke.js:115`) |
-| container layout | contract | u16le policy byte length (UTF-8 bytes, not UTF-16 units) + policy bytes + u32le ciphertext length + ciphertext | `bindings/wasm/index.d.ts:306` prose + `smoke.js:111-130` | STABLE |
+| container layout | contract | u16le policy byte length (UTF-8 bytes, not UTF-16 units) + policy bytes + u32le ciphertext length + ciphertext | `bindings/wasm/index.d.ts:306` (signature) + `bindings/wasm/test/smoke.js:111-130` (layout round-trip) | STABLE |
 
 C surface: `crypto_abe_setup` etc. at `src/Crypto/crypto.h:96-101` — the JS row is the supported path (PRESENT).
 
