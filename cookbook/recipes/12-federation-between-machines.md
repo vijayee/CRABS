@@ -102,7 +102,7 @@ Guaranteed (everything below is executed by the snippets):
 - *Revocation and severance are distinct tools with real semantics*: a
   revoked child keeps living and loses only vouches; a dissolved child loses
   the bridge instantly and durably; a tombstone for a live child is refused
-  (`src/Lineage/lineage.c:1787-1790` honesty gate observed; manifest-gated
+  (`src/Lineage/lineage.c:1937` honesty gate observed; manifest-gated
   issuance at `src/Lineage/lineage.h:670-685`).
 
 Not guaranteed — the honesty this recipe owes:
@@ -153,7 +153,7 @@ Not guaranteed — the honesty this recipe owes:
   vouch/decay/sever/proof on wasm + node and consume on C, and nothing more.
 
 - *Revocation is a one-way door, and the dissolve door closes behind it* (a
-  divergent pair the engine settles): a `attestation_revoked` entry refuses
+  divergent pair the engine settles): an `attestation_revoked` entry refuses
   new vouches — and also refuses `__dissolve_machine__`, because the
   dissolve op requires the entry to still be ACTIVE
   (`src/Lineage/lineage.c:1787-1790`, refused in the wasm snippet). The C

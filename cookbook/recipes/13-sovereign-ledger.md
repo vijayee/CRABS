@@ -62,7 +62,7 @@ plus a signed, engine-enforced hash chain the item maintains itself.
   head; the signing canonical form (v4) binds the prefix
   (`bindings/wasm/index.d.ts:40-41`, `bindings/node/index.d.ts:33`; C op
   fields `src/StateMachine/state_machine.h:110-120`, signed form wired at
-  `src/Serialization/serialization.c:2908-2921`).
+  `src/Serialization/serialization.c:3680-3693` in `crabs_serialize_for_signing`).
 - *The gate*: DOMAIN_CHECK runs after authorization and before the handler
   (`src/StateMachine/state_machine.c:1047`): the writer is bound
   (`not_item_writer`, `:1096` — including the machine's genesis admin, the
@@ -201,7 +201,7 @@ test_ref: bindings/wasm/test/write-domains.js:12-149 + handlers per bindings/was
 ### crabs-node (native Node.js)
 
 The same per-user ledgers and refusals on the native binding. The honest
-difference (api-map §8 known difference #2): the node binding has no custom
+difference (api-map §17 known difference #2): the node binding has no custom
 handlers, so these entries advance the chain and live in the machine's op
 log without mutating the balance in-process — the guarantees shown are the
 writer-bound chain, the refusals, and the head reads.
@@ -247,7 +247,7 @@ symbols:
   state_add_item                 src/CRABS/data_model.h:719
   g_counter_increment/value      src/CRDT/crdt_merge.h
   operation_create               src/StateMachine/state_machine.h:243
-  (sovereign prefix in signed form) src/Serialization/serialization.c:2908-2921
+  (sovereign prefix in signed form) src/Serialization/serialization.c:3680-3693
   (DOMAIN_CHECK + refusals)      src/StateMachine/state_machine.c:1090-1109
   (chain advance)                src/StateMachine/state_machine.c:1142-1174
 maturity: all exercised by C tests

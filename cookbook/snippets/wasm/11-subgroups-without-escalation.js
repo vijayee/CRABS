@@ -5,7 +5,7 @@
 // Blueprint: item set, policy set and trust mode are the charter the parent
 // signed. The subgroup gets its own fresh authority (DELEGATED_COPY), the
 // parent tracks it in a child manifest, and the parent's lifecycle control
-// is real: dissolving the child sever its endorsement authority instantly
+// is real: dissolving the child severs its endorsement authority instantly
 // and mints a signed tombstone. Mirrors the wasm lineage smoke
 // (bindings/wasm/lineage_smoke.mjs).
 

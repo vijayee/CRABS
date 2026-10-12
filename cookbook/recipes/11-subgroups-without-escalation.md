@@ -52,7 +52,7 @@ key back that a machine already embedded.
   append helpers, `src/Lineage/lineage.h:106-159`). `stampHash` +
   `deserialize` verify the embedded SHA-256 on the wire image — the exact
   bytes a `__spawn_machine__` op transports (format v2, body cap
-  `src/Lineage/lineage.h:52-59`).
+  `src/Lineage/lineage.h:41-50`).
 - *Trust modes pick the authority story* (`src/Lineage/lineage.h:327-345`):
   `SHARED_ROOT` — the child deliberately **borrows** the parent's attribute
   machine and MSK, one registry serves both (`src/Lineage/lineage.c:1451-1455`);
@@ -156,7 +156,7 @@ Not guaranteed — and this is the load-bearing honesty of the recipe's title:
   (`src/Lineage/lineage.h:523-524`).
 - *Blueprint policy scoping*: a blueprint policy may use `@parent/<attr>`
   endorsement tokens — authority that resolves against the parent's
-  attestations, not the subgroup's own registry (`src/Lineage/lineage.h:166-171`,
+  attestations, not the subgroup's own registry (`src/Lineage/lineage.h:89-104`,
   tested `test/test_lineage.cpp:144-180`). That machinery is Recipe 12's
   subject.
 - *Watch the mint*: `on('change')` emits a `spawn`-kind event attributed to

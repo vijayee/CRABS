@@ -45,8 +45,9 @@ market; no runnable snippet exists because a snippet here would be a lie.
 - *Merge cannot rescue divergence*: with no module there is no committed
   prefix to adopt; content divergence between two replicas of a
   group-ordered item is *held* (unresolvable in v1) and surfaced as a
-  `__merge_fork__` change event — convergence is still reported, the item's
-  divergence is not silently merged (`src/CRDT/crdt_merge.c:733-757`,
+  `__merge_held__` change event carrying the ordering-path error —
+  convergence is still reported, the item's divergence is not silently
+  merged (`src/CRDT/crdt_merge.c:742-755`,
   dispatch `:844-846`).
 - *There is no module to register, anywhere*: the typed interface the design
   names (`crabs_ordering_module_t` with a `propose` entry point) appears in
