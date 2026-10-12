@@ -50,22 +50,23 @@ fine afterward.
 
 - *The seal*: `node.encrypt(payload, policy)` — both JS bindings
   (`bindings/wasm/index.d.ts:306`, `bindings/node/index.d.ts:257`; node
-  impl `bindings/node/src/crabs_node.cc:1889-1913`) — sealing under the
+  impl `bindings/node/src/crabs_node.cc:1886-1913`) — sealing under the
   machine's own CP-ABE authority
   (`attribute_machine.c:309` wires `abe_mk` into the state; the wasm glue
-  `encrypt` uses it), with the container layout
+  seals with it via `src/Util/wasm_helpers.c:1005-1011`), with the container layout
   `u16le policy byte length + policy bytes + u32le ciphertext length +
   ciphertext` pinned by `bindings/wasm/test/smoke.js:111-130`. This is
   Recipe 6's seal; the ABE-word mapping (`'name:value'` → `name_value`,
-  `src/Crypto/crypto.c:99-111`) is what makes an *epoch attribute* possible
+  `src/Crypto/crypto.c:100-111`) is what makes an *epoch attribute* possible
   (below).
 - *Revoke the reader*: `revokeUser(userId)` — both bindings
   (`bindings/wasm/index.d.ts:215`, `bindings/node/index.d.ts:186`; C
   `attribute_machine_revoke_user`, `src/Attribute/attribute_machine.h:175`,
   `src/Attribute/attribute_machine.c:888-907`). Admin-gated (the signer
   must hold `role:admin`), TERMINAL (`USER_REVOKED` cannot be suspended
-  back or resurrected, `src/Attribute/attribute_machine.c:841-843`,
-  audit R8-C-4), and it bumps the user's epoch counter (`.c:901`).
+  back or resurrected — the R8-C-4 refusal,
+  `src/Attribute/attribute_machine.c:841-843`), and it bumps the user's
+  epoch counter (`.c:901`).
 - *The epoch observable*: `UserInfo.keyVersion` — the JS-visible read of the
   machine's per-user mutation counter (`bindings/node/index.d.ts:53`,
   mapped directly in `bindings/node/src/crabs_node.cc:1147-1157`).
@@ -200,7 +201,7 @@ epoch re-key pattern — on C.
 - *The epoch-attribute pattern (recipe-level, not a symbol)*: grant readers
   an ordinary attribute pair like `epoch:1`, include the epoch word in the
   seal policy (`'epoch_1 and member'` — the token map,
-  `src/Crypto/crypto.c:99-111`), and treat every mutation of the audience
+  `src/Crypto/crypto.c:100-111`), and treat every mutation of the audience
   as a re-seal under the next epoch. The C snippet runs the whole cycle:
   epoch-one key opens epoch-one data; epoch-two data refuses the epoch-one
   key and opens for a fresh derivation. What the library gives you is the
@@ -209,8 +210,9 @@ epoch re-key pattern — on C.
   marks the same boundary).
 - *Demote, not delete*: `attribute_machine_revoke_role` strips ONE role and
   works on suspended/revoked targets by design (R4-4,
-  `src/Attribute/attribute_machine.h:147`,
-  `src/Attribute/attribute_machine.c:799-847`) — but no JS binding exposes
+  `src/Attribute/attribute_machine.h:147`, decl; the whitelist-bypass
+  comment and body at `src/Attribute/attribute_machine.c:772-820`) — but no
+  JS binding exposes
   it; the JS-reachable tools are the user-level `revokeUser` (terminal) and
   nothing finer. A JS consumer who wants demotion cannot get it today; this
   is the wasm/node surface of the gap above.
@@ -291,7 +293,7 @@ symbols:
   defineItem               bindings/node/index.d.ts:205
   Node.sign / Node.execute bindings/node/index.d.ts:250 / :251
   Node.on                  bindings/node/index.d.ts:188
-  Node.encrypt             bindings/node/index.d.ts:257 (crabs_node.cc:1889-1913)
+  Node.encrypt             bindings/node/index.d.ts:257 (crabs_node.cc:1886-1913)
   Operation.new            bindings/node/index.d.ts:47
   Operation.addResource    bindings/node/index.d.ts:26
   (change event shape)     bindings/node/src/crabs_node.cc:950-962
@@ -333,7 +335,7 @@ symbols:
   (staleness gate, R7-04)        src/StateMachine/state_machine.c:862-873 (CRABS_ERR_KEY_STALE, src/CRABS/crabs.h:78)
   state_add_policy               src/CRABS/data_model.h:720
   state_machine_register_handler src/StateMachine/state_machine.h:237
-  (policy grammar)               src/StateMachine/state_machine.c:768-783 + preprocess src/Condition/condition.c:1507-1600
+  (policy grammar)               src/StateMachine/state_machine.c:768-783 + preprocess src/Condition/condition.c:1501-1598
   crypto_abe_encrypt             src/Crypto/crypto.h:110-114
   crypto_abe_keygen              src/Crypto/crypto.h:104-107 (token map .c:99-111)
   crypto_abe_decrypt             src/Crypto/crypto.h:123-127 (no status/registry check, .c:1041-1079)

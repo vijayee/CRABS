@@ -168,7 +168,7 @@ int main(void) {
   const uint64_t version_after_reactivate = reader_now->key_version;  /* 5 */
   assert(version_after_reactivate == version_at_suspend + 1);
   /* The stale stamp refuses with the typed staleness error
-   * (state_machine.c:863-873 — R7-04 mandatory, CRABS_ERR_KEY_STALE). */
+   * (state_machine.c:862-873 — R7-04 mandatory, CRABS_ERR_KEY_STALE). */
   assert(execute_adjust_as(am, state, "k1", k1_key, version_at_suspend)
          == CRABS_ERR_KEY_STALE);
   /* The fresh stamp lands again. */
@@ -210,7 +210,7 @@ int main(void) {
    * (attribute_machine.c:309 wires abe_mk into the base state — the same
    * mk Node.encrypt uses). Seal under an epoch attribute the reader holds:
    * CRABS 'name:value' tokens map to OpenABE words (name_value,
-   * src/Crypto/crypto.c:99-111 — 'epoch:1,member' -> 'epoch_1|member'). */
+   * src/Crypto/crypto.c:100-111 — 'epoch:1,member' -> 'epoch_1|member'). */
   const uint8_t payload[] = "vault payload at epoch one";
   abe_master_key_t* authority = (abe_master_key_t*)state->abe_mk;
   assert(authority != NULL);
@@ -231,7 +231,8 @@ int main(void) {
 
   /* USER-LEVEL revocation (the tool both JS bindings expose:
    * revokeUser): admin-gated, terminal, bumps the epoch counter
-   * (attribute_machine.c:885-907). */
+   * (attribute_machine_revoke_user — the exact handler the bindings wrap,
+   * attribute_machine.c:888-907). */
   assert(attribute_machine_revoke_user(am, "reader", "admin") == CRABS_SUCCESS);
   reader_now = attribute_machine_find_user(am, "reader");
   assert(reader_now != NULL);

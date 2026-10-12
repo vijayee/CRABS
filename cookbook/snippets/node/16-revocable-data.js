@@ -47,7 +47,7 @@ node.on('change', (event) => {
     attributeEvents.push(event);
   }
 });
-const postAsReader = (who, whoKey, versionAt) => {
+const postAsReader = (who, whoKey) => {
   const op = new Operation('adjust');
   op.signerId = who;
   op.addResource('notes');
