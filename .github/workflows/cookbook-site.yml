@@ -36,6 +36,8 @@ jobs:
       # Neither the root CMakeLists nor the node binding builds Relic/OpenABE
       # transitively — they expect prebuilt archives, so CI builds them here.
       # Relic is configured for the CRABS pairing profile (bn254, ARITH=easy).
+      # PIC is required: the node binding links relics static archive into a
+      # shared object (crabs_node.node); non-PIC copies fail with R_X86_64_PC32.
       - name: Build relic
         run: |
           cmake -S deps/openabe-c/deps/relic -B deps/openabe-c/deps/relic/build \
@@ -43,7 +45,8 @@ jobs:
             -DFP_METHD='INTEG;INTEG;INTEG;MONTY;JMPDS;JMPDS;SLIDE' \
             -DFP_PMERS=off -DFP_QNRES=on \
             -DFPX_METHD='INTEG;INTEG;LAZYR' -DPP_METHD='LAZYR;OATEP' \
-            -DSHLIB=OFF -DSTBIN=ON
+            -DSHLIB=OFF -DSTBIN=ON \
+            -DCMAKE_POSITION_INDEPENDENT_CODE=ON
           cmake --build deps/openabe-c/deps/relic/build -j
       # The static archive is what libcrabs and the node binding link; plain
       # `make` also links liboabe_c.so, which fails with a static-only relic
