@@ -6,6 +6,8 @@
 
 **A C implementation of the CRABS protocol — self-sovereign attribute-based authorization with convergent state.**
 
+> The **cookbook** — verified, runnable recipes in C, WebAssembly-JS, and Node-JS — lives at the project site: https://vijayee.github.io/CRABS/
+
 ---
 
 ## What is CRABS?
