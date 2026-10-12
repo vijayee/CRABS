@@ -218,8 +218,8 @@ int main(void) {
   crabs_ot_ordered_set_destroy(replica_forged);
 
   /* ---- Deletion wins, and the merged tombstone positions travel through
-   * the position map (crabs_ot_ordered_set_merge is called internally on
-   * crabs_ot_ordered_set_merge, ot_ordered_set.c:521) —
+   * the position map (merge_position_maps runs inside crabs_ot_ordered_set_merge,
+   * ot_ordered_set.c:521) —
    * MergeDeletionWins, test_ot_ordered_set.cpp:395-420. */
   crabs_ot_ordered_set_t* replica_keeper = crabs_ot_ordered_set_create();
   crabs_ot_ordered_set_t* replica_eraser = crabs_ot_ordered_set_create();

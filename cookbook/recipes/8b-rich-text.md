@@ -74,7 +74,7 @@ numbers — nothing on this page is a benchmark, which is precisely the point:
   `crabs_ot_data_item_next_priority` (`src/OT/ot_types.h:141`: op-log count
   in the high 32 bits, an FNV-1a hash of the node id in the low 32, with the
   `(priority, node_id)` tie-break as backstop, `src/OT/ot_types.c:181-209`),
-  has *no caller anywhere in `src/` or `test/`* — the mechanism the design
+  has *no caller in `src/` — only its own unit tests (`test/test_ot_types.cpp:442-450`) touch it* — the mechanism the design
   names for exactly the INSERT-vs-INSERT case is dead code today. That is a
   correctness risk by absence: the deterministic tie-break exists
   (`src/OT/ot_ordered_set.c:20-28`) but a document-specific convergence
@@ -83,8 +83,9 @@ numbers — nothing on this page is a benchmark, which is precisely the point:
   stability (a collaborator typing ahead of your caret should not teleport
   it), IME composition (CJK input commits mid-session and every transform
   must respect the composing region), and rich-text span attribution under
-  concurrent overlapping styles: grep the entire `docs/` directory for
-  "cursor" and "IME" and nothing returns. This site does not know whether
+  concurrent overlapping styles: grep the design + protocol documents under
+  `docs/` for "cursor" and "IME" and nothing relevant returns. This site does
+  not know whether
   the machinery would fail these — *nobody does, because there is no
   benchmark* — which is a stronger statement than a negative result would
   be, and it is why the page status is UNSUPPORTED rather than PARTIAL.
