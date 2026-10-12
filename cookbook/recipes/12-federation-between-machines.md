@@ -90,8 +90,8 @@ Guaranteed (everything below is executed by the snippets):
   makes retired-key forgeries fail the tip gate
   (`src/Lineage/lineage.h:643-656`).
 - *The window is enforced, with typed refusals on both ends*: an attestation
-  issued with `expires_at` before `now` is refused at mint; verification
-  fails outside `not_before ≤ now ≤ expires_at`
+  issued with `expires_at` before `now` is refused at mint (`src/Lineage/lineage.h:620-629`);
+  verification fails outside `not_before ≤ now ≤ expires_at`
   (`src/Lineage/lineage.h:636-641`; expiry verified in the C snippet and
   `test/test_lineage.cpp:416-417`).
 - *B's authorization never trusts the payload, only the verification.* The
