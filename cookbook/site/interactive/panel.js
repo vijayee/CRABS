@@ -57,6 +57,7 @@ function sharedCountDemo(panel) {
   const COUNTER_NAME = 'opens';
   const DEMO_NODE_ID = 'site-visitor';
   let node = null;
+  let initPromise = null;
 
   function readValue() {
     if (!node) return null;
@@ -75,11 +76,14 @@ function sharedCountDemo(panel) {
 
   return {
     async init() {
-      if (!node) {
-        const dev = await bootCrabsOnce(panel);
-        node = await dev.Node.create('demo-panel', { ordering: 'hlc' });
-        node.addCounter(COUNTER_NAME);
+      if (!initPromise) {
+        initPromise = (async () => {
+          const dev = await bootCrabsOnce(panel);
+          node = await dev.Node.create('demo-panel', { ordering: 'hlc' });
+          node.addCounter(COUNTER_NAME);
+        })();
       }
+      await initPromise;
       refresh();
       panel.status('Node "' + node.adminId + '" is live — counter "' +
         COUNTER_NAME + '" is at ' + readValue() + '. Increments are ' +

@@ -67,7 +67,7 @@ const indexTable = ['<table class="recipe-index">',
 for (const page of pages) {
   const languages = (page.meta.languages || '').split(/\s+/).filter(Boolean).join(' · ');
   indexTable.push(
-    `<tr><td>${page.meta.number}</td><td><a href="/cookbook/${escapeHtml(page.meta.slug)}/">${escapeHtml(page.meta.title)}</a></td><td>${statusBadge(page.meta.status)}</td><td>${escapeHtml(page.meta.maturity)}</td><td>${escapeHtml(languages)}</td><td>${escapeHtml(page.meta.section)}</td></tr>`);
+    `<tr><td>${escapeHtml(page.meta.number)}</td><td><a href="/cookbook/${escapeHtml(page.meta.slug)}/">${escapeHtml(page.meta.title)}</a></td><td>${statusBadge(page.meta.status)}</td><td>${escapeHtml(page.meta.maturity)}</td><td>${escapeHtml(languages)}</td><td>${escapeHtml(page.meta.section)}</td></tr>`);
 }
 indexTable.push('</table>');
 
@@ -133,7 +133,7 @@ writeFileSync(join(dist, 'index.html'), readFileSync(join(cookbook, 'site', 'ind
 
 writeFileSync(join(dist, 'cookbook', 'index.html'), pageShell({
   title: 'The CRABS Cookbook',
-  mainHtml: `<h1>The CRABS Cookbook</h1><p>Sixteen verified recipes. STATUS and
+  mainHtml: `<h1>The CRABS Cookbook</h1><p>Fourteen recipes with runnable code, plus three gap pages. STATUS and
   maturity badges are honest: PARTIAL means gaps are documented on the page.
   UNSUPPORTED means the codebase cannot deliver it yet.</p>${indexTable.join('\n')}
   <div class="callout"><img src="/assets/Unlockster.png"><p>Trust caveat: recipes
