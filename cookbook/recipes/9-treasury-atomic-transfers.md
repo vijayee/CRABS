@@ -12,7 +12,7 @@ languages: c node
 
 You want a *treasury* — a balance many members can spend into — where a
 transfer debits one pot and credits another, and no failure, retry, or
-concurrenct teller can make two debits become one or one debit become two.
+concurrent teller can make two debits become one or one debit become two.
 The requirement has a shape you can name precisely:
 
 - a *double-submit* by the same teller (the same signed transfer delivered
@@ -58,7 +58,7 @@ a way for an op to state its preconditions so the machine can check them
   (`data_model.h:126-131`); see the honesty section.
 - An op names the items it touches: `Operation.addResource` (up to
   `CRABS_MAX_RESOURCES` = 8, `src/CRABS/crabs.h:19`; node wrapper
-  `bindings/node/src/crabs_node.cc:637-679`). With each resource the op
+  `bindings/node/src/crabs_node.cc:638-679`). With each resource the op
   carries a `required_state`/`next_state` protocol pair — that pair is what
   lets the executor enforce timing, and (see the GAP blocks) it is the part
   JS cannot author.
@@ -263,15 +263,17 @@ binding — the ceremony tail:
 > **Divergence:** no node symbol authors any of it.
 > `bindings/node/index.d.ts` has no required-state setter, no lock-claim
 > setter (`Operation.addResource` hard-codes both per-slot to
-> `PROTOCOL_IDLE`, `crabs_node.cc:668-669`), and no claim-bearing op API —
+> `PROTOCOL_IDLE`, `bindings/node/src/crabs_node.cc:669-670`), and no claim-bearing op API —
 > so from JS, a locked pot cannot be extended, verified, rolled back, or
 > unlocked (each needs a `required_state` the op builder can't declare);
 > it sits locked until the lease expires and the next execute prunes it
 > (`state_machine.c:364-407`). The C tx manager
 > (`src/TxManager/tx_manager.h:19-41`, memory impl
 > `src/TxManager/tx_manager_memory.h:16`) is likewise not wired to any
-> binding state (`state->tx_manager` stays NULL, crabs_node.cc: no
-> assignment found).
+> binding state — `state->tx_manager` (`src/CRABS/data_model.h:486`) is
+> never assigned anywhere in `bindings/node/src/crabs_node.cc` (grep: zero
+> matches), so the JS executor runs with no manager and relies on the
+> ordering backstop.
 >
 > **Tracking:** api-map §17, R9 — "no lock API surface found in C headers
 > or bindings"; map entries for locks marked DESIGNED. No binding work is
