@@ -1,0 +1,76 @@
+name: cookbook-site
+on:
+  push:
+    branches: [master]
+    paths: ['cookbook/**', 'bindings/**', '.github/workflows/cookbook-site.yml']
+  pull_request:
+    paths: ['cookbook/**', 'bindings/**']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # deps/openabe-c (and its nested deps/relic) are required to build the C
+      # library and run C snippets; both must be initialized recursively.
+      - name: Init submodules
+        run: git submodule update --init --recursive
+      # Relic's ARITH=easy backend links GMP; libgmp-dev is not preinstalled on
+      # ubuntu runner images.
+      - name: Install libgmp-dev
+        run: sudo apt-get update && sudo apt-get install -y libgmp-dev
+      - uses: actions/setup-node@v4
+        with: { node-version: 22 }
+      # Neither the root CMakeLists nor the node binding builds Relic/OpenABE
+      # transitively — they expect prebuilt archives, so CI builds them here.
+      # Relic is configured for the CRABS pairing profile (bn254, ARITH=easy).
+      - name: Build relic
+        run: |
+          cmake -S deps/openabe-c/deps/relic -B deps/openabe-c/deps/relic/build \
+            -DCHECK=off -DARITH=easy -DFP_PRIME=254 \
+            -DFP_METHD='INTEG;INTEG;INTEG;MONTY;JMPDS;JMPDS;SLIDE' \
+            -DFP_PMERS=off -DFP_QNRES=on \
+            -DFPX_METHD='INTEG;INTEG;LAZYR' -DPP_METHD='LAZYR;OATEP' \
+            -DSHLIB=OFF -DSTBIN=ON
+          cmake --build deps/openabe-c/deps/relic/build -j
+      - name: Build openabe-c
+        run: make -C deps/openabe-c -j
+      - name: Build native binding
+        run: cd bindings/node && npm ci && npm run install
+      - name: Install cookbook deps
+        run: cd cookbook && npm ci
+      - name: JS snippets
+        run: cd cookbook && npm run test:snippets
+      - name: C snippets
+        run: cd cookbook && npm run test:c
+      - name: Build site
+        run: cd cookbook && node site/build.mjs
+      - name: Install playwright browser
+        run: cd cookbook && npx playwright install --with-deps chromium
+      - name: Browser snippets
+        run: cd cookbook && npm run test:browser
+  deploy:
+    needs: test
+    if: github.ref == 'refs/heads/master'
+    runs-on: ubuntu-latest
+    environment: github-pages
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 22 }
+      - name: Build site
+        run: cd cookbook && npm ci && node site/build.mjs
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with: { path: cookbook/site/dist }
+      - uses: actions/deploy-pages@v4
