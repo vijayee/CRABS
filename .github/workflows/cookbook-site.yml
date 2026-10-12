@@ -3,9 +3,10 @@ on:
   push:
     branches: [master]
     paths: ['cookbook/**', 'bindings/**', 'Encryptstacean.png', 'Unlockster.png',
-            '.github/workflows/cookbook-site.yml']
+            'src/**', 'test/**', '.github/workflows/cookbook-site.yml']
   pull_request:
-    paths: ['cookbook/**', 'bindings/**', 'Encryptstacean.png', 'Unlockster.png',
+    paths: ['cookbook/**', 'bindings/**', 'src/**', 'test/**',
+            'Encryptstacean.png', 'Unlockster.png',
             '.github/workflows/cookbook-site.yml']
   workflow_dispatch:
 
