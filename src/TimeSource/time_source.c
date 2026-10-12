@@ -26,6 +26,7 @@ typedef SOCKET platform_socket_t;
 #define PLATFORM_INVALID_SOCKET INVALID_SOCKET
 #else
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <netdb.h>
 #include <unistd.h>
 #include <errno.h>
