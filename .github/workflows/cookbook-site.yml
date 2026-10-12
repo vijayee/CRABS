@@ -45,8 +45,11 @@ jobs:
             -DFPX_METHD='INTEG;INTEG;LAZYR' -DPP_METHD='LAZYR;OATEP' \
             -DSHLIB=OFF -DSTBIN=ON
           cmake --build deps/openabe-c/deps/relic/build -j
-      - name: Build openabe-c
-        run: make -C deps/openabe-c -j
+      # The static archive is what libcrabs and the node binding link; plain
+      # `make` also links liboabe_c.so, which fails with a static-only relic
+      # build (no PIC) — build the archive target explicitly instead.
+      - name: Build openabe-c (static lib)
+        run: make -C deps/openabe-c -j build/liboabe_c.a
       - name: Build native binding
         run: cd bindings/node && npm ci && npm run install
       - name: Install cookbook deps
