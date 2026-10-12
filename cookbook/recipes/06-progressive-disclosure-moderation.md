@@ -50,7 +50,7 @@ attribute policy.
   (`src/Trigger/trigger.c:434-441`). Triggers are installed by a signed
   `__create_trigger__` op; give that op type a policy
   (`setPolicy('__create_trigger__', 'role:admin')` — the wiring
-  `examples/devtools_demo/demo.js:54-56` uses).
+  `examples/devtools_demo/demo.js:54-57` uses).
 - The effect: `effectType: 'issue_attribute'` with `issueAttribute:
   'clearance'`, `attributeValue: 'moderator'`, `durationMs: 600000`.
   On fire the effect fans out to every ACTIVE user holding an attribute
