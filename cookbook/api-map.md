@@ -47,11 +47,11 @@ Unless a row says otherwise, wasm and node share the symbol at the same d.ts lin
 | `Node.selfAssert` | method (**node only**) | `selfAssert(attribute, value, signerId)` | `bindings/node/index.d.ts:184` | STABLE (`test/test.js:97`) |
 | `Node.verifyIdentity` | method (**node only**) | `verifyIdentity(targetUser, attribute, value, signerId)` | `bindings/node/index.d.ts:185` | PRESENT (no test found) |
 | `Node.getUser` | query | `getUser(userId) -> UserInfo \| undefined` | wasm :221, node :189 | STABLE (`smoke.js:40`) |
-| `UserInfo` | interface | `{userId, publicKeyHex, keyVersion, status, attributes[]}` | wasm :150-160, node :50-61 | STABLE (`smoke.js:41`) |
+| `UserInfo` | interface | `{userId, publicKeyHex, keyVersion, status, attributes[]}` | wasm :150-160, node :50-61 | STABLE (`smoke.js:41` — attributes list only; the wasm readback returns STUBS for `publicKeyHex`/`keyVersion`/`status`, `bindings/wasm/bindings-core.js:693-706`; crabs-node maps them directly, `bindings/node/src/crabs_node.cc:1139-1157`) |
 | `UserInfo.attributes[].verifiedBy` | field | attribute provenance string | wasm :157, node :57 | STABLE (`roles.test`-style asserts, `test/test.js:92`) |
 | `Node.pruneExpiredTempAttrs` | method | `pruneExpiredTempAttrs() -> number (wasm) / void (node)` | wasm :310, node :265 | PRESENT |
 
-**Tokens / key lifecycle**: `UserInfo.keyVersion` (wasm :153, node :53) is the JS-visible key-version read. Suspend/activate/rotate exist only in C — `user_key_suspend`, `user_key_activate`, `user_key_rotate` at `src/Attribute/attribute_machine.h:219-221`, exercised in `test/test_key_lifecycle.cpp:96,180,269`. Not JS-bound → `DESIGNED`.
+**Tokens / key lifecycle**: `UserInfo.keyVersion` (wasm :153, node :53) is the JS-visible key-version read — REAL on crabs-node (mapped from the machine, `bindings/node/src/crabs_node.cc:1147`), a stubbed `0` on wasm (`bindings/wasm/bindings-core.js:698`). Suspend/activate/rotate exist only in C — `user_key_suspend`, `user_key_activate`, `user_key_rotate` at `src/Attribute/attribute_machine.h:219-221`, exercised in `test/test_key_lifecycle.cpp:96,180,269`. Not JS-bound → `DESIGNED` (documented by cookbook recipe 16 with its readback-stub gap).
 
 ## 3. Policy surface (setPolicy, role grants)
 
