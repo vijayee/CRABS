@@ -105,9 +105,11 @@ Guaranteed (everything below is executed by the snippets):
 - *Real content is covered by the chain.* The wasm and C demos register a
   handler that applies the entry's amount to the member's balance; the
   post-op digest is recomputed over that content, so the chain's head proves
-  the *balance history*, not just the fact of writes
-  (`src/StateMachine/state_machine.c:1121-1139` — the digest preimage
-  deliberately excludes item_seq so no-op entries move a content-digest).
+  the *balance history*, not just the fact of writes (digest =
+  `state_item_digest_compute` over the content-only preimage,
+  `src/CRABS/data_model.h:752-756`; the preimage deliberately excludes
+  item_seq — a no-op entry would move a content-digest anyway, per the
+  fixture note `test/test_state_machine.cpp:1244-1247`).
 - *Forks are actionable.* Two distinct alice-signed claims to the same head
   are evidence; the report verifies and quarantines her on
   `ledger-alice` only — bob's ledger is untouched (wasm snippet's report +
