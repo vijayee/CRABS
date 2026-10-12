@@ -46,7 +46,7 @@ is matched case-insensitively so `Role` and `ADMIN` do not slip through
 
 - Users: `registerUser(userId, publicKeyHex, initialAttrs)` — facts live in
   `initialAttrs` as a `|`-separated list of `name:value` tokens (C-side
-  parsing at `src/Attribute/attribute_machine.c:130-160`; `'adult'` alone is
+  parsing at `src/Attribute/attribute_machine.c:463-516`; `'adult'` alone is
   already the full token — a bare fact needs no name).
 - Roles: `grantRole(targetUser, role, value, signerId)` — installs the
   `role:<value>` attribute *verified by the admin*; the user record's
@@ -78,7 +78,7 @@ Not guaranteed: secrecy about *why* the refusal happened. A wrong clause
 and a wrong key surface with the same error text the binding maps from the
 machine's decision — deliberately, anti-enumeration (R7-14 collapses
 not-found/suspended distinctions to
-`unauthorized`, `src/Crypto/crypto.c:1211-1226`). Your application can
+`unauthorized`, `src/Crypto/crypto.c:1194-1206`). Your application can
 distinguish "which clause failed" only by constructing ops that isolate
 clauses. Also outside this recipe: expressing roles that depend on *time*
 or on other users is Recipe 6/7 territory (triggers, attestations).
@@ -155,7 +155,7 @@ symbols:
   Node.sign        bindings/node/index.d.ts:250
   Node.execute     bindings/node/index.d.ts:251
   selfAssert       bindings/node/index.d.ts:184
-  (error names)    bindings/node/src/crabs_node.cc:85-119 (typed crabs_error map)
+  (error names)    bindings/node/src/crabs_node.cc:84-120 (typed crabs_error map)
 maturity: all STABLE
 test_ref: bindings/node/test/test.js:66-78 (policy-authorized op fails closed without a handler) + :97-109 (selfAssert + privileged refusal)
 -->

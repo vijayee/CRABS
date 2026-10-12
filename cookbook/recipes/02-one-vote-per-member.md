@@ -37,7 +37,7 @@ the one whose absence on the JS surfaces drives this recipe's status (see
 - The once-record is a named item of type `ONE_SHOT_SET`:
   `addOneShotSet('proposal-42_voters')`. Its add is idempotent and it cannot
   un-vote — there is no remove: `setRemove` is a no-op for one-shot sets
-  (`bindings/node/src/crabs_node.cc:1670-1676` — only OR-sets tombstone).
+  (`bindings/node/src/crabs_node.cc:1663-1676` — only OR-sets tombstone).
 - The tally is a G-counter per option: `incrementCounter('proposal-42_voted_yea',
   1, voter)`. Attribution is per voter, so (as in Recipe 1) a replayed
   increment from the same voter merges into one entry.
@@ -235,8 +235,8 @@ test_ref: test/test_dedup.cpp:680 (PerUserVoteOnceLifecycle) + :226-257 (registe
   function exists to make that visible: *the caller* is the only thing
   checking `setContains` before mutating.
 - The once-record cannot be edited retroactively: `setRemove` tombstones
-  OR-set elements only (`bindings/node/src/crabs_node.cc:1670-1676`; the
-  wasm glue mirrors it, `src/Util/wasm_helpers.c:863-867`). That is a
+  OR-set elements only (`bindings/node/src/crabs_node.cc:1663-1676`; the
+  wasm glue mirrors it, `src/Util/wasm_helpers.c:833-839`). That is a
   feature for a voters list and a hazard for anything you might ever want
   to retract.
 - The idempotent-add and union-merge behavior the JS demos rely on are

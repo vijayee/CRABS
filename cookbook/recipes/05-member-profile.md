@@ -103,7 +103,7 @@ symbols:
   registerUser                bindings/wasm/index.d.ts:213
   grantRole                   bindings/wasm/index.d.ts:214
   getUser                     bindings/wasm/index.d.ts:221
-  UserInfo.keyVersion         bindings/wasm/index.d.ts:153 (wasm-glued value HARDCODED 0, bindings/wasm/bindings-core.js:698)
+  UserInfo.keyVersion         bindings/wasm/index.d.ts:153 (wasm-glued value HARDCODED 0, bindings/wasm/bindings-core.js:694-700)
   addRegister                 bindings/wasm/index.d.ts:228
   setRegisterBytes            bindings/wasm/index.d.ts:264
   getRegisterBytes            bindings/wasm/index.d.ts:266
@@ -180,7 +180,7 @@ test_ref: test/test_crdt.cpp:485-519 (newer wins + node-id tie-breaker)
   `user->key_version` (registration = 1, one grant = 2, asserted in the
   node snippet), while the wasm `getUser` builds its result with hardcoded
   provenance placeholders — `keyVersion: 0`, `publicKeyHex: ''`,
-  `verifiedBy: ''` (`bindings/wasm/bindings-core.js:679-705`). Same for the
+  `verifiedBy: ''` (`bindings/wasm/bindings-core.js:694-700`). Same for the
   Recipe 4 note about `verifiedBy`. If your wasm UI needs key epochs,
   read the C struct or track writes yourself.
 - The integer-only discipline is not cosmetic: registers carry a signed

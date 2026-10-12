@@ -74,7 +74,7 @@ C-only, `src/CRDT/one_shot.h:37-41`).
 - Idempotent-skip instead of reject: the handler can return 0 on a second
   attempt and just not re-run the effect — the C executor does exactly this
   trick for replayed UUIDs (`CRABS_ERR_ALREADY_EXECUTED` is treated as an
-  idempotent skip, `src/StateMachine/state_machine.c:1384-1386`).
+  idempotent skip, `src/StateMachine/state_machine.c:1533-1540`).
 - Once-per-window, not once-ever: a trigger with `cooldownMs` (Recipe 6's
   territory) gives you "no more than once per N milliseconds" rather than
   a one-way door.
@@ -226,6 +226,6 @@ test_ref: test/test_dedup.cpp:726-762 (GlobalExecutionOnceLifecycle) + test/test
 - The "idempotent skip" nuance: a *replayed UUID* (same op bytes delivered
   twice) does not re-enter the handler at all — the transaction manager
   returns `CRABS_ERR_ALREADY_EXECUTED` and the executor treats it as
-  success-without-effect (`src/StateMachine/state_machine.c:1372-1375`). The
+  success-without-effect (`src/StateMachine/state_machine.c:1533-1540`). The
   guard above covers the *different* case: a fresh op, signed again,
   intended to run the effect a second time.
