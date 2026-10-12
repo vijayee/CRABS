@@ -5,7 +5,8 @@ on:
     paths: ['cookbook/**', 'bindings/**', 'Encryptstacean.png', 'Unlockster.png',
             '.github/workflows/cookbook-site.yml']
   pull_request:
-    paths: ['cookbook/**', 'bindings/**', '.github/workflows/cookbook-site.yml']
+    paths: ['cookbook/**', 'bindings/**', 'Encryptstacean.png', 'Unlockster.png',
+            '.github/workflows/cookbook-site.yml']
   workflow_dispatch:
 
 permissions:

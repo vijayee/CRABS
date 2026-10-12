@@ -72,8 +72,9 @@ for (const page of pages) {
 indexTable.push('</table>');
 
 // --- sidebar (shared across cookbook pages) ---
+const BADGE_LABEL = { COMPLETE: 'COMP', PARTIAL: 'PART', UNSUPPORTED: 'GAP' };
 const sidebarLinks = pages.map(page =>
-  `<a href="/cookbook/${escapeHtml(page.meta.slug)}/">${String(page.meta.number).padStart(2, '0')} ${escapeHtml(page.meta.title)}<span class="badge ${page.meta.status}">${escapeHtml(page.meta.status.slice(0, 4).toUpperCase())}</span></a>`).join('\n');
+  `<a href="/cookbook/${escapeHtml(page.meta.slug)}/">${String(page.meta.number).padStart(2, '0')} ${escapeHtml(page.meta.title)}<span class="badge ${page.meta.status}">${escapeHtml(BADGE_LABEL[page.meta.status] || '')}</span></a>`).join('\n');
 
 function sidebarFor() {
   return `<div class="sidebar">
