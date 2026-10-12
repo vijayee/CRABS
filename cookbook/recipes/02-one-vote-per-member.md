@@ -200,7 +200,7 @@ test_ref: test/test_dedup.cpp:680 (PerUserVoteOnceLifecycle) + :226-257 (registe
 > **Divergence:** neither JS binding can install a spec. `Operation`
 > (`bindings/wasm/index.d.ts:26-49`, `bindings/node/index.d.ts:19-44`) exposes
 > no `dedup` field, no payload builder for the `__define_operation_type__`
-> builtin that installs one (`src/StateMachine/state_machine.h:243` — the op
+> builtin that installs one (`src/CRABS/crabs.h:161` — the op
 > itself exists, but the spec rides in C struct fields the bindings do not
 > map). So the wasm recipe above emulates the guard *inside a custom
 > handler*, and crabs-node cannot guard at all — it gets driver-level
@@ -208,7 +208,7 @@ test_ref: test/test_dedup.cpp:680 (PerUserVoteOnceLifecycle) + :226-257 (registe
 > spec: a machine-local handler guards only ops routed through *that*
 > machine's registry, and the C registry applies to every executor call.
 >
-> **Tracking:** plan — `docs/superpowers/plans/2026-10-11-cookbook-github-pages.md`
+> **Tracking:** an internal implementation plan (not published on this site)
 > (this task's section). No dedicated binding-gap tracker found for DedupSpec
 > exposure; the api-map records the gap at "R2 | DedupSpec / per-user guard".
 >

@@ -38,7 +38,7 @@ async function main() {
     throw new Error(`expected role:member and adult on alice, got ${aliceAttrs}`);
   }
   // Note: UserInfo.attributes[].verifiedBy is populated on crabs-node
-  // (bindings/node/test/test.js:92) but comes back as an empty string on
+  // (bindings/node/src/crabs_node.cc:1160) but comes back as an empty string on
   // crabs-wasm — provenance is asserted in the node snippet, not here.
 
   node.addCounter('gposts');

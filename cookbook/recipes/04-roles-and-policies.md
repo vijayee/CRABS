@@ -206,7 +206,7 @@ test_ref: test/test_durability.cpp:65-106 (signed custom op through state_machin
   is the only observable that makes the policy real.
 - `verifiedBy` is not equal on both bindings: crabs-node populates
   `attributes[].verifiedBy` (the node snippet asserts `'admin'`, mirroring
-  `bindings/node/test/test.js:92`), crabs-wasm currently hands back an
+  `bindings/node/src/crabs_node.cc:1160`), crabs-wasm currently hands back an
   empty string for it — the wasm snippet asserts values only, and the
   divergence is recorded rather than hidden.
 - The registered role IS an attribute: `grantRole('alice','role','member',…)`

@@ -35,7 +35,11 @@ function renderProse(body) {
     return `\n\`\`\`${lang}\n${source}\n\`\`\`\n`;
   });
   const html = marked.parse(body);
-  return html.replace(/<!--\s*PROVENANCE([\s\S]*?)-->/g, (full, inner) =>
+  const withGaps = html.replace(
+    /<blockquote>\s*<p>\[!WARNING\] GAP<\/p>([\s\S]*?)<\/blockquote>/g,
+    (full, inner) =>
+      `<div class="gap"><p><strong>GAP — not yet implemented</strong></p>${inner}</div>`);
+  return withGaps.replace(/<!--\s*PROVENANCE([\s\S]*?)-->/g, (full, inner) =>
     `<footer class="provenance">PROVENANCE${inner}</footer>`);
 }
 

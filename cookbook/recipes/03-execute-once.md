@@ -198,7 +198,7 @@ test_ref: test/test_dedup.cpp:726-762 (GlobalExecutionOnceLifecycle) + test/test
 > registry only); crabs-node has no handler surface at all, so its flag is
 > raised by direct driver calls with no execute-time guard anywhere.
 >
-> **Tracking:** plan — `docs/superpowers/plans/2026-10-11-cookbook-github-pages.md`
+> **Tracking:** an internal implementation plan (not published on this site)
 > (this task's section). The api-map records the gap at "R3 | `ONE_SHOT_FLAG`,
 > global dedup".
 >
