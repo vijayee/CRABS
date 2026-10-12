@@ -13,7 +13,7 @@ import { chromium } from 'playwright';
 import { createServer } from 'http';
 import { readFileSync } from 'fs';
 import { mkdirSync, } from 'fs';
-import { join, dirname, extname, resolve } from 'path';
+import { join, dirname, extname, resolve, sep } from 'path';
 import { fileURLToPath } from 'url';
 
 const recipeUrl = '/cookbook/shared-count/';
@@ -36,7 +36,12 @@ const MIME = {
 const awaitReady = new Promise((listening, failed) => {
   const server = createServer((req, res) => {
     const urlPath = req.url.split('?')[0].replace(/^\/|\/$/g, '') || 'index.html';
-    let filePath = join(distRoot, urlPath);
+    let filePath = resolve(distRoot, urlPath);
+    if (!filePath.startsWith(distRoot + sep)) {
+      res.writeHead(404);
+      res.end('not found');
+      return;
+    }
     try {
       const body = readFileSync(filePath);
       res.writeHead(200, { 'Content-Type': MIME[extname(urlPath)] || 'application/octet-stream' });
