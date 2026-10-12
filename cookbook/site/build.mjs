@@ -118,6 +118,17 @@ mkdirSync(join(dist, 'cookbook'), { recursive: true });
 copyFileSync(join(repoRoot, 'Encryptstacean.png'), join(dist, 'assets', 'Encryptstacean.png'));
 copyFileSync(join(repoRoot, 'Unlockster.png'), join(dist, 'assets', 'Unlockster.png'));
 copyFileSync(join(cookbook, 'site', 'assets', 'style.css'), join(dist, 'assets', 'style.css'));
+
+// --- wasm bundles for the interactive demo panels ---
+// The Emscripten glue (crabs.dev.js / crabs.js) resolves its .wasm binary via
+// locateFile relative to its own script URL, so each pair is served
+// side-by-side from assets/wasm/; bindings-core.js maps the glue factory onto
+// the high-level Node/KeyPair API in the browser (see panel.js).
+mkdirSync(join(dist, 'assets', 'wasm'), { recursive: true });
+const WASM_ASSETS = ['crabs.dev.js', 'crabs.dev.wasm', 'crabs.js', 'crabs.wasm', 'bindings-core.js'];
+for (const wasmAsset of WASM_ASSETS) {
+  copyFileSync(join(repoRoot, 'bindings', 'wasm', wasmAsset), join(dist, 'assets', 'wasm', wasmAsset));
+}
 writeFileSync(join(dist, 'index.html'), readFileSync(join(cookbook, 'site', 'index.html')));
 
 writeFileSync(join(dist, 'cookbook', 'index.html'), pageShell({
@@ -137,5 +148,17 @@ for (const page of pages) {
     title: `${escapeHtml(page.meta.number)} — ${escapeHtml(page.meta.title)} — CRABS Cookbook`,
     mainHtml: renderProse(page.body),
   }));
+}
+
+// --- interactive demo panels (recipes that opt in via `interactive: true`) ---
+// Each interactive recipe names its demo page as site/interactive/<file base>.html;
+// the shared panel.js (wasm boot + action wiring) is copied once.
+const interactivePages = pages.filter(page => page.meta.interactive === 'true');
+if (interactivePages.length) {
+  copyFileSync(join(cookbook, 'site', 'interactive', 'panel.js'), join(dist, 'assets', 'panel.js'));
+  for (const page of interactivePages) {
+    const demoSource = join(cookbook, 'site', 'interactive', page.file.replace(/\.md$/, '.html'));
+    copyFileSync(demoSource, join(dist, 'cookbook', page.meta.slug, 'interactive.html'));
+  }
 }
 console.log(`Built ${pages.length} recipe pages into ${dist}`);

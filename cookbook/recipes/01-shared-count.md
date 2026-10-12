@@ -7,6 +7,7 @@ status: COMPLETE
 maturity: STABLE
 target: crabs-wasm
 languages: c wasm node
+interactive: true
 ---
 ## Intent
 
@@ -107,6 +108,12 @@ symbols:
 maturity: all STABLE
 test_ref: bindings/wasm/test/smoke.js:1
 -->
+
+<div class="interactive">
+
+<iframe src="/cookbook/shared-count/interactive.html" style="width:100%;height:420px;border:none" title="Interactive demo — A shared count"></iframe>
+
+</div>
 
 ### crabs-node (native Node.js)
 

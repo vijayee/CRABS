@@ -1,0 +1,62 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Interactive demo — A shared count — CRABS Cookbook</title>
+  <link rel="icon" href="data:,">
+  <style>
+    body {
+      font: 14px/1.5 -apple-system, 'Segoe UI', Roboto, sans-serif;
+      background: #FFF6E3;
+      color: #3A3325;
+      margin: 0;
+      padding: 18px 22px;
+      min-width: 560px;
+    }
+    h2 { margin: 0 0 2px; font-size: 17px; }
+    .hint { color: #7A6A4A; font-size: 12.5px; margin: 0 0 12px; }
+    .row { display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 14px; }
+    button {
+      background: #E0901F; color: #fff; border: none; padding: 9px 16px;
+      border-radius: 999px; cursor: pointer; font-size: 13px; font-weight: 600;
+    }
+    button:hover { background: #C97E14; }
+    button:disabled { background: #D8CCB4; cursor: default; }
+    .readout { margin: 0 0 4px; font-size: 15px; }
+    .readout strong {
+      display: inline-block; min-width: 44px; text-align: center;
+      background: #BBD9EE; color: #22405C; border-radius: 8px;
+      padding: 3px 10px; font-size: 16px; font-variant-numeric: tabular-nums;
+    }
+    .nodeid { color: #7A6A4A; font-size: 12px; margin: 0 0 10px; }
+    .status {
+      border-top: 1px solid #76A5E6; padding-top: 10px; margin: 0;
+      font-size: 12.5px; color: #5B7599;
+    }
+    .status.error { color: #A02911; font-weight: 600; }
+  </style>
+</head>
+<body>
+  <main class="interactive" data-demo="shared-count">
+    <h2>Live demo — one node, one G-counter</h2>
+    <p class="hint">Create a real CRABS node (the 1.8&nbsp;MB WebAssembly binary,
+    this page, no server logic), add the counter item
+    <code>opens</code>, and increment it. Every increment is attributed to the
+    fixed node id <code>site-visitor</code>; retries merge — they cannot
+    double-count. Read <code>getCounter('opens')</code> to sum the per-node
+    table.</p>
+    <div class="row">
+      <button type="button" data-action="init">Create node</button>
+      <button type="button" data-action="increment">Increment +1</button>
+      <button type="button" data-action="read">Read counter</button>
+    </div>
+    <p class="readout">opens = <strong data-state="counter">–</strong></p>
+    <p class="nodeid" data-node-id-line style="display:none">
+      node <span data-state="node-id">–</span></p>
+    <p class="status" data-status>WASM module not loaded yet.</p>
+  </main>
+  <script src="/assets/wasm/crabs.dev.js"></script>
+  <script src="/assets/wasm/bindings-core.js"></script>
+  <script src="/assets/panel.js"></script>
+</body>
+</html>
