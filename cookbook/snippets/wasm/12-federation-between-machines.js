@@ -115,6 +115,18 @@ async function main() {
     'a revoked child is NOT severed: the machine keeps living');
   assert.throws(() => machineA.attest('machine-c', 'dave', 'role:member'),
     /attest/, 'attest must refuse a revoked child');
+  // The one-way door (the engine's observed behavior, diverging from the C
+  // header's "dissolution stays available" comment at
+  // src/Lineage/lineage.h:516-520): the dissolve op refuses a non-ACTIVE
+  // entry — a revoked federation is not dissolvable into a tombstone either.
+  const lateDissolve = await Operation.create('__dissolve_machine__');
+  lateDissolve.signerId = 'federation-admin';
+  lateDissolve.nodeId = 'federation-admin';
+  lateDissolve.payload = new TextEncoder().encode('machine-c');
+  machineA.sign(lateDissolve, adminKey.privateKeyHex());
+  assert.throws(() => machineA.execute(lateDissolve), /unauthorized/,
+    'dissolve must refuse a revoked (non-ACTIVE) child');
+  lateDissolve.destroy();
 
   blueprintB.destroy();
   blueprintC.destroy();
