@@ -2,9 +2,10 @@ name: cookbook-site
 on:
   push:
     branches: [master]
-    paths: ['cookbook/**', 'bindings/**', '.github/workflows/cookbook-site.yml']
+    paths: ['cookbook/**', 'bindings/**', 'Encryptstacean.png', 'Unlockster.png',
+            '.github/workflows/cookbook-site.yml']
   pull_request:
-    paths: ['cookbook/**', 'bindings/**']
+    paths: ['cookbook/**', 'bindings/**', '.github/workflows/cookbook-site.yml']
   workflow_dispatch:
 
 permissions:
