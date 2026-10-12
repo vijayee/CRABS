@@ -80,6 +80,8 @@ jobs:
       - name: Build site
         run: cd cookbook && npm ci && node site/build.mjs
       - uses: actions/configure-pages@v5
+        with:
+          enablement: true
       - uses: actions/upload-pages-artifact@v3
         with: { path: cookbook/site/dist }
       - uses: actions/deploy-pages@v4
