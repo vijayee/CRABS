@@ -67,7 +67,10 @@ lies about it.
   refuses a quarantined writer, and compares the claimed seq against the
   live head; a stale/duplicate claim is `CRABS_ERR_SEQ_MISMATCH`
   (`src/CRABS/crabs.h:126`), a non-writer's op is
-  `CRABS_ERR_NOT_ITEM_WRITER` (`:125`) — note the ordering of authority:
+  `CRABS_ERR_NOT_ITEM_WRITER` (`:125`), and the same seq claimed with a
+  different digest is a gate-level fork refusal,
+  `CRABS_ERR_FORK_DETECTED` (`state_machine.c:1103-1109`) — note the
+  ordering of authority:
   the writer check beats the *policy*, so an op-authorized member is still
   refused. After the op applies, the chain advances: seq +1 and a SHA-256
   digest over the item's post-op content-only form
@@ -102,11 +105,16 @@ Guaranteed (everything below is executed by the snippets):
   snippets' rogue-op step; `write-domains.js:106`,
   `bindings/node/test/test.js:455-468`).
 - *Every accepted op is chain-bound.* The signature covers `(seq, prev
-  digest)`; the executor accepts a claim only at the live head and
-  advances the head itself, so the item's accepted history is a single
-  hash-chained sequence with no gaps and no forks — the head is readable
-  by anyone (`itemChainHead`; both snippets re-read the head between
-  writes and assert the seq/digest progression).
+  digest)`; the executor accepts a claim only at the live head — a stale
+  seq is `seq_mismatch`, the same seq with a different digest is
+  `fork_detected`, both before any mutation — then advances the head
+  itself. A replica's accepted history is therefore one hash-chained
+  sequence, and the head is readable by anyone (`itemChainHead`; both
+  snippets re-read the head between writes and assert the seq/digest
+  progression). A writer who *forks across replicas* is not stopped from
+  signing the two histories — each replica just refuses the claim its own
+  head can't satisfy — which is exactly what the evidence report is for
+  (next bullet).
 - *Forks are not just detectable — they are actionable.* A second
   leader-signed claim to an already-claimed head is evidence; the report
   op verifies the pair, quarantines the writer on that item, and the
@@ -126,9 +134,10 @@ Not guaranteed — and this is the honesty this recipe owes its name:
   (`Node.encrypt`, `bindings/wasm/index.d.ts:306`,
   `bindings/node/index.d.ts:257`). Sovereign chains and ABE policies
   compose; neither substitutes for the other.
-- *Accountability needs the evidence.* A fork detected but never reported
-  is a fork the writer continues to write into: quarantine happens only
-  through the report op, which is policy-guarded
+- *Accountability needs the evidence.* The executor *refuses* a forked
+  claim at the gate (`CRABS_ERR_FORK_DETECTED`, nothing applied —
+  `state_machine.c:1103-1109`) but it does not *convict* on its own:
+  quarantine happens only through the report op, which is policy-guarded
   (`__report_equivocation__` needs an authorizing policy, set in both
   snippets) and requires possession of the two conflicting op payloads —
   the group must actually collect them (that is what "reportEquivocation
@@ -193,9 +202,9 @@ symbols:
   Node.reportEquivocation   bindings/wasm/index.d.ts:251-252
   Operation.destroy         bindings/wasm/index.d.ts:48
   Node.destroy              bindings/wasm/index.d.ts:368
-  (DOMAIN_CHECK pipeline)   src/StateMachine/state_machine.c:978-1134, :1340
+  (DOMAIN_CHECK pipeline)   src/StateMachine/state_machine.c:978-1134, :1348
   (chain advance)           src/StateMachine/state_machine.c:1142-1174, :1471-1476
-  (equivocation handler)    src/StateMachine/state_machine.c:2585-2600
+  (equivocation handler)    src/StateMachine/state_machine.c:2562-2600, :2806
   (op type word)            src/CRABS/crabs.h:175
 maturity: all STABLE
 test_ref: bindings/wasm/test/write-domains.js:68-104 (chained writes + head) + :106-107 (not_item_writer) + :113-146 (fork report, quarantine, typed failures)
@@ -240,9 +249,10 @@ No separate C demo — deliberately. The sovereign machinery is C *first*
 `src/CRABS/data_model.h:165-195`, the DOMAIN_CHECK pipeline
 `src/StateMachine/state_machine.c:978-1134`, the chain-advance
 `:1142-1174` and the equivocation-report handler `:2585-2600`), and both
-snippets above execute it through the same path — the bindings translate
-one JS call into the same `state_machine_execute` gates
-(`bindings/node/src/crabs_node.cc:1774`). There is nothing the C
+snippets above execute it through the same path — each binding translates
+one JS call into one `state_machine_execute` call
+(`bindings/node/src/crabs_node.cc:1774`; the wasm C glue,
+`src/Util/wasm_helpers.c:420`). There is nothing the C
 surface adds that this recipe could honestly demo beyond what those
 snippets run — and nothing missing that a gap would need to document.
 
@@ -277,7 +287,8 @@ snippets run — and nothing missing that a gap would need to document.
   (`resource_not_found`), a re-report (`duplicate_operation`) — a report
   that fails any of those changes nothing (`state_machine.c:2585-2600`,
   exercised in both snippets).
-- *A leader who is *not* the item's writer is a mismatch* — the writer is
-  fixed at mint and immutable; "changing the lead" for a sovereign item is
-  re-minting under a new writer (or waiting for the write-domain surface
-  to evolve — nothing in v1 replaces a writer).
+- *The writer is fixed at mint, and it is the item's truth about its
+  leader*: the DOMAIN_CHECK compares the signer against the item's own
+  `writer` field (`data_model.h:169`), not against any policy role, so
+  "changing the lead" for a sovereign item means re-minting under a new
+  writer — nothing in v1 replaces a writer on a live item.
