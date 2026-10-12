@@ -96,9 +96,9 @@ try {
 }
 
 // (4): precondition checks are typed and leave nothing behind — an op
-// naming a resource the machine never minted is refused before any effect.
-// (The pot is also still locked; the ghost op fails at the same gate that
-// would have failed a spendable op.)
+// naming a resource the machine never minted fails inside the same
+// step-4 precondition pass that gates required states
+// (state_machine.c:846-857), before any effect.
 const ghostTransfer = new Operation('transfer');
 ghostTransfer.signerId = 'treasurer';
 ghostTransfer.addResource('ghost_treasury');
@@ -126,14 +126,7 @@ const firstTransfer = new Operation('record_transfer');
 firstTransfer.signerId = 'treasurer';
 firstTransfer.addResource('transfer_ledger');
 node.sign(firstTransfer, treasurerKey);
-
-let firstLanded = false;
-try {
-  node.execute(firstTransfer);
-  firstLanded = true;
-} catch (failure) {
-  throw new Error(`the first application must succeed, got: ${failure.message}`);
-}
+node.execute(firstTransfer);
 
 try {
   node.execute(firstTransfer); // same signed op, same ordering timestamp
@@ -142,7 +135,6 @@ try {
   assert(replay.message.includes('already_executed'),
     `expected already_executed, got: ${replay.message}`);
 }
-if (!firstLanded) throw new Error('unreachable: the first application must land first');
 
 console.log('treasury OK: gate enforced, lease acquired + re-acquisition refused, preconditions typed, replay refused');
 // Node/KeyPair expose no destroy() — native cleanup is process-exit driven.

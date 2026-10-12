@@ -103,8 +103,9 @@ works only in C — the GAP blocks below are precise about each seam.
 
 Guaranteed, by the executor (all of it exercised by the snippets below):
 
-- *Refused, not applied.* An op naming an un-locked RESOURCE is refused
-  `protocol_violation` instead of half-applying; an op naming an unknown
+- *Refused, not applied.* A handler-less custom op naming an un-locked
+  RESOURCE is refused `protocol_violation` instead of half-applying (the
+  only custom path crabs-node offers); an op naming an unknown
   resource is refused `resource_not_found`. Preconditions run across every
   named resource before the handler, so one poisoned name voids the whole
   op with no partial apply (C snippet, Demo C;
@@ -239,7 +240,7 @@ symbols:
   (refusal: re-acquire live lease) src/StateMachine/state_machine.c:1710
   (replay backstop)         src/StateMachine/state_machine.c:585-611
 maturity: mint/drive/gates STABLE; claim + required-state authoring not bound
-test_ref: bindings/node/test/test.js:36 (typed execute refusals) + test/test_tx_manager.cpp:230-291
+test_ref: bindings/node/test/test.js:64-75 (typed execute refusals) + test/test_tx_manager.cpp:230-291
 -->
 
 What the snippet could not do, and the machine cannot help with from this
@@ -300,7 +301,7 @@ two named resources.
 target: native-c
 verified: executed
 symbols:
-  state_machine_execute        src/StateMachine/state_machine.h
+  state_machine_execute        src/StateMachine/state_machine.h:177
   state_machine_register_handler src/StateMachine/state_machine.c:500-524
   CRABS_OP_LOCK/VERIFY/UNLOCK  src/CRABS/crabs.h:135-139
   __lock__ contention refusal  src/StateMachine/state_machine.c:1710-1716
@@ -308,7 +309,7 @@ symbols:
   expiry + pruning             src/StateMachine/state_machine.c:364-407
   wildcard apply gate          src/StateMachine/state_machine.c:1436-1464
   required-state check         src/StateMachine/state_machine.c:845-857
-  rollback (owner check + snapshot restore) src/StateMachine/state_machine.c:1885-1917
+  rollback (owner check + snapshot restore) src/StateMachine/state_machine.c:1882-1920
   crabs_tx_manager_memory      src/TxManager/tx_manager_memory.h:16
   CRABS_ERR_ALREADY_EXECUTED   src/CRABS/crabs.h:107
   CRABS_ERR_LOCK_TOKEN_MISMATCH src/CRABS/crabs.h:69
@@ -345,9 +346,10 @@ test_ref: test/test_state_machine.cpp:196-352 (lock ceremony) + :1153-1211 (atom
   lock snapshot, and destroy all take the raw path"), which is why the
   lock snapshot captures 8 bytes for this item (`state_machine.c:1797-1806`)
   and the restore is the historical 8-byte form (`:1913-1920`).
-- *Serialization check*: after a rollback, the content-only digest of a
-  locked item hashes back to what the lock captured
-  (`state_machine.c:1777-1779`) — the pre-lock snapshot is the recovery
+- *Serialization check*: a rollback "restores exactly the content (and
+  digest) the lock captured" (`state_machine.c:1789-1790`, the snapshot
+  contract op_lock commits to at acquisition) — so a locked-and-reverted
+  item hashes back to its pre-lock form; the snapshot is the recovery
   contract, not a courtesy.
 - Related-but-different: sovereign write domains (Recipe 10) make a
   *leader's writes* verifiable and fork-detectable; they do nothing about
