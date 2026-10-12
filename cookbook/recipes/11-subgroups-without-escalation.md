@@ -65,7 +65,8 @@ key back that a machine already embedded.
 - *Spawn is validated, then committed atomically in the manifest*: duplicate
   child ids (and the parent's own machine id) are refused; the manifest
   entry is appended only after the child is fully built, so every failure
-  leaves no residue (`src/Lineage/lineage.c:1425-1446`; caps at
+  leaves no residue (`src/Lineage/lineage.h:350-356`; refusals at
+  `src/Lineage/lineage.c:1424-1447`; the children cap is
   `CRABS_MAX_CHILD_MACHINES`, `src/CRABS/data_model.h:391`).
 - *The manifest is the parent's track record*: entries carry
   childId/mode/status/ttl (`childCount`…`children`, wasm
@@ -194,7 +195,8 @@ symbols:
   Node.attest               bindings/wasm/index.d.ts:357
   Node.lineageTombstone     bindings/wasm/index.d.ts:358-362
   (spawn trust modes)       src/Lineage/lineage.c:1451-1480
-  (manifest, atomically)    src/Lineage/lineage.c:1425-1446
+  (append-after-full-build) src/Lineage/lineage.h:350-356
+  (refusals)                src/Lineage/lineage.c:1424-1447
   (dissolve severance)      src/Lineage/lineage.c:1807 + src/StateMachine/state_machine.c:703-712
 maturity: all STABLE
 test_ref: bindings/wasm/lineage_smoke.mjs:32-198
