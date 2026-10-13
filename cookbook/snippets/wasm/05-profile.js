@@ -57,10 +57,12 @@ async function main() {
   if (readProfile('alice') !== 'Vic Morrow') {
     throw new Error(`profile must round-trip, got "${readProfile('alice')}"`);
   }
-  // Key-material provenance: keyVersion is the JS-visible read, mapped on
-  // crabs-node (crabs_node.cc:1147) but HARDCODED to 0 in the wasm getUser
-  // (bindings/wasm/bindings-core.js:698) — so the exact value assert lives
-  // in the node snippet.
+  // Key-version epochs are the JS-visible read (registration starts at 1,
+  // each grant bumps): alice registered + one role grant => 2.
+  if (node.getUser('alice').keyVersion !== 2) {
+    throw new Error(`alice keyVersion must be 2 after one grant, got ` +
+      `${node.getUser('alice').keyVersion}`);
+  }
 
   // Bob may write his own profile...
   await updateProfile(bobKey, 'bob', 'B. Okafor');
