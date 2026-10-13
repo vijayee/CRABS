@@ -656,5 +656,62 @@ try {
     'trigger installed by non-\'admin\' admin must fire and grant the attribute');
 }
 
+// Test: defineOperationType — the DedupSpec op-type registration surface.
+// A '__define_operation_type__' op signed with the node key registers a
+// machine-enforced spec (state_register_op_type_def); the executor then
+// resolves it for every later op of that type and refuses a second attempt
+// from the same signer with the dedup domain error, no driver-side guard
+// involved (state_machine_op_check_dedup / dedup_check_guard_spec).
+{
+  const voteNode = new Node('admin', { ordering: 'hlc' });
+  const voterKey = KeyPair.generate();
+  const memberKey = KeyPair.generate();
+  voteNode.registerUser('alice', voterKey.publicKeyHex(), '');
+  voteNode.registerUser('bob', memberKey.publicKeyHex(), '');
+  voteNode.grantRole('alice', 'role', 'member', 'admin');
+  voteNode.grantRole('bob', 'role', 'member', 'admin');
+
+  // The tracker must exist: the executor validates the spec's tracker item
+  // before the handler (dedup_validate_mutation_spec). The tracker IS the
+  // record — no handler surface exists on crabs-node, and none is needed:
+  // the applied spec mutation writes membership.
+  voteNode.addOneShotSet('proposal-42_voters');
+  voteNode.setPolicy('__define_operation_type__', 'role:admin');
+  voteNode.setPolicy('vote', 'role:member');
+
+  voteNode.defineOperationType('vote', {
+    dedup: 'per-user',
+    trackerPath: 'proposal-42_voters',
+    rejectionMessage: 'already_performed',
+  });
+
+  // One vote per signer: the op carries no dedup spec at all (the F-2
+  // bypass shape) — the registered spec is what enforces.
+  const castVote = (key, voter) => {
+    const op = new Operation('vote');
+    op.signerId = voter;
+    op.addResource('proposal-42_voters');  // the once-record the op touches
+    voteNode.sign(op, key);
+    voteNode.execute(op);
+  };
+
+  castVote(voterKey, 'alice');
+  castVote(memberKey, 'bob');
+  assert(voteNode.setContains('proposal-42_voters', 'alice') &&
+           voteNode.setContains('proposal-42_voters', 'bob'),
+    'the registered spec must record both voters in the tracker');
+
+  let doubleVoteRefused = false;
+  try {
+    castVote(voterKey, 'alice');
+  } catch (retryRefusal) {
+    doubleVoteRefused = retryRefusal.message.includes('already_performed');
+  }
+  assert(doubleVoteRefused,
+    "a second vote from the same signer must be refused with 'already_performed'");
+  assert(!voteNode.setContains('proposal-42_voters', 'carol'),
+    'the refused retry must not add new membership');
+}
+
 console.log(`\n${passed} passed, ${failed} failed`);
 process.exit(failed > 0 ? 1 : 0);

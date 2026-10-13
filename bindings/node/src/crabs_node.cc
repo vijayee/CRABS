@@ -513,6 +513,50 @@ private:
   }
 };
 
+// Append a resource name to an operation (shared by Operation.addResource
+// and Node.defineOperationType). The wire arrays are heap-grown one slot at
+// a time; capacity CRABS_MAX_RESOURCES. Write-domains v1: an op naming a
+// SOVEREIGN item among its resources must carry a matching sovereign prefix
+// per sovereign resource (DOMAIN_CHECK enforces the exact count). The
+// required_state / next_state arrays are per-resource too — the signing
+// canonical form and the executor index them all up to resource_count, so
+// the three grow together (zeroed states = PROTOCOL_IDLE, matching the
+// deserializer's default for a state-unconstrained resource).
+static void operation_append_resource(operation_t* op, const std::string& name,
+                                      Napi::Env env, const char* ctx) {
+  if (name.empty() || name.length() >= CRABS_MAX_USER_ID)
+    throw Napi::RangeError::New(env,
+        std::string(ctx) + ": name must be 1..63 characters");
+  if (op->resource_count >= CRABS_MAX_RESOURCES)
+    throw Napi::RangeError::New(env,
+        std::string(ctx) + ": resource capacity reached");
+  uint32_t grown_count = op->resource_count + 1;
+  auto grown_resources = (char(*)[CRABS_MAX_USER_ID])realloc(
+      op->resources, grown_count * CRABS_MAX_USER_ID);
+  if (grown_resources == NULL) {
+    throw crabs_error(env, CRABS_ERR_OOM, ctx);
+  }
+  op->resources = grown_resources;
+  auto grown_required = (protocol_state_e*)realloc(
+      op->required_state, grown_count * sizeof(protocol_state_e));
+  if (grown_required == NULL) {
+    throw crabs_error(env, CRABS_ERR_OOM, ctx);
+  }
+  op->required_state = grown_required;
+  auto grown_next = (protocol_state_e*)realloc(
+      op->next_state, grown_count * sizeof(protocol_state_e));
+  if (grown_next == NULL) {
+    throw crabs_error(env, CRABS_ERR_OOM, ctx);
+  }
+  op->next_state = grown_next;
+  memset(op->resources[op->resource_count], 0, CRABS_MAX_USER_ID);
+  strncpy(op->resources[op->resource_count], name.c_str(),
+          CRABS_MAX_USER_ID - 1);
+  op->required_state[op->resource_count] = PROTOCOL_IDLE;
+  op->next_state[op->resource_count] = PROTOCOL_IDLE;
+  op->resource_count = grown_count;
+}
+
 // ============================================================
 // Operation — wraps operation_t
 // ============================================================
@@ -629,48 +673,12 @@ private:
     op_->lamport_time = (uint64_t)val.As<Napi::Number>().DoubleValue();
   }
 
-  // Append a resource name to the op (the wire array is heap-grown one slot
-  // at a time; capacity CRABS_MAX_RESOURCES). Write-domains v1: an op naming
-  // a SOVEREIGN item among its resources must carry a matching sovereign
-  // prefix per sovereign resource (DOMAIN_CHECK enforces the exact count).
-  // The required_state / next_state arrays are per-resource too — the
-  // signing canonical form and the executor index them up to resource_count,
-  // so all three grow together (zeroed states = PROTOCOL_IDLE, matching the
-  // deserializer's default for a state-unconstrained resource).
+  // Append a resource name to the op — the shared wire-array growth helper
+  // (operation_append_resource) documents the per-resource invariants.
   Napi::Value AddResource(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
     std::string name = require_js_string(info[0], "addResource", "name");
-    if (name.empty() || name.length() >= CRABS_MAX_USER_ID)
-      throw Napi::RangeError::New(env,
-          "addResource: name must be 1..63 characters");
-    if (op_->resource_count >= CRABS_MAX_RESOURCES)
-      throw Napi::RangeError::New(env,
-          "addResource: resource capacity reached");
-    uint32_t grown_count = op_->resource_count + 1;
-    auto grown_resources = (char(*)[CRABS_MAX_USER_ID])realloc(
-        op_->resources, grown_count * CRABS_MAX_USER_ID);
-    if (grown_resources == NULL) {
-      throw crabs_error(env, CRABS_ERR_OOM, "addResource");
-    }
-    op_->resources = grown_resources;
-    auto grown_required = (protocol_state_e*)realloc(
-        op_->required_state, grown_count * sizeof(protocol_state_e));
-    if (grown_required == NULL) {
-      throw crabs_error(env, CRABS_ERR_OOM, "addResource");
-    }
-    op_->required_state = grown_required;
-    auto grown_next = (protocol_state_e*)realloc(
-        op_->next_state, grown_count * sizeof(protocol_state_e));
-    if (grown_next == NULL) {
-      throw crabs_error(env, CRABS_ERR_OOM, "addResource");
-    }
-    op_->next_state = grown_next;
-    memset(op_->resources[op_->resource_count], 0, CRABS_MAX_USER_ID);
-    strncpy(op_->resources[op_->resource_count], name.c_str(),
-            CRABS_MAX_USER_ID - 1);
-    op_->required_state[op_->resource_count] = PROTOCOL_IDLE;
-    op_->next_state[op_->resource_count] = PROTOCOL_IDLE;
-    op_->resource_count = grown_count;
+    operation_append_resource(op_, name, env, "addResource");
     return info.This();
   }
 
@@ -825,6 +833,7 @@ public:
       InstanceMethod("flagSet", &Node::FlagSet),
       InstanceMethod("flagValue", &Node::FlagValue),
       InstanceMethod("setPolicy", &Node::SetPolicy),
+      InstanceMethod("defineOperationType", &Node::DefineOperationType),
       InstanceMethod("execute", &Node::Execute),
       InstanceMethod("on", &Node::On),
       InstanceMethod("sign", &Node::SignOp),
@@ -1928,6 +1937,140 @@ private:
     crabs_error_e rc = state_machine_execute(&am_->base_state, op);
     operation_destroy(op);
     if (rc != CRABS_SUCCESS) throw crabs_error(env, rc, "createTrigger");
+    return env.Undefined();
+  }
+
+  // --- DedupSpec op-type registration (v1.4 §7) ---
+
+  // Register a machine-enforced dedup spec for a user-defined operation
+  // type: builds a '__define_operation_type__' op whose resources[0]
+  // carries the op-type name and whose dedup struct carries the spec,
+  // signs it with the node key under the machine's real admin identity
+  // (the createTrigger idiom; the caller installs the define type's own
+  // policy first — setPolicy('__define_operation_type__', 'role:admin')),
+  // and executes it. The machine registry stores the spec
+  // (state_register_op_type_def — re-defining the same type REPLACES its
+  // entry in place, so dedup:'none' removes a guard) and the executor
+  // resolves it for every later op of that type, regardless of what the op
+  // carries on the wire.
+  //
+  // Exposed dedup types are the two the machine fully enforces
+  // ('per-user' tracker / 'global' flag) + 'none'. 'custom' stays
+  // C-native: its condition evaluator and spec-carried mutation target are
+  // not reason-able from JS.
+  Napi::Value DefineOperationType(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 2 || !info[1].IsObject())
+      throw Napi::TypeError::New(env,
+          "Expected defineOperationType(opType, { dedup, trackerPath?, "
+          "flagPath?, rejectionMessage? })");
+    std::string op_type = require_js_string(info[0], "defineOperationType", "opType");
+    if (op_type.empty()) {
+      throw Napi::TypeError::New(env, "defineOperationType: opType must be a non-empty string");
+    }
+    Napi::Object options = info[1].As<Napi::Object>();
+    std::string dedup_word = to_lower_ascii(
+        require_js_string(options.Get("dedup"), "defineOperationType", "dedup"));
+    dedup_type_e dedup_type;
+    if (dedup_word == "none") {
+      dedup_type = DEDUP_NONE;
+    } else if (dedup_word == "per-user") {
+      dedup_type = DEDUP_PER_USER;
+    } else if (dedup_word == "global") {
+      dedup_type = DEDUP_GLOBAL;
+    } else {
+      throw Napi::TypeError::New(env,
+          "defineOperationType: dedup must be 'per-user' | 'global' | 'none' "
+          "(the 'custom' shape is C-native and not surfaceable)");
+    }
+    std::string tracker_path;
+    std::string flag_path;
+    std::string rejection_message;
+    bool has_rejection_message = false;
+    if (options.Has("trackerPath")) {
+      tracker_path = require_js_string(options.Get("trackerPath"), "defineOperationType", "trackerPath");
+    }
+    if (options.Has("flagPath")) {
+      flag_path = require_js_string(options.Get("flagPath"), "defineOperationType", "flagPath");
+    }
+    if (dedup_type == DEDUP_PER_USER && tracker_path.empty()) {
+      throw Napi::TypeError::New(env,
+          "defineOperationType: dedup 'per-user' requires a trackerPath "
+          "(the ONE_SHOT_SET once-record)");
+    }
+    if (dedup_type == DEDUP_NONE && !tracker_path.empty()) {
+      throw Napi::TypeError::New(env,
+          "defineOperationType: dedup 'none' takes no trackerPath "
+          "(a 'none' definition removes the guard; nothing to track)");
+    }
+    if (dedup_type == DEDUP_GLOBAL && flag_path.empty()) {
+      throw Napi::TypeError::New(env,
+          "defineOperationType: dedup 'global' requires a flagPath "
+          "(the ONE_SHOT_FLAG once-record)");
+    }
+    if (options.Has("rejectionMessage")) {
+      rejection_message = require_js_string(
+          options.Get("rejectionMessage"), "defineOperationType", "rejectionMessage");
+      has_rejection_message = !rejection_message.empty();
+    }
+    // An op-type name travels as resources[0] (the define handler reads it),
+    // so it obeys the same length bound as every other resource string.
+    if (op_type.length() >= CRABS_MAX_USER_ID) {
+      throw Napi::RangeError::New(env,
+          "defineOperationType: opType must be 1..63 characters");
+    }
+
+    operation_t* op = operation_create(CRABS_OP_DEFINE_OPERATION);
+    if (op == nullptr) throw crabs_error(env, CRABS_ERR_OOM, "defineOperationType");
+    operation_append_resource(op, op_type, env, "defineOperationType");
+    op->dedup.type = dedup_type;
+    if (dedup_type == DEDUP_PER_USER) {
+      strncpy(op->dedup.tracker_path, tracker_path.c_str(), CRABS_MAX_DEDUP_PATH - 1);
+      op->dedup.tracker_path[CRABS_MAX_DEDUP_PATH - 1] = '\0';
+    } else if (dedup_type == DEDUP_GLOBAL) {
+      strncpy(op->dedup.flag_path, flag_path.c_str(), CRABS_MAX_DEDUP_PATH - 1);
+      op->dedup.flag_path[CRABS_MAX_DEDUP_PATH - 1] = '\0';
+    }
+    // rejection_message is metadata carried on the spec (serialized with
+    // it); the enforcement error itself is the type's domain error.
+    if (has_rejection_message) {
+      strncpy(op->dedup.rejection_message, rejection_message.c_str(),
+              CRABS_MAX_DEDUP_MESSAGE - 1);
+      op->dedup.rejection_message[CRABS_MAX_DEDUP_MESSAGE - 1] = '\0';
+    }
+
+    strncpy(op->signer_id, admin_id_.c_str(), CRABS_MAX_USER_ID - 1);
+    strncpy(op->node_id, admin_id_.c_str(), CRABS_MAX_USER_ID - 1);
+
+    // Stamp BEFORE signing so the signature covers HLC + key version
+    // (the same mandatory execute gates every other op obeys).
+    if (am_->base_state.hlc_state_initialized) {
+      op->ordering_system = CRABS_ORDERING_HLC;
+      op->hlc = crabs_hlc_next(&am_->base_state.hlc_state);
+      strncpy(op->node_id, am_->base_state.hlc_state.last.node_id,
+              CRABS_MAX_USER_ID - 1);
+    }
+    user_t* signer_user = attribute_machine_find_user(am_, op->signer_id);
+    if (signer_user != nullptr) {
+      op->signer_key_version = signer_user->key_version;
+    }
+
+    if (node_key_ == nullptr) {
+      operation_destroy(op);
+      throw Napi::Error::New(env,
+        "defineOperationType: this machine carries no own node key");
+    }
+    serialized_buffer_t* ser = crabs_serialize_for_signing(op);
+    if (ser == nullptr) {
+      operation_destroy(op);
+      throw crabs_error(env, CRABS_ERR_SERIALIZATION_ERROR, "defineOperationType");
+    }
+    crypto_ecdsa_sign(node_key_->private_key, ser->data, ser->len, op->signature);
+    serialized_buffer_destroy(ser);
+
+    crabs_error_e rc = state_machine_execute(&am_->base_state, op);
+    operation_destroy(op);
+    if (rc != CRABS_SUCCESS) throw crabs_error(env, rc, "defineOperationType");
     return env.Undefined();
   }
 

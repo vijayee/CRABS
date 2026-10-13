@@ -146,6 +146,36 @@ export interface TriggerConfig {
   policyExpression?: string;
 }
 
+/**
+ * Options for Node.defineOperationType — a machine-enforced DedupSpec
+ * registered for a user-defined operation type (v1.4 §7). The executor
+ * resolves the spec for every later op of that type; a registered spec wins
+ * over anything the op carries on the wire.
+ */
+export interface DefineOperationTypeOptions {
+  /**
+   * 'per-user': one op per signer, tracked in the ONE_SHOT_SET item named
+   * by trackerPath (created with addOneShotSet; the executor validates the
+   * tracker exists before any handler runs).
+   * 'global': the op can execute once, ever — the ONE_SHOT_FLAG item named
+   * by flagPath (created with addOneShotFlag) is set by the first run and
+   * refuses every later run.
+   * 'none': removes a previously defined guard for the type (the registry
+   * entry is replaced in place) and seals it against op-carried specs.
+   */
+  dedup: 'per-user' | 'global' | 'none';
+  /** 'per-user' only: the ONE_SHOT_SET once-record item name. */
+  trackerPath?: string;
+  /** 'global' only: the ONE_SHOT_FLAG once-record item name. */
+  flagPath?: string;
+  /**
+   * Stored metadata on the spec (serialized with it, surfaced by tooling).
+   * The refusal itself always surfaces as the machine's dedup domain error
+   * ('already_performed' for per-user, 'already_executed' for global).
+   */
+  rejectionMessage?: string;
+}
+
 export interface NodeOptions {
   ordering?: 'hlc' | 'lamport';
   strategy?: 'naive' | 'bounded' | 'quorum' | 'strict' | 'trusted';
@@ -247,6 +277,18 @@ export interface Node {
 
   // Policies & Operations
   setPolicy(opType: string, expression: string): void;
+  /**
+   * Registers a machine-enforced DedupSpec for a user-defined op type
+   * (v1.4 §7): builds a '__define_operation_type__' op, signs it with the
+   * node key under the machine's real admin identity and executes it; the
+   * spec lands in the machine registry and guards every later op of that
+   * type (the registry entry is replaced in place on re-definition, so
+   * dedup 'none' removes a guard). Installing the define type's own policy
+   * first is the caller's job (setPolicy('__define_operation_type__',
+   * 'role:admin')). The 'custom' dedup shape is C-native and not
+   * surfaceable from the bindings.
+   */
+  defineOperationType(opType: string, options: DefineOperationTypeOptions): void;
   sign(op: Operation, key: KeyPair | string): void;
   execute(op: Operation): void;
 
