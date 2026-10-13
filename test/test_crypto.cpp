@@ -457,6 +457,66 @@ TEST(TestAbe, TestEncryptNullParams) {
   crypto_abe_master_key_destroy(mk);
 }
 
+// crypto_abe_ciphertext_load — the bindings' reconstruct path: an opaque
+// ciphertext must round-trip from its parts (policy + packed ct bytes),
+// exactly the halves the language-binding container exposes.
+TEST(TestAbe, TestCiphertextLoadRoundTrip) {
+  abe_master_key_t* mk = crypto_abe_setup();
+  ASSERT_NE(mk, nullptr);
+
+  const char* policy = "admin and editor";
+  const uint8_t msg[] = "load round trip";
+  size_t msg_len = sizeof(msg);
+
+  abe_ciphertext_t* ct = crypto_abe_encrypt(mk, msg, msg_len, policy);
+  ASSERT_NE(ct, nullptr);
+
+  // Disassemble into the two halves the container carries...
+  size_t data_len = 0;
+  const uint8_t* data = crypto_abe_ciphertext_get_data(ct, &data_len);
+  ASSERT_NE(data, nullptr);
+
+  // ...and rebuild from those halves; the loaded handle decrypts like the
+  // original and reports the same policy.
+  abe_ciphertext_t* loaded = crypto_abe_ciphertext_load(policy, data, data_len);
+  ASSERT_NE(loaded, nullptr);
+  EXPECT_STREQ(crypto_abe_ciphertext_get_policy(loaded), policy);
+
+  abe_user_key_t* sk = crypto_abe_keygen(mk, "admin,editor");
+  ASSERT_NE(sk, nullptr);
+  uint8_t* out = nullptr;
+  size_t out_len = 0;
+  EXPECT_EQ(crypto_abe_decrypt(sk, loaded, &out, &out_len), CRABS_SUCCESS);
+  ASSERT_NE(out, nullptr);
+  EXPECT_EQ(out_len, msg_len);
+  EXPECT_EQ(memcmp(out, msg, msg_len), 0);
+  free(out);
+
+  // A tampered body must fail closed through the loaded handle too.
+  std::vector<uint8_t> tampered(data, data + data_len);
+  tampered[tampered.size() - 1] ^= 0xff;
+  abe_ciphertext_t* tampered_ct = crypto_abe_ciphertext_load(
+      policy, tampered.data(), tampered.size());
+  ASSERT_NE(tampered_ct, nullptr);
+  out = nullptr;
+  out_len = 0;
+  EXPECT_EQ(crypto_abe_decrypt(sk, tampered_ct, &out, &out_len),
+            CRABS_ERR_UNAUTHORIZED);
+
+  crypto_abe_user_key_destroy(sk);
+  crypto_abe_ciphertext_destroy(loaded);
+  crypto_abe_ciphertext_destroy(tampered_ct);
+  crypto_abe_ciphertext_destroy(ct);
+  crypto_abe_master_key_destroy(mk);
+}
+
+TEST(TestAbe, TestCiphertextLoadNullParams) {
+  const uint8_t data[] = {0x01, 0x02, 0x03};
+  EXPECT_EQ(crypto_abe_ciphertext_load(nullptr, data, sizeof(data)), nullptr);
+  EXPECT_EQ(crypto_abe_ciphertext_load("admin", nullptr, sizeof(data)), nullptr);
+  EXPECT_EQ(crypto_abe_ciphertext_load("admin", data, 0), nullptr);
+}
+
 TEST(TestCrypto, TestSignOperation) {
   ecdsa_keypair_t* keypair = crypto_ecdsa_generate();
   ASSERT_NE(keypair, nullptr);
