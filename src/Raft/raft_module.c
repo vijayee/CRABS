@@ -242,7 +242,7 @@ static bool _raft_append_config_entry(crabs_raft_module_s* module,
                                       uint8_t kind);
 // Shared leader-start tail (both the degenerate self-election and the won
 // multi-node election): no-op entry, joint-resume, persist, fan-out.
-static void _raft_become_leader_tail(crabs_raft_module_s* module, uint64_t now_ms);
+static void _raft_become_leader_tail(crabs_raft_module_s* module);
 
 // ============================================================
 // Small helpers
@@ -1603,7 +1603,7 @@ static void _raft_begin_election(crabs_raft_module_s* module, uint64_t now_ms) {
     _raft_enqueue_notification(module, RAFT_NOTIFY_BECAME_LEADER,
                                module->config.node_id, 0, NULL, 0);
     module->election_deadline_ms = now_ms + _raft_random_election_timeout(module);
-    _raft_become_leader_tail(module, now_ms);
+    _raft_become_leader_tail(module);
     return;
   }
 
@@ -1640,15 +1640,14 @@ static void _raft_become_leader(crabs_raft_module_s* module, uint64_t now_ms) {
   module->last_append_ms = now_ms;
   _raft_enqueue_notification(module, RAFT_NOTIFY_BECAME_LEADER,
                              module->config.node_id, 0, NULL, 0);
-  _raft_become_leader_tail(module, now_ms);
+  _raft_become_leader_tail(module);
 }
 
 // Shared leader-start tail (degenerate single node and won elections alike):
 // append the §8 leadership NO-OP entry immediately, resume a joint
 // consensus transition the committed config left open, persist the new
 // tail, and fan the batch out.
-static void _raft_become_leader_tail(crabs_raft_module_s* module,
-                                     uint64_t now_ms) {
+static void _raft_become_leader_tail(crabs_raft_module_s* module) {
   // Leadership no-op (Raft §8 liveness): the leader can commit in its own
   // term even when prior-term tails stall under the §5.4.2 rule. wire_len 0
   // marks the entry; committed no-ops never materialize as machine ops.
