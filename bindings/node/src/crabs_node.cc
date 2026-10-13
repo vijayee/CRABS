@@ -1916,8 +1916,10 @@ private:
         if (dep_node.empty() || dep_node.length() >= CRABS_MAX_USER_ID)
           throw Napi::RangeError::New(env,
               std::string(ctx) + ": dep node must be 1..63 characters");
-        uint64_t dep_sequence = dep.Has("seq")
-            ? require_u64_numeric(dep.Get("seq"), ctx, "dep.seq") : 0;
+        if (!dep.Has("seq"))
+          throw Napi::TypeError::New(env,
+              std::string(ctx) + ": dep \"" + dep_node + "\" needs integer seq");
+        uint64_t dep_sequence = require_u64_numeric(dep.Get("seq"), ctx, "dep.seq");
         uint64_t dep_timestamp = dep.Has("ts") && !dep.Get("ts").IsUndefined()
             ? require_u64_numeric(dep.Get("ts"), ctx, "dep.ts") : 0;
         crabs_ot_op_id_init(&deps[dep_index], dep_node.c_str(), dep_sequence,
