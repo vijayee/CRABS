@@ -3,7 +3,7 @@ number: 12
 slug: federation-between-machines
 title: Federating two machines' machines via attestations
 section: Composition
-status: PARTIAL
+status: COMPLETE
 maturity: STABLE
 target: crabs-wasm
 languages: c wasm node
@@ -43,8 +43,8 @@ A's key chain, and every decay/sever case has a code-level answer.
 - *The vouch*: A's `attest` (`lineageAttest` on the node binding) signs a
   TTL-bounded attribute grant for a manifested child — wire image
   `u32le length + canonical body + 64-byte parent ECDSA`, body format v2,
-  canonical body cap 512 bytes (`bindings/wasm/index.d.ts:357`,
-  `bindings/node/index.d.ts:295-300`; C format constants
+  canonical body cap 512 bytes (`bindings/wasm/index.d.ts:725`,
+  `bindings/node/index.d.ts:538`; C format constants
   `src/Lineage/lineage.h:32-39`; issuer semantics, manifest-gated, at
   `src/Lineage/lineage.h:670-685`). The stamped window is not_before ≤ now ≤
   expires_at, TTL from the blueprint's `attestationTtlMs`; the body binds
@@ -57,26 +57,36 @@ A's key chain, and every decay/sever case has a code-level answer.
   attestation verifies under the child's accepted parent-key chain TIP, it
   names B's exact parent id, it names the op's resolved signer, and its
   attribute list covers the token EXACTLY
-  (`_verify_parent_endorsements`, `src/StateMachine/state_machine.c:700-756`;
-  exact-coverage check `:654-675`). Every failure collapses to
-  `unauthorized` — forged-parent, wrong-child, wrong-user, uncovered,
-  expired, tampered, and an unbound machine all fail closed (the C snippet
-  executes all of them).
+  (`_verify_parent_endorsements`, `src/StateMachine/state_machine.c:709-762`;
+  exact-coverage check `:663-689`). Every missing/invalid condition
+  collapses to `unauthorized` — forged-parent, wrong-child, wrong-user,
+  uncovered, expired, tampered, and an unbound machine all fail closed (the
+  C snippet executes all of them; the JS batteries execute the JS-reachable
+  subset: tampered, wrong-user, uncovered, wrong-child, expired). The
+  consumer side is operator-controlled JS: `Operation.addAttestation`
+  (both bindings, identical name) stages the credential field-wise onto the
+  op — `parentId`/`childId`/`userId`/`attributes`/`notBefore`/`expiresAt`/
+  `parentKeyVersion`/`signatureHex` — from the fields of the parent's
+  attest wire image, which the canonical body layout makes parseable
+  (`bindings/wasm/index.d.ts:9-25` the `AttestationFields` shape,
+  `:102` the method; node `index.d.ts:39-55`, `:112`; wasm export
+  `crabs_wasm_op_add_attestation`, `src/Util/wasm_helpers.c:810-865`;
+  node direct fill `bindings/node/src/crabs_node.cc:870-979`).
 - *The early stop*: `__revoke_attestation__` flips B's manifest entry to
   `attestation_revoked` — new vouches refuse while the machine keeps living
   (`src/Lineage/lineage.c:1752-1777`).
 - *The sever*: `__dissolve_machine__` sets B's durable
   `lineage_parent_dissolved` flag — every `@parent/` endorsement on B fails
   closed *instantly*, even with a valid unexpired attestation in hand
-  (`src/StateMachine/state_machine.c:703-712`; flag set at
+  (`src/StateMachine/state_machine.c:716-723`; flag set at
   `src/Lineage/lineage.c:1807`).
 - *The off-chain proof*: `lineageTombstone` mints A's ECDSA over the
   canonical body `u8 tag + string16 child_id + u64le parent_key_version`,
   honesty-gated (the entry must currently read DISSOLVED — minting one for a
   live child is a lie and refuses), and B consumes it through the
   `__receive_dissolution__` op, verifying tip-only and refusing re-delivery
-  idempotently (`bindings/wasm/index.d.ts:358-362`,
-  `bindings/node/index.d.ts:295-308`; delivery spec
+  idempotently (`bindings/wasm/index.d.ts:730`,
+  `bindings/node/index.d.ts:540-547`; delivery spec
   `src/Lineage/lineage.h:570-593`).
 
 ## What it guarantees / what it doesn't
@@ -97,7 +107,7 @@ Guaranteed (everything below is executed by the snippets):
 - *B's authorization never trusts the payload, only the verification.* The
   endorsement pipeline re-verifies the attestation itself, per op, against
   the chain — a carried-but-unverified "credential" (forged, foreign,
-  mis-addressed, stale) authorizes nothing (`src/StateMachine/state_machine.c:700-756`;
+  mis-addressed, stale) authorizes nothing (`src/StateMachine/state_machine.c:709-762`;
   the C snippet's negative battery).
 - *Revocation and severance are distinct tools with real semantics*: a
   revoked child keeps living and loses only vouches; a dissolved child loses
@@ -115,42 +125,18 @@ Not guaranteed — the honesty this recipe owes:
   machines running the authenticated HTTPS time source (`setTimeSource`,
   api-map §6) is the configuration the windows are meaningful under — this
   is the trust caveat the README carries, not a footnote.
-- *[The GAP — verification/attachment is C-only]:*
-
-  > [!WARNING] GAP
-  >
-  > **Prose describes:** B resolving an A-signed attestation — attaching the
-  > vouch to an op and letting B's `@parent/` endorsement policy authorize it.
-  >
-  > **Codebase status:** exists in C and is engine-tested: the op carries
-  > `attestations[]` (`src/StateMachine/state_machine.h:90-97`, wire format
-  > v5 per `CRABS_OP_FORMAT_VERSION` history `src/StateMachine/state_machine.h:60-64`),
-  > the pipeline `_verify_parent_endorsements`
-  > (`src/StateMachine/state_machine.c:700-756`), the chain-aware verifier
-  > `attestation_verify_by_lineage_key` (`src/Lineage/lineage.h:655-656`),
-  > tests at `test/test_lineage.cpp:644-777`. Neither JS binding exposes any
-  > of it: grep both `.d.ts` files — the only attestation surface is
-  > issuance (`bindings/wasm/index.d.ts:357`,
-  > `bindings/node/index.d.ts:295-300`); no op-attestation attachment, no JS
-  > deserializer (`attestation_deserialize`, `src/Lineage/lineage.h:666`, is
-  > C-only).
-  >
-  > **Divergence:** the design (spec §attestation bridge) makes attestations
-  > the cross-machine credential B's policies resolve against; JS consumers
-  > can mint the credential (both snippets do) but cannot deliver or consume
-  > one — the demoed consumption runs in the C snippet below, against the
-  > same engine the bindings wrap.
-  >
-  > **Tracking:** an internal implementation plan (not published on this
-  > site).
-  >
-  > **Agent action:** code block omitted on the JS surfaces for the consume
-  > half — do not invent `op.attestations`, an `attachAttestation`, or an
-  > attestation deserializer on either binding; the C section is where this
-  > half is real.
-
-  For that reason the frontmatter status is PARTIAL: the recipe *delivers*
-  vouch/decay/sever/proof on wasm + node and consume on C, and nothing more.
+- *The consume is JS-bound as operator staging, NOT as a verifier.*
+  `Operation.addAttestation` stages the credential onto the op and the
+  snippets execute the endorsed op end-to-end (authorized, plus the
+  tampered/wrong-user/uncovered/wrong-child/expired refusals). What stays
+  C-only is the verifier surface itself: `attestation_deserialize`
+  (`src/Lineage/lineage.h:666`) has no JS map entry, and the two fail-closed
+  cases a JS harness cannot produce — a FORGED parent (the bindings only
+  mint REAL parent-node-key attestations through `crabs_issue_attestation`)
+  and an UNBOUND machine (spawn always binds; the C snippet executes both
+  cases, `cookbook/snippets/c/12-federation-between-machines.c`). Nothing
+  here is a gap: the executor's fails-closed battery is the boundary, and
+  the JS batteries quote its `unauthorized` collapse verbatim.
 
 - *Revocation is a one-way door for vouches, and the dissolve door stays
   open behind it*: an `attestation_revoked` entry refuses new vouches —
@@ -195,7 +181,9 @@ Not guaranteed — the honesty this recipe owes:
 
 ### crabs-wasm (browser / Node / edge)
 
-Mint machine B, vouch for its members, sever with the signed tombstone,
+Mint machine B, vouch for its members, EXECUTE a `@parent/`-endorsed op on
+the child with the vouch attached (`Operation.addAttestation`: authorized,
+plus tampered/wrong-user/expired refused), sever with the signed tombstone,
 and — on a second machine — de-vouch with `__revoke_attestation__`, watching
 the machine keep living while the vouches stop — then dissolve it anyway
 (the door stays open; the late tombstone mints). The wire images are
@@ -208,29 +196,33 @@ structure-checked inline.
 target: crabs-wasm
 verified: executed
 symbols:
-  Node.create               bindings/wasm/index.d.ts:372
-  Node.setTime              bindings/wasm/index.d.ts:309
-  Blueprint.create          bindings/wasm/index.d.ts:79-81
-  Node.lineageInstall       bindings/wasm/index.d.ts:342
-  Node.lineageSpawn         bindings/wasm/index.d.ts:344
-  Node.lineageResidentChild bindings/wasm/index.d.ts:346
-  childById                 bindings/wasm/index.d.ts:353
-  Node.attest               bindings/wasm/index.d.ts:357
-  Operation.create          bindings/wasm/index.d.ts:52
+  Node.create               bindings/wasm/index.d.ts:740
+  Node.setTime              bindings/wasm/index.d.ts:677
+  Blueprint.create          bindings/wasm/index.d.ts:136-138
+  Node.lineageInstall       bindings/wasm/index.d.ts:710
+  Node.lineageSpawn         bindings/wasm/index.d.ts:712
+  Node.lineageResidentChild bindings/wasm/index.d.ts:714
+  childById                 bindings/wasm/index.d.ts:721
+  Node.attest               bindings/wasm/index.d.ts:725
+  Operation.addAttestation  bindings/wasm/index.d.ts:102 (AttestationFields :9-25)
+  Operation.create          bindings/wasm/index.d.ts:111
+  (wasm export)             crabs_wasm_op_add_attestation src/Util/wasm_helpers.c:810-865
+  (executor consume)        src/StateMachine/state_machine.c:709-762
   (lineage ops)             src/Lineage/lineage.h:484-489
-  Node.lineageTombstone     bindings/wasm/index.d.ts:358-362
+  Node.lineageTombstone     bindings/wasm/index.d.ts:730
   (revoke handler)          src/Lineage/lineage.c:1752-1777
   (dissolve + honesty gate) src/Lineage/lineage.c:1795-1801 + :1941
 maturity: all STABLE
-test_ref: bindings/wasm/lineage_smoke.mjs:82-186 (attest + tombstone) + :121-141 (honesty gates)
+test_ref: bindings/wasm/test/attestations.js (endorsed attach + refusals + op-wire round trip) + bindings/wasm/lineage_smoke.mjs:82-186 (attest + tombstone)
 -->
 
 ### crabs-node (native Node.js)
 
-Same lifecycle on the native binding, plus the delivery half the borrowed
-child wrapper makes demoable: `__receive_dissolution__` consuming the
-tombstone bytes and refusing re-delivery `already_performed` — the durable
-proof that severance reached the child.
+Same lifecycle on the native binding, plus the two halves the borrowed child
+wrapper makes demoable: `__receive_dissolution__` consuming the tombstone
+bytes and refusing re-delivery `already_performed` (the durable proof that
+severance reached the child), and the `@parent/` endorsement consume on the
+child machine itself (authorized + tampered/wrong-user/expired refusals).
 
 ```snippet:node/12-federation-between-machines.js
 ```
@@ -239,19 +231,21 @@ proof that severance reached the child.
 target: crabs-node
 verified: executed
 symbols:
-  new Node                  bindings/node/index.d.ts:312
-  Node.setTime              bindings/node/index.d.ts:264
-  Blueprint.create          bindings/node/index.d.ts:100
-  Node.lineageInstall       bindings/node/index.d.ts:284
-  Node.lineageSpawn         bindings/node/index.d.ts:290
-  Node.lineageChildren      bindings/node/index.d.ts:292
-  Node.lineageResidentChild bindings/node/index.d.ts:294
-  Node.lineageAttest        bindings/node/index.d.ts:300
-  Node.lineageTombstone     bindings/node/index.d.ts:295-308
-  Node.getNodeKey           bindings/node/index.d.ts:190
+  new Node                  bindings/node/index.d.ts:608
+  Node.setTime              bindings/node/index.d.ts:502
+  Blueprint.create          bindings/node/index.d.ts:179
+  Node.lineageInstall       bindings/node/index.d.ts:522
+  Node.lineageSpawn         bindings/node/index.d.ts:528
+  Node.lineageChildren      bindings/node/index.d.ts:530
+  Node.lineageResidentChild bindings/node/index.d.ts:532
+  Node.lineageAttest        bindings/node/index.d.ts:538
+  Operation.addAttestation  bindings/node/index.d.ts:112 (AttestationFields :39-55)
+  (addon fill)              Operation::AddAttestation bindings/node/src/crabs_node.cc:870-979
+  Node.lineageTombstone     bindings/node/index.d.ts:546
+  Node.getNodeKey           bindings/node/index.d.ts:299
   (receive-dissolution spec) src/Lineage/lineage.h:570-593
-maturity: attest/tombstone/lifecycle STABLE; receive-dissolution delivery STABLE (C-tested + demonstrated against the resident-severed wrapper)
-test_ref: bindings/node/lineage_smoke.mjs:101-239 (attest, dissolve, tombstone, receive-dissolution idempotency)
+maturity: all STABLE; receive-dissolution delivery STABLE (C-tested + demonstrated against the resident-severed wrapper)
+test_ref: bindings/node/test/attestations.js (endorsed attach + refusals) + bindings/node/lineage_smoke.mjs:101-239 (attest, dissolve, tombstone, receive-dissolution idempotency)
 -->
 
 ### C (native)
@@ -274,10 +268,10 @@ symbols:
   attestation_verify_by_lineage_key src/Lineage/lineage.h:654-656
   attestation_serialize          src/Lineage/lineage.h:661-662
   attestation_deserialize        src/Lineage/lineage.h:666
-  (op.attestations payload)      src/StateMachine/state_machine.h:90-97
-  (_verify_parent_endorsements)  src/StateMachine/state_machine.c:700-756
-  (exact coverage check)         src/StateMachine/state_machine.c:654-675
-maturity: all exercised in C tests (the JS gap above)
+  (op.attestations payload)      src/StateMachine/state_machine.h:96-97
+  (_verify_parent_endorsements)  src/StateMachine/state_machine.c:709-762
+  (exact coverage check)         src/StateMachine/state_machine.c:663-689
+maturity: all exercised in C tests; forged-parent + unbound-machine are the cases a JS harness cannot mint
 test_ref: test/test_lineage.cpp:396-508 (round trip + refusals) + :644-777 (endorsement pipeline)
 -->
 
@@ -287,13 +281,20 @@ test_ref: test/test_lineage.cpp:396-508 (round trip + refusals) + :644-777 (endo
   `crabs_issue_attestation` (manifest-gated, TTL from the blueprint) —
   wasm and node differ only in the method name (`attest` /
   `lineageAttest`) and the node binding's optional attributes argument
-  (api-map §10). Consumption is engine-only, which is why the recipe's one
-  gap sits between the sections.
-- *The length-prefix check is the whole JS-visible structure*: wasm/node
-  consumers can assert `u32le total == wire.length - 4` and a non-zero
-  trailing ECDSA — the canonical body (ids, window, stamp) is opaque to JS
-  (`attestation_deserialize`, `src/Lineage/lineage.h:666`, has no JS map
-  entry).
+  (api-map §10). Consumption is split the same way the executor is: the
+  attach is a JS struct fill (`Operation.addAttestation`, identical name,
+  both bindings — the node addon stages it straight onto `op_->attestations`,
+  the wasm export mirrors `crabs_wasm_op_add_lock_claim`'s slot growth), and
+  the VERIFICATION is the executor's — `@parent/` policies refuse on the
+  engine's own re-verification, never on the operator's word.
+- *The wire is fully parseable from JS*: the canonical body layout is
+  documented (`src/Lineage/lineage.c`, `_attestation_write_canonical_body` —
+  u8 format_version + string16 ids/attributes + u64le window + u64le stamp,
+  under the u32le length prefix), so the recipes parse the vouch field-wise
+  themselves; `attestation_deserialize` (`src/Lineage/lineage.h:666`) stays
+  C-only (no JS map entry). Tampering is therefore ALWAYS caught
+  engine-side: a hand-edit to any field breaks the parent ECDSA over the
+  body.
 - *Time discipline, restated*: A stamps the window from ITS time source
   (`setTime` before `attest` — a machine never reads the wall clock itself,
   `src/Lineage/lineage.h:621-623`); B checks the window with B's own. The

@@ -4,9 +4,12 @@
 // Same federation lifecycle as the wasm section, on the native binding —
 // plus what the borrowed child wrapper makes demonstrable: the
 // receive-dissolution delivery contract (the tombstone bytes are the exact
-// payload the child consumes, and re-delivery is refused idempotently) and
-// the attest/verify split honesty gate. Mirrors the node lineage smoke
-// (bindings/node/lineage_smoke.mjs).
+// payload the child consumes, and re-delivery is refused idempotently), the
+// attest/verify split honesty gate, and the CONSUME side — a spawned
+// child's `@parent/` endorsement policy resolving an attestation an op
+// carries (Operation.addAttestation). Mirrors the node lineage smoke
+// (bindings/node/lineage_smoke.mjs) and the binding battery
+// bindings/node/test/attestations.js.
 
 const assert = require('assert');
 const { Node, KeyPair, Operation, Blueprint, TRUST_MODE, DATA_TYPE, CRDT_TYPE } =
@@ -15,6 +18,48 @@ const { Node, KeyPair, Operation, Blueprint, TRUST_MODE, DATA_TYPE, CRDT_TYPE } 
 const childId = 'machine-b';
 const LINEAGE_DISSOLVED_TAG = 0x01;   // lineage_status_e LINEAGE_DISSOLVED
 const CRABS_SIG_SIZE = 64;
+
+// Sync 50 ms pause (the expired-window case just needs a LATER wall-clock
+// read than the mint).
+const pauseMs = (ms) =>
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+
+// Parse a parent-issued attestation wire image into the fields
+// Operation.addAttestation consumes. Canonical body layout (src/Lineage/
+// lineage.c, _attestation_write_canonical_body): u32le total length
+// (excluding the prefix itself) + u8 format_version + string16
+// parent/child/user/attributes + u64le not_before, expires_at,
+// parent_key_version + the 64-byte signature.
+function parseAttestationWire(wire) {
+  assert.strictEqual(wire.readUInt32LE(0), wire.length - 4,
+    'attestation length prefix must cover body + signature');
+  let offset = 4;
+  assert.strictEqual(wire[offset], 0x02, 'attestation body format must be v2');
+  offset += 1;
+  const readString16 = () => {
+    const len = wire.readUInt16LE(offset); offset += 2;
+    const text = wire.subarray(offset, offset + len).toString('utf8');
+    offset += len;
+    return text;
+  };
+  const parentId = readString16();
+  const childIdent = readString16();
+  const userId = readString16();
+  const attributes = readString16();
+  const notBefore = wire.readBigUInt64LE(offset); offset += 8;
+  const expiresAt = wire.readBigUInt64LE(offset); offset += 8;
+  const parentKeyVersion = wire.readBigUInt64LE(offset); offset += 8;
+  return { parentId, childId: childIdent, userId, attributes,
+           notBefore: Number(notBefore), expiresAt: Number(expiresAt),
+           parentKeyVersion: Number(parentKeyVersion),
+           signatureHex: wire.subarray(offset, offset + CRABS_SIG_SIZE)
+                           .toString('hex') };
+}
+
+// Flip the first hex digit of a signature — a deterministically tampered
+// ECDSA (r||s legitimately contains zero bytes; never flip on those).
+const tamperedSignatureHex = (signatureHex) =>
+  (signatureHex.startsWith('a') ? 'b' : 'a') + signatureHex.slice(1);
 
 const machineA = new Node('machine-a', { ordering: 'hlc' });
 machineA.setTime(Date.now());   // attest reads the machine's time source
@@ -122,6 +167,87 @@ assert(machineA.lineageResidentChild('machine-c') !== null,
 assert.throws(() => machineA.lineageAttest('machine-c', 'dave', 'role:member'),
   /unauthorized/, 'attest must refuse a revoked child');
 
-console.log('federation-between-machines OK: attested, dissolved, tombstone' +
-  ' delivered (idempotent), revoked with the machine still living');
+// ---- The consume: B's endorsement policy resolves the carried vouch ------
+// The child's policy carries `@parent/<attribute>` tokens; the executor's
+// endorsement pipeline resolves op-carried attestations
+// (_verify_parent_endorsements, src/StateMachine/state_machine.c) when the
+// op executes with Operation.addAttestation having staged the credential.
+const blueprintD = Blueprint.create('machine-d', TRUST_MODE.DELEGATED_COPY,
+                                    'd-admin', 3600000);
+blueprintD.addPolicy('__check_dedup__', '@parent/role:member');
+blueprintD.stampHash();
+const machineD = machineA.lineageSpawn(blueprintD);   // borrowed child wrapper
+const aliceKey = KeyPair.generate();
+machineD.registerUser('alice', aliceKey.publicKeyHex(), '');
+
+// Mint the vouch, parse the wire, attach, sign, execute — the endorsement
+// resolves: the attestation verifies against the child's chain TIP, names
+// the child's parent, names the RESOLVED signer, and covers the token
+// exactly.
+const endorsed = parseAttestationWire(
+  machineA.lineageAttest('machine-d', 'alice', 'role:member'));
+assert.strictEqual(endorsed.parentId, 'machine-a',
+  'attestation must bind the parent id');
+assert.strictEqual(endorsed.childId, 'machine-d',
+  'attestation must bind the child id');
+assert.strictEqual(endorsed.parentKeyVersion, 1,
+  'a fresh parent stamps the spawn generation');
+const endorsedOp = new Operation('__check_dedup__');
+endorsedOp.signerId = 'alice';
+endorsedOp.nodeId = 'alice';
+endorsedOp.addAttestation(endorsed);
+machineD.sign(endorsedOp, aliceKey.privateKeyHex());
+machineD.execute(endorsedOp);
+
+const makeEndorsedOp = (attestation) => {
+  const op = new Operation('__check_dedup__');
+  op.signerId = 'alice';
+  op.nodeId = 'alice';
+  op.addAttestation(attestation);
+  machineD.sign(op, aliceKey.privateKeyHex());
+  return op;
+};
+
+// Tampered carried signature: one flipped byte breaks the canonical-body
+// ECDSA — refused unauthorized before any effect.
+const tamperedOp = makeEndorsedOp({
+  ...endorsed, signatureHex: tamperedSignatureHex(endorsed.signatureHex),
+});
+assert.throws(() => machineD.execute(tamperedOp), /unauthorized/,
+  'tampered attestation must fail closed');
+
+// Wrong attested user: the vouch must name the op's RESOLVED signer.
+const wrongUserOp = makeEndorsedOp(parseAttestationWire(
+  machineA.lineageAttest('machine-d', 'bob', 'role:member')));
+assert.throws(() => machineD.execute(wrongUserOp), /unauthorized/,
+  'wrong-user attestation must fail closed');
+
+// The TTL: a signature-INTACT expired vouch — ttl 0 stamps expires_at = now
+// at mint, so every later wall-clock read is past the window. (A JS caller
+// cannot mint a fresh-signed expired vouch any other way: the window is
+// stamped at issue time, and hand-edits break the signature.)
+const blueprintE = Blueprint.create('machine-e', TRUST_MODE.DELEGATED_COPY,
+                                    'e-admin', 0);
+blueprintE.stampHash();
+const machineE = machineA.lineageSpawn(blueprintE);
+machineE.registerUser('alice', aliceKey.publicKeyHex(), '');
+const expiredWire = machineA.lineageAttest('machine-e', 'alice',
+                                           'role:member');
+pauseMs(50);   // walk the wall clock past the single-instant window
+const expiredOp = new Operation('__check_dedup__');
+expiredOp.signerId = 'alice';
+expiredOp.nodeId = 'alice';
+expiredOp.addAttestation(parseAttestationWire(expiredWire));
+machineE.sign(expiredOp, aliceKey.privateKeyHex());
+assert.throws(() => machineE.execute(expiredOp), /unauthorized/,
+  'expired attestation must fail closed');
+
+blueprintB.destroy();
+blueprintC.destroy();
+blueprintD.destroy();
+blueprintE.destroy();
+console.log('federation-between-machines OK: attested AND consumed'
+  + ' (endorsed op authorized; tampered/wrong-user/expired refused),'
+  + ' dissolved, tombstone delivered (idempotent), revoked with the'
+  + ' machine still living');
 // Node exposes no destroy() — native cleanup is process-exit driven.
