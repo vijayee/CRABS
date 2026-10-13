@@ -184,6 +184,12 @@ The enum tables `TRUST_MODE`, `DATA_TYPE`, `CRDT_TYPE` are exported alongside th
 #### ABE
 
 - `node.encrypt(payload, policy)` → `Buffer` — ABE-encrypt data under a policy
+- `node.abeKeygen(attrs)` → `AbeKey` — derive a CP-ABE reader key from the
+  machine's OWN master authority (the MSK never leaves the machine;
+  `AbeKey.destroy()` releases the JS-owned key)
+- `node.abeDecrypt(key, sealed)` → `Buffer` — open the container `encrypt`
+  returned; refuses `unauthorized` when the key's attributes do not satisfy
+  the policy (or the bytes were tampered with)
 
 #### Serialization
 
