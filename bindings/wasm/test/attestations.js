@@ -200,19 +200,19 @@ async function expectRefusal(runnable, expected, what) {
   // Attestations ride op wire v5+ as TRANSPORT (u32le count + per-entry
   // attestation wire image, src/Serialization/serialization.c) while being
   // EXCLUDED from the canonical signing form (each attestation carries its
-  // own parent ECDSA). The credential must survive a serialize ->
-  // deserialize -> serialize round trip intact — the re-parsed op is
-  // byte-identical. (The re-parsed op is not re-executed here: its
-  // signature covers op uuid + ordering stamps, so a transported copy is a
-  // distinct op only on a replica that kept the same machine id and has not
-  // seen it — a surface a single resident machine cannot honestly
-  // materialize; the executor's per-op attestation re-verification is
-  // already pinned by the battery above.)
+  // own parent ECDSA). The transported op EXECUTES after the round trip:
+  // bob's op (bob's own fresh-signer log, so the lamport backstop never
+  // fires) is serialized and re-parsed WITHOUT ever executing the original
+  // — what executes is the transported copy. The signature covers the uuid
+  // + ordering stamps, so the copy keeps both intact.
+  const bobKey = await KeyPair.generate();
+  childB.registerUser('bob', bobKey.publicKeyHex(), '');
   const transportOp = await Operation.create('__check_dedup__');
-  transportOp.signerId = 'alice';
-  transportOp.nodeId = 'alice';
-  transportOp.addAttestation(attested);
-  childB.sign(transportOp, aliceKey.privateKeyHex());
+  transportOp.signerId = 'bob';
+  transportOp.nodeId = 'bob';
+  transportOp.addAttestation(parseAttestationWire(
+    parent.attest('machine-b', 'bob', 'role:member')));
+  childB.sign(transportOp, bobKey.privateKeyHex());
   const opWire = transportOp.serialize();
   transportOp.destroy();
 
@@ -222,6 +222,7 @@ async function expectRefusal(runnable, expected, what) {
   const reSerialized = reloadedOp.serialize();
   assert(Buffer.from(opWire).equals(Buffer.from(reSerialized)),
     're-serialized op must be byte-identical (attestation intact)');
+  childB.execute(reloadedOp);   // the transported credential still resolves
   reloadedOp.destroy();
 
   console.log('attestations wasm OK: endorsed op authorized, tampered/' +
