@@ -106,6 +106,7 @@ BASE_EXPORTS='[
   "_crabs_wasm_serialize_state_sealed_signed",
   "_crabs_wasm_deserialize_state",
   "_crabs_wasm_merge_state",
+  "_crabs_wasm_get_hlc",
   "_serialized_buffer_destroy",
   "_malloc",
   "_free",

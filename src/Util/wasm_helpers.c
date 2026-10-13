@@ -1453,6 +1453,22 @@ void crabs_wasm_set_time(attribute_machine_t* am, uint64_t now_ms) {
   if (am) attribute_machine_set_time(am, now_ms);
 }
 
+// HLC watermark readback: reports the machine's LAST-issued HLC timestamp
+// WITHOUT advancing the clock (a diagnostic — the restore tests pin HLC
+// continuity with it). Returns 0 and leaves the out-params untouched on a
+// NULL machine or an uninitialized clock (the JS wrapper turns that into
+// undefined).
+EMSCRIPTEN_KEEPALIVE
+bool crabs_wasm_get_hlc(attribute_machine_t* am, uint64_t* out_seconds,
+                        uint64_t* out_nanos, uint64_t* out_logical_counter) {
+  if (am == NULL || !am->base_state.hlc_state_initialized) return false;
+  const crabs_hlc_t* hlc = &am->base_state.hlc_state.last;
+  if (out_seconds != NULL) *out_seconds = hlc->physical_seconds;
+  if (out_nanos != NULL) *out_nanos = hlc->physical_nanos;
+  if (out_logical_counter != NULL) *out_logical_counter = hlc->logical_counter;
+  return true;
+}
+
 EMSCRIPTEN_KEEPALIVE
 uint32_t crabs_wasm_prune_expired_temp_attrs(attribute_machine_t* am) {
   if (!am) return 0;
@@ -1739,6 +1755,13 @@ serialized_buffer_t* crabs_wasm_serialize_state_sealed_signed(
   return crabs_serialize_state_sealed_signed(&am->base_state, seal_key);
 }
 
+// The raft module registry (defined beside crabs_wasm_raft_create) tracks
+// which MACHINE an attached module currently drives so
+// crabs_wasm_raft_destroy can detach the correct state; a restore migrates
+// the module onto the restored machine, so the registry entry must move too.
+static void _raft_module_registry_repoint(crabs_raft_module_t* module,
+                                          attribute_machine_t* machine);
+
 // State snapshot restore: verify the node-key signature FIRST when
 // verify_signed is set (the ECDSA trailer covers the WHOLE sealed or plain
 // body — an attacker cannot mount a parse on unverified bytes), then parse
@@ -1752,8 +1775,14 @@ serialized_buffer_t* crabs_wasm_serialize_state_sealed_signed(
 // its JS reference. Continuity rewiring happens here so the wrapper keeps
 // its identity across the restore: node key from the previous machine (the
 // wire format serializes no secrets), change hook, the module-shared
-// attached time source, and a live raft module (the new state's parsed v16
-// module snapshot imports into it in the attach call).
+// attached time source, a live raft module (the new state's parsed v16
+// module snapshot imports into it in the attach call; the module registry
+// pairing is re-pointed to the restored machine so a later
+// crabs_wasm_raft_destroy detaches the CORRECT state), the previous
+// machine's ordering config (state-side config is wrapper-created and never
+// serialized), and the previous machine's HLC clock (the restored state's
+// hlc_state is zeroed — the restored machine's clock CONTINUES the previous
+// machine's HLC so the inbound-op skew validation stays engaged).
 EMSCRIPTEN_KEEPALIVE
 attribute_machine_t* crabs_wasm_deserialize_state(
     const attribute_machine_t* previous,
@@ -1823,16 +1852,42 @@ attribute_machine_t* crabs_wasm_deserialize_state(
     }
     // The wrapper-owned raft module migrates to the restored machine; the
     // attach call imports the restored state's runtime-only module snapshot
-    // (its durable raft history) into the module object first.
+    // (its durable raft history) into the module object first. The registry
+    // entry re-points to the restored machine so crabs_wasm_raft_destroy
+    // detaches THIS state, not the stale previous one.
     if (previous->base_state.raft_module != NULL) {
       if (state_attach_raft_module(&restored_machine->base_state,
                                    previous->base_state.raft_module) ==
           CRABS_SUCCESS) {
         state_attach_raft_module((state_t*)&previous->base_state, NULL);
+        _raft_module_registry_repoint(previous->base_state.raft_module,
+                                      restored_machine);
       }
     }
+    // Ordering config: wrapper-created and state-set, never serialized —
+    // the restored state carries none. Clone the previous config (a POD
+    // struct with no pointers) into fresh heap for the restored machine so
+    // lock-expiry and other ordering checks keep their configuration.
+    if (previous->base_state.ordering_config != NULL) {
+      crabs_ordering_config_t* restored_config =
+          (crabs_ordering_config_t*)malloc(sizeof(crabs_ordering_config_t));
+      if (restored_config != NULL) {
+        memcpy(restored_config, previous->base_state.ordering_config,
+               sizeof(crabs_ordering_config_t));
+        state_set_ordering_config(&restored_machine->base_state, restored_config);
+      }
+    }
+    // HLC continuity: the restored state's hlc_state is zeroed (the wire
+    // serializes no clock). The restored machine's clock CONTINUES the
+    // previous machine's HLC — last-issued timestamp, logical counter and
+    // stats ride over — so the inbound-op skew validation stays at the
+    // previous machine's watermark instead of restarting from zero.
+    restored_machine->base_state.hlc_state = previous->base_state.hlc_state;
+    restored_machine->base_state.hlc_state_initialized =
+        previous->base_state.hlc_state_initialized;
     // Re-attach the module-shared time source when the previous machine had
     // it attached (the restore must not silently drop authenticated time).
+    // The struct copy above carried the pointer; set is idempotent.
     if (previous->base_state.hlc_state.time_source_ops != NULL) {
       state_set_time_source(&restored_machine->base_state,
                             previous->base_state.hlc_state.time_source_ops);
@@ -2634,6 +2689,17 @@ static void _raft_module_registry_remove(crabs_raft_module_t* module) {
   if (index == UINT32_MAX) return;
   s_raft_modules[index] = s_raft_modules[s_raft_module_count - 1];
   s_raft_module_count--;
+}
+
+// A state restore migrates its module onto the restored machine; the
+// registry pairing must follow or crabs_wasm_raft_destroy would detach the
+// STALE previous machine's state while the restored state kept the module
+// pointer into dead-adjacent territory. Unknown modules are a no-op.
+static void _raft_module_registry_repoint(crabs_raft_module_t* module,
+                                          attribute_machine_t* machine) {
+  uint32_t index = _raft_module_index(module);
+  if (index == UINT32_MAX) return;
+  s_raft_modules[index].machine = machine;
 }
 
 // Copy the peer id pointer array out of wasm linear memory has already

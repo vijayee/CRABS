@@ -3354,6 +3354,26 @@ private:
     if (node_key_ != nullptr)
       state_set_node_key(&restored_machine->base_state,
                          node_key_->private_key, node_key_->public_key);
+    // Ordering config + HLC continuity. Ordering config is wrapper-created
+    // (ordering_config_ member) and NEVER serialized — the restored state
+    // carries none, so the wrapper's machine-owned instance is re-applied
+    // when the previous machine carried it (lock expiry and the other
+    // ordering checks keep their configuration). The restored state's
+    // hlc_state is zeroed; the restored machine's clock CONTINUES the
+    // previous machine's HLC (last-issued timestamp, logical counter and
+    // stats ride over — read BEFORE the previous machine is destroyed), so
+    // the inbound-op skew validation stays engaged at the previous
+    // machine's watermark. A borrowed machine loses both (as with the time
+    // source below) — its owner wrapper re-applies them.
+    if (previous_machine->base_state.ordering_config != nullptr &&
+        previous_machine->base_state.ordering_config == &ordering_config_) {
+      state_set_ordering_config(&restored_machine->base_state,
+                                &ordering_config_);
+    }
+    restored_machine->base_state.hlc_state =
+        previous_machine->base_state.hlc_state;
+    restored_machine->base_state.hlc_state_initialized =
+        previous_machine->base_state.hlc_state_initialized;
     // Clock and raft module: the machine references them through raw
     // non-owning pointers, so the restore migrates the wrapper's instances
     // onto the restored machine (A borrowed previous machine loses both —

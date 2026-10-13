@@ -569,8 +569,13 @@ export interface Node {
    * key, so its restored machine signs nothing until a key exists). Both
    * combine: { sealKey, verify: 'node-key' } for sealed+SIGNED blobs.
    * Continuity: the wrapper's node key, change hook, attached time source
-   * and raft module ride over from the previous machine; the tx manager is
-   * runtime-only — attachTxManager again after a restore.
+   * and raft module ride over from the previous machine, as do the
+   * wrapper-owned ordering config and the HLC clock state (the restored
+   * machine's clock CONTINUES the previous machine's HLC, so inbound-op
+   * skew validation stays at the previous watermark; a borrowed previous
+   * machine — whose owner wrapper also re-applies them — loses the config
+   * and clock); the tx manager is runtime-only — attachTxManager again
+   * after a restore.
    */
   deserialize(wire: Buffer,
               options?: { sealKey?: string; verify?: 'node-key' }):

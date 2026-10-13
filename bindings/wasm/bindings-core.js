@@ -1791,6 +1791,12 @@ class Node {
   // signed blob is refused rather than silently accepted unauthenticated.
   // Both combine ({sealKey, verify:'node-key'}) for sealed+SIGNED blobs.
   //
+  // Continuity: the node key, change hook, module-shared time source, live
+  // raft module (re-pointed to the restored machine so raftPump keeps
+  // driving it), the wrapper's ordering config, and the HLC clock state
+  // (the restored machine's clock CONTINUES the previous machine's HLC)
+  // ride over from the previous machine.
+  //
   // TRUST MODEL: the blob's embedded SHA-256 is an INTEGRITY check, not
   // authentication — an attacker who can write the blob can recompute it
   // (serialization.h). Loading a snapshot from an untrusted source without
@@ -1834,6 +1840,10 @@ class Node {
             'checksum, failed signature check, or an unloadable body');
       }
       this._am = restoredPointer;
+      // A restore migrates the attached raft module to the restored machine
+      // (the C side re-attaches it); the host's machine pointer must follow
+      // or raftPump would drive the stale machine.
+      if (this._raftHost) this._raftHost._am = restoredPointer;
       return { authorityRestored, mskSectionPresent };
     } finally {
       if (sealPtr !== 0) {
@@ -1865,6 +1875,34 @@ class Node {
   }
 
   setTime(nowMs) { this._M._crabs_wasm_set_time(this._am, BigInt(nowMs)); }
+
+  // HLC watermark readback: the machine's LAST-issued hybrid timestamp,
+  // WITHOUT advancing the clock (the native binding's getHLC issues a NEXT
+  // timestamp — this wasm readback stays read-only so restore tests can pin
+  // clock continuity exactly). undefined on an uninitialized clock (a
+  // lamport-ordered machine, or a restored state whose Continuity block
+  // never re-applied the clock).
+  // Out-buffer layout: u64le physical_seconds | u64le physical_nanos |
+  // u64le logical_counter.
+  getHLC() {
+    const M = this._M;
+    const outPtr = M._malloc(24);
+    try {
+      const watermark = M._crabs_wasm_get_hlc(this._am, outPtr, outPtr + 8,
+                                              outPtr + 16);
+      if (!watermark) return undefined;
+      const view = new DataView(M.HEAPU8.buffer, M.HEAPU8.byteOffset + outPtr,
+                                24);
+      return {
+        seconds: Number(view.getBigUint64(0, true)),
+        nanos: Number(view.getBigUint64(8, true)),
+        logicalCounter: Number(view.getBigUint64(16, true)),
+      };
+    } finally {
+      freeAll(M, outPtr);
+    }
+  }
+
   pruneExpiredTempAttrs() { return this._M._crabs_wasm_prune_expired_temp_attrs(this._am); }
 
   // --- Authenticated time source (R7-01 wiring; R7-02 fail closed) ---

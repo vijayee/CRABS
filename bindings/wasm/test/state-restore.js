@@ -179,14 +179,199 @@ const { Node, KeyPair, Operation } = require('..');
     throw new Error('restored machine must stay writable');
   }
 
-  source.destroy();
-  restored.destroy();
-  unsealer.destroy();
-  wrongKeyNode.destroy();
-  foreign.destroy();
-  mergerLeft.destroy();
-  mergerRight.destroy();
-  aliceKey.destroy();
+  // ------------------------------------------------------------------
+  // 6. OT items: a machine WITH one round trips its own snapshot, and a
+  //    merge HOLDS the item instead of planting a NULL-value husk (P1
+  //    review follow-up: the poisoning probe as tests).
+  // ------------------------------------------------------------------
+  const otSource = await Node.create('ot-m1', { ordering: 'hlc' });
+  otSource.setPolicy('__execute_ot__', 'role:admin');
+  otSource.addOrderedSet('doc');
+  otSource.orderedInsert('doc', 'a', 0, { id: { node: 'ot-m1', seq: 1, ts: 1000 } });
+  otSource.orderedInsert('doc', 'b', 1, { id: { node: 'ot-m1', seq: 2, ts: 1000 } });
+  otSource.addCounter('hits');
+  otSource.incrementCounter('hits', 4, 'ot-m1');
 
-  console.log('state-restore OK: round trip, merge convergence, sealed/signed snapshots');
+  // Round trip: serialize -> deserialize -> the SAME readback.
+  const otWire = otSource.serialize();
+  const otRestored = await Node.create('ot-fresh', { ordering: 'hlc' });
+  otRestored.deserialize(otWire);
+  otRestored.setPolicy('__execute_ot__', 'role:admin');
+  const otReadback = otRestored.getOrderedSet('doc').elements.join(',');
+  if (otReadback !== 'a,b') {
+    throw new Error(`OT item did not round trip (got [${otReadback}])`);
+  }
+  if (otRestored.getCounter('hits') !== 4) {
+    throw new Error(`OT round trip lost the counter (got ${otRestored.getCounter('hits')})`);
+  }
+  // And the restored machine re-serializes to a re-readable blob.
+  otRestored.deserialize(otRestored.serialize());
+  if (otRestored.getOrderedSet('doc').elements.join(',') !== 'a,b') {
+    throw new Error('re-serialized OT snapshot did not re-restore');
+  }
+
+  // Merge: the OT item is HELD (merge returns SUCCESS) — no NULL-value husk
+  // crosses, the counter in the same snapshot still merges, and the hold
+  // surfaces as a __merge_held__ change event.
+  const otMerger = await Node.create('ot-m2', { ordering: 'hlc' });
+  otMerger.setPolicy('__execute_ot__', 'role:admin');
+  otMerger.addCounter('hits');
+  otMerger.incrementCounter('hits', 1, 'ot-m2');
+  const mergeEvents = [];
+  otMerger.on('change', (event) => mergeEvents.push(event));
+  otMerger.mergeState(otWire);
+  if (otMerger.getCounter('hits') !== 5) {
+    throw new Error(`merge of the held snapshot lost the counter (got ${otMerger.getCounter('hits')})`);
+  }
+  let held = null;
+  try { otMerger.getOrderedSet('doc'); } catch (caught) { held = caught; }
+  if (!held) {
+    throw new Error('the unmergeable OT item must NOT cross the merge (no husk expected)');
+  }
+  const heldEvents = mergeEvents.filter((event) => event.type === '__merge_held__');
+  if (heldEvents.length !== 1 || heldEvents[0].target !== 'doc' ||
+      heldEvents[0].kind !== 'merge' ||
+      heldEvents[0].result !== 0x3004 /* CRABS_ERR_TYPE_MISMATCH */) {
+    throw new Error(`held divergence event missing (got ${JSON.stringify(mergeEvents)})`);
+  }
+
+  // ------------------------------------------------------------------
+  // 7. destroy(): mergeState + plain deserialize refuse consistently
+  //    (the same gate shape the verify:'node-key' path uses).
+  // ------------------------------------------------------------------
+  const doomed = await Node.create('doomed', { ordering: 'hlc' });
+  doomed.destroy();
+  let destroyedMerge = null;
+  try { doomed.mergeState(otWire); } catch (caught) { destroyedMerge = caught; }
+  if (!destroyedMerge || !/destroyed node/.test(destroyedMerge.message)) {
+    throw new Error(`mergeState on a destroyed node must refuse (got ${destroyedMerge})`);
+  }
+  let destroyedRestore = null;
+  try { doomed.deserialize(otWire); } catch (caught) { destroyedRestore = caught; }
+  if (!destroyedRestore || !/destroyed node/.test(destroyedRestore.message)) {
+    throw new Error(`deserialize on a destroyed node must refuse (got ${destroyedRestore})`);
+  }
+
+  // ------------------------------------------------------------------
+  // 8. HLC continuity: the restored machine's clock CONTINUES the previous
+  //    machine's HLC — the restored watermark EQUALS the live pre-restore
+  //    watermark (getHLC is the last-issued readback). A zeroed restarted
+  //    clock would come back undefined (or at counter 0 at an older tick).
+  // ------------------------------------------------------------------
+  const clockNode = await Node.create('clock-m1', { ordering: 'hlc' });
+  clockNode.addCounter('ticks');
+  clockNode.incrementCounter('ticks', 1, 'clock-m1');
+  const clockWire = clockNode.serialize();
+  // Advance the LIVE machine's clock past the snapshot's watermark so the
+  // continuity source is the LIVE clock, never the snapshot's.
+  clockNode.addRegister('rank', 0);
+  clockNode.setRegister('rank', 1, 'clock-m1');
+  const liveBefore = clockNode.getHLC();
+  if (!liveBefore) throw new Error('a live HLC machine must report its watermark');
+  clockNode.deserialize(clockWire);
+  const clockAfter = clockNode.getHLC();
+  if (!clockAfter) {
+    throw new Error('restored machine lost its HLC clock (getHLC undefined)');
+  }
+  if (clockAfter.seconds !== liveBefore.seconds ||
+      clockAfter.nanos !== liveBefore.nanos ||
+      clockAfter.logicalCounter !== liveBefore.logicalCounter) {
+    throw new Error(`restored clock must CONTINUE (live ${JSON.stringify(liveBefore)}, after ${JSON.stringify(clockAfter)})`);
+  }
+
+  otSource.destroy();
+  otRestored.destroy();
+  otMerger.destroy();
+  clockNode.destroy();
+
+  // ------------------------------------------------------------------
+  // 9. Raft pairing: a restore migrates the attached module to the restored
+  //    machine — status readback pins the imported term/commit tip, and the
+  //    host's raftPump keeps driving the RESTORED machine (notifications
+  //    flow; the next committed decree materializes).
+  // ------------------------------------------------------------------
+  const raftNode = await Node.create('raft-m1', { ordering: 'hlc' });
+  const raftKey = await KeyPair.generate();
+  const RAFT_OP = 'council_write';
+  const RAFT_ITEM = 'council';
+  raftNode.registerUser('alice', raftKey.publicKeyHex(), '');
+  raftNode.grantRole('alice', 'role', 'member', 'raft-m1');
+  const materialize = (state, op) => {
+    state.setRegisterBytes(RAFT_ITEM, new TextEncoder().encode(op.payload), 'alice');
+    return 0;
+  };
+  raftNode.registerHandlerJs(RAFT_OP, materialize);
+  raftNode.setPolicy(RAFT_OP, 'role:member');
+  raftNode.defineItem(RAFT_ITEM, 'register', 'lww_reg', { domain: 'group' });
+  const raftHost = raftNode.attachRaft({ peers: ['raft-m1'], seed: 5, tickMs: 20 });
+  // The storage seam is load-bearing for commits: an entry commits only
+  // after its persist window resolves (in-memory map here).
+  const persistWindows = new Map();
+  raftHost.setRaftStorage(async (persistHandle, windowBlob) => {
+    persistWindows.set(Number(persistHandle), windowBlob);
+  });
+  raftHost.startRaftHost();
+
+  const waitFor = async (predicate, what, timeoutMs = 15000) => {
+    const deadline = Date.now() + timeoutMs;
+    for (;;) {
+      if (predicate()) return;
+      if (Date.now() > deadline) throw new Error(`timeout waiting for: ${what}`);
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+  };
+  await waitFor(() => raftNode.raftStatus() !== null && raftNode.raftStatus().isLeader,
+                'the single-node cluster to elect its only member');
+  const firstDecree = await Operation.create(RAFT_OP);
+  firstDecree.signerId = 'alice';
+  firstDecree.payload = 'decree-1\x00';
+  firstDecree.addResource(RAFT_ITEM);
+  raftNode.sign(firstDecree, raftKey);
+  raftNode.execute(firstDecree);
+  await waitFor(() => {
+    const status = raftNode.raftStatus();
+    return status !== null && status.commitTip > 0 &&
+           new TextDecoder().decode(raftNode.getRegisterBytes(RAFT_ITEM))
+               .includes('decree-1');
+  }, 'decree-1 to commit + materialize');
+
+  // Snapshot, stop the ticking host during the restore, restore.
+  const raftWire = raftNode.serialize();
+  const preTerm = raftNode.raftStatus().term;
+  const preTip = raftNode.raftStatus().commitTip;
+  raftHost.stopRaftHost();
+  raftNode.deserialize(raftWire);
+  // The module re-attached to the restored machine with its durable history.
+  const restoredStatus = raftNode.raftStatus();
+  if (restoredStatus === null || restoredStatus.term < preTerm ||
+      restoredStatus.commitTip < preTip) {
+    throw new Error(`restore lost the raft pairing (status ${JSON.stringify(restoredStatus)}, pre term ${preTerm} tip ${preTip})`);
+  }
+  // The host still drives the RESTORED machine: re-apply the runtime-only
+  // handler (it never serializes) and let the next decree commit — its
+  // notification must materialize through the restored machine's pipeline.
+  raftNode.registerHandlerJs(RAFT_OP, materialize);
+  raftHost.startRaftHost();
+  // The imported module restarts as a FOLLOWER (elections re-run) — wait
+  // for the restored node to take the leadership again.
+  await waitFor(() => raftNode.raftStatus() !== null && raftNode.raftStatus().isLeader,
+                'the restored module to re-elect');
+  const secondDecree = await Operation.create(RAFT_OP);
+  secondDecree.signerId = 'alice';
+  secondDecree.payload = 'decree-2\x00';
+  secondDecree.addResource(RAFT_ITEM);
+  raftNode.sign(secondDecree, raftKey);
+  raftNode.execute(secondDecree);
+  await waitFor(() => {
+    const status = raftNode.raftStatus();
+    return status !== null && status.commitTip > preTip &&
+           new TextDecoder().decode(raftNode.getRegisterBytes(RAFT_ITEM))
+               .includes('decree-2');
+  }, 'decree-2 to commit on the RESTORED machine', 30000);
+
+  raftHost.destroy();
+  raftNode.destroy();
+  raftKey.destroy();
+
+  console.log('state-restore OK: round trip, merge convergence, sealed/signed snapshots, OT hold, raft rebind, HLC continuity');
 })().catch(e => { console.error(e); process.exit(1); });

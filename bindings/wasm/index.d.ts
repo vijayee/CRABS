@@ -34,6 +34,14 @@ export interface CrabsChangeEvent {
   result: number;  // crabs_error_e
 }
 
+/** Machine-issued hybrid timestamp (readback shape of getHLC — the native
+ *  binding's HLC view minus its formatted/nodeId fields). */
+export interface CrabsHLC {
+  seconds: number;
+  nanos: number;
+  logicalCounter: number;
+}
+
 export interface KeyPair {
   publicKeyHex(): string;
   privateKeyHex(): string;
@@ -748,9 +756,13 @@ export interface Node {
    * without a node key cannot verify; the signed blob is refused rather
    * than silently accepted unauthenticated). Both combine:
    * { sealKey, verify: 'node-key' } for sealed+SIGNED blobs. Continuity:
-   * the node key, change hook, attached (module-shared) time source and a
-   * live raft module ride over from the previous machine; the tx manager is
-   * runtime-only — attachTxManager again after a restore.
+   * the node key, change hook, attached (module-shared) time source, a live
+   * raft module (re-pointed to the restored machine — RaftHost.raftPump
+   * keeps driving it), the wrapper's ordering config and the HLC clock
+   * state (the restored machine's clock CONTINUES the previous machine's
+   * HLC, so inbound-op skew validation stays at the previous watermark)
+   * ride over from the previous machine; the tx manager is runtime-only —
+   * attachTxManager again after a restore.
    */
   deserialize(wire: Uint8Array,
               options?: { sealKey?: string; verify?: 'node-key' }):
@@ -762,11 +774,24 @@ export interface Node {
    * take-any; op logs merge by lamport time and dedupe by uuid. This
    * machine MUTATES toward the union; the source snapshot is untouched (it
    * is never attached to a machine). Throws, machine untouched, on a
-   * malformed snapshot or a held item. NOT the OT path: ordered-set items
+   * malformed snapshot. Held items are NOT a failure: content the merge
+   * layer cannot apply (an OT item, any type without a merge dispatch)
+   * surfaces as a __merge_held__ change event on the machine's hook and
+   * the merge returns SUCCESS. NOT the OT path: ordered-set items
    * need the dedicated ordered-set merge layer.
    */
   mergeState(wire: Uint8Array): void;
 
+  /**
+   * HLC watermark readback — the machine's LAST-issued hybrid timestamp,
+   * WITHOUT advancing the clock (the native binding's getHLC issues a NEXT
+   * timestamp instead; this wasm readback stays read-only so restore tests
+   * can pin clock continuity exactly). Returns undefined on an
+   * uninitialized clock (lamport-ordered machine). After a restore the
+   * watermark CONTINUES the previous machine's HLC (deserialize's
+   * Continuity note).
+   */
+  getHLC(): CrabsHLC | undefined;
   setTime(nowMs: number): void;
   pruneExpiredTempAttrs(): number;
 
