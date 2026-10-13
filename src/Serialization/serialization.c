@@ -14,6 +14,7 @@
 #include "../Condition/condition.h"
 #include "../Lineage/lineage.h"
 #include "../Raft/raft_module.h"
+#include "../StateMachine/state_machine.h"
 #include <string.h>
 #include <stdlib.h>
 #include <openssl/sha.h>
@@ -2146,19 +2147,30 @@ static serialized_buffer_t* _serialize_state_internal(const state_t* state,
   }
 
   // Raft ordering module (v16): the namespace-separated module-state
-  // section, appended after the lineage/MSK sections. The durable state
-  // exports from the runtime-attached module pointer (NULL → attached flag
-  // 0 — "no module", the pre-16 default). Fail loud: never emit a section
-  // the reader would reject (cap violations refuse the whole serialize).
-  _write_uint8(buf, state->raft_module != NULL ? 1 : 0);
+  // section, appended after the lineage/MSK sections. The section comes from
+  // the ATTACHED module's live export when one is attached; otherwise from
+  // the carried v16 snapshot of a loaded-but-never-reimported state — the
+  // import/emit drop hazard: emitting attached=0 there would silently DROP
+  // the machine's durable Raft history on the very next save. Pre-16 states
+  // carry neither → attached flag 0 ("no module", the pre-16 default). Fail
+  // loud: never emit a section the reader would reject.
+  // The section tail carries the two-phase pipeline's pending proposals
+  // (uuid + op bytes each, capped by CRABS_RAFT_MAX_PENDING_PROPOSALS) so a
+  // LEADER restart resumes its in-flight proposals; follower deliveries do
+  // not read this tail (they ride the commit-delivery credential).
+  crabs_raft_module_state_t* exported_module_state = NULL;
+  const crabs_raft_module_state_t* module_state = NULL;
   if (state->raft_module != NULL) {
-    crabs_raft_module_state_t* module_state = crabs_raft_module_export_state(
+    exported_module_state = crabs_raft_module_export_state(
         (crabs_raft_module_t*)state->raft_module);
-    if (module_state == NULL) {
-      free(buf->data);
-      free(buf);
-      return NULL;
-    }
+    module_state = exported_module_state;
+  } else {
+    // No attached module object: re-emit the LAST-KNOWN module state from
+    // the carried v16 snapshot (loaded state that was never re-imported).
+    module_state = (const crabs_raft_module_state_t*)state->raft_module_state;
+  }
+  _write_uint8(buf, module_state != NULL ? 1 : 0);
+  if (module_state != NULL) {
     bool module_state_ok = module_state->log_count <= CRABS_RAFT_MAX_LOG_ENTRIES &&
                            module_state->commit_index <= module_state->log_count;
     for (const crabs_raft_entry_persisted_t* entry = module_state->log;
@@ -2166,6 +2178,16 @@ static serialized_buffer_t* _serialize_state_internal(const state_t* state,
       module_state_ok = entry->wire_len >= 1 &&
                         entry->wire_len <= CRABS_RAFT_MAX_OP_WIRE_BYTES;
     }
+    uint32_t pending_count = 0;
+    for (const raft_pending_proposal_t* pending =
+             (const raft_pending_proposal_t*)state->raft_pending_proposals;
+         module_state_ok && pending != NULL; pending = pending->next) {
+      pending_count++;
+      module_state_ok = pending->op_len >= 1 &&
+                        pending->op_len <= CRABS_RAFT_MAX_OP_WIRE_BYTES;
+    }
+    module_state_ok = module_state_ok &&
+                      pending_count <= CRABS_RAFT_MAX_PENDING_PROPOSALS;
     if (module_state_ok) {
       _write_uint8(buf, module_state->module_id);
       _write_uint64_le(buf, module_state->term);
@@ -2179,8 +2201,18 @@ static serialized_buffer_t* _serialize_state_internal(const state_t* state,
         _write_uint32_le(buf, entry->wire_len);
         _write_bytes(buf, entry->op_wire, entry->wire_len);
       }
+      _write_uint32_le(buf, pending_count);
+      for (const raft_pending_proposal_t* pending =
+               (const raft_pending_proposal_t*)state->raft_pending_proposals;
+           pending != NULL; pending = pending->next) {
+        _write_bytes(buf, pending->uuid, CRABS_UUID_SIZE);
+        _write_uint32_le(buf, pending->op_len);
+        _write_bytes(buf, pending->op_bytes, pending->op_len);
+      }
     }
-    crabs_raft_module_state_destroy(module_state);
+    if (exported_module_state != NULL) {
+      crabs_raft_module_state_destroy(exported_module_state);
+    }
     if (!module_state_ok) {
       free(buf->data);
       free(buf);
@@ -2834,6 +2866,55 @@ static state_t* _deserialize_state_internal(const uint8_t* data, size_t len,
         }
         *entry_tail = entry;
         entry_tail = &entry->next;
+      }
+      if (!ok) {
+        crabs_raft_module_state_destroy(module_state);
+        goto fail;
+      }
+      // Pending-proposal tail (v16 module section, leader-restart resume):
+      // uuid + op bytes per entry, restored in traversal order so a
+      // save→load→save round-trip is byte-stable. Follower deliveries never
+      // read this tail (they ride the commit-delivery credential).
+      uint32_t pending_count = 0;
+      if (!_read_uint32_le(&buf, &pending_count)) {
+        crabs_raft_module_state_destroy(module_state);
+        goto fail;
+      }
+      ok = pending_count <= CRABS_RAFT_MAX_PENDING_PROPOSALS &&
+           (size_t)pending_count <= buf.len - buf.offset;
+      raft_pending_proposal_t** pending_tail =
+          (raft_pending_proposal_t**)&state->raft_pending_proposals;
+      for (uint32_t pending_index = 0; ok && pending_index < pending_count;
+           pending_index++) {
+        raft_pending_proposal_t* pending =
+            (raft_pending_proposal_t*)get_clear_memory(
+                sizeof(raft_pending_proposal_t));
+        ok = ok && _read_bytes(&buf, pending->uuid, CRABS_UUID_SIZE);
+        uint32_t pending_op_len = 0;
+        if (ok) {
+          ok = _read_uint32_le(&buf, &pending_op_len);
+        }
+        // The pending op is a whole serialized op — the same bound the op
+        // cap gives the module log entries; the by-remaining-bytes check
+        // completes the bound-then-allocate discipline.
+        ok = ok && pending_op_len >= 1 &&
+             pending_op_len <= CRABS_RAFT_MAX_OP_WIRE_BYTES &&
+             (size_t)pending_op_len <= buf.len - buf.offset;
+        if (!ok) {
+          free(pending);
+          break;
+        }
+        pending->op_bytes = (uint8_t*)get_memory(pending_op_len);
+        if (pending->op_bytes == NULL ||
+            !_read_bytes(&buf, pending->op_bytes, pending_op_len)) {
+          free(pending->op_bytes);
+          free(pending);
+          ok = false;
+          break;
+        }
+        pending->op_len = pending_op_len;
+        *pending_tail = pending;
+        pending_tail = &pending->next;
       }
       if (!ok) {
         crabs_raft_module_state_destroy(module_state);

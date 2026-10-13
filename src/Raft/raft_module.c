@@ -57,6 +57,7 @@ typedef struct raft_persist_request_node_t {
   uint64_t handle;
   uint64_t first_index;
   uint64_t last_index;
+  uint64_t epoch;   // persist epoch the batch was issued under (staleness)
   uint8_t* blob;
   size_t   blob_len;
   struct raft_persist_request_node_t* next;
@@ -100,12 +101,20 @@ typedef struct crabs_raft_module_s {
   raft_log_entry_t* log;          // heap array, capacity grows to the cap
   uint64_t log_capacity;
 
-  // Peer bookkeeping (warm from Phase 1; driven in Phase 2 replication).
+  // Peer bookkeeping (Phase 2 replication):
+  //   next_index[i] — next entry index to send to member i (leader only);
+  //   match_index[i] — highest entry index member i accepted (AppendResp);
+  //   vote_granted[i] — member i granted THIS candidate's current-term vote
+  //     (idempotency guard for duplicated VoteResp — one tally per grant).
   uint64_t next_index[CRABS_RAFT_MAX_PEERS];
   uint64_t match_index[CRABS_RAFT_MAX_PEERS];
+  bool     vote_granted[CRABS_RAFT_MAX_PEERS];
+  uint32_t votes_granted_count;   // includes this node's self-vote
 
   // Timers (the module's clock origin is the host's now_ms domain).
   uint64_t election_deadline_ms;
+  uint64_t last_now_ms;          // most recent host clock this module saw
+  uint64_t last_append_ms;       // last heartbeat/replication emit (leader)
 
   // splitmix64 state — same seed, same election deadlines, forever.
   uint64_t rng_state;
@@ -122,6 +131,11 @@ typedef struct crabs_raft_module_s {
   // next tick (propose/append emit earlier when one is riding) re-issues it.
   raft_persist_request_node_t* persist_outstanding;
   uint64_t persist_handle_seq;
+  // Persist epoch: bumped whenever the undurable tail's meaning changes
+  // under an outstanding window (log-suffix truncation). A persist_complete
+  // answering a window from an older epoch is a STALE ack — the host stored
+  // bytes the module has since discarded — and must not advance durability.
+  uint64_t persist_epoch;
 
   // Fail-closed inbound counter (rejected malformed messages).
   uint32_t rejected_message_count;
@@ -130,6 +144,12 @@ typedef struct crabs_raft_module_s {
 // Forward: the persistence window is shared by the propose, append and tick
 // paths (defined in the parsing/persistence sections below).
 static bool _raft_emit_persist_request(crabs_raft_module_s* module);
+// Forward: replication fan-out and quorum bookkeeping (leader side, Phase 2).
+static void _raft_send_append_to(crabs_raft_module_s* module,
+                                 uint32_t member_index);
+static void _raft_send_appends_all(crabs_raft_module_s* module);
+static uint32_t _raft_quorum_size(const crabs_raft_module_s* module);
+static void _raft_become_leader(crabs_raft_module_s* module, uint64_t now_ms);
 
 // ============================================================
 // Small helpers
@@ -165,6 +185,11 @@ static int _raft_peer_index(const crabs_raft_module_s* module, const char* peer_
 static bool _raft_is_self(const crabs_raft_module_s* module, const char* peer_id) {
   return peer_id != NULL &&
          strncmp(peer_id, module->config.node_id, CRABS_MAX_USER_ID) == 0;
+}
+
+// Majority of ALL members (peer_count includes this node) — Raft §5.1.
+static uint32_t _raft_quorum_size(const crabs_raft_module_s* module) {
+  return module->config.peer_count / 2 + 1;
 }
 
 static void _raft_store_u64_le(uint8_t* out, uint64_t value) {
@@ -288,8 +313,11 @@ static void _raft_enqueue_notification(crabs_raft_module_s* module,
 //   - single node: quorum is the node itself, so acked durability IS commit;
 //   - follower: commit target is the leader's commit_index from APPEND_REQ,
 //     still behind the follower's own durability line;
-//   - multi-node leader/candidate: quorum match advances commit (Phase 2) —
-//     the leader's own durability is only ever a precondition.
+//   - multi-node leader/candidate (Raft §5.3/§5.4.2): commit rides the
+//     quorum match — only entries from the CURRENT term are counted toward
+//     a quorum (the §5.4.2 safety rule; committing one index commits the
+//     whole prefix below it implicitly), and the leader's own durability
+//     line stays the hard ceiling (the persistence contract above).
 // Every newly committed entry emits one COMMITTED_OP notification carrying
 // the op wire for host materialization.
 static void _raft_advance_commit(crabs_raft_module_s* module) {
@@ -299,7 +327,31 @@ static void _raft_advance_commit(crabs_raft_module_s* module) {
   } else if (module->role == RAFT_ROLE_FOLLOWER) {
     commit_target = module->follower_commit_target;
   } else {
-    return;   // Phase 2: leader/candidate commit rides quorum match
+    // LEADER (and candidate-voted-self): quorum match over match_index.
+    uint32_t quorum = _raft_quorum_size(module);
+    commit_target = module->commit_index;
+    for (uint64_t entry_index = module->last_log_index;
+         entry_index > module->commit_index; entry_index--) {
+      raft_log_entry_t* entry = _raft_log_entry(module, entry_index);
+      if (entry == NULL || entry->term != module->current_term) continue;
+      uint32_t stored = module->durable_upto >= entry_index ? 1 : 0;
+      for (uint32_t member_index = 0; member_index < module->config.peer_count;
+           member_index++) {
+        if (_raft_is_self(module, module->config.peer_ids[member_index])) {
+          continue;   // the self term is the durable_upto check above
+        }
+        if (module->match_index[member_index] >= entry_index) {
+          stored++;
+        }
+      }
+      if (stored >= quorum) {
+        commit_target = entry_index;   // highest current-term quorum match
+        break;
+      }
+    }
+    if (commit_target == module->commit_index) {
+      return;   // no current-term entry has quorum yet
+    }
   }
   if (commit_target > module->durable_upto) {
     commit_target = module->durable_upto;
@@ -441,15 +493,19 @@ static bool _raft_marshal_append_request(crabs_raft_module_s* module,
                                          uint64_t first_index, uint64_t last_index,
                                          uint64_t prev_log_term,
                                          uint64_t prev_log_index) {
-  if (first_index == 0 || last_index > module->last_log_index ||
-      first_index > last_index + 1) {
+  // first_index == 0 encodes the EMPTY range (a heartbeat): entry_count 0,
+  // entries ride only when first_index >= 1. first/last disagreeing about
+  // emptiness, a range past the log tail, or a descending range refuse.
+  bool empty_range = first_index == 0 && last_index == 0;
+  if ((first_index == 0) != empty_range ||
+      last_index > module->last_log_index ||
+      (first_index > 0 && first_index > last_index + 1)) {
     return false;
   }
-  uint64_t entry_count =
-      last_index >= first_index ? last_index - first_index + 1 : 0;
+  uint64_t entry_count = empty_range ? 0 : last_index - first_index + 1;
   size_t body_len = CRABS_MAX_USER_ID + 2 + 8 * 3 + 4;
-  for (uint64_t entry_index = first_index; entry_index <= last_index;
-       entry_index++) {
+  for (uint64_t entry_index = first_index; empty_range == false &&
+           entry_index <= last_index; entry_index++) {
     raft_log_entry_t* entry = _raft_log_entry(module, entry_index);
     if (entry == NULL) return false;
     body_len += RAFT_ENTRY_FRAMING_LEN + entry->wire_len;
@@ -461,8 +517,8 @@ static bool _raft_marshal_append_request(crabs_raft_module_s* module,
   _raft_write_u64(&writer, prev_log_index);
   _raft_write_u64(&writer, module->commit_index);
   _raft_write_u32(&writer, (uint32_t)entry_count);
-  for (uint64_t entry_index = first_index; entry_index <= last_index;
-       entry_index++) {
+  for (uint64_t entry_index = first_index; empty_range == false &&
+           entry_index <= last_index; entry_index++) {
     raft_log_entry_t* entry = _raft_log_entry(module, entry_index);
     _raft_write_u64(&writer, entry->term);
     _raft_write_u64(&writer, entry->proposal_id);
@@ -495,6 +551,58 @@ static bool _raft_marshal_append_response(crabs_raft_module_s* module,
   if (bytes == NULL) return false;
   _raft_enqueue_outbound(module, RAFT_MSG_APPEND_RESP, to_peer, bytes, len);
   return true;
+}
+
+// ============================================================
+// Replication fan-out (Raft §5.3) — leader side
+// ============================================================
+// Ship the batch starting at next_index[i]: a heartbeat (prev = log tail,
+// empty entry range) when the follower is caught up, else the next batch of
+// entries with the log-matching prev_term/prev_index prefix. The response's
+// success/failure drives next_index/match_index repair.
+static void _raft_send_append_to(crabs_raft_module_s* module,
+                                 uint32_t member_index) {
+  if (member_index >= module->config.peer_count) return;
+  if (_raft_is_self(module, module->config.peer_ids[member_index])) return;
+  // Leader guard: replication only ever runs on the leader (a deposed node
+  // keeps stale bookkeeping — never send from a follower/candidate).
+  if (module->role != RAFT_ROLE_LEADER) return;
+
+  uint64_t send_index = module->next_index[member_index];
+  if (send_index < 1) send_index = 1;
+  if (send_index > module->last_log_index + 1) {
+    send_index = module->last_log_index + 1;   // stale bookkeeping: clamp
+  }
+  uint64_t prev_log_index = send_index - 1;
+  uint64_t prev_log_term = 0;
+  raft_log_entry_t* prev_entry = _raft_log_entry(module, prev_log_index);
+  if (prev_entry != NULL) {
+    prev_log_term = prev_entry->term;
+  }
+  // Heartbeat when the peer has everything; else a bounded batch.
+  uint64_t first_index = send_index;
+  uint64_t last_index = send_index - 1;
+  if (send_index <= module->last_log_index) {
+    last_index = send_index + CRABS_RAFT_APPEND_BATCH_ENTRIES - 1;
+    if (last_index > module->last_log_index) {
+      last_index = module->last_log_index;
+    }
+  } else {
+    first_index = 0;   // empty range == heartbeat
+    last_index = 0;
+  }
+  if (_raft_marshal_append_request(module, module->config.peer_ids[member_index],
+                                   first_index, last_index,
+                                   prev_log_term, prev_log_index)) {
+    module->last_append_ms = module->last_now_ms;
+  }
+}
+
+static void _raft_send_appends_all(crabs_raft_module_s* module) {
+  for (uint32_t member_index = 0; member_index < module->config.peer_count;
+       member_index++) {
+    _raft_send_append_to(module, member_index);
+  }
 }
 
 // ============================================================
@@ -594,8 +702,6 @@ static void _raft_handle_vote_request(crabs_raft_module_s* module,
     module->rejected_message_count++;
     return;
   }
-  (void)last_log_term;
-  (void)last_log_index;
   // A leading node learns of a newer term from any RequestVote: step down
   // first, then evaluate the grant (only followers grant votes).
   _raft_step_down(module, term, candidate_id);
@@ -603,9 +709,20 @@ static void _raft_handle_vote_request(crabs_raft_module_s* module,
     _raft_marshal_vote_response(module, candidate_id, false);
     return;
   }
+  // Up-to-dateness check (Raft §5.4.1): the candidate's log must be at
+  // least as long as ours — its last entry's term strictly newer, or the
+  // same term with an index at least ours. Denying an out-of-date candidate
+  // is what keeps committed entries ahead of whoever gets elected.
+  raft_log_entry_t* tail = _raft_log_entry(module, module->last_log_index);
+  uint64_t my_last_log_term = tail != NULL ? tail->term : 0;
+  bool candidate_up_to_date =
+      last_log_term > my_last_log_term ||
+      (last_log_term == my_last_log_term &&
+       last_log_index >= module->last_log_index);
   bool grant =
-      module->voted_for[0] == '\0' ||
-      strncmp(module->voted_for, candidate_id, CRABS_MAX_USER_ID) == 0;
+      candidate_up_to_date &&
+      (module->voted_for[0] == '\0' ||
+       strncmp(module->voted_for, candidate_id, CRABS_MAX_USER_ID) == 0);
   if (grant) {
     strncpy(module->voted_for, candidate_id, CRABS_MAX_USER_ID - 1);
     module->election_deadline_ms = now_ms + _raft_random_election_timeout(module);
@@ -615,15 +732,36 @@ static void _raft_handle_vote_request(crabs_raft_module_s* module,
 
 static void _raft_handle_vote_response(crabs_raft_module_s* module,
                                        uint64_t term,
-                                       raft_wire_reader_t* reader) {
+                                       raft_wire_reader_t* reader,
+                                       const char* voter_id,
+                                       uint64_t now_ms) {
   uint8_t granted;
   if (!_raft_read_u8(reader, &granted)) {
     module->rejected_message_count++;
     return;
   }
   _raft_step_down(module, term, NULL);
-  (void)granted;
-  // Vote tallies land with Phase 2 elections.
+  // Tallies count ONLY for a candidate in its own election term: a stale
+  // response (older term) must not increment anything, and a deposed
+  // candidate stops tallying entirely (step_down above already flipped the
+  // role for a newer term).
+  if (module->role != RAFT_ROLE_CANDIDATE || term != module->current_term) {
+    return;
+  }
+  int voter_index = _raft_peer_index(module, voter_id);
+  if (voter_index < 0) {
+    module->rejected_message_count++;
+    return;
+  }
+  if (granted != 1) return;
+  // Duplicate response (fault model duplicates wire messages): one grant
+  // per member per election — the per-member guard keeps the tally honest.
+  if (module->vote_granted[voter_index]) return;
+  module->vote_granted[voter_index] = true;
+  module->votes_granted_count++;
+  if (module->votes_granted_count >= _raft_quorum_size(module)) {
+    _raft_become_leader(module, now_ms);
+  }
 }
 
 static void _raft_handle_append_request(crabs_raft_module_s* module,
@@ -658,7 +796,28 @@ static void _raft_handle_append_request(crabs_raft_module_s* module,
     module->rejected_message_count++;
     return;
   }
+  // Same-term claims (Raft §5.2): a candidate loses to a leader from its own
+  // election term — that leader already proved the quorum. A leader ignores
+  // a same-term rival's AppendEntries entirely (two leaders in one term
+  // cannot both hold quorum; the false claim must not rewrite our log).
+  if (term == module->current_term && module->role == RAFT_ROLE_LEADER) {
+    module->rejected_message_count++;
+    return;
+  }
+  if (term == module->current_term && module->role == RAFT_ROLE_CANDIDATE) {
+    module->role = RAFT_ROLE_FOLLOWER;
+  }
   _raft_step_down(module, term, leader_id);
+  // A STALE leader's AppendEntries (older term — a partitioned leader whose
+  // term has been overtaken) must be refused outright: its prev/entries
+  // describe a history the current term may have replaced, letting it write
+  // would be a stale-leader resurrection. Reply with a failure response so
+  // the old leader (still thinking it leads) backtracks — harmless, it
+  // cannot win a vote again with an out-of-date log.
+  if (term < module->current_term) {
+    _raft_marshal_append_response(module, leader_id, false, 0);
+    return;
+  }
   strncpy(module->leader_id, leader_id, CRABS_MAX_USER_ID - 1);
   module->election_deadline_ms = now_ms + _raft_random_election_timeout(module);
 
@@ -680,6 +839,12 @@ static void _raft_handle_append_request(crabs_raft_module_s* module,
 
   // Truncate the uncommitted local suffix past the point of agreement
   // (never the committed prefix: it is durable history on this node).
+  // Discarded entries must also STOP counting as durable here: durable_upto
+  // falls back with them, so a rewritten index cannot inherit its dead
+  // occupant's ack. The outstanding persist window (if any) stays valid for
+  // the host — but its batch is STALE (it named entries that no longer
+  // exist): the persist epoch makes its eventual ack identify as stale, and
+  // the re-armed window re-persists what survives.
   if (module->last_log_index > prev_log_index &&
       prev_log_index >= module->commit_index) {
     for (uint64_t stale_index = prev_log_index + 1;
@@ -688,6 +853,10 @@ static void _raft_handle_append_request(crabs_raft_module_s* module,
       if (stale == NULL) break;
       _raft_log_entry_release(stale);
     }
+    if (module->durable_upto > prev_log_index) {
+      module->durable_upto = prev_log_index;
+    }
+    module->persist_epoch++;
     module->last_log_index = prev_log_index;
   }
 
@@ -746,19 +915,24 @@ static void _raft_handle_append_request(crabs_raft_module_s* module,
 
   // Commit advance on the follower waits for the follower's OWN durability:
   // the leader's commit index is only the ceiling. persist_complete re-runs
-  // _raft_advance_commit once the appended range is acked durable.
+  // _raft_advance_commit once the appended range is acked durable; this call
+  // covers the heartbeat case where the target rises with durability already
+  // behind it.
   if (module->follower_commit_target < leader_commit) {
     module->follower_commit_target = leader_commit;
   }
   if (appended_any) {
     _raft_emit_persist_request(module);
   }
+  _raft_advance_commit(module);
   _raft_marshal_append_response(module, leader_id, true, accepted_match);
 }
 
 static void _raft_handle_append_response(crabs_raft_module_s* module,
                                          uint64_t term,
-                                         raft_wire_reader_t* reader) {
+                                         raft_wire_reader_t* reader,
+                                         const char* responder_id,
+                                         uint64_t now_ms) {
   uint8_t success;
   uint64_t match_index;
   if (!_raft_read_u8(reader, &success) || !_raft_read_u64(reader, &match_index)) {
@@ -766,14 +940,46 @@ static void _raft_handle_append_response(crabs_raft_module_s* module,
     return;
   }
   _raft_step_down(module, term, NULL);
-  (void)success;
-  (void)match_index;
-  // Leader bookkeeping lands with Phase 2 replication.
+  // Repair bookkeeping is a LEADER-only concern: a deposed (or stale-term)
+  // response must not move next/match indices.
+  if (module->role != RAFT_ROLE_LEADER || term != module->current_term) {
+    return;
+  }
+  int responder_index = _raft_peer_index(module, responder_id);
+  if (responder_index < 0) {
+    module->rejected_message_count++;
+    return;
+  }
+  if (success != 1) {
+    // Log-matching failure (Raft §5.3): backtrack next_index one entry and
+    // retry immediately — the next probe finds the conflict point (or the
+    // follower's tail) without waiting for the heartbeat.
+    if (module->next_index[responder_index] > 1) {
+      module->next_index[responder_index]--;
+    }
+    _raft_send_append_to(module, (uint32_t)responder_index);
+    return;
+  }
+  bool match_advanced = match_index > module->match_index[responder_index];
+  if (match_advanced) {
+    module->match_index[responder_index] = match_index;
+  }
+  if (match_index >= module->next_index[responder_index]) {
+    module->next_index[responder_index] = match_index + 1;
+  }
+  if (match_advanced) {
+    _raft_advance_commit(module);
+  }
+  // Anything left unsent beyond the accepted batch rides the next heartbeat
+  // (tick) — bounded batches converge without uncontrolled fan-out.
+  (void)now_ms;
 }
 
 static void _raft_process_inbound(crabs_raft_module_s* module,
+                                  const char* peer_id,
                                   const uint8_t* blob, size_t len,
                                   uint64_t now_ms) {
+  module->last_now_ms = now_ms;
   raft_wire_reader_t reader = { blob, len, 0 };
   uint8_t magic = 0;
   uint8_t version = 0;
@@ -793,13 +999,13 @@ static void _raft_process_inbound(crabs_raft_module_s* module,
       _raft_handle_vote_request(module, term, &reader, now_ms);
       break;
     case RAFT_MSG_VOTE_RESP:
-      _raft_handle_vote_response(module, term, &reader);
+      _raft_handle_vote_response(module, term, &reader, peer_id, now_ms);
       break;
     case RAFT_MSG_APPEND_REQ:
       _raft_handle_append_request(module, term, &reader, now_ms);
       break;
     case RAFT_MSG_APPEND_RESP:
-      _raft_handle_append_response(module, term, &reader);
+      _raft_handle_append_response(module, term, &reader, peer_id, now_ms);
       break;
     default:
       module->rejected_message_count++;
@@ -846,6 +1052,7 @@ static bool _raft_emit_persist_request(crabs_raft_module_s* module) {
   node->handle = module->persist_handle_seq;
   node->first_index = first_index;
   node->last_index = module->last_log_index;
+  node->epoch = module->persist_epoch;
   node->blob = batch;
   node->blob_len = batch_len;
   node->next = NULL;
@@ -859,6 +1066,11 @@ static bool _raft_emit_persist_request(crabs_raft_module_s* module) {
 static void _raft_begin_election(crabs_raft_module_s* module, uint64_t now_ms) {
   module->current_term++;
   module->voted_for[0] = '\0';
+
+  // Election tally (Phase 2): fresh per term — the self-vote counts first,
+  // each member answers at most once (vote_granted guard), quorum promotes.
+  memset(module->vote_granted, 0, sizeof(module->vote_granted));
+  module->votes_granted_count = 1;
 
   if (module->config.peer_count == 1) {
     // Degenerate single node: NO vote exchange — the sole member elects
@@ -874,10 +1086,10 @@ static void _raft_begin_election(crabs_raft_module_s* module, uint64_t now_ms) {
     return;
   }
 
-  // Multi-node path (Phase 2 election logic; the wire path round-trips now):
-  // self-vote, then solicit every other member.
+  // Multi-node path: candidate — self-vote, then solicit every other member.
   module->role = RAFT_ROLE_CANDIDATE;
   strncpy(module->voted_for, module->config.node_id, CRABS_MAX_USER_ID - 1);
+  module->leader_id[0] = '\0';
   module->election_deadline_ms = now_ms + _raft_random_election_timeout(module);
   raft_log_entry_t* tail = _raft_log_entry(module, module->last_log_index);
   for (uint32_t member_index = 0; member_index < module->config.peer_count;
@@ -887,6 +1099,24 @@ static void _raft_begin_election(crabs_raft_module_s* module, uint64_t now_ms) {
     _raft_marshal_vote_request(
         module, peer_id, tail != NULL ? tail->term : 0, module->last_log_index);
   }
+}
+
+// Majority vote secured (Raft §5.2): the candidate becomes leader, seeds the
+// replication cursors, and immediately fans out AppendEntries — an empty
+// body per caught-up peer, or the unsent batch for laggards. The fan-out is
+// also the heartbeat that demobilizes the losers' election clocks.
+static void _raft_become_leader(crabs_raft_module_s* module, uint64_t now_ms) {
+  module->role = RAFT_ROLE_LEADER;
+  module->leader_id[0] = '\0';
+  for (uint32_t member_index = 0; member_index < module->config.peer_count;
+       member_index++) {
+    module->next_index[member_index] = module->last_log_index + 1;
+    module->match_index[member_index] = 0;
+  }
+  module->last_append_ms = now_ms;
+  _raft_enqueue_notification(module, RAFT_NOTIFY_BECAME_LEADER,
+                             module->config.node_id, 0, NULL, 0);
+  _raft_send_appends_all(module);
 }
 
 // ============================================================
@@ -990,6 +1220,7 @@ crabs_error_e crabs_raft_module_tick(crabs_raft_module_t* module_opaque,
                                      uint64_t now_ms) {
   crabs_raft_module_s* module = (crabs_raft_module_s*)module_opaque;
   if (module == NULL) return CRABS_ERR_INVALID_PARAM;
+  module->last_now_ms = now_ms;
   switch (module->role) {
     case RAFT_ROLE_FOLLOWER:
     case RAFT_ROLE_CANDIDATE:
@@ -998,8 +1229,14 @@ crabs_error_e crabs_raft_module_tick(crabs_raft_module_t* module_opaque,
       }
       break;
     case RAFT_ROLE_LEADER:
-      // Phase 1: single-node leadership needs no heartbeats (no peers);
-      // multi-node heartbeats ride Phase 2 replication.
+      // Heartbeats (Raft §5.2): an empty AppendEntries to every peer on the
+      // heartbeat interval, at the slowest (any earlier replication rides
+      // propose/persist events). The election deadline keeps ticking under
+      // the leader too — a stale bookkeeping clock must not silence it.
+      if (now_ms - module->last_append_ms >=
+          module->config.heartbeat_interval_ms) {
+        _raft_send_appends_all(module);
+      }
       break;
   }
   // Durability re-arm (any role): the undurable tail rides the persist
@@ -1020,7 +1257,7 @@ crabs_error_e crabs_raft_module_inbound(crabs_raft_module_t* module_opaque,
     module->rejected_message_count++;
     return CRABS_SUCCESS;   // unknown origin: dropped, module healthy
   }
-  _raft_process_inbound(module, blob, len, now_ms);
+  _raft_process_inbound(module, peer_id, blob, len, now_ms);
   return CRABS_SUCCESS;
 }
 
@@ -1056,8 +1293,11 @@ crabs_error_e crabs_raft_module_propose(crabs_raft_module_t* module_opaque,
   free(wire);   // release the wrapper only; the data block lives in the log
   module->last_log_index = new_index;
   // Hand the undurable tail to the host immediately (a leader tick is not
-  // required for the persistence event to exist).
+  // required for the persistence event to exist), and fan the new entry out
+  // to the followers the same way (propose-driven replication; the batch
+  // heartbeats cover anything the fan-out misses).
   _raft_emit_persist_request(module);
+  _raft_send_appends_all(module);
   *proposal_id = new_index;
   return CRABS_SUCCESS;
 }
@@ -1072,6 +1312,8 @@ crabs_error_e crabs_raft_module_persist_complete(
     return CRABS_ERR_INVALID_PARAM;
   }
   uint64_t last_index = outstanding->last_index;
+  uint64_t outstanding_epoch = outstanding->epoch;
+  bool stale_ack = outstanding_epoch != module->persist_epoch;
   module->persist_outstanding = NULL;
   free(outstanding->blob);
   free(outstanding);
@@ -1081,6 +1323,15 @@ crabs_error_e crabs_raft_module_persist_complete(
     // counts for commit; the tail re-arms and retries on the next tick.
     _raft_enqueue_notification(module, RAFT_NOTIFY_PERSIST_FAILED, NULL, 0,
                                NULL, 0);
+    return CRABS_SUCCESS;
+  }
+
+  // A stale epoch means the window's bytes were DISCARDED after the poll
+  // (log-suffix truncation): the host faithfully stored dead entries. The
+  // ack resolves the window (the module's bookkeeping is done) but must not
+  // advance durability — the re-armed window re-persists the live tail.
+  if (stale_ack) {
+    _raft_emit_persist_request(module);
     return CRABS_SUCCESS;
   }
 
@@ -1264,15 +1515,24 @@ crabs_error_e crabs_raft_module_import_state(
     strncpy(module->voted_for, persisted->voted_for, CRABS_MAX_USER_ID - 1);
   }
   module->commit_index = persisted->commit_index;
-  // d­urable_upto starts at the restored commit tip: the persisted section
-  // IS the durable history (the host wrote it), so nothing re-persists.
-  module->durable_upto = persisted->commit_index;
+  // durable_upto starts at the restored log tail: the persisted section IS
+  // the durable history (the host wrote every entry in it), so nothing
+  // re-persists and the commit tip may ride normal quorum/persist events.
+  module->durable_upto = persisted->log_count;
   // Already-committed entries are NOT re-notified (they were materialized
   // before the restart); a restored node waits for its election deadline.
-  // Undurable tail entries (log_count > commit_index) re-arm persist.
   module->role = RAFT_ROLE_FOLLOWER;
   module->leader_id[0] = '\0';
   module->follower_commit_target = 0;
+  // Fresh peer bookkeeping and election tally (the restored node restarts
+  // as a follower with no in-flight election or replication cursor state).
+  memset(module->vote_granted, 0, sizeof(module->vote_granted));
+  module->votes_granted_count = 0;
+  for (uint32_t member_index = 0; member_index < CRABS_RAFT_MAX_PEERS;
+       member_index++) {
+    module->next_index[member_index] = 1;
+    module->match_index[member_index] = 0;
+  }
   module->election_deadline_ms = _raft_random_election_timeout(module);
   return CRABS_SUCCESS;
 }

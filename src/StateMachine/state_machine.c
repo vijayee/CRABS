@@ -1279,6 +1279,29 @@ static crabs_error_e _raft_route_proposal(state_t* state, const operation_t* op)
 
 crabs_error_e state_attach_raft_module(state_t* state, void* raft_module) {
   if (state == NULL) return CRABS_ERR_INVALID_PARAM;
+  if (raft_module == NULL) {
+    state->raft_module = NULL;
+    return CRABS_SUCCESS;
+  }
+  // Carries-section rule: a state loaded from a blob carries its parsed v16
+  // module section as a runtime-only snapshot. Attaching a module IMPORTS
+  // that snapshot into the fresh module object (term/voted_for/log/commit
+  // tip restored) and consumes it — the module OBJECT now holds the
+  // last-known module state, and the WRITER re-emits it from the attached
+  // module on every save. Without this hand-off, saving a loaded state that
+  // was never re-imported would emit attached=0 and silently DROP the
+  // machine's durable Raft history.
+  if (state->raft_module_state != NULL) {
+    crabs_error_e import_rc = crabs_raft_module_import_state(
+        (crabs_raft_module_t*)raft_module,
+        (const crabs_raft_module_state_t*)state->raft_module_state);
+    if (import_rc != CRABS_SUCCESS) {
+      return import_rc;   // foreign module_id / malformed snapshot: fail closed
+    }
+    crabs_raft_module_state_destroy(
+        (crabs_raft_module_state_t*)state->raft_module_state);
+    state->raft_module_state = NULL;
+  }
   state->raft_module = raft_module;
   return CRABS_SUCCESS;
 }
@@ -1338,7 +1361,13 @@ crabs_error_e state_raft_process_notifications(state_t* state) {
       }
       continue;
     }
+    // The delivery marker is the ONLY credential a follower-side
+    // materialization needs: followers never propose locally, so no pending
+    // entry exists for their committed ops. Leader-side proposals keep the
+    // pending-list lifecycle; the execute-path uuid dedup guards both.
+    state->raft_commit_delivery = true;
     crabs_error_e rc = state_machine_execute_committed(state, op);
+    state->raft_commit_delivery = false;
     operation_destroy(op);
     if (rc != CRABS_SUCCESS && rc != CRABS_ERR_ALREADY_EXECUTED &&
         first_error == CRABS_SUCCESS) {
@@ -1372,7 +1401,17 @@ static crabs_error_e state_machine_execute_internal(state_t* state, operation_t*
       return CRABS_ERR_ORDERING_PATH;
     }
     if (skip_authorization) {
-      if (_raft_pending_find(state, op->uuid) == NULL) {
+      // Two admissible sources, both module-owned (phase-2 gate redesign):
+      //   - the LEADER's pending lifecycle (uuid proposed through this
+      //     machine's seam, waiting for its commit); or
+      //   - the delivery marker from state_raft_process_notifications —
+      //     a COMMITTED_OP straight off the attached module's notification
+      //     queue (the pump's sole source). This is what lets FOLLOWERS
+      //     materialize commits: they never proposed locally, so no pending
+      //     entry can exist for them. Off-path non-authorizing passes carry
+      //     neither → fail-closed rejection.
+      if (_raft_pending_find(state, op->uuid) == NULL &&
+          !state->raft_commit_delivery) {
         return CRABS_ERR_ORDERING_PATH;
       }
       // fall through: committed materialization — the pipeline below runs

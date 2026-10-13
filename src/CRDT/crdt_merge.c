@@ -8,6 +8,7 @@
 #include "../Util/allocator.h"
 #include "../Crypto/crypto.h"
 #include "../StateMachine/state_machine.h"
+#include "../Raft/raft_module.h"
 #include <string.h>
 #include <stdlib.h>
 
@@ -732,15 +733,102 @@ static void _merge_sovereign_item(state_t* dst, data_item_t* dst_item,
                            CRABS_ERR_FORK_DETECTED);
 }
 
-// GROUP_ORDERED v1: no ordering modules ship, so there is no committed-prefix
-// log to adopt from and a module-less item is read-only under DOMAIN_CHECK.
-// ANY content divergence between two replicas is therefore unresolvable in
-// v1 — keep item_a unchanged and surface a held-divergence event. Identity is
-// proven by comparing digests of the serialized item form (content-comparable
-// across replicas). Real committed-prefix logic is future work that arrives
-// with ordering modules.
+// A replica's module COMMIT TIP: the attached module's live committed log
+// tip, else the carried v16 snapshot's commit_index (a loaded-but-not-yet-
+// reimported state still knows how far its module got). 0 = no module
+// information at all.
+static uint64_t _merge_module_commit_tip(const state_t* state) {
+  if (state == NULL) return 0;
+  if (state->raft_module != NULL) {
+    return crabs_raft_module_committed_tip(
+        (const crabs_raft_module_t*)state->raft_module);
+  }
+  const crabs_raft_module_state_t* snapshot =
+      (const crabs_raft_module_state_t*)state->raft_module_state;
+  return snapshot != NULL ? snapshot->commit_index : 0;
+}
+
+// GROUP_ORDERED merge: the module's COMMITTED POSITION is the arbiter of
+// content (Raft's append-index invariant — two committed logs cannot hold
+// different content at the same committed index — makes the per-state tip
+// sound for every item the module orders; per-item walking of the module log
+// adds nothing the invariant has not already decided):
+//   - src tip FURTHER: ADOPT the src item's committed content (value swapped
+//     in, chain head recomputed + stamped from the replacement's own form —
+//     the carried digest stays advisory for group items, which are never
+//     chain-stamped by execution). Content the recomputed digest cannot
+//     cover is held, not adopted (fail-closed like every other hold).
+//   - tips EQUAL: committed positions agree, so committed content must
+//     agree; a content divergence at an equal committed position is a
+//     protocol anomaly — keep item_a and surface the hold (the old v1 stub
+//     behavior, now only for this anomaly case and for module-less states).
+//   - dst tip FURTHER: keep item_a (src is a stale tail; replication, not
+//     merge, repairs it).
+// Identity at equal tips is proven by comparing RECOMPUTED digests of the
+// serialized item form (content-comparable across replicas).
 static void _merge_group_ordered_item(state_t* dst, data_item_t* dst_item,
+                                      const state_t* src,
                                       const data_item_t* src_item) {
+  uint64_t dst_tip = _merge_module_commit_tip(dst);
+  uint64_t src_tip = _merge_module_commit_tip(src);
+
+  if (src_tip > dst_tip && src_tip > 0) {
+    if (src_item->type != dst_item->type ||
+        src_item->crdt_type != dst_item->crdt_type) {
+      // A same-named item of a different shape is corrupted lineage —
+      // adopting value across incompatible structs is not meaningful: hold.
+      _merge_notify_divergence(dst, "__merge_type_mismatch__", dst_item->name,
+                               CRABS_ERR_PROTOCOL_VIOLATION);
+      return;
+    }
+    void* src_value = crdt_merge_value(dst_item->type, dst_item->crdt_type,
+                                       NULL, src_item->value,
+                                       dst_item->name, src_item->name);
+    if (src_value == NULL && src_item->value != NULL) {
+      // No honest content could be built from the committed snapshot: hold.
+      _merge_notify_divergence(dst, "__merge_held__", dst_item->name,
+                               CRABS_ERR_ORDERING_PATH);
+      return;
+    }
+    // Stage the replacement, recompute the head from its own form, and only
+    // commit the swap when the digest covers it (a preimage failure rolls
+    // the stage back — the old content and head stay whole).
+    void* old_value = dst_item->value;
+    data_value_repr_t old_repr = dst_item->value_repr;
+    uint64_t old_seq = dst_item->item_seq;
+    if (src_value != NULL) {
+      dst_item->value = src_value;
+      dst_item->value_repr = DATA_VALUE_REPR_CRDT_STRUCT;
+    }
+    dst_item->item_seq = src_item->item_seq;
+    uint8_t computed_digest[CRABS_HASH_SIZE];
+    if (state_item_digest_compute(dst_item, computed_digest) !=
+        CRABS_SUCCESS) {
+      if (src_value != NULL) {
+        crdt_value_destroy(dst_item->crdt_type, src_value);
+        dst_item->value = old_value;
+        dst_item->value_repr = old_repr;
+      }
+      dst_item->item_seq = old_seq;
+      _merge_notify_divergence(dst, "__merge_held__", dst_item->name,
+                               CRABS_ERR_ORDERING_PATH);
+      return;
+    }
+    memcpy(dst_item->item_digest, computed_digest,
+           sizeof(dst_item->item_digest));
+    if (src_value != NULL) {
+      // Destroy the DISPLACED value per its OLD repr (a raw-repr legacy
+      // value must not be interpreted as a struct).
+      if (old_repr == DATA_VALUE_REPR_CRDT_STRUCT) {
+        crdt_value_destroy(dst_item->crdt_type, old_value);
+      } else {
+        free(old_value);
+      }
+    }
+    return;
+  }
+
+  // Equal tips (or module-less): content must be identical.
   uint8_t digest_a[CRABS_HASH_SIZE];
   uint8_t digest_b[CRABS_HASH_SIZE];
   crabs_error_e status_a = state_item_digest_compute(dst_item, digest_a);
@@ -842,7 +930,7 @@ crabs_error_e crdt_merge_state(state_t* dst, const state_t* src) {
     } else if (dst_item->write_domain == CRABS_DOMAIN_SOVEREIGN) {
       _merge_sovereign_item(dst, dst_item, src_item);
     } else if (dst_item->write_domain == CRABS_DOMAIN_GROUP_ORDERED) {
-      _merge_group_ordered_item(dst, dst_item, src_item);
+      _merge_group_ordered_item(dst, dst_item, src, src_item);
     } else {
       // FREE_MERGE: Item exists in dst, merge values (A5 type merge)
       void* merged_value = crdt_merge_value(dst_item->type, dst_item->crdt_type,

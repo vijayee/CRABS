@@ -43,12 +43,19 @@
 // Cluster shape: peers counts ALL members including this node (1 = the
 // degenerate single-node cluster: self-election without vote exchange).
 #define CRABS_RAFT_MAX_PEERS          16
-// Committed log retention cap (see growth model above).
-#define CRABS_RAFT_MAX_LOG_ENTRIES    65536
+// Committed log retention cap (see growth model above). Tightened in Phase 2
+// from the P1 draft 65536: 65536 entries x the op-wire cap below let one
+// module section approach a gigabyte of worst-case state — 4096 entries is a
+// sane operating ceiling while compaction stays open (Phase 3 evidence).
+#define CRABS_RAFT_MAX_LOG_ENTRIES    4096
 // One serialized CRABS op per log entry, capped like every other bounded
 // wire field (the scheduler persists whole serialized ops; the same order
 // of magnitude).
 #define CRABS_RAFT_MAX_OP_WIRE_BYTES  16384
+// Entries shipped per AppendEntries batch: bounds one message body at
+// batch * op-wire-cap and keeps a lagging follower's repair converging over
+// several heartbeats instead of one giant frame.
+#define CRABS_RAFT_APPEND_BATCH_ENTRIES 8
 // Default timer configuration; election timeouts are randomized in
 // [election_timeout_min_ms, election_timeout_max_ms] from the seed.
 #define CRABS_RAFT_ELECTION_TIMEOUT_MIN_MS 1500u
@@ -98,11 +105,14 @@ typedef struct {
   size_t           len;
 } crabs_raft_outbound_message_t;
 
-// The host persists the batch blob somewhere durable under its own handle
-// bookkeeping, then answers crabs_raft_module_persist_complete. The window
-// holds ONE outstanding request: poll_persist reports the same request until
-// persist_complete resolves it, and the blob pointer stays valid for exactly
-// that window (hosts that must defer storage copy the bytes first).
+// Persist requests do NOT follow the transfer-on-poll ownership of the
+// message and notification queues: poll_persist hands out a VIEW of the one
+// outstanding request (the blob pointer remains MODULE-owned until
+// persist_complete(handle, ok) resolves the window, and the host must not
+// free it). Hosts that must defer storage copy the bytes first. This is the
+// deliberate contrast with poll_outbound, where each poll TRANSFERS blob
+// ownership to the caller (free after reading) — poll_persist transfers
+// nothing; it reports (and re-reports, until resolved) the same window.
 typedef struct {
   uint64_t         handle;
   const uint8_t*   bytes;   // module-owned until persist_complete(handle, ok)

@@ -224,6 +224,12 @@ typedef struct raft_pending_proposal_t {
 // Attach (or detach with NULL) the machine's ordering module. RUNTIME-ONLY:
 // the module object is host-created and host-owned, never serialized and
 // never freed by the state. Module state persists through the v16 section.
+// Carries-section rule: attaching to a state that was loaded from a blob
+// imports the parsed v16 snapshot (crabs_raft_module_import_state) into the
+// fresh module object and consumes it — the WRITER then re-emits the
+// last-known module state from the attached module on every save (the
+// import/emit state-drop hazard is closed both ways). Fails closed on a
+// snapshot the module cannot accept (foreign module_id, malformed counts).
 crabs_error_e state_attach_raft_module(state_t* state, void* raft_module);
 
 // The attached module (NULL when none) — passthrough view of the runtime

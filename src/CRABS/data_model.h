@@ -616,14 +616,21 @@ typedef struct state_t {
   //     freshly created module with crabs_raft_module_import_state.
   //   raft_pending_proposal_t* raft_pending_proposals → uuid-keyed pending
   //     proposals of the two-phase pipeline seam (validated at submission,
-  //     materialized on the module's commit notification). Runtime-only
-  //     reconstruction aid: the MODULE log in the v16 section is the source
-  //     of truth for what was proposed; this list only bridges the current
-  //     process between submission and commit (a restart repopulates commit
-  //     notifications from the module, not from here). Freed by state_destroy.
+  //     materialized on the module's commit notification). Serialized into
+  //     the v16 module section (uuid + op bytes) so a leader restart resumes
+  //     its in-flight proposals; freed by state_destroy.
+  //   bool raft_commit_delivery → RUNTIME-ONLY re-entrancy marker, true
+  //     while state_raft_process_notifications materializes a commit from
+  //     the module's own notification queue. The Step-0 gate admits a
+  //     non-authorizing pass on this instead of the pending list —
+  //     FOLLOWERS never propose locally, so their committed deliveries must
+  //     not depend on any pending entry (the pending list stays the
+  //     leader-side lifecycle record; the execute-path uuid dedup still
+  //     guards resubmission).
   void* raft_module;
   void* raft_module_state;
   void* raft_pending_proposals;   // raft_pending_proposal_t* (state_machine.h)
+  bool  raft_commit_delivery;
 } state_t;
 
 // ============================================================
