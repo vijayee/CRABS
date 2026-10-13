@@ -47,26 +47,26 @@ bool raft_module_is_leader(module); uint64_t raft_module_committed_tip(module);
 - [ ] Surfaces minimal in P1: C-level only + `crabs_raft_module_*` exported; bindings/CLI come in P4.
 - [ ] Commit: `feat: transport-agnostic Raft reactor core + single-node degenerate commit path`.
 
-### Phase 2: Full Raft — elections, replication, partition behavior
+### Phase 2: Full Raft — elections, replication, partition behavior (LANDED 497e5ba, ctest 1725/1725)
 
 **Files:** raft_module.c (election + log matching), test/test_raft_sim.cpp (the harness grows the real scenarios).
-- [ ] Elections: terms, randomized timeouts (seedable), RequestVote round-trip, split-vote resolution, leadership loss on AppendEntries conflict.
-- [ ] Replication: leader AppendEntries to peers, log matching (prevTerm/prevIndex conflict repair), quorum commit advance, heartbeats; follower reads committed to local machine state via notifications.
-- [ ] **Harness scenarios (the heart of this phase — each is a scripted deterministic C test):**
-  - elect-1-of-3 basic; split-vote-2-of-3 → re-election;
+- [x] Elections: terms, randomized timeouts (seedable), RequestVote round-trip, split-vote resolution, leadership loss on AppendEntries conflict.
+- [x] Replication: leader AppendEntries to peers, log matching (prevTerm/prevIndex conflict repair), quorum commit advance, heartbeats; follower reads committed to local machine state via notifications.
+- [x] **Harness scenarios (the heart of this phase — each is a scripted deterministic C test):**
+  - elect-1-of-3 basic; split-vote-2-of-3 → re-election;  <!-- as-landed: ThreeNodeClusterElectsExactlyOneLeader, SplitVoteResolvesThroughReelection, MajorityRefusesOutOfDateCandidate (item 2 at unit scale) -->
   - partition: leader isolated → minority halts (proposals pending, notifications NOT_LEADER at old leader), majority elects new leader and commits; heal partition → old leader's uncommitted entries discarded per log matching, no duplicate commits;
-  - dropped/duplicated/reordered messages (host models loss/duplication/reorder in the script — module idempotent); slow-persist follower;
+  - dropped/duplicated/reordered messages (host models loss/duplication/reorder in the script — module idempotent); slow-persist follower; <!-- as-landed: MessageFaultsDroppedDuplicatedReorderedConvergeIdempotently, SlowPersistFollowerLagsThenConverges -->
   - restart: module state round-trips through the v16 serializer, commit continues (persistence events re-drive);
   - mixed-machine property test: group items halt while SOVEREIGN/FREE items execute on all replicas (DOMAIN_CHECK unaffected).
-- [ ] **P1 carried items (from the P1 review — all load-bearing at P2):**
-  1. Follower materialization: Step-0's pending-uuid gate blocks follower-side COMMITTED_OP delivery (followers never propose locally). Materialization must require ONLY the module-own notification queue (the pump's sole source); keep the leader-side pending lifecycle; uuid dedup at execution still guards resubmission.
+- [x] **P1 carried items (from the P1 review — all load-bearing at P2):**
+  1. Follower materialization: Step-0's pending-uuid gate blocks follower-side COMMITTED_OP delivery (followers never propose locally). AS LANDED: `state->raft_commit_delivery` runtime marker — the pump raises it around each `state_machine_execute_committed`; Step-0 admits a non-authorizing pass when pending OR delivering. Pending lifecycle unchanged; uuid dedup guards both.
   2. Vote grants MUST include the up-to-dateness check (candidate term/lastLogIndex/lastLogTerm) — P1 landed `(void)last_log_*`; correctness-critical once elections are real.
-  3. Restart + pending tail: serialize the pending list into the v16 module section (uuid + op bytes) so leader restarts resume; follower deliveries unaffected via item 1.
-  4. Import/emit state-drop hazard: saving a state whose module section wasn't re-imported emits `attached=0` and DROPS the log — the attach API must carry the imported section so the WRITER re-emits last-known module state; test save→load→save identity.
-  5. Tighten caps: 65536×16384 B ≈ 1 GB worst section — sane bounds (e.g. 4096 entries); compaction decision still open.
-  6. Merge wiring (plan-scope slip acknowledged): crdt_merge GROUP_ORDERED hold-stub → adopt-by-committed-position, in this phase.
-  7. Clarify poll-ownership comment (transfer-on-poll) at raft_module.h:97.
-- [ ] Commit: `feat: Raft elections and replicated log — deterministic simulations for partitions and message faults`.
+  3. Restart + pending tail: serialize the pending list into the v16 module section (uuid + op bytes) so leader restarts resume; follower deliveries unaffected via item 1. AS LANDED: section tail u32 count + entries (uuid/len/bytes), bounded by CRABS_RAFT_MAX_PENDING_PROPOSALS, restored in traversal order (byte-stable round-trips).
+  4. Import/emit state-drop hazard: AS LANDED both ways: `state_attach_raft_module` imports+consumes the carried snapshot, AND the writer re-emits `raft_module_state` verbatim when no module is attached; byte-identity tested both legs (RestartSaveLoadSaveCarriesModuleSectionAndPending).
+  5. Tighten caps: AS LANDED — CRABS_RAFT_MAX_LOG_ENTRIES 65536→4096 (worst section ≈ 64 MB, documented in the header); compaction decision still open (Phase 3).
+  6. Merge wiring (plan-scope slip acknowledged): AS LANDED — `_merge_group_ordered_item` adopts src content when src's module commit tip (attached module or carried v16 snapshot) exceeds dst's; equal-tip divergence and module-less divergence still hold fail-closed; Raft's append-index invariant makes the per-state committed tip sound for every committed item.
+  7. Clarify poll-ownership comment: AS LANDED — the persist-request comment now states the deliberate contrast (poll_outbound transfers blob ownership; poll_persist hands out a view, module-owned until persist_complete).
+- [x] Commit: `feat: Raft elections and replicated log — deterministic simulations for partitions and message faults`.
 
 ### Phase 3: Membership change (joint consensus) + log compaction decision
 
