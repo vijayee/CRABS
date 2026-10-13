@@ -47,6 +47,8 @@ extern "C" {
 #include "Scheduler/scheduler.h"
 #include "TimeSource/time_source.h"
 #include "Raft/raft_module.h"
+#include "OT/ot_execution.h"
+#include "OT/ot_ordered_set.h"
 #include "Util/platform.h"
 }
 
@@ -116,6 +118,11 @@ static Napi::Error crabs_error(Napi::Env env, crabs_error_e err, const char* ctx
     case CRABS_ERR_FORK_DETECTED:          msg = "fork_detected"; break;
     case CRABS_ERR_ORDERING_PATH:          msg = "ordering_path"; break;
     case CRABS_ERR_QUARANTINED:            msg = "quarantined"; break;
+    // 0x8xxx: OT errors (v1.5 §8)
+    case CRABS_ERR_NO_OT_OPS:              msg = "no_ot_ops"; break;
+    case CRABS_ERR_NOT_OT_TYPE:            msg = "not_ot_type"; break;
+    case CRABS_ERR_OT_TRANSFORM_DEPTH:     msg = "ot_transform_depth"; break;
+    case CRABS_ERR_OT_POSITION_BOUNDS:     msg = "ot_position_bounds"; break;
     default:                               msg = "unknown_error"; break;
   }
   std::string full = std::string(ctx) + ": " + msg;
@@ -866,6 +873,13 @@ public:
       InstanceMethod("setRemove", &Node::SetRemove),
       InstanceMethod("flagSet", &Node::FlagSet),
       InstanceMethod("flagValue", &Node::FlagValue),
+      // Ordered set (OT_ORDERED_SET, v1.5 §5 — recipe 8)
+      InstanceMethod("addOrderedSet", &Node::AddOrderedSet),
+      InstanceMethod("getOrderedSet", &Node::GetOrderedSet),
+      InstanceMethod("orderedInsert", &Node::OrderedInsert),
+      InstanceMethod("orderedDelete", &Node::OrderedDelete),
+      InstanceMethod("orderedMove", &Node::OrderedMove),
+      InstanceMethod("orderedSwap", &Node::OrderedSwap),
       InstanceMethod("setPolicy", &Node::SetPolicy),
       InstanceMethod("defineOperationType", &Node::DefineOperationType),
       InstanceMethod("execute", &Node::Execute),
@@ -1781,6 +1795,310 @@ private:
     data_item_t* item = state_find_item(&am_->base_state, name.c_str());
     if (!item) return Napi::Boolean::New(env, false);
     return Napi::Boolean::New(env, one_shot_flag_value((one_shot_flag_t*)item->value));
+  }
+
+  // ============================================================
+  // Ordered set (OT_ORDERED_SET, v1.5 §5) — recipe 8
+  // ============================================================
+
+  // Item creation mirrors crabs_register_ot_type (ot_execution.c): the OT
+  // wrapper allocates its own crabs_ot_ordered_set_t into item->value and
+  // its op-log/transform-matrix struct into item->ot_data — crabs_apply_ot_op
+  // dereferences both unconditionally (a NULL value is CRABS_ERR_INTERNAL),
+  // so there is no lazy attach. Default domain: FREE_MERGE.
+  Napi::Value AddOrderedSet(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    std::string name = require_js_string(info[0], "addOrderedSet", "name");
+    data_item_t* item = data_item_create(name.c_str(),
+        DATA_TYPE_OT_ORDERED_SET, CRDT_CUSTOM);
+    if (!item) throw crabs_error(env, CRABS_ERR_OOM, "addOrderedSet");
+    crabs_ot_ordered_set_t* set = crabs_ot_ordered_set_create();
+    item->value = set;
+    if (!set) {
+      data_item_destroy(item);
+      throw crabs_error(env, CRABS_ERR_OOM, "addOrderedSet");
+    }
+    item->ot_data = set->ot_data;
+    // Struct-backed value (crabs_ot_ordered_set_t) — data_item_destroy
+    // dispatches OT destruction by type.
+    item->value_repr = DATA_VALUE_REPR_CRDT_STRUCT;
+    crabs_error_e rc = state_add_item(&am_->base_state, item);
+    if (rc != CRABS_SUCCESS) throw crabs_error(env, rc, "addOrderedSet");
+    return env.Undefined();
+  }
+
+  // Visible elements in materialized order (tombstones skipped), each
+  // element's payload value decoded as UTF-8. Throws resource_not_found for
+  // an unknown / non-ordered-set name.
+  Napi::Value GetOrderedSet(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    std::string name = require_js_string(info[0], "getOrderedSet", "name");
+    data_item_t* item = state_find_item(&am_->base_state, name.c_str());
+    if (!item || item->type != DATA_TYPE_OT_ORDERED_SET)
+      throw crabs_error(env, CRABS_ERR_RESOURCE_NOT_FOUND, "getOrderedSet");
+    crabs_ot_ordered_set_t* set = (crabs_ot_ordered_set_t*)item->value;
+    if (!set) throw crabs_error(env, CRABS_ERR_INTERNAL, "getOrderedSet");
+
+    Napi::Array elements = Napi::Array::New(env);
+    uint32_t position = 0;
+    for (crabs_ordered_element_t* element = crabs_ot_ordered_set_head(set);
+         element != NULL; element = element->next) {
+      if (element->deleted) continue;
+      const uint8_t* value = element->value;
+      uint32_t value_size = element->value_size;
+      if (value == NULL) {
+        elements.Set(position, Napi::String::New(env, ""));
+      } else {
+        elements.Set(position, Napi::String::New(env,
+            reinterpret_cast<const char*>(value), value_size));
+      }
+      position++;
+    }
+    Napi::Object result = Napi::Object::New(env);
+    result.Set("elements", elements);
+    return result;
+  }
+
+  // Apply ONE ordered-set op through the machine executor: compose, sign
+  // with the node key under this machine's admin (the reportEquivocation
+  // idiom — the caller must install the '__execute_ot__' policy first) and
+  // execute a CRABS_OP_EXECUTE_OT op whose payload is a wire-encoded
+  // crabs_ot_operation_t (crabs_ot_ops_to_wire). Shared by the four sugar
+  // methods.
+  void OrderedSetApply(const Napi::CallbackInfo& info, Napi::Object options,
+                       const std::string& name, uint32_t op_kind,
+                       uint64_t visible_pos, uint64_t visible_pos_2,
+                       const char* element, uint32_t element_len,
+                       const char* ctx) {
+    Napi::Env env = info.Env();
+    if (!options.Has("id"))
+      throw Napi::TypeError::New(env, std::string(ctx) +
+          ": id is required — { node, seq, ts? } fixes the op's OT identity");
+    Napi::Object id = options.Get("id").As<Napi::Object>();
+    if (!id.Has("node") || !id.Get("node").IsString())
+      throw Napi::TypeError::New(env, std::string(ctx) +
+          ": id.node is required (string, the issuing replica's id)");
+    std::string id_node = require_js_string(id.Get("node"), ctx, "id.node");
+    if (id_node.empty() || id_node.length() >= CRABS_MAX_USER_ID)
+      throw Napi::RangeError::New(env, std::string(ctx) +
+          ": id.node must be 1..63 characters");
+    if (!id.Has("seq"))
+      throw Napi::TypeError::New(env, std::string(ctx) +
+          ": id.seq is required (integer >= 0, unique per id.node)");
+    // Non-integer / negative numbers truncate silently through the u64
+    // conversion — require_u64_numeric refuses them.
+    uint64_t id_sequence = require_u64_numeric(id.Get("seq"), ctx, "id.seq");
+    uint64_t id_timestamp = 0;
+    if (id.Has("ts") && !id.Get("ts").IsUndefined())
+      id_timestamp = require_u64_numeric(id.Get("ts"), ctx, "id.ts");
+
+    std::vector<crabs_ot_op_id_t> deps;
+    if (options.Has("deps") && !options.Get("deps").IsUndefined()) {
+      if (!options.Get("deps").IsArray())
+        throw Napi::TypeError::New(env,
+            std::string(ctx) + ": deps must be an array of { node, seq, ts? }");
+      Napi::Array raw_deps = options.Get("deps").As<Napi::Array>();
+      if (raw_deps.Length() > CRABS_OT_MAX_DEPS)
+        throw Napi::RangeError::New(env,
+            std::string(ctx) + ": at most 16 causal deps per op");
+      deps.resize(raw_deps.Length());
+      for (uint32_t dep_index = 0; dep_index < raw_deps.Length(); dep_index++) {
+        Napi::Value raw_dep = raw_deps.Get(dep_index);
+        if (!raw_dep.IsObject())
+          throw Napi::TypeError::New(env,
+              std::string(ctx) + ": each dep must be { node, seq, ts? }");
+        Napi::Object dep = raw_dep.As<Napi::Object>();
+        if (!dep.Has("node") || !dep.Get("node").IsString())
+          throw Napi::TypeError::New(env,
+              std::string(ctx) + ": dep node is required (string)");
+        std::string dep_node = require_js_string(dep.Get("node"), ctx,
+                                                 "dep.node");
+        if (dep_node.empty() || dep_node.length() >= CRABS_MAX_USER_ID)
+          throw Napi::RangeError::New(env,
+              std::string(ctx) + ": dep node must be 1..63 characters");
+        uint64_t dep_sequence = dep.Has("seq")
+            ? require_u64_numeric(dep.Get("seq"), ctx, "dep.seq") : 0;
+        uint64_t dep_timestamp = dep.Has("ts") && !dep.Get("ts").IsUndefined()
+            ? require_u64_numeric(dep.Get("ts"), ctx, "dep.ts") : 0;
+        crabs_ot_op_id_init(&deps[dep_index], dep_node.c_str(), dep_sequence,
+                            dep_timestamp);
+      }
+    }
+
+    data_item_t* item = state_find_item(&am_->base_state, name.c_str());
+    if (!item) throw crabs_error(env, CRABS_ERR_RESOURCE_NOT_FOUND, ctx);
+    if (item->type != DATA_TYPE_OT_ORDERED_SET)
+      throw crabs_error(env, CRABS_ERR_NOT_OT_TYPE, ctx);
+    crabs_ot_ordered_set_t* set = (crabs_ot_ordered_set_t*)item->value;
+    if (!set) throw crabs_error(env, CRABS_ERR_INTERNAL, ctx);
+
+    // crabs_apply_ot_op silently no-ops an out-of-range apply (get returns
+    // NULL), which would mint a signed, logged op that did nothing — refuse
+    // the position pair up front against the live visible count.
+    uint32_t visible_count = crabs_ot_ordered_set_visible_count(set);
+    if (op_kind == CRABS_OT_OP_INSERT) {
+      if (visible_pos > visible_count)
+        throw crabs_error(env, CRABS_ERR_OT_POSITION_BOUNDS, ctx);
+    } else {
+      if (visible_count == 0)
+        throw crabs_error(env, CRABS_ERR_OT_POSITION_BOUNDS, ctx);
+      if (visible_pos > visible_count - 1)
+        throw crabs_error(env, CRABS_ERR_OT_POSITION_BOUNDS, ctx);
+      if ((op_kind == CRABS_OT_OP_MOVE || op_kind == CRABS_OT_OP_SWAP) &&
+          visible_pos_2 > visible_count - 1)
+        throw crabs_error(env, CRABS_ERR_OT_POSITION_BOUNDS, ctx);
+    }
+
+    crabs_ot_operation_t ot_op;
+    crabs_ot_operation_init(&ot_op);
+    ot_op.op_type = (crabs_ot_op_type_e)op_kind;
+    ot_op.visible_pos = visible_pos;
+    ot_op.visible_pos_2 = (op_kind == CRABS_OT_OP_MOVE ||
+                           op_kind == CRABS_OT_OP_SWAP)
+        ? visible_pos_2 : 0;
+    crabs_ot_op_id_init(&ot_op.id, id_node.c_str(), id_sequence, id_timestamp);
+    if (element != NULL && element_len > 0) {
+      if (!crabs_ot_operation_set_payload(
+              &ot_op, reinterpret_cast<const uint8_t*>(element), element_len)) {
+        throw crabs_error(env, CRABS_ERR_INVALID_PARAM, ctx);
+      }
+    }
+    for (const crabs_ot_op_id_t& dep : deps) {
+      if (!crabs_ot_operation_add_dep(&ot_op, &dep)) {
+        free(ot_op.payload);
+        throw crabs_error(env, CRABS_ERR_INVALID_PARAM, ctx);
+      }
+    }
+
+    std::vector<uint8_t> wire(4 + 4 + CRABS_MAX_USER_ID + 8 * 5 + 4 +
+                              CRABS_OT_MAX_PAYLOAD + 4 +
+                              CRABS_OT_MAX_DEPS * (CRABS_MAX_USER_ID + 8 + 8));
+    uint32_t wire_size = crabs_ot_ops_to_wire(&ot_op, 1, wire.data(),
+                                              (uint32_t)wire.size());
+    free(ot_op.payload);
+    if (wire_size == 0)
+      throw crabs_error(env, CRABS_ERR_INTERNAL, ctx);
+
+    if (node_key_ == nullptr)
+      throw Napi::Error::New(env,
+          std::string(ctx) + ": this machine carries no own node key");
+    operation_t* op = operation_create(CRABS_OP_EXECUTE_OT);
+    if (op == NULL) throw crabs_error(env, CRABS_ERR_OOM, ctx);
+    operation_append_resource(op, name, env, ctx);
+    op->payload = (uint8_t*)malloc(wire_size);
+    if (op->payload == NULL) {
+      operation_destroy(op);
+      throw crabs_error(env, CRABS_ERR_OOM, ctx);
+    }
+    memcpy(op->payload, wire.data(), wire_size);
+    op->payload_size = wire_size;
+    crypto_random_bytes(op->uuid, CRABS_UUID_SIZE);
+    strncpy(op->signer_id, admin_id_.c_str(), CRABS_MAX_USER_ID - 1);
+    strncpy(op->node_id, admin_id_.c_str(), CRABS_MAX_USER_ID - 1);
+
+    // Stamp the signer's current key version (R7-04) and HLC when the
+    // machine is HLC-ordered, then sign — the same pre-sign stamping
+    // node.sign() performs.
+    if (am_->base_state.hlc_state_initialized) {
+      op->ordering_system = CRABS_ORDERING_HLC;
+      op->hlc = crabs_hlc_next(&am_->base_state.hlc_state);
+      strncpy(op->node_id, am_->base_state.hlc_state.last.node_id,
+              CRABS_MAX_USER_ID - 1);
+    }
+    user_t* signer_user = attribute_machine_find_user(am_, op->signer_id);
+    if (signer_user != NULL) {
+      op->signer_key_version = signer_user->key_version;
+    }
+    serialized_buffer_t* ser = crabs_serialize_for_signing(op);
+    if (ser == NULL) {
+      operation_destroy(op);
+      throw crabs_error(env, CRABS_ERR_SERIALIZATION_ERROR, ctx);
+    }
+    crabs_error_e rc = crypto_ecdsa_sign(node_key_->private_key, ser->data,
+                                         ser->len, op->signature);
+    serialized_buffer_destroy(ser);
+    if (rc != CRABS_SUCCESS) {
+      operation_destroy(op);
+      throw crabs_error(env, rc, (std::string(ctx) + " sign").c_str());
+    }
+
+    rc = state_machine_execute(&am_->base_state, op);
+    operation_destroy(op);
+    if (rc != CRABS_SUCCESS) throw crabs_error(env, rc, ctx);
+  }
+
+  // The options object's position varies by method (last arg) — resolve it
+  // once here so OrderedSetApply receives the parsed object.
+  static Napi::Object require_ordered_options(const Napi::CallbackInfo& info,
+                                              uint32_t options_index,
+                                              const char* ctx) {
+    Napi::Env env = info.Env();
+    if (info.Length() <= options_index || !info[options_index].IsObject())
+      throw Napi::TypeError::New(env,
+          std::string(ctx) +
+          ": id is required — { node, seq, ts? } fixes the op's OT identity");
+    return info[options_index].As<Napi::Object>();
+  }
+
+  Napi::Value OrderedInsert(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 4)
+      throw Napi::TypeError::New(env,
+          "Expected orderedInsert(name, element, position, options)");
+    Napi::Object options = require_ordered_options(info, 3, "orderedInsert");
+    std::string name = require_js_string(info[0], "orderedInsert", "name");
+    std::string element = require_js_string(info[1], "orderedInsert", "element");
+    if (element.size() > CRABS_OT_MAX_PAYLOAD)
+      throw Napi::RangeError::New(env,
+          "orderedInsert: element payload exceeds the 4096-byte OT limit");
+    uint64_t position = require_u64_numeric(info[2], "orderedInsert", "position");
+    OrderedSetApply(info, options, name, CRABS_OT_OP_INSERT, position, 0,
+                    element.c_str(), (uint32_t)element.size(), "orderedInsert");
+    return env.Undefined();
+  }
+
+  Napi::Value OrderedDelete(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 3)
+      throw Napi::TypeError::New(env, "Expected orderedDelete(name, position, options)");
+    Napi::Object options = require_ordered_options(info, 2, "orderedDelete");
+    std::string name = require_js_string(info[0], "orderedDelete", "name");
+    uint64_t position = require_u64_numeric(info[1], "orderedDelete", "position");
+    OrderedSetApply(info, options, name, CRABS_OT_OP_DELETE, position, 0,
+                    NULL, 0, "orderedDelete");
+    return env.Undefined();
+  }
+
+  Napi::Value OrderedMove(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 4)
+      throw Napi::TypeError::New(env,
+          "Expected orderedMove(name, fromPosition, toPosition, options)");
+    Napi::Object options = require_ordered_options(info, 3, "orderedMove");
+    std::string name = require_js_string(info[0], "orderedMove", "name");
+    uint64_t from_position = require_u64_numeric(info[1], "orderedMove",
+                                                 "fromPosition");
+    uint64_t to_position = require_u64_numeric(info[2], "orderedMove",
+                                               "toPosition");
+    OrderedSetApply(info, options, name, CRABS_OT_OP_MOVE, from_position,
+                    to_position, NULL, 0, "orderedMove");
+    return env.Undefined();
+  }
+
+  Napi::Value OrderedSwap(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 4)
+      throw Napi::TypeError::New(env,
+          "Expected orderedSwap(name, positionA, positionB, options)");
+    Napi::Object options = require_ordered_options(info, 3, "orderedSwap");
+    std::string name = require_js_string(info[0], "orderedSwap", "name");
+    uint64_t position_a = require_u64_numeric(info[1], "orderedSwap",
+                                              "positionA");
+    uint64_t position_b = require_u64_numeric(info[2], "orderedSwap",
+                                              "positionB");
+    OrderedSetApply(info, options, name, CRABS_OT_OP_SWAP, position_a,
+                    position_b, NULL, 0, "orderedSwap");
+    return env.Undefined();
   }
 
   // --- Policies ---
@@ -2924,6 +3242,9 @@ Napi::Object Init(Napi::Env env, Napi::Object exports) {
   data_type.Set("RESOURCE", (double)DATA_TYPE_RESOURCE);
   data_type.Set("ONE_SHOT_SET", (double)DATA_TYPE_ONE_SHOT_SET);
   data_type.Set("ONE_SHOT_FLAG", (double)DATA_TYPE_ONE_SHOT_FLAG);
+  // OT_ORDERED_SET is surfaced (recipe 8): addOrderedSet + the ordered*
+  // sugar build real OT items; the other OT words stay parse-only.
+  data_type.Set("OT_ORDERED_SET", (double)DATA_TYPE_OT_ORDERED_SET);
   data_type.Set("CUSTOM", (double)DATA_TYPE_CUSTOM);
   exports.Set("DATA_TYPE", data_type);
 
