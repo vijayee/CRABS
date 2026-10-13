@@ -738,7 +738,7 @@ export interface Node {
   /**
    * RESTORE a snapshot produced by serialize(): the wrapper's underlying
    * machine is REPLACED with the restored state — the same Node stays usable
-   * (reads, writes, destroy()); the previous machine is simply dropped from
+   * (reads, writes); the previous machine is simply dropped from
    * the wrapper's reference (wasm machines are never destroyed — the module
    * leaks them by design). Returns the restore report
    *   { authorityRestored: boolean, mskSectionPresent: boolean }

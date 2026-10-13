@@ -549,7 +549,7 @@ export interface Node {
   /**
    * RESTORE a snapshot produced by serialize(): the wrapper's underlying
    * machine is REPLACED with the restored state — the same Node stays
-   * usable (reads, writes, destroy()). The previous machine is destroyed
+   * usable (reads, writes). The previous machine is destroyed
    * when this wrapper owned it; a spawned (borrowed) child wrapper re-points
    * instead — the borrowed machine stays with its parent. Returns the
    * restore report { authorityRestored: boolean, mskSectionPresent: boolean }
@@ -587,8 +587,11 @@ export interface Node {
    * take-any; op logs merge by lamport time and dedupe by uuid. This
    * machine MUTATES toward the union; the source snapshot is untouched (it
    * is never attached to a machine). Throws, machine untouched, on a
-   * malformed snapshot or a held item. NOT the OT path: ordered-set items
-   * need the dedicated ordered-set merge layer.
+   * malformed snapshot. Held items are NOT a failure: content the merge
+   * layer cannot apply (an OT item, any type without a merge dispatch)
+   * surfaces as a __merge_held__ change event on the machine's hook ('merge'
+   * events) and the merge returns SUCCESS. NOT the OT path: ordered-set
+   * items need the dedicated ordered-set merge layer.
    */
   mergeState(wire: Buffer): void;
 

@@ -3189,20 +3189,26 @@ private:
     serialized_buffer_t* ser = nullptr;
     if (with_seal && with_signature) {
       uint8_t seal_key[32];
-      if (!hex_decode(seal_key_hex, seal_key, 32))
+      if (!hex_decode(seal_key_hex, seal_key, 32)) {
+        OPENSSL_cleanse(seal_key_hex.data(), seal_key_hex.size());
         throw Napi::TypeError::New(env,
             "serialize: sealKey must be 64 hex characters (32 bytes)");
+      }
       ser = crabs_serialize_state_sealed_signed(&am_->base_state, seal_key);
       OPENSSL_cleanse(seal_key, sizeof(seal_key));   // staged key never lingers
+      OPENSSL_cleanse(seal_key_hex.data(), seal_key_hex.size());  // nor its JS-string copy
     } else if (with_signature) {
       ser = crabs_serialize_state_signed(&am_->base_state);
     } else if (with_seal) {
       uint8_t seal_key[32];
-      if (!hex_decode(seal_key_hex, seal_key, 32))
+      if (!hex_decode(seal_key_hex, seal_key, 32)) {
+        OPENSSL_cleanse(seal_key_hex.data(), seal_key_hex.size());
         throw Napi::TypeError::New(env,
             "serialize: sealKey must be 64 hex characters (32 bytes)");
+      }
       ser = crabs_serialize_state_sealed(&am_->base_state, seal_key);
       OPENSSL_cleanse(seal_key, sizeof(seal_key));
+      OPENSSL_cleanse(seal_key_hex.data(), seal_key_hex.size());
     } else {
       ser = crabs_serialize_state(&am_->base_state);
     }
@@ -3237,6 +3243,11 @@ private:
   // THIS machine's node public key BEFORE any parse — a plain load of a
   // signed blob is refused rather than silently accepted unauthenticated.
   // Both combine ({sealKey, verify: 'node-key'}) for sealed+SIGNED blobs.
+  //
+  // Continuity: the wrapper's node key, change hook, attached time source
+  // and raft module ride over from the previous machine, as do the
+  // wrapper-owned ordering config and the HLC clock state (the restored
+  // machine's clock CONTINUES the previous machine's HLC).
   //
   // TRUST MODEL (serialization.h:70-75): "The bare SHA-256 is only a
   // corruption check — an attacker who can write the state file can recompute
@@ -3300,10 +3311,15 @@ private:
     uint8_t seal_key[32];
     const uint8_t* seal_key_ptr = nullptr;
     if (with_seal) {
-      if (!hex_decode(seal_key_hex, seal_key, 32))
+      if (!hex_decode(seal_key_hex, seal_key, 32)) {
+        OPENSSL_cleanse(seal_key_hex.data(), seal_key_hex.size());
         throw Napi::TypeError::New(env,
             "deserialize: sealKey must be 64 hex characters (32 bytes)");
+      }
       seal_key_ptr = seal_key;
+      // The JS-string staging is a copy of the key: cleanse it alongside
+      // the decoded bytes.
+      OPENSSL_cleanse(seal_key_hex.data(), seal_key_hex.size());
     }
 
     bool authority_restored = false;
@@ -3416,7 +3432,9 @@ private:
   // LWW, OR/2P-set union, one-shot take-any; logs merge by lamport time and
   // dedupe by uuid). This machine MUTATES toward the union; the source
   // snapshot is untouched (it is never attached to a machine). Throws —
-  // machine untouched — on a malformed snapshot or a held item.
+  // machine untouched — on a malformed snapshot. Held items are NOT a
+  // failure: they surface as __merge_held__ divergences on the machine's
+  // change hook ('merge' events) and the merge returns SUCCESS.
   Napi::Value MergeState(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
     if (info.Length() < 1 || !info[0].IsBuffer())

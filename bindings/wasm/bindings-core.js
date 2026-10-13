@@ -1815,8 +1815,12 @@ class Node {
     }
     const withSeal = options?.sealKey !== undefined && options?.sealKey !== null;
     const verifySigned = options?.verify === 'node-key';
-    if (verifySigned && this._am === null) {
-      throw new Error("deserialize: a destroyed node cannot verify snapshots");
+    // Same destroyed-wrapper gate shape the verifySigned branch uses — the
+    // restore migrates the wrapper's machine (node key, time source, raft
+    // module, ordering config, HLC clock), so a wrapper without one has
+    // nothing to restore INTO.
+    if (this._am === null) {
+      throw new Error("deserialize: a destroyed node cannot restore snapshots");
     }
 
     let sealPtr = 0;
@@ -1859,10 +1863,15 @@ class Node {
   // LWW, OR/2P-set union, one-shot take-any — order via the merge's logs).
   // This machine MUTATES toward the union; the source snapshot is untouched
   // (it has no machine attached). Returns undefined; throws (machine
-  // untouched) on a malformed snapshot or a held item.
+  // untouched) on a malformed snapshot. Held items are NOT a failure: they
+  // surface as __merge_held__ divergences on the change hook and the merge
+  // returns SUCCESS.
   mergeState(wire) {
     const M = this._M;
     requireWireBytes(wire, 'mergeState');
+    if (this._am === null) {
+      throw new Error('mergeState: a destroyed node cannot merge snapshots');
+    }
     let wirePtr = 0;
     try {
       wirePtr = M._malloc(wire.length);
