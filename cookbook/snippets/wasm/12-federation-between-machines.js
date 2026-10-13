@@ -6,8 +6,8 @@
 // attestation wire a B-side endorsement policy resolves against. This
 // snippet exercises the ISSUANCE side plus the federation lifecycle with two
 // minted machines: the sever path (dissolve + signed tombstone) and the
-// de-vouch path (revoke attestation — a one-way state that also closes the
-// dissolve door; see the recipe notes). Mirrors the wasm lineage smoke
+// de-vouch path (revoke attestation — a one-way state whose dissolve door
+// stays open; see the recipe notes). Mirrors the wasm lineage smoke
 // (bindings/wasm/lineage_smoke.mjs).
 
 const assert = require('assert');
@@ -115,24 +115,41 @@ async function main() {
     'a revoked child is NOT severed: the machine keeps living');
   assert.throws(() => machineA.attest('machine-c', 'dave', 'role:member'),
     /attest/, 'attest must refuse a revoked child');
-  // The one-way door (the engine's observed behavior, diverging from the C
-  // header's "dissolution stays available" comment at
-  // src/Lineage/lineage.h:516-520): the dissolve op refuses a non-ACTIVE
-  // entry — a revoked federation is not dissolvable into a tombstone either.
+  // The dissolve door stays open after revoke (src/Lineage/lineage.h:516-520
+  // — "dissolution stays available"): the revoke only stopped FUTURE vouches,
+  // so the late sever works — the manifest flips to dissolved and the
+  // tombstone the honesty gate guards becomes mintable.
   const lateDissolve = await Operation.create('__dissolve_machine__');
   lateDissolve.signerId = 'federation-admin';
   lateDissolve.nodeId = 'federation-admin';
   lateDissolve.payload = new TextEncoder().encode('machine-c');
   machineA.sign(lateDissolve, adminKey.privateKeyHex());
-  assert.throws(() => machineA.execute(lateDissolve), /unauthorized/,
-    'dissolve must refuse a revoked (non-ACTIVE) child');
+  machineA.execute(lateDissolve);
   lateDissolve.destroy();
+  const lateEntry = machineA.childById('machine-c');
+  assert(lateEntry !== null && lateEntry.status === 'dissolved',
+    `manifest status after dissolve-after-revoke: ${JSON.stringify(lateEntry)}`);
+  assert(machineA.lineageResidentChild('machine-c') === null,
+    'dissolve-after-revoke severs the resident child');
+  machineA.lineageTombstone('machine-c');  // legal only once DISSOLVED
+
+  // Idempotency gate preserved: dissolving the already-dissolved entry
+  // refuses (a fresh, re-signed op — an executed op cannot be replayed).
+  const reDissolve = await Operation.create('__dissolve_machine__');
+  reDissolve.signerId = 'federation-admin';
+  reDissolve.nodeId = 'federation-admin';
+  reDissolve.payload = new TextEncoder().encode('machine-c');
+  machineA.sign(reDissolve, adminKey.privateKeyHex());
+  assert.throws(() => machineA.execute(reDissolve), /already_performed/,
+    're-dissolving an already-DISSOLVED entry must refuse');
+  reDissolve.destroy();
 
   blueprintB.destroy();
   blueprintC.destroy();
   adminKey.destroy();
   console.log('federation-between-machines wasm OK: attested, dissolved,' +
-    ' tombstoned, revoked with the machine still living');
+    ' tombstoned, revoked then dissolved (the late sever, with its' +
+    ' tombstone)');
 }
 
 main().catch((failure) => {

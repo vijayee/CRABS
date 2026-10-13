@@ -1791,9 +1791,13 @@ crabs_error_e lineage_op_dissolve(state_t* state, operation_t* op) {
     return CRABS_ERR_ALREADY_PERFORMED;
   }
   // Sovereign children cannot be dissolved — the parent may only withdraw
-  // its genesis stake. Any non-ACTIVE entry is past its lifecycle too.
+  // its genesis stake; a withdrawn entry has nothing left to dissolve. A
+  // revoked (attestation-issuing-stopped) entry is NOT past its lifecycle:
+  // dissolution stays available after revoke (src/Lineage/lineage.h:514-520),
+  // so it proceeds to the DISSOLVED transition below — which is also what
+  // makes its tombstone mintable through the honesty gate.
   if (manifest_entry->mode == LINEAGE_SOVEREIGN ||
-      manifest_entry->status != LINEAGE_ACTIVE) {
+      manifest_entry->status == LINEAGE_WITHDRAWN) {
     return CRABS_ERR_UNAUTHORIZED;
   }
   manifest_entry->status = LINEAGE_DISSOLVED;

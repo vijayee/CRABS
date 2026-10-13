@@ -152,15 +152,16 @@ Not guaranteed — the honesty this recipe owes:
   For that reason the frontmatter status is PARTIAL: the recipe *delivers*
   vouch/decay/sever/proof on wasm + node and consume on C, and nothing more.
 
-- *Revocation is a one-way door, and the dissolve door closes behind it* (a
-  divergent pair the engine settles): an `attestation_revoked` entry refuses
-  new vouches — and also refuses `__dissolve_machine__`, because the
-  dissolve op requires the entry to still be ACTIVE
-  (`src/Lineage/lineage.c:1787-1790`, refused in the wasm snippet). The C
-  header's `__revoke_attestation__` comment claims "dissolution stays
-  available" (`src/Lineage/lineage.h:516-520`) — the handler's observed
-  behavior is what this recipe documents; treat a revoked federation as
-  ended-for-vouches and unrecoverable to the dissolve op.
+- *Revocation is a one-way door for vouches, and the dissolve door stays
+  open behind it*: an `attestation_revoked` entry refuses new vouches —
+  yet still dissolves. The C header's `__revoke_attestation__` comment
+  promises "dissolution stays available" (`src/Lineage/lineage.h:514-520`),
+  and the dissolve op honors it: it refuses only an already-DISSOLVED
+  entry (`src/Lineage/lineage.c:1790-1792`); a revoked entry proceeds to
+  the DISSOLVED transition, which is also what makes its tombstone mint
+  freely through the honesty gate (`src/Lineage/lineage.c:1941`).
+  Treat a revoked federation as ended-for-vouches but still severable —
+  the wasm snippet exercises the late dissolve end-to-end.
 - *Peer federation does not exist.* `attest` is parent→child only, strictly
   manifest-gated: a machine cannot vouch for a machine it did not mint (the
   wasm snippet's `machine-ghost` refusal; `src/Lineage/lineage.h:670-685`).
@@ -196,7 +197,8 @@ Not guaranteed — the honesty this recipe owes:
 
 Mint machine B, vouch for its members, sever with the signed tombstone,
 and — on a second machine — de-vouch with `__revoke_attestation__`, watching
-the machine keep living while the vouches stop. The wire images are
+the machine keep living while the vouches stop — then dissolve it anyway
+(the door stays open; the late tombstone mints). The wire images are
 structure-checked inline.
 
 ```snippet:wasm/12-federation-between-machines.js
@@ -218,7 +220,7 @@ symbols:
   (lineage ops)             src/Lineage/lineage.h:484-489
   Node.lineageTombstone     bindings/wasm/index.d.ts:358-362
   (revoke handler)          src/Lineage/lineage.c:1752-1777
-  (dissolve + honesty gate) src/Lineage/lineage.c:1787-1790 + :1807
+  (dissolve + honesty gate) src/Lineage/lineage.c:1795-1801 + :1941
 maturity: all STABLE
 test_ref: bindings/wasm/lineage_smoke.mjs:82-186 (attest + tombstone) + :121-141 (honesty gates)
 -->
@@ -303,8 +305,10 @@ test_ref: test/test_lineage.cpp:396-508 (round trip + refusals) + :644-777 (endo
   (`src/Lineage/lineage.h:551-562`), so a relay can never mint a
   differently-framed dissolution. The node snippet's re-delivery refusal is
   the idempotency the C contract specifies.
-- *Reconciliation note for implementers*: `src/Lineage/lineage.h:516-520`
-  says a revoked child's "dissolution stays available", while the dissolve
-  handler refuses every non-ACTIVE entry (`src/Lineage/lineage.c:1787-1790`).
-  This recipe documents the handler's observed behavior; until the two are
-  reconciled, treat revoke-then-dissolve as refused.
+- *Reconciliation note for implementers*: the old divergence is settled —
+  `src/Lineage/lineage.h:514-520` promises a revoked child's "dissolution
+  stays available", and the dissolve handler now honors it (it refuses only
+  an already-DISSOLVED, sovereign, or withdrawn entry —
+  `src/Lineage/lineage.c:1790-1801`; gated in
+  `test/test_lineage.cpp` `DissolveAfterRevokeIsLegal`). Revoke-then-dissolve
+  is legal; only re-dissolving an already-DISSOLVED entry is refused.

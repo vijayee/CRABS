@@ -2439,6 +2439,60 @@ TEST(TestLineage, DissolveViaOpSeversResidentChildImmediately) {
   spawn_parent_destroy(&harness);
 }
 
+TEST(TestLineage, DissolveAfterRevokeIsLegal) {
+  spawn_parent_harness_t harness;
+  spawn_parent_setup(&harness);
+  state_t* parent = &harness.am->base_state;
+  ASSERT_EQ(attribute_machine_grant_role(harness.am, "alice", "role", "admin",
+                                         "parent-root"), CRABS_SUCCESS);
+  lineage_install(parent);
+
+  machine_blueprint_t* blueprint = make_valid_blueprint();
+  ASSERT_NE(blueprint, nullptr);
+  attribute_machine_t* child = nullptr;
+  ASSERT_EQ(lineage_spawn_machine(parent, blueprint, &child), CRABS_SUCCESS);
+
+  // De-vouch first: the parent stops ISSUING attestations for the child —
+  // without dissolving it (src/Lineage/lineage.h:514-520: "dissolution
+  // stays available"). A revoked entry is therefore not past its lifecycle.
+  operation_t* revoke = make_signed_lineage_op(
+      harness.am, harness.alice_key, "alice",
+      CRABS_LINEAGE_OP_REVOKE_ATTESTATION, "child-red", strlen("child-red"));
+  ASSERT_NE(revoke, nullptr);
+  EXPECT_EQ(state_machine_execute(parent, revoke), CRABS_SUCCESS);
+  operation_destroy(revoke);
+  EXPECT_EQ(parent->children[0].status, LINEAGE_ATTESTATION_REVOKED);
+
+  // Dissolve the revoked child — the header contract honored: the gate only
+  // refuses an already-DISSOLVED (or sovereign/withdrawn) entry.
+  operation_t* dissolve = make_signed_lineage_op(
+      harness.am, harness.alice_key, "alice", CRABS_LINEAGE_OP_DISSOLVE,
+      "child-red", strlen("child-red"));
+  ASSERT_NE(dissolve, nullptr);
+  EXPECT_EQ(state_machine_execute(parent, dissolve), CRABS_SUCCESS);
+  operation_destroy(dissolve);
+  EXPECT_EQ(parent->children[0].status, LINEAGE_DISSOLVED);
+  EXPECT_TRUE(child->base_state.lineage_parent_dissolved);
+
+  // With the manifest entry now DISSOLVED, the tombstone honesty gate
+  // accepts the mint (a revoked child's tombstone used to be unreachable).
+  uint8_t tombstone[CRABS_SIG_SIZE];
+  EXPECT_EQ(lineage_sign_dissolution(parent, "child-red", tombstone),
+            CRABS_SUCCESS);
+
+  // Idempotency gate preserved: an already-DISSOLVED entry still refuses.
+  operation_t* again = make_signed_lineage_op(
+      harness.am, harness.alice_key, "alice", CRABS_LINEAGE_OP_DISSOLVE,
+      "child-red", strlen("child-red"));
+  ASSERT_NE(again, nullptr);
+  EXPECT_EQ(state_machine_execute(parent, again),
+            CRABS_ERR_ALREADY_PERFORMED);
+  operation_destroy(again);
+
+  machine_blueprint_destroy(blueprint);
+  spawn_parent_destroy(&harness);
+}
+
 TEST(TestLineage, SovereignDissolveRefusedWithdrawSovereignOnly) {
   spawn_parent_harness_t harness;
   spawn_parent_setup(&harness);
