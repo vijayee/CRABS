@@ -191,10 +191,20 @@ materialize through the machine's pipeline on every replica. Raw drains
 (`raftPollOutbound`, `raftPollPersistRequest` + `raftPersistComplete`,
 `raftPollNotifications`, `raftTick`, `raftPump`) and point diagnostics
 (`node.raftStatus()`) are exposed for hosts that keep a seam on purpose.
-Full API: `index.d.ts` (RaftHost). An in-memory three-node cluster —
+Crash recovery is exposed too: `host.raftRecoverFromPersist(batch)` replays
+one stored persist batch into a fresh module — when a machine blob is
+restored stale (pre-commit shape) while the host's persist-batch record
+survives, the host re-drives its batches and the node resumes committing
+(corrupt or contradictory batches fail closed). Full API: `index.d.ts`
+(RaftHost). An in-memory three-node cluster —
 election → commit → materialized on all three → partition halts one node →
-heal converges — runs in `test/raft.js` as the executable example of every
-seam.
+heal converges, then nodeB's module is rebuilt from its stored batches —
+runs in `test/raft.js` as the executable example of every seam.
+
+Membership changes ride the C reactor (`host.moduleHandle()` +
+`crabs_wasm_raft_change_membership`); binding-level exposure follows once
+host-level cluster management needs it — the C sims plus the native wire
+path are the coverage.
 
 Note: wasm string payloads reach JS handlers via
 `crabs_wasm_handler_op_get_payload_str`, which requires a NUL-terminated

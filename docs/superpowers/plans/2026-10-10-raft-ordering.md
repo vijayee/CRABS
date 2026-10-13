@@ -186,3 +186,26 @@ Commit cadence (per area): `feat: wasm raft module exports + reference
 host` / `feat: node binding raft surfaces` / `test: wasm/node raft cluster
 suites` / `feat: CLI raft diagnostics` / `docs: raft ordering — README/spec
 as-implemented` / `chore: regenerate wasm artifacts`.
+
+### Post-review follow-ups (2026-10-12, worktree `raft-ordering`)
+
+- **Recovery seam reachable from both bindings** — `crabs_wasm_raft_`
+  `recover_from_persist` existed in wasm_helpers but nothing JS-side called
+  it; the README presented recovery as THE crash-recovery seam while the
+  wrapper could not reach it. `RaftHost.raftRecoverFromPersist(batch)` (wasm)
+  and `Node.raftRecoverFromPersist` + `createRaftHost` surface (node) now
+  wrap it, C fail-closed semantics intact (contradictory replay throws).
+  Both cluster suites grew a recovery leg: nodeB loses its module state —
+  the machine blob's stale pre-commit shape — while its stored persist
+  batches survive; the host re-drives them, the committed prefix is
+  restored, and the next decree commits with the cluster converged (plus a
+  corrupt-batch refusal in each). `AttachOnPreModuleStateCommitsGroupWrites`
+  (C sims) covers the same family at the serializer boundary: a v15-shaped
+  blob (module section stripped) loads module-less, a fresh module attaches,
+  a group write commits.
+- **Membership-change reachability** — binding surface covers
+  create/tick/inbound/propose/persist but `change_membership` rides the C
+  reactor only (C-sim coverage; the joint-consensus path is fully landed
+  there). Binding exposure follows once host-level cluster management needs
+  it — C sims plus the native wire path are the coverage. Noted on the wasm
+  README's raft section.

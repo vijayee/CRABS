@@ -210,6 +210,29 @@ The enum tables `TRUST_MODE`, `DATA_TYPE`, `CRDT_TYPE` are exported alongside th
 
 Dissolution/dissolve/withdraw/revoke-attestation travel through the normal `Operation` + `node.execute()` pipeline after `lineageInstall()`; `__receive_dissolution__` runs the same way on the child machine.
 
+#### Raft ordering module (GROUP-ORDERED writes)
+
+A machine can host a **Raft ordering module** for its `group`-domain items:
+`node.attachRaft(cfg)` attaches one and `createRaftHost(node)` (from
+`index.js`) returns a **reference host** — a `setTimeout` tick loop around
+the user-replaceable seams: `setRaftTransport(fn(peerId, blob))` (ship drained
+control blobs anywhere), `setRaftStorage(async fn(handle, blob))` (persist
+windows stored anywhere durable; a resolved promise acks the window) —
+without a seam, drained blobs queue and persist polls throw. Incoming blobs
+return through `node.raftDeliver(peerId, blob)`; committed ops materialize
+through the machine's pipeline (`raftPump`), or drain raw at the wire with
+the `pumpNotifications: false` host mode. Raw surfaces
+(`node.raftPollOutbound`, `node.raftPollPersistRequest` + `raftPersistComplete`,
+`node.raftPollNotifications`, `node.raftTick`, `node.raftRecoverFromPersist`)
+and point diagnostics (`node.raftStatus()`) mirror the wasm binding's
+`RaftHost` — see the crabs-wasm README's raft section for the full seam
+tutorial and the crash-recovery walkthrough; a three-node in-memory cluster
+(election → two-phase group write → byte-identical committed-op wires on all
+replicas → partition halts one node → heal converges → recovery from stored
+batches) runs in `test/raft.js`. Membership change rides the C reactor
+(`crabs_raft_module_change_membership`) — binding exposure follows once
+host-level cluster management needs it.
+
 ## Testing
 
 ```bash
