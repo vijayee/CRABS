@@ -2324,6 +2324,9 @@ crabs_error_e state_machine_op_rollback(state_t* state, operation_t* op) {
     }
     item->protocol_state = PROTOCOL_IDLE;
     item->lock_state.lock_token_valid = false;
+    // Bearer-credential discipline (mirrors the unlock/rollback paths): zero
+    // the stale token bytes rather than leaving them parked in the item.
+    OPENSSL_cleanse(item->lock_state.lock_token, CRABS_LOCK_TOKEN_SIZE);
     memset(item->lock_state.lock_owner, 0, CRABS_MAX_USER_ID);
   }
   return CRABS_SUCCESS;
@@ -2371,6 +2374,9 @@ crabs_error_e state_machine_op_force_unlock(state_t* state, operation_t* op) {
     }
     item->protocol_state = PROTOCOL_IDLE;
     item->lock_state.lock_token_valid = false;
+    // Bearer-credential discipline: a force-unlocked lease's token is stale
+    // — zero it like the prune/rollback paths do.
+    OPENSSL_cleanse(item->lock_state.lock_token, CRABS_LOCK_TOKEN_SIZE);
     memset(item->lock_state.lock_owner, 0, CRABS_MAX_USER_ID);
     if (item->lock_state.pre_lock_snapshot != NULL) {
       free(item->lock_state.pre_lock_snapshot);
