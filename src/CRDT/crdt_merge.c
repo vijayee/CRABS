@@ -547,10 +547,12 @@ static int _compare_log_entries(const void* a, const void* b) {
 // FREE_MERGE items keep the A5 type-merge below unchanged. SOVEREIGN items
 // merge by chain-head comparison (item_seq/item_digest) — never by type
 // merge: two sovereign snapshots of different content are a divergence, not
-// a CRDT to combine. GROUP_ORDERED (v1 ships no modules) holds any
-// divergence. Divergence is NOT a merge failure — merge still converges and
-// returns CRABS_SUCCESS; what was withheld surfaces through the dst state's
-// change hook as a CRABS_CHANGE_MERGE event.
+// a CRDT to combine. GROUP_ORDERED items hold any divergence while their
+// ordering module is unattached or unavailable (the raft module's commit
+// stream is what resolves them; a module-less state fails closed — see the
+// data_model item-creation gate). Divergence is NOT a merge failure — merge
+// still converges and returns CRABS_SUCCESS; what was withheld surfaces
+// through the dst state's change hook as a CRABS_CHANGE_MERGE event.
 
 // Propagate src's quarantine evidence into dst by monotone union. Union-only:
 // an entry is never evicted and duplicates (same writer OR same evidence

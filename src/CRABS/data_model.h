@@ -203,13 +203,15 @@ typedef struct data_item_t {
 // v1 restrictions (see data_item_create_with_options):
 //   - SOVEREIGN requires a non-empty writer and a type among
 //     DATA_TYPE_COUNTER / DATA_TYPE_REGISTER.
-//   - GROUP_ORDERED requires ordering_module == 0 (no modules exist yet).
+//   - GROUP_ORDERED requires ordering_module == 0: the raft module attaches
+//     with registry id 0 (which is also the "unset" sentinel), and non-zero
+//     ids refuse at item creation until another module registers.
 //   - writer is meaningful only for SOVEREIGN; ordering_module only for
 //     GROUP_ORDERED.
 typedef struct {
   crabs_write_domain_e write_domain;    // 0 = CRABS_DOMAIN_FREE_MERGE (default)
   const char*          writer;          // SOVEREIGN only; NULL = none
-  uint8_t              ordering_module; // GROUP_ORDERED; 0 = unset (v1-only state)
+  uint8_t              ordering_module; // GROUP_ORDERED; 0 = raft module / unset
 } data_item_options_t;
 
 // ============================================================

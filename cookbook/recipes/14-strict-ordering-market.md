@@ -46,7 +46,7 @@ across partitions.
 
 - *The domain is declared at mint*: `defineItem(name, 'register', 'lww_reg',
   { domain: 'group', orderingModule: <module id> })` — both bindings
-  (wasm `bindings/wasm/index.d.ts:315-320`, node `:214-221`). The module id
+  (wasm `bindings/wasm/index.d.ts:309-316`, node `:214-221`). The module id
   must match the machine's attached ordering module; the only id the
   bindings mint is 0, and a non-zero `ordering_module` is refused at item
   creation fail-closed (`src/CRABS/data_model.c:161-172` — "the only
@@ -170,7 +170,7 @@ symbols:
                             HandlerOperation :268; setRegisterBytes/getRegisterBytes
                             inside handlers :206/:227)
   Node.getRegisterBytes     bindings/wasm/index.d.ts:566
-  defineItem                bindings/wasm/index.d.ts:535 (DefineItemOptions :315-320)
+  defineItem                bindings/wasm/index.d.ts:535 (DefineItemOptions :309-316)
   Operation.create          bindings/wasm/index.d.ts:122
   Node.sign / Node.execute  bindings/wasm/index.d.ts:657 / :656 (group op =
                             ORDERING_PENDING acceptance, state_machine.c:1532-1560)

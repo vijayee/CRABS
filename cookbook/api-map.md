@@ -230,7 +230,7 @@ Write-domains v1: items declare a domain at mint — `'free' | 'sovereign' | 'gr
 
 | symbol | kind | signature | source | maturity |
 |---|---|---|---|---|
-| `Node.defineItem` | method | `defineItem(name, dataType, crdtType, options?: DefineItemOptions)` — typed refusals: sovereign-without-writer, writer-on-free, unknown domain, non-legal type | wasm :535 (options :315-320), node :363 (options :214-221) | STABLE (`write-domains.js:23-59`, node `test/test.js:353ff`) |
+| `Node.defineItem` | method | `defineItem(name, dataType, crdtType, options?: DefineItemOptions)` — typed refusals: sovereign-without-writer, writer-on-free, unknown domain, non-legal type | wasm :535 (options :309-316), node :363 (options :214-221) | STABLE (`write-domains.js:23-59`, node `test/test.js:353ff`) |
 | `Operation.setSovereignPrefix` | method | `setSovereignPrefix(prefixIndex, seq, digest: 64-hex \| 32 raw bytes (wasm))` — signed in format v4, wire-carried in op format v6; set BEFORE signing | wasm :75, node :90 | STABLE (`write-domains.js:71-104`) |
 | `Node.itemChainHead` | query | `itemChainHead(name) -> {seq, digestHex}` — full 32-byte hex; `resource_not_found` on unknown item | wasm :544, node :371 | STABLE (`write-domains.js:80-96`) |
 | `Node.reportEquivocation` | method | `reportEquivocation(itemName, opABytes, opBBytes)` — files `__report_equivocation__`; quarantines the writer; failure modes typed (`invalid_param`, `resource_not_found`, `duplicate_operation`) | wasm :551, node :379 | STABLE (`write-domains.js:124-145`, node `test/test.js:493-540`) |
