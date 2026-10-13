@@ -169,6 +169,16 @@ cli_result_e cli_cmd_item_list(cli_node_t* node);
 cli_result_e cli_cmd_item_info(cli_node_t* node, const char* name);
 
 // ============================================================
+// Raft ordering module diagnostics
+// ============================================================
+// Attach an ordering module to the node's state and read its point
+// diagnostics. argv follows the cli_dispatch convention
+// ([0]=prog [1]=raft [2]=attach [3]=<node_id> [4..]=peers beyond self —
+// all members listed, self included).
+cli_result_e cli_cmd_raft_attach(cli_node_t* node, int argc, char** argv);
+cli_result_e cli_cmd_raft_status(cli_node_t* node);
+
+// ============================================================
 // Policy Management
 // ============================================================
 cli_result_e cli_cmd_policy_add(cli_node_t* node, const char* operation,

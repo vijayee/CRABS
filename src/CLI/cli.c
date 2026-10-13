@@ -5,6 +5,8 @@
 #include "cli.h"
 #include "../Util/allocator.h"
 #include "../Serialization/serialization.h"
+#include "../StateMachine/state_machine.h"
+#include "../Raft/raft_module.h"
 #include "../Compaction/compaction_engine.h"
 #include "../Compaction/crdt_compaction.h"
 #include <openssl/crypto.h>
@@ -1138,10 +1140,141 @@ cli_result_e cli_cmd_item_info(cli_node_t* node, const char* name) {
          item->writer[0] != '\0' ? item->writer : "(none)");
   printf("  item_seq:        %llu\n", (unsigned long long)item->item_seq);
   printf("  ordering_module: %u\n", (unsigned)item->ordering_module);
+  // GROUP_ORDERED rows also report the ordering module's live status from
+  // the state's module pointer — the two-phase pipeline only runs while a
+  // module is attached.
+  if (item->write_domain == CRABS_DOMAIN_GROUP_ORDERED) {
+    crabs_raft_module_t* module =
+        (crabs_raft_module_t*)state_raft_module(&node->attr_machine->base_state);
+    if (module == NULL) {
+      printf("  module:          detached (group writes fail closed)\n");
+    } else {
+      printf("  module:          attached — %s, commit tip %llu\n",
+             crabs_raft_module_is_leader(module) ? "leader"
+                                                 : "follower",
+             (unsigned long long)crabs_raft_module_committed_tip(module));
+    }
+  }
   printf("  forks:           %u\n", item->fork_count);
   for (uint32_t fork_index = 0; fork_index < item->fork_count; fork_index++) {
     printf("    quarantined:   %s\n", item->fork_writers[fork_index]);
   }
+  return CLI_OK;
+}
+
+// ============================================================
+// Raft ordering module diagnostics
+// ============================================================
+// Minimal operational surfaces (Phase 4): attach a module to this node's
+// state and read its point diagnostics. Replication/timers belong to the
+// app embedding the CLI, not to the shell — the diagnostics exist so an
+// operator can answer "is the group path live here?".
+
+cli_result_e cli_cmd_raft_attach(cli_node_t* node, int argc, char** argv) {
+  if (node == NULL || !node->initialized) return CLI_ERR_NOT_INIT;
+  // argv: [0]=crabs [1]=raft [2]=attach [3]=<node_id> [4..]=peers beyond self.
+  if (argc < 4) {
+    printf("Usage: raft attach <node_id> [peer_id ...]\n");
+    printf("  node_id is the FIRST member; add one argument per further peer\n");
+    printf("  (all members listed, self included — 1 id means the degenerate\n");
+    printf("  single-node cluster). Timers use the documented defaults.\n");
+    return CLI_ERR_ARGS;
+  }
+  const char* self_id = argv[3];
+  if (strlen(self_id) >= CRABS_MAX_USER_ID) {
+    printf("Error: node id exceeds %d bytes.\n", CRABS_MAX_USER_ID - 1);
+    return CLI_ERR_ARGS;
+  }
+  uint32_t peer_count = (uint32_t)(argc - 3);
+  if (peer_count > CRABS_RAFT_MAX_PEERS) {
+    printf("Error: at most %d members.\n", CRABS_RAFT_MAX_PEERS);
+    return CLI_ERR_ARGS;
+  }
+  const char** peer_ids = (const char**)malloc(peer_count * sizeof(char*));
+  if (peer_ids == NULL) return CLI_ERR_EXEC;
+  for (uint32_t peer_index = 0; peer_index < peer_count; peer_index++) {
+    peer_ids[peer_index] = argv[3 + peer_index];
+  }
+  if (state_raft_module(&node->attr_machine->base_state) != NULL) {
+    free(peer_ids);
+    printf("Error: a raft module is already attached to this node.\n");
+    return CLI_ERR_EXEC;
+  }
+  crabs_raft_config_t config;
+  crabs_raft_config_defaults(&config);
+  strncpy(config.node_id, self_id, CRABS_MAX_USER_ID - 1);
+  config.node_id[CRABS_MAX_USER_ID - 1] = '\0';
+  config.peer_count = peer_count;
+  for (uint32_t peer_index = 0; peer_index < peer_count; peer_index++) {
+    strncpy(config.peer_ids[peer_index], peer_ids[peer_index],
+            CRABS_MAX_USER_ID - 1);
+    config.peer_ids[peer_index][CRABS_MAX_USER_ID - 1] = '\0';
+  }
+  crabs_raft_module_t* module = crabs_raft_module_create(&config);
+  if (module == NULL) {
+    free(peer_ids);
+    printf("Error: raft module create refused the configuration (the node\n"
+           "       id must be among the listed peers).\n");
+    return CLI_ERR_EXEC;
+  }
+  crabs_error_e rc = state_attach_raft_module(&node->attr_machine->base_state,
+                                              module);
+  if (rc != CRABS_SUCCESS) {
+    crabs_raft_module_destroy(module);
+    free(peer_ids);
+    printf("Error: %s\n", cli_error_string(rc));
+    return CLI_ERR_EXEC;
+  }
+  free(peer_ids);
+  printf("Raft module attached: node '%s', %u member(s), module_id %u.\n",
+         self_id, (unsigned)peer_count, (unsigned)config.module_id);
+  printf("Note: the CLI does not run the raft host loop — replication needs a\n"
+           "transport/tick host around this state (see the ordering docs).\n");
+  return CLI_OK;
+}
+
+cli_result_e cli_cmd_raft_status(cli_node_t* node) {
+  if (node == NULL || !node->initialized) return CLI_ERR_NOT_INIT;
+  state_t* state = &node->attr_machine->base_state;
+  crabs_raft_module_t* module = (crabs_raft_module_t*)state_raft_module(state);
+  if (module == NULL) {
+    printf("Raft ordering module: NOT attached (group-item writes fail\n"
+           "closed with ordering_path).\n");
+    return CLI_OK;
+  }
+  printf("Raft ordering module:\n");
+  printf("  term:            %llu\n",
+         (unsigned long long)crabs_raft_module_current_term(module));
+  printf("  leader:          %s\n",
+         crabs_raft_module_is_leader(module) ? "this node"
+                                             : "another node / undecided");
+  printf("  commit tip:      %llu\n",
+         (unsigned long long)crabs_raft_module_committed_tip(module));
+  printf("  log entries:     %llu\n",
+         (unsigned long long)crabs_raft_module_log_length(module));
+  printf("  config change:   %s\n",
+         crabs_raft_module_config_change_pending(module) ? "in flight"
+                                                         : "idle");
+  char member_ids[CRABS_RAFT_MAX_PEERS][CRABS_MAX_USER_ID];
+  uint32_t member_count = crabs_raft_module_committed_members(module, member_ids);
+  printf("  members (%u):     ", (unsigned)member_count);
+  for (uint32_t member_index = 0; member_index < member_count; member_index++) {
+    printf("%s%s", member_index > 0 ? ", " : "", member_ids[member_index]);
+  }
+  printf("\n");
+  uint32_t pending_count = 0;
+  for (const raft_pending_proposal_t* pending =
+           (const raft_pending_proposal_t*)state->raft_pending_proposals;
+       pending != NULL; pending = pending->next) {
+    pending_count++;
+  }
+  printf("  pending submits: %u\n", (unsigned)pending_count);
+  printf("  retry shelf:     %s (%u attempt%s)\n",
+         state_raft_shelf_active(state) ? "blocked" : "clear",
+         (unsigned)state_raft_shelf_attempt_count(state),
+         state_raft_shelf_attempt_count(state) == 1 ? "" : "s");
+  printf("  rejected msg:    %u\n",
+         (unsigned)crabs_raft_module_rejected_message_count(module));
   return CLI_OK;
 }
 
@@ -2383,6 +2516,11 @@ static void _print_policy_usage(void) {
   printf("  policy add <operation> <expression>   Add a policy\n");
 }
 
+static void _print_raft_usage(void) {
+  printf("  raft attach <node_id> [peer_id ...]   Attach the ordering module (members listed, self included)\n");
+  printf("  raft status                           Term, leader, commit tip, members, pending/shelf counts\n");
+}
+
 static void _print_key_usage(void) {
   printf("  key generate                Generate a new ECDSA keypair\n");
   printf("  key import <hex|->          Import the node private key after a load\n");
@@ -2537,6 +2675,7 @@ void cli_print_usage(const char* prog) {
   _print_op_usage();
   _print_machine_usage();
   _print_time_source_usage();
+  _print_raft_usage();
   printf("  compact                 Run tombstone compaction on all items\n");
   // Audit A10-7b: single-shot mode destroys the node at process exit, so
   // multi-command flows (load → seal-key import → mutate → save) only work
@@ -2634,7 +2773,7 @@ cli_result_e cli_dispatch(cli_node_t* node, int argc, char** argv) {
       strcmp(cmd, "item") != 0 && strcmp(cmd, "policy") != 0 &&
       strcmp(cmd, "key") != 0 && strcmp(cmd, "op") != 0 &&
       strcmp(cmd, "machine") != 0 && strcmp(cmd, "compact") != 0 &&
-      strcmp(cmd, "time-source") != 0 &&
+      strcmp(cmd, "time-source") != 0 && strcmp(cmd, "raft") != 0 &&
       strcmp(cmd, "seal-key") != 0 && strcmp(cmd, "load-sealed") != 0) {
     printf("Unknown command: %s\n", cmd);
     cli_print_usage(argv[0]);
@@ -2809,6 +2948,18 @@ cli_result_e cli_dispatch(cli_node_t* node, int argc, char** argv) {
     }
     printf("Unknown item subcommand: %s\n", sub);
     _print_item_usage();
+    return CLI_ERR_ARGS;
+  }
+
+  if (strcmp(cmd, "raft") == 0) {
+    if (argc < 3) {
+      _print_raft_usage();
+      return CLI_ERR_ARGS;
+    }
+    if (strcmp(argv[2], "attach") == 0) return cli_cmd_raft_attach(node, argc, argv);
+    if (strcmp(argv[2], "status") == 0)  return cli_cmd_raft_status(node);
+    printf("Unknown raft subcommand: %s\n", argv[2]);
+    _print_raft_usage();
     return CLI_ERR_ARGS;
   }
 
