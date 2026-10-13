@@ -46,6 +46,18 @@ export namespace KeyPair {
   function derivePublicHex(hex: string): Promise<string>;
 }
 
+/**
+ * A machine-derived CP-ABE reader key (gap-fill A11): abeKeygen derives it
+ * from the machine's OWN master authority, so JS never touches the master
+ * secret — the machine mints it, JS holds only the derived key. JS owns the
+ * pointer: destroy() it (idempotent, like KeyPair's destroy). NOT a portable
+ * byte format in v1 — no serialized reader key crosses a module/machine
+ * boundary; the C-side user_key serialize/deserialize pair stays C-only.
+ */
+export interface AbeKey {
+  destroy(): void;
+}
+
 export interface Operation {
   type: string;
   signerId: string;
@@ -672,6 +684,28 @@ export interface Node {
   unregisterHandler(opType: string): void;
 
   encrypt(payload: Uint8Array | string, policy: string): Uint8Array;
+  /**
+   * Derives a CP-ABE reader key from THE MACHINE'S OWN master authority:
+   * whoever controls the machine can mint a key for any attribute set it
+   * names — the same trust position as encrypt. The master key itself never
+   * leaves the machine (no JS handle for it exists; no portable serialized
+   * key in v1). attrs is the comma-separated token list the C API takes,
+   * with the ':' → '_' token map applied machine-side (crypto.c:98-111) —
+   * a key derived from 'role:member,role:moderator' carries the ABE words
+   * role_member / role_moderator, so the seal policy must be written with
+   * those same words. The returned key is JS-owned: destroy() it.
+   */
+  abeKeygen(attrs: string): AbeKey;
+  /**
+   * Opens the container encrypt() returned (u16le policy byte length +
+   * policy bytes + u32le ciphertext length + ciphertext, the smoke.js:111-130
+   * layout). Refuses with the typed error word 'unauthorized' when the key's
+   * attributes do not satisfy the container's policy — the same typed path
+   * tampering fails closed on. Malformed containers refuse at the binding
+   * boundary. No portable keys: `key` must be the AbeKey abeKeygen returned
+   * (a destroyed key refuses).
+   */
+  abeDecrypt(key: AbeKey, encrypted: Uint8Array): Uint8Array;
   serialize(): Uint8Array;
 
   setTime(nowMs: number): void;

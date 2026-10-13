@@ -120,6 +120,15 @@ void               crypto_abe_ciphertext_destroy(abe_ciphertext_t* ct);
 const char*        crypto_abe_ciphertext_get_policy(const abe_ciphertext_t* ct);
 const uint8_t*     crypto_abe_ciphertext_get_data(const abe_ciphertext_t* ct, size_t* len);
 
+// Reconstruct an opaque ciphertext from its parts — the policy string and
+// the packed ciphertext bytes (exactly the halves the language-binding
+// container exposes). Used by bindings that round-trip the container wire
+// into the C decrypt path (the container IS policy + ct bytes). The policy
+// must fit CRABS_MAX_POLICY_EXPR and data must be non-empty. Returns NULL
+// on failure.
+abe_ciphertext_t*  crypto_abe_ciphertext_load(const char* policy,
+                                                const uint8_t* data, size_t len);
+
 // Decrypt with a user key. Succeeds only if the key's attributes satisfy the
 // ciphertext's policy. Caller frees *out.
 crabs_error_e      crypto_abe_decrypt(const abe_user_key_t* sk,

@@ -169,6 +169,7 @@ static Napi::Error crabs_error(Napi::Env env, crabs_error_e err, const char* ctx
 // carries them all.
 struct NodeAddonInstanceData {
   Napi::FunctionReference key_pair_ctor;
+  Napi::FunctionReference abe_key_ctor;
   Napi::FunctionReference blueprint_ctor;
   Napi::FunctionReference node_ctor;
 };
@@ -412,6 +413,62 @@ private:
     crabs_error_e rc = crypto_ecdsa_derive_public_key(priv, pub);
     if (rc != CRABS_SUCCESS) throw crabs_error(env, rc, "derivePublicHex");
     return Napi::String::New(env, hex_encode(pub, 33));
+  }
+};
+
+// ============================================================
+// AbeKey — wraps abe_user_key_t (gap-fill A11)
+// ============================================================
+
+// A machine-derived CP-ABE reader key: Node.abeKeygen derives it from the
+// machine's OWN master authority (state->abe_mk), so JS never touches the
+// master secret — the machine mints it, JS holds only the derived key. JS
+// OWNS the pointer: destroy() releases it (the destructor releases it too,
+// matching the KeyPair/Blueprint convention). NOT a portable byte format in
+// v1 — no serialized reader key crosses a process/machine boundary; the
+// C-side user_key serialize/deserialize pair stays C-only.
+class AbeKey : public Napi::ObjectWrap<AbeKey> {
+public:
+  static Napi::Object Init(Napi::Env env, Napi::Object exports) {
+    Napi::Function func = DefineClass(env, "AbeKey", {
+      InstanceMethod("destroy", &AbeKey::Destroy),
+    });
+    // Stored in the shared NodeAddonInstanceData set up by the module Init —
+    // Node.abeKeygen mints instances through it.
+    auto* inst = env.GetInstanceData<NodeAddonInstanceData>();
+    inst->abe_key_ctor = Napi::Persistent(func);
+    exports.Set("AbeKey", func);
+    return exports;
+  }
+
+  AbeKey(const Napi::CallbackInfo& info) : Napi::ObjectWrap<AbeKey>(info) {
+    sk_ = nullptr;
+  }
+
+  ~AbeKey() {
+    if (sk_) crypto_abe_user_key_destroy(sk_);
+  }
+
+  abe_user_key_t* raw() { return sk_; }
+
+  // Factory the binding's static methods use (keygen mints; nothing else).
+  static Napi::Object NewInstance(Napi::Env env, abe_user_key_t* sk) {
+    auto* inst = env.GetInstanceData<NodeAddonInstanceData>();
+    Napi::Object obj = inst->abe_key_ctor.New({});
+    AbeKey* key = AbeKey::Unwrap(obj);
+    key->sk_ = sk;
+    return obj;
+  }
+
+private:
+  abe_user_key_t* sk_;
+
+  Napi::Value Destroy(const Napi::CallbackInfo& info) {
+    if (sk_) {
+      crypto_abe_user_key_destroy(sk_);
+      sk_ = nullptr;
+    }
+    return info.Env().Undefined();
   }
 };
 
@@ -1146,6 +1203,8 @@ public:
       InstanceMethod("sign", &Node::SignOp),
       InstanceMethod("createTrigger", &Node::CreateTrigger),
       InstanceMethod("encrypt", &Node::Encrypt),
+      InstanceMethod("abeKeygen", &Node::AbeKeygen),
+      InstanceMethod("abeDecrypt", &Node::AbeDecrypt),
       InstanceMethod("serialize", &Node::Serialize),
       InstanceMethod("getHLC", &Node::GetHLC),
       InstanceMethod("setTime", &Node::SetTime),
@@ -3003,6 +3062,91 @@ private:
     return out;
   }
 
+  // --- ABE keygen + decrypt (gap-fill A11) ---
+  //
+  // abeKeygen(attrs) derives a CP-ABE reader key from THE MACHINE'S OWN
+  // master authority (state->abe_mk): whoever controls the machine can
+  // mint a key for any attribute set it names — the same trust position as
+  // encrypt. The master key itself never leaves the machine (no JS handle
+  // for it exists; no portable serialized key in v1). attrs is the
+  // comma-separated token list the C API takes, with the ':' → '_' token
+  // map applied machine-side (crypto.c:98-111) — so a key derived from
+  // 'role:member,role:moderator' carries the ABE words role_member /
+  // role_moderator, and the seal policy must be written with those same
+  // words. The returned AbeKey is JS-owned: destroy() it (or any later
+  // decrypt through it refuses).
+  Napi::Value AbeKeygen(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 1)
+      throw Napi::TypeError::New(env, "Expected (attrs)");
+    std::string attrs = require_js_string(info[0], "abeKeygen", "attrs");
+    if (attrs.empty())
+      throw crabs_error(env, CRABS_ERR_INVALID_PARAM, "abeKeygen");
+    if (am_->base_state.abe_mk == nullptr)
+      throw crabs_error(env, CRABS_ERR_CRYPTOGRAPHIC_ERROR, "abeKeygen");
+
+    abe_user_key_t* sk = crypto_abe_keygen(
+        (const abe_master_key_t*)am_->base_state.abe_mk, attrs.c_str());
+    if (!sk)
+      throw crabs_error(env, CRABS_ERR_CRYPTOGRAPHIC_ERROR, "abeKeygen");
+    return AbeKey::NewInstance(env, sk);
+  }
+
+  // abeDecrypt(key, sealed) opens the container encrypt() returned —
+  // u16le policy byte length + policy bytes + u32le ciphertext length +
+  // ciphertext (the layout Encrypt writes). Malformed containers refuse at
+  // the boundary; a key whose attributes do not satisfy the container's
+  // policy refuses with the typed error — 'unauthorized' — straight from
+  // crypto_abe_decrypt (also the tamper path: GCM fail-closed). Staging
+  // discipline: the ciphertext handle is rebuilt from the container halves,
+  // decrypted, and destroyed on EVERY path (including refusals and the
+  // malformed-container throws, each destroying first); the plaintext the
+  // C side mallocs is copied into the returned Buffer and freed before
+  // anything is handed back to JS.
+  Napi::Value AbeDecrypt(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 2 || !info[0].IsObject() || !info[1].IsBuffer())
+      throw Napi::TypeError::New(env,
+        "Expected (AbeKey, encrypted container Buffer)");
+    auto* key = AbeKey::Unwrap(info[0].As<Napi::Object>());
+    if (key == nullptr || key->raw() == nullptr)
+      throw Napi::Error::New(env,
+        "abeDecrypt: expected a live AbeKey (a destroyed key refuses)");
+
+    auto sealed = info[1].As<Napi::Buffer<uint8_t>>();
+    const uint8_t* bytes = sealed.Data();
+    size_t total = sealed.Length();
+    if (total < 2 + 4)
+      throw Napi::Error::New(env, "abeDecrypt: malformed container (truncated header)");
+    size_t policy_len = (size_t)(*(const uint16_t*)bytes);
+    size_t ct_len_offset = 2 + policy_len;
+    if (ct_len_offset + 4 > total)
+      throw Napi::Error::New(env, "abeDecrypt: malformed container (truncated header)");
+    size_t ct_len = (size_t)(*(const uint32_t*)(bytes + ct_len_offset));
+    if (2 + policy_len + 4 + ct_len != total)
+      throw Napi::Error::New(env,
+        "abeDecrypt: malformed container (length header does not match container size)");
+    std::string policy((const char*)bytes + 2, policy_len);
+
+    abe_ciphertext_t* ct = crypto_abe_ciphertext_load(
+        policy.c_str(), bytes + ct_len_offset + 4, ct_len);
+    if (!ct)
+      throw Napi::Error::New(env,
+        "abeDecrypt: container did not reconstruct (policy or ciphertext invalid)");
+
+    uint8_t* out = nullptr;
+    size_t out_len = 0;
+    crabs_error_e rc = crypto_abe_decrypt(key->raw(), ct, &out, &out_len);
+    crypto_abe_ciphertext_destroy(ct);  // destroy the staged handle on every path
+    if (rc != CRABS_SUCCESS) {
+      if (out != nullptr) { free(out); out = nullptr; }  // paranoid no-op: refusal frees its own buffer
+      throw crabs_error(env, rc, "abeDecrypt");
+    }
+    Napi::Buffer<uint8_t> plain = Napi::Buffer<uint8_t>::Copy(env, out, out_len);
+    free(out);
+    return plain;
+  }
+
   // --- Serialization ---
 
   Napi::Value Serialize(const Napi::CallbackInfo& info) {
@@ -3580,6 +3724,7 @@ Napi::Object Init(Napi::Env env, Napi::Object exports) {
   // exist before the class inits store into it.
   env.SetInstanceData(new NodeAddonInstanceData());
   KeyPair::Init(env, exports);
+  AbeKey::Init(env, exports);
   Blueprint::Init(env, exports);
   Operation::Init(env, exports);
   Node::Init(env, exports);

@@ -1050,6 +1050,24 @@ const uint8_t* crypto_abe_ciphertext_get_data(const abe_ciphertext_t* ct, size_t
   return (const uint8_t*)oabe_bytestring_get_const_ptr(ct->ct_bytes);
 }
 
+abe_ciphertext_t* crypto_abe_ciphertext_load(const char* policy,
+                                               const uint8_t* data, size_t len) {
+  if (!policy || !data || len == 0) return NULL;
+  if (strlen(policy) >= CRABS_MAX_POLICY_EXPR) return NULL;  // no silent truncation
+  _ensure_oabe_init();
+
+  abe_ciphertext_t* ct = get_clear_memory(sizeof(abe_ciphertext_t));
+  if (!ct) return NULL;
+  strncpy(ct->policy, policy, CRABS_MAX_POLICY_EXPR - 1);
+  ct->policy[CRABS_MAX_POLICY_EXPR - 1] = '\0';
+  ct->ct_bytes = oabe_bytestring_new_from_data(data, len);
+  if (!ct->ct_bytes) {
+    free(ct);
+    return NULL;
+  }
+  return ct;
+}
+
 // ============================================================
 // ABE Decrypt — real CP-ABE user-key decryption (ABE-KEM + DEM).
 // ============================================================

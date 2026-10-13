@@ -360,6 +360,31 @@ class KeyPair {
 }
 
 // ============================================================
+// AbeKey
+// ============================================================
+
+// A machine-derived CP-ABE reader key (gap-fill A11): abeKeygen derives it
+// from the machine's OWN master authority, so JS never touches the master
+// secret — the machine mints it, JS holds only the derived key. JS OWNS
+// the pointer: release it with destroy() (the KeyPair contract; it is
+// idempotent). NOT a portable byte format in v1 — no serialized reader
+// key crosses a module/machine boundary; crypto_abe_user_key_serialize /
+// deserialize remain C-only.
+class AbeKey {
+  constructor(M, ptr) {
+    this._M = M;
+    this._ptr = ptr;
+  }
+
+  destroy() {
+    if (this._ptr) {
+      this._M._crabs_wasm_abe_key_destroy(this._ptr);
+      this._ptr = null;
+    }
+  }
+}
+
+// ============================================================
 // Operation
 // ============================================================
 
@@ -1588,6 +1613,86 @@ class Node {
 
     M._crabs_wasm_abe_ciphertext_destroy(ct);
     return out;
+  }
+
+  // --- ABE keygen + decrypt (gap-fill A11) ---
+  //
+  // abeKeygen(attrs) derives a CP-ABE reader key from THE MACHINE'S OWN
+  // master authority (state->abe_mk, attribute_machine.c:309): whoever
+  // controls the machine can mint a key for any attribute set it names —
+  // the same trust position as encrypt. The master key itself never leaves
+  // the machine (no JS handle for it exists; no portable serialized key in
+  // v1). attrs is the comma-separated token list the C API takes, with the
+  // ':' → '_' token map applied machine-side (crypto.c:98-111) — so a key
+  // derived from 'role:member,role:moderator' carries the ABE words
+  // role_member / role_moderator, and the seal policy must be written with
+  // those same words. The returned AbeKey is JS-owned: destroy it (or any
+  // later decrypt through it refuses).
+  abeKeygen(attrs) {
+    if (typeof attrs !== 'string' || attrs.length === 0) {
+      throw new Error('abeKeygen: attrs must be a non-empty attribute token list');
+    }
+    const M = this._M;
+    const aPtr = writeString(M, attrs);
+    const keyPtr = M._crabs_wasm_abe_keygen(this._am, aPtr);
+    freeAll(M, aPtr);
+    if (!keyPtr) throw new Error('abeKeygen failed (no machine authority or refused attrs)');
+    return new AbeKey(M, keyPtr);
+  }
+
+  // abeDecrypt(key, encrypted) opens the container encrypt() returned —
+  // u16le policy byte length + policy bytes + u32le ciphertext length +
+  // ciphertext (layouts pinned by smoke.js:111-130). Malformed containers
+  // refuse at the binding boundary; a key whose attributes do not satisfy
+  // the container's policy refuses with the typed error word —
+  // 'unauthorized' — straight from crypto_abe_decrypt (also the tamper
+  // path: GCM fail-closed). Staging discipline: the ciphertext handle is
+  // rebuilt from the container halves, decrypted, and DESTROYED on every
+  // path (inner finally); the plaintext the C side mallocs is copied into
+  // a fresh Uint8Array and M._free()d before returning — nothing lingers
+  // on the WASM heap.
+  abeDecrypt(key, encrypted) {
+    if (!(key instanceof AbeKey) || !key._ptr) {
+      throw new Error('abeDecrypt: expected a live AbeKey (from abeKeygen; a destroyed key refuses)');
+    }
+    if (!(encrypted instanceof Uint8Array) || encrypted.length === 0) {
+      throw new Error('abeDecrypt: expected the ABE container encrypt() returned');
+    }
+    const M = this._M;
+    const view = new DataView(encrypted.buffer, encrypted.byteOffset,
+                              encrypted.byteLength);
+    const policyByteLen = view.getUint16(0, true);
+    const ctLenOffset = 2 + policyByteLen;
+    if (ctLenOffset + 4 > encrypted.length) {
+      throw new Error('abeDecrypt: malformed container (truncated header)');
+    }
+    const ctLen = view.getUint32(ctLenOffset, true);
+    if (2 + policyByteLen + 4 + ctLen !== encrypted.length) {
+      throw new Error(`abeDecrypt: malformed container (header declares ${2 + policyByteLen + 4 + ctLen} bytes, container is ${encrypted.length})`);
+    }
+    const policyText = new TextDecoder().decode(encrypted.subarray(2, ctLenOffset));
+    const pPtr = writeString(M, policyText);
+    const { ptr: cPtr } = writeBytes(M, encrypted.subarray(ctLenOffset + 4,
+                                                            ctLenOffset + 4 + ctLen));
+    const ctPtr = M._crabs_wasm_abe_ciphertext_load(pPtr, cPtr, ctLen);
+    freeAll(M, pPtr, cPtr);
+    if (!ctPtr) {
+      throw new Error('abeDecrypt: container did not reconstruct (policy or ciphertext invalid)');
+    }
+    const outPtrPtr = M._malloc(4);
+    const outLenPtr = M._malloc(4);
+    try {
+      const rc = M._crabs_wasm_abe_decrypt(key._ptr, ctPtr, outPtrPtr, outLenPtr);
+      if (rc !== 0) throw crabsError(rc, 'abeDecrypt');
+      const outPtr = M.getValue(outPtrPtr, 'i32');
+      const outLen = M.getValue(outLenPtr, 'i32');
+      const plain = new Uint8Array(M.HEAPU8.subarray(outPtr, outPtr + outLen));  // copy
+      M._free(outPtr);  // copied into `plain` above — free before returning
+      return plain;
+    } finally {
+      freeAll(M, outPtrPtr, outLenPtr);
+      M._crabs_wasm_abe_ciphertext_destroy(ctPtr);
+    }
   }
 
   serialize() {

@@ -42,7 +42,7 @@ if (!nativeModule) {
 }
 
 // Re-export the native classes
-const { Node, KeyPair, Operation, Blueprint, TRUST_MODE, DATA_TYPE, CRDT_TYPE,
+const { Node, KeyPair, Operation, Blueprint, AbeKey, TRUST_MODE, DATA_TYPE, CRDT_TYPE,
     wireVersions } = nativeModule;
 
 // Mirror the wasm wrapper's frozen-object contract for the version table.
@@ -255,5 +255,5 @@ function createRaftHost(node, options = {}) {
   return host;
 }
 
-module.exports = { Node, KeyPair, Operation, Blueprint, TRUST_MODE, DATA_TYPE, CRDT_TYPE,
+module.exports = { Node, KeyPair, Operation, Blueprint, AbeKey, TRUST_MODE, DATA_TYPE, CRDT_TYPE,
     wireVersions: frozenWireVersions, createRaftHost };

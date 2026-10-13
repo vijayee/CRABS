@@ -1645,6 +1645,58 @@ void crabs_wasm_abe_ciphertext_destroy(abe_ciphertext_t* ct) {
   if (ct) crypto_abe_ciphertext_destroy(ct);
 }
 
+// ABE keygen + decrypt (gap-fill A11): derive a reader key from the
+// MACHINE'S OWN master authority (state->abe_mk) — the MSK itself never
+// leaves the machine; no JS handle for it exists. Whoever controls the
+// machine can mint a key for any attribute set it names: that is the trust
+// statement of this export (the C keygen refuses nothing beyond the
+// master's presence).
+EMSCRIPTEN_KEEPALIVE
+abe_user_key_t* crabs_wasm_abe_keygen(attribute_machine_t* am, const char* attrs) {
+  if (!am || !attrs || !am->base_state.abe_mk) return NULL;
+  return crypto_abe_keygen((abe_master_key_t*)am->base_state.abe_mk, attrs);
+}
+
+EMSCRIPTEN_KEEPALIVE
+void crabs_wasm_abe_key_destroy(abe_user_key_t* sk) {
+  crypto_abe_user_key_destroy(sk);
+}
+
+// Rebuild the opaque ciphertext from the container halves the JS side
+// carries (policy string + packed ct bytes — same layout encrypt's
+// serialized container exposes). Returns NULL on malformed input.
+EMSCRIPTEN_KEEPALIVE
+abe_ciphertext_t* crabs_wasm_abe_ciphertext_load(const char* policy,
+                                                 const uint8_t* data, uint32_t len) {
+  if (!policy || !data || len == 0) return NULL;
+  return crypto_abe_ciphertext_load(policy, data, (size_t)len);
+}
+
+// Decrypt under a machine-derived user key. On success *out holds the
+// plaintext (caller COPIES it JS-side, then M._free(*out)) and returns
+// CRABS_SUCCESS (0); otherwise returns the crabs_error_e code
+// (CRABS_ERR_UNAUTHORIZED when the key's attributes do not satisfy the
+// container's policy) and stages NOTHING — the out pointer/length go back
+// zeroed, so the failure path leaves no plaintext and no buffer to free.
+EMSCRIPTEN_KEEPALIVE
+int32_t crabs_wasm_abe_decrypt(abe_user_key_t* sk, abe_ciphertext_t* ct,
+                               uint8_t** out, uint32_t* out_len) {
+  if (!out || !out_len) return (int32_t)CRABS_ERR_INVALID_PARAM;
+  *out = NULL;
+  *out_len = 0;
+  size_t plain_len = 0;
+  uint8_t* plain = NULL;
+  crabs_error_e rc = crypto_abe_decrypt(sk, ct, &plain, &plain_len);
+  if (rc != CRABS_SUCCESS) return (int32_t)rc;  // crypto_abe_decrypt cleansed+freed plain itself
+  if (plain_len > 0xFFFFFFFFu) {
+    free(plain);
+    return (int32_t)CRABS_ERR_INTERNAL;
+  }
+  *out = plain;
+  *out_len = (uint32_t)plain_len;
+  return (int32_t)CRABS_SUCCESS;
+}
+
 // ============================================================
 // State serialization (for future catch-up; not required for v1)
 // ============================================================

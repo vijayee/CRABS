@@ -61,6 +61,7 @@ BASE_EXPORTS='[
   "_crypto_abe_ciphertext_destroy",
   "_crypto_abe_ciphertext_get_policy",
   "_crypto_abe_ciphertext_get_data",
+  "_crypto_abe_ciphertext_load",
   "_crypto_abe_user_key_serialize",
   "_crypto_abe_user_key_deserialize",
   "_crypto_sign_operation",
