@@ -134,7 +134,7 @@ writeFileSync(join(dist, 'index.html'), readFileSync(join(cookbook, 'site', 'ind
 
 writeFileSync(join(dist, 'cookbook', 'index.html'), pageShell({
   title: 'The CRABS Cookbook',
-  mainHtml: `<h1>The CRABS Cookbook</h1><p>Fourteen recipes with runnable code, plus three gap pages. STATUS and
+  mainHtml: `<h1>The CRABS Cookbook</h1><p>Fifteen recipes with runnable code, plus one honest gap page. STATUS and
   maturity badges are honest: PARTIAL means gaps are documented on the page.
   UNSUPPORTED means the codebase cannot deliver it yet.</p>${indexTable.join('\n')}
   <div class="callout"><img src="/assets/Unlockster.png"><p>Trust caveat: recipes

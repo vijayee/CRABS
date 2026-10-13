@@ -204,11 +204,12 @@ test_ref: test/test_durability.cpp:65-106 (signed custom op through state_machin
   clause → `unauthorized`, the gate itself); the C snippet adds the forged
   signature case. "An unauthorized op is rejected" is not a side note — it
   is the only observable that makes the policy real.
-- `verifiedBy` is not equal on both bindings: crabs-node populates
+- `verifiedBy` reads back on BOTH bindings: crabs-node populates
   `attributes[].verifiedBy` (the node snippet asserts `'admin'`, mirroring
-  `bindings/node/src/crabs_node.cc:1160`), crabs-wasm currently hands back an
-  empty string for it — the wasm snippet asserts values only, and the
-  divergence is recorded rather than hidden.
+  `bindings/node/src/crabs_node.cc:1160`), and the wasm binding maps the
+  same provenance field from the machine rather than an empty string — the
+  real-readback state `bindings/wasm/test/getuser-readback.js` pins
+  (the api-map's §2 rows record the same reality).
 - The registered role IS an attribute: `grantRole('alice','role','member',…)`
   installs `role:member` (smoke.js reads it back via `getUser`, :107-109);
   policies match whole tokens, so express *everything you mean to match*

@@ -176,13 +176,15 @@ test_ref: test/test_crdt.cpp:485-519 (newer wins + node-id tie-breaker)
   snippet demos the merge rule the JS demos depend on but cannot observe
   (there is no cross-machine merge call in either JS binding — merging
   happens in C, and the C test suite is the pinning evidence).
-- `keyVersion` is NOT equal on both bindings: crabs-node maps the real
-  `user->key_version` (registration = 1, one grant = 2, asserted in the
-  node snippet), while the wasm `getUser` builds its result with hardcoded
-  provenance placeholders — `keyVersion: 0`, `publicKeyHex: ''`,
-  `verifiedBy: ''` (`bindings/wasm/bindings-core.js:694-700`). Same for the
-  Recipe 4 note about `verifiedBy`. If your wasm UI needs key epochs,
-  read the C struct or track writes yourself.
+- `keyVersion` IS a real machine readback on both bindings now: crabs-node
+  maps `user->key_version` directly (registration = 1, one grant = 2,
+  asserted in the node snippet), and crabs-wasm maps the same fields —
+  `keyVersion`/`publicKeyHex`/`verifiedBy`/`status` are machine-mapped, not
+  placeholders (mapper: `bindings/wasm/bindings-core.js:895-952`; pinned by
+  `bindings/wasm/test/getuser-readback.js`). The former wasm provenance
+  stubs were the subject of that fix — the api-map's `UserInfo` row records
+  the same reality. (The old note "wasm builds placeholders — track writes
+  yourself" no longer holds.)
 - The integer-only discipline is not cosmetic: registers carry a signed
   int64 in C (`crabs_node.cc` converts to int64); both bindings reject
   fractions/NaN/Infinity, wasm additionally accepts BigInt for the full
