@@ -81,11 +81,11 @@ Add matching declarations to `wasm_init.c`'s EXPORT list (grep how `crabs_wasm_u
 - Modify: `bindings/wasm/bindings-core.js:686-696` (drop the `name + ':' + value` doubling)
 - Test: `bindings/wasm/test/06-moderation` semantics — `cookbook/snippets/wasm/06-moderation.js` currently asserts the doubled string; policy `'AND role:member clearance:moderator'` must still match via the plain token path (`src/Crypto/crypto.c:1126-1163` evaluates `temp->name` + value as two tokens).
 
-- [ ] **Step 1: Update bindings-core.js** so `issue_attribute` trigger grants read back `value` (plain `'moderator'`) instead of `'moderator:moderator'`.
-- [ ] **Step 2: Run the recipe snippet** `node cookbook/snippets/wasm/06-moderation.js` — expect FAIL where it pins the doubled string.
-- [ ] **Step 3: Update the snippet assertions** (and the recipe prose that explains the doubling — recipe 6 "How CRABS encodes it" section) to the plain token; re-run green. Also grep `bindings/wasm/test/` for other doubled-string reliance (`grep -rn "moderator:moderator" bindings/`) and fix.
-- [ ] **Step 4: Full suites**: `node bindings/wasm/test/smoke.js && node bindings/wasm/test/schedules.js && cd cookbook && node tests/run-snippets.mjs`.
-- [ ] **Step 5: Commit** `fix: unify wasm temp attributes on the plain token representation`.
+- [x] **Step 1: Update bindings-core.js** — done in commit 8751aa9: `value` now reads back the plain token `'clearance:moderator'` (the plan's `'moderator'` shorthand was loose; node's mapper returns `temp->name`, the full `name:value` token, crabs_node.cc:1208).
+- [x] **Step 2: Run the recipe snippet** `node cookbook/snippets/wasm/06-moderation.js` — expect FAIL where it pins the doubled string.
+- [x] **Step 3: Update the snippet assertions** (and the recipe prose that explains the doubling — recipe 6 "How CRABS encodes it" section) to the plain token; re-run green. Also grep `bindings/wasm/test/` for other doubled-string reliance (`grep -rn "moderator:moderator" bindings/`) and fix.
+- [x] **Step 4: Full suites**: `node bindings/wasm/test/smoke.js && node bindings/wasm/test/schedules.js && cd cookbook && node tests/run-snippets.mjs`.
+- [x] **Step 5: Commit** `fix: unify wasm temp attributes on the plain token representation`.
 
 ### Task A3: node createTrigger signs with the real caller identity
 
