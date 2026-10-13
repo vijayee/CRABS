@@ -846,6 +846,15 @@ static crabs_error_e _verify_operation_authorization(state_t* state, const opera
 
 // Step 4 helper: Verify protocol state transitions (§7.4 step 4).
 static crabs_error_e _check_transitions(state_t* state, const operation_t* op) {
+  // The define operation's resources[0] names the OPERATION TYPE being
+  // registered (state_machine_op_define_operation reads it) — not a protocol
+  // state item, so there is nothing to compare item states against. The
+  // handler's operation_is_protected check is the real boundary for the
+  // named type; skip the item-lookup gate for it (regression:
+  // DefineOperationTypeExecutesThroughMachine).
+  if (strcmp(op->type, CRABS_OP_DEFINE_OPERATION) == 0) {
+    return CRABS_SUCCESS;
+  }
   for (uint32_t resource_index = 0; resource_index < op->resource_count;
        resource_index++) {
     data_item_t* item = state_find_item(state, op->resources[resource_index]);
@@ -1671,9 +1680,14 @@ static crabs_error_e state_machine_execute_internal(state_t* state, operation_t*
   // on the target item, making it an unauthorized mutation primitive. Only
   // specs registered through __define_operation_type__ may guard or mutate
   // state; an op that carries a non-NONE spec for an op type with no
-  // registered spec is rejected outright.
+  // registered spec is rejected outright. EXCEPT for the define operation
+  // itself: its dedup struct is the registration payload it hands the
+  // handler (signed, persisted, never applied as a guard or mutation for
+  // __define_operation_type__), so the carried-spec refusal does not apply
+  // to it — the handler's operation_is_protected check is the boundary.
   const dedup_spec_t* registered_dedup = state_find_op_type_def(state, op->type);
-  if (registered_dedup == NULL && op->dedup.type != DEDUP_NONE) {
+  if (registered_dedup == NULL && op->dedup.type != DEDUP_NONE &&
+      strcmp(op->type, CRABS_OP_DEFINE_OPERATION) != 0) {
     return CRABS_ERR_UNAUTHORIZED;
   }
   const dedup_spec_t* effective_dedup = registered_dedup;

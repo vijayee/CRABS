@@ -178,6 +178,98 @@ TEST_F(TestStateMachine, OpCarriedDedupSpecRejectedWithoutRegistration) {
   operation_destroy(op);
 }
 
+// Regression: the __define_operation_type__ operation is the only admin op
+// whose TWO executor pre-handler gates both misfire for it.
+//   Step 4 (_check_transitions) resolves resources[0] as a state item — but
+//   the define op's resource names the OPERATION TYPE being registered, not
+//   an item, so the full pipeline failed with resource_not_found.
+//   Step 6 (op-carried-spec guard, the A10 audit) rejects any op carrying a
+//   non-NONE dedup spec with no registered spec for its own type — but the
+//   define op's dedup struct IS the registration payload (signed, stored,
+//   never applied as a guard or mutation for the op itself), so it failed
+//   with unauthorized.
+// Both gates must exempt CRABS_OP_DEFINE_OPERATION: the handler's protected
+// check (operation_is_protected) is the real security boundary here.
+TEST_F(TestStateMachine, DefineOperationTypeExecutesThroughMachine) {
+  state_add_policy(state, CRABS_OP_DEFINE_OPERATION, "role:admin");
+  state_add_policy(state, "vote", "role:admin");
+
+  // The once-record the registered spec guards on.
+  data_item_t* voters =
+      data_item_create("voters", DATA_TYPE_ONE_SHOT_SET, CRDT_ONE_SHOT_SET);
+  ASSERT_NE(voters, nullptr);
+  voters->value = one_shot_set_create();
+  voters->value_repr = (data_value_repr_t)DATA_VALUE_REPR_CRDT_STRUCT;
+  ASSERT_EQ(state_add_item(state, voters), CRABS_SUCCESS);
+
+  operation_t* define = operation_create(CRABS_OP_DEFINE_OPERATION);
+  memcpy(define->uuid, test_uuid, CRABS_UUID_SIZE);
+  define->resources =
+      (char(*)[CRABS_MAX_USER_ID])malloc(sizeof(char[CRABS_MAX_USER_ID]));
+  strncpy(define->resources[0], "vote", CRABS_MAX_USER_ID - 1);
+  define->resource_count = 1;
+  define->required_state = (protocol_state_e*)malloc(sizeof(protocol_state_e));
+  define->required_state[0] = PROTOCOL_IDLE;
+  define->next_state = (protocol_state_e*)malloc(sizeof(protocol_state_e));
+  define->next_state[0] = PROTOCOL_IDLE;
+  strncpy(define->signer_id, "alice", CRABS_MAX_USER_ID - 1);
+  define->dedup.type = DEDUP_PER_USER;
+  strncpy(define->dedup.tracker_path, "voters", CRABS_MAX_DEDUP_PATH - 1);
+  strncpy(define->dedup.rejection_message, "already_performed",
+          CRABS_MAX_DEDUP_MESSAGE - 1);
+  set_signer_key_version(define);
+  sign_operation(define);
+
+  EXPECT_EQ(state_machine_execute(state, define), CRABS_SUCCESS);
+  const dedup_spec_t* registered = state_find_op_type_def(state, "vote");
+  ASSERT_NE(registered, nullptr);
+  EXPECT_EQ(registered->type, DEDUP_PER_USER);
+  EXPECT_STREQ(registered->tracker_path, "voters");
+  operation_destroy(define);
+
+  // The registered spec now guards "vote" ops through the machine: the
+  // carried spec is DEDUP_NONE (the F-2 bypass shape) yet the registered
+  // spec resolves anyway — first vote passes and the executor's post-handler
+  // mutation records the vote; the retry is refused before any handler.
+  operation_t* first = operation_create("vote");
+  memcpy(first->uuid, test_uuid, CRABS_UUID_SIZE);
+  first->resources =
+      (char(*)[CRABS_MAX_USER_ID])malloc(sizeof(char[CRABS_MAX_USER_ID]));
+  strncpy(first->resources[0], "voters", CRABS_MAX_USER_ID - 1);
+  first->resource_count = 1;
+  first->required_state = (protocol_state_e*)malloc(sizeof(protocol_state_e));
+  first->required_state[0] = PROTOCOL_IDLE;
+  first->next_state = (protocol_state_e*)malloc(sizeof(protocol_state_e));
+  first->next_state[0] = PROTOCOL_IDLE;
+  strncpy(first->signer_id, "alice", CRABS_MAX_USER_ID - 1);
+  set_signer_key_version(first);
+  sign_operation(first);
+  EXPECT_EQ(state_machine_execute(state, first), CRABS_SUCCESS);
+  EXPECT_EQ(one_shot_set_count((one_shot_set_t*)voters->value), 1);
+  EXPECT_TRUE(one_shot_set_contains((one_shot_set_t*)voters->value, "alice"));
+  operation_destroy(first);
+
+  // The retry: distinct uuid, same signer — the registered guard rejects it
+  // with the spec's rejection domain (already_performed) before anything runs.
+  operation_t* retry = operation_create("vote");
+  memcpy(retry->uuid, test_uuid, CRABS_UUID_SIZE);
+  retry->resources =
+      (char(*)[CRABS_MAX_USER_ID])malloc(sizeof(char[CRABS_MAX_USER_ID]));
+  strncpy(retry->resources[0], "voters", CRABS_MAX_USER_ID - 1);
+  retry->resource_count = 1;
+  retry->required_state = (protocol_state_e*)malloc(sizeof(protocol_state_e));
+  retry->required_state[0] = PROTOCOL_IDLE;
+  retry->next_state = (protocol_state_e*)malloc(sizeof(protocol_state_e));
+  retry->next_state[0] = PROTOCOL_IDLE;
+  retry->dedup.type = DEDUP_NONE;  // the would-be bypass
+  strncpy(retry->signer_id, "alice", CRABS_MAX_USER_ID - 1);
+  set_signer_key_version(retry);
+  sign_operation(retry);
+  EXPECT_EQ(state_machine_execute(state, retry), CRABS_ERR_ALREADY_PERFORMED);
+  EXPECT_EQ(one_shot_set_count((one_shot_set_t*)voters->value), 1);
+  operation_destroy(retry);
+}
+
 TEST_F(TestStateMachine, TestValidTransition) {
   EXPECT_TRUE(state_machine_is_valid_transition(PROTOCOL_IDLE, CRABS_OP_LOCK));
   EXPECT_TRUE(state_machine_is_valid_transition(PROTOCOL_LOCKED, CRABS_OP_EXTEND));
