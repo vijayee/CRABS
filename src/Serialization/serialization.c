@@ -2175,8 +2175,8 @@ static serialized_buffer_t* _serialize_state_internal(const state_t* state,
                            module_state->commit_index <= module_state->log_count;
     for (const crabs_raft_entry_persisted_t* entry = module_state->log;
          module_state_ok && entry != NULL; entry = entry->next) {
-      module_state_ok = entry->wire_len >= 1 &&
-                        entry->wire_len <= CRABS_RAFT_MAX_OP_WIRE_BYTES;
+      // wire_len 0 is the leadership NO-OP entry (Raft §8, v17).
+      module_state_ok = entry->wire_len <= CRABS_RAFT_MAX_OP_WIRE_BYTES;
     }
     uint32_t pending_count = 0;
     for (const raft_pending_proposal_t* pending =
@@ -2208,6 +2208,26 @@ static serialized_buffer_t* _serialize_state_internal(const state_t* state,
         _write_bytes(buf, pending->uuid, CRABS_UUID_SIZE);
         _write_uint32_le(buf, pending->op_len);
         _write_bytes(buf, pending->op_bytes, pending->op_len);
+      }
+      // v17 retry-shelf tail (carried item C): the blocked committed op
+      // rides the module section so a restart resumes ordering. The strict
+      // ordering rule bounds it to ONE entry while the pump is blocked.
+      const raft_retry_shelf_t* shelf =
+          (const raft_retry_shelf_t*)state->raft_retry_shelf;
+      bool shelf_ok = shelf == NULL ||
+                      (shelf->op_len >= 1 &&
+                       shelf->op_len <= CRABS_RAFT_MAX_OP_WIRE_BYTES &&
+                       shelf->next == NULL);
+      if (!shelf_ok) {
+        free(buf->data);
+        free(buf);
+        return NULL;
+      }
+      _write_uint8(buf, shelf != NULL ? 1 : 0);
+      if (shelf != NULL) {
+        _write_uint32_le(buf, shelf->attempt_count);
+        _write_uint32_le(buf, shelf->op_len);
+        _write_bytes(buf, shelf->op_wire, shelf->op_len);
       }
     }
     if (exported_module_state != NULL) {
@@ -2849,16 +2869,19 @@ static state_t* _deserialize_state_internal(const uint8_t* data, size_t len,
         ok = ok && _read_uint64_le(&buf, &entry->term) &&
              _read_uint64_le(&buf, &entry->proposal_id) &&
              _read_uint32_le(&buf, &entry->wire_len);
-        ok = ok && entry->wire_len >= 1 &&
-             entry->wire_len <= CRABS_RAFT_MAX_OP_WIRE_BYTES &&
+        // v17: wire_len 0 is the leadership NO-OP entry (Raft §8) — a
+        // zero-length payload frame is legitimate module history here.
+        ok = ok && entry->wire_len <= CRABS_RAFT_MAX_OP_WIRE_BYTES &&
              (size_t)entry->wire_len <= buf.len - buf.offset;
         if (!ok) {
           free(entry);
           break;
         }
-        entry->op_wire = (uint8_t*)get_memory(entry->wire_len);
-        if (entry->op_wire == NULL ||
-            !_read_bytes(&buf, entry->op_wire, entry->wire_len)) {
+        entry->op_wire = entry->wire_len > 0
+            ? (uint8_t*)get_memory(entry->wire_len) : NULL;
+        if (entry->wire_len > 0 &&
+            (entry->op_wire == NULL ||
+             !_read_bytes(&buf, entry->op_wire, entry->wire_len))) {
           free(entry->op_wire);
           free(entry);
           ok = false;
@@ -2919,6 +2942,42 @@ static state_t* _deserialize_state_internal(const uint8_t* data, size_t len,
       if (!ok) {
         crabs_raft_module_state_destroy(module_state);
         goto fail;
+      }
+      // v17 retry-shelf tail (carried item C): one blocked committed op
+      // (op wire + consecutive-failure count) resumes ordering after a
+      // restart. Pre-17 blobs carry no tail (that format could not hold a
+      // shelf).
+      if (version >= 17) {
+        uint8_t shelf_present = 0;
+        if (!_read_uint8(&buf, &shelf_present) || shelf_present > 1) {
+          crabs_raft_module_state_destroy(module_state);
+          goto fail;
+        }
+        if (shelf_present == 1) {
+          raft_retry_shelf_t* shelf =
+              (raft_retry_shelf_t*)get_clear_memory(sizeof(raft_retry_shelf_t));
+          uint32_t shelf_attempt = 0;
+          uint32_t shelf_op_len = 0;
+          ok = _read_uint32_le(&buf, &shelf_attempt) &&
+               _read_uint32_le(&buf, &shelf_op_len);
+          ok = ok && shelf_op_len >= 1 &&
+               shelf_op_len <= CRABS_RAFT_MAX_OP_WIRE_BYTES &&
+               (size_t)shelf_op_len <= buf.len - buf.offset;
+          if (ok) {
+            shelf->op_wire = (uint8_t*)get_memory(shelf_op_len);
+            ok = shelf->op_wire != NULL &&
+                 _read_bytes(&buf, shelf->op_wire, shelf_op_len);
+          }
+          if (!ok) {
+            free(shelf->op_wire);
+            free(shelf);
+            crabs_raft_module_state_destroy(module_state);
+            goto fail;
+          }
+          shelf->op_len = shelf_op_len;
+          shelf->attempt_count = shelf_attempt;
+          state->raft_retry_shelf = shelf;
+        }
       }
       state->raft_module_state = module_state;
     }

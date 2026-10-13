@@ -3,6 +3,7 @@
 //
 
 #include "state_machine.h"
+#include <stdio.h>
 #include "../Util/platform.h"
 #include "../Trigger/trigger.h"
 #include "../Crypto/crypto.h"
@@ -1320,6 +1321,15 @@ void state_raft_destroy_pending(state_t* state) {
     entry = next;
   }
   state->raft_pending_proposals = NULL;
+  // The retry shelf is state-owned heap like the pendings (carried item C).
+  raft_retry_shelf_t* shelf = (raft_retry_shelf_t*)state->raft_retry_shelf;
+  while (shelf != NULL) {
+    raft_retry_shelf_t* next = shelf->next;
+    free(shelf->op_wire);
+    free(shelf);
+    shelf = next;
+  }
+  state->raft_retry_shelf = NULL;
 }
 
 // Executor for MODULE-COMMITTED operations — the raft sibling of
@@ -1342,10 +1352,73 @@ crabs_error_e state_machine_execute_committed(state_t* state, operation_t* op) {
   return rc;
 }
 
-crabs_error_e state_raft_process_notifications(state_t* state) {
+// Shelf helpers (carried item C — ordered materialization retry).
+static uint64_t _raft_shelf_backoff_ms(uint32_t attempt_count) {
+  uint64_t backoff = CRABS_RAFT_SHELF_BACKOFF_STEP_MS * attempt_count;
+  return backoff > CRABS_RAFT_SHELF_BACKOFF_CAP_MS
+             ? CRABS_RAFT_SHELF_BACKOFF_CAP_MS
+             : backoff;
+}
+
+static void _raft_shelf_release(state_t* state) {
+  raft_retry_shelf_t* shelf = (raft_retry_shelf_t*)state->raft_retry_shelf;
+  if (shelf == NULL) return;
+  free(shelf->op_wire);
+  free(shelf);
+  state->raft_retry_shelf = NULL;
+}
+
+// One retry/pump attempt at the shelf head. Returns the materialization
+// result; on success the shelf is released.
+static crabs_error_e _raft_shelf_attempt(state_t* state, uint64_t now_ms) {
+  raft_retry_shelf_t* shelf = (raft_retry_shelf_t*)state->raft_retry_shelf;
+  shelf->attempt_count++;
+  shelf->retry_not_before_ms = now_ms + _raft_shelf_backoff_ms(shelf->attempt_count);
+  operation_t* op = crabs_deserialize_operation(shelf->op_wire, shelf->op_len);
+  crabs_error_e rc = CRABS_ERR_SERIALIZATION_ERROR;
+  if (op != NULL) {
+    state->raft_commit_delivery = true;
+    rc = state_machine_execute_committed(state, op);
+    state->raft_commit_delivery = false;
+  }
+  if (rc == CRABS_SUCCESS || rc == CRABS_ERR_ALREADY_EXECUTED) {
+    _raft_shelf_release(state);
+    if (op != NULL) operation_destroy(op);
+    return CRABS_SUCCESS;
+  }
+  // Poison-pill visibility (carried item C): every attempt past the poison
+  // threshold surfaces a loud change notification — the stream STAYS
+  // blocked (order preservation over availability of the group path).
+  if (op != NULL && shelf->attempt_count >= CRABS_RAFT_SHELF_POISON_ATTEMPTS) {
+    char preview[CRABS_MAX_OP_NAME + CRABS_MAX_USER_ID + 24];
+    snprintf(preview, sizeof(preview), "shelf-retry %u failing",
+             (unsigned)shelf->attempt_count);
+    state_notify_change_for_op(state, CRABS_CHANGE_OP, op, preview, rc);
+    operation_destroy(op);
+  }
+  return rc;
+}
+
+crabs_error_e state_raft_process_notifications_at(state_t* state,
+                                                  uint64_t now_ms) {
   if (state == NULL || state->raft_module == NULL) return CRABS_ERR_INVALID_PARAM;
   crabs_raft_module_t* module = (crabs_raft_module_t*)state->raft_module;
-  crabs_error_e first_error = CRABS_SUCCESS;
+  // 1. The shelf BLOCKS the stream: while its head is failing (or its
+  //    bounded backoff has not elapsed) nothing newer may attempt. Order
+  //    preservation beats availability — a skip would fold newer group-item
+  //    content before the failed op carried older state.
+  while (state->raft_retry_shelf != NULL) {
+    if (now_ms < ((const raft_retry_shelf_t*)state->raft_retry_shelf)
+                     ->retry_not_before_ms) {
+      return CRABS_SUCCESS;   // backoff window: try again on a later pump
+    }
+    crabs_error_e shelf_rc = _raft_shelf_attempt(state, now_ms);
+    if (state->raft_retry_shelf != NULL) {
+      // Still blocked (the retry failed): nothing newer may attempt.
+      return shelf_rc;
+    }
+    // Released: fall through and drain the queue this same pump covers.
+  }
   crabs_raft_notification_t notification;
   while (crabs_raft_module_poll_notification(module, &notification)) {
     if (notification.kind != RAFT_NOTIFY_COMMITTED_OP) {
@@ -1354,12 +1427,10 @@ crabs_error_e state_raft_process_notifications(state_t* state) {
     operation_t* op = crabs_deserialize_operation(notification.op_bytes,
                                                   notification.op_len);
     if (op == NULL) {
-      // A committed op that cannot be deserialized is a hard corruption —
-      // surface it but never stop draining (fail loudly, keep looping).
-      if (first_error == CRABS_SUCCESS) {
-        first_error = CRABS_ERR_SERIALIZATION_ERROR;
-      }
-      continue;
+      // A committed op that cannot be deserialized is a hard corruption:
+      // the pump BLOCKS (fails loudly, notification stays queued) rather
+      // than skip an ordered entry it can never materialize.
+      return CRABS_ERR_SERIALIZATION_ERROR;
     }
     // The delivery marker is the ONLY credential a follower-side
     // materialization needs: followers never propose locally, so no pending
@@ -1369,12 +1440,45 @@ crabs_error_e state_raft_process_notifications(state_t* state) {
     crabs_error_e rc = state_machine_execute_committed(state, op);
     state->raft_commit_delivery = false;
     operation_destroy(op);
-    if (rc != CRABS_SUCCESS && rc != CRABS_ERR_ALREADY_EXECUTED &&
-        first_error == CRABS_SUCCESS) {
-      first_error = rc;
+    if (rc == CRABS_SUCCESS || rc == CRABS_ERR_ALREADY_EXECUTED) {
+      continue;
     }
+    // Carried item C: retain the failed op on the shelf (a COPY of the wire
+    // — the module's bytes invalidate at the next poll) and stop the pump;
+    // later deliveries wait until this one retries successfully.
+    raft_retry_shelf_t* shelf =
+        (raft_retry_shelf_t*)get_clear_memory(sizeof(raft_retry_shelf_t));
+    shelf->op_wire = (uint8_t*)get_memory(
+        notification.op_len > 0 ? notification.op_len : 1);
+    memcpy(shelf->op_wire, notification.op_bytes, notification.op_len);
+    shelf->op_len = notification.op_len;
+    shelf->attempt_count = 0;
+    shelf->retry_not_before_ms = now_ms;   // first retry: the next pump call
+    shelf->next = NULL;
+    state->raft_retry_shelf = shelf;
+    return rc;
   }
-  return first_error;
+  return CRABS_SUCCESS;
+}
+
+crabs_error_e state_raft_process_notifications(state_t* state) {
+  if (state == NULL) return CRABS_ERR_INVALID_PARAM;
+  uint64_t now_ms = 0;
+  if (!state_get_time_ms(state, &now_ms)) {
+    // No authenticated time available: run the pump without a backoff gate
+    // (backoff comparisons against a zero clock would never fire).
+    return state_raft_process_notifications_at(state, 0);
+  }
+  return state_raft_process_notifications_at(state, now_ms);
+}
+
+bool state_raft_shelf_active(const state_t* state) {
+  return state != NULL && state->raft_retry_shelf != NULL;
+}
+
+uint32_t state_raft_shelf_attempt_count(const state_t* state) {
+  if (state == NULL || state->raft_retry_shelf == NULL) return 0;
+  return ((const raft_retry_shelf_t*)state->raft_retry_shelf)->attempt_count;
 }
 
 static crabs_error_e state_machine_execute_internal(state_t* state, operation_t* op,

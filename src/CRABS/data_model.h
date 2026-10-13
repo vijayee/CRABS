@@ -630,6 +630,13 @@ typedef struct state_t {
   void* raft_module;
   void* raft_module_state;
   void* raft_pending_proposals;   // raft_pending_proposal_t* (state_machine.h)
+  // raft_retry_shelf_t* raft_retry_shelf → the ordered materialization retry
+  //   shelf (state_machine.h): a committed op whose materialization FAILED
+  //   stays here while the delivery pump blocks until it retries successfully
+  //   (log order is preserved; newer commits cannot apply before the shelf
+  //   head succeeds). Serialized into the v17 module section beside the
+  //   pendings so a restart resumes ordering; freed by state_destroy.
+  void* raft_retry_shelf;
   bool  raft_commit_delivery;
 } state_t;
 

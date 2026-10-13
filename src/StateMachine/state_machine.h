@@ -221,6 +221,33 @@ typedef struct raft_pending_proposal_t {
 // runaway submitter cannot grow it without limit.
 #define CRABS_RAFT_MAX_PENDING_PROPOSALS 1024
 
+// Ordered materialization retry shelf (raft-ordering plan, carried from the
+// phase-2 review): the delivery pump is STRICTLY ORDERED — a committed op
+// whose materialization fails retains its op wire here and BLOCKS every
+// newer delivery until the retry succeeds (the module's commit stream is an
+// ordered log; machine application must preserve that order — skipping a
+// failed op would reorder group-item content folding, so the honest failure
+// semantics halt the machine's group path while the shelf retries). The
+// strict rule bounds the shelf to ONE entry by construction: nothing newer
+// is attempted while the head is failing.
+#define CRABS_RAFT_MAX_SHELF_ENTRIES 1
+// Poison-pill visibility: after this many consecutive failed attempts the
+// pump surfaces a change notification on EVERY retry attempt (loud alert —
+// the stream stays blocked, the host learns why).
+#define CRABS_RAFT_SHELF_POISON_ATTEMPTS 8u
+// Bounded retry backoff (per pump invocation): attempt n waits
+// 1000 ms * n, capped at 30 s, measured on the pump's now_ms domain.
+#define CRABS_RAFT_SHELF_BACKOFF_STEP_MS 1000ull
+#define CRABS_RAFT_SHELF_BACKOFF_CAP_MS  30000ull
+
+typedef struct raft_retry_shelf_t {
+  uint8_t* op_wire;         // crabs_serialize_operation form (heap copy)
+  uint32_t op_len;
+  uint32_t attempt_count;   // consecutive failed materialization attempts
+  uint64_t retry_not_before_ms;  // pump now_ms must reach this before a retry
+  struct raft_retry_shelf_t* next;
+} raft_retry_shelf_t;
+
 // Attach (or detach with NULL) the machine's ordering module. RUNTIME-ONLY:
 // the module object is host-created and host-owned, never serialized and
 // never freed by the state. Module state persists through the v16 section.
@@ -249,11 +276,24 @@ crabs_error_e state_machine_execute_committed(state_t* state, operation_t* op);
 // RAFT_NOTIFY_COMMITTED_OP deserializes the carried op wire and materializes
 // it with state_machine_execute_committed (removing the pending proposal).
 // Other notification kinds return their codes' CRABS_SUCCESS (leadership
-// changes are host concerns). Returns SUCCESS after a full drain; a
-// materialization failure is recorded to the change hook (like scheduled
-// failures) and the pump continues — the module is always left drained so a
-// poison notification cannot wedge the host loop.
+// changes are host concerns). Materialization semantics (carried item C):
+// the pump is STRICTLY ORDERED — a failed materialization retains its op in
+// the retry shelf and blocks every newer delivery (the committed log order
+// must be preserved machine-side); retries run on pump invocations with a
+// bounded per-attempt backoff, and CRABS_RAFT_SHELF_POISON_ATTEMPTS
+// consecutive failures surface a loud change notification per attempt (the
+// stream stays blocked — availability halts, order never breaks).
+// Returns SUCCESS after a full drain; the shelf's error code while it
+// retried and failed.
 crabs_error_e state_raft_process_notifications(state_t* state);
+// Deterministic variant driven by an explicit now_ms (tests and hosts with
+// their own clock domain): same semantics, shelf backoff measured on this
+// clock instead of the HLC physical time.
+crabs_error_e state_raft_process_notifications_at(state_t* state, uint64_t now_ms);
+
+// Shelf queries (harness assertions, host diagnostics).
+bool state_raft_shelf_active(const state_t* state);
+uint32_t state_raft_shelf_attempt_count(const state_t* state);
 
 // Free the pending-proposal list (called from state_destroy).
 void state_raft_destroy_pending(state_t* state);
