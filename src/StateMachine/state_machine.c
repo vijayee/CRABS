@@ -268,7 +268,14 @@ void operation_destroy(operation_t* op) {
   if (op->resources != NULL) free(op->resources);
   if (op->required_state != NULL) free(op->required_state);
   if (op->next_state != NULL) free(op->next_state);
-  if (op->lock_claims != NULL) free(op->lock_claims);
+  // Lock tokens are bearer credentials: zero the claims' tokens before
+  // freeing the claims block (same discipline as the unlock rollback).
+  if (op->lock_claims != NULL) {
+    for (uint32_t claim_idx = 0; claim_idx < op->lock_claim_count; claim_idx++) {
+      OPENSSL_cleanse(op->lock_claims[claim_idx].lock_token, CRABS_LOCK_TOKEN_SIZE);
+    }
+    free(op->lock_claims);
+  }
   if (op->co_signers != NULL) free(op->co_signers);
   if (op->attestations != NULL) free(op->attestations);
   free(op);
@@ -2336,6 +2343,9 @@ crabs_error_e state_machine_op_unlock(state_t* state, operation_t* op) {
     }
     item->protocol_state = PROTOCOL_IDLE;
     item->lock_state.lock_token_valid = false;
+    // Bearer-credential discipline (mirrors the N-8 unlock rollback): zero
+    // the token bytes once the lock is released.
+    OPENSSL_cleanse(item->lock_state.lock_token, CRABS_LOCK_TOKEN_SIZE);
     memset(item->lock_state.lock_owner, 0, CRABS_MAX_USER_ID);
     if (item->lock_state.pre_lock_snapshot != NULL) {
       free(item->lock_state.pre_lock_snapshot);

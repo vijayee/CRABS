@@ -214,7 +214,9 @@ async function main() {
   assert.strictEqual(node.getResource('member_pot'), 100, 'poisoned op left the member');
 
   console.log('treasury OK: pot minted, single lease, forged claim refused, ceremony completes, debit/credit applied once under the tx manager, poisoned op applies nothing');
-  // Node/KeyPair expose no destroy() on crabs-wasm — module teardown suffices.
+  // Deterministic teardown is available: node.destroy() and keypair.destroy()
+  // exist on crabs-wasm (the no-destroy note applies to the node binding —
+  // see the node snippets, where native cleanup is process-exit driven).
 }
 
 main().catch((err) => { console.error(err); process.exit(1); });

@@ -163,7 +163,8 @@ export interface HandlerState {
   /**
    * Recipe 9: raw int64 readback of a RESOURCE item's balance — the handler
    * equivalent of Node.getResource. Throws resource_not_found /
-   * type_mismatch the same way.
+   * type_mismatch the same way: on the wasm binding this method throws on
+   * failure and never returns undefined.
    */
   getResource(name: string): number;
   /**

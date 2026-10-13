@@ -814,6 +814,15 @@ private:
                                              "resource");
     std::string token_hex = require_js_string(info[1], "addLockClaim",
                                               "tokenHex");
+    // A resource name at or above CRABS_MAX_USER_ID cannot round-trip the
+    // wire format: silently truncating it would sign a claim whose resource
+    // differs from the one the caller staged (and step 5 of the executor
+    // would then fail the claim against the live lock). Refuse loudly, the
+    // same invalid-param stance as the wasm export.
+    if (resource.size() >= CRABS_MAX_USER_ID)
+      throw Napi::RangeError::New(env,
+          "addLockClaim: resource name must be " +
+          std::to_string(CRABS_MAX_USER_ID - 1) + " bytes or fewer");
     if (op_->lock_claim_count >= CRABS_MAX_RESOURCES)
       throw Napi::RangeError::New(env, "addLockClaim: claim capacity reached");
     // Lock tokens are bearer credentials — the decoded stack copy is

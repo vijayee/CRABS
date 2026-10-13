@@ -277,8 +277,10 @@ export interface Node {
   /**
    * Raw int64 readback of the RESOURCE balance (previously machine-read
    * only). Undefined for an unknown name (getCounter's convention);
-   * type_mismatch for anything that is not a RESOURCE item. Balances beyond
-   * ±2^53 lose precision through Number.
+   * type_mismatch for anything that is not a RESOURCE item. Unlike the wasm
+   * binding's HandlerState.getResource (which throws on failure), this one
+   * signals a missing name by returning undefined. Balances beyond ±2^53
+   * lose precision through Number.
    */
   getResource(name: string): number | undefined;
   /**
