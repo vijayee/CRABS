@@ -127,3 +127,62 @@ beyond running suites under a toolchain whose libcrypto build avoids it.
 Noted here because there is no project KNOWN_ISSUES file; revisit if a
 keyring lifecycle migration to the OpenSSL 3 EVP APIs (audit N-19) changes
 the ex-data usage.
+
+### Phase 4 as-landed (2026-10-12, worktree `raft-ordering`)
+
+Surfaces + docs + final verification, all green:
+
+- **wasm exports** (`src/Util/wasm_helpers.c`): the module-handle idiom is raw
+  C pointers; a small module→machine registry lets `crabs_wasm_raft_destroy`
+  detach before teardown, and `crabs_wasm_raft_create` fails closed on a
+  double-attach (one module per machine, single state slot). Drains follow
+  the plan's disposal conventions: poll_outbound/poll_notification return a
+  self-contained copy envelope (the poll's transferred blobs are released in
+  C); poll_persist_request re-reports the open window. Notifications
+  materialize through `crabs_wasm_raft_pump` (state pipeline) — raw
+  `poll_notification` stays available for hosts driving without a state
+  pipeline. Export/import state is covered by the v17 state serializer +
+  attach-time import; `recover_from_persist` covers the restart replay.
+- **Reference host** (`bindings/wasm/bindings-core.js`): `Node.attachRaft`
+  returns `RaftHost` — setTimeout tick loop, `setRaftTransport` /
+  `setRaftStorage` seams, `raftDeliver` inbound, raw drains, `raftStatus`.
+  The pump orders persist-ack before tick (vote requests ride vote-header
+  durability) but never stalls ticks on in-flight storage. execute() now
+  resolves `ordering_pending` as success (two-phase acceptance) and the
+  error table gained the 0xA006..0xA008 names. Typed surface in
+  `index.d.ts`/`dev.d.ts`; dev.d.ts unchanged (re-exports).
+- **Node binding** (`crabs_node.cc` + `index.js`): same reactor surfaces;
+  the reference host mirrors wasm's with a `pumpNotifications: false`
+  raw-host mode (no JS-handler surface on this binding — committed ops are
+  asserted at the wire); plus a readonly `adminId` accessor for host-default
+  node identity. BigInt handles convert losslessly (Uint64Value bool*).
+- **CLI**: `raft attach <node_id> [peers...]` + `raft status` (term, leader,
+  tip, members, pending/shelf counts, rejected-message count) and a live
+  module row on `item info` group items (`test_cli.cpp` — a self-not-member
+  config is not constructible through the CLI, so that refusal stays
+  module-suite covered).
+- **Tests**: wasm `test/raft.js` — 3-node in-process cluster through the
+  REAL artifacts (election → two-phase group write → committed+materialized
+  on all three via change events → partition halts `nodeC` while the quorum
+  commits → heal converges to one shared tip). Native `test/raft.js` — same
+  shape with raw notifications and byte-identical committed-op wires across
+  replicas. Two test-only notes: (1) identical module seeds randomize
+  identical election deadlines — the lockstep split-vote livelock needs
+  per-node seeds; (2) wasm handlers read payload strings through
+  `crabs_wasm_handler_op_get_payload_str`, which requires NUL-terminated
+  payloads — string payloads are written `'text\x00'`.
+- **Verification**: ctest 1739/1739, node npm 105+cluster suite, wasm npm
+  chain (9 suites + cluster E2E), `write-domains-parity.mjs`
+  byte-identical, both lineage smokes OK. De-wonk two rounds: R1 —
+  outbound-drain blob leak (both bindings; free after enveloping/copied
+  buffer), persist-window early-return stalling heartbeats on slow storage
+  (module tolerates ticks with a busy window), unreachable peer-count clamp,
+  double-attach guard, tests touching private `_raftHost` fields (now
+  keep the returned host); R2 — pumpInbound notification gating removed,
+  persist_complete rc surfaced (unknown/stale handle = loud host bug), no
+  new issues on re-read.
+
+Commit cadence (per area): `feat: wasm raft module exports + reference
+host` / `feat: node binding raft surfaces` / `test: wasm/node raft cluster
+suites` / `feat: CLI raft diagnostics` / `docs: raft ordering — README/spec
+as-implemented` / `chore: regenerate wasm artifacts`.

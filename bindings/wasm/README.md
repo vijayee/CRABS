@@ -22,6 +22,15 @@ cd bindings/wasm
 npm run build   # runs ../../build_wasm.sh
 ```
 
+`OPENSSL_SRC` must point at a WASM-built OpenSSL 3 tree (`libcrypto.a` +
+`libssl.a` + `include/`): configure with
+`./Configure linux-generic32 no-asm ...` under emsdk and `make` — the
+linux-generic32 requirement is recorded in
+`docs/superpowers/plans/2026-10-09-consumption-fixes.md` (the generic64 BN
+path traps under emscripten). New
+wasm artifacts land in `build-wasm*/` and are copied into `bindings/wasm/`
+(the build script has no copy step).
+
 ## Quick Start
 
 ```javascript
@@ -160,6 +169,37 @@ pair out whenever its pair is present in the merged tombstone set, so a
 pair tombstoned on either replica is invisible after merge. Concurrent
 `(add e, remove e)` resolves as remove when the remove observed the add
 (the usual observed-remove bias).
+
+## Raft ordering module (GROUP-ORDERED) — reference host
+
+A machine can host a **Raft ordering module** for its `group`-domain items:
+writes then ride a two-phase pipeline (validated → pending in the module's
+log → committed → materialized through your registered handlers, surfaced as
+`change` events). `node.attachRaft(cfg)` attaches the module and returns a
+**reference host** — a small event loop that wires the module's three host
+seams (`transport`, `storage`, `timer`) out of the box and is meant to be
+replaced seam-by-seam for real deployment:
+
+| Seam | Replace with | Reference host default |
+|---|---|---|
+| `setRaftTransport(fn(peerId, blob))` | WebSocket / HTTP relay / queue send | throws when a blob is drained |
+| `setRaftStorage(async fn(handle, blob))` | IndexedDB / localStorage / server | throws when a persist window is polled |
+| `startRaftHost()` / `stopRaftHost()` | any scheduler or your own clock | `setTimeout` tick at `cfg.tickMs` |
+
+Incoming blobs return through `node.raftDeliver(peerId, blob)`; committed ops
+materialize through the machine's pipeline on every replica. Raw drains
+(`raftPollOutbound`, `raftPollPersistRequest` + `raftPersistComplete`,
+`raftPollNotifications`, `raftTick`, `raftPump`) and point diagnostics
+(`node.raftStatus()`) are exposed for hosts that keep a seam on purpose.
+Full API: `index.d.ts` (RaftHost). An in-memory three-node cluster —
+election → commit → materialized on all three → partition halts one node →
+heal converges — runs in `test/raft.js` as the executable example of every
+seam.
+
+Note: wasm string payloads reach JS handlers via
+`crabs_wasm_handler_op_get_payload_str`, which requires a NUL-terminated
+payload buffer — write op payloads as `'text\x00'` when a handler must read
+them as strings.
 
 ## Differences from crabs-node
 

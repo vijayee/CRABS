@@ -170,6 +170,32 @@ typedef struct crabs_ordering_module {
   intentionally leaves an empty-but-honest seam rather than a bespoke
   consensus implementation.
 
+> **AS IMPLEMENTED (raft-ordering plan, 2026-10-10 → 2026-10-12):** the
+> shipped ordering module REPLACED this sketch's two design decisions.
+> (1) There is no `crabs_ordering_module_t` vtable — the module is a
+> concrete deterministic Raft reactor (`src/Raft/raft_module.c`),
+> transport-agnostic: it queues outbound blobs / persist requests /
+> notifications and the HOST drives tick/inbound/propose/persist_complete
+> (the "reactor model" — hosts re-inject blobs to peers, answer persist
+> windows, and own the clock; see README "GROUP-ORDERED ordering (Raft
+> reactor)"). (2) Module membership is NOT attribute-based — elections and
+> rotation ride the module's OWN config log through joint consensus (Raft
+> §6, `crabs_raft_module_change_membership`), because quorum-majority voting
+> cannot ride the attribute machine without reintroducing exactly the
+> split-brain the consensus exists to prevent. Everything else in this
+> section stands as written: `ordering_path` fail-closed direct writes, the
+> committed-prefix merge rule, and partition halting exactly the
+> GROUP-ORDERED items. Two-phase submission semantics
+> (`CRABS_ERR_ORDERING_PENDING`; committed materialization through the
+> normal pipeline with an ordered retry shelf), the durable persist-window
+> contract (host storage acks commit), the 4096-entry log cap with
+> refusal-at-cap (compaction-as-snapshot deferred to a follow-up plan), and
+> crash recovery (v16+ machine-state module section + host-side persist
+> batch replay via `crabs_raft_module_recover_from_persist`) are as landed
+> in the raft-ordering plan's four phases (reactor core and degenerate
+> commit; elections/replication with deterministic partition/fault
+> simulations; joint-consensus membership; wasm/node/CLI surfaces + docs).
+
 ## SOVEREIGN items
 
 ### Writer binding
