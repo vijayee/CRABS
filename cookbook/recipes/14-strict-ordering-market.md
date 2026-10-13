@@ -9,23 +9,23 @@ target: crabs-wasm
 languages: wasm node
 teaches: strict ordering from an elected leader (raft module)
 ---
-## Intent
+## The problem
 
-A market — bids racing for a fixed number of slots, fills settled in *one*
-order every replica agrees on. Stated exactly, the requirement is:
+A market lists one fill slot. Two buyers bid for it at effectively the same
+moment, and the bids reach three replicas in *different orders* — replica A
+saw the red bid first, replica B saw the blue one first, and all three
+replicas are healthy. When the replicas sync, what is the fill? "First
+accepted wins" cannot even be evaluated, because acceptance is local: each
+replica accepted whichever bid arrived first *there*.
 
-- two members bidding for the same slot at the same moment produce exactly
-  one fill, in an order that is *not* a function of which replica read whose
-  message first;
+Stated exactly, the requirement is:
+
+- two bids racing for the same slot produce exactly one fill, in an order
+  that is *not* a function of which replica read whose message first;
 - every replica — including one that was offline, or partitioned, or
   restarted mid-fill — converges to the SAME committed sequence;
 - nothing is "filled" until the cluster can prove the fill durable (a fill
   forgotten by a crash is worse than a fill delayed).
-
-Free-merge CRDTs cannot do this by combining states: combining is order-free
-by design. The tool for this shape is the `GROUP-ORDERED` write domain +
-its attached ordering module — a **Raft** reactor the machine carries, with
-commit quorums and a committed log as the fill order.
 
 ## The naive version, and where it breaks
 
@@ -43,64 +43,108 @@ carries an id, replicas dedupe") rebuilds the ordering module by hand,
 except without the one thing Raft has: a commit point replicas agree on
 across partitions.
 
-## The shape
+## The idea
 
-- *The domain is declared at mint*: `defineItem(name, 'register', 'lww_reg',
-  { domain: 'group', orderingModule: <module id> })` — both bindings
-  (wasm `bindings/wasm/index.d.ts:309-316`, node `:214-221`). The module id
-  must match the machine's attached ordering module; the only id the
-  bindings mint is 0, and a non-zero `ordering_module` is refused at item
-  creation fail-closed (`src/CRABS/data_model.c:161-172` — "the only
-  creatable state is ordering_module == 0"; the id resolves against the
-  machine's attached module, not a registry of many).
-- *The module*: `attachRaft` (wasm `bindings/wasm/index.d.ts:670`, node
-  `:593-597` — the node host loop is `createRaftHost`, `:725-763`). Wraps
-  the C reactor `crabs_raft_module_t` (`src/Raft/raft_module.h:190`) — a
-  PURE state machine with no syscalls: the HOST owns transport
+A strict total order is not something merging can produce. Combining states
+is order-free *by design* — that is the property that lets replicas
+converge without a coordinator (Recipe 1) — so an order every replica agrees
+on must come from somewhere else: **one authority per item**. The pattern is
+consensus, and its pieces are worth naming before the API:
+
+- **One leader per term.** All the racing bids route to whoever won the
+  current election, and that leader assigns each accepted bid its log
+  position. Order-assignment cannot be committee work done in parallel —
+  racing assignments are precisely the problem.
+- **A commit point.** An assignment is not the order yet. The order becomes
+  real when a *quorum* has made the assignment durable — that is the
+  moment every replica, including one that was offline, can later agree
+  the entry took position N. This is what an application-level "dedupe by
+  id" scheme never has: it dedupes, but it has no commit point, so two
+  partitions can dedupe differently.
+- **The log is the order.** Once committed, the log is append-only and
+  agreed; each replica *replays positions* of the committed log, and the
+  fill order — the thing the market needed — is a fact everyone reads off
+  one sequence instead of a property anyone argues.
+
+The price is explicit, and it is why the rest of this cookbook doesn't work
+this way: writes halt when no quorum can be reached (partition = unavailability
+for group items), only the leader (or a route through it) accepts proposals,
+and the leader's log is durable state the operators must provision. Choose
+this mechanism when racing claims on one slot are the failure you cannot
+afford — that is the whole trade.
+
+## How CRABS encodes it
+
+- *The domain is declared at mint*: `defineItem(name, 'register',
+  'lww_reg', { domain: 'group', orderingModule: <module id> })` — both
+  bindings. The module id must match the machine's attached ordering
+  module; the only id the bindings mint is 0, and a non-zero
+  `ordering_module` is refused at item creation fail-closed (the id
+  resolves against the machine's attached module, not a registry of many).
+- *The module*: `attachRaft` (both bindings; the node host loop is
+  `createRaftHost`). It wraps the C reactor `crabs_raft_module_t` — a PURE
+  state machine with no syscalls: the HOST owns transport
   (`setRaftTransport` — drained blobs go anywhere; incoming return through
-  `raftDeliver`), storage (`setRaftStorage` — persist windows, answered with
-  `raftPersistComplete(handle, ok)`), and timers (`startRaftHost`'s tick
-  loop or manual `raftTick`). All seams are replaceable: the reference loop
-  is the transport/stor/timer wiring, not a networking claim.
+  `raftDeliver`), storage (`setRaftStorage` — persist windows, answered
+  with `raftPersistComplete(handle, ok)`), and timers (`startRaftHost`'s
+  tick loop or manual `raftTick`). All seams are replaceable: the reference
+  loop is the transport/storage/timer wiring, not a networking claim.
 - *Two-phase submission*: an op touching a group-ordered item NEVER
-  executes inline (`src/StateMachine/state_machine.c:1526-1560`). With NO
-  module attached the write fails closed `ordering_path`
-  (`src/CRABS/crabs.h:128`); with one attached the same op is ACCEPTED as a
-  pending proposal — `execute` resolves, the uuid is enqueued pending, and
-  nothing materializes until commit (`CRABS_ERR_ORDERING_PENDING`,
-  `src/CRABS/crabs.h:131`; the leader routes the proposal into its module
-  log at `state_machine.c:1246-1294`).
+  executes inline. With NO module attached the write fails closed
+  `ordering_path`; with one attached the same op is ACCEPTED as a pending
+  proposal — `execute` resolves, the uuid is enqueued pending, and nothing
+  materializes until commit (`CRABS_ERR_ORDERING_PENDING`; the leader
+  routes the proposal into its module log).
 - *Proposals ride the leader*: only the module that is leader can append
-  (`RAFT_NOTIFY_PROPOSAL_NOT_LEADER` otherwise, `src/Raft/raft_module.h:144`
-  — refusal tested `test/test_raft_module.cpp:300`). Elections: randomized
+  (`RAFT_NOTIFY_PROPOSAL_NOT_LEADER` otherwise). Elections: randomized
   timeouts in `[electionMinMs, electionMaxMs]` from a seed; distinct seeds
-  per node or the randomized deadlines lockstep and the vote livelocks
-  (the binding suites' comment, and the reason every example below seeds
-  `77 + i`).
+  per node or the randomized deadlines lockstep and the vote livelocks —
+  the reason every example below seeds `77 + i`.
 - *Commit rides persistence*: a log entry is durable ONLY when the host
   answers its persist window `complete(true)` — the node that never
-  acknowledges keeps committing nothing (`RaftVoteDurability` /
-  `FailedPersistNeverCommitsAndRetries`, `test/test_raft_module.cpp:150,241`).
-  The outstanding window is a VIEW the module RE-REPORTS until
-  acknowledged (`poll_persist`, `src/Raft/raft_module.h:113-132`) — poll it
-  once per async store round, never in a drain loop.
+  acknowledges keeps committing nothing. The outstanding window is a VIEW
+  the module RE-REPORTS until acknowledged — poll it once per async store
+  round, never in a drain loop.
 - *Materialization through the machine's pipeline*: committed ops return as
-  notifications whose `opBytes` are the serialized op wire
-  (`RAFT_NOTIFY_COMMITTED_OP`, `src/Raft/raft_module.h:140-148`); the pump
-  (`raftPump`/the host's materialization step) re-runs them through the full
-  executor pipeline — on crabs-wasm that fires the registered handler and
-  `change` events, so group items become real content in one settled order.
-  MERGE adopts by committed position, not by combining: the module's
+  notifications whose `opBytes` are the serialized op wire; the pump
+  (`raftPump`/the host's materialization step) re-runs them through the
+  full executor pipeline — on crabs-wasm that fires the registered handler
+  and `change` events, so group items become real content in one settled
+  order. MERGE adopts by committed position, not by combining: the module's
   committed index is the arbiter of group-item content, and two committed
-  logs cannot disagree at the same index (Raft's append-index invariant —
-  `src/CRDT/crdt_merge.c:751-790`, adopted-content test
-  `test/test_raft_sim.cpp:1637`).
+  logs cannot disagree at the same index (Raft's append-index invariant).
 - *Crash recovery is two-sided*: the machine blob carries the module's
-  durable state (term/votedFor/log) as its own v16 section
-  (`RaftPersistedState` round trips, `test/test_raft_module.cpp:705-890`),
-  and the HOST's retained persist batches replay through
-  `raftRecoverFromPersist` when the module state is stale — corrupt or
-  contradictory batches fail closed (`src/Raft/raft_module.h:226-235`).
+  durable state (term/votedFor/log) as its own v16 section, and the HOST's
+  retained persist batches replay through `raftRecoverFromPersist` when the
+  module state is stale — corrupt or contradictory batches fail closed.
+
+## Try it
+
+### crabs-wasm (browser / Node / edge)
+
+Three machines, one leader, a burst of racing bids materialized through
+each machine's handler into a fill-order register — the committed order as
+readable content, identical on every replica. (The demo carries two
+registers on purpose: the market register holds the latest fill; the
+fill-order register is the ledger of the RACE — the handler appends each
+committed bid, so "what order did we agree on" becomes content you can
+read, and diff across replicas, instead of a claim about bytes.)
+
+```snippet:wasm/14-strict-ordering-market.js
+```
+
+### crabs-node (native Node.js)
+
+The same cluster over the native binding's raft surface — `createRaftHost`
+wraps `node.attachRaft` with the reference tick loop. No handler surface
+here (api-map known difference #2), so the fill order is asserted where
+this binding can see it: the committed-op notifications drained raw, whose
+`proposalId` (the log index) orders the bytes. The three replicas' filled
+sequences are byte-identical, position for position — one commit order,
+everywhere.
+
+```snippet:node/14-strict-ordering-market.js
+```
 
 ## What it guarantees / what it doesn't
 
@@ -118,7 +162,7 @@ Guaranteed (both snippets execute it; the binding suites go further):
   snippets demonstrate the pre-attach refusal, so the module's meaning is
   visible.
 
-Not guaranteed — the honesty this recipe owes:
+Not guaranteed — the price, stated where you read it:
 
 - *The reference host is a transport contract, not a transport.* The demo
   runs three machines in one process with in-memory queues. The blobs are
@@ -126,41 +170,90 @@ Not guaranteed — the honesty this recipe owes:
   relay and `setRaftStorage` for IndexedDB or a server; what the tests
   prove (election, partition, recovery) transfers because the module is the
   same pure state machine.
-- *The committed log is bounded, not compacted*: at most
-  `CRABS_RAFT_MAX_LOG_ENTRIES` 4096 entries of at most 16384 op-wire bytes
-  each; a proposal beyond the cap is REFUSED (`RAFT_NOTIFY_LOG_FULL`, the
-  module stays healthy, `test/test_raft_module.cpp:1033`). Compaction is
-  deliberately deferred — plan storage around the documented bound.
+- *The committed log is bounded, not compacted*: at most 4096 entries of at
+  most 16384 op-wire bytes each; a proposal beyond the cap is REFUSED (the
+  module stays healthy). Compaction is deliberately deferred — plan storage
+  around the documented bound.
 - *Non-leader proposals don't execute*: submit through the leader (the
-  module refuses a follower's proposal and the pending shelf absorbs it —
-  proposal gate, `test/test_raft_module.cpp:300`).
+  module refuses a follower's proposal and the pending shelf absorbs it).
 - *The fill CONTENT only materializes where the pipeline runs* — through
   registered handlers on crabs-wasm; crabs-node has no handler surface
   (api-map known difference #2), so the node snippet asserts the fill order
   at the wire (byte-identical committed-op sequences), which is the same
   guarantee one layer down. Partition healing and crash-recovery legs: the
   snippets keep them out (single-process demo brevity) and cite the suites
-  (`bindings/wasm/test/raft.js`, `bindings/node/test/raft.js`,
-  `test/test_raft_sim.cpp:1134` partition + heal, `:685` restart round
-  trip) — the guarantees hold there, over the real artifacts.
+  — the guarantees hold there, over the real artifacts.
 - *Group-ordered halts, sovereigns don't mix*: a machine whose module
   cannot commit halts writes of exactly its group items while free-merge
-  and sovereign items keep executing (mixed-machine behavior pinned
-  `test/test_raft_sim.cpp:1576`).
+  and sovereign items keep executing.
 
-## Recipe
+## Variations
 
-### crabs-wasm (browser / Node / edge)
+- *Changing membership*: when the operator set changes, joint-consensus
+  reconfiguration is engine-real — an excluded member steps down and stops
+  receiving replication; the sim pins the single-node joint add/remove
+  cycle and the leadership-churn cases. Hosts that drive this raw take the
+  module handle (`moduleHandle()` on wasm).
+- *When order doesn't matter*: Recipe 2's commutative merges are the tool
+  for sums and counts — the value combines and the race disappears by
+  construction. A lock (Recipe 9) serializes inside one machine; Recipe 13's
+  sovereign chains keep per-writer order without any module (but no
+  cross-writer order); Recipe 10's delegated-writer model is the trust
+  trade-off when ordering by application choice suffices. This recipe is
+  the one that removes the application-choice trust: the order is
+  quorum-committed machinery.
 
-Three machines, one leader, a burst of racing bids materialized through
-each machine's handler into a fill-order register — the committed order as
-readable content, identical on every replica.
-
-```snippet:wasm/14-strict-ordering-market.js
-```
+## Verified against the code
 
 <!-- PROVENANCE
-target: crabs-wasm
+target: all-bindings
+domain + mint: defineItem group-ordered — wasm bindings/wasm/index.d.ts:535
+  (DefineItemOptions :309-316), node :363 (DefineItemOptions :214-221);
+  the only id the mint path accepts is 0 — a non-zero ordering_module is
+  refused at creation (src/CRABS/data_model.c:161-172, "the only creatable
+  state is ordering_module == 0"); the id resolves against the machine's
+  attached module
+module: Node.attachRaft — wasm bindings/wasm/index.d.ts:670
+  (RaftHostOptions :377-392), node :593-597; node reference host loop
+  createRaftHost bindings/node/index.js:91 (module export :259, d.ts
+  :715-763); C reactor crabs_raft_module_t src/Raft/raft_module.h:190
+  (create) — pure state machine, no syscalls; propose :205; poll queues
+  :241-246; persist contract :113-132 (poll_persist re-reports the
+  outstanding window until raftPersistComplete(handle, ok)); notifications
+  RAFT_NOTIFY_COMMITTED_OP :140-148 (opBytes = serialized op wire),
+  RAFT_NOTIFY_PROPOSAL_NOT_LEADER :144 (refusals tested
+  test/test_raft_module.cpp:300), RAFT_NOTIFY_LOG_FULL
+  (log caps: CRABS_RAFT_MAX_LOG_ENTRIES 4096 × 16384 op-wire bytes —
+  raft_module.h:55-59, grow-model comment :33-46, refusals tested
+  test/test_raft_module.cpp:1033; compaction deliberately deferred)
+two-phase seam: a group op never executes inline — no module →
+  CRABS_ERR_ORDERING_PATH (src/CRABS/crabs.h:128); module attached →
+  CRABS_ERR_ORDERING_PENDING (crabs.h:131) accepted as pending; executor
+  seam src/StateMachine/state_machine.c:1526-1560 (also :1532-1560), leader
+  propose route :1246-1294
+election: randomized timeouts from seed in [electionMinMs, electionMaxMs];
+  identical seeds lockstep and livelock (the binding suites' comment —
+  every example seeds 77 + i); one leader per round
+  (test/test_raft_sim.cpp:985)
+materialization + merge: committed ops pump through the full executor
+  pipeline (handler + change events on wasm); merge adopts by committed
+  position, equal tips must agree — src/CRDT/crdt_merge.c:751-790
+  (append-index invariant; adopted-content test test/test_raft_sim.cpp:1637)
+module state: state_attach_raft_module src/StateMachine/state_machine.h:260;
+  module durable state terms/votedFor/log = its own v16 machine section
+  (RaftPersistedState round trips test/test_raft_module.cpp:705-890, never
+  into items or the op log); crash recovery two-sided — host retained
+  persist batches replay through raftRecoverFromPersist; corrupt batches
+  fail closed (src/Raft/raft_module.h:226-235); raftStatus reads null after
+  a detach; one module per machine
+membership: joint-consensus reconfiguration —
+  crabs_raft_module_change_membership src/Raft/raft_module.h:222; an
+  excluded member steps down, RAFT_MSG_CONFIG_EXCLUDED; pinned
+  test/test_raft_sim.cpp:2183-2439; moduleHandle() wasm :473
+mixed-machine behavior: a halted module halts only its group items while
+  free-merge + sovereign keep executing — test/test_raft_sim.cpp:1576
+
+target: crabs-wasm (snippet wasm/14-strict-ordering-market.js)
 verified: executed
 symbols:
   Node.create               bindings/wasm/index.d.ts:774
@@ -191,23 +284,8 @@ test_ref: bindings/wasm/test/raft.js (3-node cluster E2E over the REAL wasm
   artifacts: election, pending-not-materialized, partition + heal, crash
   recovery, diagnostics) + test/test_raft_sim.cpp:985 (one leader), :1134
   (partition + heal), :685 (restart), :1637 (merge adopts committed position)
--->
 
-### crabs-node (native Node.js)
-
-The same cluster over the native binding's raft surface — `createRaftHost`
-wraps `node.attachRaft` with the reference tick loop. No handler surface
-here (api-map known difference #2), so the fill order is asserted where
-this binding can see it: the committed-op notifications drained raw, whose
-`proposalId` (the log index) orders the bytes. The three replicas' filled
-sequences are byte-identical, position for position — one commit order,
-everywhere.
-
-```snippet:node/14-strict-ordering-market.js
-```
-
-<!-- PROVENANCE
-target: crabs-node
+target: crabs-node (snippet node/14-strict-ordering-market.js)
 verified: executed
 symbols:
   new Node (NodeStatic)     bindings/node/index.d.ts:641-643
@@ -236,42 +314,8 @@ maturity: full cluster loop STABLE on the native surface (C-tested via
 test_ref: bindings/node/test/raft.js (3-node native cluster: election,
   fail-closed probe, committed-op wire identity across replicas, persist
   window re-report, partition + heal, crash recovery from stored batches)
+persist-window note: the outstanding persist window is a VIEW re-reported
+  until answered — poll once per async store round, never in a drain loop;
+  the outbound queue, by contrast, TRANSFERS each blob (drain until empty);
+  both snippets respect the difference — confusing it stalls the module
 -->
-
-## Notes
-
-- *Why two registers in the wasm snippet*: the market register holds the
-  latest fill; the fill-order register is the ledger of the RACE — the
-  handler appends each committed bid, so "what order did we agree on"
-  becomes content you can read (and diff across replicas) instead of a
-  claim about bytes.
-- *Seeds are per node*: identical seeds give identical randomized election
-  deadlines — lockstep split votes that can livelock the election. Every
-  example and test seeds `77 + i` (or a fresh seed for a recovered node —
-  the old one retires with the module).
-- *The persist window is a view, not a transfer*: `raftPollPersistRequest`
-  re-reports the same outstanding handle until
-  `raftPersistComplete(handle, ok)` — poll once per async store round. The
-  outbound queue, by contrast, TRANSFERS each blob (drain until empty).
-  Both snippets respect the difference; confusing it stalls the module.
-- *What the module attaches to*: the machine's state owns the module SEAM
-  (`state_attach_raft_module`, `src/StateMachine/state_machine.h:260`) —
-  module state serializes as its own v16 machine section (never into items
-  or the op log), and `raftStatus()` reads null after a detach, so
-  "attached or not" is always observable. One module per machine (the
-  create-time boot config is the committed config until a membership change
-  commits).
-- *Membership changes are engine-real*: joint-consensus reconfiguration
-  (`crabs_raft_module_change_membership`, `src/Raft/raft_module.h:222`) —
-  an excluded member steps down and stops receiving replication
-  (`RAFT_MSG_CONFIG_EXCLUDED`); the sim pins the single-node joint
-  add/remove cycle and the leadership-churn cases
-  (`test/test_raft_sim.cpp:2183-2439`). The bindings surface the module
-  handle (`moduleHandle()`, wasm `:473`) for hosts that drive these raw.
-- *The bounded alternatives stand where they belong*: Recipe 13's sovereign
-  chains keep per-writer strict order without any module (no cross-writer
-  order); Recipe 2's commutative merges are the tool when the value is a
-  sum or count and the order is irrelevant by construction; Recipe 10's
-  delegated-writer model remains the trust trade-off you accept when
-  ordering by application choice. This recipe is the one that removes the
-  application-choice trust: the order is quorum-committed machinery.
