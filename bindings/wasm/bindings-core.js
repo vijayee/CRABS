@@ -1183,7 +1183,7 @@ class Node {
       BigInt(positions.second === undefined ? 0 : positions.second),
       elementBytes.ptr, elementBytes.len,
       idNodePtr, BigInt(id.seq), BigInt(id.ts === undefined ? 0 : id.ts),
-      depsPtr, deps.length);
+      depsPtr.ptr, deps.length);
     freeAll(M, namePtr, idNodePtr, elementBytes.ptr, depsPtr);
     wrapRc(rc, ctx);
   }

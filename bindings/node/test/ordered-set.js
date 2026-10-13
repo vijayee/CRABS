@@ -67,6 +67,19 @@ assert.throws(() => unpoliced.orderedInsert('list', 'a', 0,
   { id: { node: 'node-plain', seq: 1 } }),
   /unauthorized/, '__execute_ot__ without a policy');
 
+// ---- Deps are carried on the wire: a dep-declared replay skips the --------
+// transform for everything it names (ot_transform.c crabs_op_depends_on) —
+// the replayed insert applies at its RAW position (0 -> head), not at the
+// transformed shifted one. Pin: x before m, not [m, x].
+const depNode = new Node('dep-check', { ordering: 'hlc' });
+depNode.setPolicy('__execute_ot__', 'role:admin');
+depNode.addOrderedSet('deps-list');
+depNode.orderedInsert('deps-list', 'm', 0, { id: { node: 'dep-check', seq: 1, ts: 2000 } });
+depNode.orderedInsert('deps-list', 'x', 0,
+  { id: { node: 'remote-node', seq: 1, ts: 5 }, deps: [{ node: 'dep-check', seq: 1 }] });
+assertOrder(depNode, 'deps-list', ['x', 'm'],
+  'dep-declared replay must skip the transform (deps travel the wire)');
+
 // ---- Two machines converge by exchanging ops ------------------------------
 const nodeA = new Node('node-a2', { ordering: 'hlc' });
 const nodeB = new Node('node-b', { ordering: 'hlc' });
