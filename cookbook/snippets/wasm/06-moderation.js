@@ -122,14 +122,11 @@ async function main() {
   if (!clearance) {
     throw new Error(`temporary clearance must be issued, got ${JSON.stringify(alicePost.attributes)}`);
   }
-  // Observed shape, pinned exactly: the wasm getUser surfaces the temp attr's
-  // token ('clearance:moderator', the C temp->name) CONCATENATED with its
-  // value again (bindings/wasm/bindings-core.js:686-696 — name already
-  // carries ':value'), so the read string is doubled compared to the token
-  // the C policy evaluator actually matches ('clearance:moderator',
-  // src/Crypto/crypto.c:1149-1150). The doubled read is the binding's
-  // display quirk; document, don't hide.
-  if (clearance.value !== 'clearance:moderator:moderator' ||
+  // Observed shape, pinned exactly: the temp attribute's value IS the plain
+  // 'name:value' token ('clearance:moderator') — the same string the C
+  // policy evaluator matches (src/Crypto/crypto.c:1143) and what the
+  // node mapper returns (bindings/node/src/crabs_node.cc:1208).
+  if (clearance.value !== 'clearance:moderator' ||
       clearance.verifiedBy !== 'trigger') {
     throw new Error(`unexpected temp attribute shape: ${JSON.stringify(clearance)}`);
   }

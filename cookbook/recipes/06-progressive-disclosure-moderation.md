@@ -154,7 +154,7 @@ symbols:
   Node.on                  bindings/wasm/index.d.ts:218
   Node.encrypt             bindings/wasm/index.d.ts:306
   Node.destroy             bindings/wasm/index.d.ts:368
-  (temp attr read, doubled string) bindings/wasm/bindings-core.js:686-696
+  (temp attr read, plain token) bindings/wasm/bindings-core.js:690-703
   (trigger fire on execute) src/StateMachine/state_machine.c:1508-1520
   (issue fan-out)          src/Attribute/attribute_machine.c:954-1026
   (temp token in policy)   src/Crypto/crypto.c:1126-1163
@@ -285,11 +285,12 @@ test_ref: test/test_trigger.cpp:125-170,378-452 (process/cooldown/one-shot) + te
   so every member holding any `role:…` value receives the clearance. That
   is the "established users" predicate of this recipe; an audience keyed to
   specific users wants dedicated attribute names or per-user triggers.
-- The wasm `getUser` read of a temporary attribute is DOUBLED — it surfaces
-  `clearance:moderator:moderator` (the token already carries `:value`, and
-  `bindings-core.js:686-696` concatenates again), while crabs-node hands
-  back the plain token plus `expiresAt`
-  (`bindings/node/src/crabs_node.cc:1166-1171`). The snippets pin the
+- Temporary attributes read back as the PLAIN token on both runtimes: the
+  wasm `getUser` and crabs-node both surface the temp attribute's `value`
+  as the full `name:value` string (`clearance:moderator`) — the same token
+  the C policy evaluator matches (`src/Crypto/crypto.c:1126-1158`) —
+  alongside `verifiedBy: 'trigger'` and `expiresAt`
+  (`bindings/node/src/crabs_node.cc:1208-1211`). The snippets pin the
   observed shapes; match on `verifiedBy === 'trigger'` / `temporary` in
   UI code, not on the string.
 - Installing a trigger is itself an authorized op: both snippets set

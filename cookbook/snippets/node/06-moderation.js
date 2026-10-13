@@ -122,8 +122,9 @@ const clearance = alicePre.attributes.find((attribute) => attribute.temporary);
 if (!clearance) {
   throw new Error(`temporary clearance must be issued, got ${JSON.stringify(alicePre.attributes)}`);
 }
-// crabs-node maps the token DIRECTLY (bindings/node/src/crabs_node.cc:1168:
-// a.Set("value", temp->name)) — no wasm-style doubling here.
+// The temp attribute's value IS the plain 'name:value' token the C policy
+// evaluator matches (crabs-node mapper: bindings/node/src/crabs_node.cc:1208,
+// a.Set("value", temp->name); the wasm binding now matches this shape).
 if (clearance.value !== 'clearance:moderator' ||
     clearance.verifiedBy !== 'trigger' ||
     !(clearance.expiresAt > 0)) {

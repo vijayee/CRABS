@@ -690,7 +690,11 @@ class Node {
     const tempName = readString(M, M._crabs_wasm_user_temp_attr_name(userPtr));
     if (tempName) {
       attrs.push({
-        value: tempName + ':' + readString(M, M._crabs_wasm_user_temp_attr_value(userPtr)),
+        // The temp attr name IS the full 'name:value' token the C policy
+        // evaluator matches (src/Crypto/crypto.c:1126-1158) — return it
+        // plain, exactly like the node mapper (crabs_node.cc:1199-1211),
+        // rather than concatenating the stored value onto it a second time.
+        value: tempName,
         verifiedBy: 'trigger',
         temporary: true,
         // Matches the node mapper's expiresAt field (crabs_node.cc:1211);
