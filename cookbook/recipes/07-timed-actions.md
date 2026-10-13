@@ -72,7 +72,7 @@ machine's own tick with no signer online at fire time.
 
 Guaranteed: the op you scheduled was validated *at submission* — policy,
 signature and key version (plus co-signatures) are checked by the machine
-before the entry is queued (`src/Util/wasm_helpers.c:1382-1392`), and the
+before the entry is queued (`src/Util/wasm_helpers.c:1509-1519`), and the
 fire then deliberately skips a second authorization pass
 (`src/StateMachine/state_machine.c:1199-1201`). That cuts both ways: a
 schedule whose signer loses the required policy *after* submission still
@@ -92,7 +92,7 @@ with the default `Date.now()` is the unauthenticated system clock — for a
 timed action whose *authority* matters (deadlines, expiries), attach an
 authenticated source instead: `setTimeSource({mode:'https'})` which fails
 closed (a fetch failure reports invalid time, never a local-clock
-fallback, `bindings/wasm/index.d.ts:313-321`; semantics
+fallback, `bindings/wasm/index.d.ts:491-498`; semantics
 `src/TimeSource/`). The same holds on crabs-node, whose `processSchedules`
 default is the wall clock too (`bindings/node/index.d.ts:320-324`) — and
 whose `setTimeSource` is machine-local (re-apply it on a surviving wrapper
@@ -199,7 +199,7 @@ symbols:
   KeyPair.publicKeyHex            bindings/node/index.d.ts:8
   Operation.addResource           bindings/node/index.d.ts:26
   (submission validate gate)      bindings/node/src/crabs_node.cc:1902-1906 + :1942-1946
-  (wall-clock tick default)       bindings/node/src/crabs_node.cc:1985-1989
+  (wall-clock tick default)       bindings/node/src/crabs_node.cc:1980-1984
   C engine unchanged: scheduler_schedule / _recurring / cancel / process_due / count / first / budget
                                   src/Scheduler/scheduler.h:20-55
   (materialization skips signature re-check) src/Scheduler/scheduler.c:337-338
@@ -245,7 +245,7 @@ test_ref: test/test_scheduler.cpp:485-529 (exactly-once materialization) + :877-
 - The wasm `schedule()` call wraps `crabs_wasm_schedule`, which validates
   the op AT SUBMISSION — policy, signature, key version, co-signatures,
   plus a read-only domain check — via `state_machine_validate` before
-  handing it to `scheduler_schedule` (`src/Util/wasm_helpers.c:1382-1392`,
+  handing it to `scheduler_schedule` (`src/Util/wasm_helpers.c:1509-1519`,
   mirroring the `__schedule__` op path). Materialization deliberately does
   NOT re-run that authorization: the executor is entered with
   `skip_authorization` set ("authorization was already enforced at
@@ -261,7 +261,7 @@ test_ref: test/test_scheduler.cpp:485-529 (exactly-once materialization) + :877-
   consciously: `setTimeSource({mode:'https'})` for authenticated wall
   time (wasm: module-shared source, re-attaching every machine;
   node: machine-local and silently stripped by a sibling destroy — both
-  documented in the d.ts prose, `:313-321` wasm / `:267-278` node).
+  documented in the d.ts prose, `:491-498` wasm / `:346-359` node).
 - The occurrence budget is node-local RUNTIME policy, not serialized
   state — a restored state reverts to the default
   (`src/Scheduler/scheduler.h:52-55`).

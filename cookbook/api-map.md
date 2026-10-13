@@ -136,7 +136,7 @@ One-shot sets and flags are added like any item (`addOneShotSet` / `addOneShotFl
 | `Node.getTimeSource` | query | `getTimeSource() -> TimeSourceInfo` | wasm :322, node :280 | STABLE (`time-source.js:32,39-45`) |
 | `Node.getHLC` | query (**node only**) | `getHLC() -> HLC \| undefined` | `bindings/node/index.d.ts:263` | STABLE (`test/test.js:81`) |
 
-Timing semantics of the authenticated HTTPS time source (defaults 30000/1000/5000) and the wasm module-shared-vs-machine-local difference are documented in the d.ts prose: wasm `bindings/wasm/index.d.ts:313-321` (module-shared; replacing the source re-attaches every machine), node `bindings/node/index.d.ts:267-278` (machine-local; destroying a sibling wrapper silently strips the clock — re-apply). C source: `src/TimeSource/`. HLC C surface: `src/HLC/hlc.h:144,164` (`crabs_hlc_state_init`, `crabs_hlc_compare`) — PRESENT, used by recipes only via node `getHLC`.
+Timing semantics of the authenticated HTTPS time source (defaults 30000/1000/5000) and the wasm module-shared-vs-machine-local difference are documented in the d.ts prose: wasm `bindings/wasm/index.d.ts:491-498` (module-shared; replacing the source re-attaches every machine), node `bindings/node/index.d.ts:346-359` (machine-local; destroying a sibling wrapper silently strips the clock — re-apply). C source: `src/TimeSource/`. HLC C surface: `src/HLC/hlc.h:144,164` (`crabs_hlc_state_init`, `crabs_hlc_compare`) — PRESENT, used by recipes only via node `getHLC`.
 
 ## 7. Triggers (R6)
 
