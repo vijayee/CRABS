@@ -4,7 +4,7 @@
 
 'use strict';
 
-const { Node, KeyPair, Operation, Blueprint, wireVersions } = require('..');
+const { Node, KeyPair, Operation, Blueprint, wireVersions, createRaftHost } = require('..');
 
 let passed = 0;
 let failed = 0;
