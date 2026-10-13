@@ -1,5 +1,5 @@
 'use strict';
-// Recipe 16 — data that must be revocable (crabs-wasm, run in Node).
+// Recipe 15 — data that must be revocable (crabs-wasm, run in Node).
 //
 // What IS on this binding: policy-gated sealing (Node.encrypt), user-level
 // revocation (revokeUser, admin-gated + terminal in C), the fail-closed

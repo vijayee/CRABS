@@ -1,5 +1,5 @@
 ---
-number: 16
+number: 15
 slug: revocable-data
 title: Data that must be revocable
 section: Ground truth
@@ -122,7 +122,7 @@ Not guaranteed — the honesty this recipe owes:
   demonstrated in every snippet; the old account stays terminal — the new
   epoch's audience is a new enrollment). The library has no revocation
   registry, no `crypto_abe_revoke`, and no re-encrypt — this is a
-  recipe-level pattern, not a library feature (api-map §17, `cookbook/api-map.md:290`).
+  recipe-level pattern, not a library feature (api-map §17, the R15 row).
 - *The decrypt half is JS-bound now; the keyring lifecycle is the C
   surface:*
 
@@ -165,7 +165,7 @@ section's executable half.
   epoch-one key opens epoch-one data; epoch-two data refuses the epoch-one
   key and opens for a fresh derivation. What the library gives you is the
   attribute system + ABE; the *convention* of what an epoch means (who
-  bumps it, when re-seal happens) is yours (api-map `cookbook/api-map.md:290`
+  bumps it, when re-seal happens) is yours (api-map §17, the R15 row
   marks the same boundary).
 - *Demote, not delete*: `attribute_machine_revoke_role` strips ONE role and
   works on suspended/revoked targets by design (R4-4,
@@ -199,7 +199,7 @@ policy-derived key even after the revocation (the bearer-instrument
 boundary — the reader for its recall is the epoch re-seal, which the
 snippet executes too).
 
-```snippet:wasm/16-revocable-data.js
+```snippet:wasm/15-revocable-data.js
 ```
 
 <!-- PROVENANCE
@@ -248,7 +248,7 @@ event. (The wasm binding maps the same readback too — the recipe-level
 parity the RESIDUAL SCOPE note above records; what remains wasm/node-odd
 is only in the C-only keyring lifecycle, not the readback.)
 
-```snippet:node/16-revocable-data.js
+```snippet:node/15-revocable-data.js
 ```
 
 <!-- PROVENANCE
@@ -290,7 +290,7 @@ the user-level revocation refusing ops and re-grants, the honest boundary
 (an already-derived ABE key keeps opening the old ciphertext), and the
 epoch re-encryption pattern that actually recalls access.
 
-```snippet:c/16-revocable-data.c
+```snippet:c/15-revocable-data.c
 ```
 
 <!-- PROVENANCE

@@ -1,5 +1,5 @@
 'use strict';
-// Recipe 16 — data that must be revocable (crabs-node, driven directly).
+// Recipe 15 — data that must be revocable (crabs-node, driven directly).
 //
 // Same real surface as the wasm binding (encrypt + abeKeygen/abeDecrypt +
 // revokeUser + the fail-closed gate): crabs-node maps

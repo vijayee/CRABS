@@ -1,4 +1,4 @@
-/* Recipe 16 — data that must be revocable (C core).
+/* Recipe 15 — data that must be revocable (C core).
  *
  * The full revocation story, on the engine the bindings wrap:
  *   - user-level revocation (revoke_user — the tool BOTH JS bindings
