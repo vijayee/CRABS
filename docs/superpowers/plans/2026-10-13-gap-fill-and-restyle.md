@@ -99,7 +99,7 @@ Add matching declarations to `wasm_init.c`'s EXPORT list (grep how `crabs_wasm_u
 **Files:**
 - Modify: `src/Lineage/lineage.c:1787-1790` (the dissolve handler's ACTIVE gate)
 - Test: gtest near `test/test_lineage.cpp` dissolve tests — add `DissolveAfterRevoke`: revoke a manifest entry, then dissolve it → expect success (per `lineage.h:516-520`'s contract), tombstone mint then legal.
-- [ ] **Step 1: Failing gtest** asserting dissolve-after-revoke returns `CRABS_SUCCESS` and the tombstone is produced. [ ] **Step 2:** run `ctest --test-dir build -R Dissolve` → FAIL. [ ] **Step 3:** allow dissolving a revoked (non-DISSOLVED) entry — keep refusing re-dissolve of an already-DISSOLVED entry (idempotency gate stays). [ ] **Step 4:** ctest green (whole suite). [ ] **Step 5: Commit** `fix: lineage dissolve works on revoked entries (honor the header contract)`.
+- [x] **Step 1: Failing gtest** asserting dissolve-after-revoke returns `CRABS_SUCCESS` and the tombstone is produced. ([x] **Step 2:** run `ctest --test-dir build -R Dissolve` → FAIL.) [x] **Step 3:** allow dissolving a revoked (non-DISSOLVED) entry — keep refusing re-dissolve of an already-DISSOLVED entry (idempotency gate stays). [x] **Step 4:** ctest green (whole suite) — plus recipe 12's wasm snippet, prose, and the wasm binary re-synced to the settled semantic (`run-snippets.mjs` green). [x] **Step 5: Commit** `fix: lineage dissolve works on revoked entries (header contract honored)`.
 
 ### Task A5: policy parser single-clause guard (decision by size)
 
