@@ -25,6 +25,8 @@
 #include "../Lineage/lineage.h"
 #include "../TimeSource/time_source.h"
 #include "../Raft/raft_module.h"
+#include "../OT/ot_execution.h"
+#include "../OT/ot_ordered_set.h"
 
 #ifdef CRABS_ENABLE_DEVTOOLS
 #include "../Devtools/devtools.h"
@@ -608,6 +610,204 @@ crabs_error_e crabs_wasm_add_register(attribute_machine_t* am, const char* name,
   // Struct-backed value (lww_register_t) — release via crdt_value_destroy.
   item->value_repr = DATA_VALUE_REPR_CRDT_STRUCT;
   return state_add_item(&am->base_state, item);
+}
+
+// ============================================================
+// OT ordered set (v1.5 §5) — recipe 8's JS surface
+// ============================================================
+
+// The item creation mirrors crabs_register_ot_type (ot_execution.c): the
+// OT wrapper allocates its own crabs_ot_ordered_set_t into item->value and
+// its op-log/transform-matrix struct into item->ot_data — crabs_apply_ot_op
+// dereferences both unconditionally (a NULL value is CRABS_ERR_INTERNAL),
+// so there is no lazy attach. Default domain: FREE_MERGE (sovereign chains
+// are COUNTER/REGISTER-only; data_item_create_with_options enforces it).
+EMSCRIPTEN_KEEPALIVE
+crabs_error_e crabs_wasm_add_ordered_set(attribute_machine_t* am, const char* name) {
+  if (!am || !name) return CRABS_ERR_INVALID_PARAM;
+  data_item_t* item = data_item_create(name, DATA_TYPE_OT_ORDERED_SET,
+                                       CRDT_CUSTOM);
+  if (!item) return CRABS_ERR_OOM;
+  crabs_ot_ordered_set_t* set = crabs_ot_ordered_set_create();
+  item->value = set;
+  if (!set) {
+    data_item_destroy(item);  // NULL value: destroy is safe on every field
+    return CRABS_ERR_OOM;
+  }
+  item->ot_data = set->ot_data;
+  // Struct-backed value (crabs_ot_ordered_set_t) — data_item_destroy
+  // dispatches OT destruction by type.
+  item->value_repr = DATA_VALUE_REPR_CRDT_STRUCT;
+  crabs_error_e rc = state_add_item(&am->base_state, item);
+  if (rc != CRABS_SUCCESS) data_item_destroy(item);
+  return rc;
+}
+
+// Resolve the ordered set behind `name`, failing closed on anything that is
+// not a live OT_ORDERED_SET item with its wrapper attached.
+static crabs_ot_ordered_set_t* _ot_ordered_set_find(
+    attribute_machine_t* am, const char* name) {
+  if (!am || !name) return NULL;
+  data_item_t* item = state_find_item(&am->base_state, name);
+  if (!item || item->type != DATA_TYPE_OT_ORDERED_SET) return NULL;
+  return (crabs_ot_ordered_set_t*)item->value;
+}
+
+// deps_wire record layout, one 80-byte record per dependency: node_id as
+// 64 NUL-padded bytes + sequence_num (u64 LE) + timestamp (u64 LE). Same
+// little-endian discipline as the op-log wire format (ot_execution.c).
+#define OT_DEP_RECORD_SIZE (CRABS_MAX_USER_ID + 8 + 8)
+
+static void _ot_dep_read_le(const uint8_t* record, crabs_ot_op_id_t* dep) {
+  memcpy(dep->node_id, record, CRABS_MAX_USER_ID);
+  dep->node_id[CRABS_MAX_USER_ID - 1] = '\0';
+  dep->sequence_num = 0;
+  dep->timestamp = 0;
+  for (uint32_t byte_index = 0; byte_index < 8; byte_index++) {
+    dep->sequence_num |= ((uint64_t)record[CRABS_MAX_USER_ID + byte_index])
+                         << (8 * byte_index);
+    dep->timestamp |= ((uint64_t)record[CRABS_MAX_USER_ID + 8 + byte_index])
+                      << (8 * byte_index);
+  }
+}
+
+// Read back the materialized, tombstone-free order of item `name`:
+// crabs_wasm_ot_ordered_count reports the visible count (-1 for an unknown
+// item or a non-ordered-set type), and crabs_wasm_ot_ordered_element copies
+// the payload of the element at `visible_pos` — -1 unknown item, -2
+// out-of-range position, -3 payload exceeds `cap` (caller retries with a
+// larger buffer).
+EMSCRIPTEN_KEEPALIVE
+int64_t crabs_wasm_ot_ordered_count(attribute_machine_t* am, const char* name) {
+  crabs_ot_ordered_set_t* set = _ot_ordered_set_find(am, name);
+  if (!set) return -1;
+  return (int64_t)crabs_ot_ordered_set_visible_count(set);
+}
+
+EMSCRIPTEN_KEEPALIVE
+int32_t crabs_wasm_ot_ordered_element(attribute_machine_t* am, const char* name,
+                                      uint32_t visible_pos, uint8_t* out,
+                                      uint32_t cap) {
+  if (!out || cap == 0) return -1;
+  crabs_ot_ordered_set_t* set = _ot_ordered_set_find(am, name);
+  if (!set) return -1;
+  crabs_ordered_element_t* element = crabs_ot_ordered_set_get(set, visible_pos);
+  if (!element) return -2;
+  if (element->value_size > cap) return -3;
+  if (element->value_size > 0) memcpy(out, element->value, element->value_size);
+  return (int32_t)element->value_size;
+}
+
+// Apply ONE ordered-set operation through the machine executor: compose,
+// node-key-sign (bootstrap admin — the __create_trigger__ idiom; the caller
+// must install the '__execute_ot__' policy first) and execute a
+// CRABS_OP_EXECUTE_OT op carrying the wire-encoded crabs_ot_operation_t (via
+// crabs_ot_ops_to_wire). `op_kind` is a crabs_ot_op_type_e restricted to the
+// ordered-set vocabulary (INSERT..SWAP, 1..5); `id_node_id`/`id_sequence`/
+// `id_timestamp` are the element's OT identity; `deps_wire` is
+// dep_count × 80 bytes of (node_id[64] + seq/8 + ts/8 LE) causal context
+// carried on cross-replica replays. Positions are validated against the
+// item's visible count BEFORE anything is signed.
+EMSCRIPTEN_KEEPALIVE
+crabs_error_e crabs_wasm_ot_apply(attribute_machine_t* am, const char* name,
+                                  int op_kind, uint64_t visible_pos,
+                                  uint64_t visible_pos_2,
+                                  const char* element, uint32_t element_len,
+                                  const char* id_node_id, uint64_t id_sequence,
+                                  uint64_t id_timestamp,
+                                  const uint8_t* deps_wire,
+                                  uint32_t dep_count) {
+  if (!am || !name) return CRABS_ERR_INVALID_PARAM;
+  if (op_kind < CRABS_OT_OP_INSERT || op_kind > CRABS_OT_OP_SWAP) {
+    return CRABS_ERR_INVALID_PARAM;
+  }
+  if (!id_node_id || id_node_id[0] == '\0' ||
+      strlen(id_node_id) >= CRABS_MAX_USER_ID) {
+    return CRABS_ERR_INVALID_PARAM;
+  }
+  if (element_len > 0 && (!element || element_len > CRABS_OT_MAX_PAYLOAD)) {
+    return CRABS_ERR_INVALID_PARAM;
+  }
+  if (dep_count > CRABS_OT_MAX_DEPS) return CRABS_ERR_INVALID_PARAM;
+
+  data_item_t* item = state_find_item(&am->base_state, name);
+  if (!item) return CRABS_ERR_RESOURCE_NOT_FOUND;
+  if (item->type != DATA_TYPE_OT_ORDERED_SET) return CRABS_ERR_NOT_OT_TYPE;
+  crabs_ot_ordered_set_t* set = (crabs_ot_ordered_set_t*)item->value;
+  if (!set) return CRABS_ERR_INTERNAL;
+
+  // crabs_apply_ot_op silently no-ops an out-of-range apply (get returns
+  // NULL), which would mint a signed, logged op that did nothing — refuse
+  // the position pair up front against the live visible count.
+  uint32_t visible_count = crabs_ot_ordered_set_visible_count(set);
+  if (op_kind == CRABS_OT_OP_INSERT) {
+    if (visible_pos > visible_count) return CRABS_ERR_OT_POSITION_BOUNDS;
+  } else {
+    if (visible_count == 0) return CRABS_ERR_OT_POSITION_BOUNDS;
+    if (visible_pos > visible_count - 1) return CRABS_ERR_OT_POSITION_BOUNDS;
+    if ((op_kind == CRABS_OT_OP_MOVE || op_kind == CRABS_OT_OP_SWAP) &&
+        visible_pos_2 > visible_count - 1) {
+      return CRABS_ERR_OT_POSITION_BOUNDS;
+    }
+  }
+
+  crabs_ot_operation_t ot_op;
+  crabs_ot_operation_init(&ot_op);
+  ot_op.op_type = (crabs_ot_op_type_e)op_kind;
+  ot_op.visible_pos = visible_pos;
+  ot_op.visible_pos_2 = visible_pos_2;
+  crabs_ot_op_id_init(&ot_op.id, id_node_id, id_sequence, id_timestamp);
+  if (element_len > 0 && element) {
+    if (!crabs_ot_operation_set_payload(
+        &ot_op, (const uint8_t*)element, element_len)) {
+      return CRABS_ERR_INVALID_PARAM;
+    }
+  }
+  if (dep_count > 0) {
+    for (uint32_t dep_index = 0; dep_index < dep_count; dep_index++) {
+      crabs_ot_op_id_t dep;
+      _ot_dep_read_le(deps_wire + (size_t)dep_index * OT_DEP_RECORD_SIZE, &dep);
+      if (!crabs_ot_operation_add_dep(&ot_op, &dep)) {
+        free(ot_op.payload);
+        return CRABS_ERR_INVALID_PARAM;
+      }
+    }
+  }
+
+  uint8_t wire[4 + 4 + CRABS_MAX_USER_ID + 8 * 5 + 4 + CRABS_OT_MAX_PAYLOAD +
+               4 + CRABS_OT_MAX_DEPS * (CRABS_MAX_USER_ID + 8 + 8)];
+  uint32_t wire_size = crabs_ot_ops_to_wire(&ot_op, 1, wire, sizeof(wire));
+  free(ot_op.payload);
+  if (wire_size == 0) return CRABS_ERR_INTERNAL;
+
+  operation_t* op = operation_create(CRABS_OP_EXECUTE_OT);
+  if (!op) return CRABS_ERR_OOM;
+  crabs_error_e rc = crabs_wasm_op_add_resource(op, name);
+  if (rc != CRABS_SUCCESS) {
+    operation_destroy(op);
+    return rc;
+  }
+  op->payload = (uint8_t*)malloc(wire_size);
+  if (!op->payload) {
+    operation_destroy(op);
+    return CRABS_ERR_OOM;
+  }
+  memcpy(op->payload, wire, wire_size);
+  op->payload_size = wire_size;
+  crypto_random_bytes(op->uuid, CRABS_UUID_SIZE);
+  const char* admin_id = am->base_state.config.bootstrap_admin;
+  if (admin_id != NULL && admin_id[0] != '\0') {
+    strncpy(op->signer_id, admin_id, CRABS_MAX_USER_ID - 1);
+    strncpy(op->node_id, admin_id, CRABS_MAX_USER_ID - 1);
+  }
+  rc = crabs_wasm_sign_with_node_key(am, op);
+  if (rc != CRABS_SUCCESS) {
+    operation_destroy(op);
+    return rc;
+  }
+  rc = state_machine_execute(&am->base_state, op);
+  operation_destroy(op);
+  return rc;
 }
 
 // ============================================================

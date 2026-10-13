@@ -6,6 +6,7 @@
 
 #include <gtest/gtest.h>
 #include <cstdlib>
+#include <vector>
 extern "C" {
 #include "../src/OT/ot_execution.h"
 #include "../src/OT/ot_ordered_set.h"
@@ -430,5 +431,148 @@ TEST(OTExecution, ApplyDocumentInsertTextDispatchMatchesEnum) {
   EXPECT_EQ(crabs_ot_document_char_count(doc), 2u);
 
   if (op.payload) { free(op.payload); op.payload = nullptr; }
+  state_destroy(state);
+}
+
+// ============================================================
+// OT Op Wire Encoding Tests (A8: ordered set from JS)
+// ============================================================
+
+TEST(OTExecution, OtOpsToWireRoundTrip) {
+  // One INSERT with a payload and two deps: encode with
+  // crabs_ot_ops_to_wire, decode with crabs_extract_ot_ops, compare fields.
+  crabs_ot_operation_t op;
+  crabs_ot_operation_init(&op);
+  op.op_type = CRABS_OT_OP_INSERT;
+  op.visible_pos = 3;
+  op.visible_pos_2 = 0;
+  op.priority = 7;
+  crabs_ot_op_id_init(&op.id, "n1", 4, 1000);
+  const uint8_t element = 0x42;
+  ASSERT_TRUE(crabs_ot_operation_set_payload(&op, &element, 1));
+  crabs_ot_op_id_t dep1 = make_id("peer", 1, 50);
+  crabs_ot_op_id_t dep2 = make_id("peer", 2, 51);
+  ASSERT_TRUE(crabs_ot_operation_add_dep(&op, &dep1));
+  ASSERT_TRUE(crabs_ot_operation_add_dep(&op, &dep2));
+
+  std::vector<uint8_t> wire(4 + 4 + CRABS_MAX_USER_ID + 8 * 5 + 4 + 1 + 4 +
+                             2 * (CRABS_MAX_USER_ID + 8 + 8));
+  uint32_t wire_size = crabs_ot_ops_to_wire(&op, 1, wire.data(),
+                                            (uint32_t)wire.size());
+  ASSERT_GT(wire_size, 0u);
+  ASSERT_LE(wire_size, (uint32_t)wire.size());
+
+  crabs_ot_operation_t* decoded = nullptr;
+  uint32_t decoded_count = crabs_extract_ot_ops(wire.data(), wire_size,
+                                                &decoded);
+  ASSERT_EQ(decoded_count, 1u);
+  ASSERT_NE(decoded, nullptr);
+  EXPECT_EQ(decoded[0].op_type, CRABS_OT_OP_INSERT);
+  EXPECT_TRUE(crabs_ot_op_id_equal(&decoded[0].id, &op.id));
+  EXPECT_EQ(decoded[0].visible_pos, 3u);
+  EXPECT_EQ(decoded[0].visible_pos_2, 0u);
+  EXPECT_EQ(decoded[0].priority, 7u);
+  ASSERT_NE(decoded[0].payload, nullptr);
+  EXPECT_EQ(decoded[0].payload_size, 1u);
+  EXPECT_EQ(decoded[0].payload[0], 0x42);
+  EXPECT_EQ(decoded[0].dep_count, 2u);
+  EXPECT_TRUE(crabs_ot_op_id_equal(&decoded[0].deps[0], &dep1));
+  EXPECT_TRUE(crabs_ot_op_id_equal(&decoded[0].deps[1], &dep2));
+
+  crabs_ot_ops_free(decoded, decoded_count);
+  free(op.payload);
+}
+
+TEST(OTExecution, OtOpsToWireRejects) {
+  crabs_ot_operation_t op;
+  crabs_ot_operation_init(&op);
+  op.op_type = CRABS_OT_OP_INSERT;
+  crabs_ot_op_id_init(&op.id, "n1", 1, 100);
+
+  uint8_t tiny[3];
+  EXPECT_EQ(crabs_ot_ops_to_wire(&op, 1, tiny, sizeof(tiny)), 0u);
+  EXPECT_EQ(crabs_ot_ops_to_wire(nullptr, 1, tiny, sizeof(tiny)), 0u);
+  static uint8_t small[256];
+  EXPECT_EQ(crabs_ot_ops_to_wire(&op, 0, small, sizeof(small)), 0u);
+  // An op with a payload larger than CRABS_OT_MAX_PAYLOAD must never be
+  // emitted — the extractor would silently mis-align on those bytes.
+  uint8_t oversized[] = {0x01, 0x02};
+  op.payload = oversized;
+  op.payload_size = CRABS_OT_MAX_PAYLOAD + 1;
+  EXPECT_EQ(crabs_ot_ops_to_wire(&op, 1, small, sizeof(small)), 0u);
+  op.payload = nullptr;
+  op.payload_size = 0;
+}
+
+TEST(OTExecution, ExecuteOtOrderedSetThroughExecutor) {
+  // The bindings route ordered-set ops through a CRABS_OP_EXECUTE_OT op
+  // whose payload crabs_ot_ops_to_wire built: register an ordered set,
+  // execute three INSERT ops through crabs_execute_ot_operation, then a
+  // MOVE — the materialized order must read [b, c, a] from item->value.
+  state_t* state = state_create();
+  data_item_t* item = crabs_register_ot_type(state, "list",
+    DATA_TYPE_OT_ORDERED_SET, nullptr);
+  ASSERT_NE(item, nullptr);
+
+  struct execute_step {
+    crabs_ot_op_type_e op_type;
+    uint64_t position;
+    uint64_t position_2;
+    const char* author;
+    uint64_t sequence;
+    uint8_t element;
+  };
+  const execute_step steps[] = {
+    { CRABS_OT_OP_INSERT, 0, 0, "n1", 1, 'a' },
+    { CRABS_OT_OP_INSERT, 1, 0, "n1", 2, 'b' },
+    { CRABS_OT_OP_INSERT, 2, 0, "n1", 3, 'c' },
+    { CRABS_OT_OP_MOVE,   0, 2, "n1", 4, 0   },
+  };
+  for (const execute_step& step : steps) {
+    crabs_ot_operation_t ot_op;
+    crabs_ot_operation_init(&ot_op);
+    ot_op.op_type = step.op_type;
+    ot_op.visible_pos = step.position;
+    ot_op.visible_pos_2 = step.position_2;
+    crabs_ot_op_id_init(&ot_op.id, step.author, step.sequence, 1000);
+    if (step.op_type == CRABS_OT_OP_INSERT) {
+      ASSERT_TRUE(crabs_ot_operation_set_payload(&ot_op, &step.element, 1));
+    }
+
+    uint8_t wire[256];
+    uint32_t wire_size = crabs_ot_ops_to_wire(&ot_op, 1, wire, sizeof(wire));
+    ASSERT_GT(wire_size, 0u);
+
+    operation_t op;
+    memset(&op, 0, sizeof(op));
+    strncpy(op.type, CRABS_OP_EXECUTE_OT, CRABS_MAX_OP_NAME - 1);
+    op.payload = wire;
+    op.payload_size = wire_size;
+    op.resources = (char(*)[CRABS_MAX_USER_ID])get_clear_memory(
+      CRABS_MAX_USER_ID);
+    ASSERT_NE(op.resources, nullptr);
+    strncpy(op.resources[0], "list", CRABS_MAX_USER_ID - 1);
+    op.resource_count = 1;
+
+    EXPECT_EQ(crabs_execute_ot_operation(state, &op), CRABS_SUCCESS);
+    free(op.resources);
+    free(ot_op.payload);
+  }
+
+  crabs_ot_ordered_set_t* set = (crabs_ot_ordered_set_t*)item->value;
+  ASSERT_NE(set, nullptr);
+  EXPECT_EQ(crabs_ot_ordered_set_visible_count(set), 3u);
+  const char* order = "bca";
+  for (uint32_t position = 0; position < 3; position++) {
+    crabs_ordered_element_t* element = crabs_ot_ordered_set_get(set, position);
+    ASSERT_NE(element, nullptr);
+    ASSERT_NE(element->value, nullptr);
+    // The MOVE re-stamps placement; the materialized order is the moved one.
+    EXPECT_EQ((char)element->value[0], order[position]) << "position "
+      << position;
+  }
+  ASSERT_NE(item->ot_data, nullptr);
+  crabs_ot_data_item_t* ot_data = (crabs_ot_data_item_t*)item->ot_data;
+  EXPECT_EQ(ot_data->op_log_count, 4u);
   state_destroy(state);
 }

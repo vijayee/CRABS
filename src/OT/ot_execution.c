@@ -271,6 +271,95 @@ void crabs_ot_ops_free(crabs_ot_operation_t* ops, uint32_t count) {
 }
 
 // ============================================================
+// OT Op Wire Encoding (inverse of crabs_extract_ot_ops)
+// ============================================================
+
+// The bindings build the CRABS_OP_EXECUTE_OT payload for an op their caller
+// composed (a sugar call supplies the op id, positions, element and causal
+// deps). Encoding lives next to the extractor above so the two sides of the
+// wire format stay one edit apart — layout comment duplicated verbatim:
+// [4 bytes: count] [count * per-op layout]
+// Each op: [op_type(4) + id.node_id(64) + id.sequence_num(8) + id.timestamp(8)
+//          + visible_pos(8) + visible_pos_2(8) + priority(8)
+//          + payload_size(4) + payload(payload_size) + dep_count(4) + deps...]
+// Same little-endian discipline as the readers (audit L-k).
+
+// Room one op needs for its fixed prefix, its payload and its deps:
+// 4 + 64 + 8*5 + 4 + payload + 4 + deps*(64+8+8).
+static uint32_t _ot_op_wire_room(const crabs_ot_operation_t* op) {
+  return 4 + (uint32_t)CRABS_MAX_USER_ID + 8 * 5 + 4 + op->payload_size +
+         4 + op->dep_count * (CRABS_MAX_USER_ID + 8 + 8);
+}
+
+static void _wr_u32_le(uint8_t* p, uint32_t value) {
+  p[0] = (uint8_t)(value & 0xFF);
+  p[1] = (uint8_t)((value >> 8) & 0xFF);
+  p[2] = (uint8_t)((value >> 16) & 0xFF);
+  p[3] = (uint8_t)((value >> 24) & 0xFF);
+}
+
+static void _wr_u64_le(uint8_t* p, uint64_t value) {
+  for (uint32_t byte_index = 0; byte_index < 8; byte_index++) {
+    p[byte_index] = (uint8_t)((value >> (8 * byte_index)) & 0xFF);
+  }
+}
+
+uint32_t crabs_ot_ops_to_wire(const crabs_ot_operation_t* ops, uint32_t count,
+                              uint8_t* buffer, uint32_t buffer_size) {
+  if (ops == NULL || buffer == NULL || count == 0 || count > 1024) return 0;
+
+  if (buffer_size < 4) return 0;
+  _wr_u32_le(buffer, count);
+  uint32_t offset = 4;
+
+  for (uint32_t op_index = 0; op_index < count; op_index++) {
+    const crabs_ot_operation_t* op = &ops[op_index];
+    if (op->payload != NULL && op->payload_size > CRABS_OT_MAX_PAYLOAD) {
+      return 0;  // the extractor would refuse these bytes — never emit them
+    }
+    if (op->dep_count > CRABS_OT_MAX_DEPS) return 0;
+    if (buffer_size - offset < _ot_op_wire_room(op)) return 0;
+
+    _wr_u32_le(buffer + offset, (uint32_t)op->op_type);
+    offset += 4;
+
+    memcpy(buffer + offset, op->id.node_id, CRABS_MAX_USER_ID);
+    offset += (uint32_t)CRABS_MAX_USER_ID;
+    _wr_u64_le(buffer + offset, op->id.sequence_num);
+    offset += 8;
+    _wr_u64_le(buffer + offset, op->id.timestamp);
+    offset += 8;
+    _wr_u64_le(buffer + offset, op->visible_pos);
+    offset += 8;
+    _wr_u64_le(buffer + offset, op->visible_pos_2);
+    offset += 8;
+    _wr_u64_le(buffer + offset, op->priority);
+    offset += 8;
+
+    _wr_u32_le(buffer + offset, op->payload_size);
+    offset += 4;
+    if (op->payload_size > 0) {
+      memcpy(buffer + offset, op->payload, op->payload_size);
+      offset += op->payload_size;
+    }
+
+    _wr_u32_le(buffer + offset, op->dep_count);
+    offset += 4;
+    for (uint32_t dep_index = 0; dep_index < op->dep_count; dep_index++) {
+      const crabs_ot_op_id_t* dep = &op->deps[dep_index];
+      memcpy(buffer + offset, dep->node_id, CRABS_MAX_USER_ID);
+      offset += (uint32_t)CRABS_MAX_USER_ID;
+      _wr_u64_le(buffer + offset, dep->sequence_num);
+      offset += 8;
+      _wr_u64_le(buffer + offset, dep->timestamp);
+      offset += 8;
+    }
+  }
+
+  return offset;
+}
+
+// ============================================================
 // OT Transform (v1.5 §8.2 step 7)
 // ============================================================
 

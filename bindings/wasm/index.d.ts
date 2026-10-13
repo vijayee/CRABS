@@ -99,6 +99,28 @@ export interface GetSetElementsOptions {
   limit?: number;
 }
 
+/** An OT op identity: (node, seq) is the dedup key, ts the issuing stamp. */
+export interface OrderedSetOpId {
+  /** Issuing replica's id (max 63 bytes). */
+  node: string;
+  /** Per-replica sequence number (integer >= 0). */
+  seq: number;
+  /** Issuing ms stamp. Optional, defaults to 0. */
+  ts?: number;
+}
+
+/** Options for orderedInsert/orderedDelete/orderedMove/orderedSwap. */
+export interface OrderedSetApplyOptions {
+  /** Required — the op's OT identity (see Node's ordered* docs). */
+  id: OrderedSetOpId;
+  /**
+   * Optional causal context (max 16), i.e. the op ids the issuing replica
+   * had already seen when it issued this op. Required for cross-replica
+   * replays; omit for locally-issued ops.
+   */
+  deps?: OrderedSetOpId[];
+}
+
 export interface HandlerState {
   incrementCounter(name: string, delta?: number, nodeId?: string): void;
   incrementPNCounter(name: string, delta?: number, nodeId?: string): void;
@@ -431,6 +453,49 @@ export interface Node {
   setRemove(name: string, element: string): void;
   flagSet(name: string, setBy: string, setAt?: number): void;
   flagValue(name: string): boolean;
+
+  // ============================================================
+  // Ordered set (OT_ORDERED_SET, v1.5 §5 — recipe 8)
+  // ============================================================
+  /**
+   * Create an OT ordered-set item (data type 0x10) on this machine.
+   * The item carries its own op log + transform matrix; apply ops with
+   * orderedInsert/orderedDelete/orderedMove/orderedSwap, read it back with
+   * getOrderedSet.
+   */
+  addOrderedSet(name: string): void;
+  /**
+   * Visible elements of the ordered set in materialized order (tombstones
+   * skipped), each element's payload value decoded as UTF-8. Throws
+   * resource_not_found for an unknown or non-ordered-set name.
+   */
+  getOrderedSet(name: string): { elements: string[] };
+  /**
+   * Apply ONE ordered-set op through the machine executor, signed with the
+   * node key under the bootstrap admin (the createTrigger idiom — install
+   * the op type's policy first:
+   * setPolicy('__execute_ot__', 'role:admin')).
+   *
+   * options.id is required: { node, seq, ts? } is the op's OT identity —
+   * replaying the SAME id (and the same payload/position) is a silent no-op.
+   * options.deps (optional, max 16) is the causal context the ISSUER had at
+   * issue time; cross-replica replays need it or the transform treats the
+   * replica's prior ops as concurrent and shifts positions.
+   */
+  orderedInsert(name: string, element: string, position: number,
+                options: OrderedSetApplyOptions): void;
+  /** Tombstone the element at `position` (deletes travel like any other op). */
+  orderedDelete(name: string, position: number,
+                options: OrderedSetApplyOptions): void;
+  /** Move the element at `fromPosition` to `toPosition`. */
+  orderedMove(name: string, fromPosition: number, toPosition: number,
+              options: OrderedSetApplyOptions): void;
+  /**
+   * Exchange the VALUES of the two positions' elements in place — a local
+   * value exchange, not a placement op (recipe 8's caveat).
+   */
+  orderedSwap(name: string, positionA: number, positionB: number,
+              options: OrderedSetApplyOptions): void;
 
   setPolicy(opType: string, expression: string): void;
   /**

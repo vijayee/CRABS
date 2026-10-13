@@ -43,6 +43,15 @@ crabs_error_e crabs_execute_ot_operation(state_t* state, operation_t* op);
 uint32_t crabs_extract_ot_ops(const uint8_t* payload, uint32_t payload_size,
                               crabs_ot_operation_t** ops_out);
 
+// Encode OT operations into the wire payload format parsed by
+// crabs_extract_ot_ops (its inverse, defined right below the extractor).
+// Returns the number of bytes written, or 0 when ops is NULL, count is
+// outside the extractable range (1..1024 — the extractor's literal cap), or
+// an op's payload/dep list does not fit in buffer_size. The caller owns the
+// buffer.
+uint32_t crabs_ot_ops_to_wire(const crabs_ot_operation_t* ops, uint32_t count,
+                              uint8_t* buffer, uint32_t buffer_size);
+
 // Transform an OT operation against concurrent operations in the op log
 // Applies both forward and reverse transforms per spec §8.2 step 7
 crabs_error_e crabs_transform_ot_op(crabs_ot_operation_t* op,

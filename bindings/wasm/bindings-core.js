@@ -169,6 +169,71 @@ function encodeText(str) {
   return new Uint8Array(Buffer.from(str, 'utf8'));
 }
 
+// ============================================================
+// Ordered-set (OT_ORDERED_SET) constants + validation helpers
+// ============================================================
+// Mirrors src/OT/ot_types.h — keep in lockstep with the C enum values.
+
+const OT_OP_INSERT = 1; // CRABS_OT_OP_INSERT
+const OT_OP_DELETE = 2; // CRABS_OT_OP_DELETE
+const OT_OP_MOVE   = 4; // CRABS_OT_OP_MOVE
+const OT_OP_SWAP   = 5; // CRABS_OT_OP_SWAP
+
+const OT_MAX_DEPS = 16;          // CRABS_OT_MAX_DEPS
+const OT_ELEMENT_MAX_BYTES = 4096; // CRABS_OT_MAX_PAYLOAD (wasm export copies
+                                  // at most this per element)
+
+const OT_TEXT_ENCODER = { encode: (text) => encodeText(text) };
+const OT_TEXT_DECODER = typeof TextDecoder !== 'undefined'
+  ? new TextDecoder()
+  : { decode: (bytes) => Buffer.from(bytes).toString('utf8') };
+
+function validateOrderedPosition(position, context, minimum) {
+  if (!Number.isInteger(position) || position < minimum ||
+      position > Number.MAX_SAFE_INTEGER) {
+    throw new RangeError(
+      `${context}: position must be an integer >= ${minimum}`);
+  }
+  return position;
+}
+
+function validateOrderedElement(element, context) {
+  const byteLength = encodeText(element).length;
+  if (byteLength > OT_ELEMENT_MAX_BYTES) {
+    throw new RangeError(
+      `${context}: element payload exceeds the ${OT_ELEMENT_MAX_BYTES}-byte OT limit (${byteLength} bytes)`);
+  }
+}
+
+// Pack ordered-set causal deps into the C exporter's record layout: each
+// record is node_id as up-to-63 NUL-padded bytes + sequence_num (u64le) +
+// timestamp (u64le) — 80 bytes (see OT_DEP_RECORD_SIZE in wasm_helpers.c).
+function packOrderedDeps(deps, context) {
+  const bytes = new Uint8Array(deps.length * 80);
+  const view = new DataView(bytes.buffer);
+  let offset = 0;
+  for (const dep of deps) {
+    if (!dep || typeof dep !== 'object' || typeof dep.node !== 'string' ||
+        dep.node.length === 0) {
+      throw new TypeError(
+        `${context}: each dep must be { node: string, seq: number, ts?: number }`);
+    }
+    if (!Number.isInteger(dep.seq) || dep.seq < 0) {
+      throw new TypeError(`${context}: dep "${dep.node}" needs an integer seq`);
+    }
+    const nodeBytes = encodeText(dep.node);
+    if (nodeBytes.length >= 64) {
+      throw new RangeError(
+        `${context}: dep node id "${dep.node}" exceeds 63 bytes`);
+    }
+    bytes.set(nodeBytes, offset);
+    view.setBigUint64(offset + 64, BigInt(dep.seq), true);
+    view.setBigUint64(offset + 72, BigInt(dep.ts === undefined ? 0 : dep.ts), true);
+    offset += 80;
+  }
+  return bytes;
+}
+
 const ERROR_MESSAGES = {
   0x0000: 'success',
   0x1001: 'protocol_violation', 0x1002: 'lock_token_mismatch', 0x1003: 'lock_owner_mismatch',
@@ -188,6 +253,9 @@ const ERROR_MESSAGES = {
   0xA004: 'ordering_path', 0xA005: 'quarantined',
   0xA006: 'ordering_pending', 0xA007: 'ordering_not_leader',
   0xA008: 'ordering_change_in_flight',
+  // 0x8xxx: OT errors (v1.5 §8)
+  0x8001: 'no_ot_ops', 0x8002: 'not_ot_type', 0x8003: 'ot_transform_depth',
+  0x8004: 'ot_position_bounds',
 };
 
 function crabsError(code, ctx) {
@@ -486,10 +554,11 @@ const TRUST_MODE = {
 const DATA_TYPE = {
   COUNTER: 0x01, PN_COUNTER: 0x02, SET: 0x03, REGISTER: 0x05,
   ONE_SHOT_SET: 0x08, ONE_SHOT_FLAG: 0x09,
+  OT_ORDERED_SET: 0x10,
 };
 const CRDT_TYPE = {
   G_COUNTER: 0x01, PN_COUNTER: 0x02, OR_SET: 0x03, LWW_REG: 0x05,
-  ONE_SHOT_SET: 0x08, ONE_SHOT_FLAG: 0x09,
+  ONE_SHOT_SET: 0x08, ONE_SHOT_FLAG: 0x09, CUSTOM: 0xFF,
 };
 
 // JS wrapper over the C machine_blueprint_t. JS OWNS the blueprint: it must
@@ -993,6 +1062,130 @@ class Node {
     const rc = M._crabs_wasm_one_shot_flag_set(this._am, nPtr, sPtr, BigInt(setAt));
     freeAll(M, nPtr, sPtr);
     wrapRc(rc, 'flagSet');
+  }
+
+  // ============================================================
+  // Ordered set (OT_ORDERED_SET, v1.5 §5) — recipe 8
+  // ============================================================
+
+  addOrderedSet(name) {
+    this._callAdd(this._M._crabs_wasm_add_ordered_set, name, 'addOrderedSet');
+  }
+
+  // Visible elements in materialized order (tombstones skipped), each
+  // element's payload value decoded as UTF-8. Throws resource_not_found for
+  // an unknown / non-ordered-set name.
+  getOrderedSet(name) {
+    const M = this._M;
+    const namePtr = writeString(M, name);
+    const count = M._crabs_wasm_ot_ordered_count(this._am, namePtr);
+    if (count < 0n) {
+      M._free(namePtr);
+      throw crabsError(0x3002, 'getOrderedSet');
+    }
+    const bufPtr = M._malloc(OT_ELEMENT_MAX_BYTES);
+    const elements = new Array(Number(count));
+    try {
+      for (let position = 0; position < Number(count); position++) {
+        const elementLength = M._crabs_wasm_ot_ordered_element(
+          this._am, namePtr, position, bufPtr, OT_ELEMENT_MAX_BYTES);
+        if (elementLength < 0) throw crabsError(0x3002, 'getOrderedSet');
+        elements[position] =
+          OT_TEXT_DECODER.decode(M.HEAPU8.subarray(bufPtr, bufPtr + elementLength));
+      }
+    } finally {
+      freeAll(M, namePtr, bufPtr);
+    }
+    return { elements };
+  }
+
+  // ---- Ordered-set mutation sugar ------------------------------------------
+  //
+  // Every call routes ONE ordered-set op through the machine as a
+  // __execute_ot__ op: composed, signed with the node key under the
+  // bootstrap admin (the createTrigger idiom — the caller installs the type's
+  // policy first: setPolicy('__execute_ot__', 'role:admin')) and executed.
+  // The C exporter validates positions against the live visible count before
+  // anything is signed,
+  //
+  //   orderedInsert(name, element, position, options)
+  //   orderedDelete(name, position, options)
+  //   orderedMove(name, fromPosition, toPosition, options)
+  //   orderedSwap(name, positionA, positionB, options)
+  //
+  // options (required):
+  //   id:  { node, seq, ts? }  — the op's OT identity (deduplicated on
+  //        replay by (node, seq): a replay with the SAME id and args is a
+  //        silent no-op).
+  //   deps: [{ node, seq, ts? }, ...] — causal context the ISSUER had at
+  //        issue time (max 16). Cross-replica replays need it: without deps
+  //        the transform treats the replica's prior ops as concurrent and
+  //        shifts positions wrongly.
+
+  orderedInsert(name, element, position, options) {
+    this._orderedSetApply(name, OT_OP_INSERT,
+      { first: validateOrderedPosition(position, 'orderedInsert', 0) },
+      element, options, 'orderedInsert');
+  }
+
+  orderedDelete(name, position, options) {
+    this._orderedSetApply(name, OT_OP_DELETE,
+      { first: validateOrderedPosition(position, 'orderedDelete', 0) },
+      null, options, 'orderedDelete');
+  }
+
+  orderedMove(name, fromPosition, toPosition, options) {
+    this._orderedSetApply(name, OT_OP_MOVE, {
+      first: validateOrderedPosition(fromPosition, 'orderedMove.fromPosition', 0),
+      second: validateOrderedPosition(toPosition, 'orderedMove.toPosition', 0),
+    }, null, options, 'orderedMove');
+  }
+
+  orderedSwap(name, positionA, positionB, options) {
+    this._orderedSetApply(name, OT_OP_SWAP, {
+      first: validateOrderedPosition(positionA, 'orderedSwap.positionA', 0),
+      second: validateOrderedPosition(positionB, 'orderedSwap.positionB', 0),
+    }, null, options, 'orderedSwap');
+  }
+
+  _orderedSetApply(name, opKind, positions, element, options, ctx) {
+    const M = this._M;
+    if (!options || typeof options.id !== 'object' || options.id === null) {
+      throw new Error(`${ctx}: id is required — { node, seq, ts? } fixes the op's OT identity`);
+    }
+    const id = options.id;
+    if (typeof id.node !== 'string' || id.node.length === 0) {
+      throw new Error(`${ctx}: id.node is required (string, the issuing replica's id)`);
+    }
+    if (!Number.isInteger(id.seq) || id.seq < 0) {
+      throw new Error(`${ctx}: id.seq is required (integer >= 0, unique per ${id.node})`);
+    }
+    if (id.ts !== undefined && (!Number.isInteger(id.ts) || id.ts < 0)) {
+      throw new Error(`${ctx}: id.ts must be a non-negative integer ms stamp`);
+    }
+    const deps = options.deps === undefined ? [] : options.deps;
+    if (!Array.isArray(deps) || deps.length > OT_MAX_DEPS) {
+      throw new Error(`${ctx}: deps must be an array of at most ${OT_MAX_DEPS} { node, seq, ts? } ids`);
+    }
+    if (typeof element === 'string') {
+      validateOrderedElement(element, ctx);
+    }
+
+    const idNodePtr = writeString(M, id.node);
+    const elementBytes = element === null || element === undefined
+      ? { ptr: 0, len: 0 }
+      : writeBytes(M, OT_TEXT_ENCODER.encode(element));
+    const depsPtr = writeBytes(M, packOrderedDeps(deps, ctx));
+    const namePtr = writeString(M, name);
+    const rc = M._crabs_wasm_ot_apply(
+      this._am, namePtr, opKind,
+      BigInt(positions.first),
+      BigInt(positions.second === undefined ? 0 : positions.second),
+      elementBytes.ptr, elementBytes.len,
+      idNodePtr, BigInt(id.seq), BigInt(id.ts === undefined ? 0 : id.ts),
+      depsPtr, deps.length);
+    freeAll(M, namePtr, idNodePtr, elementBytes.ptr, depsPtr);
+    wrapRc(rc, ctx);
   }
 
   execute(op) {
