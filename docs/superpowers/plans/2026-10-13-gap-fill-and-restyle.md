@@ -233,7 +233,7 @@ Concrete concept-notes per page (the new "The problem"/"The idea" seeds — expa
 - 03 execute-once: problem = double-applied webhooks; idea = monotone flags and why "skip if seen" needs the seen-set to be part of the state.
 - 04 roles-and-policies: problem = who may close the merge request; idea = authorization inputs are state transitions, not config.
 - 05 member-profile: problem = two tabs editing one profile; idea = LWW and why tie-break needs order, not timestamps alone.
-- [ ] Pages 01-05 restructured per procedure, builds green, commits `docs(cookbook): restructure recipe 0N into teaching form`.
+- [x] Pages 01-05 restructured per procedure, builds green, commits `docs(cookbook): restructure recipe 0N into teaching form` (991c024, b9ee174, e6d095c, 4d758e4, dc76a1d — one per page, 2026-10-13).
 
 ### Task B3: restructure Conditions + Convergence (06, 07, 8, 8b)
 
