@@ -117,14 +117,19 @@ typedef struct raft_persist_request_node_t {
 // Vote traffic WITHHELD until the term/votedFor record is durable (carry
 // item A): a grant response never leaves the reactor before the header
 // batch carrying that grant is acked, and a candidacy solicitation waits
-// the same way. Holds from superseded terms drop at flush time.
+// the same way. Holds from superseded terms drop at flush time. The same
+// gate covers APPEND_RESP: the match_index a follower reports counts
+// toward the leader's commit, so it flows only once the persist batch
+// covering the stored suffix acks (two-sided durability for every
+// effectiveness claim).
 typedef struct raft_held_msg_t {
-  raft_msg_kind_e kind;    // RAFT_MSG_VOTE_REQ or RAFT_MSG_VOTE_RESP only
+  raft_msg_kind_e kind;    // VOTE_REQ, VOTE_RESP, or APPEND_RESP
   uint64_t term;
   char     to_peer[CRABS_MAX_USER_ID];
   bool     granted;        // VOTE_RESP payload
   uint64_t last_log_term;  // VOTE_REQ payload
   uint64_t last_log_index;
+  uint64_t match_index;    // APPEND_RESP payload (accepted_match)
   struct raft_held_msg_t* next;
 } raft_held_msg_t;
 
@@ -215,6 +220,11 @@ typedef struct crabs_raft_module_s {
 // Forward: the persistence window is shared by the propose, append and tick
 // paths (defined in the parsing/persistence sections below).
 static bool _raft_emit_persist_request(crabs_raft_module_s* module);
+// Forward: the durability-hold flush (below) delivers held append responses
+// through the message marshaller (defined in the marshaling section).
+static bool _raft_marshal_append_response(crabs_raft_module_s* module,
+                                          const char* to_peer, bool success,
+                                          uint64_t match_index);
 // Forward: replication fan-out and quorum bookkeeping (leader side, Phase 2).
 static void _raft_send_append_to(crabs_raft_module_s* module,
                                  uint32_t member_index);
@@ -701,7 +711,8 @@ static bool _raft_marshal_vote_response(crabs_raft_module_s* module,
 // pure.
 static void _raft_hold_msg(crabs_raft_module_s* module, raft_msg_kind_e kind,
                            uint64_t term, const char* to_peer, bool granted,
-                           uint64_t last_log_term, uint64_t last_log_index) {
+                           uint64_t last_log_term, uint64_t last_log_index,
+                           uint64_t match_index) {
   raft_held_msg_t* held =
       (raft_held_msg_t*)get_clear_memory(sizeof(raft_held_msg_t));
   held->kind = kind;
@@ -710,6 +721,7 @@ static void _raft_hold_msg(crabs_raft_module_s* module, raft_msg_kind_e kind,
   held->granted = granted;
   held->last_log_term = last_log_term;
   held->last_log_index = last_log_index;
+  held->match_index = match_index;
   held->next = module->held_msgs;
   module->held_msgs = held;
 }
@@ -733,7 +745,17 @@ static void _raft_flush_held_msgs(crabs_raft_module_s* module) {
       verdict = RETAIN;
     } else {
       // Header durable at this term: releases iff the durable vote agrees.
-      if (held->granted &&
+      if (held->kind == RAFT_MSG_APPEND_RESP) {
+        // The append response's match counts toward commit only while the
+        // stored suffix it covers IS durable. A suffix that a later
+        // truncation discarded never re-arms a window over it — drop.
+        if (held->match_index > module->last_log_index) {
+          verdict = DROP;
+        } else {
+          verdict = module->durable_upto >= held->match_index
+                        ? DELIVER : RETAIN;
+        }
+      } else if (held->granted &&
           strncmp(module->durable_voted_for, held->to_peer,
                   CRABS_MAX_USER_ID) != 0) {
         // A grant is effective only when the durable record carries it.
@@ -757,6 +779,9 @@ static void _raft_flush_held_msgs(crabs_raft_module_s* module) {
       } else if (held->kind == RAFT_MSG_VOTE_RESP) {
         _raft_marshal_vote_response(module, held->to_peer, held->term,
                                     held->granted);
+      } else if (held->kind == RAFT_MSG_APPEND_RESP) {
+        _raft_marshal_append_response(module, held->to_peer, true,
+                                      held->match_index);
       }
     }
     free(held);
@@ -1014,7 +1039,7 @@ static void _raft_handle_vote_request(crabs_raft_module_s* module,
     // header batch is durable — hold the response out of the reactor and
     // arm the header batch immediately (no tick required).
     _raft_hold_msg(module, RAFT_MSG_VOTE_RESP, module->current_term,
-                   candidate_id, true, 0, 0);
+                   candidate_id, true, 0, 0, 0);
     _raft_emit_persist_request(module);
     return;
   }
@@ -1238,6 +1263,17 @@ static void _raft_handle_append_request(crabs_raft_module_s* module,
     _raft_emit_persist_request(module);
   }
   _raft_advance_commit(module);
+  // Two-sided durability covers replication traffic: accepted_match is the
+  // match_index the leader counts toward commit, so a response naming an
+  // undurable suffix is HELD behind the persist batch (supersede-by-term
+  // flush mechanics — the vote-response hold, extended). A match already
+  // durable (heartbeat over a settled tail, idempotent duplicate) flows
+  // immediately.
+  if (accepted_match > module->durable_upto) {
+    _raft_hold_msg(module, RAFT_MSG_APPEND_RESP, module->current_term,
+                   leader_id, true, 0, 0, accepted_match);
+    return;
+  }
   _raft_marshal_append_response(module, leader_id, true, accepted_match);
 }
 
@@ -1621,7 +1657,8 @@ static void _raft_begin_election(crabs_raft_module_s* module, uint64_t now_ms) {
     // Carry item A: the term+self-vote must be durable BEFORE any
     // solicitation is effective — hold them behind the header batch.
     _raft_hold_msg(module, RAFT_MSG_VOTE_REQ, module->current_term, peer_id,
-                   false, tail != NULL ? tail->term : 0, module->last_log_index);
+                   false, tail != NULL ? tail->term : 0,
+                   module->last_log_index, 0);
   }
 }
 

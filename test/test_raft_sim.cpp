@@ -1330,6 +1330,100 @@ TEST(RaftSimHarness, SlowPersistFollowerLagsThenConverges) {
   EXPECT_EQ(memcmp(caught_up_value->value, "slow-decree", 10), 0);
   sim_host_destroy(&host);
 }
+TEST(RaftSimHarness, FollowerAcksWaitForTheirOwnDurability) {
+  // Two-sided durability covers replication traffic, not just votes: the
+  // follower's APPEND_RESP is the match_index the leader counts toward
+  // commit, so a leader-durable + follower-undurable ack must NEVER quorum.
+  // Construct: leader + 2 followers whose hosts BOTH hold their persist
+  // windows (a follower crash replay resolves via recover_from_persist);
+  // the quorum (2 of 3) can only close on a DURABLE follower match — every
+  // entry waits while a needed matcher stays undurable.
+  sim_host_t host = sim_host_make();
+  sim_cluster_attach(&host, nullptr);
+  sim_run_until(&host, 100, 40, sim_pred_any_leader);
+  int leader_index = sim_find_leader(&host);
+  ASSERT_GE(leader_index, 0);
+  uint32_t follower_a = (uint32_t)(leader_index + 1) % 3;
+  uint32_t follower_b = (uint32_t)(leader_index + 2) % 3;
+
+  // Settle the leadership no-op (baseline tip 1 everywhere, all durable).
+  sim_target_tip = 1;
+  sim_run_until(&host, 100, 40, sim_pred_target_tips);
+  sim_target_tip = 0;
+
+  // From here the leader's own tail persists normally; both followers stall.
+  host.nodes[follower_a].auto_persist = false;
+  host.nodes[follower_b].auto_persist = false;
+  uint8_t decree_uuid[CRABS_UUID_SIZE];
+  ASSERT_EQ(sim_submit_write(&host, (uint32_t)leader_index, "council_write",
+                             "council", "quorum-decree", decree_uuid),
+            CRABS_ERR_ORDERING_PENDING);
+
+  // The undurable followers' append responses are HELD behind their persist
+  // batches: the leader's quorum count stays at its own durable match (1 of
+  // 3) — nothing commits, nothing notifies, and the followers materialize
+  // nothing while undurable.
+  sim_delivery_tally_t tally = {};
+  for (uint32_t turn = 0; turn < 12; turn++) {
+    sim_step(&host, 100, &tally);
+  }
+  EXPECT_EQ(crabs_raft_module_committed_tip(
+                host.nodes[leader_index].module), 1u);
+  EXPECT_EQ(tally.committed_count[leader_index], 0u);
+  EXPECT_EQ(tally.committed_count[follower_a], 0u);
+  EXPECT_EQ(tally.committed_count[follower_b], 0u);
+  EXPECT_EQ(sim_state_uuid_occurrences(host.nodes[follower_a].state,
+                                       decree_uuid), 0u);
+
+  // Crash-replay consistency: follower_b's held bytes are exactly what its
+  // host stored before "crashing" — playing them back resolves cleanly.
+  crabs_raft_persist_request_t held_window;
+  ASSERT_TRUE(crabs_raft_module_poll_persist(
+                  host.nodes[follower_b].module, &held_window));
+  std::vector<uint8_t> stored_batch(held_window.bytes,
+                                    held_window.bytes + held_window.len);
+  EXPECT_EQ(crabs_raft_module_recover_from_persist(
+                host.nodes[follower_b].module, stored_batch.data(),
+                stored_batch.size()), CRABS_SUCCESS);
+
+  // The window acks AFTER the replay: the held response flushes, the match
+  // becomes durable, and the quorum closes — commit (and materialization)
+  // advances for follower_b while the still-undurable follower_a waits.
+  host.nodes[follower_b].auto_persist = true;
+  uint32_t settle_turns = 0;
+  while ((crabs_raft_module_committed_tip(
+              host.nodes[leader_index].module) != 2u ||
+          crabs_raft_module_committed_tip(
+              host.nodes[follower_b].module) != 2u) &&
+         settle_turns < 30) {
+    sim_step(&host, 100, nullptr);
+    settle_turns++;
+  }
+  EXPECT_EQ(crabs_raft_module_committed_tip(
+                host.nodes[leader_index].module), 2u);
+  EXPECT_EQ(crabs_raft_module_committed_tip(
+                host.nodes[follower_b].module), 2u);
+  EXPECT_EQ(sim_state_uuid_occurrences(host.nodes[follower_b].state,
+                                       decree_uuid), 1u);
+  EXPECT_EQ(crabs_raft_module_committed_tip(
+                host.nodes[follower_a].module), 1u);
+  EXPECT_EQ(sim_state_uuid_occurrences(host.nodes[follower_a].state,
+                                       decree_uuid), 0u);
+
+  // follower_a's host finally answers: the same hold/flush mechanics close
+  // its commit tip too (idempotent materialization, no duplicates).
+  host.nodes[follower_a].auto_persist = true;
+  settle_turns = 0;
+  while (crabs_raft_module_committed_tip(
+             host.nodes[follower_a].module) != 2u &&
+         settle_turns < 30) {
+    sim_step(&host, 100, nullptr);
+    settle_turns++;
+  }
+  EXPECT_EQ(sim_state_uuid_occurrences(host.nodes[follower_a].state,
+                                       decree_uuid), 1u);
+  sim_host_destroy(&host);
+}
 TEST(RaftSimHarness, RestartSaveLoadSaveCarriesModuleSectionAndPending) {
   // Carried items 3+4, end to end: (a) the pending proposal list and the
   // module log round-trip through the v16 module section; (b) the attach
@@ -1929,6 +2023,14 @@ TEST(RaftMembership, SingleNodeJointAddThenRemoveCompletesSafely) {
   sim_target_tip = 0;
   sim_pred_config_expected = 2;
   sim_run_until(&host, 100, 40, sim_pred_config_count);
+  // The standby's durable-match hold means it learns the commit tip one
+  // round-trip behind the leader's advance — settle alpha onto the plain
+  // pair config before asserting both nodes agree.
+  sim_run_until(&host, 100, 40, [](sim_host_t* settling_host) {
+    crabs_raft_module_t* standby = settling_host->nodes[1].module;
+    return crabs_raft_module_joint_members(standby, nullptr) == 0 &&
+           crabs_raft_module_committed_members(standby, nullptr) == 2u;
+  });
   for (uint32_t node_index = 0; node_index < host.node_count; node_index++) {
     EXPECT_EQ(crabs_raft_module_joint_members(
                   host.nodes[node_index].module, nullptr), 0u);
