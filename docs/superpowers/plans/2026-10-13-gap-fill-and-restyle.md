@@ -1,6 +1,6 @@
 # CRABS Cookbook Gap-Fill + Teaching-Restyle — Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [x]`) syntax for tracking.
 
 **Goal:** Fill every gap the cookbook documents (dedup JS, node schedules, OT ordered set JS, locks/tx-manager JS, attestation consumption, ABE decrypt + wasm getUser stub, documented divergences), correct the cookbook's stale ordering-module finding, remove the hardware-attestation recipe, then restyle all 16 recipe pages per `cookbook/STYLE.md`.
 
@@ -52,7 +52,7 @@ Phase B adds: `cookbook/site/build.mjs` (hub learning path), recipe restructures
 - Modify: `bindings/wasm/index.d.ts` (if UserInfo doc lines change)
 - Test: `bindings/wasm/test/getuser-readback.js` (new)
 
-- [ ] **Step 1: Failing JS test** — new `bindings/wasm/test/getuser-readback.js` (mirror `smoke.js` prelude: `Node.create('admin', {ordering:'hlc'})`, `KeyPair.generate`, `registerUser('alice', key.publicKeyHex(), 'adult')`), asserting after `grantRole('alice','role','member','admin')`:
+- [x] **Step 1: Failing JS test** — new `bindings/wasm/test/getuser-readback.js` (mirror `smoke.js` prelude: `Node.create('admin', {ordering:'hlc'})`, `KeyPair.generate`, `registerUser('alice', key.publicKeyHex(), 'adult')`), asserting after `grantRole('alice','role','member','admin')`:
 ```js
 const user = node.getUser('alice');
 assert.strictEqual(user.keyVersion, 1);          // stamped at grant (attribute_machine.c:597,617)
@@ -61,8 +61,8 @@ assert.ok(user.publicKeyHex.length === 66);      // 33 bytes hex
 const role = user.attributes.find(a => a.value === 'member');
 assert.strictEqual(role.verifiedBy, 'admin');
 ```
-- [ ] **Step 2: Run** `node bindings/wasm/test/getuser-readback.js` — expect FAIL (`keyVersion` is hardcode-0, `publicKeyHex` empty).
-- [ ] **Step 3: Add C exports** in `wasm_helpers.c` following the `crabs_wasm_user_attr_*` idiom (:981-997 read the same `user_t*`; `attribute_machine.h:81-98` has `public_key[33]`, `status`, `key_version`; attr entries carry `verified_by`):
+- [x] **Step 2: Run** `node bindings/wasm/test/getuser-readback.js` — expect FAIL (`keyVersion` is hardcode-0, `publicKeyHex` empty).
+- [x] **Step 3: Add C exports** in `wasm_helpers.c` following the `crabs_wasm_user_attr_*` idiom (:981-997 read the same `user_t*`; `attribute_machine.h:81-98` has `public_key[33]`, `status`, `key_version`; attr entries carry `verified_by`):
 ```c
 int64_t  crabs_wasm_user_key_version(void* user);
 int32_t  crabs_wasm_user_status(void* user);
@@ -71,9 +71,9 @@ const char* crabs_wasm_user_attr_verified_by(void* user, int32_t index);
 uint64_t crabs_wasm_user_attr_expires_at(void* user, int32_t index);
 ```
 Add matching declarations to `wasm_init.c`'s EXPORT list (grep how `crabs_wasm_user_attr_value` is registered there and follow).
-- [ ] **Step 4: Map in bindings-core.js** — replace the stubbed return (:699-706 fragment) using the existing `readString`/hex idiom used elsewhere in that file; the status switch mirrors `crabs_node.cc:1183-1187` (`active`/`suspended`/`revoked`).
-- [ ] **Step 5: Test green** + run `node bindings/wasm/test/smoke.js` (no regression) + `bash cookbook/tests/run-c.sh | tail -1`.
-- [ ] **Step 6: Commit** `fix: wasm getUser returns real keyVersion, status, publicKey, verifiedBy`.
+- [x] **Step 4: Map in bindings-core.js** — replace the stubbed return (:699-706 fragment) using the existing `readString`/hex idiom used elsewhere in that file; the status switch mirrors `crabs_node.cc:1183-1187` (`active`/`suspended`/`revoked`).
+- [x] **Step 5: Test green** + run `node bindings/wasm/test/smoke.js` (no regression) + `bash cookbook/tests/run-c.sh | tail -1`.
+- [x] **Step 6: Commit** `fix: wasm getUser returns real keyVersion, status, publicKey, verifiedBy`.
 
 ### Task A2: temp-attr representation — node's plain token wins
 
@@ -92,7 +92,7 @@ Add matching declarations to `wasm_init.c`'s EXPORT list (grep how `crabs_wasm_u
 **Files:**
 - Modify: `bindings/node/src/crabs_node.cc:1846-1862` (replace hardcoded sign-block keyed to `'admin'` with the machine's admin identity used by every other node op path — read `crabs_node.cc` `DefineItem`/`Execute` to see what id the wrapper normally stamps; the bug is ONLY if the node wrapper fabricates `'admin'` when the machine's admin is named otherwise).
 - Test: add to `bindings/node/test/test.js` (follow existing style) — machine created with admin id `'chair'` (NOT `'admin'`), then `node.createTrigger(...)` must succeed (it failed/signed-as-'admin' before) and the trigger grant's `verifiedBy`/signer is `chair` (assert whatever field the machine exposes).
-- [ ] **Step 1: Failing test** (admin named `'chair'`; createTrigger → expect success where the old code produced `key_stale`/wrong-signer behavior). [ ] **Step 2:** run → FAIL. [ ] **Step 3:** fix the signer stamping. [ ] **Step 4:** green + `node cookbook/snippets/node/06-moderation.js` (that snippet has the "machine must be created with admin id `'admin'`" workaround note — update the snippet + recipe 6 note once the constraint is gone). [ ] **Step 5: Commit** `fix: crabs-node createTrigger signs with the machine's real admin identity`.
+- [x] **Step 1: Failing test** (admin named `'chair'`; createTrigger → expect success where the old code produced `key_stale`/wrong-signer behavior). [ ] **Step 2:** run → FAIL. [ ] **Step 3:** fix the signer stamping. [ ] **Step 4:** green + `node cookbook/snippets/node/06-moderation.js` (that snippet has the "machine must be created with admin id `'admin'`" workaround note — update the snippet + recipe 6 note once the constraint is gone). [ ] **Step 5: Commit** `fix: crabs-node createTrigger signs with the machine's real admin identity`.
 
 ### Task A4: dissolve-after-revoke reconciliation
 
@@ -160,7 +160,7 @@ Add matching declarations to `wasm_init.c`'s EXPORT list (grep how `crabs_wasm_u
 - Modify: `bindings/wasm/bindings-core.js`: `node.abeKeygen(attrs) -> object` and `node.abeDecrypt(key, encrypted)` (shape parallels the existing `encrypt` pipeline at :1050-1081). Node binding: same two methods via `crabs_node.cc`.
 - Note: the machine-owned-MSK decision means the ADMIN (anyone controlling the machine) derives keys — the recipes frame this as "the machine derives a reader key for the reader's attribute set".
 - Test: `bindings/wasm/test/` + node: full round trip encrypt→keygen→decrypt==plaintext + wrong-attrs keygen refuses decrypt (mirrors `test_crypto.cpp:249-301`).
-- [ ] Steps: TDD; cookbook: recipe 6's ABE GAP block replaced with round-trip snippet; recipe 16's decrypt gap likewise; both statuses COMPLETE where the rest of their surfaces are real. [ ] **Commit** `feat: ABE keygen and decrypt from JS with machine-held master key`.
+- [x] Steps: TDD; cookbook: recipe 6's ABE GAP block replaced with round-trip snippet; recipe 16's decrypt gap likewise; both statuses COMPLETE where the rest of their surfaces are real. [ ] **Commit** `feat: ABE keygen and decrypt from JS with machine-held master key`.
 
 ### Task A12: cookbook corrections — recipe 14 runnable, recipe 15 deleted
 
@@ -171,13 +171,13 @@ Add matching declarations to `wasm_init.c`'s EXPORT list (grep how `crabs_wasm_u
 - api-map: delete R15 row, renumber R16→R15, update R2/R3/R7/R8/R9/R12 rows to reflect the new bindings (each with real file:line from this phase's code).
 - [x] Steps: rebuild (`node cookbook/site/build.mjs` → "Built 16 recipe pages"), hub rows correct, snippets harness green. [x] **Commit** `docs(cookbook): ordering module is real (recipe 14 runnable); drop hw attestation; renumber` — done across 450da07 (recipe 14 runnable: wasm HAS the attachRaft surface — languages wasm node, status COMPLETE; snippets cookbook/snippets/{node,wasm}/14-strict-ordering-market.js) + 7d7fa3e (hw recipe deleted, 16→15 renumbered with the snippet files) + 1917e30 (api-map refresh: §17 R14 rewritten from source, R15-hw row deleted, R16→R15, §17 heading 2–15, §11 gains the raft block with verified cites, §1–§8/§10/§12/§14/§15 line cites re-verified against the 790/753-line d.ts files; hub/landing say fifteen recipes + one honest gap page; recipes 4/5 keyVersion/verifiedBy notes match the post-A1 readbacks). run-snippets 30/30 green, run-c.sh green, browser.js green.
 
-### Task A13: wasm artifact regeneration + full Phase A verification
+### Task A13: wasm artifact regeneration + full Phase A verification — DONE (regen woven into A1/A4/A6/A9/A10/A11 + the standalone `fee41f0` cleanses regen; battery green 55 commits; final review READY)
 
 **Files:** `bindings/wasm/crabs.js`, `crabs.wasm`, `crabs.dev.js`, `crabs.dev.wasm` (committed artifacts).
-- [ ] **Step 1: Regenerate:** `OPENSSL_SRC=/tmp/openssl-3.4.0 bash build_wasm.sh` (per `bindings/wasm/package.json` build script; if `/tmp/openssl-3.4.0` is absent locally, follow the openabe-c fork build path the repo committed before — the last artifact commit shows the exact flow; report the flag set used).
-- [ ] **Step 2:** rerun EVERYTHING: `node bindings/wasm/test/smoke.js` + full wasm test chain (`package.json` test script), cookbook harnesses, `bash cookbook/tests/run-c.sh`, CMake + `ctest --test-dir build`, `node cookbook/tests/browser.js`.
-- [ ] **Step 3: Commit** `chore: regenerate wasm artifacts (dedup, schedules-parity, OT, claims, ABE decrypt, trigger signer)`.
-- [ ] **Step 4: Final Phase A review** — spec compliance + quality reviewer passes over the branch, then merge `gap-fill` to master (finishing-a-development-branch flow). Phase B starts from the merged master.---
+- [x] **Step 1: Regenerate:** `OPENSSL_SRC=/tmp/openssl-3.4.0 bash build_wasm.sh` (per `bindings/wasm/package.json` build script; if `/tmp/openssl-3.4.0` is absent locally, follow the openabe-c fork build path the repo committed before — the last artifact commit shows the exact flow; report the flag set used).
+- [x] **Step 2:** rerun EVERYTHING: `node bindings/wasm/test/smoke.js` + full wasm test chain (`package.json` test script), cookbook harnesses, `bash cookbook/tests/run-c.sh`, CMake + `ctest --test-dir build`, `node cookbook/tests/browser.js`.
+- [x] **Step 3: Commit** `chore: regenerate wasm artifacts (dedup, schedules-parity, OT, claims, ABE decrypt, trigger signer)`.
+- [x] **Step 4: Final Phase A review** — spec compliance + quality reviewer passes over the branch, then merge `gap-fill` to master (finishing-a-development-branch flow). Phase B starts from the merged master.---
 
 ## PHASE B (branch `cookbook-restyle` off merged master; starts only after A13's review merges)
 
