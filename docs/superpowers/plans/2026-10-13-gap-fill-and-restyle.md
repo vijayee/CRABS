@@ -52,7 +52,7 @@ Phase B adds: `cookbook/site/build.mjs` (hub learning path), recipe restructures
 - Modify: `bindings/wasm/index.d.ts` (if UserInfo doc lines change)
 - Test: `bindings/wasm/test/getuser-readback.js` (new)
 
-- [] **Step 1: Failing JS test** — new `bindings/wasm/test/getuser-readback.js` (mirror `smoke.js` prelude: `Node.create('admin', {ordering:'hlc'})`, `KeyPair.generate`, `registerUser('alice', key.publicKeyHex(), 'adult')`), asserting after `grantRole('alice','role','member','admin')`:
+- [ ] **Step 1: Failing JS test** — new `bindings/wasm/test/getuser-readback.js` (mirror `smoke.js` prelude: `Node.create('admin', {ordering:'hlc'})`, `KeyPair.generate`, `registerUser('alice', key.publicKeyHex(), 'adult')`), asserting after `grantRole('alice','role','member','admin')`:
 ```js
 const user = node.getUser('alice');
 assert.strictEqual(user.keyVersion, 1);          // stamped at grant (attribute_machine.c:597,617)
