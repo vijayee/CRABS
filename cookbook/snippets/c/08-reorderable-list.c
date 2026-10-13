@@ -4,8 +4,11 @@
  * an "overwrite": concurrent inserts at the same position are both kept and
  * both replicas materialize the same converged sequence, a duplicated op id
  * with a conflicting payload refuses to merge at all, and a delete beats a
- * concurrent live element. No JS binding exposes any of this — the recipe's
- * wasm/node GAP blocks document that; here the C surface runs directly.
+ * concurrent live element. The bindings' ordered* sugar covers the OP layer
+ * of this demo (the snippets' two-machine convergence goes through the
+ * executor's transform instead); the MERGE primitives here
+ * (crabs_ot_ordered_set_merge + merge_position_maps) have no JS map entry —
+ * recipe 8 keeps that PARTIAL note.
  * Mirrors the real test usage:
  *   test/test_ot_ordered_set.cpp:190-225  (MOVE re-positions elements)
  *   test/test_ot_ordered_set.cpp:347-375  (merge is commutative for
