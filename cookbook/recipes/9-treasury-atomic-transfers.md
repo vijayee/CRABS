@@ -201,7 +201,7 @@ symbols:
   grantRole                 bindings/wasm/index.d.ts:430
   Node.addResource          bindings/wasm/index.d.ts:451
   Node.getResource          bindings/wasm/index.d.ts:458
-  Node.getLockState         bindings/wasm/index.d.ts:466 (LockStateView :195-203)
+  Node.getLockState         bindings/wasm/index.d.ts:466 (LockStateView :207-215)
   Node.attachTxManager      bindings/wasm/index.d.ts:477
   new Operation             bindings/wasm/index.d.ts:72
   Operation.addResource     bindings/wasm/index.d.ts:33
@@ -216,7 +216,7 @@ symbols:
   (mint export)             src/Util/wasm_helpers.c:638 (crabs_wasm_add_resource — mirrors the node mint)
   (lock-state read)         src/Util/wasm_helpers.c:730 (crabs_wasm_lock_state)
   (claims + state setters)  src/Util/wasm_helpers.c:759-806
-  (tx manager attach)       src/Util/wasm_helpers.c:828
+  (tx manager attach)       src/Util/wasm_helpers.c:829
   (handler arithmetic)      src/Util/wasm_helpers.c:682
   (lock protocol op types)  src/CRABS/crabs.h:135-140
   (refusal: un-locked RESOURCE wildcard) src/StateMachine/state_machine.c:1836-1846
@@ -243,23 +243,23 @@ application); the balance arithmetic stays the driver's.
 target: crabs-node
 verified: executed
 symbols:
-  NodeStatic.new            bindings/node/index.d.ts:567
+  NodeStatic.new            bindings/node/index.d.ts:566
   KeyPair.generate          bindings/node/index.d.ts:14
   registerUser              bindings/node/index.d.ts:252
   grantRole                 bindings/node/index.d.ts:253
   Node.addResource          bindings/node/index.d.ts:276 (seeds the int64
-                            balance; implemented bindings/node/src/crabs_node.cc:1745)
-  Node.getResource          bindings/node/index.d.ts:283 (crabs_node.cc:1837)
-  Node.getLockState         bindings/node/index.d.ts:290 (crabs_node.cc:1756)
-  Node.attachTxManager      bindings/node/index.d.ts:304 (crabs_node.cc:1785)
+                            balance; implemented bindings/node/src/crabs_node.cc:1738)
+  Node.getResource          bindings/node/index.d.ts:283 (crabs_node.cc:1830)
+  Node.getLockState         bindings/node/index.d.ts:290 (crabs_node.cc:1804)
+  Node.attachTxManager      bindings/node/index.d.ts:303 (crabs_node.cc:1778)
   new Operation             bindings/node/index.d.ts:87
   Operation.addResource     bindings/node/index.d.ts:46
   Operation.setRequiredState / setNextState bindings/node/index.d.ts:61-64
                             (crabs_node.cc:648,800)
   Operation.addLockClaim    bindings/node/index.d.ts:73 (crabs_node.cc:650,820)
-  Node.setPolicy            bindings/node/index.d.ts:397
-  Node.sign / execute       bindings/node/index.d.ts:410-411
-  (tx manager attach)       bindings/node/src/crabs_node.cc:1785
+  Node.setPolicy            bindings/node/index.d.ts:396
+  Node.sign / execute       bindings/node/index.d.ts:409-410
+  (tx manager attach)       bindings/node/src/crabs_node.cc:1778
   (lock protocol op types)  src/CRABS/crabs.h:135-140
   (refusal: un-locked RESOURCE wildcard) src/StateMachine/state_machine.c:1836-1846
   (refusal: re-acquire live lease) src/StateMachine/state_machine.c:2102-2110
@@ -280,9 +280,9 @@ be true: the op builder could not author `required_state` or a lock claim,
 so once JS locked a pot it sat locked until lease expiry and the next
 execute pruned it (`state_machine.c:364-411`) — the "pot-unspendable
 discovery". Now: `Operation.setRequiredState`/`setNextState` author the
-protocol states (`crabs_node.cc:800` / wasm `wasm_helpers.c:759-806`) and
+protocol states (`crabs_node.cc:769-797` / wasm `wasm_helpers.c:759-806`) and
 `Operation.addLockClaim` carries the live bearer token read from
-`Node.getLockState` (`crabs_node.cc:1756` / `wasm_helpers.c:730`) — so the
+`Node.getLockState` (`crabs_node.cc:1804` / `wasm_helpers.c:730`) — so the
 locked pot is operable under its lease: claim-bearing ops pass the state
 gate, and `__verify__`/`__unlock__` complete the ceremony from both JS
 bindings. Two caveats survive, deliberately: the claim discipline stays
@@ -346,7 +346,7 @@ test_ref: test/test_state_machine.cpp:196-352 (lock ceremony) + :1153-1211 (atom
   (`state_machine.c:2102-2110`) — the snippet's second `__lock__` from the
   same treasurer is refused exactly as a rival's would be.
 - *Balance values on RESOURCE items are raw int64s* (`bindings/node/src/
-  crabs_node.cc:1741` — "the library contract — dedup mutations, the
+  crabs_node.cc:1748` — "the library contract — dedup mutations, the
   lock snapshot, and destroy all take the raw path"), which is why the
   lock snapshot captures 8 bytes for this item (`state_machine.c:2183-2212`)
   and the restore is the historical 8-byte form (`:2304-2318`).
