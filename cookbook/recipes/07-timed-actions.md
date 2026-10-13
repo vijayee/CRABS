@@ -3,10 +3,10 @@ number: 7
 slug: timed-actions
 title: Actions that wait for a time
 section: Conditions
-status: PARTIAL
+status: COMPLETE
 maturity: STABLE
 target: crabs-wasm
-languages: c wasm
+languages: c wasm node
 ---
 ## Intent
 
@@ -39,19 +39,19 @@ machine's own tick with no signer online at fire time.
 - Submission: `schedule(innerOp, executeAtMs) -> bigint` — the op is
   signed NOW (signer, policy, HLC), serialized into the pending entry with
   its submitter, and the machine hands back a schedule id
-  (`bindings/wasm/index.d.ts:324`; exercised
+  (`bindings/wasm/index.d.ts:501`; exercised
   `bindings/wasm/test/schedules.js:25-35`). A recurring version takes a
   start time, an interval, a repeat count and an optional end:
   `scheduleRecurring(op, startAtMs, intervalMs, repeatCount, endAtMs)`
-  (:325-326, `schedules.js:60-66`).
+  (:502-503, `schedules.js:60-66`).
 - Inspection: `pendingSchedules()` returns the queue —
   `{id, executeAt, intervalMs, repeatCount, endAt, submitter}` with
-  bigints (:332-334) — and `cancelSchedule(id)` removes one before due
-  (:327).
+  bigints (:509-511) — and `cancelSchedule(id)` removes one before due
+  (:504).
 - Ticking: `processSchedules(nowMs)`. This is an EXPLICIT clock poke — the
   demo passes a fixed `now` and never depends on the wall clock; the
   default argument is `Date.now()`
-  (`bindings/wasm/bindings-core.js:1210`). Every due entry materializes
+  (`bindings/wasm/bindings-core.js:1316`). Every due entry materializes
   through the machine's executor with the authorization step *skipped* —
   signature and policy were checked when you submitted, so the fire re-runs
   only the domain check and the engine's guards (transitions, locks, dedup,
@@ -63,7 +63,7 @@ machine's own tick with no signer online at fire time.
   `CRABS_ERR_ALREADY_EXECUTED`, `scheduler.c:257`).
 - Burst control: `setScheduleOccurrenceBudget(maxPerTick)` bounds the
   per-tick catch-up burst; deferred slots carry over and keep their exact
-  slots; `0` is unlimited (:330-331, `schedules.js:84-93`).
+  slots; `0` is unlimited (:507-508, `schedules.js:84-93`).
 - The schedule IS machine state: the pending set survives a serialize /
   deserialize round trip and schedule ids continue after restore (never
   collide with a restored id — `test/test_scheduler.cpp:111-158,199-230`).
@@ -93,9 +93,10 @@ timed action whose *authority* matters (deadlines, expiries), attach an
 authenticated source instead: `setTimeSource({mode:'https'})` which fails
 closed (a fetch failure reports invalid time, never a local-clock
 fallback, `bindings/wasm/index.d.ts:313-321`; semantics
-`src/TimeSource/`). And on crabs-node there is nothing to call — see the
-gap below; node carries time plumbing only (`setTime`, `setTimeSource`,
-`getTimeSource`, `getHLC`) with no schedule surface.
+`src/TimeSource/`). The same holds on crabs-node, whose `processSchedules`
+default is the wall clock too (`bindings/node/index.d.ts:320-324`) — and
+whose `setTimeSource` is machine-local (re-apply it on a surviving wrapper
+if a sibling one is destroyed, node d.ts `:346-359`).
 
 ## Variations
 
@@ -127,29 +128,29 @@ gap below; node carries time plumbing only (`setTime`, `setTimeSource`,
 target: crabs-wasm
 verified: executed
 symbols:
-  Node.create              bindings/wasm/index.d.ts:372
+  Node.create              bindings/wasm/index.d.ts:549
   KeyPair.generate         bindings/wasm/index.d.ts:21
   publicKeyHex             bindings/wasm/index.d.ts:15
   KeyPair.destroy          bindings/wasm/index.d.ts:17
-  registerUser             bindings/wasm/index.d.ts:213
-  grantRole                bindings/wasm/index.d.ts:214
-  addCounter               bindings/wasm/index.d.ts:223
-  getCounter               bindings/wasm/index.d.ts:254
-  setPolicy                bindings/wasm/index.d.ts:295
-  registerHandlerJs        bindings/wasm/index.d.ts:303
+  registerUser             bindings/wasm/index.d.ts:353
+  grantRole                bindings/wasm/index.d.ts:354
+  addCounter               bindings/wasm/index.d.ts:363
+  getCounter               bindings/wasm/index.d.ts:394
+  setPolicy                bindings/wasm/index.d.ts:435
+  registerHandlerJs        bindings/wasm/index.d.ts:480
   HandlerState.incrementCounter bindings/wasm/index.d.ts:103
   Operation.create         bindings/wasm/index.d.ts:52
   Operation.signerId       bindings/wasm/index.d.ts:28
-  Node.sign                bindings/wasm/index.d.ts:297
-  Node.schedule            bindings/wasm/index.d.ts:324
-  Node.scheduleRecurring   bindings/wasm/index.d.ts:325-326
-  Node.cancelSchedule      bindings/wasm/index.d.ts:327
-  Node.processSchedules    bindings/wasm/index.d.ts:328
-  Node.setScheduleOccurrenceBudget bindings/wasm/index.d.ts:330
-  Node.scheduleOccurrenceBudget    bindings/wasm/index.d.ts:331
-  Node.pendingSchedules    bindings/wasm/index.d.ts:332-334
-  Node.destroy             bindings/wasm/index.d.ts:368
-  (Date.now() default tick)  bindings/wasm/bindings-core.js:1210
+  Node.sign                bindings/wasm/index.d.ts:454
+  Node.schedule            bindings/wasm/index.d.ts:501
+  Node.scheduleRecurring   bindings/wasm/index.d.ts:502-503
+  Node.cancelSchedule      bindings/wasm/index.d.ts:504
+  Node.processSchedules    bindings/wasm/index.d.ts:505
+  Node.setScheduleOccurrenceBudget bindings/wasm/index.d.ts:507
+  Node.scheduleOccurrenceBudget    bindings/wasm/index.d.ts:508
+  Node.pendingSchedules    bindings/wasm/index.d.ts:509-511
+  Node.destroy             bindings/wasm/index.d.ts:545
+  (Date.now() default tick)  bindings/wasm/bindings-core.js:1316
   (failures recorded, idempotent skip) src/Scheduler/scheduler.h:42-50 + src/Scheduler/scheduler.c:257
   (exactly-once uuid guard)  test/test_scheduler.cpp:485-529
 maturity: all STABLE
@@ -158,38 +159,53 @@ test_ref: bindings/wasm/test/schedules.js:25-93 (one-off, cancel, recurring catc
 
 ### crabs-node (native Node.js)
 
-crabs-node has *no schedule surface*. Time is there; execution is not.
+The whole schedule surface is ported: the same method names as the wasm
+wrapper (d.ts `bindings/node/index.d.ts:306-331`), driven by the node's
+own machine. `schedule(innerOp, executeAtMs)` runs the machine's read-only
+validate pass (policy + signature + key version + co-signatures + domain
+check) BEFORE queueing — the same submission-time authorization gate the
+wasm wrapper carries (`bindings/node/src/crabs_node.cc:1902-1906`) — and
+materialization skips the re-authorization exactly as the C engine does.
+One node-specific difference: there is no `registerHandlerJs`, so a
+scheduled op's fire is observable through the 'change' event stream —
+every materialized slot (and every durable `__schedule_failed__` record)
+fires a kind-`schedule` event (`Node.on`,
+`bindings/node/index.d.ts:218`), which is how the demo's audit ledger is
+asserted. Watch the fire events rather than polling a counter.
 
-> [!WARNING] GAP
->
-> **Prose describes:** queueing a signed op with a due time from
-> crabs-node and ticking the machine's queue — the Recipe's whole demo,
-> on the native Node.js binding.
->
-> **Codebase status:** the engine exists in C and is deeply tested —
-> `scheduler_schedule` / `scheduler_schedule_recurring` / `scheduler_cancel`
-> / `scheduler_process_due` / the occurrence budget
-> (`src/Scheduler/scheduler.h:20-55`; 37 tests in
-> `test/test_scheduler.cpp`, from exactly-once
-> `test_scheduler.cpp:485-529` to budget carry-over `:1029-1082`) — and
-> EVERY method is bound on the wasm side (`bindings/wasm/index.d.ts:324-334`).
->
-> **Divergence:** `bindings/node/index.d.ts` declares none of it — no
-> `schedule`, `scheduleRecurring`, `cancelSchedule`, `processSchedules`,
-> `pendingSchedules`, or occurrence-budget symbols anywhere in the node
-> surface (api-map §6, "schedules are entirely wasm-only" and difference
-> list item 3). crabs-node keeps the *time-plumbing* half:
-> `setTime` (:264), `setTimeSource`/`getTimeSource` (:279-280), and
-> `getHLC` (:263) are declared and tested (`test/test.js:81,272`).
->
-> **Tracking:** an internal implementation plan (not published on this
-> site). The gap is recorded in api-map §17 ("R7 | schedules,
-> `setTimeSource`, HLC").
->
-> **Agent action:** code block omitted. Do not fabricate a
-> `node.schedule()` onto the d.ts — drive the wasm binding, or call the C
-> scheduler (`src/Scheduler/scheduler.h`) from a native process that owns
-> the state.
+```snippet:node/07-timed-actions.js
+```
+
+<!-- PROVENANCE
+target: crabs-node
+verified: executed
+symbols:
+  Node                            bindings/node/index.d.ts:210
+  Node.registerUser               bindings/node/index.d.ts:212
+  Node.grantRole                  bindings/node/index.d.ts:213
+  Node.on                         bindings/node/index.d.ts:218
+  Node.addCounter                 bindings/node/index.d.ts:223
+  Node.addResource                bindings/node/index.d.ts:229
+  Node.setPolicy                  bindings/node/index.d.ts:279
+  Node.sign                       bindings/node/index.d.ts:292
+  Node.schedule                   bindings/node/index.d.ts:309
+  Node.scheduleRecurring          bindings/node/index.d.ts:315-316
+  Node.cancelSchedule             bindings/node/index.d.ts:318
+  Node.processSchedules           bindings/node/index.d.ts:324
+  Node.setScheduleOccurrenceBudget bindings/node/index.d.ts:326
+  Node.scheduleOccurrenceBudget   bindings/node/index.d.ts:327
+  Node.pendingSchedules           bindings/node/index.d.ts:329-331
+  KeyPair.generate                bindings/node/index.d.ts:14
+  KeyPair.publicKeyHex            bindings/node/index.d.ts:8
+  Operation.addResource           bindings/node/index.d.ts:26
+  (submission validate gate)      bindings/node/src/crabs_node.cc:1902-1906 + :1942-1946
+  (wall-clock tick default)       bindings/node/src/crabs_node.cc:1985-1989
+  C engine unchanged: scheduler_schedule / _recurring / cancel / process_due / count / first / budget
+                                  src/Scheduler/scheduler.h:20-55
+  (materialization skips signature re-check) src/Scheduler/scheduler.c:337-338
+maturity: all STABLE
+test_ref: bindings/node/test/test.js (schedule-surface block — one-off exactly-once via change events, not-due skip, cancel pin, unknown-id resource_not_found, recurring 3-fire catch-up, budget defer + lift, unauthorized/unknown-signer submission refusals, typed argument rejections)
+-->
 
 ### C (native)
 

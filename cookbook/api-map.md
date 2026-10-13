@@ -120,17 +120,17 @@ One-shot sets and flags are added like any item (`addOneShotSet` / `addOneShotFl
 
 ## 6. Schedules and time sources (R7)
 
-**All schedule methods are wasm-only** — the node binding declares none of them. HLC reads differ: node has `getHLC()` + an `HLC` interface (`bindings/node/index.d.ts:114-120,263`); wasm has no HLC getter (HLC identity shows up as `Node.adminId` / op `nodeId`).
+**All schedule methods exist on BOTH bindings** (wasm `bindings/wasm/index.d.ts:501-511`; node `bindings/node/index.d.ts:306-331` — ported from the wasm surface). The submission-time authorization gate in both wrappers runs `state_machine_validate` before queueing (wasm `src/Util/wasm_helpers.c:1509-1519`, node `bindings/node/src/crabs_node.cc:1902-1906`). A node-specific divergence: no `registerHandlerJs` on node, so a scheduled fire is observed as a kind-`schedule` change event, not a counter effect (node `test/test.js` schedule-surface block). HLC reads differ: node has `getHLC()` + an `HLC` interface (`bindings/node/index.d.ts:114-120,343`); wasm has no HLC getter (HLC identity shows up as `Node.adminId` / op `nodeId`).
 
 | symbol | kind | signature | source | maturity |
 |---|---|---|---|---|
-| `Node.schedule` | method (wasm only) | `schedule(innerOp, executeAtMs) -> bigint` | `bindings/wasm/index.d.ts:324` | STABLE (`schedules.js:25-35`) |
-| `Node.scheduleRecurring` | method (wasm only) | `scheduleRecurring(innerOp, startAtMs, intervalMs, repeatCount, endAtMs) -> bigint` | `bindings/wasm/index.d.ts:325-326` | STABLE (`schedules.js:60-66`) |
-| `Node.cancelSchedule` | method (wasm only) | `cancelSchedule(scheduleId: bigint)` | `bindings/wasm/index.d.ts:327` | STABLE (`schedules.js:51`) |
-| `Node.processSchedules` | method (wasm only) | `processSchedules(nowMs?)` | `bindings/wasm/index.d.ts:328` | STABLE (`schedules.js:38-42`) |
-| `Node.setScheduleOccurrenceBudget` | method (wasm only) | `setScheduleOccurrenceBudget(maxPerTick)` — 0 = unlimited | `bindings/wasm/index.d.ts:330` | STABLE (`schedules.js:84`) |
-| `Node.scheduleOccurrenceBudget` | query (wasm only) | `scheduleOccurrenceBudget() -> number` | `bindings/wasm/index.d.ts:331` | STABLE (`schedules.js:85`) |
-| `Node.pendingSchedules` | query (wasm only) | `pendingSchedules() -> [{id, executeAt, intervalMs, repeatCount, endAt, submitter}]` (bigints) | `bindings/wasm/index.d.ts:332-334` | STABLE (`schedules.js:33-35,63-65`) |
+| `Node.schedule` | method | `schedule(innerOp, executeAtMs) -> bigint` | wasm :501, node :309 | STABLE (`schedules.js:25-35`; node `test/test.js` schedule block) |
+| `Node.scheduleRecurring` | method | `scheduleRecurring(innerOp, startAtMs, intervalMs, repeatCount, endAtMs) -> bigint` | wasm :502-503, node :315-316 | STABLE (`schedules.js:60-66`; node test) |
+| `Node.cancelSchedule` | method | `cancelSchedule(scheduleId: bigint \| number)` — number/bigint on node, bigint on wasm | wasm :504, node :318 | STABLE (`schedules.js:51`; node test) |
+| `Node.processSchedules` | method | `processSchedules(nowMs?)` — defaults to the wall clock on both | wasm :505, node :324 | STABLE (`schedules.js:38-42`; node test) |
+| `Node.setScheduleOccurrenceBudget` | method | `setScheduleOccurrenceBudget(maxPerTick)` — 0 = unlimited | wasm :507, node :326 | STABLE (`schedules.js:84`; node test) |
+| `Node.scheduleOccurrenceBudget` | query | `scheduleOccurrenceBudget() -> number` | wasm :508, node :327 | STABLE (`schedules.js:85`; node test) |
+| `Node.pendingSchedules` | query | `pendingSchedules() -> [{id, executeAt, intervalMs, repeatCount, endAt, submitter}]` (bigints) | wasm :509-511, node :329-331 | STABLE (`schedules.js:33-35,63-65`; node test) |
 | `Node.setTime` | method | `setTime(nowMs)` | wasm :309, node :264 | STABLE (`lineage_smoke.mjs:48` node) |
 | `Node.setTimeSource` | method | `setTimeSource({mode:'https'|'system', url?, resyncMs?, timeoutMs?, maxSkewMs?})` — fetch fails closed, no local-clock fallback | wasm :321, node :279 | STABLE (`time-source.js:37,54`; node `test/test.js:272`) |
 | `Node.getTimeSource` | query | `getTimeSource() -> TimeSourceInfo` | wasm :322, node :280 | STABLE (`time-source.js:32,39-45`) |
@@ -280,7 +280,7 @@ Where a recipe capability has **no JS map entry**, that fact is recorded here �
 | R4 | `registerUser`, `grantRole`, `setPolicy` | §2 / §3, STABLE |
 | R5 | register LWW + key versioning/pair | `Node.setRegister` / `getRegister` + BigInt-vs-number split (§4); key pair = `KeyPair.*` (§13); `UserInfo.keyVersion` is the JS-visible version (§2) |
 | R6 | triggers, threshold attributes, ABE | `createTrigger` / `TriggerConfig` (§7, STABLE); threshold conditions live in the C condition grammar `src/Condition/` (PRESENT in C, surface tested via `createTrigger`); `Node.encrypt` (§9, STABLE) |
-| R7 | schedules, `setTimeSource`, HLC | §6; schedules wasm-only (STABLE), HLC via node `getHLC` (STABLE) + C `src/HLC/hlc.h` (PRESENT) |
+| R7 | schedules, `setTimeSource`, HLC | §6; schedules STABLE on both bindings (wasm `bindings/wasm/index.d.ts:501-511`, node `bindings/node/index.d.ts:306-331`, node test pinned), HLC via node `getHLC` (STABLE) + C `src/HLC/hlc.h` (PRESENT) |
 | R8 | OT ordered set surface | **Not JS-bound.** C source `src/OT/ot_ordered_set.h:63-117` (`crabs_ot_ordered_set_create/destroy/merge_position_maps`, elements via `crabs_ordered_element_destroy`). The node binding *parses* the `ot_ordered_set` data-type word (`bindings/node/src/crabs_node.cc:212`) and `DATA_TYPE_OT_ORDERED_SET = 0x10` exists (`src/CRABS/data_model.h:33`), but no `d.ts` export, test, or example exercises OT items → recipe R8 is PARTIAL; map entries marked DESIGNED |
 | R9 | resources, locks / transaction manager | Resources half is STABLE JS: `Operation.addResource` (§12) + node-only `Node.addResource` (§2). Locks / transaction manager are **not JS-bound**: C `src/TxManager/tx_manager.h:19-41` — vtable-based `crabs_tx_manager_t` with `accept/commit/destroy` and `crabs_tx_manager_none()` (accept-everything). Typed lock errors exist (`CRABS_ERR_LOCK_NOT_EXPIRED`, `bindings/node/src/crabs_node.cc:90`) but no lock API surface found in C headers or bindings → recipe R9 is PARTIAL (resources-only); map entries for locks marked DESIGNED |
 | R10 | op signing modes / sovereign prefixes | `Operation.setSovereignPrefix` + signing format v4 (§11/§12), STABLE |
@@ -295,7 +295,7 @@ Where a recipe capability has **no JS map entry**, that fact is recorded here �
 
 1. Construction: `Node.create` (wasm) vs `new Node` (node). `Operation.create` vs `new Operation`. `KeyPair.generate` async vs sync. `Blueprint.create` exists in both bindings (node also has `new Blueprint`).
 2. Handlers: `registerHandlerJs` / `unregisterHandler` / low-level `registerHandler` / `HandlerState` / `HandlerOperation` are wasm-only — node has **no custom-handler surface**.
-3. Schedules are entirely wasm-only. HLC: node `getHLC()`, wasm none.
+3. Schedules exist on both bindings (same names, wasm `:501-511` / node `:306-331`); node observes fires via 'schedule' change events (no `registerHandlerJs`). HLC: node `getHLC()`, wasm none.
 4. OR-set pagination (`getSetSize`/`getSetElements`/`getSetTags`) and register byte API (`setRegisterBytes`/`getRegisterBytes`) are wasm-only.
 5. BigInt register/prefix inputs: wasm `number | bigint`, node `number` only.
 6. `Node.off` exists in wasm.d.ts; node relies on the unsubscribe function returned by `on`.
