@@ -276,7 +276,7 @@ symbols:
   Node.getResource          bindings/wasm/index.d.ts:509
   Node.getLockState         bindings/wasm/index.d.ts:517 (LockStateView :258-266)
   Node.attachTxManager      bindings/wasm/index.d.ts:528
-  new Operation             bindings/wasm/index.d.ts:72
+  Operation.create          bindings/wasm/index.d.ts:122
   Operation.addResource     bindings/wasm/index.d.ts:68
   Operation.setRequiredState / setNextState bindings/wasm/index.d.ts:84 / :87
   Operation.addLockClaim    bindings/wasm/index.d.ts:96

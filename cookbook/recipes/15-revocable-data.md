@@ -191,15 +191,13 @@ Not guaranteed — the bearer-instrument boundary:
   >
   > **What is real from JS (both bindings):** `abeKeygen(attrs)` derives a
   > reader key from the machine's own master authority and
-  > `abeDecrypt(key, container)` opens the container `encrypt` returned —
-  > (api-map §9; pinned by `bindings/wasm/test/abe-decrypt.js` and
-  > `bindings/node/test/abe.js`, and executed by both snippets below —
-  > including the bearer-instrument demonstration and the epoch-two
-  > re-seal).
+  > `abeDecrypt(key, container)` opens the container `encrypt` returned
+  > (api-map §9; executed by both snippets below — including the
+  > bearer-instrument demonstration and the epoch-two re-seal).
   >
   > **What stays C-only in v1:** the keyring mutation tools —
-  > `user_key_suspend` / `user_key_activate` / `user_key_rotate`
-  > (exercised `test/test_key_lifecycle.cpp`). JS consumers observe their
+  > `user_key_suspend` / `user_key_activate` / `user_key_rotate` (the C
+  > tests pin that lifecycle). JS consumers observe their
   > *effects* (a bumped `keyVersion` on both bindings, refused ops) but
   > cannot *perform* them; the C snippet is where that lifecycle is
   > executable. No portable reader-key bytes ship: `AbeKey` is a
@@ -230,12 +228,14 @@ Not guaranteed — the bearer-instrument boundary:
   KEY_SUSPENDED → activate with a version bump — so signatures made during
   the suspended window die even though the user returns. The
   recoverable/terminal pair is the C surface's honest split.
-- *Observability differences after the same revoke*: to instrument a
-  revocation UI, know what each surface streams — on crabs-node the
-  attribute-kind change event (`kind: 'attribute'`, `type:
-  'revoke_user'`) carries the revocation, `getUser` shows the terminal
-  status, and even the bump is observable; on crabs-wasm only the refusal
-  is observable; in C you own the record directly.
+- *Observability of the revocation*: to instrument a revocation UI, the
+  same three signals exist on both JS bindings — the attribute-kind change
+  event (`kind: 'attribute'`, `type: 'revoke_user'`) the engine fires
+  straight out of the revoke and both wrappers forward, the `getUser`
+  readback flipping to `revoked`, and the bumped `keyVersion`. The node
+  snippet demonstrates the event end-to-end; the wasm snippet exercises
+  the refusal + readback (same engine hook, same event in flight). In C
+  you own the record directly.
 - *The grammar pin, after the single-clause fix*: the CRABS policy
   evaluator accepts both prefix (`AND <l> <r>`) and infix (`<l> AND <r>`)
   forms, and a one-clause prefix policy `'AND role:member'` — a
@@ -307,8 +307,13 @@ policy grammar: prefix AND infix both accepted; single-clause prefix
   seal parser INFIX-ONLY (this fork case-insensitive) — prefix seal
   policies fail the encrypt call noisily; condition preprocessing
   src/Condition/condition.c:1501-1598
-change events: node streams kind 'attribute' type 'revoke_user' +
-  keyVersion bump observable; wasm exposes only the refusal
+change events: the C engine fires a kind-'attribute' revoke_user event from
+  attribute_machine_revoke_user (attribute_machine.c:904,
+  _notify_attribute_change :550-556) and BOTH wrappers forward it — hook
+  registered at machine creation with no kind filter (wasm
+  src/Util/wasm_helpers.c:262 + _forward_change_to_js, node
+  crabs_node.cc:1311 + EmitChange); the node snippet demonstrates the event
+  end-to-end; getUser readback (revoked + keyVersion bump) real on both
 
 target: crabs-wasm (snippet wasm/15-revocable-data.js)
 verified: executed
