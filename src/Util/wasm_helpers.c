@@ -998,6 +998,36 @@ const char* crabs_wasm_user_temp_attr_value(user_t* user) {
   return (user && user->temp_attrs) ? user->temp_attrs->value : NULL;
 }
 
+EMSCRIPTEN_KEEPALIVE
+int64_t crabs_wasm_user_key_version(user_t* user) {
+  return user ? (int64_t)user->key_version : 0;
+}
+
+EMSCRIPTEN_KEEPALIVE
+int32_t crabs_wasm_user_status(user_t* user) {
+  return user ? (int32_t)user->status : 0;
+}
+
+// Copies the user's legacy 33-byte ECDSA public key into out (the caller
+// allocates 33 bytes). Returns the byte count copied, 0 on failure.
+EMSCRIPTEN_KEEPALIVE
+int32_t crabs_wasm_user_public_key(user_t* user, uint8_t* out) {
+  if (!user || !out) return 0;
+  memcpy(out, user->public_key, 33);
+  return 33;
+}
+
+EMSCRIPTEN_KEEPALIVE
+const char* crabs_wasm_user_attr_verified_by(user_t* user, uint32_t i) {
+  if (!user || i >= user->attribute_count) return NULL;
+  return user->attributes[i].verified_by;
+}
+
+EMSCRIPTEN_KEEPALIVE
+uint64_t crabs_wasm_user_temp_attr_expires_at(user_t* user) {
+  return (user && user->temp_attrs) ? user->temp_attrs->expires_at : 0;
+}
+
 // ============================================================
 // ABE helpers
 // ============================================================

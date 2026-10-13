@@ -156,6 +156,7 @@ export interface UserInfo {
     value: string;
     verifiedBy: string;
     temporary: boolean;
+    expiresAt?: number;
   }>;
 }
 

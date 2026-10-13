@@ -2,12 +2,12 @@
 // Recipe 16 — data that must be revocable (crabs-wasm, run in Node).
 //
 // What IS on this binding: policy-gated sealing (Node.encrypt), user-level
-// revocation (revokeUser, admin-gated + terminal in C), and the fail-closed
-// gate that refuses a revoked user's subsequent ops. What is NOT: decrypting
-// the container (recipe 6's gap) and the key-level lifecycle (suspend /
-// activate / rotate are C-only). The getUser readback of keyVersion/status
-// is a wasm-side STUB (keyVersion: 0, status: 'active' hardcoded,
-// bindings/wasm/bindings-core.js getUser) — demonstrated below, not hidden.
+// revocation (revokeUser, admin-gated + terminal in C), the fail-closed
+// gate that refuses a revoked user's subsequent ops, and a REAL getUser
+// readback (keyVersion, status, publicKeyHex, per-attribute verifiedBy —
+// bindings/wasm/bindings-core.js mirrors the node mapper). What is NOT:
+// decrypting the container (recipe 6's gap) and the key-level lifecycle
+// (suspend / activate / rotate are C-only).
 
 const assert = require('assert');
 const { Node, KeyPair, Operation } = require('../../../bindings/wasm');
@@ -18,16 +18,18 @@ async function main() {
   const readerKey = await KeyPair.generate();
   node.registerUser('reader', readerKey.publicKeyHex(), 'vetted');
 
-  // The epoch observable exists in the machine (the user's key_version
-  // bumps on every attribute mutation, src/Attribute/attribute_machine.c);
-  // the wasm binding returns a STUB for it — pin the observed shape.
+  // The epoch observable exists in the machine (the user's key_version is
+  // stamped at registration, src/Attribute/attribute_machine.c:495, and
+  // bumps on every privileged mutation); the wasm readback surfaces it.
   const before = node.getUser('reader');
-  assert.strictEqual(before.keyVersion, 0, 'wasm getUser readback is a stub (keyVersion hardcoded 0)');
-  assert.strictEqual(before.status, 'active', 'wasm getUser readback is a stub (status hardcoded "active")');
+  assert.strictEqual(before.keyVersion, 1, 'registration stamps key_version 1');
+  assert.strictEqual(before.status, 'active', 'registration stamps status USER_ACTIVE');
+  assert.strictEqual(before.publicKeyHex, readerKey.publicKeyHex(), 'readback returns the registered key');
 
-  // Grant the reader what the policy will require. (The wasm readback
-  // cannot show the bumps the machine made — see Notes on the page.)
+  // Grant the reader what the policy will require. The machine bumps the
+  // version on the grant (attribute_machine.c:617); the readback shows it.
   node.grantRole('reader', 'role', 'member', 'admin');
+  assert.strictEqual(node.getUser('reader').keyVersion, 2, 'grant bumps key_version to 2');
 
   // The write gate: a policy-gated custom op, written through the handler.
   node.addCounter('notes');
@@ -102,14 +104,13 @@ async function main() {
     throw new Error(`granting to a revoked target must be refused, got "${regrantRefusal}"`);
   }
 
-  // Honest pin of the wasm-side readback stub: the machine revoked the user
-  // (the refusals above are its consequence), but the browser CANNOT observe
-  // it through getUser — keyVersion stays 0 and status stays 'active'.
-  const stub = node.getUser('reader');
-  assert.strictEqual(stub.keyVersion, 0, 'wasm getUser readback is a stub after revocation (keyVersion 0)');
-  assert.strictEqual(stub.status, 'active', 'wasm getUser readback is a stub after revocation (status "active")');
+  // The revocation is observable through the readback: the machine flips
+  // status to USER_REVOKED and bumps key_version (attribute_machine.c:902-903).
+  const revoked = node.getUser('reader');
+  assert.strictEqual(revoked.status, 'revoked', 'revocation flips the readback status');
+  assert.strictEqual(revoked.keyVersion, 3, 'revocation bumps key_version to 3 (register 1, grant 2, revoke 3)');
 
-  console.log('revocable-data OK: reader sealed+gated, revoked, re-ops refused, re-grant refused, wasm readback stub pinned');
+  console.log('revocable-data OK: reader sealed+gated, revoked, re-ops refused, re-grant refused, revocation visible in readback');
   node.destroy();
   readerKey.destroy();
 }

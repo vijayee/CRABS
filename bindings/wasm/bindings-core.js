@@ -681,7 +681,9 @@ class Node {
     for (let i = 0; i < n; i++) {
       attrs.push({
         value: readString(M, M._crabs_wasm_user_attr_value(userPtr, i)),
-        verifiedBy: '',
+        // Mirror the node mapper (crabs_node.cc:1199-1201): each stored
+        // attribute records the verifier that stamped it.
+        verifiedBy: readString(M, M._crabs_wasm_user_attr_verified_by(userPtr, i)),
         temporary: false,
       });
     }
@@ -691,14 +693,30 @@ class Node {
         value: tempName + ':' + readString(M, M._crabs_wasm_user_temp_attr_value(userPtr)),
         verifiedBy: 'trigger',
         temporary: true,
+        // Matches the node mapper's expiresAt field (crabs_node.cc:1211);
+        // 0 means no expiry.
+        expiresAt: Number(M._crabs_wasm_user_temp_attr_expires_at(userPtr)),
       });
     }
 
+    // The 33-byte legacy ECDSA public key is copied into a scratch buffer
+    // and hex-encoded with the same idiom as the KeyPair surfaces.
+    const pkPtr = M._malloc(33);
+    const pkLen = M._crabs_wasm_user_public_key(userPtr, pkPtr);
+    const publicKeyHex = pkLen === 33
+      ? hexEncode(M.HEAPU8.subarray(pkPtr, pkPtr + 33), 33) : '';
+    M._free(pkPtr);
+
+    // user_status_e order: USER_ACTIVE/SUSPENDED/REVOKED = 0/1/2
+    // (attribute_machine.h:17-21), matching the node mapper's switch.
+    const STATUS_NAMES = ['active', 'suspended', 'revoked'];
+    const statusNumber = M._crabs_wasm_user_status(userPtr);
+
     return {
       userId: readString(M, M._crabs_wasm_user_id(userPtr)),
-      publicKeyHex: '',
-      keyVersion: 0,
-      status: 'active',
+      publicKeyHex,
+      keyVersion: Number(M._crabs_wasm_user_key_version(userPtr)),
+      status: STATUS_NAMES[statusNumber] || 'unknown',
       attributes: attrs,
     };
   }
