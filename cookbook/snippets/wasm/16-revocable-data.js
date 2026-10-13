@@ -3,11 +3,13 @@
 //
 // What IS on this binding: policy-gated sealing (Node.encrypt), user-level
 // revocation (revokeUser, admin-gated + terminal in C), the fail-closed
-// gate that refuses a revoked user's subsequent ops, and a REAL getUser
+// gate that refuses a revoked user's subsequent ops, the REAL getUser
 // readback (keyVersion, status, publicKeyHex, per-attribute verifiedBy —
-// bindings/wasm/bindings-core.js mirrors the node mapper). What is NOT:
-// decrypting the container (recipe 6's gap) and the key-level lifecycle
-// (suspend / activate / rotate are C-only).
+// bindings/wasm/bindings-core.js mirrors the node mapper), and the
+// keygen/decrypt round trip (abeKeygen mints from the machine's own master
+// authority; abeDecrypt opens the container — the bearer-instrument
+// boundary and the epoch re-seal are executed below). What is NOT:
+// the key-level lifecycle (suspend / activate / rotate are C-only).
 
 const assert = require('assert');
 const { Node, KeyPair, Operation } = require('../../../bindings/wasm');
@@ -110,9 +112,55 @@ async function main() {
   assert.strictEqual(revoked.status, 'revoked', 'revocation flips the readback status');
   assert.strictEqual(revoked.keyVersion, 3, 'revocation bumps key_version to 3 (register 1, grant 2, revoke 3)');
 
-  console.log('revocable-data OK: reader sealed+gated, revoked, re-ops refused, re-grant refused, revocation visible in readback');
+  // The decrypt half (gap-fill A11) — and the BEARER-INSTRUMENT boundary,
+  // executed after the revocation: keygen consults no user record, and
+  // decrypt consults no user record either (crypto_abe_keygen /
+  // crypto_abe_decrypt). A reader key derived from 'member' — minted here
+  // for a user the machine just revoked, because the machine mints from its
+  // own authority — STILL opens the epoch-one payload. The seal carries its
+  // policy forever; user-record revocation never re-checks it.
+  const readerAbeKey = node.abeKeygen('member');
+  const opened = node.abeDecrypt(readerAbeKey, sealed);
+  assert.strictEqual(new TextDecoder().decode(opened), 'vault payload at epoch one',
+    'the policy-derived key still opens the epoch-one payload after revocation');
+
+  // What recalls access is RE-SEALING under the next epoch's policy: epoch
+  // two refuses the epoch-one key and opens for a fresh derivation
+  // (recipe-level re-key convention — the library has no re-encrypt).
+  const epochTwo = node.encrypt('vault payload at epoch two', 'epoch_2 and member');
+  let epochRefusal = '';
+  try {
+    node.abeDecrypt(readerAbeKey, epochTwo);
+  } catch (refusal) {
+    epochRefusal = String(refusal.message);
+  }
+  if (!epochRefusal.includes('unauthorized')) {
+    throw new Error(`epoch-one key must not open epoch-two data, got "${epochRefusal}"`);
+  }
+  const epochTwoKey = node.abeKeygen('epoch_2,member');
+  assert.strictEqual(new TextDecoder().decode(node.abeDecrypt(epochTwoKey, epochTwo)),
+    'vault payload at epoch two', 'a fresh epoch-two derivation opens the re-sealed payload');
+
+  // The negative from the other side: a key minted for an attribute the
+  // policy never asks for refuses the epoch-one payload too (typed
+  // 'unauthorized' — also the tamper path, GCM fail-closed).
+  const outsiderKey = node.abeKeygen('guest');
+  let outsiderRefusal = '';
+  try {
+    node.abeDecrypt(outsiderKey, sealed);
+  } catch (refusal) {
+    outsiderRefusal = String(refusal.message);
+  }
+  if (!outsiderRefusal.includes('unauthorized')) {
+    throw new Error(`a policy-missing key must be refused, got "${outsiderRefusal}"`);
+  }
+
+  console.log('revocable-data OK: reader sealed+gated, revoked, re-ops refused, re-grant refused, revocation visible in readback, old-seal bearer key still opened (post-revoke keygen+decrypt), epoch-two re-seal refused the old key and opened for a fresh one, outsider refused');
   node.destroy();
   readerKey.destroy();
+  readerAbeKey.destroy();
+  epochTwoKey.destroy();
+  outsiderKey.destroy();
 }
 main()
   .then(() => process.exit(0))

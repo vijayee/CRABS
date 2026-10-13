@@ -3,7 +3,7 @@ number: 16
 slug: revocable-data
 title: Data that must be revocable
 section: Ground truth
-status: PARTIAL
+status: COMPLETE
 maturity: STABLE
 target: crabs-wasm
 languages: c wasm node
@@ -29,11 +29,11 @@ revoke the reader, the ciphertext refuses. That is not what an ABE
 ciphertext is. The seal carries its policy **forever** — the re-check at
 decryption time is *the reader's key against the policy*, and a CP-ABE key
 derived from attributes when access was granted is a bearer instrument: no
-user-record lookup happens at decrypt. The C snippet below executes the
-refutation — a reader whose user record is REVOKED still opens the payload
-they were already able to derive a key for, because
-`crypto_abe_decrypt` consults no user status and no revocation registry
-(`src/Crypto/crypto.c:1041-1079`).
+user-record lookup happens at decrypt. Every snippet below (C, wasm, node)
+executes the refutation — a reader whose user record is REVOKED still opens
+the payload they were already able to derive a key for, because
+`crypto_abe_keygen` and `crypto_abe_decrypt` consult no user status and no
+revocation registry (`src/Crypto/crypto.c:1075-1105`).
 
 The other naive direction fails at the other end: skipping revocation
 entirely, because "the data is already sealed" — which ignores the *write*
@@ -49,18 +49,18 @@ fine afterward.
 ## The shape
 
 - *The seal*: `node.encrypt(payload, policy)` — both JS bindings
-  (`bindings/wasm/index.d.ts:306`, `bindings/node/index.d.ts:257`; node
-  impl `bindings/node/src/crabs_node.cc:1886-1913`) — sealing under the
+  (`bindings/wasm/index.d.ts:686`, `bindings/node/index.d.ts:508`; node
+  impl `bindings/node/src/crabs_node.cc:3036-3060`) — sealing under the
   machine's own CP-ABE authority
   (`attribute_machine.c:309` wires `abe_mk` into the state; the wasm glue
-  seals with it via `src/Util/wasm_helpers.c:1129-1136`), with the container layout
+  seals with it via `src/Util/wasm_helpers.c:1622-1628`), with the container layout
   `u16le policy byte length + policy bytes + u32le ciphertext length +
   ciphertext` pinned by `bindings/wasm/test/smoke.js:111-130`. This is
   Recipe 6's seal; the ABE-word mapping (`'name:value'` → `name_value`,
-  `src/Crypto/crypto.c:100-111`) is what makes an *epoch attribute* possible
+  `src/Crypto/crypto.c:98-111`) is what makes an *epoch attribute* possible
   (below).
 - *Revoke the reader*: `revokeUser(userId)` — both bindings
-  (`bindings/wasm/index.d.ts:215`, `bindings/node/index.d.ts:186`; C
+  (`bindings/wasm/index.d.ts:482`, `bindings/node/index.d.ts:308`; C
   `attribute_machine_revoke_user`, `src/Attribute/attribute_machine.h:175`,
   `src/Attribute/attribute_machine.c:888-907`). Admin-gated (the signer
   must hold `role:admin`), TERMINAL (`USER_REVOKED` cannot be suspended
@@ -68,13 +68,13 @@ fine afterward.
   `src/Attribute/attribute_machine.c:841-843`), and it bumps the user's
   epoch counter (`.c:901`).
 - *The epoch observable*: `UserInfo.keyVersion` — the JS-visible read of the
-  machine's per-user mutation counter (`bindings/node/index.d.ts:53`,
-  mapped directly in `bindings/node/src/crabs_node.cc:1147-1157`).
-  **Readback asymmetry**: the crabs-node readback is real; the WASM
-  binding's `getUser` returns STUBS for `keyVersion` (`0`) and `status`
-  (`'active'`) — hardcoded in `bindings/wasm/bindings-core.js:693-706` —
-  so the browser cannot observe a revocation through `getUser` (the gap
-  block, below).
+  machine's per-user mutation counter on BOTH bindings (node
+  `bindings/node/index.d.ts:145`, mapped directly in
+  `bindings/node/src/crabs_node.cc:1567-1601`; wasm
+  `bindings/wasm/index.d.ts:277-288`, mapped in
+  `bindings/wasm/bindings-core.js:895-952` — the former hardcoded stubs
+  were replaced by real readbacks in the binding fix that
+  `bindings/wasm/test/getuser-readback.js` pins).
 - *The fail-closed gates*: a non-ACTIVE user's op refuses with the collapsed
   `unauthorized` (mode A, `src/Crypto/crypto.c:1395-1403`, R7-14); a
   suspended or revoked *keyring* key refuses the same way
@@ -115,86 +115,45 @@ Not guaranteed — the honesty this recipe owes:
 
 - *Recall of already-sealed payloads is NOT a user-record story.* A CP-ABE
   key already derived from the old attributes keeps opening the ciphertext
-  it satisfied — the C snippet revokes the user first and then opens the
-  old payload anyway. Real recall is *re-keying*: re-encrypt under the next
+  it satisfied — the C and JS snippets all revoke the user first (the JS
+  snippets derive the key AFTER the revocation) and then open the old
+  payload anyway. Real recall is *re-keying*: re-encrypt under the next
   epoch's policy and derive fresh reader keys (the epoch-attribute pattern,
-  demonstrated in the C snippet; the old account stays terminal — the new
+  demonstrated in every snippet; the old account stays terminal — the new
   epoch's audience is a new enrollment). The library has no revocation
   registry, no `crypto_abe_revoke`, and no re-encrypt — this is a
   recipe-level pattern, not a library feature (api-map §17, `cookbook/api-map.md:290`).
-- *On the JS bindings there is no decrypt at all* (Recipe 6's gap, one
-  level up), and no keyring lifecycle:
+- *The decrypt half is JS-bound now; the keyring lifecycle is the C
+  surface:*
 
-  > [!WARNING] GAP
+  > [!NOTE] RESIDUAL SCOPE
   >
-  > **Prose describes:** proving the revocation end-to-end from JS — the
-  > revoked reader's key failing to open the sealed payload, and the
-  > key-level tools (suspend / activate / rotate) available to the
-  > application.
+  > **What is real from JS (both bindings):** `abeKeygen(attrs)` derives a
+  > reader key from the machine's own master authority and
+  > `abeDecrypt(key, container)` opens the container `encrypt` returned —
+  > `bindings/wasm/index.d.ts:698,708`, `bindings/node/index.d.ts:520,529`
+  > (api-map §9; pinned by `bindings/wasm/test/abe-decrypt.js` and
+  > `bindings/node/test/abe.js`, and executed by both snippets below —
+  > including the bearer-instrument demonstration and the epoch-two
+  > re-seal).
   >
-  > **Codebase status:** exists in C and is engine-tested —
-  > `crypto_abe_keygen` / `crypto_abe_decrypt`
-  > (`src/Crypto/crypto.h:104-107,123-127`, pinned positive AND negative in
-  > `test/test_crypto.cpp:163-301`), `user_key_suspend/activate/rotate`
-  > (`src/Attribute/attribute_machine.h:219-221`,
-  > `test/test_key_lifecycle.cpp`). Neither JS binding maps any of it: grep
-  > both `.d.ts` files — decrypt rows do not exist, keyring-mutation rows
-  > do not exist (only the `keyVersion`/`status` READS are mapped; api-map
-  > §9 records the encrypt-only rows at `bindings/wasm/index.d.ts:306`,
-  > `bindings/node/index.d.ts:257`; api-map §2 records the C-only
-  > lifecycle).
-  >
-  > **Divergence:** the design (v1.3 §9 key lifecycle) treats suspension
-  > and rotation as operational tools; JS consumers can observe their
-  > *effects* (a bumped `keyVersion` on crabs-node, refused ops on both
-  > bindings) but cannot *perform* them, and cannot open the sealed
-  > payload from JS at all — the demonstrable halves on this page stop at
-  > the refusal gate.
-  >
-  > **Tracking:** an internal implementation plan (not published on this
-  > site).
-  >
-  > **Agent action:** code block omitted for the missing half — do not
-  > invent `decrypt()`, `suspendKey()`, or `rotateKey()` onto either
-  > binding; the C section is where this half is real.
+  > **What stays C-only in v1:** the keyring mutation tools —
+  > `user_key_suspend` / `user_key_activate` / `user_key_rotate`
+  > (`src/Attribute/attribute_machine.h:219-221`, exercised
+  > `test/test_key_lifecycle.cpp`). JS consumers observe their *effects*
+  > (a bumped `keyVersion` on both bindings, refused ops) but cannot
+  > *perform* them; the C snippet is where that lifecycle is executable.
+  > No portable reader-key bytes ship: `AbeKey` is a destroyable wrapper
+  > around the machine-derived key — the C-side
+  > `crypto_abe_user_key_serialize`/`deserialize` pair remains outside the
+  > JS surface by design (the machine, not the file system, holds the key
+  > material).
 
-- *The wasm readback cannot show the revocation at all:*
-
-  > [!WARNING] GAP
-  >
-  > **Prose describes:** a browser (crabs-wasm) observing that a reader is
-  > revoked — reading `getUser('reader').status` / `.keyVersion` after
-  > `revokeUser` and rendering the account state.
-  >
-  > **Codebase status:** the wasm `getUser` implementation returns
-  > hardcoded stubs for three of its fields — `publicKeyHex: ''`,
-  > `keyVersion: 0`, `status: 'active'`
-  > (`bindings/wasm/bindings-core.js:693-706`) — while the node binding
-  > maps the same fields directly from the machine
-  > (`bindings/node/src/crabs_node.cc:1139-1157`; the same fields are
-  > declared at `bindings/wasm/index.d.ts:150-160`). The snippets pin the
-  > stubbed readback executing `revokeUser` and then observing
-  > `status: 'active'` / `keyVersion: 0`.
-  >
-  > **Divergence:** the api-map §2 documents `UserInfo` as STABLE on wasm
-  > (`cookbook/api-map.md:50`, exercised only for the attributes list at
-  > `bindings/wasm/test/smoke.js:41`); the `keyVersion`/`status` fields
-  > are display stubs on wasm — a wasm consumer's only revocation
-  > observable is the *refusal of the revoked user's next op*, not the
-  > account readback. The node binding is the surface where the honest
-  > readback exists.
-  >
-  > **Tracking:** none found — the stub is undocumented in the bindings'
-  > own READMEs; this page records it.
-  >
-  > **Agent action:** code block omitted for the fix; do not present
-  > wasm `getUser().keyVersion` / `.status` as live values (they are
-  > constants of the wasm glue today).
-
-For that reason the frontmatter status is PARTIAL: the recipe *delivers*
-seal + revocation-refusal on wasm and node (with the node-side honest
-readback), and the full story — keyring lifecycle, decryption, and the
-epoch re-key pattern — on C.
+For that reason the JS halves of this recipe are complete as demonstrated
+by the snippets: seal + revocation-refusal + readback + keygen/decrypt
+(including the honest bearer-instrument boundary and the epoch re-key
+pattern) run on both bindings, and the keyring lifecycle is the C
+section's executable half.
 
 ## Variations
 
@@ -233,8 +192,12 @@ epoch re-key pattern — on C.
 ### crabs-wasm (browser / Node / edge)
 
 Seed the reader (register + grant), seal the payload, revoke, and watch the
-only two wasm observables: the revoked reader's op refusing fail-closed, and
-(getClient-side pinned) the `getUser` readback stubs that stay fake.
+three wasm observables of the revocation: the revoked reader's op refusing
+fail-closed, the REAL `getUser` readback flipping to `revoked` with the
+bumped `keyVersion`, and the sealed payload staying openable to the
+policy-derived key even after the revocation (the bearer-instrument
+boundary — the reader for its recall is the epoch re-seal, which the
+snippet executes too).
 
 ```snippet:wasm/16-revocable-data.js
 ```
@@ -243,38 +206,46 @@ only two wasm observables: the revoked reader's op refusing fail-closed, and
 target: crabs-wasm
 verified: executed
 symbols:
-  Node.create              bindings/wasm/index.d.ts:372
-  KeyPair.generate         bindings/wasm/index.d.ts:21
-  registerUser             bindings/wasm/index.d.ts:213
-  grantRole                bindings/wasm/index.d.ts:214
-  Node.revokeUser          bindings/wasm/index.d.ts:215 (C: attribute_machine_revoke_user, src/Attribute/attribute_machine.c:888-907)
-  (readback stub)          bindings/wasm/bindings-core.js:693-706
-  addCounter               bindings/wasm/index.d.ts:223
-  getCounter               bindings/wasm/index.d.ts:254
-  setPolicy                bindings/wasm/index.d.ts:295
-  registerHandlerJs        bindings/wasm/index.d.ts:303
-  HandlerState.incrementCounter bindings/wasm/index.d.ts:103
-  Operation.create         bindings/wasm/index.d.ts:52
-  Node.sign / Node.execute bindings/wasm/index.d.ts:297 / :296
-  Node.encrypt             bindings/wasm/index.d.ts:306
-  Node.destroy             bindings/wasm/index.d.ts:368
+  Node.create              bindings/wasm/index.d.ts:774
+  KeyPair.generate         bindings/wasm/index.d.ts:43-47
+  registerUser             bindings/wasm/index.d.ts:480
+  grantRole                bindings/wasm/index.d.ts:481
+  Node.revokeUser          bindings/wasm/index.d.ts:482 (C: attribute_machine_revoke_user, src/Attribute/attribute_machine.c:888-907)
+  getUser (real readback)  bindings/wasm/index.d.ts:488 (mapper: bindings/wasm/bindings-core.js:895-952)
+  addCounter               bindings/wasm/index.d.ts:490
+  getCounter               bindings/wasm/index.d.ts:554
+  setPolicy                bindings/wasm/index.d.ts:638
+  registerHandlerJs        bindings/wasm/index.d.ts:683
+  HandlerState.incrementCounter bindings/wasm/index.d.ts:195
+  Operation.create         bindings/wasm/index.d.ts:122
+  Node.sign / Node.execute bindings/wasm/index.d.ts:657 / :656
+  Node.encrypt             bindings/wasm/index.d.ts:686
+  Node.abeKeygen           bindings/wasm/index.d.ts:698
+  Node.abeDecrypt          bindings/wasm/index.d.ts:708
+  AbeKey.destroy           bindings/wasm/index.d.ts:57-59
+  Node.destroy             bindings/wasm/index.d.ts:770
   (fail-closed user gate)  src/Crypto/crypto.c:1395-1403 (R7-14 collapse)
   (re-grant whitelist)     src/Attribute/attribute_machine.c:585-588 (R4-2)
-maturity: revokeUser semantics STABLE (C-tested via the R4-2/R7-14 gates; the
-  binding suite only type-checks the method — bindings/node/test/test.js:253 —
-  this snippet is the first executable demonstration of the semantics on wasm)
-test_ref: bindings/wasm/test/smoke.js:111-130 (encrypt container layout)
+  (keygen consults no user record) src/Crypto/crypto.c:809-855
+  (decrypt consults no user record) src/Crypto/crypto.c (crypto_abe_decrypt)
+maturity: revokeUser + readback + abeKeygen/abeDecrypt semantics STABLE
+  (C-tested via the R4-2/R7-14 gates; pinned on this binding by
+  test/abe-decrypt.js + test/getuser-readback.js)
+test_ref: bindings/wasm/test/abe-decrypt.js (keygen/decrypt round trip +
+  refusals + token map) + bindings/wasm/test/getuser-readback.js + bindings/wasm/test/smoke.js:111-130 (encrypt container layout)
 -->
 
-The decrypt half is C-only (recipe 6's gap, above) and the keyring
-lifecycle is C-only — see the C section for where the story completes.
+The JS-residual is exactly the keyring lifecycle (suspend / activate /
+rotate — C-only; the RESIDUAL SCOPE note above). Everything else — seal,
+refusals, readback, decrypt — is executable from this binding.
 
 ### crabs-node (native Node.js)
 
-The same flow with the readback the browser binding stubs away: the machine
-maps `keyVersion` and `status` directly, so the revocation is observable as
-a `1 -> 2 -> 3` bump plus the terminal `revoked` status, and it streams as
-an `attribute`-kind change event.
+The same flow — this binding maps `keyVersion` and `status` directly, so
+the revocation is observable as a `1 -> 2 -> 3` bump plus the terminal
+`revoked` status, and it streams as an `attribute`-kind change event (the
+wasm binding shows the same readback since the real-`getUser` mapping —
+recipe-level parity; see the RESIDUAL SCOPE note for what is left).
 
 ```snippet:node/16-revocable-data.js
 ```
@@ -283,25 +254,30 @@ an `attribute`-kind change event.
 target: crabs-node
 verified: executed
 symbols:
-  NodeStatic.new           bindings/node/index.d.ts:312
-  KeyPair.generate         bindings/node/index.d.ts:14
-  registerUser             bindings/node/index.d.ts:182
-  grantRole                bindings/node/index.d.ts:183
-  Node.revokeUser          bindings/node/index.d.ts:186
-  getUser                  bindings/node/index.d.ts:189 (crabs_node.cc:1139-1157)
-  UserInfo.keyVersion      bindings/node/index.d.ts:53 (crabs_node.cc:1147)
-  defineItem               bindings/node/index.d.ts:205
-  Node.sign / Node.execute bindings/node/index.d.ts:250 / :251
-  Node.on                  bindings/node/index.d.ts:188
-  Node.encrypt             bindings/node/index.d.ts:257 (crabs_node.cc:1886-1913)
-  Operation.new            bindings/node/index.d.ts:47
-  Operation.addResource    bindings/node/index.d.ts:26
-  (change event shape)     bindings/node/src/crabs_node.cc:950-962
+  NodeStatic.new           bindings/node/index.d.ts:641-643
+  KeyPair.generate         bindings/node/index.d.ts:58
+  registerUser             bindings/node/index.d.ts:304
+  grantRole                bindings/node/index.d.ts:305
+  Node.revokeUser          bindings/node/index.d.ts:308
+  getUser                  bindings/node/index.d.ts:311 (crabs_node.cc:1567-1601)
+  UserInfo.keyVersion      bindings/node/index.d.ts:145 (crabs_node.cc)
+  defineItem               bindings/node/index.d.ts:363
+  Node.sign / Node.execute bindings/node/index.d.ts:463 / :464
+  Node.on                  bindings/node/index.d.ts:310
+  Node.encrypt             bindings/node/index.d.ts:508 (crabs_node.cc:3036-3060)
+  Node.abeKeygen           bindings/node/index.d.ts:520 (crabs_node.cc:3078-3104)
+  Node.abeDecrypt          bindings/node/index.d.ts:529 (crabs_node.cc:3106-3119)
+  AbeKey.destroy           bindings/node/index.d.ts:41-43 (crabs_node.cc:430-474)
+  Operation.new            bindings/node/index.d.ts:139
+  Operation.addResource    bindings/node/index.d.ts:70
+  (change event shape)     bindings/node/src/crabs_node.cc (EmitChange)
   (fail-closed user gate)  src/Crypto/crypto.c:1395-1403 (R7-14 collapse)
   (re-grant whitelist)     src/Attribute/attribute_machine.c:585-588 (R4-2)
 maturity: all STABLE; the revoke readback (keyVersion/status) is mapped
-  directly from the machine — no stub
-test_ref: bindings/node/test/test.js:143-147 (op-event result field) + :253
+  directly from the machine — no stub; abeKeygen/abeDecrypt pinned by
+  bindings/node/test/abe.js
+test_ref: bindings/node/test/abe.js (keygen/decrypt round trip + refusals)
+  + bindings/node/test/test.js:143-147 (op-event result field) + :253
 -->
 
 ### C (native)
@@ -338,7 +314,7 @@ symbols:
   (policy grammar)               src/StateMachine/state_machine.c:768-783 + preprocess src/Condition/condition.c:1501-1598
   crypto_abe_encrypt             src/Crypto/crypto.h:110-114
   crypto_abe_keygen              src/Crypto/crypto.h:104-107 (token map .c:99-111)
-  crypto_abe_decrypt             src/Crypto/crypto.h:123-127 (no status/registry check, .c:1041-1079)
+  crypto_abe_decrypt             src/Crypto/crypto.h:134-137 (no status/registry check, .c:1075-1105)
   crypto_ecdsa_generate          src/Crypto/crypto.h:21
   CRABS_SUCCESS / ERR_UNAUTHORIZED / ERR_USER_SUSPENDED / ERR_KEY_STALE src/CRABS/crabs.h:65,77,80,78
 maturity: all exercise the same C-tested paths the header comments describe
@@ -347,12 +323,11 @@ test_ref: test/test_key_lifecycle.cpp:88-125 (suspend), :171-251 (activate + R8-
 
 ## Notes
 
-- *Why the wasm readback pin matters*: the recipe treats the stub as a
-  finding, not a footnote — a revocation UI built on the wasm binding today
-  would show every revoked member as `active / keyVersion 0` forever. The
-  binding suite only type-checks `revokeUser`
-  (`bindings/node/test/test.js:253`) and never reads back, which is why the
-  snippets are the first executable pin of the semantics on either binding.
+- *Why the readback pin matters*: the user records of every surface are
+  machine-mapped now — a revocation UI reading `getUser(...).status` /
+  `.keyVersion` observes `revoked` / the bump on BOTH bindings
+  (`bindings/wasm/test/getuser-readback.js` pins the wasm readback;
+  `bindings/node/test/test.js:253` type-checks the node surface).
 - *What the epoch counter actually counts*: record mutations, not keys —
   `user_key_register` does not bump it (`src/Attribute/attribute_machine.c:1091-1151`),
   while every attribute mutation and every key-status transition does
@@ -379,6 +354,8 @@ test_ref: test/test_key_lifecycle.cpp:88-125 (suspend), :171-251 (activate + R8-
   property, demonstrated). If a reader's key was already extracted from an
   envelope, the epoch bump does not help retroactively any more than
   revocation does — re-encrypt early.
-- *The api-map correction*: §2's `UserInfo` row was marked STABLE on both
-  bindings; the wasm readback's stub fields now have their own ledger
-  caveat (api-map §2) — matching what this page demonstrates.
+- *The api-map rows*: §2's `UserInfo` row reflects the readback being a
+  real machine-mapped surface on BOTH bindings, and §9 records the full
+  ABE round trip (`encrypt` + `abeKeygen`/`abeDecrypt` + `AbeKey`) with
+  the machine-held-master-key trust shape — matching what this page
+  demonstrates.

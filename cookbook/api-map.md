@@ -47,7 +47,7 @@ Unless a row says otherwise, wasm and node share the symbol at the same d.ts lin
 | `Node.selfAssert` | method (**node only**) | `selfAssert(attribute, value, signerId)` | `bindings/node/index.d.ts:184` | STABLE (`test/test.js:97`) |
 | `Node.verifyIdentity` | method (**node only**) | `verifyIdentity(targetUser, attribute, value, signerId)` | `bindings/node/index.d.ts:185` | PRESENT (no test found) |
 | `Node.getUser` | query | `getUser(userId) -> UserInfo \| undefined` | wasm :221, node :189 | STABLE (`smoke.js:40`) |
-| `UserInfo` | interface | `{userId, publicKeyHex, keyVersion, status, attributes[]}` | wasm :150-160, node :50-61 | STABLE (`smoke.js:41` — attributes list only; the wasm readback returns STUBS for `publicKeyHex`/`keyVersion`/`status`, `bindings/wasm/bindings-core.js:693-706`; crabs-node maps them directly, `bindings/node/src/crabs_node.cc:1139-1157`) |
+| `UserInfo` | interface | `{userId, publicKeyHex, keyVersion, status, attributes[]}` | wasm :277-288, node :142-152 | STABLE (`getuser-readback.js` — keyVersion/status/publicKeyHex/verifiedBy are REAL readbacks on BOTH bindings now: wasm maps them in `bindings/wasm/bindings-core.js:895-952`, node in `bindings/node/src/crabs_node.cc:1567-1601`; the former wasm display stubs are gone) |
 | `UserInfo.attributes[].verifiedBy` | field | attribute provenance string | wasm :157, node :57 | STABLE (`roles.test`-style asserts, `test/test.js:92`) |
 | `Node.pruneExpiredTempAttrs` | method | `pruneExpiredTempAttrs() -> number (wasm) / void (node)` | wasm :310, node :265 | PRESENT |
 
@@ -171,14 +171,29 @@ Timing semantics of the authenticated HTTPS time source (defaults 30000/1000/500
 | `HandlerState.getSetElements` inside a handler | method (wasm only) | same as Node's, same 256-hard-cap → `getSetElements(name, {limit:999})` throws inside handlers too | `bindings/wasm/index.d.ts:180` + `handler-reads.js:139-146` | STABLE |
 | `HandlerOperation` | interface (wasm only) | `{type, signerId, nodeId, payload?: string, resources: string[]}` — `resources` are the op's declared resource names (recipe 9's transfer handler resolves the pots through them) | `bindings/wasm/index.d.ts:212-218` | STABLE (`smoke.js:59-63`, `locks-tx.js` transfer handler) |
 
-## 9. ABE encryption (encrypt) (R6)
+## 9. ABE encryption + machine-side keygen/decrypt (R6, R16)
+
+Both bindings carry the full seal/open round trip. **Trust shape:** the
+CP-ABE master key is machine-held (`state->abe_mk`,
+`src/CRABS/data_model.h`; wired at `src/Attribute/attribute_machine.c:309`)
+— no JS handle for it exists and no portable reader-key bytes ship in v1:
+`abeKeygen` derives a key from the machine's OWN authority (whoever
+controls the machine can mint a reader key for any attribute set it names;
+`crypto_abe_keygen` consults no user record), and `AbeKey` is a destroyable
+JS-owned wrapper (idempotent `destroy()`, like `KeyPair`).
 
 | symbol | kind | signature | source | maturity |
 |---|---|---|---|---|
-| `Node.encrypt` | method | `encrypt(payload: Uint8Array\|string (wasm) / Buffer (node), policy: string) -> ABE container` | wasm :306, node :257 | STABLE (`smoke.js:115`) |
-| container layout | contract | u16le policy byte length (UTF-8 bytes, not UTF-16 units) + policy bytes + u32le ciphertext length + ciphertext | `bindings/wasm/index.d.ts:306` (signature) + `bindings/wasm/test/smoke.js:111-130` (layout round-trip) | STABLE |
+| `Node.encrypt` | method | `encrypt(payload: Uint8Array\|string (wasm) / Buffer (node), policy: string) -> ABE container` | wasm :686, node :508 | STABLE (`smoke.js:115`) |
+| container layout | contract | u16le policy byte length (UTF-8 bytes, not UTF-16 units) + policy bytes + u32le ciphertext length + ciphertext | `bindings/wasm/index.d.ts:686` (signature) + `bindings/wasm/test/smoke.js:111-130` (layout round-trip) | STABLE |
+| `Node.abeKeygen` | method | `abeKeygen(attrs: string) -> AbeKey` — attrs = the comma-separated CRABS token list; the ':' → '_' / ',' → '\|' token map applies machine-side (`src/Crypto/crypto.c:98-111`), so the seal policy must carry the mapped words (`'role:member'` key ↔ `role_member` policy word) | wasm `index.d.ts:698` (`bindings/wasm/bindings-core.js`), node `index.d.ts:520` (`crabs_node.cc:3078`) | STABLE (`abe-decrypt.js`, node `test/abe.js` — round trip + refusals + token map) |
+| `AbeKey` | class (both bindings) | destroyable wrapper around the machine-derived `abe_user_key_t*`; NOT portable bytes (C-side `crypto_abe_user_key_serialize`/`deserialize` remain outside the JS surface) | wasm `index.d.ts:57-59`, node `index.d.ts:41-43` | STABLE (destroy idempotence pinned by both tests) |
+| `Node.abeDecrypt` | method | `abeDecrypt(key: AbeKey, encrypted: container) -> Uint8Array (wasm) / Buffer (node)` — parses the container, rebuilds the ciphertext (`crypto_abe_ciphertext_load`, `src/Crypto/crypto.h:129`), decrypts; refuses with the typed `unauthorized` when the key's attributes do not satisfy the policy (also the tamper path, GCM fail-closed); malformed containers refuse at the binding boundary | wasm `index.d.ts:708`, node `index.d.ts:529` | STABLE (`abe-decrypt.js` / node `test/abe.js`: right-attrs decrypt, wrong-attrs + partial-clause + tampered refusals) |
 
-C surface: `crypto_abe_setup` etc. at `src/Crypto/crypto.h:96-101` — the JS row is the supported path (PRESENT).
+C surface: `crypto_abe_setup` etc. at `src/Crypto/crypto.h:96-137` — the JS
+rows above are the supported path; the keyring lifecycle
+(`user_key_suspend/activate/rotate`) and the serialized-key transport
+envelope stay C-only (api-map §2).
 
 ## 10. Lineage: Blueprint, spawn, attest, tombstone (R11, R12)
 
@@ -295,7 +310,7 @@ Where a recipe capability has **no JS map entry**, that fact is recorded here �
 | R3 | `ONE_SHOT_FLAG`, global dedup | `addOneShotFlag` / `flagSet` / `flagValue` (§4), STABLE; global dedup → `Node.defineOperationType` with `dedup: 'global'` (§5, STABLE — both bindings) |
 | R4 | `registerUser`, `grantRole`, `setPolicy` | §2 / §3, STABLE |
 | R5 | register LWW + key versioning/pair | `Node.setRegister` / `getRegister` + BigInt-vs-number split (§4); key pair = `KeyPair.*` (§13); `UserInfo.keyVersion` is the JS-visible version (§2) |
-| R6 | triggers, threshold attributes, ABE | `createTrigger` / `TriggerConfig` (§7, STABLE); threshold conditions live in the C condition grammar `src/Condition/` (PRESENT in C, surface tested via `createTrigger`); `Node.encrypt` (§9, STABLE) |
+| R6 | triggers, threshold attributes, ABE | `createTrigger` / `TriggerConfig` (§7, STABLE); threshold conditions live in the C condition grammar `src/Condition/` (PRESENT in C, surface tested via `createTrigger`); `Node.encrypt` + `Node.abeKeygen`/`Node.abeDecrypt` + `AbeKey` (§9, STABLE — the full seal/open round trip runs from JS on both bindings) |
 | R7 | schedules, `setTimeSource`, HLC | §6; schedules STABLE on both bindings (wasm `bindings/wasm/index.d.ts:501-511`, node `bindings/node/index.d.ts:306-331`, node test pinned), HLC via node `getHLC` (STABLE) + C `src/HLC/hlc.h` (PRESENT) |
 | R8 | OT ordered set surface | **Op layer JS-bound on both bindings** (§15): `addOrderedSet` + `orderedInsert/orderedDelete/orderedMove/orderedSwap` (op id `{node,seq,ts?}` + optional causal `deps`) + `getOrderedSet` readback — wasm `index.d.ts:466-498`, node `index.d.ts:287-319`; executor path `crabs_wasm_ot_apply` (`src/Util/wasm_helpers.c:712`) / `crabs_node.cc:1868`, payload from `crabs_ot_ops_to_wire` (`src/OT/ot_execution.h:49-54`). **Merge layer still C-only:** `crabs_ot_ordered_set_merge` + `merge_position_maps` (`src/OT/ot_ordered_set.h:114-118`) — conflicting-payload refusal and merged position-map guarantees demoable only in C (`test/test_ot_ordered_set.cpp:377-420`) → recipe R8 is PARTIAL with `languages: c wasm node` |
 | R9 | resources, locks / transaction manager | **Full surface STABLE JS (both bindings)** (recipe 9): `Node.addResource(name, initial?)` + `getResource` (§4) — the lock-capable RESOURCE item mint (wasm export `crabs_wasm_add_resource`, `src/Util/wasm_helpers.c:638`; node `crabs_node.cc:1738`); the lock drive = `__lock__`/`__verify__`/`__unlock__` built-ins + `Node.getLockState(name)` (the live bearer-token read; wasm `wasm_helpers.c:730`, node `crabs_node.cc:1804`) + `Operation.setRequiredState`/`setNextState`/`addLockClaim` (§12; executor steps 4-5, `src/StateMachine/state_machine.c:848-866,1653-1668`); replay = `Node.attachTxManager('memory'|'none')` (wasm `wasm_helpers.c:829`, node `crabs_node.cc:1778` — wraps `src/TxManager/tx_manager.h:19-41` vtable + `crabs_tx_manager_memory`/`crabs_tx_manager_none`). Residual limits: lock state is runtime-only (never serialized), claim discipline stays cooperative (recipe 9's honesty notes), and crabs-node still has no handler surface — the debit/credit *arithmetic* there stays the driver's |
@@ -305,7 +320,7 @@ Where a recipe capability has **no JS map entry**, that fact is recorded here �
 | R13 | write domain SOVEREIGN | `defineItem({domain:'sovereign', writer})` + `itemChainHead` + `reportEquivocation` (§11, STABLE) |
 | R14 | GROUP-ORDERED / elected ordering module | **Not shipped.** `DefineItemOptions.orderingModule` accepts only 0 (`bindings/wasm/index.d.ts:186-187`, node :128-129 — "v1 ships no ordering modules"); C field exists (`src/CRABS/data_model.h:206-212`: "GROUP_ORDERED requires ordering_module == 0 (no modules exist yet)") → DESIGNED; no consensus/election module found in `src/` → recipe R14 is DESIGNED-level, must be labeled as such |
 | R15 | hardware attestation namespace | **Not found anywhere** — no `hardware`/`secure element`/attestation-attribute symbol in `src/` or `bindings/`; the only TPM-shaped code is the declared-unimplemented HLC time-source enum `CRABS_TIME_SOURCE_TPM = 0x02` (`src/HLC/hlc.h:57`, ops-required/fail-closed `src/HLC/hlc.c:276-286`; designed in `docs/CRABS Protocol Specification v1.6 Amendment 6.md:218,669-689` as a *time* source) plus the cookbook plan mention (`docs/superpowers/plans/2026-10-11-cookbook-github-pages.md:709`) → no map entry; recipe R15 must be labeled DESIGNED / future-work |
-| R16 | key versioning / epoch attributes | `UserInfo.keyVersion` (§2); full lifecycle C-only: `user_key_suspend/activate/rotate` `src/Attribute/attribute_machine.h:219-221` + `test/test_key_lifecycle.cpp` → key-version read is PRESENT-in-JS, rotation is DESIGNED (C-only); "epoch" as an attribute convention is a recipe-level pattern, not a library symbol |
+| R16 | key versioning / epoch attributes | `UserInfo.keyVersion` (§2, real readback on both bindings); ABE seal + open round trip from JS: `Node.abeKeygen`/`Node.abeDecrypt` (§9, STABLE — recipe 16's snippets execute the bearer-instrument boundary and the epoch re-key from both bindings); keyring lifecycle still C-only: `user_key_suspend/activate/rotate` `src/Attribute/attribute_machine.h:219-221` + `test/test_key_lifecycle.cpp` (rotation/suspension DESIGNED as C-surface tools); "epoch" as an attribute convention is a recipe-level pattern, not a library symbol |
 
 ### Known wasm/node differences (full list found while mapping)
 

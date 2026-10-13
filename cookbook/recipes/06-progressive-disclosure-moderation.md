@@ -3,7 +3,7 @@ number: 6
 slug: progressive-disclosure-moderation
 title: Progressive disclosure moderation
 section: Conditions
-status: PARTIAL
+status: COMPLETE
 maturity: STABLE
 target: crabs-wasm
 languages: c wasm node
@@ -80,7 +80,9 @@ attribute policy.
   u16le policy byte length + policy bytes + u32le ciphertext length +
   ciphertext (exercised `bindings/wasm/test/smoke.js:111-130`, which pins
   the round-trip; `Node.encrypt`'s signature is
-  `bindings/wasm/index.d.ts:306`).
+  `bindings/wasm/index.d.ts:686`). The reader's side of the same container:
+  `node.abeKeygen(attrs)` + `node.abeDecrypt(key, container)`
+  (`bindings/wasm/index.d.ts:698,708`) — see the decrypt provenance below.
 
 ## What it guarantees / what it doesn't
 
@@ -97,17 +99,19 @@ to nothing (the C snippet pins the negative).
 Not guaranteed: *when* the trigger fires relative to real time. Trigger
 passes run after executed ops — a machine nobody sends ops to (or one
 driving ticks through `evaluateTriggers`, wasm only
-`bindings/wasm/index.d.ts:336`) evaluates on *its* cadence. The
+`bindings/wasm/index.d.ts:738`) evaluates on *its* cadence. The
 `targetRole` audience is a fan-out over every ACTIVE holder of an
 attribute name, so a broad name fans out broadly — narrow audiences want
 narrow names (the demo uses the role *attribute* `role:…`, not user ids).
-And the decrypt half, below, is C-only today.
+And the decrypt key comes from the machine: a viewer decrypts with a key
+`abeKeygen` minted from the machine's master authority (the key-minting
+trust position is the machine admin's, below).
 
 ## Variations
 
 - Explicit ticking: `evaluateTriggers()` (wasm) signs and executes an admin
   no-op purely to run the trigger pass — the pattern the devtools demo
-  uses (`bindings/wasm/index.d.ts:336`). On crabs-node there is no such
+  uses (`bindings/wasm/index.d.ts:738`). On crabs-node there is no such
   method; any landing op is the tick (see the node snippet).
 - Self-extinguishing escalation: `oneShot: true` disables the trigger after
   its first fire (`src/Trigger/trigger.c:268-271`) — useful for a one-time
@@ -133,64 +137,54 @@ And the decrypt half, below, is C-only today.
 target: crabs-wasm
 verified: executed
 symbols:
-  Node.create              bindings/wasm/index.d.ts:372
-  KeyPair.generate         bindings/wasm/index.d.ts:21
-  publicKeyHex             bindings/wasm/index.d.ts:15
-  KeyPair.destroy          bindings/wasm/index.d.ts:17
-  registerUser             bindings/wasm/index.d.ts:213
-  grantRole                bindings/wasm/index.d.ts:214
-  getUser                  bindings/wasm/index.d.ts:221
-  addCounter               bindings/wasm/index.d.ts:223
-  setPolicy                bindings/wasm/index.d.ts:295
-  createTrigger            bindings/wasm/index.d.ts:298
-  TriggerConfig            bindings/wasm/index.d.ts:167-178
-  registerHandlerJs        bindings/wasm/index.d.ts:303
-  HandlerState.incrementCounter bindings/wasm/index.d.ts:103
-  HandlerOperation.signerId bindings/wasm/index.d.ts:145
-  Operation.create         bindings/wasm/index.d.ts:52
-  Operation.signerId       bindings/wasm/index.d.ts:28
-  Node.sign                bindings/wasm/index.d.ts:297
-  Node.execute             bindings/wasm/index.d.ts:296
-  Node.on                  bindings/wasm/index.d.ts:218
-  Node.encrypt             bindings/wasm/index.d.ts:306
-  Node.destroy             bindings/wasm/index.d.ts:368
-  (temp attr read, plain token) bindings/wasm/bindings-core.js:690-703
+  Node.create              bindings/wasm/index.d.ts:774
+  KeyPair.generate         bindings/wasm/index.d.ts:43-47
+  publicKeyHex             bindings/wasm/index.d.ts:38
+  KeyPair.destroy          bindings/wasm/index.d.ts:40
+  registerUser             bindings/wasm/index.d.ts:480
+  grantRole                bindings/wasm/index.d.ts:481
+  getUser                  bindings/wasm/index.d.ts:488
+  addCounter               bindings/wasm/index.d.ts:490
+  setPolicy                bindings/wasm/index.d.ts:638
+  createTrigger            bindings/wasm/index.d.ts:658
+  TriggerConfig            bindings/wasm/index.d.ts:295+
+  registerHandlerJs        bindings/wasm/index.d.ts:683
+  HandlerState.incrementCounter bindings/wasm/index.d.ts:195
+  HandlerOperation.signerId bindings/wasm/index.d.ts:270
+  Operation.create         bindings/wasm/index.d.ts:122
+  Operation.signerId       bindings/wasm/index.d.ts:63
+  Node.sign                bindings/wasm/index.d.ts:657
+  Node.execute             bindings/wasm/index.d.ts:656
+  Node.on                  bindings/wasm/index.d.ts:485
+  Node.encrypt             bindings/wasm/index.d.ts:686
+  Node.abeKeygen           bindings/wasm/index.d.ts:698
+  AbeKey.destroy           bindings/wasm/index.d.ts:57-59
+  Node.abeDecrypt          bindings/wasm/index.d.ts:708
+  Node.destroy             bindings/wasm/index.d.ts:770
+  (temp attr read, plain token) bindings/wasm/bindings-core.js (getUser temp branch)
   (trigger fire on execute) src/StateMachine/state_machine.c:1508-1520
   (issue fan-out)          src/Attribute/attribute_machine.c:954-1026
   (temp token in policy)   src/Crypto/crypto.c:1126-1163
   (cooldown skip)          src/Trigger/trigger.c:219-222
 maturity: all STABLE
-test_ref: bindings/wasm/test/smoke.js:111-130 (encrypt container layout) + bindings/wasm/test/change-events.js:44-52 (change event shape) + examples/devtools_demo/demo.js:54-84 (createTrigger policy + config wiring)
+test_ref: bindings/wasm/test/abe-decrypt.js (machine-held-M-key keygen/decrypt round trip, unauthorized refusals, token map, tamper fail-closed) + bindings/wasm/test/smoke.js:111-130 (encrypt container layout) + bindings/wasm/test/change-events.js:44-52 (change event shape) + examples/devtools_demo/demo.js:54-84 (createTrigger policy + config wiring)
 -->
 
-**Decrypting the container from JS is not exposed today.**
-
-> [!WARNING] GAP
->
-> **Prose describes:** a viewer holding policy-satisfying attributes
-> decrypts the sealed payload locally — the half that makes the payload
-> progressive rather than merely gated.
->
-> **Codebase status:** exists in C and is tested: `crypto_abe_setup` /
-> `crypto_abe_keygen` / `crypto_abe_decrypt`
-> (`src/Crypto/crypto.h:96-131`), pinned positive AND negative in
-> `test/test_crypto.cpp:163-301` (satisfying key decrypts, missing clause
-> is `CRABS_ERR_UNAUTHORIZED`). The machine holds its own CP-ABE authority
-> internally (`attribute_machine.c:309`; `state->abe_mk` is what
-> `encrypt` uses), and derived user keys travel ECIES-sealed in key
-> envelopes (`src/Crypto/crypto.c` envelope format).
->
-> **Divergence:** neither JS binding maps keygen or decrypt —
-> `bindings/wasm/index.d.ts:306` and `bindings/node/index.d.ts:257` are
-> encrypt-only rows (api-map §9). A browser cannot open the container.
->
-> **Tracking:** an internal implementation plan (not published on this
-> site). The api-map records the C-only surface at "§9 … C surface …
-> (PRESENT)".
->
-> **Agent action:** code block omitted. Keep encryption in the recipe, and
-> do decryption in a C service today — do not invent a `decrypt()` onto
-> the JS bindings.
+The snippet's decrypt half closes the old "C-only decrypt" gap: `abeKeygen`
+derives a reader key from the *machine's own* master authority and
+`abeDecrypt` opens the container locally — a browser can read the payload
+exactly when a policy-satisfying key has been minted for its holder's
+attributes. The master key never leaves the machine; there is no JS handle
+for it and no portable serialized key in v1 (`AbeKey` is a destroyable
+wrapper around the machine-derived key, api-map §9). The trust fact to
+carry into designs: **whoever controls the machine can mint a reader key
+for any attribute set it names** — keygen consults no user record
+(`crypto_abe_keygen`, `src/Crypto/crypto.c:809-855`), so "a moderator
+decrypts" is true in this recipe only because a policy-satisfying key was
+minted for that purpose. A policy-missing key (the snippet's `guest`)
+refuses with the typed `unauthorized` — the same typed path the C battery
+pins (`test/test_crypto.cpp:163-301`) and the same path tampering fails
+closed on.
 
 ### crabs-node (native Node.js)
 
@@ -201,39 +195,46 @@ test_ref: bindings/wasm/test/smoke.js:111-130 (encrypt container layout) + bindi
 target: crabs-node
 verified: executed
 symbols:
-  NodeStatic.new           bindings/node/index.d.ts:311-313
-  KeyPair.generate         bindings/node/index.d.ts:14
-  publicKeyHex             bindings/node/index.d.ts:8
-  registerUser             bindings/node/index.d.ts:182
-  grantRole                bindings/node/index.d.ts:183
-  getUser                  bindings/node/index.d.ts:189
-  UserInfo.keyVersion      bindings/node/index.d.ts:53
-  (temp attr read, direct token + expiresAt) bindings/node/src/crabs_node.cc:1208-1211
-  addCounter               bindings/node/index.d.ts:193
-  incrementCounter         bindings/node/index.d.ts:238
-  getCounter               bindings/node/index.d.ts:224
-  setPolicy                bindings/node/index.d.ts:249
-  createTrigger            bindings/node/index.d.ts:254
-  TriggerConfig (issue_attribute | change_policy only) bindings/node/index.d.ts:132-147
-  Operation.new            bindings/node/index.d.ts:47
-  Operation.addResource    bindings/node/index.d.ts:26
-  Node.sign                bindings/node/index.d.ts:250
-  Node.execute             bindings/node/index.d.ts:251
-  Node.on                  bindings/node/index.d.ts:188
-  Node.encrypt             bindings/node/index.d.ts:257
+  NodeStatic.new           bindings/node/index.d.ts:641-643
+  KeyPair.generate         bindings/node/index.d.ts:58
+  publicKeyHex             bindings/node/index.d.ts:28
+  registerUser             bindings/node/index.d.ts:304
+  grantRole                bindings/node/index.d.ts:305
+  getUser                  bindings/node/index.d.ts:311
+  UserInfo.keyVersion      bindings/node/index.d.ts:145
+  (temp attr read, direct token + expiresAt) bindings/node/src/crabs_node.cc:1593-1601
+  addCounter               bindings/node/index.d.ts:315
+  incrementCounter         bindings/node/index.d.ts:396
+  getCounter               bindings/node/index.d.ts:382
+  setPolicy                bindings/node/index.d.ts:450
+  createTrigger            bindings/node/index.d.ts:505
+  TriggerConfig (issue_attribute | change_policy only) bindings/node/index.d.ts:224-241
+  Operation.new            bindings/node/index.d.ts:139
+  Operation.addResource    bindings/node/index.d.ts:70
+  Node.sign                bindings/node/index.d.ts:463
+  Node.execute             bindings/node/index.d.ts:464
+  Node.on                  bindings/node/index.d.ts:310
+  Node.encrypt             bindings/node/index.d.ts:508
+  Node.abeKeygen           bindings/node/index.d.ts:520
+  AbeKey.destroy           bindings/node/index.d.ts:41-43
+  Node.abeDecrypt          bindings/node/index.d.ts:529
   (createTrigger stamps the machine's real admin id and signs with the node key)
-                           bindings/node/src/crabs_node.cc:1891-1925
-  (event result field)     bindings/node/src/crabs_node.cc:988
+                           bindings/node/src/crabs_node.cc:2842-2871
+  (event result field)     bindings/node/src/crabs_node.cc:1376
   (trigger fire on execute) src/StateMachine/state_machine.c:1508-1520
   (wildcard non-RESOURCE resources apply nothing, op still lands)
                            src/StateMachine/state_machine.c:1414-1428
-maturity: createTrigger/encrypt/trigger fire STABLE (asserted by this snippet); the 'tick' op is the driver convention of node tests
-test_ref: bindings/node/test/test.js:158-197 (createTrigger refusal paths) + test/test_trigger.cpp:378-415 (cooldown semantics) + test/test_attribute_machine.cpp:561-584 (temp attr expiry + fan-out semantics)
+maturity: createTrigger/encrypt/trigger fire STABLE; abeKeygen/abeDecrypt pinned by bindings/node/test/abe.js — STABLE (asserted by this snippet); the 'tick' op is the driver convention of node tests
+test_ref: bindings/node/test/abe.js (keygen/decrypt round trip + refusals + token map) + bindings/node/test/test.js:158-197 (createTrigger refusal paths) + test/test_trigger.cpp:378-415 (cooldown semantics) + test/test_attribute_machine.cpp:561-584 (temp attr expiry + fan-out semantics)
 -->
 
 crabs-node carries the same mechanism without the handler surface: the
 counter is driver-written, the tick is a landing op, and the observable
-for "the gate opened" is the `op` change event with `result === 0`.
+for "the gate opened" is the `op` change event with `result === 0`. The
+snippet's decrypt tail runs the identical `abeKeygen`/`abeDecrypt` round
+trip on the native binding (same container layout Encrypt serializes,
+`bindings/node/src/crabs_node.cc:3036-3119`; same typed `unauthorized`
+refusal to a policy-missing key).
 `TriggerConfig` here is the *narrower* union
 (`'issue_attribute' | 'change_policy'` — no self-perpetuating
 `create_trigger`/`delete_trigger`/`disable_trigger` effects), which is the
@@ -268,7 +269,7 @@ symbols:
   crypto_abe_keygen            src/Crypto/crypto.h:104-107
   crypto_abe_encrypt           src/Crypto/crypto.h:110-114
   crypto_abe_ciphertext_get_policy/data src/Crypto/crypto.h:117-121
-  crypto_abe_decrypt           src/Crypto/crypto.h:123-127
+  crypto_abe_decrypt           src/Crypto/crypto.h:134-137
   (attr token → ABE word mapping) src/Crypto/crypto.c:95-115
   crypto_ecdsa_generate        src/Crypto/crypto.h:21
   CRABS_SUCCESS                src/CRABS/crabs.h:65

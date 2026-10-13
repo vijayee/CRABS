@@ -165,4 +165,34 @@ if (2 + policyByteLength + 4 + ciphertextLength !== sealed.length) {
 }
 
 console.log('moderation OK: trigger fired at threshold, gate opened, cooldown suppressed, payload sealed');
+
+// The decrypt half (gap-fill A11): the machine derives a reader key from
+// ITS OWN master authority — abeKeygen('moderator,member') mints a key
+// carrying the ABE words the policy asks for, and abeDecrypt opens the
+// container locally (the machine never exposes its master key; the derived
+// key is JS-owned — destroy() it. Minting reader keys is the same trust
+// position as encrypt: the machine's admin side names the attribute set).
+const readerKey = node.abeKeygen('moderator,member');
+const opened = node.abeDecrypt(readerKey, sealed);
+if (opened.toString('utf8') !== 'contact for verified viewers') {
+  throw new Error(`decrypted payload mismatch, got "${opened.toString('utf8')}"`);
+}
+readerKey.destroy();
+
+// The negative: a key whose attributes lack a policy clause refuses with
+// the typed error word — 'unauthorized' (crypto_abe_decrypt; also the
+// tamper path, GCM fail-closed).
+const guestKey = node.abeKeygen('guest');
+let decryptRefusal = '';
+try {
+  node.abeDecrypt(guestKey, sealed);
+} catch (refusal) {
+  decryptRefusal = String(refusal.message);
+}
+if (!decryptRefusal.includes('unauthorized')) {
+  throw new Error(`decrypt must refuse a policy-missing key, got "${decryptRefusal}"`);
+}
+guestKey.destroy();
+
+console.log('decrypt OK: reader key opened the sealed payload, guest key refused unauthorized');
 // Node/KeyPair expose no destroy() — native cleanup is process-exit driven.

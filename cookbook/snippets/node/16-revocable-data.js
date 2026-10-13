@@ -1,13 +1,12 @@
 'use strict';
 // Recipe 16 — data that must be revocable (crabs-node, driven directly).
 //
-// Same real surface as the wasm binding (encrypt + revokeUser + the
-// fail-closed gate) — with the readback the browser binding stubs away:
-// crabs-node maps UserInfo.keyVersion and UserInfo.status DIRECTLY from the
-// machine (bindings/node/src/crabs_node.cc:1147-1157), so revocation is
-// observable as a status flip plus a keyVersion bump. Still missing here:
-// decrypt (recipe 6's gap, C-only) and the key-level lifecycle
-// (suspend/activate/rotate, C-only).
+// Same real surface as the wasm binding (encrypt + abeKeygen/abeDecrypt +
+// revokeUser + the fail-closed gate): crabs-node maps
+// UserInfo.keyVersion and UserInfo.status DIRECTLY from the machine
+// (bindings/node/src/crabs_node.cc GetUser), so revocation is observable as
+// a status flip plus a keyVersion bump. Still missing here: the key-level
+// lifecycle (suspend/activate/rotate, C-only).
 
 const assert = require('assert');
 const { Node, KeyPair, Operation } = require('../../../bindings/node');
@@ -120,4 +119,46 @@ if (!regrantRefusal.includes('user_suspended')) {
   throw new Error(`granting to a revoked target must be refused, got "${regrantRefusal}"`);
 }
 
-console.log('revocable-data OK: reader seeded (kv 1->2), op landed, revoked (kv 3, status revoked, event streamed), re-ops and re-grants refused');
+// The decrypt half (gap-fill A11) — and the BEARER-INSTRUMENT boundary,
+// executed after the revocation: keygen consults no user record, and
+// decrypt consults no user record either (crypto_abe_keygen /
+// crypto_abe_decrypt). A reader key derived from 'member' — minted here for
+// a user the machine just revoked, because the machine mints from its own
+// authority — STILL opens the epoch-one payload.
+const readerAbeKey = node.abeKeygen('member');
+const opened = node.abeDecrypt(readerAbeKey, sealed);
+assert.strictEqual(opened.toString('utf8'), 'vault payload at epoch one',
+  'the policy-derived key still opens the epoch-one payload after revocation');
+
+// What recalls access is RE-SEALING under the next epoch's policy: epoch
+// two refuses the epoch-one key and opens for a fresh derivation
+// (recipe-level re-key convention — the library has no re-encrypt).
+const epochTwo = node.encrypt(Buffer.from('vault payload at epoch two'), 'epoch_2 and member');
+let epochRefusal = '';
+try {
+  node.abeDecrypt(readerAbeKey, epochTwo);
+} catch (caught) {
+  epochRefusal = String(caught.message);
+}
+if (!epochRefusal.includes('unauthorized')) {
+  throw new Error(`epoch-one key must not open epoch-two data, got "${epochRefusal}"`);
+}
+const epochTwoKey = node.abeKeygen('epoch_2,member');
+assert.strictEqual(node.abeDecrypt(epochTwoKey, epochTwo).toString('utf8'),
+  'vault payload at epoch two', 'a fresh epoch-two derivation opens the re-sealed payload');
+
+// The negative from the other side: a key minted for an attribute the
+// policy never asks for refuses the epoch-one payload too (typed
+// 'unauthorized' — also the tamper path, GCM fail-closed).
+const outsiderKey = node.abeKeygen('guest');
+let outsiderRefusal = '';
+try {
+  node.abeDecrypt(outsiderKey, sealed);
+} catch (caught) {
+  outsiderRefusal = String(caught.message);
+}
+if (!outsiderRefusal.includes('unauthorized')) {
+  throw new Error(`a policy-missing key must be refused, got "${outsiderRefusal}"`);
+}
+
+console.log('revocable-data OK: reader seeded (kv 1->2), op landed, revoked (kv 3, status revoked, event streamed), re-ops and re-grants refused, old-seal bearer key still opened (post-revoke keygen+decrypt), epoch-two re-seal refused the old key and opened for a fresh one, outsider refused');

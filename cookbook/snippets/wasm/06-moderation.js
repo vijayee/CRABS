@@ -162,7 +162,38 @@ async function main() {
     throw new Error(`container length ${sealed.byteLength} must match header ${2 + policyByteLength + 4 + ciphertextLength}`);
   }
 
-  console.log('moderation OK: threshold trigger issued clearance, gate opened, cooldown re-fired suppression, payload sealed');
+  // The decrypt half (gap-fill A11): the machine derives a reader key from
+  // ITS OWN master authority — abeKeygen('moderator,member') mints a key
+  // carrying the ABE words the policy asks for, and abeDecrypt opens the
+  // container locally (the machine never exposes its master key; the
+  // derived key is JS-owned — destroy() it). This is the trust statement of
+  // the surface: whoever controls the machine can mint a reader key for any
+  // attribute set it names — decrypting 'by a moderator' here happens with
+  // a key the machine's admin side minted.
+  const readerKey = node.abeKeygen('moderator,member');
+  const opened = node.abeDecrypt(readerKey, sealed);
+  if (new TextDecoder().decode(opened) !== 'contact for verified viewers') {
+    throw new Error(`decrypted payload mismatch, got "${new TextDecoder().decode(opened)}"`);
+  }
+  readerKey.destroy();
+
+  // The negative: a key whose attributes lack a policy clause refuses with
+  // the typed error word — 'unauthorized' (crypto_abe_decrypt; also the
+  // tamper path, GCM fail-closed). The key is still destroyed even on the
+  // refusal path.
+  const guestKey = node.abeKeygen('guest');
+  let decryptRefusal = '';
+  try {
+    node.abeDecrypt(guestKey, sealed);
+  } catch (refusal) {
+    decryptRefusal = String(refusal.message);
+  }
+  if (!decryptRefusal.includes('unauthorized')) {
+    throw new Error(`decrypt must refuse a policy-missing key, got "${decryptRefusal}"`);
+  }
+  guestKey.destroy();
+
+  console.log('moderation OK: threshold trigger issued clearance, gate opened, cooldown re-fired suppression, payload sealed, reader key decrypted, guest key refused');
   node.destroy();
   aliceKey.destroy();
 }
