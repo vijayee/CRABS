@@ -483,6 +483,77 @@ class Operation {
     return this;
   }
 
+  // Recipe 12 (attestation bridge): attach one parent-signed attestation to
+  // the op — the credential an executor `@parent/` endorsement policy
+  // resolves against (_verify_parent_endorsements, state_machine.c). The
+  // fields are the canonical attestation body (parse them out of the
+  // parent's attest() wire image — u32le length + format_version + string16
+  // parent/child/user/attributes + u64le not_before/expires_at/
+  // parent_key_version + 64-byte signature). The signature must decode to
+  // 64 bytes (CRABS_SIG_SIZE) or the attach refuses loudly. Attestations
+  // ride the op WIRE as transport (format v5+) but are NOT part of the
+  // canonical signing form — the parent's own ECDSA covers each body. Set
+  // BEFORE signing; the executor verifies during authorization regardless.
+  // Chainable.
+  addAttestation(attestation) {
+    const M = this._M;
+    if (!attestation || typeof attestation !== 'object' ||
+        Array.isArray(attestation)) {
+      throw new Error(
+        'addAttestation: expected { parentId, childId, userId, attributes, notBefore?, expiresAt?, parentKeyVersion, signatureHex }');
+    }
+    for (const field of ['parentId', 'childId', 'userId', 'attributes']) {
+      if (typeof attestation[field] !== 'string') {
+        throw new Error(`addAttestation: ${field} must be a string`);
+      }
+    }
+    if (typeof attestation.signatureHex !== 'string' ||
+        !/^[0-9a-fA-F]{128}$/.test(attestation.signatureHex)) {
+      throw new Error(
+        'addAttestation: signatureHex must be 128 hex chars (64 bytes)');
+    }
+    // The chain-TIP version the parent stamped (attestation body field) —
+    // the executor's endorsement verifier compares it with the child's
+    // chain tip exactly, so it is required.
+    if (attestation.parentKeyVersion === undefined ||
+        attestation.parentKeyVersion === null) {
+      throw new Error(
+        'addAttestation: parentKeyVersion is required (the chain TIP version the parent stamped)');
+    }
+    // Timestamps/versions: accept integer numbers or BigInts; fractional or
+    // out-of-range values would wrap through the u64 wire — refuse.
+    const stampToBigInt = (value, field) => {
+      if (value === undefined || value === null) return 0n;
+      if (typeof value === 'bigint') {
+        if (value < 0n) {
+          throw new RangeError(`addAttestation: ${field} must be >= 0`);
+        }
+        return value;
+      }
+      if (Number.isInteger(value) && value >= 0) return BigInt(value);
+      throw new RangeError(
+        `addAttestation: ${field} must be a non-negative integer or BigInt`);
+    };
+    const notBefore = stampToBigInt(attestation.notBefore, 'notBefore');
+    const expiresAt = stampToBigInt(attestation.expiresAt, 'expiresAt');
+    const parentKeyVersion = stampToBigInt(
+      attestation.parentKeyVersion, 'parentKeyVersion');
+
+    const idPtrs = {};
+    for (const field of ['parentId', 'childId', 'userId', 'attributes']) {
+      idPtrs[field] = writeString(M, attestation[field]);
+    }
+    const sigPtr = M._malloc(64);
+    hexDecode(M, attestation.signatureHex, sigPtr, 64);
+    const rc = M._crabs_wasm_op_add_attestation(
+      this._ptr, idPtrs.parentId, idPtrs.childId, idPtrs.userId,
+      idPtrs.attributes, notBefore, expiresAt, parentKeyVersion, sigPtr, 64);
+    freeAll(M, idPtrs.parentId, idPtrs.childId, idPtrs.userId,
+            idPtrs.attributes, sigPtr);
+    wrapRc(rc, 'addAttestation');
+    return this;
+  }
+
   // Write-domains v1 (op format v6, signing format v4): the sovereign chain
   // prefix at prefixIndex — item_seq plus the 32-byte digest of the item at
   // that sequence, either as 64 hex chars or 32 raw bytes. Set BEFORE

@@ -29,6 +29,30 @@ export interface KeyPair {
   privateKeyHex(): string;
 }
 
+/**
+ * One parent-signed attestation, field-wise — the canonical attestation body
+ * (attestation_t, src/Lineage/lineage.h) parsed out of lineageAttest's wire
+ * image, ready for Operation.addAttestation. Signature carries the parent's
+ * ECDSA over the body; the chain-TIP version stamp rides in
+ * parentKeyVersion.
+ */
+export interface AttestationFields {
+  parentId: string;
+  childId: string;
+  userId: string;
+  /** Comma-separated name:value pairs; an endorsement resolves when the
+   *  list CONTAINS the token exactly. */
+  attributes: string;
+  /** Epoch ms; 0 = no lower fence. */
+  notBefore?: number;
+  /** Epoch ms; 0 is a legal (instant-then-expired) window. */
+  expiresAt?: number;
+  /** The chain TIP version the parent stamped (required — tip-only verify). */
+  parentKeyVersion: number;
+  /** 128 hex chars (64 bytes = CRABS_SIG_SIZE). */
+  signatureHex: string;
+}
+
 export interface KeyPairStatic {
   new (): KeyPair;
   generate(): KeyPair;
@@ -71,6 +95,21 @@ export interface Operation {
    * Chainable.
    */
   addLockClaim(resource: string, tokenHex: string): this;
+  /**
+   * Recipe 12 (attestation bridge): attach one parent-signed attestation to
+   * the op — the credential an executor `@parent/` endorsement policy
+   * resolves against (_verify_parent_endorsements, src/StateMachine/
+   * state_machine.c). Parse the fields out of lineageAttest's wire image
+   * (canonical body: format_version + string16 parent/child/user/attributes
+   * + u64le not_before/expires_at/parent_key_version + 64-byte signature).
+   * The executor re-verifies everything during authorization (chain TIP,
+   * ids, window, exact coverage) — every bad field fails closed
+   * ('unauthorized'). signatureHex must be 128 hex chars
+   * (64 bytes = CRABS_SIG_SIZE) or the attach refuses loudly. Attestations
+   * ride the op WIRE (format v5+) but are NOT part of the canonical signing
+   * form. Set BEFORE signing. Chainable.
+   */
+  addAttestation(attestation: AttestationFields): this;
   /** Wire bytes of the op as currently staged (sign first, then serialize). */
   serialize(): Buffer;
   /**

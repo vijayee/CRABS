@@ -807,6 +807,63 @@ crabs_error_e crabs_wasm_op_add_lock_claim(operation_t* op, const char* resource
   return CRABS_SUCCESS;
 }
 
+// Append one parent attestation to the op (recipe 12's consume half):
+// the caller (JS) owns the credential fields — parsed from the parent's
+// attestation wire image or carried across the federation seam by its own
+// transport — and this fill mirrors attestation_deserialize's field
+// discipline: exact signature size, capacity-safe strings, and the
+// format_version stamp the verifier requires. The array is grown one slot
+// at a time exactly like the claims above; the capacity refusal follows the
+// per-state registry precedent (crabs.h has no dedicated limit enumerator —
+// CRABS_ERR_OOM, as at CRABS_MAX_CHILD_MACHINES). NOT part of the canonical
+// signing form (the attestation carries its own parent ECDSA) — but the
+// executor verifies everything here during authorization, so a bad field
+// only ever fails closed.
+EMSCRIPTEN_KEEPALIVE
+crabs_error_e crabs_wasm_op_add_attestation(
+    operation_t* op, const char* parent_id, const char* child_id,
+    const char* user_id, const char* attributes,
+    uint64_t not_before, uint64_t expires_at, uint64_t parent_key_version,
+    const uint8_t* signature, uint32_t signature_len) {
+  if (!op || !parent_id || !child_id || !user_id || !attributes) {
+    return CRABS_ERR_INVALID_PARAM;
+  }
+  // Capacity-bound ids: a field the canonical body writer cannot
+  // null-terminate would serialize a body different from the one verified.
+  if (strnlen(parent_id, CRABS_MAX_USER_ID) >= CRABS_MAX_USER_ID ||
+      strnlen(child_id, CRABS_MAX_USER_ID) >= CRABS_MAX_USER_ID ||
+      strnlen(user_id, CRABS_MAX_USER_ID) >= CRABS_MAX_USER_ID ||
+      strnlen(attributes, CRABS_MAX_POLICY_EXPR) >= CRABS_MAX_POLICY_EXPR) {
+    return CRABS_ERR_INVALID_PARAM;
+  }
+  if (!signature || signature_len != CRABS_SIG_SIZE) {
+    return CRABS_ERR_INVALID_PARAM;
+  }
+  if (op->attestation_count >= CRABS_MAX_OP_ATTESTATIONS) {
+    return CRABS_ERR_OOM;
+  }
+  attestation_t* grown_attestations = (attestation_t*)realloc(
+      op->attestations,
+      (op->attestation_count + 1) * sizeof(attestation_t));
+  if (grown_attestations == NULL) return CRABS_ERR_OOM;
+  op->attestations = grown_attestations;
+  attestation_t* attestation =
+      &op->attestations[op->attestation_count];
+  memset(attestation, 0, sizeof(*attestation));
+  attestation->format_version = CRABS_ATTESTATION_FORMAT_VERSION;
+  strncpy(attestation->parent_id, parent_id, CRABS_MAX_USER_ID - 1);
+  strncpy(attestation->child_id, child_id, CRABS_MAX_USER_ID - 1);
+  strncpy(attestation->user_id, user_id, CRABS_MAX_USER_ID - 1);
+  strncpy(attestation->attributes, attributes,
+          sizeof(attestation->attributes) - 1);
+  attestation->not_before = not_before;
+  attestation->expires_at = expires_at;
+  attestation->parent_key_version = parent_key_version;
+  memcpy(attestation->signature, signature, CRABS_SIG_SIZE);
+  op->attestation_count++;
+  return CRABS_SUCCESS;
+}
+
 // ============================================================
 // Attachable tx manager (recipe 9)
 // ============================================================

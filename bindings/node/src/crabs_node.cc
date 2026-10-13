@@ -648,6 +648,8 @@ public:
       InstanceMethod("setRequiredState", &Operation::SetRequiredState),
       InstanceMethod("setNextState", &Operation::SetNextState),
       InstanceMethod("addLockClaim", &Operation::AddLockClaim),
+      // Attestation bridge (recipe 12): attach a parent-signed vouch
+      InstanceMethod("addAttestation", &Operation::AddAttestation),
       InstanceMethod("serialize", &Operation::SerializeOp),
       InstanceAccessor("type", &Operation::GetType, &Operation::SetType),
       InstanceAccessor("signerId", &Operation::GetSignerId, &Operation::SetSignerId),
@@ -848,6 +850,131 @@ private:
     memcpy(claim->lock_token, token, CRABS_LOCK_TOKEN_SIZE);
     OPENSSL_cleanse(token, CRABS_LOCK_TOKEN_SIZE);
     op_->lock_claim_count++;
+    return info.This();
+  }
+
+  // Recipe 12 (attestation bridge): attach one parent-signed attestation to
+  // the op — the credential an executor `@parent/` endorsement policy
+  // resolves against (_verify_parent_endorsements, state_machine.c). The
+  // JS side parses the fields out of the parent's attestation wire image
+  // (canonical body layout in lineage.c) and hands them over; the executor
+  // re-verifies everything (chain TIP, ids, window, coverage) during
+  // authorization, so a bad field only ever fails closed. NOT part of the
+  // canonical signing form — the parent's own ECDSA covers each body —
+  // but attached BEFORE signing like every other staged field.
+  //
+  // The decoded signature staging buffer is cleansed on the failure throws
+  // and after the struct copy (the same discipline AddLockClaim applies to
+  // lock tokens — attestations are signatures, not bearer secrets, but the
+  // copy hygiene keeps every staging path uniform).
+  Napi::Value AddAttestation(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 1 || !info[0].IsObject())
+      throw Napi::TypeError::New(env,
+          "Expected addAttestation({ parentId, childId, userId, attributes, "
+          "notBefore?, expiresAt?, parentKeyVersion, signatureHex })");
+    Napi::Object fields = info[0].As<Napi::Object>();
+    auto require_string_field =
+        [&](const char* name, const char* ctx) -> std::string {
+      Napi::Value value = fields.Get(name);
+      if (!value.IsString())
+        throw Napi::TypeError::New(env,
+            std::string("addAttestation: ") + name + " must be a string");
+      return value.As<Napi::String>().Utf8Value();
+    };
+    std::string parent_id = require_string_field("parentId", "addAttestation");
+    std::string child_id = require_string_field("childId", "addAttestation");
+    std::string user_id = require_string_field("userId", "addAttestation");
+    std::string attributes =
+        require_string_field("attributes", "addAttestation");
+    // Capacity-bound ids: a field the canonical body writer cannot
+    // null-terminate would verify differently after transport than it was
+    // staged here. Refuse loudly, mirroring AddLockClaim's invalid-param
+    // stance.
+    if (parent_id.size() >= CRABS_MAX_USER_ID ||
+        child_id.size() >= CRABS_MAX_USER_ID ||
+        user_id.size() >= CRABS_MAX_USER_ID)
+      throw Napi::RangeError::New(env,
+          "addAttestation: ids must be " +
+          std::to_string(CRABS_MAX_USER_ID - 1) + " bytes or fewer");
+    if (attributes.size() >= CRABS_MAX_POLICY_EXPR)
+      throw Napi::RangeError::New(env,
+          "addAttestation: attributes must be " +
+          std::to_string(CRABS_MAX_POLICY_EXPR - 1) + " bytes or fewer");
+
+    // Stamps from the attestation body field-wise: notBefore/expiresAt are
+    // optional (default 0 — epoch, i.e. no lower fence), parentKeyVersion is
+    // REQUIRED (the chain-TIP version the parent stamped; the executor's
+    // tip-only gate compares it exactly with the child's chain tip).
+    auto stamp_field = [&](const char* name, bool required,
+                           const char* ctx) -> uint64_t {
+      Napi::Value value = fields.Get(name);
+      if (value.IsUndefined() || value.IsNull()) {
+        if (required)
+          throw Napi::TypeError::New(env,
+              std::string("addAttestation: ") + name + " is required");
+        return 0;
+      }
+      if (!value.IsNumber())
+        throw Napi::RangeError::New(env,
+            std::string("addAttestation: ") + name +
+            " must be a number (epoch ms)");
+      double stamp = value.As<Napi::Number>().DoubleValue();
+      // A non-integer or a value past JS's exact-integer range (2^53) would
+      // truncate silently on the double -> uint64 conversion; refuse loudly.
+      if (stamp < 0 || stamp >= 9007199254740992.0 ||
+          stamp != floor(stamp))
+        throw Napi::RangeError::New(env,
+            std::string("addAttestation: ") + name +
+            " must be an integer 0..2^53-1");
+      return (uint64_t)stamp;
+    };
+    uint64_t not_before = stamp_field("notBefore", false, "addAttestation");
+    uint64_t expires_at = stamp_field("expiresAt", false, "addAttestation");
+    uint64_t parent_key_version =
+        stamp_field("parentKeyVersion", true, "addAttestation");
+
+    // The carried ECDSA: exactly 128 hex chars (64 bytes = CRABS_SIG_SIZE).
+    Napi::Value signature_value = fields.Get("signatureHex");
+    if (!signature_value.IsString()
+        || signature_value.As<Napi::String>().Utf8Value().length()
+               != CRABS_SIG_SIZE * 2)
+      throw Napi::RangeError::New(env,
+          "addAttestation: signatureHex must be 128 hex chars (64 bytes)");
+
+    if (op_->attestation_count >= CRABS_MAX_OP_ATTESTATIONS)
+      throw Napi::RangeError::New(env,
+          "addAttestation: attestation capacity reached (" +
+          std::to_string(CRABS_MAX_OP_ATTESTATIONS) + ")");
+    attestation_t* grown_attestations = (attestation_t*)realloc(
+        op_->attestations,
+        (op_->attestation_count + 1) * sizeof(attestation_t));
+    if (grown_attestations == NULL)
+      throw crabs_error(env, CRABS_ERR_OOM, "addAttestation");
+    op_->attestations = grown_attestations;
+
+    uint8_t signature[CRABS_SIG_SIZE];
+    std::string signature_hex = signature_value.As<Napi::String>().Utf8Value();
+    if (!hex_decode(signature_hex, signature, CRABS_SIG_SIZE)) {
+      OPENSSL_cleanse(signature, CRABS_SIG_SIZE);
+      throw Napi::RangeError::New(env,
+          "addAttestation: signatureHex must be 128 hex chars (64 bytes)");
+    }
+    attestation_t* attestation =
+        &op_->attestations[op_->attestation_count];
+    memset(attestation, 0, sizeof(*attestation));
+    attestation->format_version = CRABS_ATTESTATION_FORMAT_VERSION;
+    strncpy(attestation->parent_id, parent_id.c_str(), CRABS_MAX_USER_ID - 1);
+    strncpy(attestation->child_id, child_id.c_str(), CRABS_MAX_USER_ID - 1);
+    strncpy(attestation->user_id, user_id.c_str(), CRABS_MAX_USER_ID - 1);
+    strncpy(attestation->attributes, attributes.c_str(),
+            sizeof(attestation->attributes) - 1);
+    attestation->not_before = not_before;
+    attestation->expires_at = expires_at;
+    attestation->parent_key_version = parent_key_version;
+    memcpy(attestation->signature, signature, CRABS_SIG_SIZE);
+    OPENSSL_cleanse(signature, CRABS_SIG_SIZE);
+    op_->attestation_count++;
     return info.This();
   }
 

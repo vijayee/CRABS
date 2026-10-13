@@ -1,5 +1,28 @@
 // TypeScript definitions for crabs-wasm
 
+/**
+ * One parent-signed attestation, field-wise — the canonical attestation body
+ * (attestation_t, src/Lineage/lineage.h) parsed out of attest's wire image,
+ * ready for Operation.addAttestation. Signature carries the parent's ECDSA
+ * over the body; the chain-TIP version stamp rides in parentKeyVersion.
+ */
+export interface AttestationFields {
+  parentId: string;
+  childId: string;
+  userId: string;
+  /** Comma-separated name:value pairs; an endorsement resolves when the
+   *  list CONTAINS the token exactly. */
+  attributes: string;
+  /** Epoch ms; 0 = no lower fence (integer or BigInt). */
+  notBefore?: number | bigint;
+  /** Epoch ms; 0 is a legal (instant-then-expired) window. */
+  expiresAt?: number | bigint;
+  /** The chain TIP version the parent stamped (required — tip-only verify). */
+  parentKeyVersion: number | bigint;
+  /** 128 hex chars (64 bytes = CRABS_SIG_SIZE). */
+  signatureHex: string;
+}
+
 export interface CrabsChangeEvent {
   kind: 'op' | 'schedule' | 'trigger' | 'attribute' | 'spawn' | 'lineage';
   type: string;
@@ -59,6 +82,21 @@ export interface Operation {
    * Chainable.
    */
   addLockClaim(resource: string, tokenHex: string): this;
+  /**
+   * Recipe 12 (attestation bridge): attach one parent-signed attestation to
+   * the op — the credential an executor `@parent/` endorsement policy
+   * resolves against (_verify_parent_endorsements, src/StateMachine/
+   * state_machine.c). Parse the fields out of attest's wire image
+   * (canonical body: format_version + string16 parent/child/user/attributes
+   * + u64le not_before/expires_at/parent_key_version + 64-byte signature).
+   * The executor re-verifies everything during authorization (chain TIP,
+   * ids, window, exact coverage) — every bad field fails closed
+   * ('unauthorized'). signatureHex must be 128 hex chars
+   * (64 bytes = CRABS_SIG_SIZE) or the attach refuses loudly. Attestations
+   * ride the op WIRE (format v5+) but are NOT part of the canonical signing
+   * form. Set BEFORE signing. Chainable.
+   */
+  addAttestation(attestation: AttestationFields): this;
   /**
    * Op format version this op carries. Fresh ops report the build's
    * wireVersions.op; deserialized ops report the version declared on the
