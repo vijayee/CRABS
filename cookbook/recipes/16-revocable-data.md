@@ -42,7 +42,7 @@ mechanism makes the refusal structural rather than a list check: every user
 carries a monotonically increasing `key_version`, bumped by every record
 mutation, and every op the v1.3 signing path stamps that version — an op
 carrying a stale stamp refuses with a typed staleness error (R7-04,
-`src/StateMachine/state_machine.c:862-873`). Revocation without that stamp
+`src/StateMachine/state_machine.c:873-884`). Revocation without that stamp
 would rot into a race: a op signed *just before* the revoke would replay
 fine afterward.
 
@@ -53,7 +53,7 @@ fine afterward.
   impl `bindings/node/src/crabs_node.cc:1886-1913`) — sealing under the
   machine's own CP-ABE authority
   (`attribute_machine.c:309` wires `abe_mk` into the state; the wasm glue
-  seals with it via `src/Util/wasm_helpers.c:1005-1011`), with the container layout
+  seals with it via `src/Util/wasm_helpers.c:1129-1136`), with the container layout
   `u16le policy byte length + policy bytes + u32le ciphertext length +
   ciphertext` pinned by `bindings/wasm/test/smoke.js:111-130`. This is
   Recipe 6's seal; the ABE-word mapping (`'name:value'` → `name_value`,
@@ -82,7 +82,7 @@ fine afterward.
   a revoked target cannot be re-armed (`src/Attribute/attribute_machine.c:585-588`,
   audit R4-2); and the staleness gate refuses ops stamped with a
   superseded `key_version` (`CRABS_ERR_KEY_STALE`,
-  `src/StateMachine/state_machine.c:862-873`).
+  `src/StateMachine/state_machine.c:873-884`).
 - *The C-only deeper tools*: `user_key_suspend` / `user_key_activate` /
   `user_key_rotate` (`src/Attribute/attribute_machine.h:219-221`,
   exercised `test/test_key_lifecycle.cpp:96,180,269`). Suspension is
@@ -332,7 +332,7 @@ symbols:
   user_key_find / find_active    src/Attribute/attribute_machine.h:208-209
   (key status gate)              src/Crypto/crypto.c:1325
   (user status gate, R7-14)      src/Crypto/crypto.c:1395-1403
-  (staleness gate, R7-04)        src/StateMachine/state_machine.c:862-873 (CRABS_ERR_KEY_STALE, src/CRABS/crabs.h:78)
+  (staleness gate, R7-04)        src/StateMachine/state_machine.c:873-884 (CRABS_ERR_KEY_STALE, src/CRABS/crabs.h:78)
   state_add_policy               src/CRABS/data_model.h:720
   state_machine_register_handler src/StateMachine/state_machine.h:237
   (policy grammar)               src/StateMachine/state_machine.c:768-783 + preprocess src/Condition/condition.c:1501-1598

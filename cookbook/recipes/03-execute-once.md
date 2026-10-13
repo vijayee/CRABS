@@ -3,7 +3,7 @@ number: 3
 slug: execute-once
 title: Execute once, ever
 section: Basics
-status: PARTIAL
+status: COMPLETE
 maturity: STABLE
 target: crabs-wasm
 languages: c wasm node
@@ -29,9 +29,11 @@ ever un-see an execution, and two replicas that saw different executions
 agree on the first one.
 
 The C catalog pairs that primitive with a `DEDUP_GLOBAL` spec whose guard
-runs inside the executor (`src/Dedup/dedup.h`, `src/StateMachine/state_machine.c:1297-1316`)
-— the strict version, C-only, and the reason this recipe is PARTIAL (see
-`### The strict version (dedup)`).
+runs inside the executor (`src/Dedup/dedup.h:31-33`, resolved at
+`src/StateMachine/state_machine.c:1693-1712`) — and both JS bindings
+install it with `defineOperationType`, exactly like the C snippet installs
+it with `state_register_op_type_def`. That is what the recipes below do;
+the one-way door is the machine's, not the calling code's.
 
 ## The shape
 
@@ -39,48 +41,49 @@ runs inside the executor (`src/Dedup/dedup.h`, `src/StateMachine/state_machine.c
   `addOneShotFlag('closeout_done')`. It reads false out of the mint, flips
   true once, and has no path back — `flagSet` has no false transition.
 - Raising it is `flagSet(name, setBy, setAtMs)`; reading it is
-  `flagValue(name)`. The C struct also records *who* and *when*
-  (`src/CRDT/one_shot.h:37-41`), but no JS binding maps those reads — see
-  the node snippet's note.
-- The guard, on crabs-wasm, is a custom handler on the `closeout` op type
-  that consults a `ONE_SHOT_SET` sentinel and returns
-  `CRABS_ERR_ALREADY_EXECUTED` (0x7002) on the second attempt. A set is
-  used instead of the flag because `HandlerState` exposes `flagSet` but no
-  `flagValue` read (`bindings/wasm/index.d.ts:117` — the read exists only on
-  `Node`, :293).
+  `flagValue(name)`.
+- The guard is a REGISTERED spec: `defineOperationType('closeout', { dedup:
+  'global', flagPath: 'closeout_done' })` installs a `DEDUP_GLOBAL` spec —
+  guard + flag-set mutation are entirely C-native, so the op itself carries
+  nothing the machine has to trust. The op names the flag item as its
+  resource and the executor resolves it: on rerun the guard refuses BEFORE
+  any handler would run, and stays refused for every signer afterwards
+  (`src/StateMachine/state_machine.c:1693-1712`).
+- Installing the spec is itself a signed op under the machine's admin
+  authority: set `setPolicy('__define_operation_type__', 'role:admin')`
+  first (the bootstrap admin holds `role:admin`; the `__create_trigger__`
+  precedent).
 - Merge semantics of the flag: true dominates, the earliest timestamp wins,
   and ties break lexicographically by setter id (`test/test_one_shot.cpp:258-292`).
 
 ## What it guarantees / what it doesn't
 
-Guaranteed on crabs-wasm: each signed `closeout` op is executed at most
-once on that machine — the second attempt is rejected inside the machine
-before any effect re-runs; the outcome flag, once true, cannot become
-false again on any replica, and after replicas sync they agree on who
-executed first (the earliest setter wins).
+Guaranteed on both JS bindings: each signed `closeout` op is executed at
+most once on that machine — the second attempt is rejected inside the
+machine (any signer) before any effect re-runs; the outcome flag, once
+true, cannot become false again on any replica, and the registered spec,
+once executed, cannot be un-installed by a signer's op (only a later admin
+`defineOperationType` with `dedup: 'none'` replaces it in place).
 
 Not guaranteed: exclusivity *across* replicas that have not yet met. Two
-replicas can each pass a local guard (both see an empty sentinel) and both
-run the effect; the merged flag stays true either way, and the merged
-sentinel set stays a single `run`, so the record converges — but the
-effect ran twice. The registered `DEDUP_GLOBAL` spec has the same
-single-flag shape and the same edge; what it adds is bypass-proof
-enforcement on the signed-op path, and that is C-only. Also not
-observable from JS: *which* attempt won (the setter/timestamp reads are
+replicas can each run the effect inside the blind window (both flags read
+false locally) and both proceed; the merged flag stays true either way, so
+the record converges — but the effect ran twice. Also not observable from
+the JS bindings: *which* attempt won (the setter/timestamp reads are
 C-only, `src/CRDT/one_shot.h:37-41`).
 
 ## Variations
 
-- Idempotent-skip instead of reject: the handler can return 0 on a second
-  attempt and just not re-run the effect — the C executor does exactly this
-  trick for replayed UUIDs (`CRABS_ERR_ALREADY_EXECUTED` is treated as an
-  idempotent skip, `src/StateMachine/state_machine.c:1533-1540`).
+- Idempotent-skip instead of reject: replayed UUID semantics —
+  `CRABS_ERR_ALREADY_EXECUTED` from the transaction manager is treated as
+  an idempotent skip (`src/StateMachine/state_machine.c:1929-1931`), so the
+  same op bytes delivered twice never re-run the effect.
 - Once-per-window, not once-ever: a trigger with `cooldownMs` (Recipe 6's
   territory) gives you "no more than once per N milliseconds" rather than
   a one-way door.
-- Once-per-resource instead of once-global: guard on
-  `state.setContains('executed_' + payloadTarget, 'run')` — Recipe 2's
-  per-user pattern, keyed by target instead of signer.
+- Once-per-target instead of once-global: one registered flag + op type per
+  target (`executed_<payloadTarget>` items, one `defineOperationType`
+  each) — Recipe 2's per-user pattern, keyed by target instead of signer.
 
 ## Recipe
 
@@ -93,28 +96,28 @@ C-only, `src/CRDT/one_shot.h:37-41`).
 target: crabs-wasm
 verified: executed
 symbols:
-  Node.create               bindings/wasm/index.d.ts:372
+  Node.create               bindings/wasm/index.d.ts:549
   KeyPair.generate          bindings/wasm/index.d.ts:21
   publicKeyHex              bindings/wasm/index.d.ts:15
   KeyPair.destroy           bindings/wasm/index.d.ts:17
-  registerUser              bindings/wasm/index.d.ts:213
-  grantRole                 bindings/wasm/index.d.ts:214
-  addOneShotFlag            bindings/wasm/index.d.ts:227
-  flagValue                 bindings/wasm/index.d.ts:293
-  addOneShotSet             bindings/wasm/index.d.ts:226
-  setPolicy                 bindings/wasm/index.d.ts:295
-  registerHandlerJs         bindings/wasm/index.d.ts:303
-  HandlerState.setContains  bindings/wasm/index.d.ts:123
-  HandlerState.setAdd       bindings/wasm/index.d.ts:115
-  HandlerState.flagSet      bindings/wasm/index.d.ts:117
+  registerUser              bindings/wasm/index.d.ts:353
+  grantRole                 bindings/wasm/index.d.ts:354
+  addOneShotFlag            bindings/wasm/index.d.ts:367
+  flagValue                 bindings/wasm/index.d.ts:433
+  setPolicy                 bindings/wasm/index.d.ts:435
+  defineOperationType       bindings/wasm/index.d.ts:446
+  DefineOperationTypeOptions bindings/wasm/index.d.ts:197-217
   Operation.create          bindings/wasm/index.d.ts:52
   Operation.signerId        bindings/wasm/index.d.ts:28
-  Node.sign                 bindings/wasm/index.d.ts:297
-  Node.execute              bindings/wasm/index.d.ts:296
-  Node.destroy              bindings/wasm/index.d.ts:368
-  (handler return code)     src/CRABS/crabs.h:107 (CRABS_ERR_ALREADY_EXECUTED = 0x7002)
+  Operation.addResource     bindings/wasm/index.d.ts:33
+  Node.sign                 bindings/wasm/index.d.ts:454
+  Node.execute              bindings/wasm/index.d.ts:453
+  Node.destroy              bindings/wasm/index.d.ts:545
+  (register semantics)      src/StateMachine/state_machine.c:2909-2925 (define op handler + registry store)
+  (execution guard)         src/StateMachine/state_machine.c:1693-1712 (registered GLOBAL spec refuses the rerun, any signer)
+  (error surfaced)          src/CRABS/crabs.h:107 (CRABS_ERR_ALREADY_EXECUTED = 0x7002, name 'already_executed')
 maturity: all STABLE
-test_ref: bindings/wasm/test/smoke.js:59 (registerHandlerJs) + test/test_one_shot.cpp:172-201 (flag transitions once)
+test_ref: bindings/wasm/test/dedup-surface.js (global spec: first run sets the flag, rerun refused incl. a different signer)
 -->
 
 ### crabs-node (native Node.js)
@@ -126,15 +129,20 @@ test_ref: bindings/wasm/test/smoke.js:59 (registerHandlerJs) + test/test_one_sho
 target: crabs-node
 verified: executed
 symbols:
-  NodeStatic.new    bindings/node/index.d.ts:312
-  KeyPair.generate  bindings/node/index.d.ts:14
-  publicKeyHex      bindings/node/index.d.ts:8
-  registerUser      bindings/node/index.d.ts:182
-  grantRole         bindings/node/index.d.ts:183
-  addOneShotFlag    bindings/node/index.d.ts:197
-  flagSet           bindings/node/index.d.ts:245
-  flagValue         bindings/node/index.d.ts:246
-  (unmapped reads)  src/CRDT/one_shot.h:37-41 (set_by/set_at live in the C struct, no JS row)
+  NodeStatic.new      bindings/node/index.d.ts:412
+  KeyPair.generate    bindings/node/index.d.ts:13
+  publicKeyHex        bindings/node/index.d.ts:8
+  registerUser        bindings/node/index.d.ts:212
+  grantRole           bindings/node/index.d.ts:213
+  addOneShotFlag      bindings/node/index.d.ts:227
+  flagValue           bindings/node/index.d.ts:276
+  setPolicy           bindings/node/index.d.ts:279
+  defineOperationType bindings/node/index.d.ts:291
+  DefineOperationTypeOptions bindings/node/index.d.ts:155-175
+  Operation           bindings/node/index.d.ts:19-44 (signerId, addResource)
+  Node.sign           bindings/node/index.d.ts:292
+  Node.execute        bindings/node/index.d.ts:293
+  (unmapped reads)    src/CRDT/one_shot.h:37-41 (set_by/set_at live in the C struct, no JS row)
 maturity: all STABLE
 test_ref: test/test_one_shot.cpp:186-201 (SetIsIdempotent: second set keeps the first setter)
 -->
@@ -174,58 +182,29 @@ maturity: all STABLE
 test_ref: test/test_dedup.cpp:726-762 (GlobalExecutionOnceLifecycle) + test/test_one_shot.cpp:258-292 (merge keeps earlier setter)
 -->
 
-### The strict version (dedup)
-
-> [!WARNING] GAP
->
-> **Prose describes:** an operation type whose global "at most once" rule is
-> installed on the machine itself — a registered `DEDUP_GLOBAL` spec — so
-> every signed op of that type is guarded by the executor, the guard consults
-> the flag the machine owns, and no caller code can forget or bypass it.
->
-> **Codebase status:** exists only in C. The spec type is `DEDUP_GLOBAL`
-> with a `flag_path` (`src/CRABS/data_model.h:364-374`), installed via
-> `state_register_op_type_def` (`src/CRABS/data_model.h:757`), guarded by
-> the executor through `dedup_check_guard_spec` (`src/Dedup/dedup.h:31-33`)
-> at `src/StateMachine/state_machine.c:1302-1316`, rejecting with
-> `CRABS_ERR_ALREADY_EXECUTED`. The C snippet above runs the real functions,
-> library-style, on a bare `state_t` — mirroring `test/test_dedup.cpp:726-762`.
->
-> **Divergence:** neither JS binding can install a spec — `Operation`
-> (`bindings/wasm/index.d.ts:26-49`, `bindings/node/index.d.ts:19-44`) maps no
-> dedup field and no `__define_operation_type__` payload builder. The wasm
-> recipe above emulates the guard inside a custom handler (one machine's
-> registry only); crabs-node has no handler surface at all, so its flag is
-> raised by direct driver calls with no execute-time guard anywhere.
->
-> **Tracking:** an internal implementation plan (not published on this site)
-> (this task's section). The api-map records the gap at "R3 | `ONE_SHOT_FLAG`,
-> global dedup".
->
-> **Agent action:** code block omitted. Do not fake a dedup field onto the
-> JS `Operation`; the wasm handler pattern above is the strongest
-> JS-reachable version.
-
 ### Notes
 
 - `flagValue` is typed differently per binding: crabs-wasm returns `0`/`1`
-  numbers (`bindings/wasm/bindings-core.js:964` passes the raw C `bool`
-  through Emscripten's numeric ABI), crabs-node returns real booleans
-  (`bindings/node/src/crabs_node.cc:1689-1690`). Compare truthiness, never
-  `=== true`.
-- The flag reads as `false` for an unknown item name (`src/Util/wasm_helpers.c:840-845`
+  numbers (the raw C `bool` passes through Emscripten's numeric ABI in the
+  wasm glue, `bindings/wasm/bindings-core.js` flagValue), crabs-node
+  returns real booleans (`bindings/node/src/crabs_node.cc:1734-1742`).
+  Compare truthiness, never `=== true`.
+- The flag reads as `false` for an unknown item name (`src/Util/wasm_helpers.c:936-941`
   returns false when the item is missing), so a typo in a flag name looks
   like "not executed yet" rather than an error. Assert the name the first
   time you mint it.
-- Why the sentinel set instead of guarding on the flag itself: a handler
-  may write the flag but not read it — `HandlerState` has `flagSet`
-  (`bindings/wasm/index.d.ts:117`) and no `flagValue`; the `Node`-level read
-  (:293) is available only outside the handler. The set doubles as the
-  guard record, and the flag stays the persisted outcome whose
-  setter/timestamp the C core keeps forever.
+- Direct `flagSet` calls are not ops — they bypass signatures, policies,
+  and any registered guard (driver-level setup/testing only). The enforced
+  path is the signed `closeout` op resolving the registered spec; the
+  snippets use `flagValue` reads to assert what the machine did.
+- The registry entry is REPLACED on re-definition
+  (`state_register_op_type_def`, `src/CRABS/data_model.c:529-553`): a
+  later admin `defineOperationType('closeout', { dedup: 'none' })` removes
+  the guard. Capacity is 32 entries (`src/CRABS/data_model.h:379`).
 - The "idempotent skip" nuance: a *replayed UUID* (same op bytes delivered
-  twice) does not re-enter the handler at all — the transaction manager
-  returns `CRABS_ERR_ALREADY_EXECUTED` and the executor treats it as
-  success-without-effect (`src/StateMachine/state_machine.c:1533-1540`). The
-  guard above covers the *different* case: a fresh op, signed again,
-  intended to run the effect a second time.
+  twice) does not re-enter the guard as a fresh op — the duplicate is
+  refused with `CRABS_ERR_ALREADY_EXECUTED` by the replay backstops and
+  the execute wrapper treats it as an idempotent skip, not an error
+  (`src/StateMachine/state_machine.c:1929-1931`). The registered spec
+  covers the *different* case: a fresh op, signed again, intended to run
+  the effect a second time.

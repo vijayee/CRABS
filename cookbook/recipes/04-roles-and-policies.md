@@ -216,7 +216,7 @@ test_ref: test/test_durability.cpp:65-106 (signed custom op through state_machin
 - Signing on C carries three stamps the executor demands, all of which the
   JS `sign` path does for you (see what `crabs_wasm_sign_operation` does,
   `src/Util/wasm_helpers.c:379-408`): HLC + ordering system (`R7-15`), the
-  signer's current `key_version` (`R7-04` staleness check, `src/StateMachine/state_machine.c:862-876`),
+  signer's current `key_version` (`R7-04` staleness check, `src/StateMachine/state_machine.c:873-889`),
   and a lamport time strictly newer than the signer's prior op (`R7-11`,
   `src/StateMachine/state_machine.c:1246-1258`). The C snippet stamps all
   three manually — miss one and the op is refused as stale or replayed.

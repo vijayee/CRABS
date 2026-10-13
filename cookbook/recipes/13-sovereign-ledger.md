@@ -193,7 +193,7 @@ symbols:
   Node.reportEquivocation   bindings/wasm/index.d.ts:251-252
   (DOMAIN_CHECK)            src/StateMachine/state_machine.c:1047-1129
   (chain advance)           src/StateMachine/state_machine.c:1142-1174
-  (handler payload must be NUL-terminated) src/Util/wasm_helpers.c:1071-1080
+  (handler payload must be NUL-terminated) src/Util/wasm_helpers.c:1195-1201
 maturity: all STABLE
 test_ref: bindings/wasm/test/write-domains.js:12-149 + handlers per bindings/wasm/test/smoke.js:59-63 + registers per bindings/wasm/test/registers.js:83-100
 -->
@@ -270,7 +270,7 @@ test_ref: test/test_state_machine.cpp:1238-1430 (handler-driven sovereign counte
 - *The wasm handler payload contract*: `HandlerOperation.payload` reaches
   JS only when the op's payload is NUL-terminated
   (`crabs_wasm_handler_op_get_payload_str`,
-  `src/Util/wasm_helpers.c:1071-1080`) — the snippet terminates the amount
+  `src/Util/wasm_helpers.c:1195-1201`) — the snippet terminates the amount
   it encodes. Without the terminator the handler sees an empty payload.
 - *Where the "no one" in the title is literally enforced*: the machine's own
   genesis admin is a user like any other at the item — role:admin

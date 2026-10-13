@@ -3,7 +3,7 @@ number: 2
 slug: one-vote-per-member
 title: One vote per member
 section: Basics
-status: PARTIAL
+status: COMPLETE
 maturity: STABLE
 target: crabs-wasm
 languages: c wasm node
@@ -26,51 +26,64 @@ per-replica list can lose or duplicate memberships during merge, and a
 deletable set breaks the entire property the moment some replica removes an
 entry under duplicate-pressure.
 
-The C catalog has exactly the missing pieces — a `DedupSpec` whose per-user
-guard is resolved *inside* the executor, so the signer cannot influence it
-(`src/Dedup/dedup.h:23-30`, audit F-2). That is the strict version, and it is
-the one whose absence on the JS surfaces drives this recipe's status (see
-`### The strict version (dedup)`).
+The strict version — a `DedupSpec` whose per-user guard is resolved
+*inside* the executor, so the signer cannot influence it (`src/Dedup/dedup.h:23-30`,
+audit F-2) — is registered on the machine with `defineOperationType` on both
+JS bindings, exactly like the C snippet registers it with
+`state_register_op_type_def`. That is what the recipes below do; the once
+per member rule is the machine's, not the calling code's.
 
 ## The shape
 
 - The once-record is a named item of type `ONE_SHOT_SET`:
   `addOneShotSet('proposal-42_voters')`. Its add is idempotent and it cannot
   un-vote — there is no remove: `setRemove` is a no-op for one-shot sets
-  (`bindings/node/src/crabs_node.cc:1663-1676` — only OR-sets tombstone).
+  (`bindings/node/src/crabs_node.cc:1712-1722` — only OR-sets tombstone).
 - The tally is a G-counter per option: `incrementCounter('proposal-42_voted_yea',
   1, voter)`. Attribution is per voter, so (as in Recipe 1) a replayed
   increment from the same voter merges into one entry.
-- The guard, on crabs-wasm, runs inside the machine: a custom handler for the
-  `vote` op type checks `state.setContains('proposal-42_voters', op.signerId)`
-  and returns `CRABS_ERR_ALREADY_PERFORMED` (0x7001) when the member is
-  already recorded — the executor propagates that as a thrown
-  `already_performed` and, critically, applies nothing afterward (the handler
-  result is checked before any post-handler state work, `src/StateMachine/state_machine.c:1431`).
-- Membership is checked and written in the same handler body, so within one
-  machine the check-then-vote is atomic from the op's point of view: the op
-  either lands with membership and tally, or is rejected with both untouched.
+- The guard is a REGISTERED spec: `defineOperationType('vote', { dedup:
+  'per-user', trackerPath: 'proposal-42_voters' })` composes and executes a
+  node-key-signed `__define_operation_type__` op whose resources[0] carries
+  the op type name and whose dedup struct carries the spec
+  (`state_machine_op_define_operation`, `src/StateMachine/state_machine.c:2909-2925`);
+  the machine registry stores it (`state_register_op_type_def`,
+  `src/CRABS/data_model.c:529-553`) and the executor resolves it for every
+  later op of that type (`src/StateMachine/state_machine.c:1693-1712`) —
+  a registered spec wins over anything the op carries on the wire, so the
+  F-2 bypass shape (a `vote` op claiming `dedup: none`) is refused rather
+  than honored.
+- The tracker must exist before the spec is exercised: the executor
+  validates the spec's mutation target BEFORE the handler runs
+  (`dedup_validate_mutation_spec`, R8-S-3) and the guard reads it
+  (`tracker_not_found` otherwise). The spec's own mutation — not any caller
+  code — records membership after a successful run
+  (`src/StateMachine/state_machine.c:1854-1862`), keeping the
+  check-then-record atomic from the op's point of view.
+- Installing the spec is itself a signed op under the machine's admin
+  authority: set `setPolicy('__define_operation_type__', 'role:admin')`
+  first (the bootstrap admin holds `role:admin`; the `__create_trigger__`
+  precedent).
 
 ## What it guarantees / what it doesn't
 
-Guaranteed on crabs-wasm: a signed op that claims a member's vote is
+Guaranteed on both JS bindings: a signed op that claims a member's vote is
 executed at most once per that member *as far as the machine's merged set is
 concerned* — a second op from the same signer is rejected inside the
-machine, before `execute` returns, and the reject path leaves the tally
-untouched. On crabs-node, no custom-handler surface exists, so the guard is
-driver discipline; what the machine itself guarantees is that the
-once-record is idempotent and additive (a replay absorbed, nothing
-deletable).
+machine, before any handler or effect can re-run, and the reject path
+leaves the tally untouched. The registered spec cannot be bypassed by
+calling code: the op's carried dedup field defaults to NONE and the machine
+resolves the registered spec anyway; the registered spec also survives
+deserialization (`src/Serialization/serialization.c:2016,2569-2598`).
 
 Not guaranteed: a global tally that is exact under concurrent voting from
 several replicas. Two replicas can both see "alice has not voted" and both
 accept her first vote (each against its local view); the *set* merges back
 to one alice, but two per-option counter increments from two replica ids
-merge to 2. The C `DEDUP_PER_USER` spec has the same single-tracker shape and
-inherits the same edge — the guard is exact on the merged state, not across
-the window in which two replicas have not yet seen each other. What the C
-spec adds, and JS cannot, is enforcement on the *signed-op path*: see the
-strict-version gap below.
+merge to 2. The registered `DEDUP_PER_USER` spec has the same
+single-tracker shape and inherits the same edge — the guard is exact on the
+merged state, not across the window in which two replicas have not yet seen
+each other.
 
 ## Variations
 
@@ -96,30 +109,33 @@ strict-version gap below.
 target: crabs-wasm
 verified: executed
 symbols:
-  Node.create               bindings/wasm/index.d.ts:372
+  Node.create               bindings/wasm/index.d.ts:549
   KeyPair.generate          bindings/wasm/index.d.ts:21
   publicKeyHex              bindings/wasm/index.d.ts:15
   KeyPair.destroy           bindings/wasm/index.d.ts:17
-  registerUser              bindings/wasm/index.d.ts:213
-  grantRole                 bindings/wasm/index.d.ts:214
-  addOneShotSet             bindings/wasm/index.d.ts:226
-  addCounter                bindings/wasm/index.d.ts:223
-  setPolicy                 bindings/wasm/index.d.ts:295
-  registerHandlerJs         bindings/wasm/index.d.ts:303
-  HandlerState.setContains  bindings/wasm/index.d.ts:123
-  HandlerState.setAdd       bindings/wasm/index.d.ts:115
+  registerUser              bindings/wasm/index.d.ts:353
+  grantRole                 bindings/wasm/index.d.ts:354
+  addOneShotSet             bindings/wasm/index.d.ts:366
+  addCounter                bindings/wasm/index.d.ts:363
+  setPolicy                 bindings/wasm/index.d.ts:435
+  defineOperationType       bindings/wasm/index.d.ts:446
+  DefineOperationTypeOptions bindings/wasm/index.d.ts:197-217
+  registerHandlerJs         bindings/wasm/index.d.ts:480
   HandlerState.incrementCounter bindings/wasm/index.d.ts:103
   Operation.create          bindings/wasm/index.d.ts:52
   Operation.signerId        bindings/wasm/index.d.ts:28
   Operation.payload         bindings/wasm/index.d.ts:30
-  Node.sign                 bindings/wasm/index.d.ts:297
-  Node.execute              bindings/wasm/index.d.ts:296
-  getCounter                bindings/wasm/index.d.ts:254
-  Node.destroy              bindings/wasm/index.d.ts:368
-  (handler return code)     src/CRABS/crabs.h:106 (CRABS_ERR_ALREADY_PERFORMED = 0x7001)
-  (string payload contract) src/Util/wasm_helpers.c:1071-1079 (payload must be NUL-terminated)
+  Node.sign                 bindings/wasm/index.d.ts:454
+  Node.execute              bindings/wasm/index.d.ts:453
+  setContains               bindings/wasm/index.d.ts:407
+  getCounter                bindings/wasm/index.d.ts:394
+  Node.destroy              bindings/wasm/index.d.ts:545
+  (register semantics)      src/CRABS/data_model.c:529-553 (state_register_op_type_def)
+  (execution guard)         src/StateMachine/state_machine.c:1693-1712 (registered spec wins over the wire)
+  (error surfaced)          src/CRABS/crabs.h:106 (CRABS_ERR_ALREADY_PERFORMED = 0x7001, name 'already_performed')
+  (string payload contract) src/Util/wasm_helpers.c:1195-1201 (payload must be NUL-terminated)
 maturity: all STABLE
-test_ref: bindings/wasm/test/smoke.js:59 (registerHandlerJs + policy-gated custom op)
+test_ref: bindings/wasm/test/dedup-surface.js (registered per-user/global specs, registry overwrite, malformed-input refusals)
 -->
 
 ### crabs-node (native Node.js)
@@ -131,19 +147,21 @@ test_ref: bindings/wasm/test/smoke.js:59 (registerHandlerJs + policy-gated custo
 target: crabs-node
 verified: executed
 symbols:
-  NodeStatic.new     bindings/node/index.d.ts:312
-  KeyPair.generate   bindings/node/index.d.ts:14
-  publicKeyHex       bindings/node/index.d.ts:8
-  registerUser       bindings/node/index.d.ts:182
-  grantRole          bindings/node/index.d.ts:183
-  addOneShotSet      bindings/node/index.d.ts:196
-  addCounter         bindings/node/index.d.ts:193
-  setContains        bindings/node/index.d.ts:235
-  setAdd             bindings/node/index.d.ts:243
-  incrementCounter   bindings/node/index.d.ts:238
-  getCounter         bindings/node/index.d.ts:224
+  NodeStatic.new      bindings/node/index.d.ts:412
+  KeyPair.generate    bindings/node/index.d.ts:13
+  publicKeyHex        bindings/node/index.d.ts:8
+  registerUser        bindings/node/index.d.ts:212
+  grantRole           bindings/node/index.d.ts:213
+  addOneShotSet       bindings/node/index.d.ts:226
+  setPolicy           bindings/node/index.d.ts:279
+  defineOperationType bindings/node/index.d.ts:291
+  DefineOperationTypeOptions bindings/node/index.d.ts:155-175
+  Operation           bindings/node/index.d.ts:19-44 (signerId, addResource)
+  Node.sign           bindings/node/index.d.ts:292
+  Node.execute        bindings/node/index.d.ts:293
+  setContains         bindings/node/index.d.ts:265
 maturity: all STABLE
-test_ref: bindings/node/test/test.js:53 (addOneShotSet) + test/test_one_shot.cpp:43-55 (idempotent add)
+test_ref: bindings/node/test/test.js:659 (defineOperationType block: per-user guard, F-2 bypass shape refused) + test/test_dedup.cpp:223-257 (registered spec beats a NONE bypass attempt)
 -->
 
 ### C (native)
@@ -179,67 +197,39 @@ maturity: all STABLE
 test_ref: test/test_dedup.cpp:680 (PerUserVoteOnceLifecycle) + :226-257 (registered spec beats a NONE bypass attempt)
 -->
 
-### The strict version (dedup)
-
-> [!WARNING] GAP
->
-> **Prose describes:** an operation type whose "one per member" rule is
-> installed on the machine itself — a registered `DedupSpec` — so the
-> executor enforces it on every signed op regardless of what the signer
-> carries on the wire, and no replica-side calling code can forget it.
->
-> **Codebase status:** exists only in C. The registry is
-> `state_register_op_type_def` (`src/CRABS/data_model.h:757`), the executor
-> consults `state_find_op_type_def` (`src/CRABS/data_model.h:756`,
-> `src/StateMachine/state_machine.c:1297-1316`) and even rejects an op whose
-> *carried* dedup spec is non-NONE without a registered definition
-> (`src/StateMachine/state_machine.c:1298-1300`). The guard/apply pair lives at
-> `src/Dedup/dedup.h:21-52`. The C snippet above exercises the real functions,
-> library-style, on a bare `state_t` — mirroring `test/test_dedup.cpp`.
->
-> **Divergence:** neither JS binding can install a spec. `Operation`
-> (`bindings/wasm/index.d.ts:26-49`, `bindings/node/index.d.ts:19-44`) exposes
-> no `dedup` field, no payload builder for the `__define_operation_type__`
-> builtin that installs one (`src/CRABS/crabs.h:161` — the op
-> itself exists, but the spec rides in C struct fields the bindings do not
-> map). So the wasm recipe above emulates the guard *inside a custom
-> handler*, and crabs-node cannot guard at all — it gets driver-level
-> discipline only. The handler emulation is also weaker than the registered
-> spec: a machine-local handler guards only ops routed through *that*
-> machine's registry, and the C registry applies to every executor call.
->
-> **Tracking:** an internal implementation plan (not published on this site)
-> (this task's section). No dedicated binding-gap tracker found for DedupSpec
-> exposure; the api-map records the gap at "R2 | DedupSpec / per-user guard".
->
-> **Agent action:** code block omitted. Do not fake a dedup field onto the
-> JS `Operation`; if you need the strict version from JS today, use the wasm
-> handler pattern above and accept the machine-local scope, or run the C core.
-
 ### Notes
 
-- Why `0x7001`? Custom handlers return a `crabs_error_e`; the wasm binding
-  throws a JS error whose message is the canonical name — `already_performed`
-  (`bindings/wasm/bindings-core.js` ERROR_MESSAGES, 0x7001). Returning a
-  nonzero code also short-circuits the executor *before* any post-handler
-  mutation or logging (`src/StateMachine/state_machine.c:1431` and
-  `:1462-1469` — the dedup mutation applies only after a successful handler),
-  which is exactly why the retry demo leaves the tally at 1.
+- The guard and the record are the SPEC's, not the handler's: the executor
+  runs the registered guard before the handler (`src/StateMachine/state_machine.c:1693-1712`)
+  and the spec's mutation after a successful run (`:1854-1862`), so the
+  retry demo's tally stays at 1 — a refused op applies nothing afterward
+  (the handler result is checked before any post-handler state work,
+  `:1823`).
+- The registered spec is durable machine state: the dedup registry
+  serializes with the machine (`src/Serialization/serialization.c:2016,2569-2598`),
+  so a restored replica keeps enforcing without a re-define.
+- The registry entry is REPLACED on re-definition
+  (`state_register_op_type_def`, `src/CRABS/data_model.c:529-553` —
+  first-match update, capacity 32 at `src/CRABS/data_model.h:379`). A
+  `dedup: 'none'` definition is therefore the documented way to remove a
+  guard; it also seals the type against op-carried specs, which the
+  executor ignores whenever ANY spec (even a NONE one) is registered.
 - String payloads must be NUL-terminated for a handler to see them
-  (`crabs_wasm_handler_op_get_payload_str`, `src/Util/wasm_helpers.c:1071-1077`
+  (`crabs_wasm_handler_op_get_payload_str`, `src/Util/wasm_helpers.c:1195-1201`
   — "demo payloads are null-terminated JSON strings"). Hence the `'\0'`
   appended to the vote option in the wasm snippet.
 - Direct mutations are not ops. `node.setAdd` / `node.incrementCounter` (and
   the wasm equivalents) are driver-level calls for setup and testing — they
-  bypass signatures, policies, and any handler. The node snippet's cast
-  function exists to make that visible: *the caller* is the only thing
-  checking `setContains` before mutating.
+  bypass signatures, policies, and any registered guard. The snippets only
+  use them on the tracker to READ (assert) what the spec recorded.
 - The once-record cannot be edited retroactively: `setRemove` tombstones
-  OR-set elements only (`bindings/node/src/crabs_node.cc:1663-1676`; the
-  wasm glue mirrors it, `src/Util/wasm_helpers.c:833-839`). That is a
+  OR-set elements only (`bindings/node/src/crabs_node.cc:1712-1722`; the
+  wasm glue mirrors it, `src/Util/wasm_helpers.c:928-934`). That is a
   feature for a voters list and a hazard for anything you might ever want
   to retract.
-- The idempotent-add and union-merge behavior the JS demos rely on are
-  pinned in C tests: `test/test_one_shot.cpp:43-55` (add is idempotent) and
+- The idempotent-add and union-merge behavior the demos rely on are pinned
+  in C tests: `test/test_one_shot.cpp:43-55` (add is idempotent) and
   `:75-97` (merge is a union); the strict guard lifecycle is
-  `test/test_dedup.cpp:680-724`.
+  `test/test_dedup.cpp:680-724`, and the full executor path (define +
+  guard + bypass refusal) is `test/test_state_machine.cpp`
+  (`DefineOperationTypeExecutesThroughMachine`).

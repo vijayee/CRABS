@@ -65,7 +65,7 @@ async function main() {
       if (amount !== undefined) {
         // The wasm handler bridge exposes the op payload as a STRING only
         // when it is NUL-terminated (crabs_wasm_handler_op_get_payload_str,
-        // src/Util/wasm_helpers.c:1071-1080) — terminate the entry amount.
+        // src/Util/wasm_helpers.c:1195-1201) — terminate the entry amount.
         const amountBytes = new TextEncoder().encode(amount);
         const terminated = new Uint8Array(amountBytes.length + 1);
         terminated.set(amountBytes);

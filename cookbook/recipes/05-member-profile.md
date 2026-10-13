@@ -51,7 +51,7 @@ last-writer-wins (LWW) register, and it is what the machine's
   member's key material — registration starts it at 1
   (`src/Attribute/attribute_machine.c:495`) and every role grant bumps it
   (`src/Attribute/attribute_machine.c:597,617`); the executor refuses ops
-  signed by a stale version (`R7-04`, `src/StateMachine/state_machine.c:862-876`).
+  signed by a stale version (`R7-04`, `src/StateMachine/state_machine.c:873-889`).
 
 ## What it guarantees / what it doesn't
 
@@ -110,7 +110,7 @@ symbols:
   setPolicy                   bindings/wasm/index.d.ts:295
   registerHandlerJs           bindings/wasm/index.d.ts:303
   HandlerOperation.signerId   bindings/wasm/index.d.ts:145
-  HandlerOperation.payload    bindings/wasm/index.d.ts:147 (NUL-terminated string, src/Util/wasm_helpers.c:1071-1079)
+  HandlerOperation.payload    bindings/wasm/index.d.ts:147 (NUL-terminated string, src/Util/wasm_helpers.c:1195-1201)
   HandlerState.setRegisterBytes bindings/wasm/index.d.ts:114
   Operation.create            bindings/wasm/index.d.ts:52
   Operation.signerId          bindings/wasm/index.d.ts:28

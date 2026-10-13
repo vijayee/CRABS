@@ -105,14 +105,16 @@ Shared creation/query API (both bindings except where marked). **Node `.d.ts` di
 
 ## 5. One-shot sets / flags and dedup (R2, R3)
 
-One-shot sets and flags are added like any item (`addOneShotSet` / `addOneShotFlag`, §4) — their "once" semantics come from the **DedupSpec machinery in C**, which is **not reachable from either JS binding**:
+One-shot sets and flags are added like any item (`addOneShotSet` / `addOneShotFlag`, §4) — their "once" semantics come from the DedupSpec machinery in C, and `Node.defineOperationType` installs a spec on the machine registry from BOTH bindings (`'custom'`-conditioned specs + their spec-carried mutations stay C-native: the bindings surface only the machine-enforceable per-user / global / none shapes):
 
 | symbol | kind | signature | source | maturity |
 |---|---|---|---|---|
-| `Node.addOneShotSet` | method | item whose elements can be inserted once per dedup scope | wasm :226, node :196 | STABLE (node test; wasm declared) |
-| `Node.addOneShotFlag` | method | one-shot boolean | wasm :227, node :197 | STABLE (`test/test.js:112`) |
-| `dedup_check_guard` | C fn | `dedup_check_guard(state, op) -> crabs_error_e` | `src/Dedup/dedup.h:21-22` | DESIGNED (C-only; no JS row exists — recipes R2/R3 needing a per-user global guard must use a wasm custom handler + register/set state instead of a DedupSpec) |
-| `state_register_op_type_def` | C fn | `state_register_op_type_def(state, op_type, dedup_spec_t*)` | `src/CRABS/data_model.h:757` | DESIGNED (C-only; `state_find_op_type_def` at :756 is what the executor consults — signers cannot bypass it, `src/Dedup/dedup.h:24-28`) |
+| `Node.addOneShotSet` | method | item whose elements can be inserted once per dedup scope | wasm :366, node :226 | STABLE (node test; wasm declared) |
+| `Node.addOneShotFlag` | method | one-shot boolean | wasm :367, node :227 | STABLE (`test/test.js:112`) |
+| `Node.defineOperationType` | method | `defineOperationType(opType, { dedup: 'per-user' \| 'global' \| 'none', trackerPath?, flagPath?, rejectionMessage? })` | wasm :446, node :291 | STABLE (`bindings/wasm/test/dedup-surface.js`, `test/test.js:659`) |
+| `DefineOperationTypeOptions` | interface | `{dedup, trackerPath?, flagPath?, rejectionMessage?}` | wasm :197-217, node :155-175 | STABLE (same tests) |
+| `dedup_check_guard` | C fn | `dedup_check_guard(state, op) -> crabs_error_e` | `src/Dedup/dedup.h:21-22` | PRESENT in C; the executor resolves REGISTERED specs via `state_find_op_type_def` — a registered spec wins over whatever the op carries (register + bypass-refusal pinned in `test/test_state_machine.cpp` `DefineOperationTypeExecutesThroughMachine`) |
+| `state_register_op_type_def` | C fn | `state_register_op_type_def(state, op_type, dedup_spec_t*)` | `src/CRABS/data_model.h:757` | PRESENT; reachable from both JS bindings via `Node.defineOperationType` (first-match update in place — re-defining REPLACES the spec, capacity 32 at `data_model.h:379`) |
 
 `DedupSpec` types (`dedup_type_e`, `dedup_spec_t`) at `src/CRABS/data_model.h:338,364-374`; the op format carries a `dedup_spec` since wire v3 (`src/StateMachine/state_machine.h:61,99`).
 
@@ -273,8 +275,8 @@ Where a recipe capability has **no JS map entry**, that fact is recorded here �
 | Recipe | Capability | Resolution |
 |---|---|---|
 | R2 | one-shot set | `addOneShotSet` / `setAdd` + `setRemove` tombstones (§4), STABLE |
-| R2 | DedupSpec / per-user guard | **No JS entry.** C-only: `src/Dedup/dedup.h:21-51`, `state_register_op_type_def` `src/CRABS/data_model.h:757` (DESIGNED). JS-achievable per-user guard = custom `registerHandlerJs` handler reading a one-shot set / set tags (§8 + §4) |
-| R3 | `ONE_SHOT_FLAG`, global dedup | `addOneShotFlag` / `flagSet` / `flagValue` (§4), STABLE; global dedup → same DedupSpec caveat |
+| R2 | DedupSpec / per-user guard | `Node.defineOperationType` (§5, STABLE — both bindings): the registered spec guards every op of the type inside the executor (`state_find_op_type_def`), replacing the old custom-handler emulation |
+| R3 | `ONE_SHOT_FLAG`, global dedup | `addOneShotFlag` / `flagSet` / `flagValue` (§4), STABLE; global dedup → `Node.defineOperationType` with `dedup: 'global'` (§5, STABLE — both bindings) |
 | R4 | `registerUser`, `grantRole`, `setPolicy` | §2 / §3, STABLE |
 | R5 | register LWW + key versioning/pair | `Node.setRegister` / `getRegister` + BigInt-vs-number split (§4); key pair = `KeyPair.*` (§13); `UserInfo.keyVersion` is the JS-visible version (§2) |
 | R6 | triggers, threshold attributes, ABE | `createTrigger` / `TriggerConfig` (§7, STABLE); threshold conditions live in the C condition grammar `src/Condition/` (PRESENT in C, surface tested via `createTrigger`); `Node.encrypt` (§9, STABLE) |
