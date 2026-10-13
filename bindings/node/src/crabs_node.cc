@@ -50,6 +50,7 @@ extern "C" {
 #include "OT/ot_execution.h"
 #include "OT/ot_ordered_set.h"
 #include "TxManager/tx_manager.h"
+#include "Util/allocator.h"
 #include "TxManager/tx_manager_memory.h"
 #include "Util/platform.h"
 }
@@ -1206,6 +1207,8 @@ public:
       InstanceMethod("abeKeygen", &Node::AbeKeygen),
       InstanceMethod("abeDecrypt", &Node::AbeDecrypt),
       InstanceMethod("serialize", &Node::Serialize),
+      InstanceMethod("deserialize", &Node::Deserialize),
+      InstanceMethod("mergeState", &Node::MergeState),
       InstanceMethod("getHLC", &Node::GetHLC),
       InstanceMethod("setTime", &Node::SetTime),
       InstanceMethod("pruneExpiredTempAttrs", &Node::PruneExpiredTempAttrs),
@@ -3149,13 +3152,264 @@ private:
 
   // --- Serialization ---
 
+  // Snapshot serialization (the C families at serialization.h:55-90):
+  //   serialize()                  — plain, SHA-256 checksummed (CORRUPTION CHECK ONLY);
+  //   serialize({sealKey})         — sealed: MSK AES-256-GCM-wrapped under the key;
+  //   serialize({signed: true})    — node-key ECDSA trailer appended;
+  //   {sealKey, signed: true}      — sealed + signed (both at-rest guarantees).
+  // Sealed variants need the machine's live master key, signed ones its node
+  // key; without them C refuses (thrown with a descriptive hint). A snapshot
+  // blob is a FULL machine — see deserialize's trust-model note for why the
+  // bare checksum is not authentication.
   Napi::Value Serialize(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
-    serialized_buffer_t* ser = crabs_serialize_state(&am_->base_state);
-    if (!ser) throw crabs_error(env, CRABS_ERR_SERIALIZATION_ERROR, "serialize");
+
+    std::string seal_key_hex;
+    bool with_seal = false;
+    bool with_signature = false;
+    if (info.Length() > 0 && !info[0].IsUndefined()) {
+      if (!info[0].IsObject())
+        throw Napi::TypeError::New(env,
+            "serialize: options must be an object {sealKey?, signed?}");
+      Napi::Object opts = info[0].As<Napi::Object>();
+      if (opts.Has("sealKey")) {
+        seal_key_hex = require_js_string(opts.Get("sealKey"),
+                                         "serialize", "sealKey");
+        with_seal = true;
+      }
+      if (opts.Has("signed")) {
+        Napi::Value signed_value = opts.Get("signed");
+        if (!signed_value.IsBoolean())
+          throw Napi::TypeError::New(env, "serialize: signed must be a boolean");
+        with_signature = signed_value.As<Napi::Boolean>().Value();
+      }
+    }
+
+    serialized_buffer_t* ser = nullptr;
+    if (with_seal && with_signature) {
+      uint8_t seal_key[32];
+      if (!hex_decode(seal_key_hex, seal_key, 32))
+        throw Napi::TypeError::New(env,
+            "serialize: sealKey must be 64 hex characters (32 bytes)");
+      ser = crabs_serialize_state_sealed_signed(&am_->base_state, seal_key);
+      OPENSSL_cleanse(seal_key, sizeof(seal_key));   // staged key never lingers
+    } else if (with_signature) {
+      ser = crabs_serialize_state_signed(&am_->base_state);
+    } else if (with_seal) {
+      uint8_t seal_key[32];
+      if (!hex_decode(seal_key_hex, seal_key, 32))
+        throw Napi::TypeError::New(env,
+            "serialize: sealKey must be 64 hex characters (32 bytes)");
+      ser = crabs_serialize_state_sealed(&am_->base_state, seal_key);
+      OPENSSL_cleanse(seal_key, sizeof(seal_key));
+    } else {
+      ser = crabs_serialize_state(&am_->base_state);
+    }
+    if (!ser) {
+      std::string hint;
+      if (with_seal)
+        hint += " — sealed snapshots need the machine's live master key";
+      if (with_signature)
+        hint += " — signed snapshots need the machine's node key";
+      throw Napi::Error::New(env, std::string("serialize state failed") + hint);
+    }
     Napi::Buffer<uint8_t> buf = Napi::Buffer<uint8_t>::Copy(env, ser->data, ser->len);
     serialized_buffer_destroy(ser);
     return buf;
+  }
+
+  // Restore a snapshot produced by serialize(): REPLACES this wrapper's
+  // underlying machine with the restored state — the same Node stays usable,
+  // the previous machine is destroyed unless it was adopted (spawned
+  // children are owned by their parent and simply stop being referenced —
+  // attribute_machine_destroy's ownership contract protects the borrowed
+  // MSK either way). Returns the restore report
+  //   { authorityRestored, mskSectionPresent }
+  // which only means something for a SEALED blob:
+  //   authorityRestored  — the sealed MSK unsealed with sealKey (a wrong or
+  //                        missing key still loads, on the substrate-only
+  //                        compatibility path, with a FRESH authority);
+  //   mskSectionPresent  — the blob carried the authority section at all.
+  //
+  // options: { sealKey: '64-hex' } restores a sealed snapshot's master key;
+  // { verify: 'node-key' } verifies a SIGNED snapshot's ECDSA trailer with
+  // THIS machine's node public key BEFORE any parse — a plain load of a
+  // signed blob is refused rather than silently accepted unauthenticated.
+  // Both combine ({sealKey, verify: 'node-key'}) for sealed+SIGNED blobs.
+  //
+  // TRUST MODEL (serialization.h:70-75): "The bare SHA-256 is only a
+  // corruption check — an attacker who can write the state file can recompute
+  // it, so snapshot load from untrusted sources must use the signed
+  // variants." Loading a snapshot from an untrusted source without
+  // {verify: 'node-key'} (and, when authority matters, the matching sealKey)
+  // imports whatever state the writer chose. Staged seal key bytes are
+  // cleansed on every path.
+  Napi::Value Deserialize(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 1 || !info[0].IsBuffer())
+      throw Napi::TypeError::New(env,
+          "deserialize: expected the snapshot wire bytes (Buffer)");
+    Napi::Buffer<uint8_t> wire = info[0].As<Napi::Buffer<uint8_t>>();
+    const uint8_t* data = wire.Data();
+    size_t len = wire.Length();
+
+    std::string seal_key_hex;
+    bool with_seal = false;
+    bool with_signature_check = false;
+    if (info.Length() > 1) {
+      if (!info[1].IsObject())
+        throw Napi::TypeError::New(env,
+            "deserialize: options must be an object {sealKey?, verify?}");
+      Napi::Object opts = info[1].As<Napi::Object>();
+      if (opts.Has("sealKey")) {
+        seal_key_hex = require_js_string(opts.Get("sealKey"),
+                                         "deserialize", "sealKey");
+        with_seal = true;
+      }
+      if (opts.Has("verify")) {
+        std::string verify_mode = require_js_string(opts.Get("verify"),
+                                                    "deserialize", "verify");
+        if (verify_mode != "node-key")
+          throw Napi::TypeError::New(env,
+              "deserialize: verify must be the literal 'node-key'");
+        with_signature_check = true;
+      }
+    }
+
+    // R7-03: the whole body — sealed or plain — is covered by the ECDSA
+    // trailer, so verify against THIS machine's node public key before any
+    // parse. The wire serializes no key material; self-authored snapshots
+    // (crash recovery) are what this machine can authenticate.
+    size_t body_len = len;
+    if (with_signature_check) {
+      if (!am_->base_state.node_key_valid)
+        throw Napi::Error::New(env,
+            "deserialize: signature verification needs this machine's node key "
+            "(none set)");
+      if (len <= CRABS_SIG_SIZE)
+        throw Napi::Error::New(env,
+            "deserialize: signed snapshot too short to carry a signature");
+      body_len = len - CRABS_SIG_SIZE;
+      if (!crypto_ecdsa_verify(am_->base_state.node_public_key, data, body_len,
+                               data + body_len))
+        throw Napi::Error::New(env,
+            "deserialize: snapshot signature verification failed");
+    }
+
+    uint8_t seal_key[32];
+    const uint8_t* seal_key_ptr = nullptr;
+    if (with_seal) {
+      if (!hex_decode(seal_key_hex, seal_key, 32))
+        throw Napi::TypeError::New(env,
+            "deserialize: sealKey must be 64 hex characters (32 bytes)");
+      seal_key_ptr = seal_key;
+    }
+
+    bool authority_restored = false;
+    bool msk_section_present = false;
+    state_t* loaded = crabs_deserialize_state_keys_reported(
+        data, body_len, seal_key_ptr,
+        &authority_restored, &msk_section_present);
+    // Staged key bytes never linger past the call, on every path.
+    if (with_seal) OPENSSL_cleanse(seal_key, sizeof(seal_key));
+    if (!loaded)
+      throw Napi::Error::New(env,
+          "deserialize: snapshot refused — malformed format, failed SHA-256 "
+          "checksum, failed signature check, or an unloadable body");
+
+    // Adoption mirrors the CLI's load (cli_node_load): a blob that carried a
+    // user registry arrives as an attribute-machine SHELL (its attr_machine
+    // points back at its own allocation) — adopt wholesale; a bare state is
+    // wrapped in a fresh machine that takes over the state's owned members.
+    // In both outcomes the base state keeps ownership of what came off the
+    // wire and the previous machine keeps what it owns.
+    attribute_machine_t* restored_machine;
+    if (loaded->attr_machine != nullptr &&
+        loaded->attr_machine == (attribute_machine_t*)loaded) {
+      restored_machine = (attribute_machine_t*)loaded;
+    } else {
+      restored_machine = (attribute_machine_t*)get_clear_memory(
+          sizeof(attribute_machine_t));
+      if (!restored_machine) {
+        state_destroy(loaded);
+        throw Napi::Error::New(env,
+            "deserialize: out of memory wrapping the restored state");
+      }
+      restored_machine->base_state = *loaded;   // shallow copy transfers ownership
+      restored_machine->base_state.attr_machine = restored_machine;
+      restored_machine->users = nullptr;
+      restored_machine->user_count = 0;
+      restored_machine->current_time_ms = 0;
+      free(loaded);
+    }
+
+    attribute_machine_t* previous_machine = am_;
+    bool previous_owned = !adopted_;
+
+    // Continuity rewiring — the wrapper keeps its identity across the
+    // restore. The wire serializes no secrets: re-apply the wrapper's own
+    // node key (a borrowed wrapper owns no keypair, so a restored borrowed
+    // machine carries NO node key and its signing surfaces fail closed).
+    if (node_key_ != nullptr)
+      state_set_node_key(&restored_machine->base_state,
+                         node_key_->private_key, node_key_->public_key);
+    // Clock and raft module: the machine references them through raw
+    // non-owning pointers, so the restore migrates the wrapper's instances
+    // onto the restored machine (A borrowed previous machine loses both —
+    // the same fail-closed consequence the wrapper's documented teardown
+    // has; the owner must re-apply via its own wrapper).
+    if (time_source_owned_ && time_source_ops_ != nullptr) {
+      state_set_time_source(&previous_machine->base_state, NULL);
+      state_set_time_source(&restored_machine->base_state, time_source_ops_);
+    }
+    if (raft_module_ != nullptr) {
+      // Attaching re-imports the restored state's parsed v16 module snapshot
+      // (its durable raft history) INTO the module object, exactly like the
+      // C load flow demands. An unloadable snapshot (foreign module_id)
+      // leaves the machine detached-but-snapshot-carrying for a later
+      // re-attach rather than failing the restore.
+      if (state_attach_raft_module(&restored_machine->base_state,
+                                   raft_module_) == CRABS_SUCCESS)
+        state_attach_raft_module(&previous_machine->base_state, NULL);
+    }
+    state_set_change_hook(&restored_machine->base_state,
+                          _node_change_hook_thunk, this);
+
+    // Ownership transfer: the wrapper now owns the restored machine and the
+    // previous one is released only when it was wrapper-owned (mirrors the
+    // destructor's ownership statement).
+    if (previous_owned) attribute_machine_destroy(previous_machine);
+    am_ = restored_machine;
+    adopted_ = false;
+
+    Napi::Object report = Napi::Object::New(env);
+    report.Set("authorityRestored",
+               Napi::Boolean::New(env, authority_restored));
+    report.Set("mskSectionPresent",
+               Napi::Boolean::New(env, msk_section_present));
+    return report;
+  }
+
+  // Merge a foreign snapshot INTO this machine via crdt_merge_state (the
+  // general item rules: counters max-per-node/sum-across-nodes, register
+  // LWW, OR/2P-set union, one-shot take-any; logs merge by lamport time and
+  // dedupe by uuid). This machine MUTATES toward the union; the source
+  // snapshot is untouched (it is never attached to a machine). Throws —
+  // machine untouched — on a malformed snapshot or a held item.
+  Napi::Value MergeState(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 1 || !info[0].IsBuffer())
+      throw Napi::TypeError::New(env,
+          "mergeState: expected a serialized state snapshot (Buffer)");
+    Napi::Buffer<uint8_t> wire = info[0].As<Napi::Buffer<uint8_t>>();
+    state_t* source_state = crabs_deserialize_state(wire.Data(), wire.Length());
+    if (!source_state)
+      throw Napi::Error::New(env,
+          "mergeState: snapshot refused — malformed format or failed SHA-256 checksum");
+    crabs_error_e rc = crdt_merge_state(&am_->base_state, source_state);
+    state_destroy(source_state);
+    if (rc != CRABS_SUCCESS) throw crabs_error(env, rc, "mergeState");
+    return env.Undefined();
   }
 
   // --- HLC ---

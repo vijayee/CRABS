@@ -907,5 +907,144 @@ try {
     Error, 'unauthorized', 'schedule(unknown signer)');
 }
 
+// ============================================================
+// P1 (parity fill): state restore + merge + sealed/signed snapshots.
+//
+// deserialize(wire, {sealKey?, verify?}) REPLACES the wrapper's machine with
+// the restored state — the same wrapper stays usable — and returns the
+// restore report {authorityRestored, mskSectionPresent}. mergeState(wire)
+// merges a foreign snapshot through crdt_merge_state (counters max-per-node
+// / sum-across-nodes, register LWW, OR-set union).
+// ============================================================
+(() => {
+  function assert_raises(thunk, label, message) {
+    let caught = null;
+    try { thunk(); } catch (caughtError) { caught = caughtError; }
+    assert(caught !== null, message + ` (${label} did not throw)`);
+  }
+
+  const SEAL_KEY_A = 'aa'.repeat(32);
+  const SEAL_KEY_B = 'bb'.repeat(32);
+
+  // Plain serialize -> deserialize round trip into a FRESH wrapper.
+  const snapshotNode = new Node('m1', { ordering: 'hlc' });
+  snapshotNode.addCounter('hits');
+  snapshotNode.incrementCounter('hits', 5, 'm1');
+  snapshotNode.addRegister('rank', 0);
+  snapshotNode.setRegister('rank', 42, 'm1');
+  snapshotNode.addORSet('tags');
+  snapshotNode.setAdd('tags', 'crdt', 'writer-a');
+  snapshotNode.setAdd('tags', 'abe', 'writer-b');
+  const restoreKey = KeyPair.generate();
+  snapshotNode.registerUser('restoree', restoreKey.publicKeyHex(), '');
+  snapshotNode.grantRole('restoree', 'role', 'member', 'm1');
+  const wire1 = snapshotNode.serialize();
+
+  const restored = new Node('fresh', { ordering: 'hlc' });
+  const plainReport = restored.deserialize(wire1);
+  assert(plainReport.authorityRestored === false &&
+         plainReport.mskSectionPresent === false,
+    `plain snapshot report must be plain (got ${JSON.stringify(plainReport)})`);
+  assert(restored.getCounter('hits') === 5, 'counter did not restore');
+  assert(restored.getRegister('rank') === 42, 'register did not restore');
+  assert(restored.setContains('tags', 'crdt') && restored.setContains('tags', 'abe'),
+    'OR-set members did not restore');
+  const restoree = restored.getUser('restoree');
+  assert(restoree !== undefined && restoree.userId === 'restoree',
+    'user registry did not restore');
+  assert(restoree.attributes.some(attr => attr.value === 'role:member'),
+    'restored user record lost the granted role');
+
+  assert_raises(() => restored.deserialize(Buffer.from([0, 1, 2])),
+    'deserialize', 'garbage wire must refuse deserialize');
+
+  // mergeState: divergent machines converge on crdt_merge_state's rules.
+  const mergerLeft = new Node('ml', { ordering: 'hlc' });
+  mergerLeft.addCounter('hits');
+  mergerLeft.incrementCounter('hits', 3, 'm-left');
+  mergerLeft.addRegister('rank', 0);
+  mergerLeft.setRegister('rank', 7, 'm-left');
+  mergerLeft.addORSet('tags');
+  mergerLeft.setAdd('tags', 'shared', 'left');
+  const mergerRight = new Node('mr', { ordering: 'hlc' });
+  mergerRight.addCounter('hits');
+  mergerRight.incrementCounter('hits', 9, 'm-right');
+  mergerRight.addRegister('rank', 0);
+  mergerRight.setRegister('rank', 99, 'm-right');
+  mergerRight.addORSet('tags');
+  mergerRight.setAdd('tags', 'shared', 'right');
+  mergerRight.setAdd('tags', 'extra', 'right');
+  mergerLeft.mergeState(mergerRight.serialize());
+
+  assert(mergerLeft.getCounter('hits') === 12,
+    `merged counter: distinct node contributions sum (expected 12, got ${mergerLeft.getCounter('hits')})`);
+  assert(mergerLeft.getRegister('rank') === 99,
+    `merged register: later / higher-node-id LWW wins (expected 99, got ${mergerLeft.getRegister('rank')})`);
+  assert(mergerLeft.setContains('tags', 'shared') &&
+         mergerLeft.setContains('tags', 'extra'), 'merged OR-set lost elements');
+  assert(mergerRight.getCounter('hits') === 9,
+    'mergeState must not mutate the source machine');
+
+  const beforeRefusedMerge = mergerLeft.getCounter('hits');
+  assert_raises(() => mergerLeft.mergeState(Buffer.alloc(8)),
+    'mergeState', 'garbage mergeState input must refuse');
+  assert(mergerLeft.getCounter('hits') === beforeRefusedMerge,
+    'refused merge must leave the machine untouched');
+
+  // Sealed snapshot: same key restores authority, wrong key does not.
+  const sealedWire = snapshotNode.serialize({ sealKey: SEAL_KEY_A });
+  const unsealer = new Node('unsealer', { ordering: 'hlc' });
+  const sealReport = unsealer.deserialize(sealedWire, { sealKey: SEAL_KEY_A });
+  assert(sealReport.mskSectionPresent === true,
+    'sealed snapshot must report the MSK section present');
+  assert(sealReport.authorityRestored === true,
+    'correct seal key must restore the machine authority');
+  assert(unsealer.getCounter('hits') === 5, 'sealed snapshot content did not restore');
+
+  const wrongKeyNode = new Node('wrongkey', { ordering: 'hlc' });
+  const wrongReport = wrongKeyNode.deserialize(sealedWire, { sealKey: SEAL_KEY_B });
+  assert(wrongReport.mskSectionPresent === true && wrongReport.authorityRestored === false,
+    `wrong seal key must refuse the authority (got ${JSON.stringify(wrongReport)})`);
+  assert(wrongKeyNode.getCounter('hits') === 5,
+    'wrong-key restore must still load the substrate');
+
+  // Signed snapshot: self-restore + tamper refusal.
+  const signedWire = snapshotNode.serialize({ signed: true });
+  const tampered = Buffer.from(signedWire);
+  tampered[16] ^= 0xFF;  // flip one payload byte (signature must catch it)
+  assert_raises(() => snapshotNode.deserialize(tampered, { verify: 'node-key' }),
+    'deserialize', 'tampered signed snapshot must refuse');
+
+  const signedReport = snapshotNode.deserialize(signedWire, { verify: 'node-key' });
+  assert(snapshotNode.getCounter('hits') === 5 &&
+         snapshotNode.getRegister('rank') === 42,
+    'signed self-restore lost the snapshot content');
+  assert(signedReport.authorityRestored === false &&
+         signedReport.mskSectionPresent === false,
+    'the plain body of a signed snapshot reports the plain path');
+
+  const foreign = new Node('foreign', { ordering: 'hlc' });
+  assert_raises(() => foreign.deserialize(signedWire, { verify: 'node-key' }),
+    'deserialize', 'foreign node key must not verify a foreign signature');
+
+  // Sealed + signed: both families compose from the wrapper.
+  const sealedSignedWire =
+      snapshotNode.serialize({ sealKey: SEAL_KEY_A, signed: true });
+  const sealedSignedReport = snapshotNode.deserialize(
+      sealedSignedWire, { sealKey: SEAL_KEY_A, verify: 'node-key' });
+  assert(sealedSignedReport.authorityRestored === true &&
+         sealedSignedReport.mskSectionPresent === true,
+    `sealed+signed restore lost both guarantees (got ${JSON.stringify(sealedSignedReport)})`);
+  assert(snapshotNode.getCounter('hits') === 5,
+    'sealed+signed content did not restore');
+
+  // The restored machine stays usable end to end.
+  snapshotNode.setRegister('rank', 43, 'm1');
+  assert(snapshotNode.getRegister('rank') === 43, 'restored machine must stay writable');
+
+  // The N-API Node exposes no destroy() (borrowed-lifetime design): the
+  // machines are reclaimed with GC.
+})();
+
 console.log(`\n${passed} passed, ${failed} failed`);
 process.exit(failed > 0 ? 1 : 0);

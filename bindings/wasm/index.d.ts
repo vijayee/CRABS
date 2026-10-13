@@ -706,7 +706,66 @@ export interface Node {
    * (a destroyed key refuses).
    */
   abeDecrypt(key: AbeKey, encrypted: Uint8Array): Uint8Array;
-  serialize(): Uint8Array;
+
+  // ============================================================
+  // State snapshots (parity-fill P1)
+  // ============================================================
+  /**
+   * Snapshot serialization — the C families at serialization.h:55-90:
+   *   serialize()                    plain, SHA-256 checksummed;
+   *   serialize({sealKey})           sealed — the MSK is AES-256-GCM-wrapped
+   *                                  under `sealKey` (64 hex chars, 32 bytes;
+   *                                  needs the machine's LIVE master key);
+   *   serialize({signed: true})      a node-key ECDSA trailer is appended
+   *                                  (needs the machine's node key);
+   *   serialize({sealKey, signed})   sealed + signed (both at-rest
+   *                                  guarantees in one blob).
+   * Staged seal-key bytes are zeroed inside the module heap on every path.
+   * A snapshot blob carries the FULL machine (items, log, registry) — but
+   * the bare SHA-256 inside it is an INTEGRITY check, not authentication:
+   * anyone who can write the blob can recompute that checksum. Loading from
+   * an untrusted source belongs to the signed variants (see deserialize).
+   */
+  serialize(options?: { sealKey?: string; signed?: boolean }): Uint8Array;
+  /**
+   * RESTORE a snapshot produced by serialize(): the wrapper's underlying
+   * machine is REPLACED with the restored state — the same Node stays usable
+   * (reads, writes, destroy()); the previous machine is simply dropped from
+   * the wrapper's reference (wasm machines are never destroyed — the module
+   * leaks them by design). Returns the restore report
+   *   { authorityRestored: boolean, mskSectionPresent: boolean }
+   * which only means something for a SEALED blob:
+   *   authorityRestored  — the sealed MSK unsealed with `sealKey`; a wrong or
+   *                        missing key still loads, on the substrate-only
+   *                        compatibility path, with a FRESH authority
+   *                        (serialization.h:50-54) — treat authority as
+   *                        unproven then;
+   *   mskSectionPresent  — the blob carried the authority section at all.
+   *
+   * options: { sealKey?: '64-hex' } restores a sealed snapshot's master key;
+   * { verify: 'node-key' } verifies a SIGNED snapshot's ECDSA trailer with
+   * THIS machine's node public key BEFORE any parse (R7-03 — a machine
+   * without a node key cannot verify; the signed blob is refused rather
+   * than silently accepted unauthenticated). Both combine:
+   * { sealKey, verify: 'node-key' } for sealed+SIGNED blobs. Continuity:
+   * the node key, change hook, attached (module-shared) time source and a
+   * live raft module ride over from the previous machine; the tx manager is
+   * runtime-only — attachTxManager again after a restore.
+   */
+  deserialize(wire: Uint8Array,
+              options?: { sealKey?: string; verify?: 'node-key' }):
+      { authorityRestored: boolean; mskSectionPresent: boolean };
+  /**
+   * Merge a foreign snapshot INTO this machine via crdt_merge_state — the
+   * general item rules: counters max-per-node / sum-across-nodes, register
+   * LWW (timestamp, then node id on tie), OR/2P-set union, one-shot
+   * take-any; op logs merge by lamport time and dedupe by uuid. This
+   * machine MUTATES toward the union; the source snapshot is untouched (it
+   * is never attached to a machine). Throws, machine untouched, on a
+   * malformed snapshot or a held item. NOT the OT path: ordered-set items
+   * need the dedicated ordered-set merge layer.
+   */
+  mergeState(wire: Uint8Array): void;
 
   setTime(nowMs: number): void;
   pruneExpiredTempAttrs(): number;

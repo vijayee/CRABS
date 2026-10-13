@@ -138,6 +138,27 @@ function writeBytes(M, bytes) {
   return { ptr, len: bytes.length };
 }
 
+// Stage a 32-byte seal key from 64 hex chars. The caller MUST cleanse and
+// free the returned pointer after the C call:
+//   M.HEAPU8.fill(0, ptr, ptr + 32); M._free(ptr);
+// (key bytes never linger in the module heap past the call).
+function stageSealKey32(M, sealKeyHex, label) {
+  if (typeof sealKeyHex !== 'string' || !/^[0-9a-fA-F]{64}$/.test(sealKeyHex)) {
+    throw new TypeError(`${label}: sealKey must be 64 hex characters (32 bytes)`);
+  }
+  const ptr = M._malloc(32);
+  hexDecode(M, sealKeyHex, ptr, 32);
+  return ptr;
+}
+
+// View-typed wire-argument gate shared by deserialize / mergeState.
+function requireWireBytes(bytes, label) {
+  if (!ArrayBuffer.isView(bytes)) {
+    throw new TypeError(`${label}: expected the snapshot wire bytes (Uint8Array)`);
+  }
+  return bytes;
+}
+
 // Page cap for set enumerators (mirrors the C-side
 // CRABS_WASM_HANDLER_SET_PAGE_CAP in src/Util/wasm_helpers.c — keep the two
 // in lockstep, the JS guard is UX-first so callers get a descriptive throw
@@ -1700,15 +1721,147 @@ class Node {
     }
   }
 
-  serialize() {
+  // Snapshot serialization (the C families at serialization.h:55-90):
+  //   serialize()               — plain, SHA-256 checksummed (CORRUPTION CHECK ONLY);
+  //   serialize({sealKey})      — sealed: MSK AES-256-GCM-wrapped under the key;
+  //   serialize({signed: true}) — node-key ECDSA trailer appended;
+  //   {sealKey, signed: true}   — sealed + signed (both at-rest guarantees).
+  // Sealed variants need the machine's live master key, signed ones its node
+  // key; without them C refuses (caught as a descriptive throw). A snapshot
+  // blob is a FULL machine — see the restoreReport block on deserialize for
+  // why the bare checksum is not authentication.
+  serialize(options) {
     const M = this._M;
-    const ser = M._crabs_wasm_serialize_state(this._am);
-    if (!ser) throw new Error('serialize state failed');
+    if (options !== undefined && options !== null &&
+        (typeof options !== 'object' || Array.isArray(options))) {
+      throw new TypeError('serialize: options must be an object {sealKey?, signed?}');
+    }
+    if (options?.signed !== undefined && typeof options?.signed !== 'boolean') {
+      throw new TypeError('serialize: signed must be a boolean');
+    }
+    const withSeal = options?.sealKey !== undefined && options?.sealKey !== null;
+    const withSignature = options?.signed === true;
+
+    let sealPtr = 0;
+    let ser;
+    try {
+      if (withSeal) sealPtr = stageSealKey32(M, options.sealKey, 'serialize');
+      if (withSignature && withSeal) {
+        ser = M._crabs_wasm_serialize_state_sealed_signed(this._am, sealPtr);
+      } else if (withSignature) {
+        ser = M._crabs_wasm_serialize_state_signed(this._am);
+      } else if (withSeal) {
+        ser = M._crabs_wasm_serialize_state_sealed(this._am, sealPtr);
+      } else {
+        ser = M._crabs_wasm_serialize_state(this._am);
+      }
+    } finally {
+      if (sealPtr !== 0) {  // the staged seal key never lingers past the call
+        M.HEAPU8.fill(0, sealPtr, sealPtr + 32);
+        M._free(sealPtr);
+      }
+    }
+    if (!ser) {
+      let hint = '';
+      if (withSeal) hint += " — sealed snapshots need the machine's live master key";
+      if (withSignature) hint += " — signed snapshots need the machine's node key";
+      throw new Error(`serialize state failed${hint}`);
+    }
     const len = M._crabs_wasm_buffer_len(ser);
     const data = M._crabs_wasm_buffer_data(ser);
     const out = new Uint8Array(M.HEAPU8.subarray(data, data + len));
     M._crabs_wasm_buffer_destroy(ser);
     return out;
+  }
+
+  // Restore a snapshot produced by serialize(): REPLACES this wrapper's
+  // underlying machine with the restored state (the same Node stays usable;
+  // the previous machine stays alive inside the module — wasm machines are
+  // never destroyed). Returns the restore report
+  //   { authorityRestored, mskSectionPresent }
+  // which only means something for a SEALED blob:
+  //   authorityRestored  — the sealed MSK unsealed with seal_key (a wrong or
+  //                        missing key still loads, on the substrate-only
+  //                        compatibility path, with a FRESH authority);
+  //   mskSectionPresent  — the blob carried the authority section at all.
+  //
+  // options: { sealKey: '64-hex' } restores a sealed snapshot's master key;
+  // { verify: 'node-key' } verifies a SIGNED snapshot's ECDSA trailer with
+  // THIS machine's node public key BEFORE any parse — a plain load of a
+  // signed blob is refused rather than silently accepted unauthenticated.
+  // Both combine ({sealKey, verify:'node-key'}) for sealed+SIGNED blobs.
+  //
+  // TRUST MODEL: the blob's embedded SHA-256 is an INTEGRITY check, not
+  // authentication — an attacker who can write the blob can recompute it
+  // (serialization.h). Loading a snapshot from an untrusted source without
+  // {verify:'node-key'} (and, when authority matters, the seal key) imports
+  // whatever state the writer chose. Staged seal key bytes are zeroed on
+  // every path.
+  deserialize(wire, options) {
+    const M = this._M;
+    requireWireBytes(wire, 'deserialize');
+    if (options !== undefined && (typeof options !== 'object' ||
+                                  Array.isArray(options))) {
+      throw new TypeError('deserialize: options must be an object {sealKey?, verify?}');
+    }
+    if (options?.verify !== undefined && options.verify !== 'node-key') {
+      throw new TypeError("deserialize: verify must be the literal 'node-key'");
+    }
+    const withSeal = options?.sealKey !== undefined && options?.sealKey !== null;
+    const verifySigned = options?.verify === 'node-key';
+    if (verifySigned && this._am === null) {
+      throw new Error("deserialize: a destroyed node cannot verify snapshots");
+    }
+
+    let sealPtr = 0;
+    let outAuthority = 0;
+    let outMskSection = 0;
+    let wirePtr = 0;
+    try {
+      if (withSeal) sealPtr = stageSealKey32(M, options.sealKey, 'deserialize');
+      outAuthority = M._malloc(1);
+      outMskSection = M._malloc(1);
+      wirePtr = M._malloc(wire.length);
+      M.HEAPU8.set(wire, wirePtr);
+      const restoredPointer = M._crabs_wasm_deserialize_state(
+          this._am, wirePtr, wire.length, sealPtr, verifySigned ? 1 : 0,
+          outAuthority, outMskSection);
+      const authorityRestored = M.getValue(outAuthority, 'i8') !== 0;
+      const mskSectionPresent = M.getValue(outMskSection, 'i8') !== 0;
+      if (restoredPointer === 0) {
+        throw new Error(
+            'deserialize: snapshot refused — malformed format, failed SHA-256 ' +
+            'checksum, failed signature check, or an unloadable body');
+      }
+      this._am = restoredPointer;
+      return { authorityRestored, mskSectionPresent };
+    } finally {
+      if (sealPtr !== 0) {
+        M.HEAPU8.fill(0, sealPtr, sealPtr + 32);
+        M._free(sealPtr);
+      }
+      freeAll(M, wirePtr, outAuthority, outMskSection);
+    }
+  }
+
+  // Merge a foreign snapshot INTO this machine via crdt_merge_state (the
+  // general item rules: counters max-per-node/sum-across-nodes, register
+  // LWW, OR/2P-set union, one-shot take-any — order via the merge's logs).
+  // This machine MUTATES toward the union; the source snapshot is untouched
+  // (it has no machine attached). Returns undefined; throws (machine
+  // untouched) on a malformed snapshot or a held item.
+  mergeState(wire) {
+    const M = this._M;
+    requireWireBytes(wire, 'mergeState');
+    let wirePtr = 0;
+    try {
+      wirePtr = M._malloc(wire.length);
+      M.HEAPU8.set(wire, wirePtr);
+      const rc = M._crabs_wasm_merge_state(this._am, wirePtr, wire.length);
+      wrapRc(rc, 'mergeState');
+    } finally {
+      if (wirePtr) M._free(wirePtr);
+    }
   }
 
   setTime(nowMs) { this._M._crabs_wasm_set_time(this._am, BigInt(nowMs)); }

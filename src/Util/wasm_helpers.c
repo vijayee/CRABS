@@ -26,6 +26,7 @@
 #include "../TimeSource/time_source.h"
 #include "../Raft/raft_module.h"
 #include "../OT/ot_execution.h"
+#include "allocator.h"
 #include "../OT/ot_ordered_set.h"
 #include "../TxManager/tx_manager.h"
 #include "../TxManager/tx_manager_memory.h"
@@ -1704,6 +1705,160 @@ int32_t crabs_wasm_abe_decrypt(abe_user_key_t* sk, abe_ciphertext_t* ct,
 EMSCRIPTEN_KEEPALIVE
 serialized_buffer_t* crabs_wasm_serialize_state(attribute_machine_t* am) {
   return am ? crabs_serialize_state(&am->base_state) : NULL;
+}
+
+// ============================================================
+// State restore + merge (snapshot round trips from JS)
+//
+// The three serialize exports map 1:1 onto the C families
+// (serialization.h:55-90): plain (checksummed), node-key-signed (ECDSA
+// trailer), sealed (AES-256-GCM-wrapped master key — requires the
+// machine's live authority), and their compositions. Sealed/signed
+// serialization fails by returning NULL (the JS wrapper raises) when the
+// machine has no live master key or no node key to sign with.
+// ============================================================
+
+EMSCRIPTEN_KEEPALIVE
+serialized_buffer_t* crabs_wasm_serialize_state_sealed(
+    attribute_machine_t* am, const uint8_t* seal_key) {
+  if (am == NULL || seal_key == NULL) return NULL;
+  return crabs_serialize_state_sealed(&am->base_state, seal_key);
+}
+
+EMSCRIPTEN_KEEPALIVE
+serialized_buffer_t* crabs_wasm_serialize_state_signed(
+    attribute_machine_t* am) {
+  return am ? crabs_serialize_state_signed(&am->base_state) : NULL;
+}
+
+EMSCRIPTEN_KEEPALIVE
+serialized_buffer_t* crabs_wasm_serialize_state_sealed_signed(
+    attribute_machine_t* am, const uint8_t* seal_key) {
+  if (am == NULL || seal_key == NULL) return NULL;
+  return crabs_serialize_state_sealed_signed(&am->base_state, seal_key);
+}
+
+// State snapshot restore: verify the node-key signature FIRST when
+// verify_signed is set (the ECDSA trailer covers the WHOLE sealed or plain
+// body — an attacker cannot mount a parse on unverified bytes), then parse
+// the BODY with the same keys-reported core the CLI load path uses. The
+// seal key (32 staged bytes) or NULL restores a sealed MSK section; the
+// report out-params surface whether authority actually came back (the
+// wrong-key path still loads a substrate-only machine, never NULL).
+//
+// The PREVIOUS machine is left untouched — wasm machines are never
+// destroyed (crabs_wasm_node_destroy's leak policy) — and the caller drops
+// its JS reference. Continuity rewiring happens here so the wrapper keeps
+// its identity across the restore: node key from the previous machine (the
+// wire format serializes no secrets), change hook, the module-shared
+// attached time source, and a live raft module (the new state's parsed v16
+// module snapshot imports into it in the attach call).
+EMSCRIPTEN_KEEPALIVE
+attribute_machine_t* crabs_wasm_deserialize_state(
+    const attribute_machine_t* previous,
+    const uint8_t* data, uint32_t len,
+    const uint8_t* seal_key, int32_t verify_signed,
+    bool* out_authority_restored, bool* out_msk_section_present) {
+  if (data == NULL || len < CRABS_HASH_SIZE + CRABS_SIG_SIZE + 16) {
+    return NULL;
+  }
+
+  size_t body_len = len;
+  if (verify_signed != 0) {
+    // R7-03: the signature is checked by the node public key BEFORE any
+    // parse. The trailer is appended after the checksummed body, so the
+    // signed verify path looks at data[0 .. len-64) and the 64-byte
+    // trailer at the end.
+    if (previous == NULL || !previous->base_state.node_key_valid ||
+        !crypto_ecdsa_verify(previous->base_state.node_public_key, data,
+                             body_len - CRABS_SIG_SIZE,
+                             data + body_len - CRABS_SIG_SIZE)) {
+      return NULL;
+    }
+    body_len -= CRABS_SIG_SIZE;
+  }
+
+  bool authority_restored = false;
+  bool msk_section_present = false;
+  state_t* loaded = crabs_deserialize_state_keys_reported(
+      data, body_len, seal_key, &authority_restored, &msk_section_present);
+  if (loaded == NULL) return NULL;
+  if (out_authority_restored != NULL) *out_authority_restored = authority_restored;
+  if (out_msk_section_present != NULL) *out_msk_section_present = msk_section_present;
+
+  // Adoption mirrors the CLI's load (cli.c): a deserialized blob that
+  // carried a user registry arrives as an attribute-machine SHELL (its
+  // attr_machine points back at its own allocation) — adopt wholesale; a
+  // bare state is wrapped in a fresh machine that takes over the state's
+  // owned members. In both outcomes the base state keeps ownership of
+  // whatever came off the wire and `previous` keeps everything it owns.
+  attribute_machine_t* restored_machine;
+  if (loaded->attr_machine != NULL &&
+      loaded->attr_machine == (attribute_machine_t*)loaded) {
+    restored_machine = (attribute_machine_t*)loaded;
+    restored_machine->base_state.attr_machine = restored_machine;
+  } else {
+    restored_machine = (attribute_machine_t*)get_clear_memory(
+        sizeof(attribute_machine_t));
+    if (restored_machine == NULL) {
+      state_destroy(loaded);
+      return NULL;
+    }
+    restored_machine->base_state = *loaded;
+    restored_machine->base_state.attr_machine = restored_machine;
+    restored_machine->users = NULL;
+    restored_machine->user_count = 0;
+    restored_machine->current_time_ms = 0;
+    free(loaded);
+  }
+
+  if (previous != NULL) {
+    // The restored state carries no node key (secrets never serialize);
+    // re-apply the wrapper's identity so signing keeps working.
+    if (previous->base_state.node_key_valid) {
+      state_set_node_key(&restored_machine->base_state,
+                         previous->base_state.node_private_key,
+                         previous->base_state.node_public_key);
+    }
+    // The wrapper-owned raft module migrates to the restored machine; the
+    // attach call imports the restored state's runtime-only module snapshot
+    // (its durable raft history) into the module object first.
+    if (previous->base_state.raft_module != NULL) {
+      if (state_attach_raft_module(&restored_machine->base_state,
+                                   previous->base_state.raft_module) ==
+          CRABS_SUCCESS) {
+        state_attach_raft_module((state_t*)&previous->base_state, NULL);
+      }
+    }
+    // Re-attach the module-shared time source when the previous machine had
+    // it attached (the restore must not silently drop authenticated time).
+    if (previous->base_state.hlc_state.time_source_ops != NULL) {
+      state_set_time_source(&restored_machine->base_state,
+                            previous->base_state.hlc_state.time_source_ops);
+      _time_source_register_machine(restored_machine);
+    }
+  }
+  state_set_change_hook(&restored_machine->base_state, _node_change_hook,
+                        restored_machine);
+  return restored_machine;
+}
+
+// Foreign-snapshot merge into THIS machine: crdt_merge_state's item rules
+// (counters max-per-node/sum-across-nodes, register LWW, OR/2P-set union,
+// one-shot take-any, sovereign chain judgment). The source state is
+// deserialized fresh on every call and destroyed before returning — merge
+// leaves no C-side residue.
+EMSCRIPTEN_KEEPALIVE
+crabs_error_e crabs_wasm_merge_state(attribute_machine_t* am,
+                                     const uint8_t* data, uint32_t len) {
+  if (am == NULL || data == NULL || len < CRABS_HASH_SIZE + CRABS_SIG_SIZE) {
+    return CRABS_ERR_INVALID_PARAM;
+  }
+  state_t* source_state = crabs_deserialize_state(data, len);
+  if (source_state == NULL) return CRABS_ERR_SERIALIZATION_ERROR;
+  crabs_error_e rc = crdt_merge_state(&am->base_state, source_state);
+  state_destroy(source_state);
+  return rc;
 }
 
 // ============================================================
