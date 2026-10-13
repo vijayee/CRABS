@@ -598,5 +598,63 @@ try {
     `fresh op getWireVersion=${probe.getWireVersion()}, expected ${wireVersions.op}`);
 }
 
+// Test: createTrigger must sign with the machine's REAL admin identity, not
+// a hardcoded 'admin' string. This machine's admin is deliberately 'chair' —
+// the node key is registered under 'chair', so the install op must land with
+// signer 'chair' (the old code stamped signer_id 'admin', which has no user
+// record here and refuses with key_stale/unauthorized).
+{
+  const chairNode = new Node('chair', { ordering: 'hlc' });
+  chairNode.addCounter('reports');
+  const patientKey = KeyPair.generate();
+  chairNode.registerUser('patient', patientKey.publicKeyHex(), '');
+  chairNode.grantRole('patient', 'role', 'member', 'chair');
+  chairNode.setPolicy('__create_trigger__', 'role:admin');
+  chairNode.setPolicy('tick', 'role:admin');
+
+  const installEvents = [];
+  chairNode.on('change', (changeEvent) => {
+    if (changeEvent.kind === 'op' &&
+        changeEvent.type === '__create_trigger__') {
+      installEvents.push(changeEvent);
+    }
+  });
+
+  let installError = '';
+  try {
+    chairNode.createTrigger({
+      triggerId: 'chair_flag',
+      condition: 'reports >= 1',
+      effectType: 'issue_attribute',
+      issueAttribute: 'flagged',
+      targetRole: 'role',
+      attributeValue: 'member',
+      durationMs: 600000,  // 0 would expire the grant instantly on readback
+    });
+  } catch (installRefusal) {
+    installError = String(installRefusal.message);
+  }
+  assert(installError === '',
+    `createTrigger under admin 'chair' must not throw, got "${installError}"`);
+  assert(installEvents.length === 1 && installEvents[0].result === 0 &&
+           installEvents[0].signer === 'chair',
+    `createTrigger under admin 'chair' must land signed by 'chair', got ` +
+    JSON.stringify(installEvents));
+
+  // The trigger must actually install, not just not-throw: cross the
+  // threshold and drive a landing op; the temporary attribute fires.
+  chairNode.incrementCounter('reports', 1, 'chair');
+  const tickOp = new Operation('tick');
+  tickOp.signerId = 'chair';
+  tickOp.addResource('reports');
+  chairNode.sign(tickOp, chairNode.getNodeKey().privateKeyHex);
+  chairNode.execute(tickOp);
+  const patient = chairNode.getUser('patient');
+  assert(patient !== undefined &&
+           patient.attributes.some((attribute) =>
+             attribute.temporary && attribute.value === 'flagged:member'),
+    'trigger installed by non-\'admin\' admin must fire and grant the attribute');
+}
+
 console.log(`\n${passed} passed, ${failed} failed`);
 process.exit(failed > 0 ? 1 : 0);

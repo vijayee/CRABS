@@ -1888,8 +1888,13 @@ private:
     op->payload = (uint8_t*)malloc(strlen(payload) + 1);
     memcpy(op->payload, payload, strlen(payload) + 1);
     op->payload_size = (uint32_t)strlen(payload) + 1;
-    strncpy(op->signer_id, "admin", CRABS_MAX_USER_ID - 1);
-    strncpy(op->node_id, "admin", CRABS_MAX_USER_ID - 1);
+    // The machine's real admin identity — the id the node key is registered
+    // under (attribute_machine_create at construction), not a hardcoded
+    // literal. Signing with the node key while stamping a non-existent
+    // 'admin' signer refused with unauthorized on any machine whose admin id
+    // differs (reportEquivocation stamps the same way).
+    strncpy(op->signer_id, admin_id_.c_str(), CRABS_MAX_USER_ID - 1);
+    strncpy(op->node_id, admin_id_.c_str(), CRABS_MAX_USER_ID - 1);
 
     // Stamp BEFORE signing so the signature covers them (mirrors SignOp):
     // HLC when the machine runs HLC ordering, and the signer's current

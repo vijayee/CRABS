@@ -7,11 +7,15 @@
 
 const { Node, KeyPair, Operation } = require('../../../bindings/node');
 
-const node = new Node('admin', { ordering: 'hlc' });
+// The admin id is deliberately NOT 'admin': createTrigger signs with the
+// machine's real admin identity (the id the node key is registered under),
+// so any admin name works — this pins that property.
+const ADMIN = 'chair';
+const node = new Node(ADMIN, { ordering: 'hlc' });
 
 const aliceKey = KeyPair.generate();
 node.registerUser('alice', aliceKey.publicKeyHex(), 'adult');
-node.grantRole('alice', 'role', 'member', 'admin');
+node.grantRole('alice', 'role', 'member', ADMIN);
 
 // Threshold item + gated action, as on crabs-wasm. The counter is written
 // by the DRIVER here (no registerHandlerJs on this binding — the landed
@@ -60,7 +64,7 @@ const tickAs = (signerName, signerKey) => {
   node.sign(op, signerKey);
   node.execute(op);
 };
-tickAs('admin', node.getNodeKey().privateKeyHex);
+tickAs(ADMIN, node.getNodeKey().privateKeyHex);
 
 // Gated action: pre-threshold, the policy clause 'clearance:moderator'
 // cannot be satisfied — refuse with the typed error.
@@ -89,9 +93,9 @@ if (contactReadEvents.length !== 0) {
 // The threshold is crossed by driver writes + landing-op ticks. Two ticks
 // below threshold: nothing fires.
 node.incrementCounter('abuse_reports', 1, 'alice');
-tickAs('admin', node.getNodeKey().privateKeyHex);
+tickAs(ADMIN, node.getNodeKey().privateKeyHex);
 node.incrementCounter('abuse_reports', 1, 'alice');
-tickAs('admin', node.getNodeKey().privateKeyHex);
+tickAs(ADMIN, node.getNodeKey().privateKeyHex);
 if (node.getCounter('abuse_reports') !== 2) {
   throw new Error(`expected 2 reports, got ${node.getCounter('abuse_reports')}`);
 }
@@ -107,7 +111,7 @@ if (alicePre.attributes.some((attribute) => attribute.temporary)) {
 // attribute is issued to every holder of an attribute NAMED 'role' and
 // alice's keyVersion bumps with the grant.
 node.incrementCounter('abuse_reports', 1, 'alice');
-tickAs('admin', node.getNodeKey().privateKeyHex);
+tickAs(ADMIN, node.getNodeKey().privateKeyHex);
 if (node.getCounter('abuse_reports') !== 3) {
   throw new Error(`expected 3 reports, got ${node.getCounter('abuse_reports')}`);
 }
@@ -141,7 +145,7 @@ if (contactReadEvents.length !== 1) {
 
 // Cooldown: another tick with the condition still true must NOT re-fire
 // while the 60s cooldown is in force.
-tickAs('admin', node.getNodeKey().privateKeyHex);
+tickAs(ADMIN, node.getNodeKey().privateKeyHex);
 if (triggerEvents.length !== 1) {
   throw new Error(`cooldown must suppress the immediate re-fire, got ${triggerEvents.length} events`);
 }

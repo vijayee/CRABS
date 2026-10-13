@@ -208,7 +208,7 @@ symbols:
   grantRole                bindings/node/index.d.ts:183
   getUser                  bindings/node/index.d.ts:189
   UserInfo.keyVersion      bindings/node/index.d.ts:53
-  (temp attr read, direct token + expiresAt) bindings/node/src/crabs_node.cc:1166-1171
+  (temp attr read, direct token + expiresAt) bindings/node/src/crabs_node.cc:1208-1211
   addCounter               bindings/node/index.d.ts:193
   incrementCounter         bindings/node/index.d.ts:238
   getCounter               bindings/node/index.d.ts:224
@@ -221,9 +221,9 @@ symbols:
   Node.execute             bindings/node/index.d.ts:251
   Node.on                  bindings/node/index.d.ts:188
   Node.encrypt             bindings/node/index.d.ts:257
-  (createTrigger signs as literal 'admin' with the node key)
-                           bindings/node/src/crabs_node.cc:1846-1862
-  (event result field)     bindings/node/src/crabs_node.cc:962
+  (createTrigger stamps the machine's real admin id and signs with the node key)
+                           bindings/node/src/crabs_node.cc:1891-1925
+  (event result field)     bindings/node/src/crabs_node.cc:988
   (trigger fire on execute) src/StateMachine/state_machine.c:1508-1520
   (wildcard non-RESOURCE resources apply nothing, op still lands)
                            src/StateMachine/state_machine.c:1414-1428
@@ -295,10 +295,12 @@ test_ref: test/test_trigger.cpp:125-170,378-452 (process/cooldown/one-shot) + te
   UI code, not on the string.
 - Installing a trigger is itself an authorized op: both snippets set
   `setPolicy('__create_trigger__', 'role:admin')` (the demo wiring). On
-  crabs-node, `createTrigger` additionally signs as a user literally named
-  `'admin'` with the node key (`crabs_node.cc:1846-1862`) — name your
-  machine's admin `'admin'` or register an `'admin'` user with the node
-  key, or the op refuses with `unauthorized`.
+  crabs-node, `createTrigger` signs with the node key, but it stamps the
+  machine's REAL admin identity — the id the node key is registered under at
+  construction (`crabs_node.cc:1891-1897`), so any admin id works; the
+  snippet pins that by running with the deliberately non-default admin id
+  `'chair'`. (Older bindings stamped a literal `'admin'` signer and refused
+  with `unauthorized` on machines whose admin id differed.)
 - The ABE policy in `encrypt` is not the condition-expression grammar: it
   is the OpenABE CP-ABE grammar (lowercase `and`/`or` with parentheses,
   plain words), pinned by `test/test_crypto.cpp:249-301`. CRABS attribute
@@ -306,7 +308,7 @@ test_ref: test/test_trigger.cpp:125-170,378-452 (process/cooldown/one-shot) + te
   derived from them (`src/Crypto/crypto.c:95-115`) — keep the policy words
   consistent with what will be in the reader's key.
 - A refused op still STREAMS as an op-kind change event (with a nonzero
-  `result`, `crabs_node.cc:962`) — "the gate opened" is read as
+  `result`, `crabs_node.cc:988`) — "the gate opened" is read as
   `result === 0`, which the node snippet filters explicitly.
 - The C snippet runs `trigger_process_all` explicitly because C callers
   *own* the tick loop; the bindings run it for you (post-execute), which
