@@ -180,7 +180,8 @@ UI shows row-level movement.
 
 - Tree-shaped reordering — when the list's elements have ancestry: the
   same OT machinery ships an `OT_TREE` type with
-  `insert_node / delete_node / reparent / reorder` ops — C-only: no
+  `insert_node / delete_node / reparent / reorder` ops
+  (src/OT/ot_types.h:36-39) — C-only: no
   binding creates or applies tree items (Recipe 8b's document type
   likewise).
 - Bigger lists — when the op log's growth becomes the problem: the log
@@ -209,10 +210,10 @@ UI shows row-level movement.
 element identity: every element keyed by op id (node_id, sequence, timestamp) + anchor_id/placement_id placement metadata — crabs_ordered_element_t src/OT/ot_ordered_set.h:33-43.
 coordinate spaces: internal(tombstones)/visible bridged by BST position map — crabs_xi/crabs_xi_inv src/OT/position_map.h:49-52 (+ union_one/xi_one :55-58); deletes mark internal positions (crabs_union_one/crabs_xi_one) and maps merge via crabs_bst_merge copying src deleted entries — position_map.h:64-65.
 vocabulary: CRABS_OT_OP_INSERT/DELETE/UPDATE/MOVE/SWAP src/OT/ot_types.h:22-28 — an OR-set cannot express move (docs/CRABS Extended.md §4.1, :197-201).
-transform: one function per op-type pair — 15x15 matrix on the item (src/OT/ot_types.h:93-102, init crabs_transform_matrix_init src/OT/ot_transform.c:317); insert-insert tie-break: design's priority formula (docs/CRABS Extended.md §4.3, :219 + §4.4, :244) is NOT the implemented rule — the bankable tie-break is the op-id byte compare (node id bytes, then sequence), src/OT/ot_ordered_set.c:20-28.
+transform: one function per op-type pair — 15x15 matrix on the item (src/OT/ot_types.h:93-102, init crabs_transform_matrix_init src/OT/ot_transform.c:317); insert-insert tie-break: skip rule src/OT/ot_transform.c:32-63 (replays carry deps; pinned by both binding ordered-set tests); design's priority formula (docs/CRABS Extended.md §4.3, :219 + §4.4, :244) is NOT the implemented rule — the bankable tie-break is the op-id byte compare (node id bytes, then sequence), src/OT/ot_ordered_set.c:20-28.
 type surface: create/destroy/count/visible/get/find/head/tail + five apply_* + merge + merge_position_maps — src/OT/ot_ordered_set.h:69-117.
 merge semantics: copies src-only elements, larger placement_id per element (op-id tie-break), deletions win, re-materialized order from placement metadata — src/OT/ot_ordered_set.c:514+ (_materialize :293-350 rebuilds from anchor chain + placement priority; the snippet's merged replica re-derives its order, not arrival order).
-whole-order re-stamp: apply_move re-stamps every element's placement (src/OT/ot_ordered_set.c:432-443) — one deterministic winner per merged pair, not row-interleaved moves.
+whole-order re-stamp: apply_move re-stamps every element's placement (src/OT/ot_ordered_set.c:432-478) — one deterministic winner per merged pair, not row-interleaved moves.
 merge preflight: _merge_preflight (src/OT/ot_ordered_set.c:197-257) refuses same-op-id/different-payload or invalid-merged-anchor replicas — merge returns NULL, destination untouched (a failed merge is an error, not a silent overwrite).
 status (why PARTIAL with languages: c wasm node): the op layer is JS-bound on BOTH bindings and the snippets execute; the merge layer — crabs_ot_ordered_set_merge + merge_position_maps, with the conflicting-payload refusal and merged-position-map guarantees — has no JS map entry (api-map §17 R8), so those properties are demonstrated in C: test/test_ot_ordered_set.cpp:347-375 (merge commutative for concurrent singletons) · :377-393 (conflicting payload refuses) · :395-420 (deletion wins).
 paper vs code: the shape is the paper's (docs/CRABS Extended.md §4, :195-279); two layers JS-bound — the op layer (items + apply through the executor, both bindings) and the C-only merge layer. The convergence a JS replica observes is transform-based, driven by the deps the issuer declares — say that before building on it.

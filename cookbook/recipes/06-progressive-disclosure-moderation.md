@@ -212,10 +212,10 @@ seal is opened by a key minted for that same attribute set.
 <!-- PROVENANCE
 trigger pass: machine-evaluated after every executed op — Step 9, src/StateMachine/state_machine.c:1907-1919; wasm evaluateTriggers signs+executes an admin no-op to run the pass (bindings/wasm/index.d.ts:738).
 resolve path: FULL item path → logical value; missing path resolves 0, no sibling aliasing — condition_resolve_path src/Condition/condition.c:916-943.
-creation-time parse refusal: unparseable condition is rejected instead of stored as a silently-dead NULL AST — src/Trigger/trigger.c:432-437 (the audit H fix).
+creation-time parse refusal: unparseable condition is rejected instead of stored as a silently-dead NULL AST — src/Trigger/trigger.c:432-437.
 skip discipline: cooldown :219-221 (clock-regression guard) · expired :224-226 · one-shot :228 (also :269) — src/Trigger/trigger.c.
 fan-out: issue audience matches attribute NAME only (_attribute_matches_name src/Attribute/attribute_machine.c:198-204; role match at :932-943); issue_temporary prepends a temp token with expiry + fans out to every ACTIVE name-holder — attribute_machine_issue_temporary src/Attribute/attribute_machine.c:954-1027.
-privileged refusal: _is_privileged_attr_name gate refuses a trigger-issued 'role:…' — src/Attribute/attribute_machine.c:981-983 (audit N-1).
+privileged refusal: _is_privileged_attr_name gate refuses a trigger-issued 'role:…' — src/Attribute/attribute_machine.c:981-983 (the privileged-name gate).
 temp token in policy: expired temp attributes are dropped fail-closed (expires_at <= now, or clock==0) before the token is offered to the policy evaluator — src/Crypto/crypto.c:1128-1177 (_build_attr_string; R8-A-8 comment at :1170-1174).
 token shape: the temp attr readback is the PLAIN name:value token — wasm bindings/wasm/bindings-core.js:895-926 (value: tempName, verifiedBy 'trigger', temporary true, expiresAt) · node bindings/node/src/crabs_node.cc:1592-1601 · matched in C at crypto.c:1128-1177.
 machine-held master key (trust note): abe_mk lives in the machine (wired src/Attribute/attribute_machine.c:309); abeKeygen consults no user record — crypto_abe_keygen src/Crypto/crypto.c:809-857 — so "a moderator decrypts" holds only because a policy-satisfying key was minted for it; policy-missing keys refuse typed unauthorized; the C battery pins it end to end.
