@@ -125,7 +125,7 @@ export interface DefineItemOptions {
   domain?: 'free' | 'sovereign' | 'group';
   /** Required for 'sovereign': the item's single-writer user id. */
   writer?: string;
-  /** 'group' only; v1 ships no ordering modules, so only 0 is legal. */
+  /** 'group' only; must match the moduleId of the attached raft module. */
   orderingModule?: number;
 }
 
@@ -306,6 +306,57 @@ export interface Node {
    * typed errors (resource_not_found / unauthorized / cryptographic_error).
    */
   lineageTombstone(childId: string): Buffer;
+
+  // ============================================================
+  // Raft ordering module (GROUP_ORDERED writes)
+  // ============================================================
+  /** The bootstrap admin id — the machine's HLC identity and default raft node id. */
+  readonly adminId: string;
+  /**
+   * Attach a raft ordering module to this machine's state. The reference
+   * host loop (createRaftHost in index.js) wraps these surfaces with the
+   * setTimeout tick loop and the user-replaceable transport/storage seams.
+   * Before any attach, group-item writes fail closed (ordering_path).
+   */
+  attachRaft(options: { nodeId?: string; peers: string[];
+                        electionMinMs?: number; electionMaxMs?: number;
+                        heartbeatMs?: number; seed?: number }): this;
+  /** Manual tick at an explicit time (Date.now() when omitted). Returns the crabs_error_e. */
+  raftTick(nowMs?: number): number;
+  /** Inject one inbound raft control blob from peerId. Returns the crabs_error_e. */
+  raftDeliver(peerId: string, blob: Buffer): number;
+  /** Acknowledge a persist window from raftPollPersistRequest. Returns the crabs_error_e. */
+  raftPersistComplete(handle: bigint | number, ok: boolean): number;
+  /**
+   * Materialize committed ops through the machine's pipeline (fires
+   * 'change' events, shelves ordered retries). Returns the crabs_error_e.
+   */
+  raftPump(nowMs?: number): number;
+  /**
+   * Drain outbound control blobs ({kind, to, blob}) — TRANSFERS each blob;
+   * drain until empty.
+   */
+  raftPollOutbound(): Array<{ kind: number; to: string; blob: Buffer }>;
+  /**
+   * Report the outstanding persist window ({handle: bigint, blob}) — a
+   * VIEW: the handle stays module-open until raftPersistComplete; the same
+   * handle is re-reported while unresolved. Undefined when drained.
+   */
+  raftPollPersistRequest(): { handle: bigint; blob: Buffer } | undefined;
+  /**
+   * Raw committed-op / leadership notifications ({kind, peerId, proposalId,
+   * commitIndex, opBytes?}). With the reference host's pumpNotifications:
+   * false mode, hosts drain this queue themselves.
+   */
+  raftPollNotifications(): Array<{ kind: number; peerId: string;
+                                   proposalId: number; commitIndex: number;
+                                   opBytes?: Buffer }>;
+  /** Point diagnostics of the attached module (null when detached). */
+  raftStatus(): { nodeId: string; isLeader: boolean; term: number;
+                  commitTip: number; logLength: number;
+                  configChangePending: boolean; peerCount: number } | null;
+  /** Detach and destroy the attached module (the destructor does this too). */
+  raftDetach(): void;
 }
 
 export interface NodeStatic {
@@ -355,4 +406,43 @@ export const wireVersions: {
   readonly state: number;
   readonly op: number;
   readonly signing: number;
+};
+/**
+ * Raft reference host — wraps a Node's attached raft module with the
+ * setTimeout tick loop and the user-replaceable transport/storage seams
+ * (mirroring bindings/wasm's RaftHost). Transport: drained control blobs go
+ * anywhere; incoming blobs return through node.raftDeliver. Storage:
+ * persist windows stored anywhere durable; a resolved promise acks the
+ * window (persist_complete true), a rejected one marks it failed. With
+ * pumpNotifications: false (raw-host mode) the committed-op queue is left
+ * for the host to drain via raftPollNotifications — use it when no
+ * materialization handlers are registered, otherwise every committed op
+ * fails the pipeline and piles onto the retry shelf.
+ */
+export function createRaftHost(node: Node, options?: {
+  nodeId?: string;
+  peers?: string[];
+  tickMs?: number;
+  timers?: { electionMinMs?: number; electionMaxMs?: number; heartbeatMs?: number };
+  seed?: number;
+  pumpNotifications?: boolean;
+}): {
+  readonly nodeId: string;
+  readonly peers: string[];
+  setRaftTransport(fn?: (peerId: string, blob: Buffer) => void | Promise<void>): void;
+  setRaftStorage(fn?: (handle: bigint, blob: Buffer) => void | Promise<void>): void;
+  startRaftHost(): void;
+  stopRaftHost(): void;
+  raftTick(nowMs?: number): void;
+  pumpInbound(peerId: string, blob: Buffer): void;
+  raftPollOutbound(): Array<{ kind: number; to: string; blob: Buffer }>;
+  raftPollPersistRequest(): { handle: bigint; blob: Buffer } | undefined;
+  raftPersistComplete(handle: bigint | number, ok: boolean): void;
+  raftPollNotifications(): Array<{ kind: number; peerId: string;
+                                   proposalId: number; commitIndex: number;
+                                   opBytes?: Buffer }>;
+  raftPump(nowMs?: number): void;
+  status(): { nodeId: string; isLeader: boolean; term: number; commitTip: number;
+              logLength: number; configChangePending: boolean; peerCount: number };
+  destroy(): void;
 };

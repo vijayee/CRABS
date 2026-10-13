@@ -28,6 +28,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <cmath>
+#include <chrono>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -44,6 +45,7 @@ extern "C" {
 #include "CRDT/one_shot.h"
 #include "Lineage/lineage.h"
 #include "TimeSource/time_source.h"
+#include "Raft/raft_module.h"
 #include "Util/platform.h"
 }
 
@@ -842,6 +844,21 @@ public:
       // Authenticated time source (A10-L9 wiring)
       InstanceMethod("setTimeSource", &Node::SetTimeSource),
       InstanceMethod("getTimeSource", &Node::GetTimeSource),
+      // Raft ordering module (reference host surfaces live in index.js)
+      InstanceMethod("attachRaft", &Node::AttachRaft),
+      InstanceMethod("raftTick", &Node::RaftTick),
+      InstanceMethod("raftDeliver", &Node::RaftDeliver),
+      InstanceMethod("raftPersistComplete", &Node::RaftPersistComplete),
+      InstanceMethod("raftPump", &Node::RaftPump),
+      InstanceMethod("raftPollOutbound", &Node::RaftPollOutbound),
+      InstanceMethod("raftPollPersistRequest", &Node::RaftPollPersistRequest),
+      InstanceMethod("raftPollNotifications", &Node::RaftPollNotifications),
+      InstanceMethod("raftStatus", &Node::RaftStatus),
+      InstanceMethod("raftDetach", &Node::RaftDetach),
+      // The bootstrap admin id — the node's HLC identity and default raft
+      // node id (property for parity with the wasm wrapper's readonly
+      // adminId).
+      InstanceAccessor("adminId", &Node::GetAdminId, nullptr),
     });
     auto* inst = env.GetInstanceData<NodeAddonInstanceData>();
     inst->node_ctor = Napi::Persistent(func);
@@ -916,6 +933,14 @@ public:
 
   ~Node() {
     for (auto& listener : change_listeners_) listener.Reset();
+    // Raft module cleanup FIRST: the module outlived through raw pointers
+    // into the machine's state — detach before the state dies. The state
+    // never owns the module object (see state_attach_raft_module).
+    if (raft_module_ != nullptr) {
+      state_attach_raft_module(&am_->base_state, NULL);
+      crabs_raft_module_destroy(raft_module_);
+      raft_module_ = nullptr;
+    }
     // Time-source cleanup FIRST: the machine's state_t references the ops
     // object through a raw, non-owning pointer (state_set_time_source), so
     // the ops must outlive neither the state nor the pointer stored in it.
@@ -1018,6 +1043,20 @@ private:
   uint64_t time_source_resync_ms_ = CRABS_TIME_SOURCE_DEFAULT_RESYNC_MS;
   uint64_t time_source_timeout_ms_ = CRABS_TIME_SOURCE_DEFAULT_TIMEOUT_MS;
   uint64_t time_source_max_skew_ms_ = CRABS_TIME_SOURCE_DEFAULT_MAX_SKEW_MS;
+
+  // Raft ordering module (GROUP_ORDERED writes). The wrapper owns the
+  // module object (crabs_raft_module_create); the machine's state only
+  // references it non-owning through state_attach_raft_module. nullptr =
+  // detached (group writes fail closed at the pipeline gate).
+  crabs_raft_module_t* raft_module_ = nullptr;
+
+  // Throws for surfaces that need an attached module.
+  void ensure_raft_attached(Napi::Env env, const char* method) {
+    if (raft_module_ == nullptr) {
+      throw Napi::Error::New(env, std::string(method) +
+          ": no raft module attached (call attachRaft first)");
+    }
+  }
 
   // Shared construction path for wrapping a borrowed child machine. The
   // adoption packet is freed by the External's finalizer (GC time), so the
@@ -1772,7 +1811,12 @@ private:
     // after signing invalidates the signature. Use node.sign(op, key) to stamp
     // HLC and sign in one step before calling execute.
     crabs_error_e rc = state_machine_execute(&am_->base_state, op->raw());
-    if (rc != CRABS_SUCCESS) throw crabs_error(env, rc, "execute");
+    // Raft two-phase path: a GROUP_ORDERED write under an attached module
+    // returns ordering_pending — the op was ACCEPTED into the module's log
+    // as a pending proposal and materializes on commit (pumped by the raft
+    // host). Mirrors the wasm binding's execute() handling.
+    if (rc != CRABS_SUCCESS && rc != CRABS_ERR_ORDERING_PENDING)
+      throw crabs_error(env, rc, "execute");
     return env.Undefined();
   }
 
@@ -1951,6 +1995,219 @@ private:
   Napi::Value PruneExpiredTempAttrs(const Napi::CallbackInfo& info) {
     attribute_machine_prune_expired_temporary(am_);
     return info.Env().Undefined();
+  }
+
+  // --- Raft ordering module (GROUP_ORDERED writes) ---
+  //
+  // The reference host loop (timer, transport, storage seams) lives in the
+  // JS wrapper (index.js RaftNodeHost); the native surface stays at the
+  // module's own reactor boundary: attach/tick/deliver/drains + pump.
+  // Mirrors the wasm binding 1:1 — same query shapes, same disposal
+  // conventions (poll_outbound transfers; poll_persist reports a view).
+
+  Napi::Value AttachRaft(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (raft_module_ != nullptr)
+      throw Napi::Error::New(env, "attachRaft: a raft module is already attached");
+    if (info.Length() < 1 || !info[0].IsObject())
+      throw Napi::TypeError::New(env, "attachRaft: expected {nodeId?, peers, "
+                                      "electionMinMs?, electionMaxMs?, heartbeatMs?, seed?}");
+    Napi::Object opts = info[0].As<Napi::Object>();
+
+    std::string node_id = opts.Has("nodeId") && opts.Get("nodeId").IsString()
+        ? opts.Get("nodeId").As<Napi::String>().Utf8Value()
+        : admin_id_;
+    if (!opts.Has("peers") || !opts.Get("peers").IsArray())
+      throw Napi::TypeError::New(env, "attachRaft: peers must be an id array");
+    Napi::Array peers = opts.Get("peers").As<Napi::Array>();
+    uint32_t peer_count = peers.Length();
+    if (peer_count == 0 || peer_count > CRABS_RAFT_MAX_PEERS)
+      throw Napi::RangeError::New(env, "attachRaft: peers must have 1..16 ids");
+
+    std::vector<std::string> peer_ids;
+    std::vector<const char*> peer_id_ptrs;
+    for (uint32_t index = 0; index < peer_count; index++) {
+      peer_ids.push_back(require_js_string(peers.Get(index),
+                                           "attachRaft.peers", "peer id"));
+      peer_id_ptrs.push_back(peer_ids.back().c_str());
+    }
+
+    crabs_raft_config_t config;
+    crabs_raft_config_defaults(&config);
+    strncpy(config.node_id, node_id.c_str(), CRABS_MAX_USER_ID - 1);
+    config.node_id[CRABS_MAX_USER_ID - 1] = '\0';
+    config.peer_count = peer_count;
+    for (uint32_t index = 0; index < peer_count; index++) {
+      strncpy(config.peer_ids[index], peer_ids[index].c_str(),
+              CRABS_MAX_USER_ID - 1);
+      config.peer_ids[index][CRABS_MAX_USER_ID - 1] = '\0';
+    }
+    auto read_u64 = [&](const char* key, uint64_t fallback) -> uint64_t {
+      if (!opts.Has(key) || !opts.Get(key).IsNumber()) return fallback;
+      double value = opts.Get(key).As<Napi::Number>().DoubleValue();
+      return value > 0 ? (uint64_t)value : fallback;
+    };
+    config.election_timeout_min_ms = read_u64("electionMinMs",
+                                              config.election_timeout_min_ms);
+    config.election_timeout_max_ms = read_u64("electionMaxMs",
+                                              config.election_timeout_max_ms);
+    config.heartbeat_interval_ms = read_u64("heartbeatMs",
+                                            config.heartbeat_interval_ms);
+    if (opts.Has("seed") && opts.Get("seed").IsNumber())
+      config.seed = (uint64_t)opts.Get("seed").As<Napi::Number>().DoubleValue();
+
+    crabs_raft_module_t* module = crabs_raft_module_create(&config);
+    if (!module) throw Napi::Error::New(env, "attachRaft: module create failed");
+    crabs_error_e rc = state_attach_raft_module(&am_->base_state, module);
+    if (rc != CRABS_SUCCESS) {
+      crabs_raft_module_destroy(module);
+      throw crabs_error(env, rc, "attachRaft");
+    }
+    raft_module_ = module;
+    return info.This();
+  }
+
+  Napi::Value RaftTick(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    ensure_raft_attached(env, "raftTick");
+    uint64_t now_ms = info.Length() > 0 && info[0].IsNumber()
+        ? (uint64_t)info[0].As<Napi::Number>().DoubleValue()
+        : (uint64_t)(std::chrono::duration_cast<std::chrono::milliseconds>(
+              std::chrono::system_clock::now().time_since_epoch()).count());
+    auto rc = crabs_raft_module_tick(raft_module_, now_ms);
+    return Napi::Number::New(env, (double)rc);
+  }
+
+  Napi::Value RaftDeliver(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    ensure_raft_attached(env, "raftDeliver");
+    std::string peer_id = require_js_string(info[0], "raftDeliver", "peerId");
+    if (info.Length() < 2 || !info[1].IsBuffer())
+      throw Napi::TypeError::New(env, "raftDeliver: blob must be a Buffer");
+    auto blob = info[1].As<Napi::Buffer<uint8_t>>();
+    uint64_t now_ms = (uint64_t)(std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count());
+    crabs_error_e rc = crabs_raft_module_inbound(
+        raft_module_, peer_id.c_str(), blob.Data(), blob.Length(), now_ms);
+    return Napi::Number::New(env, (double)rc);
+  }
+
+  Napi::Value RaftPersistComplete(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    ensure_raft_attached(env, "raftPersistComplete");
+    if (info.Length() < 2 || !info[1].IsBoolean())
+      throw Napi::TypeError::New(env, "raftPersistComplete: (handle, ok:boolean)");
+    bool raft_handle_lossless = false;
+    uint64_t handle = info[0].IsBigInt()
+        ? info[0].As<Napi::BigInt>().Uint64Value(&raft_handle_lossless)
+        : (uint64_t)info[0].As<Napi::Number>().DoubleValue();
+    crabs_error_e rc = crabs_raft_module_persist_complete(
+        raft_module_, handle, info[1].As<Napi::Boolean>().Value());
+    return Napi::Number::New(env, (double)rc);
+  }
+
+  Napi::Value RaftPump(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    uint64_t now_ms = info.Length() > 0 && info[0].IsNumber()
+        ? (uint64_t)info[0].As<Napi::Number>().DoubleValue()
+        : (uint64_t)(std::chrono::duration_cast<std::chrono::milliseconds>(
+              std::chrono::system_clock::now().time_since_epoch()).count());
+    auto rc = state_raft_process_notifications_at(&am_->base_state, now_ms);
+    return Napi::Number::New(env, (double)rc);
+  }
+
+  Napi::Value RaftPollOutbound(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    ensure_raft_attached(env, "raftPollOutbound");
+    Napi::Array out = Napi::Array::New(env);
+    uint32_t index = 0;
+    crabs_raft_outbound_message_t message;
+    while (crabs_raft_module_poll_outbound(raft_module_, &message)) {
+      // Ownership-transfer queue: the module hands the blob over, so copy
+      // into a JS Buffer and release the transferred C bytes.
+      Napi::Object entry = Napi::Object::New(env);
+      entry.Set("kind", Napi::Number::New(env, (double)message.kind));
+      entry.Set("to", Napi::String::New(env, message.to_peer));
+      entry.Set("blob", Napi::Buffer<uint8_t>::Copy(env, message.bytes,
+                                                    message.len));
+      free(const_cast<uint8_t*>(message.bytes));
+      out.Set(index++, entry);
+    }
+    return out;
+  }
+
+  Napi::Value RaftPollPersistRequest(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    ensure_raft_attached(env, "raftPollPersistRequest");
+    crabs_raft_persist_request_t request;
+    if (!crabs_raft_module_poll_persist(raft_module_, &request))
+      return env.Undefined();
+    // Report-only view: bytes copied into a JS Buffer; the window stays
+    // module-open until raftPersistComplete(handle, ok).
+    Napi::Object entry = Napi::Object::New(env);
+    entry.Set("handle",
+        Napi::BigInt::New(env, (int64_t)request.handle));
+    entry.Set("blob", Napi::Buffer<uint8_t>::Copy(env, request.bytes, request.len));
+    return entry;
+  }
+
+  Napi::Value RaftPollNotifications(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    ensure_raft_attached(env, "raftPollNotifications");
+    Napi::Array out = Napi::Array::New(env);
+    uint32_t index = 0;
+    crabs_raft_notification_t notification;
+    while (crabs_raft_module_poll_notification(raft_module_, &notification)) {
+      Napi::Object entry = Napi::Object::New(env);
+      entry.Set("kind", Napi::Number::New(env, (double)notification.kind));
+      entry.Set("peerId", Napi::String::New(env, notification.peer_id));
+      entry.Set("proposalId",
+                Napi::Number::New(env, (double)notification.proposal_id));
+      entry.Set("commitIndex",
+                Napi::Number::New(env, (double)notification.commit_index));
+      if (notification.op_len > 0 && notification.op_bytes != NULL) {
+        entry.Set("opBytes",
+                  Napi::Buffer<uint8_t>::Copy(env, notification.op_bytes,
+                                              notification.op_len));
+      } else {
+        entry.Set("opBytes", env.Undefined());
+      }
+      out.Set(index++, entry);
+    }
+    return out;
+  }
+
+  Napi::Value RaftStatus(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (raft_module_ == nullptr) return env.Null();
+    Napi::Object entry = Napi::Object::New(env);
+    entry.Set("nodeId", Napi::String::New(env, admin_id_));
+    entry.Set("isLeader", crabs_raft_module_is_leader(raft_module_));
+    entry.Set("term", Napi::Number::New(env,
+        (double)crabs_raft_module_current_term(raft_module_)));
+    entry.Set("commitTip", Napi::Number::New(env,
+        (double)crabs_raft_module_committed_tip(raft_module_)));
+    entry.Set("logLength", Napi::Number::New(env,
+        (double)crabs_raft_module_log_length(raft_module_)));
+    entry.Set("configChangePending",
+              crabs_raft_module_config_change_pending(raft_module_));
+    char member_ids[CRABS_RAFT_MAX_PEERS][CRABS_MAX_USER_ID];
+    entry.Set("peerCount", crabs_raft_module_committed_members(raft_module_,
+                                                              member_ids));
+    return entry;
+  }
+
+  Napi::Value RaftDetach(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (raft_module_ == nullptr) return info.Env().Undefined();
+    state_attach_raft_module(&am_->base_state, NULL);
+    crabs_raft_module_destroy(raft_module_);
+    raft_module_ = nullptr;
+    return info.Env().Undefined();
+  }
+
+  Napi::Value GetAdminId(const Napi::CallbackInfo& info) {
+    return Napi::String::New(info.Env(), admin_id_);
   }
 
   // --- Authenticated time source (A10-L9 wiring, R7-01) ---
