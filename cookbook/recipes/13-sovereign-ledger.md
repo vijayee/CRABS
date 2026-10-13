@@ -140,7 +140,7 @@ different-digest claim (`fork_detected`), each verified to move no chain.
 
 ## What it guarantees / what it doesn't
 
-Guaranteed (everything below is executed by the snippets):
+Guaranteed:
 
 - *No one's override reaches another member's ledger.* Bob's and the
   admin's signed entry attempts on alice's ledger refuse

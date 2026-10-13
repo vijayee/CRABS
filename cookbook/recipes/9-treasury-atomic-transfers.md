@@ -162,7 +162,7 @@ two named resources.
 
 ## What it guarantees / what it doesn't
 
-Guaranteed, by the executor (all of it exercised by the snippets above):
+Guaranteed:
 
 - *Refused, not applied.* Preconditions run across every named resource
   before the handler; one poisoned name voids the whole op with no partial

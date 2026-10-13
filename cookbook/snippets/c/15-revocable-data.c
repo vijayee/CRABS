@@ -76,7 +76,7 @@ int main(void) {
    * key_version bumps at every mutation — 1 at register
    * (attribute_machine.c:495), 2 at grant (:617). This is exactly what
    * UserInfo.keyVersion reads on BOTH bindings (node maps it at
-   * bindings/node/src/crabs_node.cc:1147; the wasm readback is the real
+   * bindings/node/src/crabs_node.cc:1575; the wasm readback is the real
    * machine-mapped readback pinned by bindings/wasm/test/getuser-readback.js). */
   ecdsa_keypair_t* reader_id_key = crypto_ecdsa_generate();
   assert(reader_id_key != NULL);

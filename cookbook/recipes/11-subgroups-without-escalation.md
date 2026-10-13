@@ -152,7 +152,7 @@ the signed op pipeline, manifest + attest honesty checks.
 
 ## What it guarantees / what it doesn't
 
-Guaranteed (everything below is executed by the snippets):
+Guaranteed:
 
 - *The subgroup's starting authority is the charter, verified.* Spawn
   accepts only blueprints that pass full structural validation and applies

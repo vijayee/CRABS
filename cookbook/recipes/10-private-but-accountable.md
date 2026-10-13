@@ -145,7 +145,7 @@ those snippets run — and nothing missing that a gap would need to document.
 
 ## What it guarantees / what it doesn't
 
-Guaranteed (everything below is executed by the snippets):
+Guaranteed:
 
 - *No one writes the leader's item but the leader.* Writer identity is
   checked at the item, over and above the policy — an op-authorized

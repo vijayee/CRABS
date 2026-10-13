@@ -115,8 +115,8 @@ each of which leaves a different provable residue for outsiders.
 - *The time configuration*: A stamps the window from ITS time source (`setTime`
   before `attest` — a machine never reads the wall clock itself); B checks
   the window with B's own. Both machines running the authenticated HTTPS
-  time source is the configuration the windows are meaningful under (Recipe
-  covers the source; with the default system clock the TTL is advice).
+  time source is the configuration the windows are meaningful under. With
+  the default system clock the TTL is advice.
 
 ## Try it
 
@@ -157,7 +157,7 @@ tampered body, unbound machine.
 
 ## What it guarantees / what it doesn't
 
-Guaranteed (everything below is executed by the snippets):
+Guaranteed:
 
 - *Vouches are A's signature over a bounded claim.* The canonical body —
   parent/child/user ids, attribute list, window, and the parent key-version
