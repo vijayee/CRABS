@@ -149,9 +149,9 @@ writeFileSync(join(dist, 'index.html'), readFileSync(join(cookbook, 'site', 'ind
 
 writeFileSync(join(dist, 'cookbook', 'index.html'), pageShell({
   title: 'The CRABS Cookbook',
-  mainHtml: `<h1>The CRABS Cookbook</h1><p>Fifteen recipes with runnable code, plus one honest gap page. STATUS and
-  maturity badges are honest: PARTIAL means gaps are documented on the page.
-  UNSUPPORTED means the codebase cannot deliver it yet.</p>${learningPath.join('\n')}
+  mainHtml: `<h1>The CRABS Cookbook</h1><p>Fifteen recipes, every one executed by the CI battery. STATUS and
+  maturity badges are honest: PARTIAL means a residual boundary is
+  documented on the page.</p>${learningPath.join('\n')}
   <h2>Recipe index</h2>${indexTable.join('\n')}
   <div class="callout"><img src="/assets/Unlockster.png"><p>Trust caveat: recipes
   only claim what the code proves today. DESIGNED symbols never appear in

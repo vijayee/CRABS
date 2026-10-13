@@ -27,9 +27,9 @@ This is the convergence problem for *order*, and it is strictly harder
 than the counter in Recipe 1: a counter only has to agree on a number, a
 list has to agree on a *sequence* while positions renumber under
 everyone's fingers. It is also — deliberately — NOT a collaborative text
-editor: the page you want for shared rich text is Recipe 8b, a separate
-and much more honest page. The ordered list here is the project's blessed
-OT application.
+editor: ordered discrete elements are the bounded case; shared rich text
+(document-style positions, carets, styling) is a different and unmeasured
+problem. The ordered list here is the project's blessed OT application.
 
 ## The naive version, and where it breaks
 
@@ -173,8 +173,8 @@ UI shows row-level movement.
   replica cannot absorb a peer's serialized state until a binding ships
   the merge.
 - Rich-text/word-processing is a different and harder problem (cursor
-  stability, IME composition, styled spans) with its own unbenchmarked
-  status: that is Recipe 8b's page, not this one.
+  stability, IME composition, styled spans) — out of the cookbook's
+  scope: the ordered set here covers discrete elements only.
 
 ## Variations
 
@@ -182,8 +182,8 @@ UI shows row-level movement.
   same OT machinery ships an `OT_TREE` type with
   `insert_node / delete_node / reparent / reorder` ops
   (src/OT/ot_types.h:36-39) — C-only: no
-  binding creates or applies tree items (Recipe 8b's document type
-  likewise).
+  binding creates or applies tree items (the document type is the same
+  story).
 - Bigger lists — when the op log's growth becomes the problem: the log
   behind a set is bounded and prunable, and log pruning + compaction is
   the design's stated mitigation for OT merge cost.
