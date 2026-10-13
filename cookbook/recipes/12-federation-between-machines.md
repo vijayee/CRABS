@@ -204,7 +204,7 @@ symbols:
   Node.lineageResidentChild bindings/wasm/index.d.ts:714
   childById                 bindings/wasm/index.d.ts:721
   Node.attest               bindings/wasm/index.d.ts:725
-  Operation.addAttestation  bindings/wasm/index.d.ts:102 (AttestationFields :9-25)
+  Operation.addAttestation  bindings/wasm/index.d.ts:99 (AttestationFields :9-24)
   Operation.create          bindings/wasm/index.d.ts:111
   (wasm export)             crabs_wasm_op_add_attestation src/Util/wasm_helpers.c:810-865
   (executor consume)        src/StateMachine/state_machine.c:709-762

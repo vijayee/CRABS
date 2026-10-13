@@ -108,6 +108,9 @@ function hexEncode(bytes, len) {
     .map(b => b.toString(16).padStart(2, '0')).join('');
 }
 
+// NOTE: this helper trusts its input — a malformed hex string coerces to 0
+// via parseInt rather than failing. Every caller must pre-validate the hex
+// shape (the addAttestation/addLockClaim wrappers regex-gate before calling).
 function hexDecode(M, hex, ptr, maxLen) {
   const len = Math.min(hex.length / 2, maxLen);
   for (let i = 0; i < len; i++) {
