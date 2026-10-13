@@ -143,7 +143,7 @@ authorization as verification (policy + signature evaluated together in the exec
 attribute tokens: facts parse from registerUser's initial_attrs — attribute_machine_register_user src/Attribute/attribute_machine.c:463 + _parse_attributes; whole "name:value" token matching (audit F-1) — src/Crypto/crypto.c:1129-1190; OR disjunction form — test/test_durability.cpp:87.
 privileged blocklist: registration refuses minted privileges (audit R7-08) — src/Attribute/attribute_machine.c:509-524; self-assert refusal — :648; list + strcasecmp (case-insensitive) — :215-233; policy tokens cannot be satisfied by a differently-named member value (whole-token match, F-1) — crypto.c:1134-1157.
 anti-enumeration collapse of not-found/suspended to unauthorized (R7-14) — src/Crypto/crypto.c:1228-1239.
-C signing stamps the JS sign path performs for you: crabs_wasm_sign_operation src/Util/wasm_helpers.c:392-423 (HLC + ordering system, R7-15) + caller-fills key_version (:410); R7-04 staleness gate _check_key_version src/StateMachine/state_machine.c:880-892; R7-11 lamport monotonicity :1640-1650. Integrator wiring of the attr_machine back-pointer: src/Util/wasm_helpers.c:247, src/CLI/cli.c:251.
+C signing stamps the JS sign path performs for you: crabs_wasm_sign_operation src/Util/wasm_helpers.c:392-423 (HLC + ordering system, R7-15) + caller-fills key_version (:410); R7-04 staleness gate _check_key_version src/StateMachine/state_machine.c:880-892; R7-11 lamport monotonicity :1640-1650. Integrator wiring of the attr_machine back-pointer: src/Util/wasm_helpers.c:247, src/CLI/cli.c:259.
 verifiedBy provenance reads back on BOTH bindings: node maps user->attributes[].verified_by (bindings/node/src/crabs_node.cc:1588, snippet asserts 'admin'); wasm maps the same machine field (bindings/wasm/bindings-core.js:895-952, pinned by bindings/wasm/test/getuser-readback.js).
 typed error names: node map bindings/node/src/crabs_node.cc:125-158; wasm map bindings/wasm/bindings-core.js (0x2001 unauthorized / 0x5003 invalid_param); CRABS_ERR_UNAUTHORIZED = 0x2001 src/CRABS/crabs.h:77, CRABS_ERR_INVALID_PARAM = 0x5003 :95.
 role IS an attribute: grantRole installs role:<value>; smoke.js reads it back via getUser — bindings/wasm/test/smoke.js:11, :40 area.
@@ -154,7 +154,7 @@ symbols:
   Node.create               bindings/wasm/index.d.ts:774
   KeyPair.generate          bindings/wasm/index.d.ts:44
   publicKeyHex              bindings/wasm/index.d.ts:38
-  KeyPair.destroy           bindings/wasm/index.d.ts:42
+  KeyPair.destroy           bindings/wasm/index.d.ts:40
   registerUser              bindings/wasm/index.d.ts:480
   grantRole                 bindings/wasm/index.d.ts:481
   getUser                   bindings/wasm/index.d.ts:488

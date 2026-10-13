@@ -83,6 +83,12 @@ claiming it carries no rule.
   authority: set `setPolicy('__define_operation_type__', 'role:admin')`
   first (the bootstrap admin holds `role:admin`; the `__create_trigger__`
   precedent).
+- Removing a guard is the same registry op with the guard word swapped:
+  a later `defineOperationType('vote', { dedup: 'none' })` replaces the
+  spec in place — the documented way to take a guard off. It also seals
+  the type: once any spec is registered, carried specs are ignored no
+  matter who sent them, so the executor never consults a signer-authored
+  rule.
 
 ## Try it
 
@@ -142,6 +148,7 @@ error surfaced: CRABS_ERR_ALREADY_PERFORMED = 0x7001 'already_performed' — src
 one-shot set behavior: add idempotent + union merge — test/test_one_shot.cpp:43-55, :75-97 · setRemove tombstones OR-sets only: bindings/node/src/crabs_node.cc:2178-2188 (wasm glue mirrors, src/Util/wasm_helpers.c:1421-1428).
 registry durability: the dedup registry serializes with the machine — src/Serialization/serialization.c:2010-2016, 2569-2598.
 driver-level calls (setAdd/incrementCounter) bypass guards — recipe-level note, contract of the direct-op surface.
+none-seal: a 'none' definition replaces the spec in place and seals the type against carried specs — bindings/wasm/test/dedup-surface.js:160-167 · state_register_op_type_def first-match update src/CRABS/data_model.c:529-553.
 
 target: crabs-wasm (snippet wasm/02-one-vote.js)
 verified: executed
@@ -149,7 +156,7 @@ symbols:
   Node.create               bindings/wasm/index.d.ts:774
   KeyPair.generate          bindings/wasm/index.d.ts:44
   publicKeyHex              bindings/wasm/index.d.ts:38
-  KeyPair.destroy           bindings/wasm/index.d.ts:42
+  KeyPair.destroy           bindings/wasm/index.d.ts:40
   registerUser              bindings/wasm/index.d.ts:480
   grantRole                 bindings/wasm/index.d.ts:481
   addOneShotSet             bindings/wasm/index.d.ts:493
@@ -159,9 +166,11 @@ symbols:
   DefineOperationTypeOptions bindings/wasm/index.d.ts:324-345
   registerHandlerJs         bindings/wasm/index.d.ts:683
   HandlerState.incrementCounter bindings/wasm/index.d.ts:195
-  HandlerOperation          bindings/wasm/index.d.ts:268-278 (signerId :270, payload :271)
+  HandlerOperation          bindings/wasm/index.d.ts:268-275 (signerId :270, payload :272)
   Operation.create          bindings/wasm/index.d.ts:122
   Operation.destroy         bindings/wasm/index.d.ts:118
+  Operation.signerId        bindings/wasm/index.d.ts:63
+  Operation.payload         bindings/wasm/index.d.ts:65
   Node.sign                 bindings/wasm/index.d.ts:657
   Node.execute              bindings/wasm/index.d.ts:656
   setContains               bindings/wasm/index.d.ts:567

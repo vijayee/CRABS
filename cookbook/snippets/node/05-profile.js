@@ -1,6 +1,6 @@
 'use strict';
 // Recipe 5 — a member's own profile, numeric half (crabs-node, driven directly).
-// crabs-node maps registers as NUMBERS ONLY (bindings/node/index.d.ts:227-234
+// crabs-node maps registers as NUMBERS ONLY (bindings/node/index.d.ts:386-392
 // — the full int64 range and the byte-register API live on crabs-wasm), so
 // the profile half this binding can carry honestly is a signed integer field
 // (karma, level, quota): one register per member, newest write wins.
@@ -32,7 +32,7 @@ node.addRegister('profile_karma_bob', 0);
 
 // Each member controls their own register; the key they registered with is
 // the thing key_version will track when keys rotate (JS-visible on the user
-// record, bindings/node/index.d.ts:53; rotation itself is C-only).
+// record, bindings/node/index.d.ts:145; rotation itself is C-only).
 const setKarma = (member, karma) => {
   node.setRegister(`profile_karma_${member}`, karma, member);
 };
@@ -49,7 +49,7 @@ if (node.getRegister('profile_karma_bob') !== 3) {
 
 // Registers are integer-only int64 slots: fractional, NaN, Infinity, and —
 // on this binding — BigInt are refused BEFORE the C int64 can silently
-// truncate (node d.ts:227-234; mirrors bindings/node/test/test.js:555-578).
+// truncate (node d.ts:386-390; mirrors bindings/node/test/test.js:552-578).
 const mustReject = (invoke, fragment, label) => {
   let refused = null;
   try { invoke(); } catch (refusal) { refused = String(refusal.message); }

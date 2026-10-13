@@ -33,7 +33,7 @@ static uint32_t count_temp_attrs(user_t* user) {
 
 int main(void) {
   /* Machine: attribute machine + its wired base state (integrator wiring,
-   * src/Util/wasm_helpers.c:242). */
+   * src/Util/wasm_helpers.c:247). */
   ecdsa_keypair_t* admin_key = crypto_ecdsa_generate();
   assert(admin_key != NULL);
   attribute_machine_t* am = attribute_machine_create("admin", admin_key->public_key);

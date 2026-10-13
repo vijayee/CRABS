@@ -37,9 +37,11 @@ async function main() {
   if (!aliceAttrs.includes('role:member') || !aliceAttrs.includes('adult')) {
     throw new Error(`expected role:member and adult on alice, got ${aliceAttrs}`);
   }
-  // Note: UserInfo.attributes[].verifiedBy is populated on crabs-node
-  // (bindings/node/src/crabs_node.cc:1160) but comes back as an empty string on
-  // crabs-wasm — provenance is asserted in the node snippet, not here.
+  // UserInfo.attributes[].verifiedBy comes back populated on BOTH bindings —
+  // the wasm getUser glue reads it back from the machine
+  // (bindings/wasm/bindings-core.js:895-952), the node binding maps the same
+  // field (bindings/node/src/crabs_node.cc:1588); the earlier empty-string
+  // divergence is fixed and pinned by bindings/wasm/test/getuser-readback.js.
 
   node.addCounter('gposts');
   node.setPolicy('post', 'AND role:member adult');

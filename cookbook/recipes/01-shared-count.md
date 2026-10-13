@@ -22,8 +22,8 @@ B counts 5 opens, and the two sync. `5` meets `5` — and neither copy can tell
 whether that is the *same* five opens seen twice or *ten* different opens. The
 number that arrives cannot say what happened to it. Whichever laptop's value
 wins the sync, one of two things goes silently wrong for good: either an
-increment disappears (the copies overwrite each other's), or a real open never
-gets recounted because no copy remembers it. Retrying the sync changes
+increment disappears (the copies overwrite each other's), or an open nobody's
+copy remembers is an open never counted. Retrying the sync changes
 nothing, because no copy is missing information about the network — each copy
 is missing information about *itself*. The problem is that `5` is the entire
 state, and CRABS' counter is designed around exactly that failure.
@@ -135,8 +135,9 @@ is the requirement, the state needs a different shape (Recipe 3 takes it).
 - Need decrements too? Swap `addCounter`/`incrementCounter` for the
   PN-counter family (`addPNCounter`/`incrementPNCounter`/`decrementPNCounter`)
   — the merge keeps the per-node maximum on each side of the entry, so
-  decrements converge the same way. The decrement method itself is PRESENT
-  (declared, see the footer) rather than smoke-tested.
+  decrements converge the same way. Decrement support is declared but not
+  yet exercised by any test — the footer says where to look before relying
+  on it.
 - Same shape across process boundaries: attribution is by whatever node id
   string you pass, so two processes each with their own `Node` and distinct
   ids merge without coordination — nothing about the counter is per-machine.
@@ -156,7 +157,7 @@ symbols:
   Node.create            bindings/wasm/index.d.ts:774
   KeyPair.generate       bindings/wasm/index.d.ts:44
   publicKeyHex           bindings/wasm/index.d.ts:38
-  KeyPair.destroy        bindings/wasm/index.d.ts:42
+  KeyPair.destroy        bindings/wasm/index.d.ts:40
   registerUser           bindings/wasm/index.d.ts:480
   addCounter             bindings/wasm/index.d.ts:490
   incrementCounter       bindings/wasm/index.d.ts:586

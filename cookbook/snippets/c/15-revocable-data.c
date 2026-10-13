@@ -68,7 +68,7 @@ int main(void) {
   assert(admin_key != NULL);
   attribute_machine_t* am = attribute_machine_create("admin", admin_key->public_key);
   assert(am != NULL);
-  /* Integrator wiring — the line wasm_helpers.c:242 and cli.c share. */
+  /* Integrator wiring — the line wasm_helpers.c:247 and cli.c share. */
   am->base_state.attr_machine = am;
   state_t* state = &am->base_state;
 

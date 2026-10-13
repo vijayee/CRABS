@@ -119,7 +119,9 @@ idempotency, receipting, and one-way doors are built on.
   more than once per N milliseconds".
 - Once-per-target instead of once-global — when each subject closes once
   but different subjects queue in parallel: one registered flag + op type
-  per target, Recipe 2's per-user pattern keyed by target instead of signer.
+  per target, named by the target (`executed_<payloadTarget>` items, one
+  `defineOperationType` each) — Recipe 2's per-user pattern keyed by
+  target instead of signer.
 
 ## Verified against the code
 
@@ -138,7 +140,7 @@ symbols:
   Node.create               bindings/wasm/index.d.ts:774
   KeyPair.generate          bindings/wasm/index.d.ts:44
   publicKeyHex              bindings/wasm/index.d.ts:38
-  KeyPair.destroy           bindings/wasm/index.d.ts:42
+  KeyPair.destroy           bindings/wasm/index.d.ts:40
   registerUser              bindings/wasm/index.d.ts:480
   grantRole                 bindings/wasm/index.d.ts:481
   addOneShotFlag            bindings/wasm/index.d.ts:494

@@ -128,20 +128,21 @@ usually what you want; for a counter, never.
   their CURRENT key_version; when the C key lifecycle rotates the key,
   stale-key writes are refused, and `keyVersion` is how readers observe
   the rotation happened.
-- Wider profiles — when one write should move several fields: the same
-  handler pattern can write several registers per op — one op, one
-  member, several fields.
+- Fractional values without decimals — when the field is a rate or a
+  percentage and the writer surface is integer-only: store scaled units
+  rather than decimals (12.5% becomes 125 in per-mille), so the value
+  rides the same int64 register guard-freely and the LWW shape is
+  unchanged.
 
 ## Verified against the code
 
 <!-- PROVENANCE
 LWW structure: single register item, (value, timestamp, node_id) tuple, merge keeps the newest with node-id tie-break.
 LWW C shape: lww_register_t src/CRDT/crdt_merge.h:94-99 · create :101 · merge :103 · destroy :102. Test pins: test/test_crdt.cpp:485-500 (newer wins) · :502-519 (tie broken by node id).
-byte-register API: wasm-only — setRegisterBytes bindings/wasm/index.d.ts:564 · getRegisterBytes :566 (HandlerState.setRegisterBytes :206, HandlerOperation :268-278); the node binding has no byte API and accepts numbers only for its int64 registers — bindings/node/index.d.ts:386-392; wasm additionally accepts BigInt past ±Number.MAX_SAFE_INTEGER — wasm register discipline docs :558-563. Pinned by bindings/wasm/test/registers.js:36-46 (integer-only rejections), :60-67 (BigInt round-trip incl. 2**60) and bindings/node/test/test.js:552-578 (node-side guards); byte round trip direct + handler context: bindings/wasm/test/handler-reads.js:86-110.
+byte-register API: wasm-only — setRegisterBytes bindings/wasm/index.d.ts:564 · getRegisterBytes :566 (HandlerState.setRegisterBytes :206, HandlerOperation :268-275); the node binding has no byte API and accepts numbers only for its int64 registers — bindings/node/index.d.ts:386-392; wasm additionally accepts BigInt past ±Number.MAX_SAFE_INTEGER — wasm register discipline docs :558-563. Pinned by bindings/wasm/test/registers.js:36-46 (integer-only rejections), :60-67 (BigInt round-trip incl. 2**60) and bindings/node/test/test.js:552-578 (node-side guards); byte round trip direct + handler context: bindings/wasm/test/handler-reads.js:86-110.
 ownership refusal: the handler returns CRABS_ERR_UNAUTHORIZED = 0x2001 (src/CRABS/crabs.h:77) and execute surfaces the typed name (node crabs_node.cc:132; wasm map in bindings/wasm/bindings-core.js). NUL-terminated payloads reach handlers (src/Util/wasm_helpers.c:1741-1749).
 keyVersion: registration starts at 1 — src/Attribute/attribute_machine.c:495; every role grant bumps it — :597,617; JS-visible readback on BOTH bindings (wasm machine-mapped bindings/wasm/bindings-core.js:895-952, keyVersion at :945; node mapped bindings/node/src/crabs_node.cc:1575 — pinned by getuser-readback.js + the node snippet's =2 assertion). R7-04 staleness gate: _check_key_version src/StateMachine/state_machine.c:880-892. Key rotation (user_key_rotate — src/Attribute/attribute_machine.h:219-221) is C-only; test/test_key_lifecycle.cpp:269.
 "item owner only" is not in v1's grammar: the {user_id} placeholder in preprocess_policy — src/Condition/condition.c:1245-1262, applied :1510.
-Note: the node snippet's header comment cites the pre-A12 d.ts line range (227-234) — current node register-discipline lines are 386-392; the behavior is unchanged.
 
 target: crabs-wasm (snippet wasm/05-profile.js)
 verified: executed
@@ -149,11 +150,11 @@ symbols:
   Node.create                 bindings/wasm/index.d.ts:774
   KeyPair.generate            bindings/wasm/index.d.ts:44
   publicKeyHex                bindings/wasm/index.d.ts:38
-  KeyPair.destroy             bindings/wasm/index.d.ts:42
+  KeyPair.destroy             bindings/wasm/index.d.ts:40
   registerUser                bindings/wasm/index.d.ts:480
   grantRole                   bindings/wasm/index.d.ts:481
   getUser                     bindings/wasm/index.d.ts:488
-  UserInfo.keyVersion         bindings/wasm/index.d.ts:279
+  UserInfo.keyVersion         bindings/wasm/index.d.ts:280
   addRegister                 bindings/wasm/index.d.ts:495
   setRegisterBytes            bindings/wasm/index.d.ts:564
   getRegisterBytes            bindings/wasm/index.d.ts:566
@@ -161,7 +162,7 @@ symbols:
   registerHandlerJs           bindings/wasm/index.d.ts:683
   HandlerState.setRegisterBytes bindings/wasm/index.d.ts:206
   HandlerOperation.signerId   bindings/wasm/index.d.ts:270
-  HandlerOperation.payload    bindings/wasm/index.d.ts:271
+  HandlerOperation.payload    bindings/wasm/index.d.ts:272
   Operation.create            bindings/wasm/index.d.ts:122
   Operation.destroy           bindings/wasm/index.d.ts:118
   Node.sign                   bindings/wasm/index.d.ts:657

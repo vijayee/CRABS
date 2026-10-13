@@ -35,7 +35,7 @@ int main(void) {
   assert(am != NULL);
   /* The base state's attribute-machine back-pointer is attached by the
    * INTEGRATOR, not by attribute_machine_create — the exact line the wasm
-   * glue (src/Util/wasm_helpers.c:242) and the CLI (src/CLI/cli.c:257) run. */
+   * glue (src/Util/wasm_helpers.c:247) and the CLI (src/CLI/cli.c:259) run. */
   am->base_state.attr_machine = am;
 
   /* register_user must refuse a privileged attribute name. */
