@@ -3,10 +3,10 @@ number: 9
 slug: treasury-atomic-transfers
 title: A treasury with atomic transfers
 section: Coordination
-status: PARTIAL
+status: COMPLETE
 maturity: STABLE
-target: crabs-node
-languages: c node
+target: all-bindings
+languages: c wasm node
 ---
 ## Intent
 
@@ -52,25 +52,25 @@ a way for an op to state its preconditions so the machine can check them
 - The pot is a RESOURCE item — `DATA_TYPE_RESOURCE`
   (`src/CRABS/data_model.h:29`, "PN-Counter + lock"). Locks live on the
   item, in `lock_state_t` (`src/CRABS/data_model.h:117-133`): a 32-byte
-  CSPRNG bearer `lock_token` (`src/StateMachine/state_machine.c:310-322`),
+  CSPRNG bearer `lock_token` (`src/StateMachine/state_machine.c:312`),
   `lock_owner`, `lock_expiry`, extension count, and a `pre_lock_snapshot`
   for rollback. Lock state is runtime-only — it is *never serialized*
-  (`data_model.h:126-131`); see the honesty section.
+  (`data_model.h:130`); see the honesty section.
 - An op names the items it touches: `Operation.addResource` (up to
   `CRABS_MAX_RESOURCES` = 8, `src/CRABS/crabs.h:19`; node wrapper
-  `bindings/node/src/crabs_node.cc:638-679`). With each resource the op
+  `bindings/node/src/crabs_node.cc:756-773`). With each resource the op
   carries a `required_state`/`next_state` protocol pair — that pair is what
-  lets the executor enforce timing, and (see the GAP blocks) it is the part
-  JS cannot author.
+  lets the executor enforce timing, and `Operation.setRequiredState(index,
+  'locked')` / `setNextState` are how a driver authors it from JS.
 - The executor's gates run in order *before any effect*: replay
   (signature, then per-signer ordering monotonicity,
-  `src/StateMachine/state_machine.c:1248-1259`), required protocol state
+  `src/StateMachine/state_machine.c:1633-1643`), required protocol state
   across **every** named resource
-  (`_check_transitions`, `src/StateMachine/state_machine.c:845-857`,
-  run at `:1260-1264`), presented lock claims
-  (`:1266-1281`), dedup guard (`:1283+`), handler, and only then the
+  (`_check_transitions`, `src/StateMachine/state_machine.c:848-866`,
+  run at `:1647-1651`), presented lock claims
+  (`:1653-1668`), dedup guard (`:1671+`), handler, and only then the
   wildcard apply — which for handler-less custom ops is restricted to
-  LOCKED resources (`src/StateMachine/state_machine.c:1436-1464`). A gate
+  LOCKED resources (`src/StateMachine/state_machine.c:1825-1851`). A gate
   that fails leaves *nothing*: no log entry, no version bump, no balance
   change (`test/test_state_machine.cpp:1153-1211`,
   `test/test_tx_manager.cpp:246-266`).
@@ -78,26 +78,28 @@ a way for an op to state its preconditions so the machine can check them
   `__verify__`, `__rollback__`, `__unlock__`, `__force_unlock__`
   (`src/CRABS/crabs.h:135-140`) — moving the item through
   IDLE → LOCKED → MODIFIED → VERIFIED → IDLE
-  (`src/StateMachine/state_machine.c:128-142`). A live lease refuses
-  re-acquisition (`:1710`), expires on its own
-  (`state_machine_lock_expired`, `:364-385`) and is pruned by the next
-  execute (`:389-407`); a rollback is owner-checked
-  (`:1890-1897`) and restores the pre-lock snapshot
-  (`:1898-1917`), so a locked-and-reverted item hashes back to exactly what
+  (`src/StateMachine/state_machine.c:133-145`). A live lease refuses
+  re-acquisition (`:2102-2110`), expires on its own
+  (`state_machine_lock_expired`, `:366-385`) and is pruned by the next
+  execute (`:389-411`); a rollback is owner-checked
+  (`:2282-2289`) and restores the pre-lock snapshot
+  (`:2296-2323`), so a locked-and-reverted item hashes back to exactly what
   the lock captured.
 - Replay protection is pluggable: a tx manager sits in front of the
   executor with `accept`/`commit`/`destroy`
   (`src/TxManager/tx_manager.h:19-41`) — memory-backed duplicates land as
   `CRABS_ERR_ALREADY_EXECUTED` (`src/CRABS/crabs.h:107`; wired and tested,
-  `test/test_tx_manager.cpp:230-244`) — and even with *no* manager, the
+  `test/test_tx_manager.cpp:225-243`) — and even with *no* manager, the
   per-signer ordering backstop rejects a replayed op after a restart
-  (`state_signer_has_replay`, `src/StateMachine/state_machine.c:585-611`,
-  `test/test_tx_manager.cpp:268-291`).
+  (`state_signer_has_replay`, `src/StateMachine/state_machine.c:587-611`,
+  `test/test_tx_manager.cpp:269-295`).
 
-This is the machine's contract. What surfaces can *drive* it is where this
-recipe is PARTIAL: the pot minting and the lock drive work on crabs-node,
-the full ceremony (claims, required states, extend/verify/rollback/unlock)
-works only in C — the GAP blocks below are precise about each seam.
+This is the machine's contract. Every surface now *drives* it: the pot mint
+(`Node.addResource`), the lease and the bearer token (`Node.getLockState`),
+the per-slot protocol states and lock claims
+(`Operation.setRequiredState`/`setNextState`/`addLockClaim`), and the
+attachable tx manager (`Node.attachTxManager`) are bound on BOTH JS
+bindings — the same ceremony runs three times below.
 
 ## What it guarantees / what it doesn't
 
@@ -112,31 +114,31 @@ Guaranteed, by the executor (all of it exercised by the snippets below):
   `test/test_state_machine.cpp:1153-1211`).
 - *Apply at most once.* A committed op's uuid is recorded by the memory tx
   manager and a duplicate submission is `already_executed`
-  (`test/test_tx_manager.cpp:230-244`); with no manager configured,
+  (`test/test_tx_manager.cpp:225-243`); with no manager configured,
   ordering monotonicity still rejects a replayed op — the same signed op
-  cannot land twice (`src/StateMachine/state_machine.c:585-611`,
-  `:1248-1259`).
+  cannot land twice (`src/StateMachine/state_machine.c:587-611`,
+  `:1633-1643`).
 - *One live lease per pot.* A locked RESOURCE refuses acquisition until
-  expiry (`state_machine.c:1710`); the lock token is a CSPRNG bearer
-  credential (`:310-322`) and any claim an op presents on a
-  locked/modified item is verified against it (`:1266-1281`), so a forged
+  expiry (`state_machine.c:2102-2110`); the lock token is a CSPRNG bearer
+  credential (`:312-326`) and any claim an op presents on a
+  locked/modified item is verified against it (`:1653-1668`), so a forged
   claim is `lock_token_mismatch`. A lock expires and is pruned; a rollback
   puts back the exact pre-lock balance.
 
 Not guaranteed — say this before building on it:
 
 - *The lock is machine-local, not a distributed lease.* Lock state is
-  runtime-only and never serialized (`src/CRABS/data_model.h:126-131`,
-  the chain digest excludes lock state, `:749`); two replicas do not negotiate
+  runtime-only and never serialized (`src/CRABS/data_model.h:130`,
+  the chain digest excludes protocol state, `:785`); two replicas do not negotiate
   a shared lease. The lock protocol
   coordinates *one machine's* operators — e.g. a validator process holding
   the treasury — while replica convergence is still CRDT merge after the
   fact. There is no cross-replica atomic commit here.
 - *Claim discipline is cooperative at the op level.* The executor verifies
-  the claims an op presents (`:1266-1281`) and refuses custom ops on a
-  non-LOCKED resource (`:1440-1452`) — but the wildcard apply does not
-  force a claim to be present, and a custom op with a registered handler
-  owns its own protocol transitions entirely (`:1419-1433`). "Every treasury
+  the claims an op presents (`:1653-1668`) and refuses handler-less custom
+  ops on a non-LOCKED resource (`:1825-1851`) — but the wildcard apply does
+  not force a claim to be present, and a custom op with a registered
+  handler owns its own protocol transitions entirely (`:1808-1831`). "Every treasury
   spend must say LOCKED-and-carry-the-token" is driver discipline the
   machine *verifies* (the C snippet shows both halves of that), not an
   invariant the machine imposes on arbitrary custom ops.
@@ -147,9 +149,14 @@ Not guaranteed — say this before building on it:
   tx_manager.h:4-7` — "in-memory, persistent, no-op"). After a restart the
   manager is empty and replay protection rests on the ordering backstop —
   which is exactly what the tests cover (`test/test_tx_manager.cpp:
-  268-291`).
-- *No JavaScript completion of the ceremony.* See the GAP blocks: claims,
-  required-state authors, and the tx manager have no binding surface.
+  268-291`); attach (`Node.attachTxManager('memory')`) again after a state
+  round trip — the manager is host-owned and not serialized.
+- *A crabs-node op carries the protocol, not the arithmetic.* crabs-node has
+  no custom-handler surface (api-map known difference #2), so its transfer
+  op advances the protocol states and is applied at most once, while the
+  balance arithmetic stays the driver's (the snippets read balances with
+  `Node.getResource`); the handler-owned debit/credit runs on crabs-wasm
+  (`registerHandlerJs` + `HandlerState.adjustResource`) and in C.
 
 ## Variations
 
@@ -159,15 +166,15 @@ Not guaranteed — say this before building on it:
   multi-item transaction here (`test/test_state_machine.cpp:1153-1211`).
 - *Recovery instead of undo*: `__verify__` promotes MODIFIED → VERIFIED or
   drops the item to ERROR on a failed invariant
-  (`state_machine.c:1858-1880`); `__rollback__` takes either MODIFIED or
-  ERROR back to IDLE with the snapshot restored (`:1882-1920`).
+  (`state_machine.c:2250-2272`); `__rollback__` takes either MODIFIED or
+  ERROR back to IDLE with the snapshot restored (`:2274-2323`).
 - *Break-glass unblocking*: `__force_unlock__` releases an *expired but
   not-yet-pruned* lock to IDLE — it is not a lock steal: a live lease is
-  refused with `CRABS_ERR_LOCK_NOT_EXPIRED` (`state_machine.c:1958-1970`,
+  refused with `CRABS_ERR_LOCK_NOT_EXPIRED` (`state_machine.c:2350-2362`,
   error at `src/CRABS/crabs.h:72`), and the whole op is refused with
   `force_unlock_disabled` unless `config.allow_force_unlock` is set
   (`src/CRABS/data_model.h:283`; typed string
-  `bindings/node/src/crabs_node.cc:92`).
+  `bindings/node/src/crabs_node.cc:131`).
 - *Vote-then-spend treasuries* compose Recipe 2's one-shot vote records
   with this item: the vote gate is the caller's, the spend serialization
   is this page's.
@@ -178,45 +185,56 @@ Not guaranteed — say this before building on it:
 
 ### crabs-wasm (browser / Node / edge)
 
-No full treasury demo exists on the wasm binding: the op half is real, the
-item mint and the lock surface are not.
+The whole demo now runs on this binding — the mint, the lease, the claims,
+the handler-owned debit/credit, and the tx manager.
 
-> [!WARNING] GAP
->
-> **Prose describes:** the whole demo on crabs-wasm — minting a treasury
-> pot in the browser, locking it, submitting a transfer with a lock claim,
-> and seeing replay/precondition refusals.
->
-> **Codebase status:** half of the seam exists on wasm. `Operation.
-> addResource` is STABLE (`bindings/wasm/index.d.ts:33`, wrapper
-> `bindings/wasm/bindings-core.js:352-358`) and the executor-side gates are
-> the same C pipeline (`src/StateMachine/state_machine.c:1260-1281`) — but
-> `Node.addResource`, the item mint (`DATA_TYPE_RESOURCE`), is **node-only**
-> (`bindings/node/index.d.ts:199`, implemented
-> `bindings/node/src/crabs_node.cc:1489-1513`); wasm declares no mint for
-> a RESOURCE item, and no wasm surface sets required states or lock claims.
->
-> **Divergence:** an op carrying a resource name on wasm either names an
-> item that does not exist (`resource_not_found`) or — because `__lock__`
-> also requires the item to exist and be IDLE — no lock can ever be taken
-> on a pot wasm never minted. The recipe's demo needs `Node.addResource`;
-> api-map §17 records the split: "Resources half is STABLE JS … Locks /
-> transaction manager are **not JS-bound**" under R9's node-only note.
->
-> **Tracking:** api-map §17, R9 (resources STABLE on node; locks/tx manager
-> DESIGNED C-only). No wasm-side mint or lock build is scheduled.
->
-> **Agent action:** code block omitted. Do not call
-> `node.addResource('treasury')` on crabs-wasm — the wasm `Node` declares
-> no such method. Drive the pot from crabs-node or from the C surface
-> (below), and treat wasm as the reader half only.
+```snippet:wasm/09-treasury.js
+```
+
+<!-- PROVENANCE
+target: crabs-wasm
+verified: executed
+symbols:
+  NodeStatic.create         bindings/wasm/index.d.ts:677
+  KeyPair.generate          bindings/wasm/index.d.ts:21
+  registerUser              bindings/wasm/index.d.ts:429
+  grantRole                 bindings/wasm/index.d.ts:430
+  Node.addResource          bindings/wasm/index.d.ts:451
+  Node.getResource          bindings/wasm/index.d.ts:458
+  Node.getLockState         bindings/wasm/index.d.ts:466 (LockStateView :195-203)
+  Node.attachTxManager      bindings/wasm/index.d.ts:477
+  new Operation             bindings/wasm/index.d.ts:72
+  Operation.addResource     bindings/wasm/index.d.ts:33
+  Operation.setRequiredState / setNextState bindings/wasm/index.d.ts:49-52
+  Operation.addLockClaim    bindings/wasm/index.d.ts:61
+  Node.setPolicy            bindings/wasm/index.d.ts:587
+  Node.sign                 bindings/wasm/index.d.ts:606
+  Node.execute              bindings/wasm/index.d.ts:605
+  registerHandlerJs         bindings/wasm/index.d.ts:632 (HandlerState.
+                            adjustResource / getResource :167-171, resources
+                            on HandlerOperation :211)
+  (mint export)             src/Util/wasm_helpers.c:638 (crabs_wasm_add_resource — mirrors the node mint)
+  (lock-state read)         src/Util/wasm_helpers.c:730 (crabs_wasm_lock_state)
+  (claims + state setters)  src/Util/wasm_helpers.c:759-806
+  (tx manager attach)       src/Util/wasm_helpers.c:828
+  (handler arithmetic)      src/Util/wasm_helpers.c:682
+  (lock protocol op types)  src/CRABS/crabs.h:135-140
+  (refusal: un-locked RESOURCE wildcard) src/StateMachine/state_machine.c:1836-1846
+  (refusal: re-acquire live lease) src/StateMachine/state_machine.c:2102-2110
+  (claim verify, step 5)    src/StateMachine/state_machine.c:1653-1668
+  (required-state gate, step 4) src/StateMachine/state_machine.c:848-866
+maturity: full ceremony + tx manager STABLE (bindings/wasm/test/locks-tx.js)
+test_ref: bindings/wasm/test/locks-tx.js (mirror of the C battery: single lease, forged claim, ceremony, apply-once, poisoned op, cooperative wildcard) + test/test_state_machine.cpp:196-352
+-->
 
 ### crabs-node (native Node.js)
 
-The pot mint, the lock drive, and the executor's refusals are all real on
-this binding — and one honest limit is demonstrated right in the snippet:
-once the pot is locked, the op builder cannot author `required_state` or a
-lock claim, so the locked pot is not spendable from JS at all.
+The pot mint, the lock drive, the claims, and the executor's refusals are
+all real on this binding — the same ceremony as wasm's, minus one thing the
+api-map pins as a known difference (#2): no custom-handler surface, so the
+debit/credit *arithmetic* cannot live in a machine handler here. The op
+below carries the protocol (gates, lease, claims, at-most-once
+application); the balance arithmetic stays the driver's.
 
 ```snippet:node/09-treasury.js
 ```
@@ -225,67 +243,52 @@ lock claim, so the locked pot is not spendable from JS at all.
 target: crabs-node
 verified: executed
 symbols:
-  NodeStatic.new            bindings/node/index.d.ts:312
+  NodeStatic.new            bindings/node/index.d.ts:567
   KeyPair.generate          bindings/node/index.d.ts:14
-  registerUser              bindings/node/index.d.ts:182
-  grantRole                 bindings/node/index.d.ts:183
-  Node.addResource          bindings/node/index.d.ts:199
-  new Operation             bindings/node/index.d.ts:47
-  Operation.addResource     bindings/node/index.d.ts:26
-  Node.setPolicy            bindings/node/index.d.ts:249
-  Node.sign                 bindings/node/index.d.ts:250
-  Node.execute              bindings/node/index.d.ts:251
-  Node.addCounter           bindings/node/index.d.ts:193
+  registerUser              bindings/node/index.d.ts:252
+  grantRole                 bindings/node/index.d.ts:253
+  Node.addResource          bindings/node/index.d.ts:276 (seeds the int64
+                            balance; implemented bindings/node/src/crabs_node.cc:1745)
+  Node.getResource          bindings/node/index.d.ts:283 (crabs_node.cc:1837)
+  Node.getLockState         bindings/node/index.d.ts:290 (crabs_node.cc:1756)
+  Node.attachTxManager      bindings/node/index.d.ts:304 (crabs_node.cc:1785)
+  new Operation             bindings/node/index.d.ts:87
+  Operation.addResource     bindings/node/index.d.ts:46
+  Operation.setRequiredState / setNextState bindings/node/index.d.ts:61-64
+                            (crabs_node.cc:648,800)
+  Operation.addLockClaim    bindings/node/index.d.ts:73 (crabs_node.cc:650,820)
+  Node.setPolicy            bindings/node/index.d.ts:397
+  Node.sign / execute       bindings/node/index.d.ts:410-411
+  (tx manager attach)       bindings/node/src/crabs_node.cc:1785
   (lock protocol op types)  src/CRABS/crabs.h:135-140
-  (refusal: un-locked RESOURCE op) src/StateMachine/state_machine.c:1440-1452
-  (refusal: re-acquire live lease) src/StateMachine/state_machine.c:1710
-  (replay backstop)         src/StateMachine/state_machine.c:585-611
-maturity: mint/drive/gates STABLE; claim + required-state authoring not bound
-test_ref: bindings/node/test/test.js:64-75 (typed execute refusals) + test/test_tx_manager.cpp:230-291
+  (refusal: un-locked RESOURCE wildcard) src/StateMachine/state_machine.c:1836-1846
+  (refusal: re-acquire live lease) src/StateMachine/state_machine.c:2102-2110
+  (claim verify, step 5)    src/StateMachine/state_machine.c:1653-1668
+  (required-state gate, step 4) src/StateMachine/state_machine.c:848-866
+  (duplicate refusal)       src/StateMachine/state_machine.c:1600-1620
+maturity: full ceremony + tx manager STABLE (no handler surface — the
+  arithmetic is the driver's, api-map known difference #2)
+test_ref: bindings/node/test/locks-tx.js (17 asserts: the C battery minus the
+  handler arithmetic) + test/test_tx_manager.cpp:225-243
 -->
 
-What the snippet could not do, and the machine cannot help with from this
-binding — the ceremony tail:
+What the snippets could not do before — and what closing that gap changed —
+is worth stating once, because it was this binding's most famous trap.
 
-> [!WARNING] GAP
->
-> **Prose describes:** the part of the treasury protocol that makes the
-> locked pot *useful* — carrying the live lock token as a claim into the
-> transfer op, declaring `required_state: LOCKED` so the executor verifies
-> the transfer ran under the lease, and driving `__verify__`/`__rollback__`/
-> `__unlock__` (or the admin `__force_unlock__` escape) to completion.
->
-> **Codebase status:** all of it works in C — claims are step 5 of the
-> executor (`src/StateMachine/state_machine.c:1266-1281`), the required-
-> state gate is step 4 (`:1260-1264`, helper `:845-857`), and the full
-> lock-modify-verify-unlock ceremony is proven
-> (`test/test_state_machine.cpp:196-352`). The executor is reached exactly
-> as-is from the node binding (`bindings/node/src/crabs_node.cc:1774`).
->
-> **Divergence:** no node symbol authors any of it.
-> `bindings/node/index.d.ts` has no required-state setter, no lock-claim
-> setter (`Operation.addResource` hard-codes both per-slot to
-> `PROTOCOL_IDLE`, `bindings/node/src/crabs_node.cc:669-670`), and no claim-bearing op API —
-> so from JS, a locked pot cannot be extended, verified, rolled back, or
-> unlocked (each needs a `required_state` the op builder can't declare);
-> it sits locked until the lease expires and the next execute prunes it
-> (`state_machine.c:364-407`). The C tx manager
-> (`src/TxManager/tx_manager.h:19-41`, memory impl
-> `src/TxManager/tx_manager_memory.h:16`) is likewise not wired to any
-> binding state — `state->tx_manager` (`src/CRABS/data_model.h:486`) is
-> never assigned anywhere in `bindings/node/src/crabs_node.cc` (grep: zero
-> matches), so the JS executor runs with no manager and relies on the
-> ordering backstop.
->
-> **Tracking:** api-map §17, R9 — "no lock API surface found in C headers
-> or bindings"; map entries for locks marked DESIGNED. No binding work is
-> scheduled.
->
-> **Agent action:** the code block above is what exists — the pot, the
-> gates, the lease, the replay backstop. For the ceremonial claims, do not
-> invent `op.setRequiredState(...)`/`op.claim('treasury', token)`; drive
-> the full protocol from C (next section) or design the binding surface
-> first.
+**The old "locked pot is unspendable from JS" trap is gone.** What used to
+be true: the op builder could not author `required_state` or a lock claim,
+so once JS locked a pot it sat locked until lease expiry and the next
+execute pruned it (`state_machine.c:364-411`) — the "pot-unspendable
+discovery". Now: `Operation.setRequiredState`/`setNextState` author the
+protocol states (`crabs_node.cc:800` / wasm `wasm_helpers.c:759-806`) and
+`Operation.addLockClaim` carries the live bearer token read from
+`Node.getLockState` (`crabs_node.cc:1756` / `wasm_helpers.c:730`) — so the
+locked pot is operable under its lease: claim-bearing ops pass the state
+gate, and `__verify__`/`__unlock__` complete the ceremony from both JS
+bindings. Two caveats survive, deliberately: the claim discipline stays
+cooperative (below), and the token is only claimable through
+`getLockState` before signing — the signature binds whatever the op
+carries, so claim AFTER `__lock__` and BEFORE `sign`.
 
 ### C (native)
 
@@ -303,20 +306,20 @@ target: native-c
 verified: executed
 symbols:
   state_machine_execute        src/StateMachine/state_machine.h:177
-  state_machine_register_handler src/StateMachine/state_machine.c:500-524
+  state_machine_register_handler src/StateMachine/state_machine.c:502-527
   CRABS_OP_LOCK/VERIFY/UNLOCK  src/CRABS/crabs.h:135-139
-  __lock__ contention refusal  src/StateMachine/state_machine.c:1710-1716
-  lock token generation        src/StateMachine/state_machine.c:310-326
-  expiry + pruning             src/StateMachine/state_machine.c:364-407
-  wildcard apply gate          src/StateMachine/state_machine.c:1436-1464
-  required-state check         src/StateMachine/state_machine.c:845-857
-  rollback (owner check + snapshot restore) src/StateMachine/state_machine.c:1882-1920
+  __lock__ contention refusal  src/StateMachine/state_machine.c:2102-2110
+  lock token generation        src/StateMachine/state_machine.c:312-326
+  expiry + pruning             src/StateMachine/state_machine.c:366-411
+  wildcard apply gate          src/StateMachine/state_machine.c:1825-1851
+  required-state check         src/StateMachine/state_machine.c:848-866
+  rollback (owner check + snapshot restore) src/StateMachine/state_machine.c:2274-2323
   crabs_tx_manager_memory      src/TxManager/tx_manager_memory.h:16
   CRABS_ERR_ALREADY_EXECUTED   src/CRABS/crabs.h:107
   CRABS_ERR_LOCK_TOKEN_MISMATCH src/CRABS/crabs.h:69
   data_item_create / state_add_item src/CRABS/data_model.h
 maturity: all STABLE (executor + lock protocol + tx manager, tested)
-test_ref: test/test_state_machine.cpp:196-352 (lock ceremony) + :1153-1211 (atomic across resources) + test/test_tx_manager.cpp:230-244 (duplicate refused) + :268-291 (lamport backstop)
+test_ref: test/test_state_machine.cpp:196-352 (lock ceremony) + :1153-1211 (atomic across resources) + test/test_tx_manager.cpp:225-243 (duplicate refused) + :269-295 (lamport backstop)
 -->
 
 ## Notes
@@ -328,27 +331,27 @@ test_ref: test/test_state_machine.cpp:196-352 (lock ceremony) + :1153-1211 (atom
   failure leaves no log entry, no version bump, and no balance change
   (`test/test_state_machine.cpp:1153-1211`); (2) *apply-once* — duplicate
   submissions are recorded and refused (`test/test_tx_manager.cpp:
-  230-244`), with the ordering backstop covering the post-restart window
-  (`:268-291`); (3) *recovery* — a locked item snapshots its balance at
+  225-243`), with the ordering backstop covering the post-restart window
+  (`:269-295`); (3) *recovery* — a locked item snapshots its balance at
   acquisition and rollback restores exactly those bytes (`state_machine.c:
-  1885-1917`), which is why the demo's treasury can end where it started.
+  2296-2323`), which is why the demo's treasury can end where it started.
 - *Why the node binding refuses an un-locked spend at all*: crabs-node has
-  no custom-handler surface (api-map §15 known difference #2), so
+  no custom-handler surface (api-map "Known wasm/node differences" #2), so
   handler-less custom ops go through the wildcard apply — and that path
-  only acts on LOCKED resources (`state_machine.c:1440-1452`). The
+  only acts on LOCKED resources (`state_machine.c:1836-1851`). The
   refusal is the gate, not a bug.
 - *The lock is a lease, not an ownership transfer*: it has an expiry
   (`max_lock_duration_ms` per extension, `src/CRABS/data_model.h:281`) and
   re-acquisition stays refused while it is live regardless of who calls
-  (`state_machine.c:1710-1716`) — the snippet's second `__lock__` from the
+  (`state_machine.c:2102-2110`) — the snippet's second `__lock__` from the
   same treasurer is refused exactly as a rival's would be.
 - *Balance values on RESOURCE items are raw int64s* (`bindings/node/src/
-  crabs_node.cc:1501-1510` — "the library contract — dedup mutations, the
+  crabs_node.cc:1741` — "the library contract — dedup mutations, the
   lock snapshot, and destroy all take the raw path"), which is why the
-  lock snapshot captures 8 bytes for this item (`state_machine.c:1797-1806`)
-  and the restore is the historical 8-byte form (`:1913-1920`).
+  lock snapshot captures 8 bytes for this item (`state_machine.c:2183-2212`)
+  and the restore is the historical 8-byte form (`:2304-2318`).
 - *Serialization check*: a rollback "restores exactly the content (and
-  digest) the lock captured" (`state_machine.c:1789-1790`, the snapshot
+  digest) the lock captured" (`state_machine.c:2182-2189`, the snapshot
   contract op_lock commits to at acquisition) — so a locked-and-reverted
   item hashes back to its pre-lock form; the snapshot is the recovery
   contract, not a courtesy.

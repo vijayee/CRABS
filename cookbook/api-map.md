@@ -4,8 +4,8 @@ Every recipe's provenance footer cites the entries defined here. Two JS bindings
 
 | Binding | Types | Read in full | Lines |
 |---|---|---|---|
-| `crabs-wasm` (Emscripten) | [`bindings/wasm/index.d.ts`](../bindings/wasm/index.d.ts) | 2026-10-11 | 388 |
-| `crabs-node` (N-API) | [`bindings/node/index.d.ts`](../bindings/node/index.d.ts) | 2026-10-11 | 357 |
+| `crabs-wasm` (Emscripten) | [`bindings/wasm/index.d.ts`](../bindings/wasm/index.d.ts) | 2026-10-13 | 717 |
+| `crabs-node` (N-API) | [`bindings/node/index.d.ts`](../bindings/node/index.d.ts) | 2026-10-13 | 678 |
 
 **Maturity labels**
 
@@ -65,30 +65,30 @@ Policies are condition expressions over attributes: `"AND role:member adult"` (`
 
 Condition expression grammar lives in `src/Condition/`; `attribute` change events kind `'attribute'` are emitted on grants (`change-events.js:44-52`).
 
-## 4. CRDT surface — counters, sets, registers
+## 4. CRDT surface — counters, sets, registers, RESOURCE items
 
 Shared creation/query API (both bindings except where marked). **Node `.d.ts` differs**: node exposes only `setContains`; the bounded enumerator (`getSetSize` / `getSetElements` / `getSetTags`) and the register byte API (`setRegisterBytes` / `getRegisterBytes`) are **wasm-only**.
 
 | symbol | kind | signature | source | maturity |
 |---|---|---|---|---|
-| `Node.addCounter` | method | `addCounter(name)` — G-counter | wasm :223, node :193 | STABLE (`smoke.js:13`) |
-| `Node.addPNCounter` | method | `addPNCounter(name)` | wasm :224, node :194 | STABLE (`smoke.js:14`) |
-| `Node.addORSet` | method | `addORSet(name)` | wasm :225, node :195 | STABLE (`smoke.js:15`) |
-| `Node.addOneShotSet` | method | `addOneShotSet(name)` | wasm :226, node :196 | STABLE (`test/test.js:53`; wasm declared only) |
-| `Node.addOneShotFlag` | method | `addOneShotFlag(name)` | wasm :227, node :197 | STABLE (`test/test.js:54,112-113`) |
-| `Node.addRegister` | method | `addRegister(name, initialValue?)` | wasm :228, node :198 | STABLE (`registers.js:13`) |
-| `Node.incrementCounter` | method | `incrementCounter(name, delta?, nodeId?)` | wasm :286, node :238 | STABLE (`smoke.js:28`) |
-| `Node.incrementPNCounter` | method | `incrementPNCounter(name, delta?, nodeId?)` | wasm :287, node :239 | STABLE (wasm test path; node declared) |
-| `Node.decrementPNCounter` | method | `decrementPNCounter(name, delta?, nodeId?)` | wasm :288, node :240 | PRESENT (no test found) |
-| `Node.getCounter` | query | `getCounter(name) -> number` | wasm :254, node :224 | STABLE (`smoke.js:39`) |
-| `Node.getPNCounter` | query | `getPNCounter(name) -> number` | wasm :255, node :225 | PRESENT |
-| `Node.getRegister` | query | `getRegister(name) -> number` | wasm :256, node :226 | STABLE (`registers.js:51`) |
-| `Node.setRegister` | method | `setRegister(name, value, nodeId?)` | wasm :263, node :234 | STABLE (`registers.js:50`) |
-| `Node.setAdd` | method | `setAdd(name, element, tag?)` | wasm :290, node :243 | STABLE (`test/test.js:87`) |
-| `Node.setRemove` | method | `setRemove(name, element)` | wasm :291, node :244 | STABLE (`handler-reads.js:79`) |
-| `Node.setContains` | query | `setContains(name, element) -> boolean` | wasm :267, node :235 | STABLE (`test/test.js:88`) |
-| `Node.flagSet` | method | `flagSet(name, setBy, setAt?)` — one-shot flag | wasm :292, node :245 | STABLE (`test/test.js:112`) |
-| `Node.flagValue` | query | `flagValue(name) -> boolean` | wasm :293, node :246 | STABLE (`test/test.js:113`) |
+| `Node.addCounter` | method | `addCounter(name)` — G-counter | wasm :427, node :263 | STABLE (`smoke.js:13`) |
+| `Node.addPNCounter` | method | `addPNCounter(name)` | wasm :428, node :264 | STABLE (`smoke.js:14`) |
+| `Node.addORSet` | method | `addORSet(name)` | wasm :429, node :265 | STABLE (`smoke.js:15`) |
+| `Node.addOneShotSet` | method | `addOneShotSet(name)` | wasm :430, node :266 | STABLE (`test/test.js:53`; wasm declared only) |
+| `Node.addOneShotFlag` | method | `addOneShotFlag(name)` | wasm :431, node :267 | STABLE (`test/test.js:54,112-113`) |
+| `Node.addRegister` | method | `addRegister(name, initialValue?)` | wasm :432, node :268 | STABLE (`registers.js:13`) |
+| `Node.incrementCounter` | method | `incrementCounter(name, delta?, nodeId?)` | wasm :523, node :343 | STABLE (`smoke.js:28`) |
+| `Node.incrementPNCounter` | method | `incrementPNCounter(name, delta?, nodeId?)` | wasm :524, node :344 | STABLE (wasm test path; node declared) |
+| `Node.decrementPNCounter` | method | `decrementPNCounter(name, delta?, nodeId?)` | wasm :525, node :345 | PRESENT (no test found) |
+| `Node.getCounter` | query | `getCounter(name) -> number` | wasm :491, node :329 | STABLE (`smoke.js:39`) |
+| `Node.getPNCounter` | query | `getPNCounter(name) -> number` | wasm :492, node :330 | PRESENT |
+| `Node.getRegister` | query | `getRegister(name) -> number` | wasm :493, node :331 | STABLE (`registers.js:51`) |
+| `Node.setRegister` | method | `setRegister(name, value, nodeId?)` | wasm :500, node :339 | STABLE (`registers.js:50`) |
+| `Node.setAdd` | method | `setAdd(name, element, tag?)` | wasm :527, node :348 | STABLE (`test/test.js:87`) |
+| `Node.setRemove` | method | `setRemove(name, element)` | wasm :528, node :349 | STABLE (`handler-reads.js:79`) |
+| `Node.setContains` | query | `setContains(name, element) -> boolean` | wasm :504, node :340 | STABLE (`test/test.js:88`) |
+| `Node.flagSet` | method | `flagSet(name, setBy, setAt?)` — one-shot flag | wasm :529, node :350 | STABLE (`test/test.js:112`) |
+| `Node.flagValue` | query | `flagValue(name) -> boolean` | wasm :530, node :351 | STABLE (`test/test.js:113`) |
 
 **LWW registers — int64/BigInt handling (R5, R16).** Registers carry a signed int64. Both bindings accept integers within ±`Number.MAX_SAFE_INTEGER` and reject fractions/NaN/Infinity (consumption finding 1; `registers.js:30-46`, node `test/test.js:555-578`). The wasm binding additionally accepts `BigInt` for the full int64 range (`bindings/wasm/index.d.ts:262-263`; `registers.js:60-67`: `2**60 BigInt round-trips`, and inside handlers at `registers.js:91`); **the node binding accepts numbers only** — full int64 range requires crabs-wasm (`bindings/node/index.d.ts:227-234`). C source: `src/StateMachine/state_machine.h`.
 
@@ -96,12 +96,21 @@ Shared creation/query API (both bindings except where marked). **Node `.d.ts` di
 
 | symbol | kind | signature | source | maturity |
 |---|---|---|---|---|
-| `Node.getSetSize` | query (wasm only) | `getSetSize(name) -> number` — distinct live elements | `bindings/wasm/index.d.ts:272` | STABLE (`handler-reads.js:36`) |
-| `Node.getSetElements` | query (wasm only) | `getSetElements(name, {offset?, limit?<=256}) -> string[]` — sorted strcmp, snapshot semantics | `bindings/wasm/index.d.ts:281-282` | STABLE (`handler-reads.js:39-46`) |
-| `Node.getSetTags` | query (wasm only) | `getSetTags(name, element) -> string[]` — live tags of an OR-set element | `bindings/wasm/index.d.ts:284` | STABLE (`handler-reads.js:68-74`) |
-| `Node.getRegisterBytes` | query (wasm only) | `getRegisterBytes(name) -> Uint8Array` — raw register payload | `bindings/wasm/index.d.ts:266` | STABLE (`handler-reads.js:88-90`) |
-| `Node.setRegisterBytes` | method (wasm only) | `setRegisterBytes(name, bytes, nodeId?)` — byte-exact inverse | `bindings/wasm/index.d.ts:264` | STABLE (`handler-reads.js:89,108`) |
-| `setRemove` tombstone/`GetSetElementsOptions` behavior | contract | removal leaves tombstones; size counts live only | `bindings/wasm/index.d.ts:95-138` | STABLE (`handler-reads.js:80-83`) |
+| `Node.getSetSize` | query (wasm only) | `getSetSize(name) -> number` — distinct live elements | `bindings/wasm/index.d.ts:509` | STABLE (`handler-reads.js:36`) |
+| `Node.getSetElements` | query (wasm only) | `getSetElements(name, {offset?, limit?<=256}) -> string[]` — sorted strcmp, snapshot semantics | `bindings/wasm/index.d.ts:519-520` | STABLE (`handler-reads.js:39-46`) |
+| `Node.getSetTags` | query (wasm only) | `getSetTags(name, element) -> string[]` — live tags of an OR-set element | `bindings/wasm/index.d.ts:521` | STABLE (`handler-reads.js:68-74`) |
+| `Node.getRegisterBytes` | query (wasm only) | `getRegisterBytes(name) -> Uint8Array` — raw register payload | `bindings/wasm/index.d.ts:503` | STABLE (`handler-reads.js:88-90`) |
+| `Node.setRegisterBytes` | method (wasm only) | `setRegisterBytes(name, bytes, nodeId?)` — byte-exact inverse | `bindings/wasm/index.d.ts:501` | STABLE (`handler-reads.js:89,108`) |
+| `setRemove` tombstone/`GetSetElementsOptions` behavior | contract | removal leaves tombstones; size counts live only | `bindings/wasm/index.d.ts:115-161` | STABLE (`handler-reads.js:80-83`) |
+
+**RESOURCE items, locks and the tx manager (R9):**
+
+| symbol | kind | signature | source | maturity |
+|---|---|---|---|---|
+| `Node.addResource` | method | `addResource(name, initial?)` — the lock-capable `DATA_TYPE_RESOURCE` item ("PN-Counter + lock", raw int64 value) | wasm :439, node :276 | STABLE (`locks-tx.js`; node `test/locks-tx.js`) |
+| `Node.getResource` | query | `getResource(name) -> number` — raw int64 balance readback (wasm throws `resource_not_found`/`type_mismatch`; node returns undefined for unknown, throws for non-RESOURCE) | wasm :446, node :283 | STABLE (`locks-tx.js`) |
+| `Node.getLockState` | query | `getLockState(name) -> LockStateView` — `protocolState` word (`idle`/`locked`/`modified`/`verified`/`error`), `lockOwner`, `lockTokenHex` (the 32-byte CSPRNG bearer token, '' when unset), `lockExpiry`, `lockExtensions` | wasm :454 + LockStateView :195, node :290 + LockStateView :17 | STABLE (`locks-tx.js`) |
+| `Node.attachTxManager` | method | `attachTxManager('memory' \| 'none')` — attaches the replay-protection manager (`src/TxManager/tx_manager.h:19-41` vtable; memory impl `src/TxManager/tx_manager_memory.h:16`) to `state->tx_manager` (`src/CRABS/data_model.h:486`); step 3b refuses duplicates `already_executed` (`src/StateMachine/state_machine.c:1600-1620`) | wasm :465, node :304 | STABLE (`locks-tx.js` duplicate-submission scenario) |
 
 ## 5. One-shot sets / flags and dedup (R2, R3)
 
@@ -155,12 +164,12 @@ Timing semantics of the authenticated HTTPS time source (defaults 30000/1000/500
 
 | symbol | kind | signature | source | maturity |
 |---|---|---|---|---|
-| `Node.registerHandlerJs` | method (wasm only) | `registerHandlerJs(opType, (state: HandlerState, op: HandlerOperation) -> number)` | `bindings/wasm/index.d.ts:303` | STABLE (`smoke.js:59`; re-registration replaces, `smoke.js:71-81`) |
-| `Node.unregisterHandler` | method (wasm only) | `unregisterHandler(opType)` | `bindings/wasm/index.d.ts:304` | STABLE (`smoke.js:83-102`) |
-| `Node.registerHandler` | method (wasm only) | `registerHandler(opType, (statePtr, opPtr) -> number)` — low-level raw WASM pointers | `bindings/wasm/index.d.ts:301` | PRESENT (high-level variant is what tests use) |
-| `HandlerState` | interface (wasm only) | mutation + read proxy: `incrementCounter`, `incrementPNCounter`, `decrementPNCounter`, `setRegister` (int/BigInt, integer-only), `setRegisterBytes`, `setAdd`, `setRemove`, `flagSet`, `getCounter`, `getPNCounter`, `getRegister`, `getRegisterBytes`, `setContains`, `getSetSize`, `getSetElements`, `getSetTags` | `bindings/wasm/index.d.ts:102-141` | STABLE (`registers.js:83-100`, `handler-reads.js:104-126`) |
-| `HandlerState.getSetElements` inside a handler | method (wasm only) | same as Node's, same 256-hard-cap → `getSetElements(name, {limit:999})` throws inside handlers too | `bindings/wasm/index.d.ts:138` + `handler-reads.js:139-146` | STABLE |
-| `HandlerOperation` | interface (wasm only) | `{type, signerId, nodeId, payload?: string}` | `bindings/wasm/index.d.ts:143-148` | STABLE (`smoke.js:59-63`) |
+| `Node.registerHandlerJs` | method (wasm only) | `registerHandlerJs(opType, (state: HandlerState, op: HandlerOperation) -> number)` | `bindings/wasm/index.d.ts:620` | STABLE (`smoke.js:59`; re-registration replaces, `smoke.js:71-81`) |
+| `Node.unregisterHandler` | method (wasm only) | `unregisterHandler(opType)` | `bindings/wasm/index.d.ts:621` | STABLE (`smoke.js:83-102`) |
+| `Node.registerHandler` | method (wasm only) | `registerHandler(opType, (statePtr, opPtr) -> number)` — low-level raw WASM pointers | `bindings/wasm/index.d.ts:618` | PRESENT (high-level variant is what tests use) |
+| `HandlerState` | interface (wasm only) | mutation + read proxy: `incrementCounter`, `incrementPNCounter`, `decrementPNCounter`, `setRegister` (int/BigInt, integer-only), `setRegisterBytes`, `setAdd`, `setRemove`, `flagSet`, `getCounter`, `getPNCounter`, `getRegister`, `getResource`, `adjustResource` (recipe 9), `getRegisterBytes`, `setContains`, `getSetSize`, `getSetElements`, `getSetTags` | `bindings/wasm/index.d.ts:144-191` | STABLE (`registers.js:83-100`, `handler-reads.js:104-126`, `locks-tx.js` transfer handler) |
+| `HandlerState.getSetElements` inside a handler | method (wasm only) | same as Node's, same 256-hard-cap → `getSetElements(name, {limit:999})` throws inside handlers too | `bindings/wasm/index.d.ts:180` + `handler-reads.js:139-146` | STABLE |
+| `HandlerOperation` | interface (wasm only) | `{type, signerId, nodeId, payload?: string, resources: string[]}` — `resources` are the op's declared resource names (recipe 9's transfer handler resolves the pots through them) | `bindings/wasm/index.d.ts:212-218` | STABLE (`smoke.js:59-63`, `locks-tx.js` transfer handler) |
 
 ## 9. ABE encryption (encrypt) (R6)
 
@@ -218,17 +227,20 @@ Domain error taxonomy (`CRABS_ERR_NOT_ITEM_WRITER` etc.) maps in `bindings/node/
 
 | symbol | kind | signature | source | maturity |
 |---|---|---|---|---|
-| `Operation.create` | static (wasm) | `create(type: string) -> Promise<Operation>` | `bindings/wasm/index.d.ts:52` | STABLE (`smoke.js:23`) |
+| `Operation.create` | static (wasm) | `create(type: string) -> Promise<Operation>` | `bindings/wasm/index.d.ts:72-76` | STABLE (`smoke.js:23`) |
 | `new Operation` | ctor (node) | `new Operation(type: string)` | `bindings/node/index.d.ts:47` | STABLE (`test/test.js:66`) |
 | `Operation.deserialize` | static | wasm: async `deserialize(bytes) -> Promise<Operation>`; node `.d.ts` has no `Operation.deserialize` (node round-trips state, not ops) | `bindings/wasm/index.d.ts:53` | STABLE (`smoke.js:33`) |
-| `Operation.serialize` | method | `serialize() -> Uint8Array\|Buffer` ("sign first, then serialize", node :34) | wasm :31, node :35 | STABLE (`smoke.js:31`) |
-| `Operation.sign` (node) | method | `sign(keyPair)` / `signWithPrivateKey(privateKeyHex)` | `bindings/node/index.d.ts:42-43` | STABLE (implied by node test flow) |
-| `operation.signerId` / `.nodeId` | assignment | wasm ops get their signer via `node.sign(op, key)` + fields set by JS (`smoke.js:24-26`); node supports field assignment (`test.js`) | wasm :27-30, node :20-22 | STABLE |
-| `Operation.lamportTime` | property (**node only**) | `lamportTime: number` | `bindings/node/index.d.ts:24` | PRESENT |
-| `Operation.addResource` | method | `addResource(name) -> this` — capacity 8 | wasm :33, node :26 | STABLE (`write-domains.js:46`) |
-| `Node.addResource` | method (**node only**) | `addResource(name)` — a Node-level resource append wasm doesn't expose | `bindings/node/index.d.ts:199` | PRESENT |
-| `Operation.getWireVersion` | method | fresh ops report the build's `wireVersions().op`; parsed ops report the wire's version | wasm :47, node :41 | STABLE (`wire-versions.js:44-56`) |
-| `Operation.destroy` | method (wasm only) | `destroy()` | `bindings/wasm/index.d.ts:48` | STABLE (`smoke.js:103-105`) |
+| `Operation.serialize` | method | `serialize() -> Uint8Array\|Buffer` ("sign first, then serialize", node :34) | wasm :31, node :75 | STABLE (`smoke.js:31`) |
+| `Operation.sign` (node) | method | `sign(keyPair)` / `signWithPrivateKey(privateKeyHex)` | `bindings/node/index.d.ts:82-83` | STABLE (implied by node test flow) |
+| `operation.signerId` / `.nodeId` | assignment | wasm ops get their signer via `node.sign(op, key)` + fields set by JS (`smoke.js:24-26`); node supports field assignment (`test.js`) | wasm :54-60, node :40-44 | STABLE |
+| `Operation.lamportTime` | property (**node only**) | `lamportTime: number` | `bindings/node/index.d.ts:64` | PRESENT |
+| `Operation.addResource` | method | `addResource(name) -> this` — capacity 8 | wasm :33, node :46 | STABLE (`write-domains.js:46`, `locks-tx.js`) |
+| `Node.addResource` | method | `addResource(name, initial?)` — mints the `DATA_TYPE_RESOURCE` lock-capable item (recipe 9; `initial` seeds the raw int64 balance) | wasm :439, node :276 | STABLE (`locks-tx.js:30`, node `test/locks-tx.js`) |
+| `Operation.setRequiredState` | method | `setRequiredState(slotIndex, 'idle'|'locked'|'modified'|'verified'|'error') -> this` — the per-slot `required_state` the executor's step 4 checks; slots are created 'idle' by addResource. Signed (format v4) — set BEFORE signing | wasm :49, node :61 | STABLE (`locks-tx.js`, C mirror `cookbook/snippets/c/09-treasury.c`) |
+| `Operation.setNextState` | method | `setNextState(slotIndex, stateWord) -> this` — the per-slot `next_state` the driver declares (signed) | wasm :52, node :64 | STABLE (`locks-tx.js`) |
+| `Operation.addLockClaim` | method | `addLockClaim(resource, tokenHex) -> this` — one 32-byte bearer-token claim (64 hex chars); the executor's step 5 verifies presented claims against the item's live token. Signed — set BEFORE signing | wasm :61, node :73 | STABLE (`locks-tx.js` forged-claim + ceremony scenarios; `test/test_state_machine.cpp:417` = the C pin for `lock_token_mismatch`) |
+| `Operation.getWireVersion` | method | fresh ops report the build's `wireVersions().op`; parsed ops report the wire's version | wasm :67, node :81 | STABLE (`wire-versions.js:44-56`) |
+| `Operation.destroy` | method (wasm only) | `destroy()` | `bindings/wasm/index.d.ts:68` | STABLE (`smoke.js:103-105`) |
 
 ## 13. KeyPair
 
@@ -283,7 +295,7 @@ Where a recipe capability has **no JS map entry**, that fact is recorded here �
 | R6 | triggers, threshold attributes, ABE | `createTrigger` / `TriggerConfig` (§7, STABLE); threshold conditions live in the C condition grammar `src/Condition/` (PRESENT in C, surface tested via `createTrigger`); `Node.encrypt` (§9, STABLE) |
 | R7 | schedules, `setTimeSource`, HLC | §6; schedules STABLE on both bindings (wasm `bindings/wasm/index.d.ts:501-511`, node `bindings/node/index.d.ts:306-331`, node test pinned), HLC via node `getHLC` (STABLE) + C `src/HLC/hlc.h` (PRESENT) |
 | R8 | OT ordered set surface | **Op layer JS-bound on both bindings** (§15): `addOrderedSet` + `orderedInsert/orderedDelete/orderedMove/orderedSwap` (op id `{node,seq,ts?}` + optional causal `deps`) + `getOrderedSet` readback — wasm `index.d.ts:466-498`, node `index.d.ts:287-319`; executor path `crabs_wasm_ot_apply` (`src/Util/wasm_helpers.c:712`) / `crabs_node.cc:1868`, payload from `crabs_ot_ops_to_wire` (`src/OT/ot_execution.h:49-54`). **Merge layer still C-only:** `crabs_ot_ordered_set_merge` + `merge_position_maps` (`src/OT/ot_ordered_set.h:114-118`) — conflicting-payload refusal and merged position-map guarantees demoable only in C (`test/test_ot_ordered_set.cpp:377-420`) → recipe R8 is PARTIAL with `languages: c wasm node` |
-| R9 | resources, locks / transaction manager | Resources half is STABLE JS: `Operation.addResource` (§12) + node-only `Node.addResource` (§2). Locks / transaction manager are **not JS-bound**: C `src/TxManager/tx_manager.h:19-41` — vtable-based `crabs_tx_manager_t` with `accept/commit/destroy` and `crabs_tx_manager_none()` (accept-everything). Typed lock errors exist (`CRABS_ERR_LOCK_NOT_EXPIRED`, `bindings/node/src/crabs_node.cc:90`) but no lock API surface found in C headers or bindings → recipe R9 is PARTIAL (resources-only); map entries for locks marked DESIGNED |
+| R9 | resources, locks / transaction manager | **Full surface STABLE JS (both bindings)** (recipe 9): `Node.addResource(name, initial?)` + `getResource` (§4) — the lock-capable RESOURCE item mint (wasm export `crabs_wasm_add_resource`, `src/Util/wasm_helpers.c:638`; node `crabs_node.cc:1731`); the lock drive = `__lock__`/`__verify__`/`__unlock__` built-ins + `Node.getLockState(name)` (the live bearer-token read; wasm `wasm_helpers.c:730`, node `crabs_node.cc:1741`) + `Operation.setRequiredState`/`setNextState`/`addLockClaim` (§12; executor steps 4-5, `src/StateMachine/state_machine.c:848-866,1653-1668`); replay = `Node.attachTxManager('memory'|'none')` (wasm `wasm_helpers.c:828`, node `crabs_node.cc:1770` — wraps `src/TxManager/tx_manager.h:19-41` vtable + `crabs_tx_manager_memory`/`crabs_tx_manager_none`). Residual limits: lock state is runtime-only (never serialized), claim discipline stays cooperative (recipe 9's honesty notes), and crabs-node still has no handler surface — the debit/credit *arithmetic* there stays the driver's |
 | R10 | op signing modes / sovereign prefixes | `Operation.setSovereignPrefix` + signing format v4 (§11/§12), STABLE |
 | R11 | Blueprint + spawn + attenuation | §10, STABLE (wasm pointer vs node wrapper divergence documented) |
 | R12 | attestations, parent key chain | `attest`/`lineageAttest`, `lineageTombstone`, `TRUST_MODE` (§10, STABLE); verify-side C functions PRESENT |
@@ -300,7 +312,7 @@ Where a recipe capability has **no JS map entry**, that fact is recorded here �
 4. OR-set pagination (`getSetSize`/`getSetElements`/`getSetTags`) and register byte API (`setRegisterBytes`/`getRegisterBytes`) are wasm-only.
 5. BigInt register/prefix inputs: wasm `number | bigint`, node `number` only.
 6. `Node.off` exists in wasm.d.ts; node relies on the unsubscribe function returned by `on`.
-7. Node-only symbols: `selfAssert`, `verifyIdentity`, `Node.addResource`, `Operation.lamportTime`, `Operation.sign`/`signWithPrivateKey`, `getHLC`+`HLC` interface, `UserInfo.attributes[].expiresAt`.
+7. Node-only symbols: `selfAssert`, `verifyIdentity`, `Operation.lamportTime`, `Operation.sign`/`signWithPrivateKey`, `getHLC`+`HLC` interface, `UserInfo.attributes[].expiresAt`.
 8. Trigger effect unions differ (wasm has create/delete/disable trigger variants; node is `issue_attribute|change_policy` + `policy*` fields).
 9. Lineage shapes: wasm exposes opaque pointers + flat manifest accessors + `attest`; node returns `Node` wrappers + `lineageChildren` + `lineageAttest`.
 10. `Operation.deserialize` and `destroy()` are wasm-side lifecycle obligations; node wrappers rely on ownership semantics documented in the d.ts prose.

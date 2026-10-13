@@ -3,48 +3,63 @@
 //
 // What the machine itself guarantees on this binding, and what this snippet
 // executes:
-//   (1) a node can mint the shared pot — a lock-capable DATA_TYPE_RESOURCE
-//       item (node-only `Node.addResource`);
-//   (2) a signed op that NAMES the pot is gated by the executor: a custom
-//       op is only applied to a LOCKED resource, so the un-coordinated
-//       transfer is refused, never silently applied;
-//   (3) the lease is acquirable — the built-in `__lock__` op type drives
-//       the C lock protocol, and a live pot refuses re-acquisition
-//       (single active lease per RESOURCE item);
-//   (4) a precondition failure (unknown resource) is typed and leaves
-//       nothing behind;
-//   (5) a replay of a previously executed signed op is refused by the
-//       executor's ordering-monotonicity backstop, even without a
-//       tx_manager wired on the JS node.
-// What this binding CANNOT do (the recipe page's GAP blocks): present a
-// lock-claim token, set an op's required protocol states, or drive the
-// extend/verify/rollback/unlock tail of the ceremony — no d.ts symbol
-// exists for any of it.
+//   (1) a node mints the shared pot — a lock-capable DATA_TYPE_RESOURCE item
+//       (`Node.addResource`, now with a seeded balance) and reads its raw
+//       int64 balance back (`Node.getResource`);
+//   (2) a signed op naming the pot is gated by the executor: a handler-less
+//       custom op only acts on a LOCKED resource, so the un-coordinated
+//       transfer is refused, never silently applied
+//       (src/StateMachine/state_machine.c wildcard gate);
+//   (3) the lease is acquirable — the built-in `__lock__` op type drives the
+//       C lock protocol, a live pot refuses re-acquisition (single active
+//       lease), and the 32-byte CSPRNG bearer token is read back live via
+//       `Node.getLockState`;
+//   (4) the full ceremony — a forged claim (wrong bearer token) is refused
+//       lock_token_mismatch before any effect; the claim-bearing op declares
+//       required/next protocol states per slot and advances
+//       LOCKED -> MODIFIED; `__verify__` + `__unlock__` close it;
+//   (5) an attached memory tx manager (`Node.attachTxManager('memory')`)
+//       refuses a duplicate submission of the same signed op with
+//       already_executed, and all-or-nothing preconditions leave a poisoned
+//       op (unknown resource) with no partial apply.
+// crabs-node still has NO custom-handler surface (api-map known difference
+// #2): the debit/credit arithmetic cannot live in a machine handler here —
+// the op-level guarantees (at-most-once log application, the protocol state,
+// every gate) are machine-owned; the value arithmetic stays the driver's
+// (recipe page notes). The handler-owned debit/credit runs on crabs-wasm
+// and C (this recipe's other snippets). The lock is machine-local
+// coordination (runtime-only lock state) and claim discipline is
+// cooperative — the executor verifies the claims an op PRESENTS but forces
+// none.
 
 const assert = require('assert');
 const { Node, KeyPair, Operation } = require('../../../bindings/node');
 
-const node = new Node('node-1', { ordering: 'hlc' });
+const node = new Node('treasury-node', { ordering: 'hlc' });
 
 const treasurerKey = KeyPair.generate();
 node.registerUser('treasurer', treasurerKey.publicKeyHex(), '');
-node.grantRole('treasurer', 'role', 'treasurer', 'node-1');
+node.grantRole('treasurer', 'role', 'treasurer', 'treasury-node');
 
-// The pot: node-only `addResource` mints a DATA_TYPE_RESOURCE item (a
-// PN-counter with a raw int64 balance) — the item type that carries
-// protocol state, lock owner/token/expiry and a pre-lock snapshot
-// (src/CRABS/data_model.h:117-133). Its balance is machine-read only; the
-// JS bindings expose no read for RESOURCE items.
-node.addResource('treasury');
-node.setPolicy('transfer', 'role:treasurer');
-node.setPolicy('__lock__', 'role:treasurer');
+// The pot: `addResource` mints a DATA_TYPE_RESOURCE item — the item type
+// that carries protocol state, lock owner/token/expiry and a pre-lock
+// snapshot (src/CRABS/data_model.h:117-133). `initial` seeds the raw
+// int64 balance; `getResource` is its readback.
+node.addResource('treasury', 1000);
+node.addResource('member_pot', 0);
+assert.strictEqual(node.getResource('treasury'), 1000, 'pot seed');
+assert.strictEqual(node.getResource('member_pot'), 0, 'member seed');
 
-// (1)+(2): the executor refuses an un-coordinated op against the pot. The
-// op is authorized (policy passes), the pot exists and is in the IDLE
-// state the op requires — and the executor still refuses it, because the
-// wildcard apply of a custom op only acts on LOCKED resources
-// (src/StateMachine/state_machine.c:1440-1452).
-const uncoordinated = new Operation('transfer');
+for (const opType of ['__lock__', '__verify__', '__rollback__', '__unlock__',
+                      'observe', 'record_transfer']) {
+  node.setPolicy(opType, 'role:treasurer');
+}
+
+// (2): the executor refuses an un-coordinated op against the pot. The op is
+// authorized (policy passes), the pot exists and is IDLE — and the executor
+// still refuses it: the wildcard apply of a handler-less custom op only
+// acts on LOCKED resources (state_machine.c).
+const uncoordinated = new Operation('record_transfer');
 uncoordinated.signerId = 'treasurer';
 uncoordinated.addResource('treasury');
 node.sign(uncoordinated, treasurerKey);
@@ -57,84 +72,133 @@ try {
 }
 
 // (3): acquire the lease on the pot through the built-in op type.
-const acquire = new Operation('__lock__');
-acquire.signerId = 'treasurer';
-acquire.addResource('treasury');
-node.sign(acquire, treasurerKey);
-node.execute(acquire);
+const lock = () => {
+  const op = new Operation('__lock__');
+  op.signerId = 'treasurer';
+  op.addResource('treasury');
+  node.sign(op, treasurerKey);
+  node.execute(op);
+};
+lock();
 
-// The live lease refuses re-acquisition: the pot is no longer IDLE, so a
-// second `__lock__` — the same signer's, even — is refused before any
-// token is minted (state_machine_op_lock, src/StateMachine/state_machine.c:1710).
-const reacquire = new Operation('__lock__');
-reacquire.signerId = 'treasurer';
-reacquire.addResource('treasury');
-node.sign(reacquire, treasurerKey);
+const live = node.getLockState('treasury');
+assert.strictEqual(live.protocolState, 'locked', 'lease acquired');
+assert.strictEqual(live.lockOwner, 'treasurer', 'lease owner');
+assert.strictEqual(live.lockTokenHex.length, 64,
+  'bearer token: 32 bytes of CSPRNG hex');
+
+// A live lease refuses re-acquisition: the pot is no longer IDLE, so a
+// second `__lock__` — the same signer's, even — is refused
+// (state_machine_op_lock's IDLE requirement).
 try {
-  node.execute(reacquire);
+  lock();
   throw new Error('a live lease must refuse re-acquisition');
 } catch (refusal) {
   assert(refusal.message.includes('protocol_violation'),
     `expected protocol_violation, got: ${refusal.message}`);
 }
 
-// The honest limit, demonstrated: once locked, a transfer op naming the
-// pot fails the required-state check (the op builder cannot declare
-// required_state PROTOCOL_LOCKED) — a JS-locked pot is not spendable by
-// op at all, from anyone, until the lease expires and is pruned by the
-// next execute (state_machine.c:364-407).
-const whileLocked = new Operation('transfer');
-whileLocked.signerId = 'treasurer';
-whileLocked.addResource('treasury');
-node.sign(whileLocked, treasurerKey);
+// (4): a forged claim — a wrong bearer token — is refused BEFORE any effect
+// (executor step 5 verifies each presented claim against the live token).
+const forged = new Operation('record_transfer');
+forged.signerId = 'treasurer';
+forged.addResource('treasury');
+forged.setRequiredState(0, 'locked');
+forged.setNextState(0, 'modified');
+forged.addLockClaim('treasury', 'ff'.repeat(32));
+node.sign(forged, treasurerKey);
 try {
-  node.execute(whileLocked);
-  throw new Error('an op on a LOCKED pot must be refused here (no required_state)');
+  node.execute(forged);
+  throw new Error('a forged claim must be refused');
 } catch (refusal) {
-  assert(refusal.message.includes('protocol_violation'),
-    `expected protocol_violation, got: ${refusal.message}`);
+  assert(refusal.message.includes('lock_token_mismatch'),
+    `expected lock_token_mismatch, got: ${refusal.message}`);
 }
+assert.strictEqual(node.getLockState('treasury').protocolState, 'locked',
+  'a refused op never moves the protocol state');
 
-// (4): precondition checks are typed and leave nothing behind — an op
-// naming a resource the machine never minted fails inside the same
-// step-4 precondition pass that gates required states
-// (state_machine.c:846-857), before any effect.
-const ghostTransfer = new Operation('transfer');
-ghostTransfer.signerId = 'treasurer';
-ghostTransfer.addResource('ghost_treasury');
-node.sign(ghostTransfer, treasurerKey);
-try {
-  node.execute(ghostTransfer);
-  throw new Error('an op naming an unknown resource must be refused');
-} catch (refusal) {
-  assert(refusal.message.includes('resource_not_found'),
-    `expected resource_not_found, got: ${refusal.message}`);
-}
+// (4) cont.: the honest claim-bearing op — required/next states declared per
+// slot, the LIVE token claimed — advances LOCKED -> MODIFIED through the
+// wildcard apply (no handler owns 'record_transfer' on this binding, so the
+// machine's wildcard carries the transition while the value arithmetic
+// stays the driver's). Then `__verify__` and `__unlock__` close the
+// ceremony.
+const apply = new Operation('record_transfer');
+apply.signerId = 'treasurer';
+apply.addResource('treasury');
+apply.setRequiredState(0, 'locked');
+apply.setNextState(0, 'modified');
+apply.addLockClaim('treasury', live.lockTokenHex);
+node.sign(apply, treasurerKey);
+node.execute(apply);
+assert.strictEqual(node.getLockState('treasury').protocolState, 'modified',
+  'claim-bearing apply advances LOCKED->MODIFIED');
 
-// (5): what a signed transfer CANNOT do: play twice. Mint an item the
-// machine can actually apply (a counter — non-RESOURCE items skip the
-// wildcard lock gate), apply one transfer op, then re-execute the SAME
-// signed op bytes. The ordering-monotonicity backstop catches the replay
-// (state_signer_has_replay, src/StateMachine/state_machine.c:585).
-// The machine does not bump the counter — a custom op carries intent, the
-// value arithmetic is the driver's (Recipe 2); what the machine guarantees
-// is that the op is applied to the log at most once.
+const ceremony = (opType, fromState) => {
+  const op = new Operation(opType);
+  op.signerId = 'treasurer';
+  op.addResource('treasury');
+  op.setRequiredState(0, fromState);
+  op.addLockClaim('treasury', node.getLockState('treasury').lockTokenHex);
+  node.sign(op, treasurerKey);
+  node.execute(op);
+};
+ceremony('__verify__', 'modified');
+assert.strictEqual(node.getLockState('treasury').protocolState, 'verified',
+  '__verify__ promotes MODIFIED->VERIFIED');
+ceremony('__unlock__', 'verified');
+assert.strictEqual(node.getLockState('treasury').protocolState, 'idle',
+  '__unlock__ returns the pot to IDLE');
+assert.strictEqual(node.getLockState('treasury').lockTokenHex, '',
+  'unlock clears the bearer token');
+
+// (5): apply exactly once under the memory tx manager — the manager records
+// committed op uuids and the executor's step 3b (after the signature check)
+// refuses the duplicate with already_executed. Without a manager the
+// ordering backstop (state_signer_has_replay) still rejects a replayed op;
+// the manager covers uuids whose ordering state could not catch them.
+node.attachTxManager('memory');
 node.addCounter('transfer_ledger');
-node.setPolicy('record_transfer', 'role:treasurer');
-
-const firstTransfer = new Operation('record_transfer');
-firstTransfer.signerId = 'treasurer';
-firstTransfer.addResource('transfer_ledger');
-node.sign(firstTransfer, treasurerKey);
-node.execute(firstTransfer);
-
+const record = () => {
+  const op = new Operation('record_transfer');
+  op.signerId = 'treasurer';
+  op.addResource('transfer_ledger');
+  op.setRequiredState(0, 'idle');
+  op.setNextState(0, 'idle');
+  node.sign(op, treasurerKey);
+  node.execute(op);
+  return op;
+};
+const applied = record();
 try {
-  node.execute(firstTransfer); // same signed op, same ordering timestamp
-  throw new Error('re-executing a recorded transfer op must be refused');
+  node.execute(applied); // same signed op, re-submitted
+  throw new Error('a duplicate submission must be refused');
 } catch (replay) {
   assert(replay.message.includes('already_executed'),
     `expected already_executed, got: ${replay.message}`);
 }
 
-console.log('treasury OK: gate enforced, lease acquired + re-acquisition refused, preconditions typed, replay refused');
+// All-or-nothing preconditions: one unknown item poisons the whole op — the
+// transition check runs over EVERY named resource before anything moves, so
+// nothing is logged. The pots' balances (driver arithmetic aside) are
+// demonstrably untouched by refusals.
+try {
+  const poisoned = new Operation('record_transfer');
+  poisoned.signerId = 'treasurer';
+  poisoned.addResource('treasury');
+  poisoned.addResource('ghost_treasury');
+  poisoned.setRequiredState(0, 'idle');
+  poisoned.setNextState(0, 'idle');
+  poisoned.setRequiredState(1, 'idle');
+  poisoned.setNextState(1, 'idle');
+  node.sign(poisoned, treasurerKey);
+  node.execute(poisoned);
+  throw new Error('an op naming an unknown resource must be refused');
+} catch (refusal) {
+  assert(refusal.message.includes('resource_not_found'),
+    `expected resource_not_found, got: ${refusal.message}`);
+}
+assert.strictEqual(node.getResource('treasury'), 1000, 'refusals left the pot');
+
+console.log('treasury OK: pot minted + read, gate enforced, lease acquired + contested refused, forged claim refused, ceremony completes, duplicate refused under the tx manager, poisoned op applies nothing');
 // Node/KeyPair expose no destroy() — native cleanup is process-exit driven.
