@@ -13,8 +13,8 @@ const { Operation, wireVersions } = require('..');
   // Constants are exposed and match the documented build values
   // (serialization.h CRABS_SERIAL_VERSION, state_machine.h
   // CRABS_OP_FORMAT_VERSION, serialization.h CRABS_SIGNING_FORMAT_VERSION).
-  if (versions.state !== 15) {
-    throw new Error(`wireVersions.state=${versions.state}, expected 15`);
+  if (versions.state !== 17) {
+    throw new Error(`wireVersions.state=${versions.state}, expected 17`);
   }
   if (versions.op !== 6) {
     throw new Error(`wireVersions.op=${versions.op}, expected 6`);
@@ -30,7 +30,7 @@ const { Operation, wireVersions } = require('..');
   try {
     versions.state = 0;  // silent no-op under freeze (sloppy mode)
   } catch (_) { /* strict-mode engines throw here — also acceptable */ }
-  if (versions.state !== 15) {
+  if (versions.state !== 17) {
     throw new Error('wireVersions was mutable');
   }
 
