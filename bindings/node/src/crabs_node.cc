@@ -44,6 +44,7 @@ extern "C" {
 #include "CRDT/crdt_merge.h"
 #include "CRDT/one_shot.h"
 #include "Lineage/lineage.h"
+#include "Scheduler/scheduler.h"
 #include "TimeSource/time_source.h"
 #include "Raft/raft_module.h"
 #include "Util/platform.h"
@@ -156,6 +157,39 @@ static std::string to_lower_ascii(const std::string& value) {
     if (ch >= 'A' && ch <= 'Z') ch = (char)(ch - 'A' + 'a');
   }
   return lowered;
+}
+
+// Timed-transactions argument parsing (v1): the schedule surface carries
+// epoch ms / intervals / counts / ids as JS numbers (the node binding's
+// number-only convention, mirroring setRegister), while the C scheduler API
+// is uint64. Bigints are accepted too (mirroring the raft handle args) so a
+// schedule id round-trips back into cancelSchedule unchanged. Every double
+// must be a finite, non-negative integer within JS's exact-integer range
+// (2^53) so the double→uint64 conversion never truncates or wraps.
+static uint64_t require_u64_numeric(const Napi::Value& value,
+                                    const char* method, const char* field) {
+  if (value.IsBigInt()) {
+    bool lossless = false;
+    const uint64_t raw = value.As<Napi::BigInt>().Uint64Value(&lossless);
+    if (!lossless) {
+      throw Napi::RangeError::New(value.Env(),
+          std::string(method) + ": " + field + " exceeds the 64-bit range");
+    }
+    return raw;
+  }
+  if (!value.IsNumber()) {
+    throw Napi::TypeError::New(value.Env(),
+        std::string(method) + ": " + field +
+        " must be a non-negative number or bigint");
+  }
+  const double raw = value.As<Napi::Number>().DoubleValue();
+  if (!std::isfinite(raw) || raw < 0 || raw >= 9007199254740992.0 ||
+      raw != floor(raw)) {
+    throw Napi::RangeError::New(value.Env(),
+        std::string(method) + ": " + field +
+        " must be an integer 0..2^53-1");
+  }
+  return (uint64_t)raw;
 }
 
 // trustMode — string word or the wire number (mirrors the wasm bindings'
@@ -835,6 +869,16 @@ public:
       InstanceMethod("setPolicy", &Node::SetPolicy),
       InstanceMethod("defineOperationType", &Node::DefineOperationType),
       InstanceMethod("execute", &Node::Execute),
+      // Timed transactions (v1) — mirror of the wasm surface
+      // (bindings/wasm/index.d.ts:501-511)
+      InstanceMethod("schedule", &Node::Schedule),
+      InstanceMethod("scheduleRecurring", &Node::ScheduleRecurring),
+      InstanceMethod("cancelSchedule", &Node::CancelSchedule),
+      InstanceMethod("processSchedules", &Node::ProcessSchedules),
+      InstanceMethod("setScheduleOccurrenceBudget",
+                     &Node::SetScheduleOccurrenceBudget),
+      InstanceMethod("scheduleOccurrenceBudget", &Node::ScheduleOccurrenceBudget),
+      InstanceMethod("pendingSchedules", &Node::PendingSchedules),
       InstanceMethod("on", &Node::On),
       InstanceMethod("sign", &Node::SignOp),
       InstanceMethod("createTrigger", &Node::CreateTrigger),
@@ -1828,6 +1872,164 @@ private:
     if (rc != CRABS_SUCCESS && rc != CRABS_ERR_ORDERING_PENDING)
       throw crabs_error(env, rc, "execute");
     return env.Undefined();
+  }
+
+  // --- Timed transactions (v1) ---
+  //
+  // Mirror of the wasm schedule surface (bindings/wasm/index.d.ts:501-511).
+  // The submission-time authorization gate lives HERE in the wrapper:
+  // state_machine_validate (policy + signature + key version + co-signatures
+  // + read-only domain check) runs BEFORE the op is queued, mirroring
+  // crabs_wasm_schedule (src/Util/wasm_helpers.c:1509-1519). The later
+  // materialization deliberately skips re-authorization — the scheduler
+  // executes with the authorization step off
+  // (src/Scheduler/scheduler.c:337-338). The scheduler serializes its own
+  // copy of the embedded op at submission, so the JS Operation keeps its
+  // lifetime; the pending entries are durable machine state.
+
+  // Queue a signed op for materialization at executeAtMs. Returns the
+  // schedule id (a positive bigint) or throws the typed authorization /
+  // serialization refusal.
+  Napi::Value Schedule(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 2 || !info[0].IsObject())
+      throw Napi::TypeError::New(env, "Expected schedule(Operation, executeAtMs)");
+    Operation* op = Operation::Unwrap(info[0].As<Napi::Object>());
+    if (op == nullptr)
+      throw Napi::TypeError::New(env, "schedule: expected an Operation");
+    const uint64_t execute_at_ms =
+        require_u64_numeric(info[1], "schedule", "executeAtMs");
+    // Submission-time authorization (mirrors crabs_wasm_schedule). Read-only.
+    crabs_error_e validate_rc =
+        state_machine_validate(&am_->base_state, op->raw());
+    if (validate_rc != CRABS_SUCCESS)
+      throw crabs_error(env, validate_rc, "schedule");
+    const uint64_t schedule_id = scheduler_schedule(
+        &am_->base_state, execute_at_ms, op->raw()->signer_id, op->raw());
+    if (schedule_id == 0) {
+      // 0 means invalid input (empty submitter) or a serialization failure
+      // while stamping the pending copy — distinguish them for the caller.
+      throw crabs_error(env,
+          op->raw()->signer_id[0] == '\0' ? CRABS_ERR_INVALID_PARAM
+                                          : CRABS_ERR_SERIALIZATION_ERROR,
+          "schedule");
+    }
+    return Napi::BigInt::New(env, (int64_t)schedule_id);
+  }
+
+  // Queue a recurring series: fires at startAtMs then every intervalMs until
+  // repeatCount fires have happened (0 = infinite) or the slots pass
+  // endAtMs (0 = none), whichever comes first.
+  Napi::Value ScheduleRecurring(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 5 || !info[0].IsObject())
+      throw Napi::TypeError::New(
+          env, "Expected scheduleRecurring(Operation, startAtMs, intervalMs, "
+               "repeatCount, endAtMs)");
+    Operation* op = Operation::Unwrap(info[0].As<Napi::Object>());
+    if (op == nullptr)
+      throw Napi::TypeError::New(env, "scheduleRecurring: expected an Operation");
+    // Argument bounds are checked BEFORE submission so a malformed arg can
+    // never queue with a silently truncated cadence.
+    const uint64_t start_at_ms =
+        require_u64_numeric(info[1], "scheduleRecurring", "startAtMs");
+    const uint64_t interval_ms =
+        require_u64_numeric(info[2], "scheduleRecurring", "intervalMs");
+    const uint64_t repeat_count =
+        require_u64_numeric(info[3], "scheduleRecurring", "repeatCount");
+    const uint64_t end_at_ms =
+        require_u64_numeric(info[4], "scheduleRecurring", "endAtMs");
+    // Submission-time authorization (mirrors crabs_wasm_schedule). Read-only.
+    crabs_error_e validate_rc =
+        state_machine_validate(&am_->base_state, op->raw());
+    if (validate_rc != CRABS_SUCCESS)
+      throw crabs_error(env, validate_rc, "scheduleRecurring");
+    const uint64_t schedule_id = scheduler_schedule_recurring(
+        &am_->base_state, start_at_ms, interval_ms, repeat_count, end_at_ms,
+        op->raw()->signer_id, op->raw());
+    if (schedule_id == 0) {
+      throw crabs_error(env,
+          op->raw()->signer_id[0] == '\0' ? CRABS_ERR_INVALID_PARAM
+                                          : CRABS_ERR_SERIALIZATION_ERROR,
+          "scheduleRecurring");
+    }
+    return Napi::BigInt::New(env, (int64_t)schedule_id);
+  }
+
+  // Remove one pending schedule by id. resource_not_found when absent.
+  Napi::Value CancelSchedule(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 1 ||
+        (!info[0].IsBigInt() && !info[0].IsNumber()))
+      throw Napi::TypeError::New(env,
+          "cancelSchedule: scheduleId must be a number or bigint");
+    const uint64_t schedule_id =
+        require_u64_numeric(info[0], "cancelSchedule", "scheduleId");
+    crabs_error_e rc = scheduler_cancel(&am_->base_state, schedule_id);
+    if (rc != CRABS_SUCCESS) throw crabs_error(env, rc, "cancelSchedule");
+    return env.Undefined();
+  }
+
+  // Materialize every pending schedule whose due time has passed. The tick
+  // is an EXPLICIT clock poke: nowMs defaults to the wall clock (the same
+  // Date.now() default the wasm wrapper carries, bindings-core.js:1316),
+  // but every demo and test passes an explicit `now`. Failures are recorded
+  // as __schedule_failed__ entries per the C contract and never propagated.
+  Napi::Value ProcessSchedules(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    const uint64_t now_ms = info.Length() > 0 && !info[0].IsUndefined()
+        ? require_u64_numeric(info[0], "processSchedules", "nowMs")
+        : (uint64_t)std::chrono::duration_cast<std::chrono::milliseconds>(
+              std::chrono::system_clock::now().time_since_epoch()).count();
+    crabs_error_e rc = scheduler_process_due(&am_->base_state, now_ms);
+    if (rc != CRABS_SUCCESS) throw crabs_error(env, rc, "processSchedules");
+    return env.Undefined();
+  }
+
+  // Per-tick ceiling on materialized scheduled occurrences (0 = unlimited).
+  // Node-local runtime policy, never serialized (scheduler.h:52-55).
+  Napi::Value SetScheduleOccurrenceBudget(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 1 || !info[0].IsNumber())
+      throw Napi::RangeError::New(env,
+          "setScheduleOccurrenceBudget: maxPerTick must be an integer 0..2^32-1");
+    const double max_per_tick = info[0].As<Napi::Number>().DoubleValue();
+    if (max_per_tick < 0 || max_per_tick > (double)UINT32_MAX ||
+        max_per_tick != floor(max_per_tick))
+      throw Napi::RangeError::New(env,
+          "setScheduleOccurrenceBudget: maxPerTick must be an integer 0..2^32-1");
+    scheduler_set_max_occurrences_per_tick(&am_->base_state,
+                                           (uint32_t)max_per_tick);
+    return env.Undefined();
+  }
+
+  Napi::Value ScheduleOccurrenceBudget(const Napi::CallbackInfo& info) {
+    return Napi::Number::New(info.Env(),
+                             (double)am_->base_state.max_occurrences_per_tick);
+  }
+
+  // The pending queue in submission order (also after restore): one row per
+  // entry with the same shape the wasm wrapper returns.
+  Napi::Value PendingSchedules(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    Napi::Array rows = Napi::Array::New(env);
+    uint32_t row_index = 0;
+    for (const scheduled_operation_t* entry =
+             scheduler_first(&am_->base_state);
+         entry != NULL; entry = entry->next) {
+      Napi::Object row = Napi::Object::New(env);
+      row.Set("id", Napi::BigInt::New(env, (int64_t)entry->schedule_id));
+      row.Set("executeAt",
+              Napi::BigInt::New(env, (int64_t)entry->execute_at_ms));
+      row.Set("intervalMs",
+              Napi::BigInt::New(env, (int64_t)entry->interval_ms));
+      row.Set("repeatCount",
+              Napi::BigInt::New(env, (int64_t)entry->repeat_count));
+      row.Set("endAt", Napi::BigInt::New(env, (int64_t)entry->end_at_ms));
+      row.Set("submitter", Napi::String::New(env, entry->submitter));
+      rows.Set(row_index++, row);
+    }
+    return rows;
   }
 
   // --- Triggers ---

@@ -713,5 +713,199 @@ try {
     'the refused retry must not add new membership');
 }
 
+// Test: schedule surface — timed transactions on crabs-node (recipe 7).
+// Mirrors bindings/wasm/test/schedules.js: a one-off mint, the not-due
+// idempotent skip, due materializes exactly once, cancel + tick past ->
+// never fires, a recurring 3-fire catch-up in order, and the per-tick
+// occurrence budget. crabs-node has no registerHandlerJs surface, so the
+// scheduled op drives the machine's wildcard path (a policy-authorized
+// type naming an existing resource) and each materialized slot is
+// observable as a 'schedule'-kind change event with a "scheduled <op>"
+// preview — the submission event instead says "scheduled at <ms>" (the
+// ChangeHookFiresPerMaterializedSlot shape in test/test_scheduler.cpp).
+{
+  const schedNode = new Node('admin', { ordering: 'hlc' });
+  const mintKey = KeyPair.generate();
+  schedNode.registerUser('alice', mintKey.publicKeyHex(), '');
+  schedNode.grantRole('alice', 'role', 'member', 'admin');
+  const outsiderKey = KeyPair.generate();
+  schedNode.registerUser('mallory', outsiderKey.publicKeyHex(), '');
+  schedNode.setPolicy('mint', 'role:member');
+  schedNode.addCounter('tokens');
+
+  const scheduleEvents = [];  // kind 'schedule', type 'mint'
+  const failureEvents = [];   // kind 'schedule', type '__schedule_failed__'
+  schedNode.on('change', (changeEvent) => {
+    if (changeEvent.kind !== 'schedule') return;
+    if (changeEvent.type === '__schedule_failed__') failureEvents.push(changeEvent);
+    else if (changeEvent.type === 'mint') scheduleEvents.push(changeEvent);
+  });
+  const fireEvents = () => scheduleEvents.filter(
+    (changeEvent) => !changeEvent.preview.startsWith('scheduled at '));
+
+  const signMintOp = () => {
+    const op = new Operation('mint');
+    op.signerId = 'alice';
+    op.addResource('tokens');
+    schedNode.sign(op, mintKey);
+    return op;
+  };
+
+  // Fixed demo clock, mirroring schedules.js:30 — never the wall clock.
+  const now = 1000000000000;
+
+  // Submission-time authorization: the wrapper must validate (policy +
+  // signature + key version) BEFORE queueing, mirroring
+  // crabs_wasm_schedule's state_machine_validate gate.
+  const unauthorized = new Operation('mint');
+  unauthorized.signerId = 'mallory';
+  unauthorized.addResource('tokens');
+  schedNode.sign(unauthorized, outsiderKey);
+  let scheduleUnauthorizedRefused = false;
+  try {
+    schedNode.schedule(unauthorized, now + 5000);
+  } catch (authorizationRefusal) {
+    scheduleUnauthorizedRefused =
+      authorizationRefusal.message.includes('unauthorized');
+  }
+  assert(scheduleUnauthorizedRefused,
+    'schedule must refuse an op whose signer lacks the policy (unauthorized)');
+
+  // One-off: mint in +60s.
+  const scheduleId = schedNode.schedule(signMintOp(), now + 60000);
+  assert(scheduleId > 0n && typeof scheduleId === 'bigint',
+    `schedule must return a positive bigint id, got ${scheduleId}`);
+  assert(schedNode.pendingSchedules().length === 1,
+    `one scheduled op must be pending, got ${schedNode.pendingSchedules().length}`);
+  assert(schedNode.pendingSchedules()[0].submitter === 'alice',
+    'pending row must name the submitter');
+  assert(schedNode.pendingSchedules()[0].executeAt === BigInt(now + 60000),
+    'pending row must carry the due time');
+
+  // Not due yet: nothing materializes.
+  schedNode.processSchedules(now);
+  assert(schedNode.pendingSchedules().length === 1,
+    `a not-due tick must keep the op pending, got ${schedNode.pendingSchedules().length}`);
+  assert(fireEvents().length === 0 && failureEvents.length === 0,
+    'nothing may fire (or fail) before the due time');
+
+  // Due: materializes exactly once.
+  schedNode.processSchedules(now + 60001);
+  assert(schedNode.pendingSchedules().length === 0,
+    'a due one-shot must leave the pending queue');
+  assert(fireEvents().length === 1,
+    `expected one materialized fire, got ${fireEvents().length}`);
+  assert(fireEvents()[0].result === 0 && fireEvents()[0].signer === 'alice',
+    'the materialized mint must land successfully signed by alice');
+  // Idempotent: another tick re-materializes nothing.
+  schedNode.processSchedules(now + 60002);
+  assert(fireEvents().length === 1,
+    'a materialized op must not run twice');
+
+  // Cancel: a queued change of plans must be retrievable before due.
+  const cancelId = schedNode.schedule(signMintOp(), now + 120000);
+  schedNode.cancelSchedule(cancelId);
+  assert(schedNode.pendingSchedules().length === 0,
+    'a cancelled schedule must leave the pending queue');
+  // And it must stay materialized-away: tick past the would-be due time.
+  schedNode.processSchedules(now + 120001);
+  assert(fireEvents().length === 1,
+    'a cancelled schedule must never materialize');
+  // Cancellation is typed: an unknown id is resource_not_found.
+  let unknownCancelTyped = false;
+  try {
+    schedNode.cancelSchedule(987654321n);
+  } catch (cancelRefusal) {
+    unknownCancelTyped = cancelRefusal.message.includes('resource_not_found');
+  }
+  assert(unknownCancelTyped,
+    'cancelSchedule on an unknown id must be typed resource_not_found');
+
+  // Recurring: 3 slots at 1s intervals, catch-up in one IN-ORDER pass, then
+  // the series is exhausted. The row describes the series.
+  const recurringId = schedNode.scheduleRecurring(signMintOp(), now + 1000, 1000, 3, 0);
+  assert(recurringId > 0n, 'scheduleRecurring must return a positive id');
+  const recurringRow = schedNode.pendingSchedules()[0];
+  assert(recurringRow.intervalMs === 1000n,
+    `recurring row must carry the interval, got ${recurringRow.intervalMs}`);
+  assert(recurringRow.repeatCount === 3n,
+    `recurring row must carry the fire count, got ${recurringRow.repeatCount}`);
+  assert(recurringRow.endAt === 0n,
+    `recurring row must carry the (unset) end, got ${recurringRow.endAt}`);
+  assert(recurringRow.executeAt === BigInt(now + 1000),
+    `recurring row must carry the first slot, got ${recurringRow.executeAt}`);
+  schedNode.processSchedules(now);
+  assert(schedNode.pendingSchedules().length === 1 &&
+           fireEvents().length === 1,
+    'a not-due recurring series must stay pending, unfired');
+  schedNode.processSchedules(now + 3500);
+  assert(schedNode.pendingSchedules().length === 0,
+    'a fully caught-up series must leave the pending queue');
+  assert(fireEvents().length === 4,
+    `expected 1 one-off + 3 recurring fires, got ${fireEvents().length}`);
+  assert(failureEvents.length === 0,
+    `every slot must fire cleanly, got ${failureEvents.length} failure records`);
+
+  // Occurrence budget: bounds the per-tick catch-up burst. Slots 1000 and
+  // 2000 fire in the first tick; slot 3000 stays pending at its exact slot
+  // until the budget is lifted, then fires.
+  schedNode.scheduleRecurring(signMintOp(), now + 1000, 1000, 3, 0);
+  schedNode.setScheduleOccurrenceBudget(2);
+  assert(schedNode.scheduleOccurrenceBudget() === 2,
+    'the budget setter must be reflected by the getter');
+  schedNode.processSchedules(now + 3500);
+  assert(schedNode.pendingSchedules().length === 1,
+    'the budget must defer the third slot, keeping it pending');
+  assert(fireEvents().length === 6,
+    `budget must cap the burst (expected 6, got ${fireEvents().length})`);
+  schedNode.setScheduleOccurrenceBudget(0);  // 0 = unlimited
+  assert(schedNode.scheduleOccurrenceBudget() === 0,
+    'budget 0 (unlimited) must read back as 0');
+  schedNode.processSchedules(now + 3500);
+  assert(schedNode.pendingSchedules().length === 0,
+    'the deferred slot must fire once the budget lifts');
+  assert(fireEvents().length === 7,
+    `deferred slot must fire once the budget lifts (expected 7, got ${fireEvents().length})`);
+
+  // Typed argument rejections mirroring the binding's other surfaces.
+  function expectArgumentRejection(thunk, errorType, fragment, label) {
+    try {
+      thunk();
+      assert(false, `${label} should throw`);
+    } catch (rejection) {
+      assert(rejection instanceof errorType &&
+               rejection.message.includes(fragment),
+        `${label} should throw ${errorType.name} with "${fragment}", got ` +
+        `${rejection}`);
+    }
+  }
+  expectArgumentRejection(() => schedNode.schedule('nope', now),
+    TypeError, 'Operation', 'schedule(string)');
+  expectArgumentRejection(() => schedNode.schedule(signMintOp(), -1),
+    RangeError, 'executeAtMs', 'schedule(negative due)');
+  expectArgumentRejection(() => schedNode.schedule(signMintOp()),
+    TypeError, 'executeAtMs', 'schedule(missing due)');
+  expectArgumentRejection(() =>
+      schedNode.scheduleRecurring(signMintOp(), now, -1000, 3, 0),
+    RangeError, 'intervalMs', 'scheduleRecurring(negative interval)');
+  expectArgumentRejection(() =>
+      schedNode.scheduleRecurring(signMintOp(), now, 1000, 3),
+    TypeError, 'endAtMs', 'scheduleRecurring(missing endAt)');
+  expectArgumentRejection(() => schedNode.cancelSchedule('x'),
+    TypeError, 'cancelSchedule', 'cancelSchedule(string id)');
+  expectArgumentRejection(() => schedNode.processSchedules('tomorrow'),
+    TypeError, 'processSchedules', 'processSchedules(string)');
+
+  // An op signed by NO registered user fails the same submission gate —
+  // the policy evaluation fails closed on the unresolvable signer
+  // (_verify_operation_authorization).
+  const ghostOp = new Operation('mint');
+  ghostOp.signerId = 'ghost';
+  ghostOp.addResource('tokens');
+  schedNode.sign(ghostOp, KeyPair.generate());
+  expectArgumentRejection(() => schedNode.schedule(ghostOp, now + 5000),
+    Error, 'unauthorized', 'schedule(unknown signer)');
+}
+
 console.log(`\n${passed} passed, ${failed} failed`);
 process.exit(failed > 0 ? 1 : 0);

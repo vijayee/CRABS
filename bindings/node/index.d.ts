@@ -292,6 +292,44 @@ export interface Node {
   sign(op: Operation, key: KeyPair | string): void;
   execute(op: Operation): void;
 
+  // Timed transactions (v1) — mirror of the wasm surface
+  // (bindings/wasm/index.d.ts:501-510). The submission-time authorization
+  // gate lives in the wrapper: every schedule* call runs the machine's
+  // read-only validate pass (policy + signature + key version +
+  // co-signatures + domain check, state_machine_validate) BEFORE queueing,
+  // and throws the typed crabs error on refusal. Materialization (below)
+  // deliberately skips re-authorization — the fire re-runs only the domain
+  // check and the engine's guards; a failed fire is recorded as an
+  // '__schedule_failed__' entry and never propagated.
+  /**
+   * Queue a signed op for materialization at executeAtMs (epoch ms).
+   * Returns the schedule id (per-state monotonic, persists past a
+   * serialize/restore round trip) as a bigint.
+   */
+  schedule(innerOp: Operation, executeAtMs: number): bigint;
+  /**
+   * Queue a recurring series: fires at startAtMs, then every intervalMs,
+   * until repeatCount fires have happened (0 = infinite) or the slots pass
+   * endAtMs (0 = no end), whichever comes first.
+   */
+  scheduleRecurring(innerOp: Operation, startAtMs: number, intervalMs: number,
+                    repeatCount: number, endAtMs: number): bigint;
+  /** Remove one pending schedule before it fires (resource_not_found when absent). */
+  cancelSchedule(scheduleId: bigint | number): void;
+  /**
+   * Explicit clock poke: materialize everything due against `nowMs`
+   * (epoch ms). Defaults to the wall clock — pass it explicitly in demos
+   * and tests.
+   */
+  processSchedules(nowMs?: number): void;
+  /** Per-tick ceiling on materialized scheduled occurrences (0 = unlimited). */
+  setScheduleOccurrenceBudget(maxPerTick: number): void;
+  scheduleOccurrenceBudget(): number;
+  /** The pending queue in submission order. */
+  pendingSchedules(): Array<{ id: bigint; executeAt: bigint;
+                              intervalMs: bigint; repeatCount: bigint;
+                              endAt: bigint; submitter: string }>;
+
   // Triggers
   createTrigger(config: TriggerConfig): void;
 
