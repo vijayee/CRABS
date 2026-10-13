@@ -14,6 +14,7 @@
 #include "../OT/ot_tree.h"
 #include "../CRDT/crdt_merge.h"
 #include "../CRDT/one_shot.h"
+#include "../Raft/raft_module.h"
 #include "../Serialization/serialization.h"
 #include "../Util/allocator.h"
 #include <openssl/crypto.h>
@@ -386,6 +387,16 @@ void state_destroy(state_t* state) {
     free(state->triggers);
   }
   scheduler_destroy_all(state);
+  // Raft ordering module runtime state (Phase 1): the pending-proposal list
+  // is state-owned heap; raft_module_state was parsed from a loaded v16
+  // section (state-owned raft_module_state_destroy). Never touch
+  // state->raft_module — the module object is host-created and host-owned.
+  state_raft_destroy_pending(state);
+  if (state->raft_module_state != NULL) {
+    crabs_raft_module_state_destroy(
+        (crabs_raft_module_state_t*)state->raft_module_state);
+    state->raft_module_state = NULL;
+  }
   if (state->tx_manager != NULL) {
     crabs_tx_manager_t* tx = (crabs_tx_manager_t*)state->tx_manager;
     if (tx->vtable.destroy != NULL) tx->vtable.destroy(tx);

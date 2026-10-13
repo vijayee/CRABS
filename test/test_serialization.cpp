@@ -3513,7 +3513,7 @@ TEST(StateSerialize, V14ItemDomainRoundTrip) {
 
   serialized_buffer_t* buf = crabs_serialize_state(original);
   ASSERT_NE(buf, nullptr);
-  ASSERT_EQ((uint32_t)CRABS_SERIAL_VERSION, 15u);
+  ASSERT_EQ((uint32_t)CRABS_SERIAL_VERSION, 16u);   // v16: Raft module section appended
 
   state_t* restored = crabs_deserialize_state(buf->data, buf->len);
   ASSERT_NE(restored, nullptr);
@@ -3702,6 +3702,16 @@ TEST(StateSerialize, V13BlobLoadsAllFreeMerge) {
   // Version 15 -> 13 (pre-domain-tail). The downgraded blob's item values
   // load through the legacy raw-int64 path regardless of content shape —
   // this test asserts only domain-field defaults.
+  // v16 downgrade: the module section is a single attached-flag byte (0x00,
+  // no module) after the MSK flag and before the checksum — strip it for a
+  // pre-16 blob shape.
+  size_t module_flag_offset = buf->len - CRABS_HASH_SIZE - 1;
+  ASSERT_EQ(buf->data[module_flag_offset], 0x00)
+      << "module section of a module-less v16 blob is exactly one 0x00 byte";
+  memmove(buf->data + module_flag_offset, buf->data + module_flag_offset + 1,
+          buf->len - module_flag_offset - 1);
+  buf->len -= 1;
+
   buf->data[4] = 13;
   v14_rehash(buf);
 

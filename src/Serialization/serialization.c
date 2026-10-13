@@ -13,6 +13,7 @@
 #include "../Trigger/trigger.h"
 #include "../Condition/condition.h"
 #include "../Lineage/lineage.h"
+#include "../Raft/raft_module.h"
 #include <string.h>
 #include <stdlib.h>
 #include <openssl/sha.h>
@@ -2144,6 +2145,49 @@ static serialized_buffer_t* _serialize_state_internal(const state_t* state,
     _write_uint8(buf, 0);
   }
 
+  // Raft ordering module (v16): the namespace-separated module-state
+  // section, appended after the lineage/MSK sections. The durable state
+  // exports from the runtime-attached module pointer (NULL → attached flag
+  // 0 — "no module", the pre-16 default). Fail loud: never emit a section
+  // the reader would reject (cap violations refuse the whole serialize).
+  _write_uint8(buf, state->raft_module != NULL ? 1 : 0);
+  if (state->raft_module != NULL) {
+    crabs_raft_module_state_t* module_state = crabs_raft_module_export_state(
+        (crabs_raft_module_t*)state->raft_module);
+    if (module_state == NULL) {
+      free(buf->data);
+      free(buf);
+      return NULL;
+    }
+    bool module_state_ok = module_state->log_count <= CRABS_RAFT_MAX_LOG_ENTRIES &&
+                           module_state->commit_index <= module_state->log_count;
+    for (const crabs_raft_entry_persisted_t* entry = module_state->log;
+         module_state_ok && entry != NULL; entry = entry->next) {
+      module_state_ok = entry->wire_len >= 1 &&
+                        entry->wire_len <= CRABS_RAFT_MAX_OP_WIRE_BYTES;
+    }
+    if (module_state_ok) {
+      _write_uint8(buf, module_state->module_id);
+      _write_uint64_le(buf, module_state->term);
+      _write_string16(buf, module_state->voted_for);
+      _write_uint64_le(buf, module_state->commit_index);
+      _write_uint32_le(buf, module_state->log_count);
+      for (const crabs_raft_entry_persisted_t* entry = module_state->log;
+           entry != NULL; entry = entry->next) {
+        _write_uint64_le(buf, entry->term);
+        _write_uint64_le(buf, entry->proposal_id);
+        _write_uint32_le(buf, entry->wire_len);
+        _write_bytes(buf, entry->op_wire, entry->wire_len);
+      }
+    }
+    crabs_raft_module_state_destroy(module_state);
+    if (!module_state_ok) {
+      free(buf->data);
+      free(buf);
+      return NULL;
+    }
+  }
+
   // Checksum: SHA-256 of all preceding bytes.
   // NOTE: this is an INTEGRITY/CORRUPTION check, NOT authentication. An
   // attacker who can modify the blob can recompute this hash. Loading state
@@ -2732,6 +2776,70 @@ static state_t* _deserialize_state_internal(const uint8_t* data, size_t len,
       }
       OPENSSL_cleanse(sealed_blob, sealed_len);
       free(sealed_blob);
+    }
+  }
+
+  // Raft ordering module (v16): the namespace-separated module-state
+  // section, appended after the lineage/MSK sections. The parse result is
+  // stored as a RUNTIME-ONLY snapshot (state->raft_module_state) — the
+  // module OBJECT itself is host-created; the host imports the snapshot
+  // with crabs_raft_module_import_state. Pre-16 blobs leave the snapshot
+  // NULL (no module attached — the zero-default behavior).
+  if (version >= 16) {
+    uint8_t module_attached;
+    if (!_read_uint8(&buf, &module_attached)) goto fail;
+    if (module_attached > 1) goto fail;   // the flag is boolean on the wire
+    if (module_attached == 1) {
+      crabs_raft_module_state_t* module_state =
+          (crabs_raft_module_state_t*)get_clear_memory(
+              sizeof(crabs_raft_module_state_t));
+      if (module_state == NULL) goto fail;
+      bool ok = _read_uint8(&buf, &module_state->module_id) &&
+                _read_uint64_le(&buf, &module_state->term) &&
+                _read_string16(&buf, module_state->voted_for,
+                               CRABS_MAX_USER_ID) &&
+                _read_uint64_le(&buf, &module_state->commit_index) &&
+                _read_uint32_le(&buf, &module_state->log_count);
+      ok = ok && module_state->log_count <= CRABS_RAFT_MAX_LOG_ENTRIES &&
+           module_state->commit_index <= module_state->log_count;
+      // Every entry needs its full framing plus at least one op-wire byte;
+      // a count above what the remaining bytes could satisfy refuses the
+      // load (same bound-then-allocate discipline as every section above).
+      ok = ok && (size_t)module_state->log_count <=
+                      (buf.len - buf.offset) / (8 + 8 + 4);
+
+      crabs_raft_entry_persisted_t** entry_tail = &module_state->log;
+      for (uint32_t entry_index = 0; ok && entry_index < module_state->log_count;
+           entry_index++) {
+        crabs_raft_entry_persisted_t* entry =
+            (crabs_raft_entry_persisted_t*)get_clear_memory(
+                sizeof(crabs_raft_entry_persisted_t));
+        ok = ok && _read_uint64_le(&buf, &entry->term) &&
+             _read_uint64_le(&buf, &entry->proposal_id) &&
+             _read_uint32_le(&buf, &entry->wire_len);
+        ok = ok && entry->wire_len >= 1 &&
+             entry->wire_len <= CRABS_RAFT_MAX_OP_WIRE_BYTES &&
+             (size_t)entry->wire_len <= buf.len - buf.offset;
+        if (!ok) {
+          free(entry);
+          break;
+        }
+        entry->op_wire = (uint8_t*)get_memory(entry->wire_len);
+        if (entry->op_wire == NULL ||
+            !_read_bytes(&buf, entry->op_wire, entry->wire_len)) {
+          free(entry->op_wire);
+          free(entry);
+          ok = false;
+          break;
+        }
+        *entry_tail = entry;
+        entry_tail = &entry->next;
+      }
+      if (!ok) {
+        crabs_raft_module_state_destroy(module_state);
+        goto fail;
+      }
+      state->raft_module_state = module_state;
     }
   }
 

@@ -601,6 +601,29 @@ typedef struct state_t {
   // executing an op that runs the state machine again), which would
   // double-fire triggers whose last_triggered_at is not yet written.
   bool             trigger_ticking;
+  // ============================================================
+  // Raft ordering module (raft-ordering plan, Phase 1)
+  // ============================================================
+  // Runtime-only; NEVER serialized as an object and NOT owned by the state.
+  // The module OBJECT is host-created (crabs_raft_module_create) and the
+  // host destroys it; the state only holds the pointer for the pipeline
+  // seam (state_attach_raft_module). The module's durable STATE persists
+  // namespace-separatedly in the v16 machine-section module block:
+  //   void* raft_module       → crabs_raft_module_t* (Raft/raft_module.h)
+  //   void* raft_module_state → crabs_raft_module_state_t* parsed from the
+  //     v16 section of a loaded blob (state_owned heap; state_destroy frees
+  //     it via crabs_raft_module_state_destroy). The host hands it to a
+  //     freshly created module with crabs_raft_module_import_state.
+  //   raft_pending_proposal_t* raft_pending_proposals → uuid-keyed pending
+  //     proposals of the two-phase pipeline seam (validated at submission,
+  //     materialized on the module's commit notification). Runtime-only
+  //     reconstruction aid: the MODULE log in the v16 section is the source
+  //     of truth for what was proposed; this list only bridges the current
+  //     process between submission and commit (a restart repopulates commit
+  //     notifications from the module, not from here). Freed by state_destroy.
+  void* raft_module;
+  void* raft_module_state;
+  void* raft_pending_proposals;   // raft_pending_proposal_t* (state_machine.h)
 } state_t;
 
 // ============================================================

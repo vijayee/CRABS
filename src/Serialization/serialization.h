@@ -18,7 +18,7 @@
 // Magic bytes and format version (§13.1)
 // ============================================================
 #define CRABS_SERIAL_MAGIC      0x42415243  // "CRAB" in little-endian
-#define CRABS_SERIAL_VERSION    15          // v15: struct-backed counter/register item values serialize logical content (node-sorted entries / register payload+ts+node), not the struct's first 8 bytes (a heap pointer) — fixes chain-digest determinism and struct-item restore
+#define CRABS_SERIAL_VERSION    16          // v16: appended the namespace-separated Raft ordering-module section after the lineage/MSK sections — attached flag u8, module_id u8, term u64le, voted-for string16, commit index u64, log u32 count + per-entry {u64 term, u64 proposal_id, u32 wire_len, op wire bytes}; pre-16 blobs load with no module attached (v15: struct-backed counter/register item values serialize logical content (node-sorted entries / register payload+ts+node), not the struct's first 8 bytes (a heap pointer) — fixes chain-digest determinism and struct-item restore)
 
 // Canonical-form version byte emitted by crabs_serialize_for_signing (§7.5).
 // Purely domain-separation: nothing parses the signing form, so this MUST

@@ -195,6 +195,63 @@ void state_machine_log_schedule_failure(state_t* state,
                                         const uint8_t uuid[CRABS_UUID_SIZE],
                                         const char* signer_id);
 
+// ============================================================
+// Raft ordering module seam (raft-ordering plan, Phase 1)
+// ============================================================
+// Two-phase pipeline for GROUP_ORDERED items, following the scheduler's
+// pending-op precedent: an op reaching the executor is VALIDATED through the
+// full pre-handler gate chain (via state_machine_validate), then routed to
+// the attached module's propose path and enqueued as a pending proposal
+// keyed by the op's uuid, WITHOUT executing. The uuid keeps the pending
+// entry resolvable when the module later reports the commit, so the
+// committed op may materialize through the executor's non-authorizing
+// materialization path (validated once, at submission). The entry is NOT a
+// durability record — the module's own log (v16 module section) is the
+// source of truth for what was proposed.
+typedef struct raft_pending_proposal_t {
+  uint8_t  uuid[CRABS_UUID_SIZE];
+  uint64_t proposal_id;      // module-assigned log index (0 while unknown)
+  uint8_t* op_bytes;         // crabs_serialize_operation form (heap)
+  uint32_t op_len;
+  struct raft_pending_proposal_t* next;
+} raft_pending_proposal_t;
+
+// Bound on the pending list like every other pending store (the scheduler
+// caps due-per-tick; this caps in-flight proposals): a wedged module or
+// runaway submitter cannot grow it without limit.
+#define CRABS_RAFT_MAX_PENDING_PROPOSALS 1024
+
+// Attach (or detach with NULL) the machine's ordering module. RUNTIME-ONLY:
+// the module object is host-created and host-owned, never serialized and
+// never freed by the state. Module state persists through the v16 section.
+crabs_error_e state_attach_raft_module(state_t* state, void* raft_module);
+
+// The attached module (NULL when none) — passthrough view of the runtime
+// pointer; typed crabs_raft_module_t* at the caller.
+void* state_raft_module(const state_t* state);
+
+// Executor for MODULE-COMMITTED operations (the "raft materialization"
+// sibling of state_machine_execute_scheduled): full pipeline with
+// non-authorizing skip semantics (validated at submission), then removes
+// the matching pending proposal. The DOMAIN_CHECK GROUP_ORDERED arm admits
+// an op through here only when its uuid is still pending on the state —
+// a committed op that was never proposed is a protocol violation.
+// Preview prefix "committed".
+crabs_error_e state_machine_execute_committed(state_t* state, operation_t* op);
+
+// Host-side notification pump: drains the attached module's notifications;
+// RAFT_NOTIFY_COMMITTED_OP deserializes the carried op wire and materializes
+// it with state_machine_execute_committed (removing the pending proposal).
+// Other notification kinds return their codes' CRABS_SUCCESS (leadership
+// changes are host concerns). Returns SUCCESS after a full drain; a
+// materialization failure is recorded to the change hook (like scheduled
+// failures) and the pump continues — the module is always left drained so a
+// poison notification cannot wedge the host loop.
+crabs_error_e state_raft_process_notifications(state_t* state);
+
+// Free the pending-proposal list (called from state_destroy).
+void state_raft_destroy_pending(state_t* state);
+
 uint32_t       state_machine_prune_expired(state_t* state, uint64_t now_ms);
 
 // Built-in trigger operations (Amendment 1, §4) — defined in trigger.c

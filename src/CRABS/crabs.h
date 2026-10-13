@@ -126,7 +126,10 @@ typedef enum {
   CRABS_ERR_SEQ_MISMATCH     = 0xA002,  // stale/duplicate item_seq on a SOVEREIGN op
   CRABS_ERR_FORK_DETECTED    = 0xA003,  // same item_seq, different digest — writer equivocation
   CRABS_ERR_ORDERING_PATH    = 0xA004,  // direct write to a GROUP_ORDERED item (module propose path required)
-  CRABS_ERR_QUARANTINED      = 0xA005   // writer present in the item's fork-evidence set
+  CRABS_ERR_QUARANTINED      = 0xA005,  // writer present in the item's fork-evidence set
+  // Raft ordering module (raft-ordering plan, Phase 1)
+  CRABS_ERR_ORDERING_PENDING = 0xA006,  // accepted by the ordering module, NOT executed — pending commit
+  CRABS_ERR_ORDERING_NOT_LEADER = 0xA007 // ordering module refused the proposal: this node is not the leader
 } crabs_error_e;
 
 // ============================================================

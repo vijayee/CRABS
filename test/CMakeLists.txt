@@ -61,6 +61,8 @@ if (BUILD_TESTING)
         test_tx_manager.cpp
         test_devtools.cpp
         test_scheduler.cpp
+        test_raft_module.cpp
+        test_raft_sim.cpp
         test_lineage_body_writer.c
     )
 

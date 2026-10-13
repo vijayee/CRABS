@@ -19,6 +19,7 @@
 #include "../Util/allocator.h"
 #include "../TxManager/tx_manager.h"
 #include "../Scheduler/scheduler.h"
+#include "../Raft/raft_module.h"
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -1076,11 +1077,16 @@ static crabs_error_e _run_domain_check(state_t* state, const operation_t* op) {
     if (item == NULL) continue;
     switch (item->write_domain) {
       case CRABS_DOMAIN_GROUP_ORDERED:
-        // v1 seam: no ordering module can be registered (creation refuses a
-        // nonzero ordering_module, so it is always 0), and writes are only
-        // legal through a module's propose path — every direct write is
-        // off-path.
-        return CRABS_ERR_ORDERING_PATH;
+        // Group writes are legal ONLY through the attached ordering module's
+        // two-phase pipeline (executor Step 0 intercepts every group write
+        // before any mutation and routes propose / committed-
+        // materialization), so DOMAIN_CHECK itself never gates an inline
+        // group write. No module attached → every direct write is off-path
+        // (the v1 fail-closed seam, unchanged).
+        if (state->raft_module == NULL) {
+          return CRABS_ERR_ORDERING_PATH;
+        }
+        return CRABS_SUCCESS;
       case CRABS_DOMAIN_SOVEREIGN: {
         // Cheap checks first: quarantine set membership, then writer
         // attribution, then the chain prefix. The Task 6
@@ -1172,10 +1178,217 @@ static crabs_error_e _apply_sovereign_bookkeeping(state_t* state,
   return CRABS_SUCCESS;
 }
 
+// ============================================================
+// Raft ordering module seam (raft-ordering plan, Phase 1)
+// ============================================================
+static crabs_error_e state_machine_execute_internal(state_t* state, operation_t* op,
+                                                    bool skip_authorization,
+                                                    bool process_schedules);
+
+// True when any named EXISTING resource is a GROUP_ORDERED item. The
+// attached-module check lives at the call site (Step 0): a detached module
+// falls back to DOMAIN_CHECK's fail-closed rejection.
+static bool _op_touches_group_ordered_item(state_t* state, const operation_t* op) {
+  if (state == NULL || op == NULL) return false;
+  for (uint32_t resource_index = 0; resource_index < op->resource_count;
+       resource_index++) {
+    const data_item_t* item = state_find_item(state, op->resources[resource_index]);
+    if (item != NULL && item->write_domain == CRABS_DOMAIN_GROUP_ORDERED) {
+      return true;
+    }
+  }
+  return false;
+}
+
+static const raft_pending_proposal_t* _raft_pending_find(
+    const state_t* state, const uint8_t uuid[CRABS_UUID_SIZE]) {
+  for (const raft_pending_proposal_t* entry = (const raft_pending_proposal_t*)state->raft_pending_proposals;
+       entry != NULL; entry = entry->next) {
+    if (memcmp(entry->uuid, uuid, CRABS_UUID_SIZE) == 0) return entry;
+  }
+  return NULL;
+}
+
+static void _raft_pending_remove(state_t* state, const uint8_t uuid[CRABS_UUID_SIZE]) {
+  raft_pending_proposal_t** link =
+      (raft_pending_proposal_t**)&state->raft_pending_proposals;
+  while (*link != NULL) {
+    if (memcmp((*link)->uuid, uuid, CRABS_UUID_SIZE) == 0) {
+      raft_pending_proposal_t* removed = *link;
+      *link = removed->next;
+      free(removed->op_bytes);
+      free(removed);
+      return;
+    }
+    link = &(*link)->next;
+  }
+}
+
+// Two-phase routing (scheduler pending-op precedent): serialize the op,
+// hand it to the module's propose path, and enqueue the uuid-keyed pending
+// proposal. Returns CRABS_ERR_ORDERING_PENDING — accepted into the module's
+// log, NOT executed. Refusals (not leader / over-cap / full log) surface as
+// the module's error code plus its own notification; the pending list is
+// untouched.
+static crabs_error_e _raft_route_proposal(state_t* state, const operation_t* op) {
+  if (state->raft_pending_proposals != NULL) {
+    uint32_t pending_count = 0;
+    for (const raft_pending_proposal_t* entry =
+             (const raft_pending_proposal_t*)state->raft_pending_proposals;
+         entry != NULL; entry = entry->next) {
+      pending_count++;
+    }
+    // Bound the list like every other pending store (scheduler precedent);
+    // a wedged module must not grow it without limit.
+    if (pending_count >= CRABS_RAFT_MAX_PENDING_PROPOSALS) {
+      return CRABS_ERR_INTERNAL;
+    }
+  }
+  // Duplicate uuid while pending: the submission was already routed.
+  if (_raft_pending_find(state, op->uuid) != NULL) {
+    return CRABS_ERR_ALREADY_EXECUTED;
+  }
+  // Duplicate uuid already materialized into the machine log (the op was
+  // proposed, committed and executed earlier): idempotent skip, no new
+  // proposal (the scheduler's pending-store uuid guard, mirrored here).
+  for (uint64_t log_index = 0; log_index < state->log_count; log_index++) {
+    if (memcmp(state->log[log_index].uuid, op->uuid, CRABS_UUID_SIZE) == 0) {
+      return CRABS_ERR_ALREADY_EXECUTED;
+    }
+  }
+  serialized_buffer_t* wire = crabs_serialize_operation(op);
+  if (wire == NULL) return CRABS_ERR_SERIALIZATION_ERROR;
+  uint64_t proposal_id = 0;
+  crabs_error_e rc = crabs_raft_module_propose(
+      (crabs_raft_module_t*)state->raft_module, op, &proposal_id);
+  if (rc != CRABS_SUCCESS) {
+    serialized_buffer_destroy(wire);
+    return rc;
+  }
+  raft_pending_proposal_t* entry =
+      (raft_pending_proposal_t*)get_clear_memory(sizeof(raft_pending_proposal_t));
+  memcpy(entry->uuid, op->uuid, CRABS_UUID_SIZE);
+  entry->proposal_id = proposal_id;
+  entry->op_bytes = wire->data;   // blob ownership moves into the entry
+  entry->op_len = (uint32_t)wire->len;
+  free(wire);   // release the wrapper only
+  entry->next = (raft_pending_proposal_t*)state->raft_pending_proposals;
+  state->raft_pending_proposals = entry;
+  return CRABS_ERR_ORDERING_PENDING;
+}
+
+crabs_error_e state_attach_raft_module(state_t* state, void* raft_module) {
+  if (state == NULL) return CRABS_ERR_INVALID_PARAM;
+  state->raft_module = raft_module;
+  return CRABS_SUCCESS;
+}
+
+void* state_raft_module(const state_t* state) {
+  return state != NULL ? state->raft_module : NULL;
+}
+
+void state_raft_destroy_pending(state_t* state) {
+  if (state == NULL) return;
+  raft_pending_proposal_t* entry = (raft_pending_proposal_t*)state->raft_pending_proposals;
+  while (entry != NULL) {
+    raft_pending_proposal_t* next = entry->next;
+    free(entry->op_bytes);
+    free(entry);
+    entry = next;
+  }
+  state->raft_pending_proposals = NULL;
+}
+
+// Executor for MODULE-COMMITTED operations — the raft sibling of
+// state_machine_execute_scheduled. Full pipeline with non-authorizing skip
+// semantics (everything was validated at submission); the uuid-pending gate
+// in Step 0 admits the op. The pending proposal is consumed either way: a
+// successful pass executed it into the log; a failed pass surfaces its
+// error through the pump (a committed op that fails materialization must
+// not wedge the notification loop).
+crabs_error_e state_machine_execute_committed(state_t* state, operation_t* op) {
+  char preview[CRABS_MAX_OP_NAME + CRABS_MAX_USER_ID + 16];
+  memcpy(preview, "committed ", strlen("committed "));
+  _op_preview(op, preview + strlen("committed "),
+              sizeof(preview) - strlen("committed "));
+  crabs_error_e rc = state_machine_execute_internal(state, op, true, false);
+  _raft_pending_remove(state, op->uuid);
+  if (rc != CRABS_ERR_ALREADY_EXECUTED) {
+    state_notify_change_for_op(state, CRABS_CHANGE_OP, op, preview, rc);
+  }
+  return rc;
+}
+
+crabs_error_e state_raft_process_notifications(state_t* state) {
+  if (state == NULL || state->raft_module == NULL) return CRABS_ERR_INVALID_PARAM;
+  crabs_raft_module_t* module = (crabs_raft_module_t*)state->raft_module;
+  crabs_error_e first_error = CRABS_SUCCESS;
+  crabs_raft_notification_t notification;
+  while (crabs_raft_module_poll_notification(module, &notification)) {
+    if (notification.kind != RAFT_NOTIFY_COMMITTED_OP) {
+      continue;   // leadership changes are host concerns; module stays drained
+    }
+    operation_t* op = crabs_deserialize_operation(notification.op_bytes,
+                                                  notification.op_len);
+    if (op == NULL) {
+      // A committed op that cannot be deserialized is a hard corruption —
+      // surface it but never stop draining (fail loudly, keep looping).
+      if (first_error == CRABS_SUCCESS) {
+        first_error = CRABS_ERR_SERIALIZATION_ERROR;
+      }
+      continue;
+    }
+    crabs_error_e rc = state_machine_execute_committed(state, op);
+    operation_destroy(op);
+    if (rc != CRABS_SUCCESS && rc != CRABS_ERR_ALREADY_EXECUTED &&
+        first_error == CRABS_SUCCESS) {
+      first_error = rc;
+    }
+  }
+  return first_error;
+}
+
 static crabs_error_e state_machine_execute_internal(state_t* state, operation_t* op,
                                                     bool skip_authorization,
                                                     bool process_schedules) {
   if (state == NULL || op == NULL) return CRABS_ERR_INVALID_PARAM;
+
+  // Step 0: Raft ordering module seam (raft-ordering plan, Phase 1). An op
+  // naming a GROUP_ORDERED item NEVER executes inline. Placement: before
+  // every mutation, the transaction-manager accept, and the dedup guard —
+  // a routed proposal must leave ZERO executor side effects (the committed
+  // materialization re-runs the full pipeline later).
+  //   - No module attached: today's fail-closed rejection (ORDERING_PATH).
+  //   - Non-authorizing pass with a uuid that is NOT pending (e.g. a
+  //     scheduled slot firing on a group item): off-path write → reject.
+  //     Only the committed materialization (uuid pending) proceeds below.
+  //   - Normal submission: validate through the full pre-handler gate chain
+  //     (the scheduler's submission-time precedent: authorization may never
+  //     depend on the later fire time), route the op into the module's
+  //     propose path, enqueue the uuid-keyed pending proposal, and return
+  //     CRABS_ERR_ORDERING_PENDING — accepted, not executed.
+  if (_op_touches_group_ordered_item(state, op)) {
+    if (state->raft_module == NULL) {
+      return CRABS_ERR_ORDERING_PATH;
+    }
+    if (skip_authorization) {
+      if (_raft_pending_find(state, op->uuid) == NULL) {
+        return CRABS_ERR_ORDERING_PATH;
+      }
+      // fall through: committed materialization — the pipeline below runs
+      // with non-authorizing semantics (validated at submission).
+    } else {
+      // Submission gate: the FULL pre-handler gate chain runs against the
+      // current machine (the scheduler's state_machine_validate precedent —
+      // authorization may never depend on the later fire time). The
+      // validation error propagates verbatim.
+      crabs_error_e gate_rc = state_machine_validate(state, op);
+      if (gate_rc != CRABS_SUCCESS) {
+        return gate_rc;
+      }
+      return _raft_route_proposal(state, op);
+    }
+  }
 
   // Step 1: Prune expired locks
   uint64_t now_ms;
