@@ -146,7 +146,26 @@ BASE_EXPORTS='[
   "_crabs_wasm_lineage_attest",
   "_crabs_wasm_lineage_tombstone",
   "_crabs_wasm_lineage_find_manifest_entry",
-  "_crabs_wasm_register_lineage_ops"
+  "_crabs_wasm_register_lineage_ops",
+  "_crabs_wasm_raft_create",
+  "_crabs_wasm_raft_destroy",
+  "_crabs_wasm_raft_tick",
+  "_crabs_wasm_raft_inbound",
+  "_crabs_wasm_raft_propose",
+  "_crabs_wasm_raft_change_membership",
+  "_crabs_wasm_raft_persist_complete",
+  "_crabs_wasm_raft_recover_from_persist",
+  "_crabs_wasm_raft_pump",
+  "_crabs_wasm_raft_poll_outbound",
+  "_crabs_wasm_raft_poll_persist_request",
+  "_crabs_wasm_raft_poll_notification",
+  "_crabs_wasm_raft_is_leader",
+  "_crabs_wasm_raft_committed_tip",
+  "_crabs_wasm_raft_current_term",
+  "_crabs_wasm_raft_log_length",
+  "_crabs_wasm_raft_config_change_pending",
+  "_crabs_wasm_raft_rejected_message_count",
+  "_crabs_wasm_raft_committed_members"
 ]'
 
 DEVTOOLS_EXPORTS='[

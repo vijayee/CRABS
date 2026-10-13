@@ -183,7 +183,7 @@ export interface DefineItemOptions {
   domain?: 'free' | 'sovereign' | 'group';
   /** Required for 'sovereign': the item's single-writer user id. */
   writer?: string;
-  /** 'group' only; v1 ships no ordering modules, so only 0 is legal. */
+  /** 'group' only; must match the moduleId of the attached raft module. */
   orderingModule?: number;
 }
 
@@ -207,6 +207,107 @@ export type TimeSourceInfo =
   | { mode: 'system' }
   | { mode: 'https'; url: string | null; resyncMs: number;
       timeoutMs: number; maxSkewMs: number; created: boolean };
+
+// ============================================================
+// Raft ordering module — reference host types
+// ============================================================
+// The raft module orders GROUP_ORDERED writes through a two-phase
+// pipeline (submit → pending → committed → materialized). Hosts drive the
+// module through the reference RaftHost; its transport/storage/timer seams
+// are user-replaceable.
+
+export interface RaftHostOptions {
+  /** Own identity among peers (defaults to adminId). */
+  nodeId?: string;
+  /** ALL cluster members including this node; 1..16 entries. */
+  peers?: string[];
+  /** Reference setTimeout tick interval in ms (default 100). */
+  tickMs?: number;
+  /** Module timer knobs; 0/undefined uses the C defaults (1500/3000/500). */
+  timers?: { electionMinMs?: number; electionMaxMs?: number;
+             heartbeatMs?: number };
+  /** Deterministic seed for randomized election-timeout deadlines. */
+  seed?: number;
+  /** Per-machine ordering-module id (v16 state section). Default 0. */
+  moduleId?: number;
+}
+
+/** Point diagnostics of the attached raft module. */
+export interface RaftStatus {
+  nodeId: string;
+  isLeader: boolean;
+  term: number;
+  commitTip: number;
+  logLength: number;
+  configChangePending: boolean;
+  peerCount: number;
+}
+
+/** One drained raft control blob (opaque — the host never parses it). */
+export interface RaftOutboundMessage {
+  /** Wire kind (RAFT_MSG_* numbers). */
+  kind: number;
+  to: string;
+  blob: Uint8Array;
+}
+
+/** One reported persist window — a VIEW: unresolved until acknowledged. */
+export interface RaftPersistRequest {
+  handle: bigint;
+  blob: Uint8Array;
+}
+
+/** Raw notification (hosts bypassing the state pipeline only). */
+export interface RaftNotification {
+  kind: number;
+  peerId: string;
+  proposalId: number;
+  commitIndex: number;
+  opBytes: Uint8Array;
+}
+
+export interface RaftHost {
+  /**
+   * The transport seam: drained control blobs go anywhere (WebSocket,
+   * relay, in-memory queues). Incoming blobs return through
+   * Node.raftDeliver(peerId, blob). Replaces the default throw (a host
+   * with no transport simply queues undelivered messages).
+   */
+  setRaftTransport(fn?: (peerId: string, blob: Uint8Array) => void |
+                       Promise<void>): void;
+  /**
+   * The storage seam: persist windows are stored anywhere durable
+   * (IndexedDB, localStorage, a server). Resolving the returned promise
+   * acknowledges the window (persist_complete true); rejecting marks it
+   * failed. While a async store is in flight the host stops polling the
+   * persist queue (the module re-reports an unresolved handle).
+   */
+  setRaftStorage(fn?: (handle: bigint, blob: Uint8Array) => void |
+                     Promise<void>): void;
+  /** Start / stop the reference setTimeout tick loop (options.tickMs). */
+  startRaftHost(): void;
+  stopRaftHost(): void;
+  /** Manual tick at an explicit time (Date.now() when omitted). */
+  raftTick(nowMs?: number): void;
+  /** Manual materialization pump at an explicit time. */
+  raftPump(nowMs?: number): void;
+  /** Manual outbound drain WITHOUT the transport seam. */
+  raftPollOutbound(): RaftOutboundMessage[];
+  /** Report (does not consume) the outstanding persist window. */
+  raftPollPersistRequest(): RaftPersistRequest | null;
+  /** Acknowledge a window from raftPollPersistRequest. */
+  raftPersistComplete(handle: bigint, ok: boolean): void;
+  /**
+   * Raw notification drain — for hosts driving the module WITHOUT the
+   * state pipeline ONLY. State-attached hosts use raftPump (the pump
+   * consumes this queue itself; double-draining drops committed ops).
+   */
+  raftPollNotifications(): RaftNotification[];
+  /** Borrowed crabs_raft_module_t pointer (raw-propose / membership). */
+  moduleHandle(): number;
+  status(): RaftStatus;
+  destroy(): void;
+}
 
 export interface Node {
   getNodeKey(): NodeKey;
@@ -293,9 +394,35 @@ export interface Node {
   flagValue(name: string): boolean;
 
   setPolicy(opType: string, expression: string): void;
+  /**
+   * Executes a validated op. A GROUP_ORDERED write on a machine with an
+   * attached raft module resolves normally (not throwing): the two-phase
+   * pipeline ACCEPTS the op as a pending proposal (ordering_pending) and it
+   * materializes on commit, surfaced as a 'change' event by the pump.
+   */
   execute(op: Operation): void;
   sign(op: Operation, key: KeyPair | string): void;
   createTrigger(config: TriggerConfig): void;
+
+  // ============================================================
+  // Raft ordering module — reference host (GROUP_ORDERED writes)
+  // ============================================================
+  /**
+   * Attach a raft ordering module to this machine and return the RaftHost
+   * driving it. This is a REFERENCE host — the transport, storage and
+   * timer seams it wires are user-replaceable (see RaftHost). The
+   * attachment is what routes group-item writes through the two-phase
+   * pipeline: before any attach they fail closed (ordering_path).
+   */
+  attachRaft(options?: RaftHostOptions): RaftHost;
+  /**
+   * Transport receive half: inject one inbound raft control blob from
+   * peerId and drain the module cascade it provokes (outbound transport,
+   * persist windows, notification materialization).
+   */
+  raftDeliver(peerId: string, blob: Uint8Array): void;
+  /** Point diagnostics (null when detached). */
+  raftStatus(): RaftStatus | null;
 
   // Low-level handler: receives raw WASM pointers (statePtr, opPtr).
   registerHandler(opType: string, handler: (statePtr: number, opPtr: number) => number): void;

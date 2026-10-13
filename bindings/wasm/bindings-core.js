@@ -186,6 +186,8 @@ const ERROR_MESSAGES = {
   0x7004: 'tracker_not_found', 0x7005: 'flag_not_found',
   0xA001: 'not_item_writer', 0xA002: 'seq_mismatch', 0xA003: 'fork_detected',
   0xA004: 'ordering_path', 0xA005: 'quarantined',
+  0xA006: 'ordering_pending', 0xA007: 'ordering_not_leader',
+  0xA008: 'ordering_change_in_flight',
 };
 
 function crabsError(code, ctx) {
@@ -972,7 +974,16 @@ class Node {
   }
 
   execute(op) {
-    wrapRc(this._M._crabs_wasm_execute(this._am, op._ptr), 'execute');
+    // RAFT ordering module path: a GROUP_ORDERED write through an attached
+    // module returns ordering_pending (0xA006) — the op was ACCEPTED into
+    // the module's log as a pending proposal and materializes on commit
+    // (pumped by the raft host or processRaftNotifications at later now). An
+    // attachment-less direct write to a group item still throws (the v1
+    // fail-closed 'ordering_path' seam). Other error codes keep their
+    // pre-raft shape.
+    const rc = this._M._crabs_wasm_execute(this._am, op._ptr);
+    if (rc === 0xA006) return;
+    wrapRc(rc, 'execute');
   }
 
   sign(op, signingKey) {
@@ -1598,8 +1609,419 @@ class Node {
     return out;
   }
 
+  // ============================================================
+  // Raft ordering module (GROUP_ORDERED writes)
+  // ============================================================
+
+  // Attaches a raft ordering module to THIS machine's state and returns the
+  // RaftHost that drives it. This is a REFERENCE host: every seam it wires
+  // is user-replaceable —
+  //   • transport  raftHost.setRaftTransport(fn(peerId, blob)) — drained
+  //     raft control blobs go anywhere (WebSocket, HTTP relay, in-memory
+  //     queues in tests); incoming blobs come back through
+  //     node.raftDeliver(peerId, blob).
+  //   • storage    raftHost.setRaftStorage(fn(handle, blob)) — persist
+  //     windows are stored anywhere durable (IndexedDB, localStorage, a
+  //     server); the reference host acknowledges with persist_complete when
+  //     the handler resolves, or marks the window failed when it rejects.
+  //   • timer      startRaftHost() runs a setTimeout tick loop at
+  //     options.tickMs — hosts that own their own clock can skip it and
+  //     drive raftTick(ms)/raftPump(ms)/raftDeliver directly.
+  // options: { nodeId, peers, tickMs, timers: { electionMinMs,
+  // electionMaxMs, heartbeatMs }, seed, moduleId }. peers counts ALL
+  // members including this node (a single-entry list is the degenerate
+  // one-node cluster). Throws if a raft module is already attached.
+  attachRaft(options = {}) {
+    const M = this._M;
+    if (this._raftHost && this._raftHost._modulePtr) {
+      throw new Error('attachRaft: a raft module is already attached');
+    }
+    const nodeId = options.nodeId || this.adminId;
+    const peers = options.peers || [nodeId];
+    if (!Array.isArray(peers) || peers.length === 0 || peers.length > 16) {
+      throw new RangeError('attachRaft: peers must be an array of 1..16 ids');
+    }
+    if (!peers.includes(nodeId)) {
+      throw new Error('attachRaft: peers must include this node');
+    }
+    const timers = options.timers || {};
+    this._raftHost = new RaftHost(M, this, nodeId, peers, {
+      tickMs: options.tickMs || 100,
+      electionMinMs: timers.electionMinMs || 0,
+      electionMaxMs: timers.electionMaxMs || 0,
+      heartbeatMs: timers.heartbeatMs || 0,
+      seed: options.seed || 0,
+      moduleId: options.moduleId || 0,
+    });
+    return this._raftHost;
+  }
+
+  // Host delivery seam: inject one inbound raft blob from `peerId`. Runs the
+  // inbound event through the module and then drains the module (outbound
+  // transport, persist windows, notification materialization), so delivery
+  // provokes the same cascade as a timer loop in a single JS entry.
+  raftDeliver(peerId, blob) {
+    if (!this._raftHost || !this._raftHost._modulePtr) {
+      throw new Error('raftDeliver: no raft module attached');
+    }
+    return this._raftHost.pumpInbound(peerId, blob);
+  }
+
+  // Point diagnostics of the attached module (null fields when detached).
+  raftStatus() {
+    if (!this._raftHost || !this._raftHost._modulePtr) return null;
+    return this._raftHost.status();
+  }
+
   destroy() {
+    if (this._raftHost) this._raftHost.destroy();
+    this._raftHost = null;
     if (this._am) { this._M._crabs_wasm_node_destroy(this._am); this._am = null; }
+  }
+}
+
+// ============================================================
+// Raft reference host
+// ============================================================
+// The raft module (crabs_raft_module_t) is a pure reactive C core: tick /
+// inbound / propose / persist_complete go in, message / persist /
+// notification queues come out. RaftHost owns the event loop that turns
+// those queues into real I/O. It wraps the transport/storage seams so the
+// SAME reference loop works against real transports and against in-memory
+// queues in tests.
+
+// Wire envelope decoders for the C polls (little-endian):
+//   outbound:    [u32 kind][u16 to-peer len][peer][u32 blob len][blob]
+//   notification:[u32 kind][u16 peer len][peer][u64 proposal id][u64 commit
+//                 index][u32 op len][op bytes]
+//   persist view:[u64 handle][u32 blob len][blob]
+function _raftDecodeOutbound(envBytes) {
+  const view = new DataView(envBytes.buffer, envBytes.byteOffset,
+                            envBytes.byteLength);
+  let cursor = 0;
+  const kind = view.getUint32(cursor, true); cursor += 4;
+  const peerLen = view.getUint16(cursor, true); cursor += 2;
+  const to = new TextDecoder().decode(
+    envBytes.subarray(cursor, cursor + peerLen)); cursor += peerLen;
+  const blobLen = view.getUint32(cursor, true); cursor += 4;
+  const blob = envBytes.slice(cursor, cursor + blobLen);
+  return { kind, to, blob };
+}
+
+function _raftDecodePersist(envBytes) {
+  const view = new DataView(envBytes.buffer, envBytes.byteOffset,
+                            envBytes.byteLength);
+  let cursor = 0;
+  const handle = view.getBigUint64(cursor, true); cursor += 8;
+  const blobLen = view.getUint32(cursor, true); cursor += 4;
+  const blob = envBytes.slice(cursor, cursor + blobLen);
+  return { handle, blob };
+}
+
+function _raftDecodeNotification(envBytes) {
+  const view = new DataView(envBytes.buffer, envBytes.byteOffset,
+                            envBytes.byteLength);
+  let cursor = 0;
+  const kind = view.getUint32(cursor, true); cursor += 4;
+  const peerLen = view.getUint16(cursor, true); cursor += 2;
+  const peerId = new TextDecoder().decode(
+    envBytes.subarray(cursor, cursor + peerLen)); cursor += peerLen;
+  const proposalId = view.getBigUint64(cursor, true); cursor += 8;
+  const commitIndex = view.getBigUint64(cursor, true); cursor += 8;
+  const opLen = view.getUint32(cursor, true); cursor += 4;
+  const opBytes = envBytes.slice(cursor, cursor + opLen);
+  return { kind, peerId, proposalId: Number(proposalId),
+           commitIndex: Number(commitIndex), opBytes };
+}
+
+class RaftHost {
+  constructor(M, node, nodeId, peers, options) {
+    this._M = M;
+    this._node = node;
+    this._am = node._am;
+    // Build the wasm-side char*[] for the peer id list: a malloc'd pointer
+    // array whose entries point at heap strings written below.
+    this._peerPtrs = peers.map((peerId) => writeString(M, peerId));
+    this._peerArrayPtr = M._malloc(peers.length * 4);
+    for (let peerIndex = 0; peerIndex < peers.length; peerIndex++) {
+      M.setValue(this._peerArrayPtr + peerIndex * 4, this._peerPtrs[peerIndex], 'i32');
+    }
+    const nodeIdPtr = writeString(M, nodeId);
+    this._modulePtr = M._crabs_wasm_raft_create(
+      this._am, nodeIdPtr, this._peerArrayPtr, peers.length,
+      BigInt(options.electionMinMs), BigInt(options.electionMaxMs),
+      BigInt(options.heartbeatMs), BigInt(options.seed), options.moduleId);
+    M._free(nodeIdPtr);
+    for (const peerPtr of this._peerPtrs) M._free(peerPtr);
+    M._free(this._peerArrayPtr);
+    if (!this._modulePtr) {
+      throw new Error('attachRaft: raft module create failed');
+    }
+    this.nodeId = nodeId;
+    this.peers = peers.slice();
+    this._tickMs = options.tickMs;
+    this._timer = null;
+    this._transport = null;
+    this._storage = null;
+    this._persistOutstanding = false;
+    this._destroyed = false;
+  }
+
+  // ---- Seams ----
+
+  // The transport seam replaces the default throw: fn(peerId, blob) ships
+  // one drained raft control blob anywhere. Failures are surfaced to the
+  // console and retried implicitly by the module's own retransmit-free
+  // timer model — the reference host does not queue on the app's behalf.
+  setRaftTransport(transportFn) {
+    this._transport = transportFn;
+  }
+
+  // The storage seam replaces the default throw: fn(handle, blob) stores one
+  // persist window; resolution of the returned promise (or thrown rejection)
+  // is acknowledged to the module as persist_complete(true/false).
+  setRaftStorage(storageFn) {
+    this._storage = storageFn;
+  }
+
+  // ---- Host loop ----
+
+  // Start the reference setTimeout tick loop (tick → drain cascade).
+  startRaftHost() {
+    if (this._timer || this._destroyed) return;
+    this._timer = setInterval(() => this.onTick(), this._tickMs);
+  }
+
+  stopRaftHost() {
+    if (this._timer) { clearInterval(this._timer); this._timer = null; }
+  }
+
+  // One manual tick at an explicit time — for hosts that own the clock.
+  // tickMs defaults to Date.now(). The persist window is pumped FIRST so an
+  // acked-but-undrained store resolves before the tick (vote requests ride
+  // vote-header durability); the module tolerates ticks while an async
+  // store is in flight (window-busy), so heartbeats never stall on storage.
+  raftTick(nowMs) {
+    if (this._destroyed) throw new Error('RaftHost destroyed');
+    const now = BigInt(nowMs === undefined ? Date.now() : nowMs);
+    this._pumpPersist();
+    this._M._crabs_wasm_raft_tick(this._modulePtr, now);
+    this._drainOutbound();
+    this._pumpNotifications(now);
+  }
+
+  // The loop body: tick, then drain everything the tick produced.
+  onTick() {
+    try {
+      this.raftTick();
+    } catch (tickError) {
+      console.warn('crabs: raft tick failed', tickError);
+    }
+  }
+
+  // Inject an inbound blob (the receive half of the transport seam) and
+  // drain the cascade it provokes.
+  pumpInbound(peerId, blob) {
+    if (this._destroyed) throw new Error('RaftHost destroyed');
+    const bytes = blob instanceof Uint8Array ? blob : new Uint8Array(blob);
+    const { ptr: blobPtr, len } = writeBytes(this._M, bytes);
+    const peerPtr = writeString(this._M, peerId);
+    const now = BigInt(Date.now());
+    const rc = this._M._crabs_wasm_raft_inbound(this._modulePtr, peerPtr,
+                                                blobPtr, len, now);
+    freeAll(this._M, peerPtr, blobPtr);
+    if (rc !== 0) throw crabsError(rc, 'raftDeliver');
+    this._drainOutbound();
+    this._pumpPersist();
+    this._pumpNotifications(now);
+  }
+
+  // ---- Drains ----
+
+  // OUTBOUND: poll every queued message and hand it to the transport seam
+  // (async fire-and-forget — the module's queue is drained synchronously;
+  // delivery itself belongs to the transport's event loop).
+  _drainOutbound() {
+    if (!this._transport) return;
+    for (;;) {
+      const envelope = this._M._crabs_wasm_raft_poll_outbound(this._modulePtr);
+      if (!envelope) break;
+      const data = this._M._crabs_wasm_buffer_data(envelope);
+      const len = this._M._crabs_wasm_buffer_len(envelope);
+      const message = _raftDecodeOutbound(
+        this._M.HEAPU8.subarray(data, data + len));
+      this._M._crabs_wasm_buffer_destroy(envelope);
+      try {
+        const sent = this._transport(message.to, message.blob);
+        if (sent && typeof sent.catch === 'function') {
+          sent.catch((sendError) =>
+            console.warn('crabs: raft transport failed', sendError));
+        }
+      } catch (sendError) {
+        console.warn('crabs: raft transport failed', sendError);
+      }
+    }
+  }
+
+  // PERSIST: one window per call round. The module re-reports an unresolved
+  // handle, so this queue is never drain-looped — while an async store is in
+  // flight the host simply stops polling it.
+  _pumpPersist() {
+    if (this._persistOutstanding || !this._storage) return;
+    const envelope = this._M._crabs_wasm_raft_poll_persist_request(
+      this._modulePtr);
+    if (!envelope) return;
+    const data = this._M._crabs_wasm_buffer_data(envelope);
+    const len = this._M._crabs_wasm_buffer_len(envelope);
+    const request = _raftDecodePersist(this._M.HEAPU8.subarray(data, data + len));
+    this._M._crabs_wasm_buffer_destroy(envelope);
+    this._persistOutstanding = true;
+    let storeResult;
+    try {
+      storeResult = this._storage(request.handle, request.blob);
+    } catch (storeError) {
+      this._completePersist(request.handle, false, storeError);
+      return;
+    }
+    if (storeResult && typeof storeResult.then === 'function') {
+      storeResult.then(
+        () => this._completePersist(request.handle, true, null),
+        (storeError) => this._completePersist(request.handle, false, storeError));
+    } else {
+      this._completePersist(request.handle, true, null);
+    }
+  }
+
+  _completePersist(handle, ok, storageError) {
+    this._persistOutstanding = false;
+    if (storageError) {
+      console.warn('crabs: raft persist failed', storageError);
+    }
+    wrapRc(this._M._crabs_wasm_raft_persist_complete(this._modulePtr,
+                                                     BigInt(handle), ok ? 1 : 0),
+           'raftPersistComplete');
+    // The ack itself may have produced outbound/persist/notification work.
+    this._drainOutbound();
+    this._pumpPersist();
+    if (!this._persistOutstanding) this._pumpNotifications(Date.now());
+  }
+
+  // NOTIFICATIONS (materialization): committed ops go back through the
+  // state's pipeline (crabs_wasm_raft_pump → state_raft_process_notifications_at),
+  // which executes them, fires 'change' events, and shelves ordered retries.
+  _pumpNotifications(nowMs) {
+    const rc = this._M._crabs_wasm_raft_pump(this._am, BigInt(nowMs));
+    if (rc !== 0 && rc !== 0xA006) {
+      console.warn('crabs: raft notification pump failed', crabsError(rc, 'raftPump'));
+    }
+  }
+
+  // ---- Raw surfaces ----
+
+  // Manual drain of the outbound queue WITHOUT the transport seam — returns
+  // [{ kind, to, blob }] for hosts implementing custom replay/inspection.
+  raftPollOutbound() {
+    const out = [];
+    for (;;) {
+      const envelope = this._M._crabs_wasm_raft_poll_outbound(this._modulePtr);
+      if (!envelope) break;
+      const data = this._M._crabs_wasm_buffer_data(envelope);
+      const len = this._M._crabs_wasm_buffer_len(envelope);
+      const message = _raftDecodeOutbound(
+        this._M.HEAPU8.subarray(data, data + len));
+      this._M._crabs_wasm_buffer_destroy(envelope);
+      out.push(message);
+    }
+    return out;
+  }
+
+  // One outstanding persist window ({ handle, blob } | null) — a VIEW: the
+  // handle stays open on the module until raftPersistComplete(handle, ok).
+  raftPollPersistRequest() {
+    const envelope = this._M._crabs_wasm_raft_poll_persist_request(
+      this._modulePtr);
+    if (!envelope) return null;
+    const data = this._M._crabs_wasm_buffer_data(envelope);
+    const len = this._M._crabs_wasm_buffer_len(envelope);
+    const request = _raftDecodePersist(this._M.HEAPU8.subarray(data, data + len));
+    this._M._crabs_wasm_buffer_destroy(envelope);
+    return request;
+  }
+
+  // Acknowledge a persist window obtained from raftPollPersistRequest.
+  // Unknown/stale handles (double acks) are host bookkeeping bugs and throw.
+  raftPersistComplete(handle, ok) {
+    wrapRc(this._M._crabs_wasm_raft_persist_complete(this._modulePtr,
+                                                    BigInt(handle), ok ? 1 : 0),
+           'raftPersistComplete');
+  }
+
+  // Raw notification drain — NOT for state-attached reference hosts (use
+  // raftPump; the pump consumes this queue itself and double-draining here
+  // would silently drop committed ops). Returns
+  // [{ kind, peerId, proposalId, commitIndex, opBytes: Uint8Array }].
+  raftPollNotifications() {
+    const out = [];
+    for (;;) {
+      const envelope = this._M._crabs_wasm_raft_poll_notification(
+        this._modulePtr);
+      if (!envelope) break;
+      const data = this._M._crabs_wasm_buffer_data(envelope);
+      const len = this._M._crabs_wasm_buffer_len(envelope);
+      const notification = _raftDecodeNotification(
+        this._M.HEAPU8.subarray(data, data + len));
+      this._M._crabs_wasm_buffer_destroy(envelope);
+      out.push(notification);
+    }
+    return out;
+  }
+
+  // Materialize committed ops through the attached machine's pipeline at an
+  // explicit time (manual mode). rc 0 = clean; a thrown/shelving pump failure
+  // is surfaced to the caller.
+  raftPump(nowMs) {
+    wrapRc(this._M._crabs_wasm_raft_pump(this._am,
+      BigInt(nowMs === undefined ? Date.now() : nowMs)), 'raftPump');
+  }
+
+  // Direct module handle — raw-propose / membership-change exports for
+  // hosts bypassing the state pipeline. Returns the crabs_raft_module_t
+  // pointer; treat it as borrowed (lifetime anchored by the host object).
+  moduleHandle() {
+    return this._modulePtr;
+  }
+
+  status() {
+    const M = this._M;
+    // The committed-config member list arrives as [u32 count][entries…];
+    // diagnostics only need the count, so the list body is skipped.
+    const committed = M._crabs_wasm_raft_committed_members(this._modulePtr);
+    let peerCount = 0;
+    if (committed) {
+      const dataPtr = M._crabs_wasm_buffer_data(committed);
+      peerCount = M.getValue(dataPtr, 'i32') >>> 0;
+      M._crabs_wasm_buffer_destroy(committed);
+    }
+    return {
+      nodeId: this.nodeId,
+      isLeader: M._crabs_wasm_raft_is_leader(this._modulePtr) !== 0,
+      term: Number(M._crabs_wasm_raft_current_term(this._modulePtr)),
+      commitTip: Number(M._crabs_wasm_raft_committed_tip(this._modulePtr)),
+      logLength: Number(M._crabs_wasm_raft_log_length(this._modulePtr)),
+      configChangePending:
+        M._crabs_wasm_raft_config_change_pending(this._modulePtr) !== 0,
+      peerCount,
+    };
+  }
+
+  destroy() {
+    if (this._destroyed) return;
+    this._destroyed = true;
+    this.stopRaftHost();
+    if (this._modulePtr) {
+      this._M._crabs_wasm_raft_destroy(this._modulePtr);
+      this._modulePtr = null;
+    }
   }
 }
 

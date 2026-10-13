@@ -24,6 +24,7 @@
 #include "../Scheduler/scheduler.h"
 #include "../Lineage/lineage.h"
 #include "../TimeSource/time_source.h"
+#include "../Raft/raft_module.h"
 
 #ifdef CRABS_ENABLE_DEVTOOLS
 #include "../Devtools/devtools.h"
@@ -1738,6 +1739,416 @@ EMSCRIPTEN_KEEPALIVE
 void crabs_wasm_register_lineage_ops(attribute_machine_t* am) {
   if (am == NULL) return;
   lineage_install(&am->base_state);
+}
+
+// ============================================================
+// Raft ordering module surface
+// ============================================================
+// The module is a pure reactor (Raft/raft_module.h): the wasm host (the
+// bindings-core reference host, or the embedding app replacing its seams)
+// drives tick/inbound/propose/persist_complete and drains the outbound
+// queues here. Export/import of the module's durable state is NOT a raw
+// struct transfer to JS — the state serializer already carries the module's
+// state in the v16 machine section (crabs_serialize_state), and attaching a
+// fresh module via crabs_raft_create re-imports it through
+// state_attach_raft_module. crabs_wasm_raft_recover_from_persist covers the
+// remaining restart duty: replaying the host's stored persist batches.
+//
+// Drain disposal conventions (mirroring raft_module.h):
+//   - poll_outbound / poll_notification TRANSFER a copy: the returned
+//     envelope buffer is JS-owned, freed with _crabs_wasm_buffer_destroy,
+//     and the next poll moves to the next event (drain until NULL).
+//   - poll_persist reports a copy of the OUTSTANDING window — the handle
+//     stays un-resolved on the module until persist_complete(handle, ok),
+//     and the same handle is re-reported while pending. JS must poll ONE
+//     window per async storage round and never drain-loop this queue.
+//
+// Module registry: exports address modules by pointer (this file's idiom —
+// raw C object pointers, no integer handles). The registry only remembers
+// the machine each module was created for so crabs_raft_destroy can detach
+// it from the state before teardown (the state never owns the module
+// object).
+
+typedef struct {
+  crabs_raft_module_t* module;
+  attribute_machine_t* machine;
+} raft_module_registry_entry_t;
+
+static raft_module_registry_entry_t* s_raft_modules = NULL;
+static uint32_t s_raft_module_count = 0;
+static uint32_t s_raft_module_capacity = 0;
+
+static uint32_t _raft_module_index(crabs_raft_module_t* module) {
+  for (uint32_t index = 0; index < s_raft_module_count; index++) {
+    if (s_raft_modules[index].module == module) return index;
+  }
+  return UINT32_MAX;
+}
+
+static crabs_error_e _raft_module_registry_add(crabs_raft_module_t* module,
+                                               attribute_machine_t* am) {
+  if (s_raft_module_count == s_raft_module_capacity) {
+    uint32_t fresh_capacity = s_raft_module_capacity == 0
+        ? 4 : s_raft_module_capacity * 2;
+    raft_module_registry_entry_t* fresh_registry =
+        (raft_module_registry_entry_t*)realloc(
+            s_raft_modules,
+            fresh_capacity * sizeof(raft_module_registry_entry_t));
+    if (fresh_registry == NULL) return CRABS_ERR_OOM;
+    s_raft_modules = fresh_registry;
+    s_raft_module_capacity = fresh_capacity;
+  }
+  s_raft_modules[s_raft_module_count].module = module;
+  s_raft_modules[s_raft_module_count].machine = am;
+  s_raft_module_count++;
+  return CRABS_SUCCESS;
+}
+
+static void _raft_module_registry_remove(crabs_raft_module_t* module) {
+  uint32_t index = _raft_module_index(module);
+  if (index == UINT32_MAX) return;
+  s_raft_modules[index] = s_raft_modules[s_raft_module_count - 1];
+  s_raft_module_count--;
+}
+
+// Copy the peer id pointer array out of wasm linear memory has already
+// happened on the JS side: peer_ids arrives as a C array of char* built by
+// the JS wrapper (a malloc'd block of u32 pointers, each a wasm string).
+// The module copies the id strings itself, so nothing here needs to retain
+// the array.
+static void _raft_config_fill(crabs_raft_config_t* config, const char* node_id,
+                              const char* const* peer_ids,
+                              uint32_t peer_count) {
+  crabs_raft_config_defaults(config);
+  strncpy(config->node_id, node_id != NULL ? node_id : "",
+          CRABS_MAX_USER_ID - 1);
+  config->node_id[CRABS_MAX_USER_ID - 1] = '\0';
+  // The export already validated peer_count <= CRABS_RAFT_MAX_PEERS, so no
+  // clamping — an over-cap config is refused, never silently truncated.
+  config->peer_count = peer_count;
+  for (uint32_t peer_index = 0; peer_index < peer_count; peer_index++) {
+    const char* peer_id = peer_ids[peer_index];
+    strncpy(config->peer_ids[peer_index],
+            peer_id != NULL ? peer_id : "", CRABS_MAX_USER_ID - 1);
+    config->peer_ids[peer_index][CRABS_MAX_USER_ID - 1] = '\0';
+  }
+}
+
+// Create a raft module for the machine and attach it to the node's state
+// (the pipeline seam: group-item writes route through the module's
+// two-phase path only while the module is attached). Attaching also
+// imports any v16 module snapshot the state carried from a deserialize.
+// The timers in the config arrive from JS with C defaults pre-filled
+// (crabs_raft_config_defaults ran inside _raft_config_fill), so the JS
+// reference host passes 0 only when it has not filled its own values.
+EMSCRIPTEN_KEEPALIVE
+crabs_raft_module_t* crabs_wasm_raft_create(
+    attribute_machine_t* am, const char* node_id,
+    const char* const* peer_ids, uint32_t peer_count,
+    uint64_t election_timeout_min_ms, uint64_t election_timeout_max_ms,
+    uint64_t heartbeat_interval_ms, uint64_t seed, uint8_t module_id) {
+  if (am == NULL || node_id == NULL ||
+      (peer_ids == NULL && peer_count > 0) ||
+      peer_count > CRABS_RAFT_MAX_PEERS) {
+    return NULL;
+  }
+  // One module per machine (the state's module pointer is single-slot): a
+  // second create would silently orphan the previous module in the registry.
+  if (state_raft_module(&am->base_state) != NULL) return NULL;
+  crabs_raft_config_t config;
+  _raft_config_fill(&config, node_id, peer_ids, peer_count);
+  if (election_timeout_min_ms > 0) config.election_timeout_min_ms = election_timeout_min_ms;
+  if (election_timeout_max_ms > 0) config.election_timeout_max_ms = election_timeout_max_ms;
+  if (heartbeat_interval_ms > 0)  config.heartbeat_interval_ms = heartbeat_interval_ms;
+  config.seed = seed;
+  config.module_id = module_id;
+
+  crabs_raft_module_t* module = crabs_raft_module_create(&config);
+  if (module == NULL) return NULL;
+  crabs_error_e attach_rc = state_attach_raft_module(&am->base_state, module);
+  if (attach_rc != CRABS_SUCCESS) {
+    crabs_raft_module_destroy(module);
+    return NULL;
+  }
+  if (_raft_module_registry_add(module, am) != CRABS_SUCCESS) {
+    state_attach_raft_module(&am->base_state, NULL);
+    crabs_raft_module_destroy(module);
+    return NULL;
+  }
+  return module;
+}
+
+// Detach the module from its machine's state and destroy it. The node
+// object itself stays alive (see crabs_wasm_node_destroy's leak note).
+EMSCRIPTEN_KEEPALIVE
+void crabs_wasm_raft_destroy(crabs_raft_module_t* module) {
+  if (module == NULL) return;
+  uint32_t index = _raft_module_index(module);
+  if (index != UINT32_MAX) {
+    state_attach_raft_module(&s_raft_modules[index].machine->base_state, NULL);
+  }
+  _raft_module_registry_remove(module);
+  crabs_raft_module_destroy(module);
+}
+
+// Inbound events. All return a crabs_error_e.
+EMSCRIPTEN_KEEPALIVE
+crabs_error_e crabs_wasm_raft_tick(crabs_raft_module_t* module,
+                                   uint64_t now_ms) {
+  if (module == NULL) return CRABS_ERR_INVALID_PARAM;
+  return crabs_raft_module_tick(module, now_ms);
+}
+
+EMSCRIPTEN_KEEPALIVE
+crabs_error_e crabs_wasm_raft_inbound(crabs_raft_module_t* module,
+                                      const char* peer_id,
+                                      const uint8_t* blob, uint32_t len,
+                                      uint64_t now_ms) {
+  if (module == NULL || peer_id == NULL || blob == NULL) {
+    return CRABS_ERR_INVALID_PARAM;
+  }
+  return crabs_raft_module_inbound(module, peer_id, blob, (size_t)len, now_ms);
+}
+
+// Propose a (pre-validated) op directly on the module handle — the raw
+// reactor path used by hosts that drive the module WITHOUT the state
+// pipeline. The assigned proposal id (log index) lands in *out_proposal_id.
+EMSCRIPTEN_KEEPALIVE
+crabs_error_e crabs_wasm_raft_propose(crabs_raft_module_t* module,
+                                      operation_t* op, uint64_t* out_proposal_id) {
+  if (module == NULL || op == NULL) return CRABS_ERR_INVALID_PARAM;
+  return crabs_raft_module_propose(module, op, out_proposal_id);
+}
+
+// Joint-consensus membership change on the module's own config log.
+EMSCRIPTEN_KEEPALIVE
+crabs_error_e crabs_wasm_raft_change_membership(
+    crabs_raft_module_t* module, const char* const* new_member_ids,
+    uint32_t member_count, uint64_t* out_proposal_id) {
+  if (module == NULL) return CRABS_ERR_INVALID_PARAM;
+  return crabs_raft_module_change_membership(module, new_member_ids,
+                                             member_count, out_proposal_id);
+}
+
+EMSCRIPTEN_KEEPALIVE
+crabs_error_e crabs_wasm_raft_persist_complete(crabs_raft_module_t* module,
+                                               uint64_t handle, uint32_t ok) {
+  if (module == NULL) return CRABS_ERR_INVALID_PARAM;
+  return crabs_raft_module_persist_complete(module, handle, ok != 0);
+}
+
+// Crash recovery: replay one stored persist batch into the module's
+// durable state (the host's storage outlived the instance).
+EMSCRIPTEN_KEEPALIVE
+crabs_error_e crabs_wasm_raft_recover_from_persist(
+    crabs_raft_module_t* module, const uint8_t* batch, uint32_t batch_len) {
+  if (module == NULL || batch == NULL) return CRABS_ERR_INVALID_PARAM;
+  return crabs_raft_module_recover_from_persist(module, batch,
+                                                (size_t)batch_len);
+}
+
+// Materialize the module's committed notifications through the state's
+// pipeline (state_raft_process_notifications_at): deserializes each
+// COMMITTED_OP, executes it (change events fire through the module-wide
+// change hook), and shelves ordered retries. Leadership-change
+// notifications are consumed here — hosts observe leadership through the
+// query exports below.
+EMSCRIPTEN_KEEPALIVE
+crabs_error_e crabs_wasm_raft_pump(attribute_machine_t* am,
+                                   uint64_t now_ms) {
+  if (am == NULL) return CRABS_ERR_INVALID_PARAM;
+  return state_raft_process_notifications_at(&am->base_state, now_ms);
+}
+
+// Wrap one outbound event as a JS-owned wire envelope:
+//   message:     [u32 kind][u16 to_peer_len][to_peer][u32 blob_len][blob]
+//   notification:[u32 kind][u16 peer_len][peer][u64 proposal_id][u64
+//                 commit_index][u32 op_len][op_bytes]
+//   persist view:[u64 handle][u32 blob_len][blob]  (copied; handle stays
+//                 module-open until crabs_wasm_raft_persist_complete)
+// Returns a serialized_buffer_t (the file's list-encode idiom) that the JS
+// wrapper reads once and frees with _crabs_wasm_buffer_destroy.
+static serialized_buffer_t* _raft_envelope(size_t body_len,
+                                           const uint8_t* body) {
+  serialized_buffer_t* buffer =
+      (serialized_buffer_t*)malloc(sizeof(serialized_buffer_t));
+  if (buffer == NULL) return NULL;
+  buffer->data = (uint8_t*)malloc(body_len);
+  if (buffer->data == NULL) {
+    free(buffer);
+    return NULL;
+  }
+  memcpy(buffer->data, body, body_len);
+  buffer->len = body_len;
+  return buffer;
+}
+
+static serialized_buffer_t* _raft_message_envelope(
+    const crabs_raft_outbound_message_t* message) {
+  size_t peer_len = strlen(message->to_peer);
+  if (peer_len > 0xFFFF) peer_len = 0xFFFF;
+  size_t body_len = 4 + 2 + peer_len + 4 + message->len;
+  uint8_t* body = (uint8_t*)malloc(body_len);
+  if (body == NULL) return NULL;
+  size_t cursor = 0;
+  uint32_t kind = (uint32_t)message->kind;
+  memcpy(body + cursor, &kind, 4); cursor += 4;
+  uint16_t len16 = (uint16_t)peer_len;
+  memcpy(body + cursor, &len16, 2); cursor += 2;
+  memcpy(body + cursor, message->to_peer, peer_len); cursor += peer_len;
+  uint32_t blob_len = (uint32_t)message->len;
+  memcpy(body + cursor, &blob_len, 4); cursor += 4;
+  if (message->len > 0) {
+    memcpy(body + cursor, message->bytes, message->len);
+  }
+  serialized_buffer_t* buffer = _raft_envelope(body_len, body);
+  free(body);
+  return buffer;
+}
+
+static serialized_buffer_t* _raft_notification_envelope(
+    const crabs_raft_notification_t* notification) {
+  size_t peer_len = strlen(notification->peer_id);
+  if (peer_len > 0xFFFF) peer_len = 0xFFFF;
+  size_t op_len = notification->op_len > 0 ? notification->op_len : 0;
+  size_t body_len = 4 + 2 + peer_len + 8 + 8 + 4 + op_len;
+  uint8_t* body = (uint8_t*)malloc(body_len);
+  if (body == NULL) return NULL;
+  size_t cursor = 0;
+  uint32_t kind = (uint32_t)notification->kind;
+  memcpy(body + cursor, &kind, 4); cursor += 4;
+  uint16_t len16 = (uint16_t)peer_len;
+  memcpy(body + cursor, &len16, 2); cursor += 2;
+  memcpy(body + cursor, notification->peer_id, peer_len); cursor += peer_len;
+  uint64_t proposal_id = notification->proposal_id;
+  memcpy(body + cursor, &proposal_id, 8); cursor += 8;
+  uint64_t commit_index = notification->commit_index;
+  memcpy(body + cursor, &commit_index, 8); cursor += 8;
+  uint32_t op_len32 = (uint32_t)op_len;
+  memcpy(body + cursor, &op_len32, 4); cursor += 4;
+  if (op_len > 0) {
+    memcpy(body + cursor, notification->op_bytes, op_len);
+  }
+  serialized_buffer_t* buffer = _raft_envelope(body_len, body);
+  free(body);
+  return buffer;
+}
+
+static serialized_buffer_t* _raft_persist_view_envelope(
+    const crabs_raft_persist_request_t* request) {
+  size_t body_len = 8 + 4 + request->len;
+  uint8_t* body = (uint8_t*)malloc(body_len);
+  if (body == NULL) return NULL;
+  size_t cursor = 0;
+  uint64_t handle = request->handle;
+  memcpy(body + cursor, &handle, 8); cursor += 8;
+  uint32_t blob_len = (uint32_t)request->len;
+  memcpy(body + cursor, &blob_len, 4); cursor += 4;
+  if (request->len > 0) {
+    memcpy(body + cursor, request->bytes, request->len);
+  }
+  serialized_buffer_t* buffer = _raft_envelope(body_len, body);
+  free(body);
+  return buffer;
+}
+
+// Drain one outbound message; returns NULL when the queue is empty. Each
+// call moves the head out (ownership transfer semantics): the module hands
+// the blob over, so this copies it into the self-contained envelope for JS
+// and releases the transferred bytes.
+EMSCRIPTEN_KEEPALIVE
+serialized_buffer_t* crabs_wasm_raft_poll_outbound(
+    crabs_raft_module_t* module) {
+  if (module == NULL) return NULL;
+  crabs_raft_outbound_message_t message;
+  if (!crabs_raft_module_poll_outbound(module, &message)) return NULL;
+  serialized_buffer_t* envelope = _raft_message_envelope(&message);
+  free((void*)message.bytes);   // poll transferred ownership; envelope owns the copy
+  return envelope;
+}
+
+// Report the CURRENT outstanding persist window (a copy). Re-reports the
+// same handle while it is unresolved — see the section header for the
+// disposal convention.
+EMSCRIPTEN_KEEPALIVE
+serialized_buffer_t* crabs_wasm_raft_poll_persist_request(
+    crabs_raft_module_t* module) {
+  if (module == NULL) return NULL;
+  crabs_raft_persist_request_t request;
+  if (!crabs_raft_module_poll_persist(module, &request)) return NULL;
+  return _raft_persist_view_envelope(&request);
+}
+
+// Raw notification drain — ONLY for hosts driving the module without the
+// state pipeline; the state-attached reference host uses
+// crabs_wasm_raft_pump (which consumes this queue itself) and must never
+// poll here.
+EMSCRIPTEN_KEEPALIVE
+serialized_buffer_t* crabs_wasm_raft_poll_notification(
+    crabs_raft_module_t* module) {
+  if (module == NULL) return NULL;
+  crabs_raft_notification_t notification;
+  if (!crabs_raft_module_poll_notification(module, &notification)) return NULL;
+  return _raft_notification_envelope(&notification);
+}
+
+// Queries for the host loop and diagnostics.
+EMSCRIPTEN_KEEPALIVE
+uint32_t crabs_wasm_raft_is_leader(crabs_raft_module_t* module) {
+  return module != NULL && crabs_raft_module_is_leader(module) ? 1u : 0u;
+}
+
+EMSCRIPTEN_KEEPALIVE
+uint64_t crabs_wasm_raft_committed_tip(crabs_raft_module_t* module) {
+  return module != NULL ? crabs_raft_module_committed_tip(module) : 0;
+}
+
+EMSCRIPTEN_KEEPALIVE
+uint64_t crabs_wasm_raft_current_term(crabs_raft_module_t* module) {
+  return module != NULL ? crabs_raft_module_current_term(module) : 0;
+}
+
+EMSCRIPTEN_KEEPALIVE
+uint64_t crabs_wasm_raft_log_length(crabs_raft_module_t* module) {
+  return module != NULL ? crabs_raft_module_log_length(module) : 0;
+}
+
+EMSCRIPTEN_KEEPALIVE
+uint32_t crabs_wasm_raft_config_change_pending(crabs_raft_module_t* module) {
+  return module != NULL &&
+         crabs_raft_module_config_change_pending(module) ? 1u : 0u;
+}
+
+EMSCRIPTEN_KEEPALIVE
+uint32_t crabs_wasm_raft_rejected_message_count(
+    crabs_raft_module_t* module) {
+  return module != NULL ? crabs_raft_module_rejected_message_count(module) : 0;
+}
+
+// Committed-config member ids into a flat wasm buffer: u32 count +
+// count × [u16 len][id bytes], max CRABS_RAFT_MAX_PEERS entries.
+EMSCRIPTEN_KEEPALIVE
+serialized_buffer_t* crabs_wasm_raft_committed_members(
+    crabs_raft_module_t* module) {
+  if (module == NULL) return NULL;
+  char ids[CRABS_RAFT_MAX_PEERS][CRABS_MAX_USER_ID];
+  uint32_t count = crabs_raft_module_committed_members(module, ids);
+  size_t body_len = 4;
+  for (uint32_t index = 0; index < count; index++) {
+    body_len += 2 + strlen(ids[index]);
+  }
+  uint8_t* body = (uint8_t*)malloc(body_len);
+  if (body == NULL) return NULL;
+  memcpy(body, &count, 4);
+  size_t cursor = 4;
+  for (uint32_t index = 0; index < count; index++) {
+    uint16_t len16 = (uint16_t)strlen(ids[index]);
+    memcpy(body + cursor, &len16, 2); cursor += 2;
+    memcpy(body + cursor, ids[index], len16); cursor += len16;
+  }
+  serialized_buffer_t* buffer = _raft_envelope(body_len, body);
+  free(body);
+  return buffer;
 }
 
 // ============================================================
