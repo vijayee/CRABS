@@ -103,10 +103,12 @@ int main(void) {
 
   /* The write gate + the reader's op via the keyring's explicit key path
    * (op carries key_id + sig_scheme — crypto.c:1322-1331). Grammar honesty:
-   * the CRABS policy grammar is PREFIX ('AND' takes two clauses); a
-   * single-clause policy must be the bare token — 'AND role:member' with
-   * one clause silently mis-parses (an empty right operand evals false) and
-   * refuses, pinned below. */
+   * the CRABS policy grammar is PREFIX ('AND' takes two clauses), and since
+   * the single-clause fix "AND <clause>" with nothing behind the clause
+   * collapses to the clause (src/Crypto/crypto.c:680-699) — so the leading
+   * 'AND role:member' form and the bare token behave identically, pinned
+   * below. Any OTHER dangling shape still fails closed (a bare 'AND', a
+   * compound dangling operator, a parenthesized form) — also pinned below. */
   assert(state_add_policy(state, "adjust", "role:member") == CRABS_SUCCESS);
   assert(state_machine_register_handler(state, "adjust", counting_adjust_handler)
          == CRABS_SUCCESS);
@@ -115,13 +117,18 @@ int main(void) {
   assert(landed_adjusts == 1);
   printf("revocable OK: reader's op landed on the active keyring key\n");
 
-  /* Grammar pin: 'AND role:member' (one clause after AND) refuses a member
-   * — the legacy prefix parser reads it as two operands and the empty right
-   * one evaluates false (src/Crypto/crypto.c:676-696). */
+  /* Grammar pin: 'AND role:member' (one clause after AND) now collapses to
+   * the clause — identical to the bare token above. */
   assert(state_add_policy(state, "adjust_pitfall", "AND role:member")
          == CRABS_SUCCESS);
+  assert(state_machine_register_handler(state, "adjust_pitfall",
+                                        counting_adjust_handler) == CRABS_SUCCESS);
   {
-    static uint8_t pitfall_uuid = 0x30;
+    /* uuid/lamport 0x12: strictly newer than the logged 'adjust' op (0x11)
+     * and strictly older than the next logged one (0x14) — R7-11 ordering
+     * monotonicity. (0x12 also belongs to a later REFUSED op that never
+     * logs, so no replay conflict.) */
+    static uint8_t pitfall_uuid = 0x11;
     operation_t* op = operation_create("adjust_pitfall");
     assert(op != NULL);
     memset(op->uuid, ++pitfall_uuid, CRABS_UUID_SIZE);
@@ -135,11 +142,40 @@ int main(void) {
     assert(crypto_sign_operation(k1_key->private_key, wire->data, wire->len,
                                  op->signature) == CRABS_SUCCESS);
     serialized_buffer_destroy(wire);
+    assert(state_machine_execute(state, op) == CRABS_SUCCESS);
+    operation_destroy(op);
+    assert(landed_adjusts == 2);  /* the singleton ran, same as 'role:member' */
+  }
+  printf("revocable OK: the one-clause 'AND role:member' evaluates as 'role:member'\n");
+
+  /* Fail-closed pin: a dangling compound operator still refuses — the
+   * empty second operand evaluates false (crypto.c:680-699) and the policy
+   * is not silently collapsed clause by clause. */
+  assert(state_add_policy(state, "adjust_dangling", "AND role:member AND")
+         == CRABS_SUCCESS);
+  assert(state_machine_register_handler(state, "adjust_dangling",
+                                        counting_adjust_handler) == CRABS_SUCCESS);
+  {
+    static uint8_t dangling_uuid = 0x12;  /* uuid/lamport 0x13: same refused
+                                           * slot caveat as the pitfall pin */
+    operation_t* op = operation_create("adjust_dangling");
+    assert(op != NULL);
+    memset(op->uuid, ++dangling_uuid, CRABS_UUID_SIZE);
+    strncpy(op->signer_id, "reader", CRABS_MAX_USER_ID - 1);
+    op->lamport_time = dangling_uuid;
+    op->signer_key_version = reader_now->key_version;
+    strncpy(op->key_id, "k1", CRABS_MAX_KEY_ID - 1);
+    op->sig_scheme = ECDSA_SECP256K1;
+    serialized_buffer_t* wire = crabs_serialize_for_signing(op);
+    assert(wire != NULL);
+    assert(crypto_sign_operation(k1_key->private_key, wire->data, wire->len,
+                                 op->signature) == CRABS_SUCCESS);
+    serialized_buffer_destroy(wire);
     assert(state_machine_execute(state, op) == CRABS_ERR_UNAUTHORIZED);
     operation_destroy(op);
-    assert(landed_adjusts == 1);  /* the handler did not run */
+    assert(landed_adjusts == 2);  /* the handler did not run again */
   }
-  printf("revocable OK: the one-clause 'AND role:member' pitfall refuses a member (fail-closed grammar)\n");
+  printf("revocable OK: a dangling 'AND role:member AND' still refuses a member (fail-closed grammar)\n");
   reader_now = attribute_machine_find_user(am, "reader");
   assert(reader_now != NULL);
 
@@ -155,7 +191,7 @@ int main(void) {
   assert(version_at_suspend == 3);
   assert(execute_adjust_as(am, state, "k1", k1_key, version_at_suspend)
          == CRABS_ERR_UNAUTHORIZED);
-  assert(landed_adjusts == 1);
+  assert(landed_adjusts == 2);  /* +1: the singleton op landed earlier */
   printf("revocable OK: suspended key refused (unauthorized), nothing landed\n");
 
   /* ACTIVATE recovers the key — and R8-A-5 bumps the version ON
@@ -174,7 +210,7 @@ int main(void) {
   /* The fresh stamp lands again. */
   assert(execute_adjust_as(am, state, "k1", k1_key, version_after_reactivate)
          == CRABS_SUCCESS);
-  assert(landed_adjusts == 2);
+  assert(landed_adjusts == 3);
   printf("revocable OK: reactivation is real, and the version bump killed the suspended-window stamps\n");
 
   /* ROTATE (C-only): the old key is revoked and the new one chained to it
@@ -203,7 +239,7 @@ int main(void) {
          == CRABS_ERR_UNAUTHORIZED);
   assert(execute_adjust_as(am, state, "k2", k2_key, reader_now->key_version)
          == CRABS_SUCCESS);
-  assert(landed_adjusts == 3);
+  assert(landed_adjusts == 4);
   printf("revocable OK: rotation revoked the old key, chained the new one, old-key ops refused\n");
 
   /* The seal: the machine's own CP-ABE authority
@@ -247,7 +283,7 @@ int main(void) {
    * re-grants are refused too. */
   assert(execute_adjust_as(am, state, "k2", k2_key, reader_now->key_version)
          == CRABS_ERR_UNAUTHORIZED);
-  assert(landed_adjusts == 3);
+  assert(landed_adjusts == 4);
   assert(attribute_machine_grant_role(am, "reader", "role", "member", "admin")
          == CRABS_ERR_USER_SUSPENDED);
   printf("revocable OK: revoked user's ops and re-grants refused (fail-closed)\n");

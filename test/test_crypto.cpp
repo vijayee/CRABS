@@ -384,6 +384,67 @@ TEST(TestAbe, TestPolicyInfixAndComparison) {
   EXPECT_FALSE(crypto_abe_eval_policy("views < 5", "views:10"));
 }
 
+// Gap-fill A5: a one-clause prefix policy "AND <clause>" was mis-parsed as a
+// two-operand AND whose empty right operand evaluates false, silently
+// refusing every valid holder. It must collapse to the clause itself; every
+// other dangling shape still fails closed.
+TEST(TestAbe, SingleClauseAndPolicyIsTheClause) {
+  abe_master_key_t* mk = crypto_abe_setup();
+  ASSERT_NE(mk, nullptr);
+
+  // The eval surface: "AND <clause>" is exactly the clause.
+  EXPECT_TRUE(crypto_abe_eval_policy("AND role:member", "role:member"));
+  EXPECT_FALSE(crypto_abe_eval_policy("AND role:member", "role:admin"));
+  EXPECT_TRUE(crypto_abe_eval_policy("AND role:member ", "role:member"));
+  // Baseline: the bare token, the working form before the relaxation.
+  EXPECT_TRUE(crypto_abe_eval_policy("role:member", "role:member"));
+
+  // Other dangling shapes keep the fail-closed refusal (a typo'd policy must
+  // refuse, never silently drop a required clause).
+  EXPECT_FALSE(crypto_abe_eval_policy("AND", "role:member"));
+  EXPECT_FALSE(crypto_abe_eval_policy("AND role:member AND", "role:member"));
+  EXPECT_FALSE(crypto_abe_eval_policy(
+      "AND role:member AND role:editor", "role:member,role:editor"));
+  EXPECT_FALSE(crypto_abe_eval_policy("AND (role:member)", "role:member"));
+
+  // A fully-formed prefix multi-clause policy still requires every clause.
+  EXPECT_TRUE(crypto_abe_eval_policy("AND role:member adult", "role:member,adult"));
+  EXPECT_FALSE(crypto_abe_eval_policy("AND role:member adult", "role:member"));
+
+  // The encrypt surface (OpenABE, infix-only grammar) refuses the prefix
+  // form at encrypt time — noisy, fail-closed — and the bare token encrypts
+  // with the identical holder semantics. (Keygen attrs must be bare tokens:
+  // _crabs_attrs_to_oabe maps ':' to '_' for the OpenABE key, so a colon
+  // policy would never match; the eval surface above handles colon tokens.)
+  const uint8_t policy_message[] = "single clause";
+  abe_ciphertext_t* bare_ct =
+      crypto_abe_encrypt(mk, policy_message, sizeof(policy_message), "member");
+  ASSERT_NE(bare_ct, nullptr);
+  abe_user_key_t* member_key = crypto_abe_keygen(mk, "member,auditor");
+  ASSERT_NE(member_key, nullptr);
+  abe_user_key_t* outsider_key = crypto_abe_keygen(mk, "auditor");
+  ASSERT_NE(outsider_key, nullptr);
+
+  uint8_t* decrypted = nullptr;
+  size_t decrypted_len = 0;
+  EXPECT_EQ(crypto_abe_decrypt(member_key, bare_ct, &decrypted, &decrypted_len),
+            CRABS_SUCCESS);
+  EXPECT_EQ(memcmp(decrypted, policy_message, sizeof(policy_message)), 0);
+  free(decrypted);
+  decrypted = nullptr;
+  EXPECT_NE(crypto_abe_decrypt(outsider_key, bare_ct, &decrypted, &decrypted_len),
+            CRABS_SUCCESS);
+  free(decrypted);
+  EXPECT_EQ(crypto_abe_encrypt(mk, policy_message, sizeof(policy_message),
+                               "AND member"),
+            nullptr);
+
+  crypto_abe_user_key_destroy(member_key);
+  crypto_abe_user_key_destroy(outsider_key);
+  crypto_abe_ciphertext_destroy(bare_ct);
+  crypto_abe_master_key_destroy(mk);
+}
+
 TEST(TestAbe, TestEncryptNullParams) {
   abe_master_key_t* mk = crypto_abe_setup();
   ASSERT_NE(mk, nullptr);

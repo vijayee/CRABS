@@ -104,9 +104,9 @@ Add matching declarations to `wasm_init.c`'s EXPORT list (grep how `crabs_wasm_u
 ### Task A5: policy parser single-clause guard (decision by size)
 
 **Files:** possibly `src/Crypto/crypto.c:676-696`; Test: gtest addition near `test/test_crypto.cpp` policy tests.
-- [ ] **Step 1:** Read the `AND`-prefix branch. If a one-guard fix exists (treat `AND x` with empty right operand as the singleton `x`), implement it with the gtest `SingleClauseAndPolicy`: `crypto_abe_*` policy eval of `'AND role:member'` matches exactly the same set as `'role:member'`. If it is NOT a small guard, STOP and report — recipe 15 (revocable-data) documents the rule instead.
-- [ ] **Step 2:** full crypto gtest section green — note the behavior change is a relaxation; no existing test asserts refusal for this shape (grep `AND role:` singles first; if one does, it was encoding the bug — update with a comment).
-- [ ] **Step 3: Commit** `fix: 'AND x' single-clause policy parses as x` (or skip commit if documented instead; report either way).
+- [x] **Step 1:** Fix implemented (recipe 16, not 15, is the revocable-data doc): a pre-parse guard in the `_eval_policy_expr` prefix-AND branch — the collapse applies only when the text after `AND` is a single term running to end-of-string (no further operator/paren/comma), and only if the operand parse consumes it fully. Every other dangling shape (bare `AND`, compound `AND role:member AND`, parenthesized form, infix trailing `<term> AND` — ambiguous at recursion depth) keeps the fail-closed refusal. gtest `SingleClauseAndPolicyIsTheClause` added; red confirmed on the eval assertions only, green after the fix.
+- [x] **Step 2:** crypto section (12/12 `TestAbe*`) + whole `ctest` suite 1742/1742 green; `run-c.sh` all snippets green after rewriting 16's pitfall pin (singleton now lands as `'role:member'`, plus a new fail-closed pin for `'AND role:member AND'`); `run-snippets.mjs` 24/24 green. Recipe 16 prose updated to the post-fix grammar rule.
+- [x] **Step 3: Commit** `fix: 'AND x' single-clause policy parses as x`.
 
 ### Task A6: DedupSpec JS surface (recipes 2/3)
 

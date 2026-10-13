@@ -359,12 +359,20 @@ test_ref: test/test_key_lifecycle.cpp:88-125 (suspend), :171-251 (activate + R8-
   (list in the C provenance). The bump-on-activation is deliberate
   (R8-A-5): signatures made while a key was suspended must not outlive the
   reactivation.
-- *A grammar pitfall pinned on the way*: the CRABS policy grammar is prefix
-  — `AND` takes two clauses. The single-clause `'AND role:member'` is a
-  legal-looking string that mis-parses (an empty right operand evaluates
-  false, `src/Crypto/crypto.c:676-696`) and silently refuses every member —
-  the C snippet pins it. Single-clause policies are the bare token; this
-  recipe uses `'role:member'` on all three surfaces.
+- *The grammar pin, after the single-clause fix*: the CRABS policy evaluator
+  accepts both prefix (`AND <l> <r>`) and infix (`<l> AND <r>`) forms. A
+  one-clause prefix policy `'AND role:member'` — a legal-looking string that
+  used to mis-parse (an empty right operand evaluated false, silently
+  refusing every member) — now collapses to the bare token
+  (`src/Crypto/crypto.c:680-699`): any leading single-clause `AND` is the
+  plain token, and both forms are pinned as equivalent in the C snippet.
+  The fail-closed rule still stands for every OTHER dangling shape — a bare
+  `'AND'`, a compound dangling operator (`'AND role:member AND'`), a
+  parenthesized sub-expression — all refuse, also pinned. Note the
+  encrypt/decrypt surface is stricter: OpenABE's policy parser is infix-only
+  (this fork's parser is case-insensitive), so a prefix `'AND member'` fails
+  the *encrypt* call itself (noisy, fail-closed) — encode encrypt policies
+  infix (`'epoch_1 and member'`), as this recipe's seal does.
 - *The re-encryption recall is only as sound as the re-seal*: the epoch
   pattern protects future READS of newly-sealed data; data sealed under
   epoch N stays openable to every epoch-N-derived key (bearer-instrument

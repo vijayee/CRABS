@@ -680,7 +680,23 @@ static bool _eval_policy_expr(const char** pp, const char* attrs) {
   if (strncmp(*pp, "AND", 3) == 0 && !isalpha((unsigned char)(*pp)[3])) {
     *pp += 3;
     while (**pp == ' ') (*pp)++;
+
+    // Gap-fill A5: "AND <clause>" with nothing behind the clause is that
+    // clause, not a two-operand AND mis-read against an empty right operand
+    // (which silently refused every valid holder). Qualify ONLY a single
+    // term running to the end of the string: every other dangling shape —
+    // compound operands, parenthesized/sub-expressions, a bare "AND", an
+    // infix <term> AND — keeps the fail-closed refusal below, so a typo'd
+    // policy never drops a required clause.
+    const char* scan = *pp;
+    while (*scan && *scan != ' ' && *scan != '(' && *scan != ')' && *scan != ',') scan++;
+    while (*scan == ' ') scan++;
+    bool single_clause = (*scan == '\0');
+
     bool left = _eval_policy_expr(pp, attrs);
+
+    while (**pp == ' ') (*pp)++;
+    if (single_clause && **pp == '\0') return left;
     bool right = _eval_policy_expr(pp, attrs);
     return left && right;
   }
