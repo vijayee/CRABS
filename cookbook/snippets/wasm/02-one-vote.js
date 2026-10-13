@@ -1,7 +1,7 @@
 'use strict';
 // Recipe 2 — one vote per member (crabs-wasm, run in Node).
 // The once-record is a ONE_SHOT_SET item (additive, idempotent, cannot
-// un-vote); the tallies are per-option G-counters. The guard is REGISTRED on
+// un-vote); the tallies are per-option G-counters. The guard is REGISTERED on
 // the machine: defineOperationType installs a DedupSpec for the 'vote' op
 // type (state_register_op_type_def via a node-key-signed
 // '__define_operation_type__' op) and the executor resolves it for every

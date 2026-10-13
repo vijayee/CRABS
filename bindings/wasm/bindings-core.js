@@ -1116,15 +1116,21 @@ class Node {
     if (options.dedup === 'global' && !options.flagPath) {
       throw new Error("defineOperationType: dedup 'global' requires a flagPath (the ONE_SHOT_FLAG once-record)");
     }
-    // The C spec fields are CRABS_MAX_DEDUP_PATH (128) bytes — a longer path
-    // would be silently truncated into a tracker/flag lookup that never
-    // resolves, so refuse loudly instead.
+    // The C spec fields are CRABS_MAX_DEDUP_PATH (128) / CRABS_MAX_DEDUP_MESSAGE
+    // (256) bytes — a longer string would be silently truncated into a
+    // tracker/flag lookup that never resolves (or a cut-off message), so
+    // refuse loudly instead. The C buffers count BYTES, so measure the UTF-8
+    // encoding, never the UTF-16 string length.
     const DEDUP_PATH_MAX = 127;
-    if (options.trackerPath && options.trackerPath.length > DEDUP_PATH_MAX) {
+    const DEDUP_MESSAGE_MAX = 255;
+    if (options.trackerPath && encodeText(options.trackerPath).length > DEDUP_PATH_MAX) {
       throw new Error(`defineOperationType: trackerPath exceeds ${DEDUP_PATH_MAX} bytes`);
     }
-    if (options.flagPath && options.flagPath.length > DEDUP_PATH_MAX) {
+    if (options.flagPath && encodeText(options.flagPath).length > DEDUP_PATH_MAX) {
       throw new Error(`defineOperationType: flagPath exceeds ${DEDUP_PATH_MAX} bytes`);
+    }
+    if (options.rejectionMessage && encodeText(options.rejectionMessage).length > DEDUP_MESSAGE_MAX) {
+      throw new Error(`defineOperationType: rejectionMessage exceeds ${DEDUP_MESSAGE_MAX} bytes`);
     }
     const opTypePtr = writeString(M, opType);
     const trackerPtr = options.trackerPath ? writeString(M, options.trackerPath) : 0;

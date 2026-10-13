@@ -159,10 +159,10 @@ const { Node, KeyPair, Operation } = require('..');
 
   // Re-defining the same op type REPLACES its spec in place
   // (state_register_op_type_def first-match update): a 'none' definition
-  // disables the guard — a registered-NONE type also seals it against
-  // op-carried specs (the executor ignores the carried spec when ANY spec is
-  // registered, and rejects carried specs only when NONE is registered for
-  // the type).
+  // disables the guard. Carried specs are rejected when NO spec is
+  // registered for the type, and ignored whenever ANY spec is registered —
+  // including NONE (the seal) — so the executor never consults a
+  // signer-authored spec.
   node.defineOperationType('boost', { dedup: 'none' });
   await castBoost(aliceKey, 'alice');  // the previously-refused second call now passes
 

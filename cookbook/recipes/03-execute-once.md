@@ -162,14 +162,14 @@ symbols:
   one_shot_flag_merge         src/CRDT/one_shot.h:47
   one_shot_flag_destroy       src/CRDT/one_shot.h:44
   (set_by / set_at fields)    src/CRDT/one_shot.h:37-41
-  state_create                src/CRABS/data_model.h:684
-  state_destroy               src/CRABS/data_model.h:685
-  data_item_create            src/CRABS/data_model.h:636
-  state_add_item              src/CRABS/data_model.h:719
-  data_value_repr_t           src/CRABS/data_model.h:79-81
-  state_register_op_type_def  src/CRABS/data_model.h:757
-  state_find_op_type_def      src/CRABS/data_model.h:756
-  dedup_spec_t                src/CRABS/data_model.h:364-374
+  state_create                src/CRABS/data_model.h:721
+  state_destroy               src/CRABS/data_model.h:722
+  data_item_create            src/CRABS/data_model.h:673
+  state_add_item              src/CRABS/data_model.h:756
+  data_value_repr_t           src/CRABS/data_model.h:77-81
+  state_register_op_type_def  src/CRABS/data_model.h:794
+  state_find_op_type_def      src/CRABS/data_model.h:793
+  dedup_spec_t                src/CRABS/data_model.h:363-374
   CRABS_MAX_DEDUP_PATH        src/CRABS/data_model.h:330
   dedup_check_guard_spec      src/Dedup/dedup.h:31-33
   dedup_apply_mutation_spec   src/Dedup/dedup.h:43-45

@@ -2024,6 +2024,14 @@ private:
       rejection_message = require_js_string(
           options.Get("rejectionMessage"), "defineOperationType", "rejectionMessage");
       has_rejection_message = !rejection_message.empty();
+      // The C spec field is CRABS_MAX_DEDUP_MESSAGE (256) bytes — a longer
+      // message would be silently truncated mid-text, so refuse loudly
+      // instead (std::string::length() counts UTF-8 bytes, matching the
+      // C buffer).
+      if (rejection_message.length() >= CRABS_MAX_DEDUP_MESSAGE) {
+        throw Napi::RangeError::New(env,
+            "defineOperationType: rejectionMessage exceeds 255 bytes");
+      }
     }
     // An op-type name travels as resources[0] (the define handler reads it),
     // so it obeys the same length bound as every other resource string.

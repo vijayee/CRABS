@@ -173,18 +173,18 @@ test_ref: bindings/node/test/test.js:659 (defineOperationType block: per-user gu
 target: native-c
 verified: executed
 symbols:
-  state_create               src/CRABS/data_model.h:684
-  state_destroy              src/CRABS/data_model.h:685
-  data_item_create           src/CRABS/data_model.h:636
-  state_add_item             src/CRABS/data_model.h:719
+  state_create               src/CRABS/data_model.h:721
+  state_destroy              src/CRABS/data_model.h:722
+  data_item_create           src/CRABS/data_model.h:673
+  state_add_item             src/CRABS/data_model.h:756
   one_shot_set_create        src/CRDT/one_shot.h:24
   one_shot_set_count         src/CRDT/one_shot.h:28
   one_shot_set_contains      src/CRDT/one_shot.h:27
   one_shot_set_destroy       src/CRDT/one_shot.h:25
-  data_value_repr_t          src/CRABS/data_model.h:79-81
-  state_register_op_type_def src/CRABS/data_model.h:757
-  state_find_op_type_def     src/CRABS/data_model.h:756
-  dedup_spec_t               src/CRABS/data_model.h:364-374
+  data_value_repr_t          src/CRABS/data_model.h:77-81
+  state_register_op_type_def src/CRABS/data_model.h:794
+  state_find_op_type_def     src/CRABS/data_model.h:793
+  dedup_spec_t               src/CRABS/data_model.h:363-374
   CRABS_MAX_DEDUP_PATH       src/CRABS/data_model.h:330
   dedup_check_guard_spec     src/Dedup/dedup.h:31-33
   dedup_apply_mutation_spec  src/Dedup/dedup.h:43-45

@@ -114,9 +114,9 @@ One-shot sets and flags are added like any item (`addOneShotSet` / `addOneShotFl
 | `Node.defineOperationType` | method | `defineOperationType(opType, { dedup: 'per-user' \| 'global' \| 'none', trackerPath?, flagPath?, rejectionMessage? })` | wasm :446, node :291 | STABLE (`bindings/wasm/test/dedup-surface.js`, `test/test.js:659`) |
 | `DefineOperationTypeOptions` | interface | `{dedup, trackerPath?, flagPath?, rejectionMessage?}` | wasm :197-217, node :155-175 | STABLE (same tests) |
 | `dedup_check_guard` | C fn | `dedup_check_guard(state, op) -> crabs_error_e` | `src/Dedup/dedup.h:21-22` | PRESENT in C; the executor resolves REGISTERED specs via `state_find_op_type_def` — a registered spec wins over whatever the op carries (register + bypass-refusal pinned in `test/test_state_machine.cpp` `DefineOperationTypeExecutesThroughMachine`) |
-| `state_register_op_type_def` | C fn | `state_register_op_type_def(state, op_type, dedup_spec_t*)` | `src/CRABS/data_model.h:757` | PRESENT; reachable from both JS bindings via `Node.defineOperationType` (first-match update in place — re-defining REPLACES the spec, capacity 32 at `data_model.h:379`) |
+| `state_register_op_type_def` | C fn | `state_register_op_type_def(state, op_type, dedup_spec_t*)` | `src/CRABS/data_model.h:794` | PRESENT; reachable from both JS bindings via `Node.defineOperationType` (first-match update in place — re-defining REPLACES the spec, capacity 32 at `data_model.h:379`) |
 
-`DedupSpec` types (`dedup_type_e`, `dedup_spec_t`) at `src/CRABS/data_model.h:338,364-374`; the op format carries a `dedup_spec` since wire v3 (`src/StateMachine/state_machine.h:61,99`).
+`DedupSpec` types (`dedup_type_e`, `dedup_spec_t`) at `src/CRABS/data_model.h:333-338,363-374`; the op format carries a `dedup_spec` since wire v3 (`src/StateMachine/state_machine.h:61,99`).
 
 ## 6. Schedules and time sources (R7)
 
