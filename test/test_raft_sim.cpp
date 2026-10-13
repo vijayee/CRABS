@@ -193,7 +193,19 @@ static void sim_cluster_attach(sim_host_t* host, sim_extra_setup_fn extra_setup)
 }
 
 // Route every drained outbound message onto the wire (addressed by the
-// to_peer id).
+// to_peer id). Per-destination KIND tallies let scenarios count traffic
+// shapes (e.g. zero appends to an evicted node after its exclusion).
+typedef struct {
+  uint32_t append_req[kSimMaxNodes];
+  uint32_t config_excluded[kSimMaxNodes];
+} sim_wire_kind_tally_t;
+
+static sim_wire_kind_tally_t sim_wire_kinds = {};
+
+static void sim_wire_kinds_reset() {
+  sim_wire_kinds = sim_wire_kind_tally_t{};
+}
+
 static void sim_route_outbound(sim_host_t* host) {
   for (uint32_t node_index = 0; node_index < host->node_count; node_index++) {
     crabs_raft_outbound_message_t outbound;
@@ -208,6 +220,14 @@ static void sim_route_outbound(sim_host_t* host) {
           message.to_node = peer_index;
           break;
         }
+      }
+      if (message.to_node < kSimMaxNodes &&
+          outbound.kind == RAFT_MSG_APPEND_REQ) {
+        sim_wire_kinds.append_req[message.to_node]++;
+      }
+      if (message.to_node < kSimMaxNodes &&
+          outbound.kind == RAFT_MSG_CONFIG_EXCLUDED) {
+        sim_wire_kinds.config_excluded[message.to_node]++;
       }
       free((void*)outbound.bytes);
       host->wire.push_back(message);
@@ -2133,15 +2153,51 @@ TEST(RaftMembership, SingleNodeJointAddThenRemoveCompletesSafely) {
   sim_run_until(&host, 100, 60, sim_pred_config_count);
   EXPECT_FALSE(crabs_raft_module_is_leader(host.nodes[1].module));
 
+  // Ghost replication ends: once C_new commits, the leader's fan-out gates
+  // on the COMMITTED config — alpha is cut off and told exactly once. The
+  // exclusion control carries the final commit ceiling, so alpha finishes
+  // committing the (durably held) config change and lands on [node-0].
+  uint32_t settle_turns = 0;
+  while ((sim_wire_kinds.config_excluded[1] == 0u ||
+          crabs_raft_module_joint_members(host.nodes[1].module,
+                                          nullptr) != 0u) &&
+         settle_turns < 30) {
+    sim_step(&host, 100, nullptr);
+    settle_turns++;
+  }
+  ASSERT_LT(settle_turns, 30u) << "exclusion never settled the evicted node";
+  ASSERT_GE(sim_wire_kinds.config_excluded[1], 1u)
+      << "evicted node never received the exclusion";
+  EXPECT_EQ(crabs_raft_module_joint_members(host.nodes[1].module, nullptr),
+            0u);
+  EXPECT_EQ(crabs_raft_module_committed_members(host.nodes[1].module, nullptr),
+            1u);
+  EXPECT_EQ(crabs_raft_module_committed_tip(host.nodes[1].module),
+            crabs_raft_module_committed_tip(host.nodes[0].module));
+  // Zero post-exclusion appends to the evicted node: committed group data
+  // never flows to a server the committed config excluded (§6).
+  uint32_t appends_before = sim_wire_kinds.append_req[1];
+  for (uint32_t turn = 0; turn < 6; turn++) {
+    sim_step(&host, 100, nullptr);
+  }
+  EXPECT_EQ(sim_wire_kinds.append_req[1], appends_before);
+
   // A post-removal decree commits on the single-member cluster and
-  // materializes exactly once.
+  // materializes EXACTLY on the leader — never on the evicted standby.
   uint8_t decree_uuid[CRABS_UUID_SIZE];
   ASSERT_EQ(sim_submit_write(&host, 0, "council_write", "council",
                              "post-remove", decree_uuid),
             CRABS_ERR_ORDERING_PENDING);
-  sim_target_tip = crabs_raft_module_log_length(host.nodes[0].module);
-  sim_run_until(&host, 100, 40, sim_pred_target_tips);
+  uint64_t decree_tip = crabs_raft_module_log_length(host.nodes[0].module);
+  uint32_t decree_turns = 0;
+  while (crabs_raft_module_committed_tip(host.nodes[0].module) != decree_tip &&
+         decree_turns < 30) {
+    sim_step(&host, 100, nullptr);
+    decree_turns++;
+  }
+  EXPECT_EQ(crabs_raft_module_committed_tip(host.nodes[0].module), decree_tip);
   EXPECT_EQ(sim_state_uuid_occurrences(host.nodes[0].state, decree_uuid), 1u);
+  EXPECT_EQ(sim_state_uuid_occurrences(host.nodes[1].state, decree_uuid), 0u);
 
   sim_host_destroy(&host);
 }

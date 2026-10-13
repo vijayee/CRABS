@@ -100,7 +100,14 @@ typedef enum {
   RAFT_MSG_VOTE_REQ   = 1,
   RAFT_MSG_VOTE_RESP  = 2,
   RAFT_MSG_APPEND_REQ = 3,
-  RAFT_MSG_APPEND_RESP = 4
+  RAFT_MSG_APPEND_RESP = 4,
+  // Leader-side membership eviction notice (Raft §6): the committed config
+  // no longer counts the addressed peer, so the leader stopped replicating
+  // to it. Body: u64 commit ceiling — the exclusion REPLACES the follower's
+  // append traffic, so the ceiling lets the evicted node finish committing
+  // what it durably holds before it stops. The peer surfaces
+  // RAFT_NOTIFY_CONFIG_EXCLUDED and steps down.
+  RAFT_MSG_CONFIG_EXCLUDED = 5
 } raft_msg_kind_e;
 
 typedef struct {

@@ -186,6 +186,10 @@ typedef struct crabs_raft_module_s {
   uint64_t next_index[RAFT_MEMBER_TABLE_MAX];
   uint64_t match_index[RAFT_MEMBER_TABLE_MAX];
   bool     vote_granted[RAFT_MEMBER_TABLE_MAX];
+  // exclusion_sent[i] — this leader already told member i it fell out of the
+  // committed config (the CONFIG_EXCLUDED control flies ONCE per peer per
+  // leadership; every heartbeat would otherwise re-scream it).
+  bool     exclusion_sent[RAFT_MEMBER_TABLE_MAX];
 
   // Timers (the module's clock origin is the host's now_ms domain).
   uint64_t election_deadline_ms;
@@ -240,6 +244,10 @@ static crabs_error_e _raft_config_register_members(
 static crabs_error_e _raft_config_entry_lists(
     crabs_raft_module_s* module, const raft_log_entry_t* entry,
     raft_config_list_t* out_old, raft_config_list_t* out_new, uint8_t* out_kind);
+// Forward: replication fan-out admission (committed config + in-flight
+// change members — a §6 ghost gate; defined with the config mechanics).
+static bool _raft_append_admitted(crabs_raft_module_s* module,
+                                  uint32_t member_index);
 // Commit-side apply: adopt the entry's lists into the active config.
 static void _raft_config_apply_committed(crabs_raft_module_s* module,
                                          const raft_log_entry_t* entry);
@@ -559,11 +567,17 @@ static void _raft_advance_commit(crabs_raft_module_s* module) {
   // Transition step 2 (leader side): a committed C_old,new commits its own
   // C_new successor automatically. Any leader (even one the change evicts)
   // may finish it — commit quorums still ride the committed joint rules.
+  // The successor is fanned out IMMEDIATELY after the append: the joint is
+  // still active right here, so a would-be-evicted member gets the FINAL
+  // entry before its next-commit fan-out switches it to the exclusion path
+  // (otherwise the final entry can commit — single-member quorum — without
+  // ever leaving the leader).
   if (joint_committed && module->role == RAFT_ROLE_LEADER &&
       module->config_change_in_flight == 0) {
     raft_config_list_t joint_new = module->config_new;
     _raft_append_config_entry(module, module->config_old, joint_new,
                                RAFT_CONFIG_KIND_FINAL);
+    _raft_send_appends_all(module);
   }
   // A committed change that evicted this node steps it down (§6: a removed
   // member stops leading; it only learns through the committed entry).
@@ -856,6 +870,25 @@ static bool _raft_marshal_append_response(crabs_raft_module_s* module,
   return true;
 }
 
+// Membership eviction notice (Raft §6): the addressed peer fell out of the
+// committed config, so the replication traffic STOPS and this single
+// control replaces it — carrying the current commit ceiling so the evicted
+// node can finish committing what it durably holds before it stops.
+static bool _raft_marshal_config_excluded(crabs_raft_module_s* module,
+                                          const char* to_peer) {
+  uint8_t body[8];
+  raft_wire_writer_t writer = { body, sizeof(body), 0, false };
+  _raft_write_u64(&writer, module->commit_index);
+  size_t len = 0;
+  uint8_t* bytes = _raft_marshal(RAFT_MSG_CONFIG_EXCLUDED,
+                                 module->current_term, body, writer.offset,
+                                 &len);
+  if (bytes == NULL) return false;
+  _raft_enqueue_outbound(module, RAFT_MSG_CONFIG_EXCLUDED, to_peer, bytes,
+                         len);
+  return true;
+}
+
 // ============================================================
 // Replication fan-out (Raft §5.3) — leader side
 // ============================================================
@@ -902,9 +935,24 @@ static void _raft_send_append_to(crabs_raft_module_s* module,
 }
 
 static void _raft_send_appends_all(crabs_raft_module_s* module) {
+  // Fan out over the member ADDRESS BOOK but gate on committed-config
+  // membership (_raft_append_admitted encodes the §6 rules precisely):
+  // committed data never flows to a node the committed config evicted.
   for (uint32_t member_index = 0; member_index < module->member_n;
        member_index++) {
-    _raft_send_append_to(module, member_index);
+    if (_raft_is_self(module, module->member_ids[member_index])) continue;
+    if (_raft_append_admitted(module, member_index)) {
+      _raft_send_append_to(module, member_index);
+      continue;
+    }
+    // An evicted peer: cut the appends and tell it ONCE per leadership —
+    // the exclusion control carries the commit ceiling (it replaces this
+    // peer's append traffic), so it learns the final committed tip.
+    if (!module->exclusion_sent[member_index] &&
+        _raft_marshal_config_excluded(module,
+                                      module->member_ids[member_index])) {
+      module->exclusion_sent[member_index] = true;
+    }
   }
 }
 
@@ -1277,6 +1325,40 @@ static void _raft_handle_append_request(crabs_raft_module_s* module,
   _raft_marshal_append_response(module, leader_id, true, accepted_match);
 }
 
+// Inbound membership eviction (the peer-side of _raft_send_appends_all's
+// gate): the committed config no longer counts this node, and the leader's
+// append traffic — including commit-carrying ceilings — stops with it. The
+// control carries the FINAL commit ceiling so this node still finishes
+// committing what it durably holds; its config applies at the tip and the
+// host learns the eviction through CONFIG_EXCLUDED.
+static void _raft_handle_config_excluded(crabs_raft_module_s* module,
+                                         uint64_t term,
+                                         raft_wire_reader_t* reader) {
+  uint64_t commit_ceiling;
+  if (!_raft_read_u64(reader, &commit_ceiling)) {
+    module->rejected_message_count++;
+    return;
+  }
+  // Only a claim from the CURRENT term (or newer — then it also steps the
+  // node down through the ordinary term mechanics) settles membership: an
+  // older term's notice is stale chatter about a superseded change.
+  if (term < module->current_term) {
+    module->rejected_message_count++;
+    return;
+  }
+  if (term > module->current_term) {
+    _raft_step_down(module, term, NULL);
+  }
+  if (commit_ceiling > module->follower_commit_target) {
+    module->follower_commit_target = commit_ceiling;
+  }
+  _raft_advance_commit(module);
+  module->role = RAFT_ROLE_FOLLOWER;
+  module->leader_id[0] = '\0';
+  _raft_enqueue_notification(module, RAFT_NOTIFY_CONFIG_EXCLUDED, NULL, 0,
+                             NULL, 0);
+}
+
 static void _raft_handle_append_response(crabs_raft_module_s* module,
                                          uint64_t term,
                                          raft_wire_reader_t* reader,
@@ -1355,6 +1437,9 @@ static void _raft_process_inbound(crabs_raft_module_s* module,
       break;
     case RAFT_MSG_APPEND_RESP:
       _raft_handle_append_response(module, term, &reader, peer_id, now_ms);
+      break;
+    case RAFT_MSG_CONFIG_EXCLUDED:
+      _raft_handle_config_excluded(module, term, &reader);
       break;
     default:
       module->rejected_message_count++;
@@ -1483,6 +1568,37 @@ static void _raft_config_apply_committed(crabs_raft_module_s* module,
     module->config_old = entry_new;
     module->config_new.member_n = 0;
   }
+}
+
+// Replication fan-out admission (Raft §6, precisely): a peer receives
+// committed-group traffic while
+//   - it sits in the COMMITTED config (the joint pair spans both lists
+//     while C_old,new is active — members of either list are legit), or
+//   - it sits in the newest APPENDED (possibly uncommitted) config entry —
+//     the change's OWN commit needs that peer's durable match, so the
+//     ghost gate must never deadlock the change it is announcing.
+// Everyone else in the address book is a ghost: excluded servers must not
+// receive committed group state.
+static bool _raft_append_admitted(crabs_raft_module_s* module,
+                                  uint32_t member_index) {
+  if (_raft_in_list(&module->config_old, member_index) ||
+      (module->config_new.member_n > 0 &&
+       _raft_in_list(&module->config_new, member_index))) {
+    return true;
+  }
+  if (module->config_change_in_flight == 0) return false;
+  raft_log_entry_t* change = _raft_log_entry(module,
+                                             module->config_change_in_flight);
+  if (change == NULL || !_raft_entry_is_config(change)) return false;
+  raft_config_list_t change_old;
+  raft_config_list_t change_new;
+  uint8_t kind = 0;
+  if (_raft_config_entry_lists(module, change, &change_old, &change_new,
+                               &kind) != CRABS_SUCCESS) {
+    return false;   // undecodable in-flight change: fail closed as a ghost
+  }
+  return _raft_in_list(&change_old, member_index) ||
+         _raft_in_list(&change_new, member_index);
 }
 
 // Leader-side append of a config entry at the log tail (the joint
@@ -1673,6 +1789,7 @@ static void _raft_become_leader(crabs_raft_module_s* module, uint64_t now_ms) {
        member_index++) {
     module->match_index[member_index] = 0;
     module->next_index[member_index] = module->last_log_index + 1;
+    module->exclusion_sent[member_index] = false;   // fresh eviction bookkeeping
   }
   module->last_append_ms = now_ms;
   _raft_enqueue_notification(module, RAFT_NOTIFY_BECAME_LEADER,
@@ -2405,6 +2522,7 @@ crabs_error_e crabs_raft_module_import_state(
   // as a follower with no in-flight election or replication cursor state);
   // held vote traffic has nothing to ride on after a restart — drop it.
   memset(module->vote_granted, 0, sizeof(module->vote_granted));
+  memset(module->exclusion_sent, 0, sizeof(module->exclusion_sent));
   {
     raft_held_msg_t* held = module->held_msgs;
     while (held != NULL) {
