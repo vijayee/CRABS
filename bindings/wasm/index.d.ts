@@ -24,7 +24,7 @@ export interface AttestationFields {
 }
 
 export interface CrabsChangeEvent {
-  kind: 'op' | 'schedule' | 'trigger' | 'attribute' | 'spawn' | 'lineage';
+  kind: 'op' | 'schedule' | 'trigger' | 'attribute' | 'spawn' | 'lineage' | 'merge';
   type: string;
   uuid: string;
   signer: string;

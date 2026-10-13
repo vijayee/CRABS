@@ -290,7 +290,7 @@ export type TimeSourceInfo =
       timeoutMs: number; maxSkewMs: number; created: boolean };
 
 export interface CrabsChangeEvent {
-  kind: 'op' | 'schedule' | 'trigger' | 'attribute' | 'spawn' | 'lineage';
+  kind: 'op' | 'schedule' | 'trigger' | 'attribute' | 'spawn' | 'lineage' | 'merge';
   type: string;
   signer: string | null;
   node: string | null;

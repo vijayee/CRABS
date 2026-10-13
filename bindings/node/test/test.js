@@ -585,8 +585,8 @@ try {
 {
   assert(wireVersions && typeof wireVersions === 'object',
     'wireVersions should be exposed');
-  assert(wireVersions.state === 17,
-    `wireVersions.state=${wireVersions.state}, expected 17`);
+  assert(wireVersions.state === 18,
+    `wireVersions.state=${wireVersions.state}, expected 18`);
   assert(wireVersions.op === 6,
     `wireVersions.op=${wireVersions.op}, expected 6`);
   assert(wireVersions.signing === 4,

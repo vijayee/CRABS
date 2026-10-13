@@ -9,7 +9,7 @@
 // snapshot into this machine via crdt_merge_state (counters max-per-node /
 // sum-across-nodes, register LWW, OR-set union).
 
-const { Node, KeyPair } = require('..');
+const { Node, KeyPair, Operation } = require('..');
 
 (async () => {
   const SEAL_KEY_A = 'aa'.repeat(32);

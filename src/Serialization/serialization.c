@@ -1122,6 +1122,8 @@ crabs_error_e data_item_restore_value_from_logical_bytes(data_item_t* item,
 // durable-state form (_serialize_data_item / crabs_serialize_data_item);
 // false for the sovereign chain preimage (_serialize_data_item_chain_
 // preimage).
+// v18 OT value-presence marker bytes — the definitions live in
+// serialization.h next to the state-wire version they introduced.
 static void _serialize_data_item_shape(write_buf_t* buf, const data_item_t* item,
                                        bool include_protocol_state) {
   // name_length + name
@@ -1170,8 +1172,13 @@ static void _serialize_data_item_shape(write_buf_t* buf, const data_item_t* item
       }
       _write_bytes32(buf, val_bytes, sizeof(int64_t));
     } else if (item->type >= DATA_TYPE_OT_ORDERED_SET && item->type <= DATA_TYPE_OT_ORDERED_MAP) {
-      // OT type: serialize the ot_data (op_log + position_map + priority_counters)
-      // followed by type-specific state (elements, spans, tree nodes)
+      // v18: value-presence marker first, then the ot_data (op_log +
+      // position_map + priority_counters) followed by type-specific state
+      // (elements, spans, tree nodes). The value MUST be present for this
+      // arm (a valueless OT item takes the marker-0 branch below).
+      if (include_protocol_state) {
+        _write_uint8(buf, CRABS_OT_VALUE_PRESENT);
+      }
       if (item->ot_data != NULL) {
         serialized_buffer_t* ot_buf = crabs_serialize_ot_data(
           (crabs_ot_data_item_t*)item->ot_data);
@@ -1195,7 +1202,17 @@ static void _serialize_data_item_shape(write_buf_t* buf, const data_item_t* item
       // Generic: just write 0 length for unsupported types
       _write_bytes32(buf, NULL, 0);
     }
+  } else if (include_protocol_state &&
+             item->type >= DATA_TYPE_OT_ORDERED_SET &&
+             item->type <= DATA_TYPE_OT_ORDERED_MAP) {
+    // v18 durable form: a valueless OT item writes the absence marker and
+    // NOTHING else (no bytes32, no type-state section) — the section the
+    // v17 reader unconditionally expected. The chain preimage keeps the
+    // legacy zero-length value form so the digest stays form-stable.
+    _write_uint8(buf, CRABS_OT_VALUE_ABSENT);
   } else {
+    // Generic valueless item (any form) or the chain preimage of a valueless
+    // OT item: the legacy zero-length value section.
     _write_bytes32(buf, NULL, 0);
   }
 
@@ -1255,10 +1272,30 @@ static bool _deserialize_data_item(read_buf_t* buf, data_item_t* item, uint32_t 
   if (!_read_uint8(buf, &ps)) return false;
   item->protocol_state = (protocol_state_e)ps;
 
-  // value
+  // value. v18 OT items open with a value-presence marker (see the writer's
+  // CRABS_OT_VALUE_* comment): 0x01 = the value section AND the type-state
+  // section follow; 0x00 = the item carries NO value at all (no bytes32, no
+  // type-state — the section the v17 reader unconditionally expected while
+  // the v17 writer omitted it, desyncing on any valueless OT item). The
+  // marker reads as an enum whitelist: any other byte fails closed. Pre-18
+  // blobs keep the unmarked v17 layout.
+  bool ot_item = item->type >= DATA_TYPE_OT_ORDERED_SET &&
+                 item->type <= DATA_TYPE_OT_ORDERED_MAP;
+  bool ot_value_absent = false;
+  if (ot_item && version >= 18) {
+    uint8_t ot_value_marker = 0;
+    if (!_read_uint8(buf, &ot_value_marker)) return false;
+    if (ot_value_marker == CRABS_OT_VALUE_ABSENT) {
+      ot_value_absent = true;
+    } else if (ot_value_marker != CRABS_OT_VALUE_PRESENT) {
+      return false;
+    }
+  }
   uint8_t* val_data = NULL;
   uint32_t val_len = 0;
-  if (!_read_bytes32(buf, &val_data, &val_len)) return false;
+  if (!ot_value_absent) {
+    if (!_read_bytes32(buf, &val_data, &val_len)) return false;
+  }
 
   if (val_data != NULL && val_len > 0) {
     bool struct_backed = version >= 15 &&
@@ -1366,8 +1403,9 @@ static bool _deserialize_data_item(read_buf_t* buf, data_item_t* item, uint32_t 
     item->value = NULL;
   }
 
-  // For OT types, deserialize type-specific state (elements, spans, tree nodes)
-  if (item->type >= DATA_TYPE_OT_ORDERED_SET && item->type <= DATA_TYPE_OT_ORDERED_MAP) {
+  // For OT types, deserialize type-specific state (elements, spans, tree
+  // nodes). A v18 marker-0 item carries no value and NO type-state section.
+  if (ot_item && !ot_value_absent) {
     if (!_deserialize_ot_type_state(buf, item, version)) return false;
   }
 

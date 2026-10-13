@@ -18,7 +18,18 @@
 // Magic bytes and format version (§13.1)
 // ============================================================
 #define CRABS_SERIAL_MAGIC      0x42415243  // "CRAB" in little-endian
-#define CRABS_SERIAL_VERSION    17          // v17: raft module section — committed entries may carry wire_len 0 (leadership no-op entries, Raft §8) and a retry-shelf tail follows the pending proposals (ordered materialization retry: op wire + attempt count, one entry max while the pump blocks); v16 comment — appended the namespace-separated Raft ordering-module section after the lineage/MSK sections — attached flag u8, module_id u8, term u64le, voted-for string16, commit index u64, log u32 count + per-entry {u64 term, u64 proposal_id, u32 wire_len, op wire bytes}; pre-16 blobs load with no module attached (v15: struct-backed counter/register item values serialize logical content (node-sorted entries / register payload+ts+node), not the struct's first 8 bytes (a heap pointer) — fixes chain-digest determinism and struct-item restore)
+#define CRABS_SERIAL_VERSION    18          // v18: OT items open with a value-presence marker u8 before the value section (durable state form only — the chain preimage is unchanged) — 0x01 = ot_data bytes32 + type-state section follow, 0x00 = NO value at all (no bytes32, no type-state); the v17 writer omitted the type-state section for a valueless OT item while the v17 reader read it unconditionally, so any snapshot carrying one desynced the reader (pre-18 blobs keep the unmarked v17 layout and stay readable); v17 comment — raft module section — committed entries may carry wire_len 0 (leadership no-op entries, Raft §8) and a retry-shelf tail follows the pending proposals (ordered materialization retry: op wire + attempt count, one entry max while the pump blocks); v16 — appended a namespace-separated Raft ordering-module section after the lineage/MSK sections — attached flag u8, module_id u8, term u64le, voted-for string16, commit index u64, log u32 count + per-entry {u64 term, u64 proposal_id, u32 wire_len, op wire bytes}; pre-16 blobs load with no module attached (v15: struct-backed counter/register item values serialize logical content (node-sorted entries / register payload+ts+node), not the struct's first 8 bytes (a heap pointer) — fixes chain-digest determinism and struct-item restore)
+
+// v18 OT value-presence marker bytes: an OT item whose value is absent
+// writes CRABS_OT_VALUE_ABSENT and NO type-state section; the v17 writer
+// silently omitted the type-state section there while the reader read it
+// unconditionally — any snapshot carrying a valueless OT item desynced the
+// reader. The marker makes the type-state section's presence
+// self-describing. It appears ONLY in the durable state form; the chain
+// preimage keeps the pre-marker bytes (a digest-stable form — the marker is
+// state-wire evolution, not item content).
+#define CRABS_OT_VALUE_PRESENT  0x01
+#define CRABS_OT_VALUE_ABSENT   0x00
 
 // Canonical-form version byte emitted by crabs_serialize_for_signing (§7.5).
 // Purely domain-separation: nothing parses the signing form, so this MUST

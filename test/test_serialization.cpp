@@ -2314,10 +2314,10 @@ TEST(OrderedSetDeserialize, CountBoundedByRemainingBytes) {
   // Locate the ordered-set element count. State header is magic(4) +
   // version(4) + state_version(8) + item_count(4) + policy_count(4) +
   // log_count(4) = 28 bytes. The single item then carries name string16,
-  // type/crdt/protocol (3 bytes), the ot_data bytes32, and finally the
-  // type-state element count.
+  // type/crdt/protocol (3 bytes), the v18 value-presence marker (1 byte),
+  // the ot_data bytes32, and finally the type-state element count.
   const size_t state_header_len = 28;
-  const size_t ot_data_len_offset = state_header_len + 2 + strlen("set2") + 3;
+  const size_t ot_data_len_offset = state_header_len + 2 + strlen("set2") + 4;
   uint32_t ot_data_len = 0;
   for (int byte_index = 0; byte_index < 4; byte_index++) {
     ot_data_len |= ((uint32_t)buf->data[ot_data_len_offset + byte_index]) << (byte_index * 8);
@@ -3513,7 +3513,7 @@ TEST(StateSerialize, V14ItemDomainRoundTrip) {
 
   serialized_buffer_t* buf = crabs_serialize_state(original);
   ASSERT_NE(buf, nullptr);
-  ASSERT_EQ((uint32_t)CRABS_SERIAL_VERSION, 17u);   // v17: no-op entries + retry-shelf tail
+  ASSERT_EQ((uint32_t)CRABS_SERIAL_VERSION, 18u);   // v18: OT value-presence marker
 
   state_t* restored = crabs_deserialize_state(buf->data, buf->len);
   ASSERT_NE(restored, nullptr);
@@ -3959,4 +3959,168 @@ TEST(StateSerialize, V14WriterRefusesInconsistentDomainFields) {
   if (buf != nullptr) serialized_buffer_destroy(buf);
 
   state_destroy(state);
+}
+
+// ============================================================
+// v18 OT value-presence marker
+// ============================================================
+
+// A valueless OT item (a defensive husk — the merge layer refuses to mint
+// them since the held-event fix) serializes as marker 0x00 with NO
+// type-state section, and the reader restores it as an item with no value:
+// the blob round trips, including a byte-identical re-serialize. The v17
+// form (no marker, no section) desynced the reader instead.
+TEST(OtValueMarker, ValuelessOtItemRoundTripsMarked) {
+  state_t* state = state_create();
+  ASSERT_NE(state, nullptr);
+
+  data_item_t* husk = data_item_create("doc", (data_type_e)DATA_TYPE_OT_ORDERED_SET,
+                                       CRDT_CUSTOM);
+  ASSERT_NE(husk, nullptr);
+  ASSERT_EQ(state_add_item(state, husk), CRABS_SUCCESS);
+
+  // A plain counter beside it proves the non-OT stream is untouched.
+  data_item_t* counter = data_item_create("hits", DATA_TYPE_COUNTER,
+                                          CRDT_G_COUNTER);
+  ASSERT_NE(counter, nullptr);
+  counter->value = g_counter_create();
+  counter->value_repr = (data_value_repr_t)DATA_VALUE_REPR_CRDT_STRUCT;
+  ASSERT_EQ(g_counter_increment((g_counter_t*)counter->value, "a", 7),
+            CRABS_SUCCESS);
+  ASSERT_EQ(state_add_item(state, counter), CRABS_SUCCESS);
+
+  serialized_buffer_t* buf = crabs_serialize_state(state);
+  ASSERT_NE(buf, nullptr);
+
+  state_t* restored = crabs_deserialize_state(buf->data, buf->len);
+  ASSERT_NE(restored, nullptr);
+  data_item_t* r_husk = state_find_item(restored, "doc");
+  ASSERT_NE(r_husk, nullptr);
+  EXPECT_EQ(r_husk->type, DATA_TYPE_OT_ORDERED_SET);
+  EXPECT_EQ(r_husk->value, nullptr);
+  EXPECT_EQ(r_husk->ot_data, nullptr);
+  data_item_t* r_counter = state_find_item(restored, "hits");
+  ASSERT_NE(r_counter, nullptr);
+  EXPECT_EQ(g_counter_value((g_counter_t*)r_counter->value), 7);
+
+  // Re-serialize the restored state byte-identically (canonical wire).
+  serialized_buffer_t* again = crabs_serialize_state(restored);
+  ASSERT_NE(again, nullptr);
+  ASSERT_EQ(again->len, buf->len);
+  EXPECT_EQ(memcmp(again->data, buf->data, buf->len), 0);
+
+  state_destroy(restored);
+  state_destroy(state);
+  serialized_buffer_destroy(buf);
+  serialized_buffer_destroy(again);
+}
+
+// A machine carrying a REAL OT item still round trips under the marker
+// (marker 0x01 precedes the ot_data bytes32 + type-state sections).
+TEST(OtValueMarker, PopulatedOtItemRoundTrips) {
+  state_t* state = state_create();
+  ASSERT_NE(state, nullptr);
+
+  data_item_t* item = data_item_create("set1",
+                                       (data_type_e)DATA_TYPE_OT_ORDERED_SET,
+                                       CRDT_CUSTOM);
+  ASSERT_NE(item, nullptr);
+  crabs_ot_ordered_set_t* set = crabs_ot_ordered_set_create();
+  ASSERT_NE(set, nullptr);
+  crabs_ot_operation_t insert_op = {};
+  strncpy(insert_op.id.node_id, "node1", sizeof(insert_op.id.node_id) - 1);
+  insert_op.id.sequence_num = 1;
+  insert_op.id.timestamp = 1000;
+  insert_op.op_type = CRABS_OT_OP_INSERT;
+  insert_op.payload = (uint8_t*)"aaaa";
+  insert_op.payload_size = 4;
+  ASSERT_NE(crabs_ot_ordered_set_apply_insert(set, &insert_op), nullptr);
+  item->value = set;
+  item->ot_data = set->ot_data;
+  ASSERT_EQ(state_add_item(state, item), CRABS_SUCCESS);
+
+  serialized_buffer_t* buf = crabs_serialize_state(state);
+  ASSERT_NE(buf, nullptr);
+
+  // The marker is on the wire: the public per-item form opens with
+  // string16 name + u8 type + u8 crdt_type + u8 protocol_state, then the
+  // v18 OT marker (offset 2 + 4 + 1 + 1 + 1 = 9 for "set1").
+  serialized_buffer_t* per_item = crabs_serialize_data_item(state->items);
+  ASSERT_NE(per_item, nullptr);
+  ASSERT_GT(per_item->len, 9u);
+  EXPECT_EQ(per_item->data[9], CRABS_OT_VALUE_PRESENT);
+  serialized_buffer_destroy(per_item);
+
+  state_t* restored = crabs_deserialize_state(buf->data, buf->len);
+  ASSERT_NE(restored, nullptr);
+  data_item_t* r_item = state_find_item(restored, "set1");
+  ASSERT_NE(r_item, nullptr);
+  EXPECT_NE(r_item->value, nullptr);
+  EXPECT_NE(r_item->ot_data, nullptr);
+
+  state_destroy(restored);
+  state_destroy(state);
+  serialized_buffer_destroy(buf);
+}
+
+// Pre-18 blobs keep loading on the old layout: the version gate keeps the
+// pre-18 read path intact (unmarked bytes32 + unconditional type-state
+// read). Synthesize one from the v18 blob — rewind the version field to 17
+// and strip the single marker byte of the lone OT item — and load it.
+TEST(OtValueMarker, PreMarkerBlobStillLoads) {
+  state_t* state = state_create();
+  ASSERT_NE(state, nullptr);
+
+  data_item_t* item = data_item_create("set1",
+                                       (data_type_e)DATA_TYPE_OT_ORDERED_SET,
+                                       CRDT_CUSTOM);
+  ASSERT_NE(item, nullptr);
+  crabs_ot_ordered_set_t* set = crabs_ot_ordered_set_create();
+  ASSERT_NE(set, nullptr);
+  crabs_ot_operation_t insert_op = {};
+  strncpy(insert_op.id.node_id, "node1", sizeof(insert_op.id.node_id) - 1);
+  insert_op.id.sequence_num = 1;
+  insert_op.id.timestamp = 1000;
+  insert_op.op_type = CRABS_OT_OP_INSERT;
+  insert_op.payload = (uint8_t*)"aaaa";
+  insert_op.payload_size = 4;
+  ASSERT_NE(crabs_ot_ordered_set_apply_insert(set, &insert_op), nullptr);
+  item->value = set;
+  item->ot_data = set->ot_data;
+  ASSERT_EQ(state_add_item(state, item), CRABS_SUCCESS);
+
+  serialized_buffer_t* buf = crabs_serialize_state(state);
+  ASSERT_NE(buf, nullptr);
+
+  // The lone OT item's marker sits after the state header (magic 4 +
+  // version 4 + state_version 8 + item_count 4 + policy_count 4 +
+  // log_count 4 = 28), the name string16 (2 + strlen), and the
+  // type/crdt/protocol triple.
+  const size_t state_header_len = 28;
+  const size_t marker_offset = state_header_len + 2 + strlen("set1") + 3;
+  ASSERT_EQ(buf->data[marker_offset], CRABS_OT_VALUE_PRESENT);
+
+  // Strip the marker and rewind the version (magic 4B + version u32le at 4)
+  // so the blob is the exact bytes a v17 writer would have emitted.
+  memmove(buf->data + marker_offset, buf->data + marker_offset + 1,
+          buf->len - (marker_offset + 1));
+  buf->len -= 1;
+  buf->data[4] = 17;
+  buf->data[5] = 0;
+  buf->data[6] = 0;
+  buf->data[7] = 0;
+  uint8_t hash[CRABS_HASH_SIZE];
+  crypto_sha256(buf->data, buf->len - CRABS_HASH_SIZE, hash);
+  memcpy(buf->data + buf->len - CRABS_HASH_SIZE, hash, CRABS_HASH_SIZE);
+
+  state_t* restored = crabs_deserialize_state(buf->data, buf->len);
+  ASSERT_NE(restored, nullptr);
+  data_item_t* r_item = state_find_item(restored, "set1");
+  ASSERT_NE(r_item, nullptr);
+  EXPECT_NE(r_item->value, nullptr);
+  EXPECT_NE(r_item->ot_data, nullptr);
+
+  state_destroy(restored);
+  state_destroy(state);
+  serialized_buffer_destroy(buf);
 }

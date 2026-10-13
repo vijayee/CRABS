@@ -1136,6 +1136,7 @@ static const char* _change_kind_name_napi(crabs_change_kind_e kind) {
     case CRABS_CHANGE_ATTRIBUTE: return "attribute";
     case CRABS_CHANGE_SPAWN:     return "spawn";
     case CRABS_CHANGE_LINEAGE:   return "lineage";
+    case CRABS_CHANGE_MERGE:     return "merge";  // write-domains v1 divergence
     default:                     return "op";
   }
 }

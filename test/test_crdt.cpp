@@ -2,6 +2,8 @@
 extern "C" {
 #include "../src/CRDT/crdt_merge.h"
 #include "../src/StateMachine/state_machine.h"
+#include "../src/OT/ot_types.h"
+#include "../src/OT/ot_ordered_set.h"
 }
 
 // ============================================================
@@ -1390,6 +1392,73 @@ TEST(TestCRDTMerge, TestGroupOrderedMergeIdenticalNoOp) {
   ASSERT_NE(merged, nullptr);
   EXPECT_EQ(merged->value, nullptr);
   EXPECT_EQ(capture.calls, 0);
+
+  _destroy_state_values(dst);
+  _destroy_state_values(src);
+  state_destroy(dst);
+  state_destroy(src);
+}
+
+// A src-only item the merge layer cannot build (an OT type —
+// crdt_merge_value returns NULL for CRDT_CUSTOM) is HELD, not adopted as a
+// NULL-value husk: merge still returns CRABS_SUCCESS, dst surfaces one
+// CRABS_CHANGE_MERGE "__merge_held__" event with the type-mismatch result,
+// the item never crosses into dst, and the other items in the snapshot
+// still merge.
+TEST(TestCRDTMerge, TestMergeHoldsUnmergeableOtItem) {
+  state_t* dst = state_create();
+  state_t* src = state_create();
+  merge_event_capture_t capture = {};
+  state_set_change_hook(dst, _merge_event_hook, &capture);
+
+  data_item_t* dst_counter = data_item_create("hits", DATA_TYPE_COUNTER,
+                                              CRDT_G_COUNTER);
+  ASSERT_NE(dst_counter, nullptr);
+  dst_counter->value = g_counter_create();
+  dst_counter->value_repr = (data_value_repr_t)DATA_VALUE_REPR_CRDT_STRUCT;
+  g_counter_increment((g_counter_t*)dst_counter->value, "a", 5);
+  ASSERT_EQ(state_add_item(dst, dst_counter), CRABS_SUCCESS);
+
+  data_item_t* src_counter = data_item_create("hits", DATA_TYPE_COUNTER,
+                                              CRDT_G_COUNTER);
+  ASSERT_NE(src_counter, nullptr);
+  src_counter->value = g_counter_create();
+  src_counter->value_repr = (data_value_repr_t)DATA_VALUE_REPR_CRDT_STRUCT;
+  g_counter_increment((g_counter_t*)src_counter->value, "b", 9);
+  ASSERT_EQ(state_add_item(src, src_counter), CRABS_SUCCESS);
+
+  data_item_t* src_set = data_item_create("doc", (data_type_e)DATA_TYPE_OT_ORDERED_SET,
+                                          CRDT_CUSTOM);
+  ASSERT_NE(src_set, nullptr);
+  crabs_ot_ordered_set_t* set = crabs_ot_ordered_set_create();
+  ASSERT_NE(set, nullptr);
+  crabs_ot_operation_t insert_op = {};
+  strncpy(insert_op.id.node_id, "src", sizeof(insert_op.id.node_id) - 1);
+  insert_op.id.sequence_num = 1;
+  insert_op.id.timestamp = 1000;
+  insert_op.op_type = CRABS_OT_OP_INSERT;
+  insert_op.payload = (uint8_t*)"entry";
+  insert_op.payload_size = 5;
+  ASSERT_NE(crabs_ot_ordered_set_apply_insert(set, &insert_op), nullptr);
+  src_set->value = set;
+  src_set->ot_data = set->ot_data;
+  src_set->value_repr = (data_value_repr_t)DATA_VALUE_REPR_CRDT_STRUCT;
+  ASSERT_EQ(state_add_item(src, src_set), CRABS_SUCCESS);
+
+  EXPECT_EQ(crdt_merge_state(dst, src), CRABS_SUCCESS);
+
+  // The OT item never crossed: no husk with a NULL value in dst.
+  EXPECT_EQ(state_find_item(dst, "doc"), nullptr);
+  data_item_t* merged_counter = state_find_item(dst, "hits");
+  ASSERT_NE(merged_counter, nullptr);
+  // The counter in the same snapshot still merged (max per node, sum across
+  // nodes: dst's a:5 plus src's b:9).
+  EXPECT_EQ(g_counter_value((g_counter_t*)merged_counter->value), 14);
+  ASSERT_EQ(capture.calls, 1);
+  EXPECT_EQ(capture.kind, CRABS_CHANGE_MERGE);
+  EXPECT_STREQ(capture.type, "__merge_held__");
+  EXPECT_STREQ(capture.target, "doc");
+  EXPECT_EQ(capture.result, CRABS_ERR_TYPE_MISMATCH);
 
   _destroy_state_values(dst);
   _destroy_state_values(src);

@@ -119,6 +119,7 @@ static char* _change_event_json(const crabs_change_event_t* event) {
     case CRABS_CHANGE_ATTRIBUTE: kind_name = "attribute"; break;
     case CRABS_CHANGE_SPAWN:     kind_name = "spawn"; break;
     case CRABS_CHANGE_LINEAGE:   kind_name = "lineage"; break;
+    case CRABS_CHANGE_MERGE:     kind_name = "merge"; break;  // write-domains v1 divergence
     default: break;
   }
 

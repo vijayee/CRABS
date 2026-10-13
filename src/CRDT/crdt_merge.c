@@ -591,8 +591,15 @@ static crabs_error_e _merge_fork_evidence_digest(
 
 static void _merge_notify_divergence(state_t* dst, const char* type,
                                      const char* target, crabs_error_e reason) {
-  state_notify_change(dst, CRABS_CHANGE_MERGE, type, NULL, NULL, NULL,
-                      target, NULL, reason);
+  // node_id: the DST machine's bootstrap admin — the identity a binding's
+  // listener registry filters events by (e.g. the wasm trampoline drops
+  // events whose node id does not match the listener's Node). A state-level
+  // event is dst-local; a bare state (no bootstrap admin) passes NULL and
+  // stays unfiltered.
+  const char* dst_node_id =
+      dst->config.bootstrap_admin[0] != '\0' ? dst->config.bootstrap_admin : NULL;
+  state_notify_change(dst, CRABS_CHANGE_MERGE, type, NULL, NULL,
+                      dst_node_id, target, NULL, reason);
 }
 
 // SOVEREIGN v1 merge rule over two chain-head snapshots (item_a = local,
@@ -861,6 +868,22 @@ crabs_error_e crdt_merge_state(state_t* dst, const state_t* src) {
       if (new_item->value != NULL) {
         // crdt_merge_value builds structs for the CRDT types it handles.
         new_item->value_repr = DATA_VALUE_REPR_CRDT_STRUCT;
+      }
+      if (new_item->value == NULL && src_item->value != NULL) {
+        // Merge-layer gap (an OT type, or any type the merge dispatch does
+        // not build — crdt_merge_value returns NULL for it): the item must
+        // NOT arrive as a NULL-value husk. Adding it would plant a valueless
+        // OT item whose serialized form the reader cannot parse (the
+        // no-value marker is for defensive round trips, not a legitimate
+        // state), and the later same-name merge would then treat the husk
+        // as the destination item. Hold instead: surface a divergence event
+        // (merge still converges and returns CRABS_SUCCESS — the same
+        // contract as _merge_group_ordered_item), and destroy the copy.
+        _merge_notify_divergence(dst, "__merge_held__", new_item->name,
+                                 CRABS_ERR_TYPE_MISMATCH);
+        data_item_destroy(new_item);
+        src_item = src_item->next;
+        continue;
       }
       // Fresh adopt of a SOVEREIGN item (write-domains v1 follow-up): the
       // chain head must come from the arriving CONTENT, not the carried
