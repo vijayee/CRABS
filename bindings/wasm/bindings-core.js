@@ -271,6 +271,12 @@ function freeAll(M, ...ptrs) {
   for (const p of ptrs) { if (p) M._free(p); }
 }
 
+// Protocol states (protocol_state_e, src/CRABS/data_model.h:58-65) as the
+// JS words the recipes use; the executor consumes the numbers 0..4 in the
+// op's per-resource required_state / next_state arrays.
+const PROTOCOL_STATE_WORDS = { idle: 0, locked: 1, modified: 2, verified: 3, error: 4 };
+const PROTOCOL_STATE_NAMES = ['idle', 'locked', 'modified', 'verified', 'error'];
+
 // Integer-only guard for register writes (consumption finding 1). Registers
 // carry an int64 in C; BigInt(non-integer) would throw a generic RangeError
 // and numbers past ±2^53 silently lose precision. Reject early with an
@@ -425,6 +431,55 @@ class Operation {
     const rc = M._crabs_wasm_op_add_resource(this._ptr, namePtr);
     if (namePtr) M._free(namePtr);
     wrapRc(rc, 'addResource');
+    return this;
+  }
+
+  // Recipe 9: set the per-slot protocol state at `slotIndex` (slots are
+  // created IDLE by addResource). The executor's step 4 checks
+  // item->protocol_state == op->requiredState[index] for EVERY named
+  // resource before anything moves. stateWord: 'idle' | 'locked' |
+  // 'modified' | 'verified' | 'error'. Signed (format v4 §6/§7) — set
+  // BEFORE signing. Chainable.
+  _setProtocolState(exportFn, ctx, slotIndex, stateWord) {
+    const M = this._M;
+    const state = PROTOCOL_STATE_WORDS[stateWord];
+    if (state === undefined) {
+      throw new RangeError(`${ctx}: stateWord must be 'idle' | 'locked' | 'modified' | 'verified' | 'error'`);
+    }
+    if (!Number.isInteger(slotIndex) || slotIndex < 0 || slotIndex > 7) {
+      throw new RangeError(`${ctx}: slotIndex must be an integer 0..7`);
+    }
+    const rc = exportFn(this._ptr, slotIndex, state);
+    wrapRc(rc, ctx);
+    return this;
+  }
+
+  setRequiredState(slotIndex, stateWord) {
+    return this._setProtocolState(this._M._crabs_wasm_op_set_required_state,
+      'setRequiredState', slotIndex, stateWord);
+  }
+
+  setNextState(slotIndex, stateWord) {
+    return this._setProtocolState(this._M._crabs_wasm_op_set_next_state,
+      'setNextState', slotIndex, stateWord);
+  }
+
+  // Recipe 9: append one lock claim — the resource name plus the 32-byte
+  // bearer token the op claims to hold (the executor verifies presented
+  // claims against the item's live lock token; state_machine.c step 5).
+  // tokenHex is 64 hex chars. Signed (format v4 §8) — set BEFORE signing.
+  // Chainable.
+  addLockClaim(resource, tokenHex) {
+    const M = this._M;
+    if (typeof tokenHex !== 'string' || !/^[0-9a-fA-F]{64}$/.test(tokenHex)) {
+      throw new Error('addLockClaim: tokenHex must be 64 hex chars (32 bytes)');
+    }
+    const resourcePtr = writeString(M, resource);
+    const tokenPtr = M._malloc(32);
+    hexDecode(M, tokenHex, tokenPtr, 32);
+    const rc = M._crabs_wasm_op_add_lock_claim(this._ptr, resourcePtr, tokenPtr, 32);
+    freeAll(M, resourcePtr, tokenPtr);
+    wrapRc(rc, 'addLockClaim');
     return this;
   }
 
@@ -909,6 +964,97 @@ class Node {
     const rc = M._crabs_wasm_add_register(this._am, nPtr, BigInt(initial));
     if (nPtr) M._free(nPtr);
     wrapRc(rc, 'addRegister');
+  }
+
+  // ============================================================
+  // Resource items + lock protocol (recipe 9)
+  // ============================================================
+
+  // Mint a lock-capable RESOURCE item ("PN-Counter + lock") whose value is
+  // a raw int64 balance (the library contract — the lock snapshot and dest-
+  // roy take the raw path for RESOURCE). Node.addResource on the node
+  // binding gained the same shape; `initial` seeds the balance so demo/
+  // test drivers can mint a pot without a client-side op.
+  addResource(name, initial = 0) {
+    const M = this._M;
+    if (initial !== undefined && !Number.isInteger(initial)) {
+      throw new Error('addResource: initial must be an integer (int64 balance)');
+    }
+    const nPtr = writeString(M, name);
+    const rc = M._crabs_wasm_add_resource(this._am, nPtr, BigInt(initial));
+    if (nPtr) M._free(nPtr);
+    wrapRc(rc, 'addResource');
+  }
+
+  // Raw int64 readback of the RESOURCE balance. Throws resource_not_found
+  // for an unknown name, type_mismatch for a non-RESOURCE item. Balances
+  // beyond ±2^53 lose precision through Number (the driver-owned values the
+  // demos use stay far below) — same convention as the schedule ids.
+  getResource(name) {
+    const M = this._M;
+    const nPtr = writeString(M, name);
+    const outPtr = M._malloc(8);
+    const rc = M._crabs_wasm_get_resource(this._am, nPtr, outPtr);
+    let balance = null;
+    if (rc === 0) {
+      balance = new DataView(M.HEAPU8.buffer, M.HEAPU8.byteOffset + outPtr, 8)
+        .getBigInt64(0, true);
+    }
+    freeAll(M, nPtr, outPtr);
+    wrapRc(rc, 'getResource');
+    return Number(balance);
+  }
+
+  // LIVE lock state of a RESOURCE item — how the driver receives the 32-byte
+  // bearer token state_machine_op_lock minted (the executor consumes the
+  // lock response internally; the item's lock_state is the token's only
+  // observable home). Packed read buffer (fixed offsets, documented on the
+  // C export): u32 protocol_state | u32 token_valid | u64 extensions |
+  // u64 expiry | char[64] lock_owner | u8[32] lock_token.
+  getLockState(name) {
+    const M = this._M;
+    const nPtr = writeString(M, name);
+    const bufPtr = M._malloc(120);
+    const rc = M._crabs_wasm_lock_state(this._am, nPtr, bufPtr);
+    freeAll(M, nPtr);
+    wrapRc(rc, 'getLockState');
+
+    const view = new DataView(M.HEAPU8.buffer, M.HEAPU8.byteOffset + bufPtr, 120);
+    const protocolState = PROTOCOL_STATE_NAMES[view.getUint32(0, true)];
+    const tokenValid = view.getUint32(4, true) === 1;
+    const extensions = Number(view.getBigUint64(8, true));
+    const expiry = Number(view.getBigUint64(16, true));
+    const ownerBuf = M.HEAPU8.subarray(bufPtr + 24, bufPtr + 88);
+    const ownerEnd = ownerBuf.indexOf(0);
+    const lockOwner = M.UTF8ToString(bufPtr + 24,
+      (ownerEnd === -1 ? 64 : ownerEnd));
+    const lockTokenHex = tokenValid
+      ? hexEncode(M.HEAPU8.subarray(bufPtr + 88, bufPtr + 120), 32) : '';
+    M._free(bufPtr);
+    return {
+      protocolState: protocolState || 'idle',
+      lockOwner,
+      lockTokenHex,
+      lockExpiry: expiry,
+      lockExtensions: extensions,
+    };
+  }
+
+  // Attach a replay-protection manager to this machine's state
+  // (src/TxManager/tx_manager.h): 'memory' records committed op uuids and
+  // the executor's step 3b refuses duplicate submissions with
+  // already_executed; 'none' is the accept-everything hook
+  // (crabs_tx_manager_none). With NO manager attached the executor's
+  // ordering-monotonicity backstop still rejects a replayed op. Runtime
+  // only — never serialized; attach again after a state round trip.
+  attachTxManager(kind) {
+    const M = this._M;
+    const kinds = { none: 0, memory: 1 };
+    if (kinds[kind] === undefined) {
+      throw new Error("attachTxManager: kind must be 'memory' or 'none'");
+    }
+    const rc = M._crabs_wasm_attach_tx_manager(this._am, kinds[kind]);
+    wrapRc(rc, 'attachTxManager');
   }
 
   _callAdd(fn, name, ctx) {
@@ -1588,11 +1734,21 @@ class Node {
     const node = this;
     const wrapper = (statePtr, opPtr) => {
       const amPtr = M._crabs_wasm_handler_get_am(statePtr);
+      // The op's declared resource names, in order (fixed 64-byte C slots
+      // read synchronously) — what a handler needs to resolve the items it
+      // debits/credits (recipe 9).
+      const resources = [];
+      const resourceCount = M._crabs_wasm_op_resource_count(opPtr);
+      for (let slot = 0; slot < resourceCount; slot++) {
+        const namePtr = M._crabs_wasm_handler_op_resource(opPtr, slot);
+        resources.push(namePtr ? readString(M, namePtr) : null);
+      }
       const op = {
         type: readString(M, M._crabs_wasm_op_get_type(opPtr)),
         signerId: readString(M, M._crabs_wasm_op_get_signer(opPtr)),
         nodeId: readString(M, M._crabs_wasm_op_get_node(opPtr)),
         payload: readString(M, M._crabs_wasm_handler_op_get_payload_str(opPtr)),
+        resources,
       };
       const state = {
         getCounter(name) { return node._callCounterGetFromAm(M, amPtr, M._crabs_wasm_get_counter, name); },
@@ -1619,6 +1775,35 @@ class Node {
         },
         getSetTags(name, element) { return node._callGetSetTagsFromAm(M, amPtr, name, element); },
         getRegisterBytes(name) { return node._callGetRegisterBytesFromAm(M, amPtr, name); },
+        // Recipe 9 handler surface: raw RESOURCE balance readback + the
+        // overflow-checked int64 adjustment a debit/credit handler uses (the
+        // C handlers do the same find-and-mutate). Only RESOURCE items are
+        // accepted; the executor's preconditions ran before this handler.
+        getResource(name) {
+          const M2 = M;
+          const nPtr = writeString(M2, name);
+          const outPtr = M2._malloc(8);
+          const rc = M2._crabs_wasm_get_resource(amPtr, nPtr, outPtr);
+          let balance = 0n;
+          if (rc === 0) {
+            balance = new DataView(M2.HEAPU8.buffer,
+              M2.HEAPU8.byteOffset + outPtr, 8).getBigInt64(0, true);
+          }
+          freeAll(M2, nPtr, outPtr);
+          wrapRc(rc, 'handler getResource');
+          return Number(balance);
+        },
+        adjustResource(name, delta) {
+          const M2 = M;
+          if (!Number.isInteger(delta)) {
+            throw new Error('adjustResource: delta must be an integer (int64)');
+          }
+          const nPtr = writeString(M2, name);
+          const rc = M2._crabs_wasm_handler_adjust_resource(
+            statePtr, nPtr, BigInt(delta));
+          if (nPtr) M2._free(nPtr);
+          wrapRc(rc, 'handler adjustResource');
+        },
         setRegisterBytes(name, bytes, nodeId = 'system') { return node._callSetRegisterBytesFromAm(M, amPtr, name, bytes, nodeId); },
         incrementCounter(name, delta = 1, nodeId = 'system') { return node._callCounterFromAm(M, amPtr, M._crabs_wasm_increment_counter, name, delta, nodeId); },
         incrementPNCounter(name, delta = 1, nodeId = 'system') { return node._callCounterFromAm(M, amPtr, M._crabs_wasm_increment_pn_counter, name, delta, nodeId); },

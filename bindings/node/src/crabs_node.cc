@@ -49,6 +49,8 @@ extern "C" {
 #include "Raft/raft_module.h"
 #include "OT/ot_execution.h"
 #include "OT/ot_ordered_set.h"
+#include "TxManager/tx_manager.h"
+#include "TxManager/tx_manager_memory.h"
 #include "Util/platform.h"
 }
 
@@ -65,6 +67,38 @@ static std::string hex_encode(const uint8_t* data, size_t len) {
     out.push_back(hex[data[i] & 0xF]);
   }
   return out;
+}
+
+// The five protocol states (protocol_state_e, src/CRABS/data_model.h:58-65).
+// The JS surface spells them as words (the policy/ordering convention); the
+// executor consumes the enum numbers in the op's per-resource state arrays.
+static bool protocol_state_from_word(const std::string& word,
+                                     protocol_state_e* out_state) {
+  if (word == "idle")            *out_state = PROTOCOL_IDLE;
+  else if (word == "locked")     *out_state = PROTOCOL_LOCKED;
+  else if (word == "modified")   *out_state = PROTOCOL_MODIFIED;
+  else if (word == "verified")   *out_state = PROTOCOL_VERIFIED;
+  else if (word == "error")      *out_state = PROTOCOL_ERROR;
+  else return false;
+  return true;
+}
+
+static const char* protocol_state_name(protocol_state_e state) {
+  switch (state) {
+    case PROTOCOL_LOCKED:   return "locked";
+    case PROTOCOL_MODIFIED: return "modified";
+    case PROTOCOL_VERIFIED: return "verified";
+    case PROTOCOL_ERROR:    return "error";
+    default:                return "idle";
+  }
+}
+
+static int64_t* resource_balance(data_item_t* item) {
+  if (item == NULL || item->type != DATA_TYPE_RESOURCE ||
+      item->value == NULL) {
+    return NULL;
+  }
+  return (int64_t*)item->value;
 }
 
 static bool hex_decode(const std::string& hex, uint8_t* out, size_t out_len) {
@@ -610,6 +644,10 @@ public:
       InstanceMethod("signWithPrivateKey", &Operation::SignWithPrivateKey),
       InstanceMethod("addResource", &Operation::AddResource),
       InstanceMethod("setSovereignPrefix", &Operation::SetSovereignPrefix),
+      // Lock protocol (recipe 9): per-slot protocol states + lock claims
+      InstanceMethod("setRequiredState", &Operation::SetRequiredState),
+      InstanceMethod("setNextState", &Operation::SetNextState),
+      InstanceMethod("addLockClaim", &Operation::AddLockClaim),
       InstanceMethod("serialize", &Operation::SerializeOp),
       InstanceAccessor("type", &Operation::GetType, &Operation::SetType),
       InstanceAccessor("signerId", &Operation::GetSignerId, &Operation::SetSignerId),
@@ -720,6 +758,87 @@ private:
     Napi::Env env = info.Env();
     std::string name = require_js_string(info[0], "addResource", "name");
     operation_append_resource(op_, name, env, "addResource");
+    return info.This();
+  }
+
+  // Set the per-slot protocol state one declared slot at a time. The
+  // executor's step 4 (state_machine.c _check_transitions) checks
+  // item->protocol_state == op->required_state[index] for EVERY named
+  // resource before anything moves; operation_append_resource hard-codes
+  // fresh slots to PROTOCOL_IDLE. Words: idle/locked/modified/verified/error.
+  void SetProtocolState(const Napi::CallbackInfo& info, protocol_state_e* array,
+                        const char* ctx) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 2 || !info[0].IsNumber() || !info[1].IsString())
+      throw Napi::TypeError::New(env,
+          std::string("Expected ") + ctx + "(slotIndex, stateWord)");
+    double slot_value = info[0].As<Napi::Number>().DoubleValue();
+    if (slot_value < 0 || slot_value >= CRABS_MAX_RESOURCES ||
+        slot_value != (double)(uint32_t)slot_value)
+      throw Napi::RangeError::New(env, std::string(ctx) +
+          ": slotIndex must be an integer 0..7");
+    uint32_t slot_index = (uint32_t)slot_value;
+    if (op_->resource_count == 0 || slot_index >= op_->resource_count)
+      throw Napi::RangeError::New(env, std::string(ctx) +
+          ": slotIndex is past the op's declared resources");
+    protocol_state_e state;
+    if (!protocol_state_from_word(
+            require_js_string(info[1], ctx, "stateWord"), &state))
+      throw Napi::RangeError::New(env, std::string(ctx) +
+          ": stateWord must be 'idle' | 'locked' | 'modified' | 'verified' | 'error'");
+    array[slot_index] = state;
+  }
+
+  Napi::Value SetRequiredState(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    SetProtocolState(info, op_->required_state, "setRequiredState");
+    return info.This();
+  }
+
+  Napi::Value SetNextState(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    SetProtocolState(info, op_->next_state, "setNextState");
+    return info.This();
+  }
+
+  // Append one lock claim (resources + 32-byte bearer token, signing format
+  // v4 §8 — set BEFORE signing). The executor verifies presented claims
+  // against the item's live lock token (state_machine.c step 5); claims are
+  // grown one slot at a time like the resource arrays.
+  Napi::Value AddLockClaim(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 2 || !info[0].IsString() || !info[1].IsString())
+      throw Napi::TypeError::New(env,
+          "Expected addLockClaim(resource, tokenHex)");
+    std::string resource = require_js_string(info[0], "addLockClaim",
+                                             "resource");
+    std::string token_hex = require_js_string(info[1], "addLockClaim",
+                                              "tokenHex");
+    if (op_->lock_claim_count >= CRABS_MAX_RESOURCES)
+      throw Napi::RangeError::New(env, "addLockClaim: claim capacity reached");
+    // Lock tokens are bearer credentials — the decoded stack copy is
+    // cleansed on the failure throws and after the claim copy (the same
+    // discipline SignWithPrivateKey applies to its private-key staging).
+    uint8_t token[CRABS_LOCK_TOKEN_SIZE];
+    if (!hex_decode(token_hex, token, CRABS_LOCK_TOKEN_SIZE)) {
+      OPENSSL_cleanse(token, CRABS_LOCK_TOKEN_SIZE);
+      throw Napi::RangeError::New(env,
+          "addLockClaim: tokenHex must be 64 hex chars (32 bytes)");
+    }
+    lock_claim_t* grown_claims = (lock_claim_t*)realloc(
+        op_->lock_claims,
+        (op_->lock_claim_count + 1) * sizeof(lock_claim_t));
+    if (grown_claims == NULL) {
+      OPENSSL_cleanse(token, CRABS_LOCK_TOKEN_SIZE);
+      throw crabs_error(env, CRABS_ERR_OOM, "addLockClaim");
+    }
+    op_->lock_claims = grown_claims;
+    lock_claim_t* claim = &op_->lock_claims[op_->lock_claim_count];
+    memset(claim, 0, sizeof(*claim));
+    strncpy(claim->resource, resource.c_str(), CRABS_MAX_USER_ID - 1);
+    memcpy(claim->lock_token, token, CRABS_LOCK_TOKEN_SIZE);
+    OPENSSL_cleanse(token, CRABS_LOCK_TOKEN_SIZE);
+    op_->lock_claim_count++;
     return info.This();
   }
 
@@ -913,6 +1032,10 @@ public:
       InstanceMethod("getTimeSource", &Node::GetTimeSource),
       // Raft ordering module (reference host surfaces live in index.js)
       InstanceMethod("attachRaft", &Node::AttachRaft),
+      // Lock protocol + tx manager (recipe 9 — locks / replay protection)
+      InstanceMethod("attachTxManager", &Node::AttachTxManager),
+      InstanceMethod("getLockState", &Node::GetLockState),
+      InstanceMethod("getResource", &Node::GetResource),
       InstanceMethod("raftTick", &Node::RaftTick),
       InstanceMethod("raftDeliver", &Node::RaftDeliver),
       InstanceMethod("raftPersistComplete", &Node::RaftPersistComplete),
@@ -1024,6 +1147,15 @@ public:
       time_source_owned_ = false;
     }
     if (node_key_) crypto_ecdsa_keypair_destroy(node_key_);
+    // No explicit tx-manager cleanup here: state->tx_manager is host-owned
+    // (data_model.h) but the machine's teardown DESTROYS it
+    // (attribute_machine_destroy — attribute_machine.c:434-438, mirroring
+    // state_destroy:data_model.c:400-404), which covers both owned and
+    // adopted (parent-destroyed) machines. The wrapper does need the
+    // destroy-on-replace path below (nothing else frees a replaced
+    // manager), and the wasm binding destroys explicitly because its
+    // machine teardown is intentionally skipped (wasm_helpers.c
+    // crabs_wasm_node_destroy).
     // Ownership statement (mirrors the wasm binding's resident-registry one):
     // a wrapper around a machine it did not create NEVER destroys the machine.
     // The parent owns every machine it spawned directly (spawned_machines_,
@@ -1606,16 +1738,104 @@ private:
   Napi::Value AddResource(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
     std::string name = require_js_string(info[0], "addResource", "name");
+    int64_t initial = 0;
+    if (info.Length() > 1 && info[1].IsNumber())
+      initial = (int64_t)info[1].As<Napi::Number>().Int64Value();
+    if (state_find_item(&am_->base_state, name.c_str()) != NULL)
+      throw crabs_error(env, CRABS_ERR_DUPLICATE_OPERATION, "addResource");
     data_item_t* item = data_item_create(name.c_str(), DATA_TYPE_RESOURCE, CRDT_PN_COUNTER);
+    if (item == NULL) throw crabs_error(env, CRABS_ERR_OOM, "addResource");
     // RESOURCE items carry a bare heap int64_t (the library contract — dedup
     // mutations, the lock snapshot, and destroy all take the raw path for
     // RESOURCE), never a pn_counter struct; value_repr stays RAW_INT64.
-    int64_t* initial = (int64_t*)malloc(sizeof(int64_t));
-    *initial = 0;
-    item->value = initial;
+    int64_t* initial_balance = (int64_t*)malloc(sizeof(int64_t));
+    if (initial_balance == NULL) {
+      data_item_destroy(item);
+      throw crabs_error(env, CRABS_ERR_OOM, "addResource");
+    }
+    *initial_balance = initial;
+    item->value = initial_balance;
     crabs_error_e rc = state_add_item(&am_->base_state, item);
     if (rc != CRABS_SUCCESS) throw crabs_error(env, rc, "addResource");
     return env.Undefined();
+  }
+
+  // --- Recipe 9: lock protocol + tx manager ----------------------------
+  //
+  // Attach a replay-protection manager to the machine's state
+  // (src/TxManager/tx_manager.h). 'memory' records committed op uuids in an
+  // in-memory committed-uuid store (an AVL tree): the executor's step 3b
+  // accept — which runs AFTER the signature check (the R7-L-4 oracle
+  // placement) — refuses a duplicate submission with already_executed, and
+  // step 8c commit records the op after it lands. 'none' is the
+  // accept-everything deployment hook (crabs_tx_manager_none). With NO
+  // manager attached, the ordering-monotonicity backstop (step 3c,
+  // state_signer_has_replay) still rejects a replayed op — including after
+  // a restart, when the manager's memory is empty. Replacing an attached
+  // manager destroys the previous one (host-owned, vtable destroy). Not
+  // serialized: after a state round trip the machine runs manager-less
+  // again (attach again after load).
+  Napi::Value AttachTxManager(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    std::string kind = require_js_string(info[0], "attachTxManager", "kind");
+    crabs_tx_manager_t* attached = NULL;
+    if (kind == "memory") {
+      attached = crabs_tx_manager_memory(64);
+    } else if (kind == "none") {
+      attached = crabs_tx_manager_none();
+    } else {
+      throw Napi::RangeError::New(env,
+          "attachTxManager: kind must be 'memory' or 'none'");
+    }
+    if (attached == NULL) throw crabs_error(env, CRABS_ERR_OOM, "attachTxManager");
+    if (am_->base_state.tx_manager != NULL) {
+      ((crabs_tx_manager_t*)am_->base_state.tx_manager)->vtable.destroy(
+          (crabs_tx_manager_t*)am_->base_state.tx_manager);
+    }
+    am_->base_state.tx_manager = attached;
+    return env.Undefined();
+  }
+
+  // LIVE lock state of a RESOURCE item (data_item_t.lock_state_t — runtime
+  // only, never serialized). This is how the JS driver receives the bearer
+  // token state_machine_op_lock minted: the executor consumes the
+  // lock_response_t internally, so the item is the token's only observable
+  // home; claim it into the next op's addLockClaim before signing.
+  Napi::Value GetLockState(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    std::string name = require_js_string(info[0], "getLockState", "name");
+    data_item_t* item = state_find_item(&am_->base_state, name.c_str());
+    if (item == NULL) throw crabs_error(env, CRABS_ERR_RESOURCE_NOT_FOUND,
+                                        "getLockState");
+    if (item->type != DATA_TYPE_RESOURCE)
+      throw crabs_error(env, CRABS_ERR_TYPE_MISMATCH, "getLockState");
+    Napi::Object view = Napi::Object::New(env);
+    view.Set("protocolState", protocol_state_name(item->protocol_state));
+    view.Set("lockOwner", std::string(item->lock_state.lock_owner));
+    view.Set("lockTokenHex",
+             item->lock_state.lock_token_valid
+                 ? hex_encode(item->lock_state.lock_token,
+                              CRABS_LOCK_TOKEN_SIZE)
+                 : std::string(""));
+    view.Set("lockExpiry",
+             (double)item->lock_state.lock_expiry);
+    view.Set("lockExtensions",
+             (double)item->lock_state.lock_extensions);
+    return view;
+  }
+
+  // Raw int64 readback of a RESOURCE item's balance. Undefined for an
+  // unknown name (getCounter's convention); type_mismatch for anything that
+  // is not a RESOURCE item.
+  Napi::Value GetResource(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    std::string name = require_js_string(info[0], "getResource", "name");
+    data_item_t* item = state_find_item(&am_->base_state, name.c_str());
+    if (item == NULL) return env.Undefined();
+    int64_t* balance = resource_balance(item);
+    if (balance == NULL)
+      throw crabs_error(env, CRABS_ERR_TYPE_MISMATCH, "getResource");
+    return Napi::Number::New(env, (double)*balance);
   }
 
   // --- Queries ---

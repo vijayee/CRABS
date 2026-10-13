@@ -27,6 +27,8 @@
 #include "../Raft/raft_module.h"
 #include "../OT/ot_execution.h"
 #include "../OT/ot_ordered_set.h"
+#include "../TxManager/tx_manager.h"
+#include "../TxManager/tx_manager_memory.h"
 
 #ifdef CRABS_ENABLE_DEVTOOLS
 #include "../Devtools/devtools.h"
@@ -277,6 +279,14 @@ void crabs_wasm_node_destroy(attribute_machine_t* am) {
   // guarantees a hypothetical future full teardown cannot leave a dangling
   // ops pointer behind.
   if (am == NULL) return;
+  // The attached tx manager is binding-owned (crabs_wasm_attach_tx_manager):
+  // destroy it and clear the state pointer so the still-live (leaked)
+  // machine never observes a dangling manager on a later execute.
+  if (am->base_state.tx_manager != NULL) {
+    ((crabs_tx_manager_t*)am->base_state.tx_manager)->vtable.destroy(
+        (crabs_tx_manager_t*)am->base_state.tx_manager);
+    am->base_state.tx_manager = NULL;
+  }
   state_set_time_source(&am->base_state, NULL);
   _time_source_unregister_machine(am);
 }
@@ -610,6 +620,230 @@ crabs_error_e crabs_wasm_add_register(attribute_machine_t* am, const char* name,
   // Struct-backed value (lww_register_t) — release via crdt_value_destroy.
   item->value_repr = DATA_VALUE_REPR_CRDT_STRUCT;
   return state_add_item(&am->base_state, item);
+}
+
+// ============================================================
+// Resource items + the lock protocol surface (recipe 9)
+// ============================================================
+// A RESOURCE (0x05, "PN-Counter + lock", src/CRABS/data_model.h:29) is the
+// only item type whose protocol_state the executor drives through the lock
+// ceremony (IDLE → LOCKED → MODIFIED → VERIFIED → IDLE). The item's value is
+// a bare heap int64 in the RAW_INT64 representation — the library contract:
+// dedup mutations, the lock snapshot, and destroy all take the raw path for
+// RESOURCE — which is why the mint here mirrors the node binding's
+// Node.addResource (crabs_node.cc AddResource) rather than a pn_counter
+// struct.
+
+EMSCRIPTEN_KEEPALIVE
+crabs_error_e crabs_wasm_add_resource(attribute_machine_t* am, const char* name,
+                                      int64_t initial) {
+  if (!am || !name) return CRABS_ERR_INVALID_PARAM;
+  // state_add_item does not detect duplicates for the (typed) caller; a
+  // second mint of the same name would shadow the first — refuse before
+  // any allocation so a bad call changes nothing.
+  if (state_find_item(&am->base_state, name) != NULL) {
+    return CRABS_ERR_DUPLICATE_OPERATION;
+  }
+  data_item_t* item = data_item_create(name, DATA_TYPE_RESOURCE, CRDT_PN_COUNTER);
+  if (!item) return CRABS_ERR_OOM;
+  int64_t* initial_balance = (int64_t*)malloc(sizeof(int64_t));
+  if (!initial_balance) {
+    data_item_destroy(item);
+    return CRABS_ERR_OOM;
+  }
+  *initial_balance = initial;
+  item->value = initial_balance;
+  return state_add_item(&am->base_state, item);
+}
+
+// Raw int64 readback of a RESOURCE item. Other types keep their dedicated
+// getters (getCounter/getRegister/...); RESOURCE balances were machine-read
+// only before this — the JS driver needs the balance to check preconditions
+// and to prove apply-once.
+EMSCRIPTEN_KEEPALIVE
+crabs_error_e crabs_wasm_get_resource(attribute_machine_t* am, const char* name,
+                                      int64_t* out_balance) {
+  if (!am || !name || !out_balance) return CRABS_ERR_INVALID_PARAM;
+  data_item_t* item = state_find_item(&am->base_state, name);
+  if (!item) return CRABS_ERR_RESOURCE_NOT_FOUND;
+  if (item->type != DATA_TYPE_RESOURCE) return CRABS_ERR_TYPE_MISMATCH;
+  *out_balance = (item->value != NULL) ? *(int64_t*)item->value : 0;
+  return CRABS_SUCCESS;
+}
+
+// Handler-context form of the same raw arithmetic the C handlers perform
+// (state_find_item + the int64 mutation, cookbook/snippets/c/09-treasury.c's
+// transfer_handler): a registered JS handler adjusts the RESOURCE balance it
+// debits/credits. Overflow-checked addition — an int64 wrap would silently
+// invent or erase money, the exact failure recipe 9 exists to prevent; the
+// refusal happens before either half of a debit/credit is applied via this
+// helper.
+EMSCRIPTEN_KEEPALIVE
+crabs_error_e crabs_wasm_handler_adjust_resource(state_t* state,
+                                                 const char* name,
+                                                 int64_t delta) {
+  if (!state || !name) return CRABS_ERR_INVALID_PARAM;
+  data_item_t* item = state_find_item(state, name);
+  if (!item) return CRABS_ERR_RESOURCE_NOT_FOUND;
+  if (item->type != DATA_TYPE_RESOURCE) return CRABS_ERR_TYPE_MISMATCH;
+  if (item->value == NULL) return CRABS_ERR_INTERNAL;
+  int64_t* balance = (int64_t*)item->value;
+  // Overflow-checked addition — an int64 wrap would silently invent or
+  // erase money, the exact failure recipe 9 exists to prevent.
+  if (delta > 0 && *balance > INT64_MAX - delta) return CRABS_ERR_INVALID_PARAM;
+  if (delta < 0 && *balance < INT64_MIN - delta) return CRABS_ERR_INVALID_PARAM;
+  *balance += delta;
+  return CRABS_SUCCESS;
+}
+
+// Read back one op resource by index from handler context (HandlerOperation.
+// resources in JS): op resources are fixed 64-byte name slots, so the
+// returned pointer is the slot itself — valid while the operation lives and
+// read synchronously by the JS wrapper.
+EMSCRIPTEN_KEEPALIVE
+const char* crabs_wasm_handler_op_resource(operation_t* op, uint32_t index) {
+  if (!op || index >= op->resource_count) return NULL;
+  return op->resources[index];
+}
+
+// The op's declared resource count — bounds the HandlerOperation.resources
+// enumeration in JS.
+EMSCRIPTEN_KEEPALIVE
+uint32_t crabs_wasm_op_resource_count(operation_t* op) {
+  return op ? op->resource_count : 0;
+}
+
+// ============================================================
+// Lock read / claim / required-state surface (recipe 9)
+// ============================================================
+// The executor verifies the lock claims an op PRESENTS (state_machine.c
+// step 5: token via CRYPTO_memcmp, then the owner) but forces none — the
+// driver composes its claims from the item's live state. This packed read
+// (one fixed-layout buffer; offsets documented on the JS wrapper) is how JS
+// receives the 32-byte bearer token minted by state_machine_op_lock: the
+// lock response tokens are consumed inside the executor, so the ITEM is the
+// only place the live token is observable.
+
+#define CRABS_WASM_LOCK_STATE_BUF 120
+
+EMSCRIPTEN_KEEPALIVE
+crabs_error_e crabs_wasm_lock_state(attribute_machine_t* am, const char* name,
+                                    uint8_t* out) {
+  if (!am || !name || !out) return CRABS_ERR_INVALID_PARAM;
+  data_item_t* item = state_find_item(&am->base_state, name);
+  if (!item) return CRABS_ERR_RESOURCE_NOT_FOUND;
+  if (item->type != DATA_TYPE_RESOURCE) return CRABS_ERR_TYPE_MISMATCH;
+  memset(out, 0, CRABS_WASM_LOCK_STATE_BUF);
+  uint32_t protocol_state = (uint32_t)item->protocol_state;
+  memcpy(out, &protocol_state, sizeof(protocol_state));
+  uint32_t token_valid = item->lock_state.lock_token_valid ? 1u : 0u;
+  memcpy(out + 4, &token_valid, sizeof(token_valid));
+  memcpy(out + 8, &item->lock_state.lock_extensions,
+         sizeof(item->lock_state.lock_extensions));
+  memcpy(out + 16, &item->lock_state.lock_expiry,
+         sizeof(item->lock_state.lock_expiry));
+  strncpy((char*)(out + 24), item->lock_state.lock_owner, 63);
+  if (token_valid) {
+    memcpy(out + 88, item->lock_state.lock_token, CRABS_LOCK_TOKEN_SIZE);
+  }
+  return CRABS_SUCCESS;
+}
+
+// Per-slot protocol state setters: the executor's step 4 checks
+// item->protocol_state == op->required_state[index] for EVERY named resource
+// before anything moves (_check_transitions). addResource hard-codes the
+// slots to PROTOCOL_IDLE; these set one declared slot at a time. Values are
+// the protocol_state_e numbers (0..4) — the JS wrapper takes the words.
+
+EMSCRIPTEN_KEEPALIVE
+crabs_error_e crabs_wasm_op_set_required_state(operation_t* op, uint32_t index,
+                                               int32_t state) {
+  if (!op) return CRABS_ERR_INVALID_PARAM;
+  if (index >= op->resource_count || state < PROTOCOL_IDLE ||
+      state > PROTOCOL_ERROR) {
+    return CRABS_ERR_INVALID_PARAM;
+  }
+  op->required_state[index] = (protocol_state_e)state;
+  return CRABS_SUCCESS;
+}
+
+EMSCRIPTEN_KEEPALIVE
+crabs_error_e crabs_wasm_op_set_next_state(operation_t* op, uint32_t index,
+                                           int32_t state) {
+  if (!op) return CRABS_ERR_INVALID_PARAM;
+  if (index >= op->resource_count || state < PROTOCOL_IDLE ||
+      state > PROTOCOL_ERROR) {
+    return CRABS_ERR_INVALID_PARAM;
+  }
+  op->next_state[index] = (protocol_state_e)state;
+  return CRABS_SUCCESS;
+}
+
+// Append one lock claim: the resource name plus the 32-byte bearer token the
+// op claims to hold. Signed (signing format v4 §8) — set BEFORE signing.
+// The claim array is grown one slot at a time exactly like the per-resource
+// arrays in crabs_wasm_op_add_resource; capacity CRABS_MAX_RESOURCES.
+EMSCRIPTEN_KEEPALIVE
+crabs_error_e crabs_wasm_op_add_lock_claim(operation_t* op, const char* resource,
+                                           const uint8_t* lock_token,
+                                           uint32_t token_len) {
+  if (!op || !resource || resource[0] == '\0' ||
+      strlen(resource) >= CRABS_MAX_USER_ID) {
+    return CRABS_ERR_INVALID_PARAM;
+  }
+  if (!lock_token || token_len != CRABS_LOCK_TOKEN_SIZE) {
+    return CRABS_ERR_INVALID_PARAM;
+  }
+  if (op->lock_claim_count >= CRABS_MAX_RESOURCES) return CRABS_ERR_OOM;
+  lock_claim_t* grown_claims = (lock_claim_t*)realloc(
+      op->lock_claims, (op->lock_claim_count + 1) * sizeof(lock_claim_t));
+  if (grown_claims == NULL) return CRABS_ERR_OOM;
+  op->lock_claims = grown_claims;
+  lock_claim_t* claim = &op->lock_claims[op->lock_claim_count];
+  memset(claim, 0, sizeof(*claim));
+  strncpy(claim->resource, resource, CRABS_MAX_USER_ID - 1);
+  memcpy(claim->lock_token, lock_token, CRABS_LOCK_TOKEN_SIZE);
+  op->lock_claim_count++;
+  return CRABS_SUCCESS;
+}
+
+// ============================================================
+// Attachable tx manager (recipe 9)
+// ============================================================
+// The pluggable replay-protection layer in front of the executor
+// (src/TxManager/tx_manager.h): step 3b accept() refuses a duplicate uuid
+// with CRABS_ERR_ALREADY_EXECUTED, and step 8c commit() records it after the
+// op lands. state->tx_manager is a host-owned void* — the binding attaches
+// and owns the object, so a replacement destroys the previous manager and
+// crabs_wasm_node_destroy detaches + destroys it before the machine's
+// (leaked-on-purpose) state could observe a dangling pointer. kinds:
+// 0 = crabs_tx_manager_none (accept-everything), 1 = crabs_tx_manager_memory
+// (in-memory committed-uuid store — an AVL tree, unbounded; the capacity
+// argument is accepted-and-ignored by the impl).
+
+#define CRABS_WASM_TX_MANAGER_NONE    0
+#define CRABS_WASM_TX_MANAGER_MEMORY  1
+#define CRABS_WASM_TX_MANAGER_CAPACITY 64
+
+EMSCRIPTEN_KEEPALIVE
+crabs_error_e crabs_wasm_attach_tx_manager(attribute_machine_t* am,
+                                           int32_t kind) {
+  if (!am) return CRABS_ERR_INVALID_PARAM;
+  crabs_tx_manager_t* attached = NULL;
+  if (kind == CRABS_WASM_TX_MANAGER_NONE) {
+    attached = crabs_tx_manager_none();
+  } else if (kind == CRABS_WASM_TX_MANAGER_MEMORY) {
+    attached = crabs_tx_manager_memory(CRABS_WASM_TX_MANAGER_CAPACITY);
+  } else {
+    return CRABS_ERR_INVALID_PARAM;
+  }
+  if (attached == NULL) return CRABS_ERR_OOM;
+  if (am->base_state.tx_manager != NULL) {
+    ((crabs_tx_manager_t*)am->base_state.tx_manager)->vtable.destroy(
+        (crabs_tx_manager_t*)am->base_state.tx_manager);
+  }
+  am->base_state.tx_manager = attached;
+  return CRABS_SUCCESS;
 }
 
 // ============================================================

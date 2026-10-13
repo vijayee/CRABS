@@ -4,6 +4,26 @@
 
 /// <reference types="node" />
 
+/** Protocol state words (protocol_state_e, src/CRABS/data_model.h:58-65). */
+export type ProtocolStateWord = 'idle' | 'locked' | 'modified' | 'verified' | 'error';
+
+/**
+ * Live lock state of a RESOURCE item (data_item_t.lock_state_t — runtime
+ * only, never serialized). lockTokenHex is the 32-byte CSPRNG bearer token
+ * the executor minted at __lock__ ('' when the item carries no valid
+ * token): claim it into the next op's addLockClaim BEFORE signing — the
+ * signature binds the claims.
+ */
+export interface LockStateView {
+  protocolState: ProtocolStateWord;
+  lockOwner: string;
+  lockTokenHex: string;
+  /** Expiry in epoch ms (0 = the item is IDLE / un-locked). */
+  lockExpiry: number;
+  /** Number of __extend__ extensions granted this lease. */
+  lockExtensions: number;
+}
+
 export interface KeyPair {
   publicKeyHex(): string;
   privateKeyHex(): string;
@@ -31,6 +51,26 @@ export interface Operation {
    * (op format v6).
    */
   setSovereignPrefix(prefixIndex: number, seq: number, digestHex: string): this;
+  /**
+   * Recipe 9 (lock protocol): set the per-slot required_state at slotIndex —
+   * the executor refuses the op with protocol_violation unless every named
+   * resource is in exactly that state before anything moves. Slots are
+   * created 'idle' by addResource. Signed (format v4) — set BEFORE signing.
+   * Chainable.
+   */
+  setRequiredState(slotIndex: number, state: ProtocolStateWord): this;
+  /** The per-slot next_state (the state the driver says the op leaves the
+   * resource in). Signed — set BEFORE signing. Chainable. */
+  setNextState(slotIndex: number, state: ProtocolStateWord): this;
+  /**
+   * Recipe 9 (lock protocol): append one lock claim — the resource name plus
+   * the 32-byte bearer token the op claims to hold (getLockState's
+   * lockTokenHex). The executor verifies presented claims against the item's
+   * live lock token; a forged claim is refused lock_token_mismatch BEFORE
+   * any effect. tokenHex: 64 hex chars. Signed — set BEFORE signing.
+   * Chainable.
+   */
+  addLockClaim(resource: string, tokenHex: string): this;
   /** Wire bytes of the op as currently staged (sign first, then serialize). */
   serialize(): Buffer;
   /**
@@ -226,7 +266,41 @@ export interface Node {
   addOneShotSet(name: string): void;
   addOneShotFlag(name: string): void;
   addRegister(name: string, initialValue?: number): void;
-  addResource(name: string): void;
+  /**
+   * Recipe 9: mint a lock-capable RESOURCE item ("PN-Counter + lock"). The
+   * value is a raw int64 balance (dedup mutations, the lock snapshot and
+   * destroy all take the raw path for RESOURCE); `initial` seeds it. Pair
+   * with getLockState / Operation.setRequiredState + addLockClaim to drive
+   * the lock ceremony from JS.
+   */
+  addResource(name: string, initial?: number): void;
+  /**
+   * Raw int64 readback of the RESOURCE balance (previously machine-read
+   * only). Undefined for an unknown name (getCounter's convention);
+   * type_mismatch for anything that is not a RESOURCE item. Balances beyond
+   * ±2^53 lose precision through Number.
+   */
+  getResource(name: string): number | undefined;
+  /**
+   * Recipe 9: LIVE lock state of a RESOURCE item — the driver reads the
+   * bearer token here and claims it into the next op's addLockClaim BEFORE
+   * signing. Lock state is runtime only — never serialized (and never
+   * part of the chain digest).
+   */
+  getLockState(name: string): LockStateView;
+  /**
+   * Recipe 9: attach a replay-protection manager to the machine's state
+   * (src/TxManager/tx_manager.h). 'memory' records committed op uuids — the
+   * executor's signature-verified step 3b refuses a duplicate submission
+   * with already_executed; 'none' is the accept-everything hook
+   * (crabs_tx_manager_none). With NO manager attached, the ordering-
+   * monotonicity backstop still rejects a replayed op, including after a
+   * restart. Runtime only — never serialized; attach again after a state
+   * round trip. Replacing an attached manager destroys the previous one;
+   * the machine's own teardown destroys whatever remains attached
+   * (attribute_machine_destroy — the binding does not double-manage it).
+   */
+  attachTxManager(kind: 'memory' | 'none'): void;
   /**
    * Write-domains v1: item creation with an explicit write-domain
    * declaration. v1 supports 'counter'/'register' (the SOVEREIGN-legal
