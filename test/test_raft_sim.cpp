@@ -276,6 +276,25 @@ static void sim_pump_persist(sim_host_t* host) {
   }
 }
 
+// Persisted-state settlement: carried item A can CHAIN windows (a grant arm
+// fires while another resolves), so scenarios wanting fully settled
+// durability pump until every node's window is empty (bounded).
+static void sim_pump_persist_settled(sim_host_t* host) {
+  for (uint32_t round = 0; round < 8; round++) {
+    sim_pump_persist(host);
+    bool any_window = false;
+    for (uint32_t node_index = 0; node_index < host->node_count; node_index++) {
+      crabs_raft_persist_request_t persist;
+      if (crabs_raft_module_poll_persist(host->nodes[node_index].module,
+                                         &persist)) {
+        any_window = true;
+        break;
+      }
+    }
+    if (!any_window) return;
+  }
+}
+
 // Notification pump: attached states materialize through the pipeline; bare
 // nodes drain leadership events into the void (host concerns). Counting
 // pump mode records COMMITTED_OP deliveries per node for the dedup
@@ -526,7 +545,7 @@ TEST(RaftSimHarness, SubmitCommitsAndMaterializesThroughPipeline) {
   operation_destroy(op);
 
   EXPECT_TRUE(crabs_raft_module_is_leader(fixture.module));
-  EXPECT_EQ(crabs_raft_module_log_length(fixture.module), 1u);
+  EXPECT_EQ(crabs_raft_module_log_length(fixture.module), 2u);  // §8 no-op + decree
   EXPECT_EQ(crabs_raft_module_committed_tip(fixture.module), 0u);
   const raft_pending_proposal_t* pending =
       (const raft_pending_proposal_t*)fixture.state->raft_pending_proposals;
@@ -537,13 +556,18 @@ TEST(RaftSimHarness, SubmitCommitsAndMaterializesThroughPipeline) {
   ASSERT_NE(before_commit, nullptr);
   EXPECT_EQ(memcmp(before_commit->value, "origin", 6), 0);
 
-  // Host storage loop: the persist request is stored anywhere durable and
-  // acknowledged. NO commit counts before the ack.
+  // Host storage loop: the persist windows are stored anywhere durable and
+  // acknowledged. NO commit counts before the ack. Window 1 carries the
+  // leadership no-op (which commits silently); window 2 carries the decree.
   crabs_raft_persist_request_t persist;
   ASSERT_TRUE(crabs_raft_module_poll_persist(fixture.module, &persist));
   EXPECT_EQ(crabs_raft_module_persist_complete(fixture.module, persist.handle,
                                                true), CRABS_SUCCESS);
   EXPECT_EQ(crabs_raft_module_committed_tip(fixture.module), 1u);
+  ASSERT_TRUE(crabs_raft_module_poll_persist(fixture.module, &persist));
+  EXPECT_EQ(crabs_raft_module_persist_complete(fixture.module, persist.handle,
+                                               true), CRABS_SUCCESS);
+  EXPECT_EQ(crabs_raft_module_committed_tip(fixture.module), 2u);
 
   // Notification pump: the committed op materializes — the group item now
   // carries the committed content and the machine log carries the op.
@@ -573,7 +597,7 @@ TEST(RaftSimHarness, SubmitCommitsAndMaterializesThroughPipeline) {
   EXPECT_EQ(state_machine_execute(fixture.state, op),
             CRABS_ERR_ALREADY_EXECUTED);
   operation_destroy(op);
-  EXPECT_EQ(crabs_raft_module_log_length(fixture.module), 1u);
+  EXPECT_EQ(crabs_raft_module_log_length(fixture.module), 2u);
 
   sim_single_fixture_destroy(&fixture);
 }
@@ -622,7 +646,7 @@ TEST(RaftSimHarness, UnvalidatedProposalIsRefusedAtTheGate) {
   memcpy(op->payload, "evil", 4);
   EXPECT_EQ(state_machine_execute(fixture.state, op), CRABS_ERR_UNAUTHORIZED);
   operation_destroy(op);
-  EXPECT_EQ(crabs_raft_module_log_length(fixture.module), 0u);
+  EXPECT_EQ(crabs_raft_module_log_length(fixture.module), 1u);  // §8 no-op only
 
   sim_single_fixture_destroy(&fixture);
 }
@@ -640,6 +664,12 @@ TEST(RaftSimHarness, RestartRoundTripContinuesCommitting) {
   EXPECT_EQ(state_machine_execute(fixture.state, op), CRABS_ERR_ORDERING_PENDING);
   operation_destroy(op);
   crabs_raft_persist_request_t persist;
+  // Window 1: the §8 leadership no-op (commits silently at tip 1)...
+  ASSERT_TRUE(crabs_raft_module_poll_persist(fixture.module, &persist));
+  EXPECT_EQ(crabs_raft_module_persist_complete(fixture.module, persist.handle,
+                                               true), CRABS_SUCCESS);
+  EXPECT_EQ(crabs_raft_module_committed_tip(fixture.module), 1u);
+  // ...window 2: the op itself (tip 2).
   ASSERT_TRUE(crabs_raft_module_poll_persist(fixture.module, &persist));
   EXPECT_EQ(crabs_raft_module_persist_complete(fixture.module, persist.handle,
                                                true), CRABS_SUCCESS);
@@ -647,7 +677,7 @@ TEST(RaftSimHarness, RestartRoundTripContinuesCommitting) {
   const lww_register_t* registered = sim_council_register(fixture.state);
   ASSERT_NE(registered, nullptr);
   EXPECT_EQ(memcmp(registered->value, "pre-restart", 11), 0);
-  EXPECT_EQ(crabs_raft_module_committed_tip(fixture.module), 1u);
+  EXPECT_EQ(crabs_raft_module_committed_tip(fixture.module), 2u);
 
   // Serialize the machine WITH the module attached; the v16 section carries
   // the module state out.
@@ -669,7 +699,7 @@ TEST(RaftSimHarness, RestartRoundTripContinuesCommitting) {
   crabs_raft_module_state_t* parsed =
       (crabs_raft_module_state_t*)restored_state->raft_module_state;
   ASSERT_NE(parsed, nullptr);
-  EXPECT_EQ(parsed->commit_index, 1u);
+  EXPECT_EQ(parsed->commit_index, 2u);
 
   // Host re-creates the module object and imports the persisted state.
   crabs_raft_config_t config;
@@ -726,10 +756,16 @@ TEST(RaftSimHarness, RestartRoundTripContinuesCommitting) {
             CRABS_ERR_ORDERING_PENDING);
   operation_destroy(post_op);
   crabs_raft_persist_request_t restart_persist;
+  // Window 1: the revived leadership's own no-op (commits at tip 3)...
   ASSERT_TRUE(crabs_raft_module_poll_persist(revived, &restart_persist));
   EXPECT_EQ(crabs_raft_module_persist_complete(revived, restart_persist.handle,
                                                true), CRABS_SUCCESS);
-  EXPECT_EQ(crabs_raft_module_committed_tip(revived), 2u);
+  EXPECT_EQ(crabs_raft_module_committed_tip(revived), 3u);
+  // ...window 2: the post-restart op (tip 4).
+  ASSERT_TRUE(crabs_raft_module_poll_persist(revived, &restart_persist));
+  EXPECT_EQ(crabs_raft_module_persist_complete(revived, restart_persist.handle,
+                                               true), CRABS_SUCCESS);
+  EXPECT_EQ(crabs_raft_module_committed_tip(revived), 4u);
   EXPECT_EQ(state_raft_process_notifications(restored_state), CRABS_SUCCESS);
   const lww_register_t* post_value =
       (const lww_register_t*)state_find_item(restored_state, "council")->value;
@@ -774,6 +810,8 @@ TEST(RaftSimHarness, NetworkPlumbingRoutesFaultsAndDelivers) {
   host.nodes[1].node_id = "beta";
   host.nodes[1].module = crabs_raft_module_create(&config_b);
   ASSERT_NE(host.nodes[1].module, nullptr);
+  host.nodes[0].auto_persist = true;   // host storage answers persist windows
+  host.nodes[1].auto_persist = true;
   host.node_count = 2;
 
   // Scripted ticks elect alpha to candidacy (sim_run_until drives turn-based
@@ -781,9 +819,13 @@ TEST(RaftSimHarness, NetworkPlumbingRoutesFaultsAndDelivers) {
   uint32_t turns = sim_run_until(&host, 100, 20, sim_pred_alpha_elected);
   ASSERT_LT(turns, 20u);
   // A fresh re-election tick re-solicits the peer: the wire holds a live
-  // message we can fault and deliver.
+  // message we can fault and deliver. Carried item A gates the solicitation
+  // on the term/votedFor header batch — one persist round-trip first.
+  uint64_t term_before_reelection =
+      crabs_raft_module_current_term(host.nodes[0].module);
   EXPECT_EQ(crabs_raft_module_tick(host.nodes[0].module, host.now_ms + 10000),
             CRABS_SUCCESS);
+  sim_pump_persist_settled(&host);
   sim_route_outbound(&host);
   ASSERT_FALSE(host.wire.empty());
   EXPECT_EQ(host.wire[0].from_node, 0u);
@@ -796,11 +838,13 @@ TEST(RaftSimHarness, NetworkPlumbingRoutesFaultsAndDelivers) {
   sim_deliver_all(&host);
   EXPECT_EQ(crabs_raft_module_rejected_message_count(host.nodes[1].module), 0u);
   // The duplicate carried the re-election term: beta absorbs it idempotently.
-  EXPECT_EQ(crabs_raft_module_current_term(host.nodes[1].module), 2u);
+  EXPECT_EQ(crabs_raft_module_current_term(host.nodes[1].module),
+            term_before_reelection + 1);
 
   // Beta's duplicate vote responses flow back to the candidate and are
-  // absorbed idempotently (no tally side effects in P1, no corruption in P2
-  // once tallies land).
+  // absorbed idempotently. Carried item A: beta's grant waits on its own
+  // header batch first.
+  sim_pump_persist_settled(&host);
   sim_route_outbound(&host);
   ASSERT_GE(host.wire.size(), 1u);
   sim_deliver_all(&host);
@@ -926,9 +970,12 @@ TEST(RaftSimHarness, ThreeNodeClusterElectsExactlyOneLeader) {
     EXPECT_EQ(crabs_raft_module_current_term(host.nodes[node_index].module),
               leader_term);
   }
-  // No proposals yet: empty logs everywhere, zero commits, clean wire.
+  // No proposals yet: zero commits, clean wire. The leader's log holds the
+  // §8 leadership no-op it appended the moment it won; followers (which have
+  // not acked it yet) still show empty logs.
   for (uint32_t node_index = 0; node_index < host.node_count; node_index++) {
-    EXPECT_EQ(crabs_raft_module_log_length(host.nodes[node_index].module), 0u);
+    uint32_t log_length = crabs_raft_module_log_length(host.nodes[node_index].module);
+    EXPECT_TRUE(log_length == 0u || log_length == 1u);
     EXPECT_EQ(crabs_raft_module_committed_tip(host.nodes[node_index].module), 0u);
     EXPECT_EQ(crabs_raft_module_rejected_message_count(
                   host.nodes[node_index].module), 0u);
@@ -1028,11 +1075,18 @@ TEST(RaftSimHarness, MajorityRefusesOutOfDateCandidate) {
   crabs_raft_module_state_destroy(snapshot_a2);
   crabs_raft_module_state_destroy(snapshot_b2);
 
-  // Upsilon hits its deadline → term-7 candidacy soliciting phi.
+  // Upsilon hits its deadline → term-7 candidacy soliciting phi. Carried
+  // item A: the solicitation waits behind its OWN term/self-vote persist.
   crabs_raft_module_t* upsilon = host.nodes[0].module;
   EXPECT_EQ(crabs_raft_module_tick(
                 upsilon, crabs_raft_module_next_election_deadline(upsilon)),
             CRABS_SUCCESS);
+  {
+    crabs_raft_persist_request_t candidacy_persist;
+    ASSERT_TRUE(crabs_raft_module_poll_persist(upsilon, &candidacy_persist));
+    EXPECT_EQ(crabs_raft_module_persist_complete(upsilon, candidacy_persist.handle,
+                                                 true), CRABS_SUCCESS);
+  }
   sim_route_outbound(&host);
   sim_deliver_all(&host);
   sim_route_outbound(&host);
@@ -1075,7 +1129,8 @@ TEST(RaftSimHarness, PartitionIsolatedLeaderHaltsMajorityCommitsAndHeals) {
   ASSERT_EQ(sim_submit_write(&host, (uint32_t)old_leader, "council_write",
                              "council", "decree-1", decree_1_uuid),
             CRABS_ERR_ORDERING_PENDING);
-  sim_target_tip = 1;
+  // Tip 2: the leader's §8 no-op (index 1) + decree-1 (index 2).
+  sim_target_tip = 2;
   sim_run_until(&host, 100, 20, sim_pred_target_tips);
 
   // --- PARTITION: the isolated leader vs the two-node majority ---
@@ -1093,8 +1148,10 @@ TEST(RaftSimHarness, PartitionIsolatedLeaderHaltsMajorityCommitsAndHeals) {
   for (uint32_t step = 0; step < 6; step++) {
     sim_step(&host, 100, nullptr);
   }
-  EXPECT_EQ(crabs_raft_module_log_length(host.nodes[old_leader].module), 2u);
-  EXPECT_EQ(crabs_raft_module_committed_tip(host.nodes[old_leader].module), 1u);
+  // Log: no-op (1) + decree-1 (2) + the uncommitted lost decree (3). Tip
+  // frozen at 2: the minority never collects a quorum again.
+  EXPECT_EQ(crabs_raft_module_log_length(host.nodes[old_leader].module), 3u);
+  EXPECT_EQ(crabs_raft_module_committed_tip(host.nodes[old_leader].module), 2u);
   const lww_register_t* isolated_value =
       sim_council_register(host.nodes[old_leader].state);
   ASSERT_NE(isolated_value, nullptr);
@@ -1123,13 +1180,14 @@ TEST(RaftSimHarness, PartitionIsolatedLeaderHaltsMajorityCommitsAndHeals) {
                              "council", "decree-majority", majority_uuid),
             CRABS_ERR_ORDERING_PENDING);
   {
+    // Tip 4 on the majority leader: its own no-op (3) + decree-majority (4).
     uint32_t turns = 0;
-    while (crabs_raft_module_committed_tip(host.nodes[new_leader].module) != 2u &&
+    while (crabs_raft_module_committed_tip(host.nodes[new_leader].module) != 4u &&
            turns < 25) {
       sim_step(&host, 100, nullptr);
       turns++;
     }
-    ASSERT_EQ(crabs_raft_module_committed_tip(host.nodes[new_leader].module), 2u);
+    ASSERT_EQ(crabs_raft_module_committed_tip(host.nodes[new_leader].module), 4u);
   }
   ASSERT_NE(memcmp(majority_uuid, decree_1_uuid, CRABS_UUID_SIZE), 0);
 
@@ -1137,7 +1195,8 @@ TEST(RaftSimHarness, PartitionIsolatedLeaderHaltsMajorityCommitsAndHeals) {
   for (uint32_t node_index = 0; node_index < host.node_count; node_index++) {
     host.nodes[node_index].partition_group = 0;
   }
-  sim_target_tip = 2;
+  // Tip 4: the majority's no-op + decree adopted everywhere post-heal.
+  sim_target_tip = 4;
   sim_run_until(&host, 100, 60, sim_pred_target_tips);
 
   // Log-matching repair: the healed replica's UNCOMMITTED suffix was
@@ -1145,7 +1204,7 @@ TEST(RaftSimHarness, PartitionIsolatedLeaderHaltsMajorityCommitsAndHeals) {
   // (no zombie log entry, no duplicate commit anywhere), and every
   // committed op materialized exactly once per replica.
   for (uint32_t node_index = 0; node_index < host.node_count; node_index++) {
-    EXPECT_EQ(crabs_raft_module_committed_tip(host.nodes[node_index].module), 2u);
+    EXPECT_EQ(crabs_raft_module_committed_tip(host.nodes[node_index].module), 4u);
     EXPECT_EQ(sim_state_uuid_occurrences(host.nodes[node_index].state,
                                          majority_uuid), 1u);
     EXPECT_EQ(sim_state_uuid_occurrences(host.nodes[node_index].state,
@@ -1202,7 +1261,8 @@ TEST(RaftSimHarness, MessageFaultsDroppedDuplicatedReorderedConvergeIdempotently
     sim_step(&host, 100, nullptr);
     converged = true;
     for (uint32_t node_index = 0; node_index < host.node_count; node_index++) {
-      if (crabs_raft_module_committed_tip(host.nodes[node_index].module) != 1u ||
+      // Tip 2 = the leader's no-op (1) + the decree (2).
+      if (crabs_raft_module_committed_tip(host.nodes[node_index].module) != 2u ||
           sim_state_uuid_occurrences(host.nodes[node_index].state,
                                      decree_uuid) != 1u) {
         converged = false;
@@ -1211,7 +1271,7 @@ TEST(RaftSimHarness, MessageFaultsDroppedDuplicatedReorderedConvergeIdempotently
   }
   EXPECT_TRUE(converged);
   for (uint32_t node_index = 0; node_index < host.node_count; node_index++) {
-    EXPECT_EQ(crabs_raft_module_committed_tip(host.nodes[node_index].module), 1u);
+    EXPECT_EQ(crabs_raft_module_committed_tip(host.nodes[node_index].module), 2u);
     EXPECT_EQ(sim_state_uuid_occurrences(host.nodes[node_index].state,
                                          decree_uuid), 1u);
     EXPECT_EQ(crabs_raft_module_rejected_message_count(
@@ -1242,16 +1302,16 @@ TEST(RaftSimHarness, SlowPersistFollowerLagsThenConverges) {
   // persistence contract has not closed).
   sim_step(&host, 100, nullptr);
   sim_step(&host, 100, nullptr);
-  EXPECT_EQ(crabs_raft_module_log_length(host.nodes[slow_node].module), 1u);
+  EXPECT_EQ(crabs_raft_module_log_length(host.nodes[slow_node].module), 2u);
   EXPECT_EQ(crabs_raft_module_committed_tip(host.nodes[slow_node].module), 0u);
   {
     uint32_t turns = 0;
-    while (crabs_raft_module_committed_tip(host.nodes[fast_node].module) != 1u &&
+    while (crabs_raft_module_committed_tip(host.nodes[fast_node].module) != 2u &&
            turns < 20) {
       sim_step(&host, 100, nullptr);
       turns++;
     }
-    ASSERT_EQ(crabs_raft_module_committed_tip(host.nodes[fast_node].module), 1u);
+    ASSERT_EQ(crabs_raft_module_committed_tip(host.nodes[fast_node].module), 2u);
   }
   EXPECT_EQ(crabs_raft_module_committed_tip(host.nodes[slow_node].module), 0u);
   EXPECT_EQ(sim_state_uuid_occurrences(host.nodes[slow_node].state,
@@ -1260,7 +1320,7 @@ TEST(RaftSimHarness, SlowPersistFollowerLagsThenConverges) {
   // The host answers the held window: the laggard catches up — commit
   // advances past the tip and the committed op materializes exactly once.
   host.nodes[slow_node].auto_persist = true;
-  sim_target_tip = 1;
+  sim_target_tip = 2;
   sim_run_until(&host, 100, 20, sim_pred_target_tips);
   EXPECT_EQ(sim_state_uuid_occurrences(host.nodes[slow_node].state,
                                        decree_uuid), 1u);
@@ -1298,7 +1358,8 @@ TEST(RaftSimHarness, RestartSaveLoadSaveCarriesModuleSectionAndPending) {
   EXPECT_EQ(state_machine_execute(fixture.state, op2), CRABS_ERR_ORDERING_PENDING);
   operation_destroy(op2);
   ASSERT_NE(fixture.state->raft_pending_proposals, nullptr);
-  EXPECT_EQ(crabs_raft_module_log_length(fixture.module), 2u);
+  // Log: §8 no-op (1) + op1 (2) + the pending op2 (3).
+  EXPECT_EQ(crabs_raft_module_log_length(fixture.module), 3u);
 
   serialized_buffer_t* blob1 = crabs_serialize_state(fixture.state);
   ASSERT_NE(blob1, nullptr);
@@ -1341,7 +1402,7 @@ TEST(RaftSimHarness, RestartSaveLoadSaveCarriesModuleSectionAndPending) {
   EXPECT_EQ(crabs_raft_module_import_state(revived, carried), CRABS_SUCCESS);
   ASSERT_EQ(state_attach_raft_module(loaded, revived), CRABS_SUCCESS);
   EXPECT_EQ(crabs_raft_module_committed_tip(revived), 1u);
-  EXPECT_EQ(crabs_raft_module_log_length(revived), 2u);
+  EXPECT_EQ(crabs_raft_module_log_length(revived), 3u);
   EXPECT_EQ(loaded->raft_pending_proposals != nullptr, true);
   serialized_buffer_t* blob2 = crabs_serialize_state(loaded);
   ASSERT_NE(blob2, nullptr);
@@ -1437,7 +1498,8 @@ TEST(RaftSimHarness, MixedMachineGroupHaltsWhileSovereignFreeExecute) {
 
   // Commit rides replication: every replica's group item materializes the
   // committed decree; the sovereign/free contents are untouched by it.
-  sim_target_tip = 1;
+  // Tip 2 = the leader's §8 no-op (1) + the decree (2).
+  sim_target_tip = 2;
   sim_run_until(&host, 100, 20, sim_pred_target_tips);
   for (uint32_t node_index = 0; node_index < host.node_count; node_index++) {
     const lww_register_t* committed_value = sim_council_register(host.nodes[node_index].state);
@@ -1510,4 +1572,619 @@ TEST(RaftMerge, GroupItemAdoptsByCommittedPosition) {
   src->raft_module_state = NULL;
   state_destroy(dst);
   state_destroy(src);
+}
+
+// ============================================================
+// Carried item C (P2 review): ordered materialization retry shelf — a
+// committed op whose materialization fails BLOCKS the stream until retried
+// successfully; the pump stays strictly ordered, retries carry bounded
+// backoff, poison-pill failures surface notifications, and a restart
+// resumes the shelf.
+// ============================================================
+
+static uint32_t sim_flaky_remaining_failures = 0;
+
+static crabs_error_e sim_handler_flaky_once(state_t* state, operation_t* op) {
+  (void)state;
+  (void)op;
+  if (sim_flaky_remaining_failures > 0) {
+    sim_flaky_remaining_failures--;
+    return CRABS_ERR_INTERNAL;
+  }
+  return CRABS_SUCCESS;
+}
+
+// Force the pump through its bounded backoff with one wide clock step per
+// attempt (the linear backoff caps at CRABS_RAFT_SHELF_BACKOFF_CAP_MS).
+static void sim_shelf_pump_loose(sim_single_fixture_t* fixture,
+                                 uint64_t base_ms, uint32_t attempts,
+                                 crabs_error_e* last_rc) {
+  *last_rc = CRABS_SUCCESS;
+  for (uint32_t attempt = 0; attempt < attempts; attempt++) {
+    *last_rc = state_raft_process_notifications_at(fixture->state,
+                                                   base_ms + attempt * CRABS_RAFT_SHELF_BACKOFF_CAP_MS);
+  }
+}
+
+static crabs_error_e sim_handler_always_failing(state_t* state, operation_t* op) {
+  (void)state;
+  (void)op;
+  return CRABS_ERR_INTERNAL;
+}
+
+TEST(RaftSimShelf, FailedMaterializationBlocksThenStreamResumesInOrder) {
+  sim_single_fixture_t fixture;
+  sim_single_fixture_init(&fixture);
+  // A handler with a budget of TWO failures: the committed op lands on the
+  // shelf instead of being dropped, and NOTHING newer may apply.
+  sim_flaky_remaining_failures = 3;   // fill-failure + two failed retries
+  EXPECT_EQ(state_machine_register_handler(fixture.state, "council_write",
+                                           sim_handler_flaky_once),
+            CRABS_SUCCESS);
+  uint64_t deadline = crabs_raft_module_next_election_deadline(fixture.module);
+  EXPECT_EQ(crabs_raft_module_tick(fixture.module, deadline), CRABS_SUCCESS);
+
+  operation_t* op1 = sim_signed_council_write(&fixture, "blocked-1");
+  ASSERT_NE(op1, nullptr);
+  uint8_t uuid1[CRABS_UUID_SIZE];
+  memcpy(uuid1, op1->uuid, CRABS_UUID_SIZE);
+  EXPECT_EQ(state_machine_execute(fixture.state, op1), CRABS_ERR_ORDERING_PENDING);
+  operation_destroy(op1);
+  // Windows: no-op, then op1.
+  crabs_raft_persist_request_t persist;
+  ASSERT_TRUE(crabs_raft_module_poll_persist(fixture.module, &persist));
+  EXPECT_EQ(crabs_raft_module_persist_complete(fixture.module, persist.handle,
+                                               true), CRABS_SUCCESS);
+  ASSERT_TRUE(crabs_raft_module_poll_persist(fixture.module, &persist));
+  EXPECT_EQ(crabs_raft_module_persist_complete(fixture.module, persist.handle,
+                                               true), CRABS_SUCCESS);
+  EXPECT_EQ(crabs_raft_module_committed_tip(fixture.module), 2u);
+
+  // Pump: the materialization FAILS → the op is retained on the shelf, the
+  // group item does NOT move, and the error surfaces.
+  crabs_error_e pump_rc = state_raft_process_notifications_at(fixture.state, 0);
+  EXPECT_EQ(pump_rc, CRABS_ERR_INTERNAL);
+  EXPECT_EQ(memcmp(sim_council_register(fixture.state)->value, "origin", 6), 0);
+  EXPECT_TRUE(state_raft_shelf_active(fixture.state));
+  EXPECT_EQ(state_raft_shelf_attempt_count(fixture.state), 0u);
+
+  // A newer COMMIT while the shelf is blocked: its notification stays
+  // queued — the pump attempts NOTHING newer until the shelf succeeds.
+  operation_t* op2 = sim_signed_council_write(&fixture, "blocked-2");
+  ASSERT_NE(op2, nullptr);
+  uint8_t uuid2[CRABS_UUID_SIZE];
+  memcpy(uuid2, op2->uuid, CRABS_UUID_SIZE);
+  EXPECT_EQ(state_machine_execute(fixture.state, op2), CRABS_ERR_ORDERING_PENDING);
+  operation_destroy(op2);
+  ASSERT_TRUE(crabs_raft_module_poll_persist(fixture.module, &persist));
+  EXPECT_EQ(crabs_raft_module_persist_complete(fixture.module, persist.handle,
+                                               true), CRABS_SUCCESS);
+  EXPECT_EQ(crabs_raft_module_committed_tip(fixture.module), 3u);
+
+  // The first shelf RETRY (next pump call) fails: attempt 1 of the budget.
+  pump_rc = state_raft_process_notifications_at(fixture.state, 1000);
+  EXPECT_EQ(pump_rc, CRABS_ERR_INTERNAL);
+  EXPECT_EQ(state_raft_shelf_attempt_count(fixture.state), 1u);
+  // The blocked newer op did NOT leak into the machine log.
+  EXPECT_EQ(sim_state_uuid_occurrences(fixture.state, uuid2), 0u);
+
+  // Bounded backoff: loose wide-step pumps burn the second budget failure
+  // (attempt 2), the budget runs out...
+  sim_shelf_pump_loose(&fixture, 2000, 1, &pump_rc);
+  EXPECT_EQ(pump_rc, CRABS_ERR_INTERNAL);
+  EXPECT_EQ(state_raft_shelf_attempt_count(fixture.state), 2u);
+  EXPECT_EQ(memcmp(sim_council_register(fixture.state)->value, "origin", 6), 0);
+  // ...and the handler heals: the very next pump attempt releases the
+  // shelf and the stream resumes — strictly in commit order.
+  EXPECT_EQ(state_machine_register_handler(fixture.state, "council_write",
+                                           sim_handler_council_write),
+            CRABS_SUCCESS);
+  pump_rc = state_raft_process_notifications_at(fixture.state, 900000);
+  EXPECT_EQ(pump_rc, CRABS_SUCCESS);
+  EXPECT_FALSE(state_raft_shelf_active(fixture.state));
+  // Order: uuid1 materialized exactly once, uuid2 right behind it — the
+  // strictly ordered pump applied the QUEUED newer op only after the head.
+  EXPECT_EQ(sim_state_uuid_occurrences(fixture.state, uuid1), 1u);
+  EXPECT_EQ(sim_state_uuid_occurrences(fixture.state, uuid2), 1u);
+  uint64_t uuid1_position = UINT64_MAX;
+  uint64_t uuid2_position = UINT64_MAX;
+  for (uint64_t log_index = 0; log_index < fixture.state->log_count;
+       log_index++) {
+    if (memcmp(fixture.state->log[log_index].uuid, uuid1, CRABS_UUID_SIZE) == 0) {
+      uuid1_position = log_index;
+    }
+    if (memcmp(fixture.state->log[log_index].uuid, uuid2, CRABS_UUID_SIZE) == 0) {
+      uuid2_position = log_index;
+    }
+  }
+  ASSERT_LT(uuid1_position, uuid2_position);
+  EXPECT_EQ(memcmp(sim_council_register(fixture.state)->value, "blocked-2", 9), 0);
+
+  sim_flaky_remaining_failures = 0;
+  sim_single_fixture_destroy(&fixture);
+}
+
+TEST(RaftSimShelf, PoisonPillFailuresSurfaceNotificationsLoudly) {
+  sim_single_fixture_t fixture;
+  sim_single_fixture_init(&fixture);
+  EXPECT_EQ(state_machine_register_handler(fixture.state, "council_write",
+                                           sim_handler_always_failing),
+            CRABS_SUCCESS);
+  uint64_t deadline = crabs_raft_module_next_election_deadline(fixture.module);
+  EXPECT_EQ(crabs_raft_module_tick(fixture.module, deadline), CRABS_SUCCESS);
+
+  operation_t* op = sim_signed_council_write(&fixture, "poison");
+  ASSERT_NE(op, nullptr);
+  EXPECT_EQ(state_machine_execute(fixture.state, op), CRABS_ERR_ORDERING_PENDING);
+  operation_destroy(op);
+  crabs_raft_persist_request_t persist;
+  while (crabs_raft_module_poll_persist(fixture.module, &persist)) {
+    EXPECT_EQ(crabs_raft_module_persist_complete(fixture.module, persist.handle,
+                                                 true), CRABS_SUCCESS);
+  }
+
+  struct change_capture_t {
+    uint32_t count;
+  } capture = {0};
+  state_set_change_hook(
+      fixture.state,
+      [](state_t*, const crabs_change_event_t*, void* user_data) {
+        ((change_capture_t*)user_data)->count++;
+      },
+      &capture);
+
+  // Backoff-aware pumping (one wide step per pump call — the linear
+  // backoff caps at 30 s, so this reaches every attempt): the poison
+  // threshold is 8 consecutive failures; every attempt AFTER it screams.
+  uint64_t now_ms = 0;
+  // One pump fills the shelf (not counted as a retry), each subsequent one
+  // attempts: run past the poison threshold.
+  for (uint32_t attempt = 0; attempt < CRABS_RAFT_SHELF_POISON_ATTEMPTS + 3;
+       attempt++) {
+    state_raft_process_notifications_at(fixture.state, now_ms);
+    now_ms += CRABS_RAFT_SHELF_BACKOFF_CAP_MS;
+  }
+  EXPECT_EQ(state_raft_shelf_attempt_count(fixture.state),
+            CRABS_RAFT_SHELF_POISON_ATTEMPTS + 2);
+  EXPECT_GT(capture.count, 0u);   // loudly surfaced, stream STILL blocked
+  EXPECT_TRUE(state_raft_shelf_active(fixture.state));
+  EXPECT_EQ(memcmp(sim_council_register(fixture.state)->value, "origin", 6), 0);
+
+  sim_single_fixture_destroy(&fixture);
+}
+
+TEST(RaftSimShelf, RestartCarriesTheShelfAndResumesOrdering) {
+  sim_single_fixture_t fixture;
+  sim_single_fixture_init(&fixture);
+  EXPECT_EQ(state_machine_register_handler(fixture.state, "council_write",
+                                           sim_handler_always_failing),
+            CRABS_SUCCESS);
+  uint64_t deadline = crabs_raft_module_next_election_deadline(fixture.module);
+  EXPECT_EQ(crabs_raft_module_tick(fixture.module, deadline), CRABS_SUCCESS);
+
+  operation_t* op = sim_signed_council_write(&fixture, "shelf-carry");
+  ASSERT_NE(op, nullptr);
+  EXPECT_EQ(state_machine_execute(fixture.state, op), CRABS_ERR_ORDERING_PENDING);
+  operation_destroy(op);
+  crabs_raft_persist_request_t persist;
+  while (crabs_raft_module_poll_persist(fixture.module, &persist)) {
+    EXPECT_EQ(crabs_raft_module_persist_complete(fixture.module, persist.handle,
+                                                 true), CRABS_SUCCESS);
+  }
+  state_raft_process_notifications_at(fixture.state, 0);
+  ASSERT_TRUE(state_raft_shelf_active(fixture.state));
+  // One failed retry first: the shelf rides the section with its
+  // consecutive-failure count (poison visibility continues after restart).
+  EXPECT_EQ(state_raft_process_notifications_at(fixture.state,
+                                                CRABS_RAFT_SHELF_BACKOFF_CAP_MS),
+            CRABS_ERR_INTERNAL);
+  ASSERT_EQ(state_raft_shelf_attempt_count(fixture.state), 1u);
+
+  // Serialize WITH the shelf: the v17 module section carries the blocked op
+  // beside the pendings; the restart resumes ordering from it.
+  serialized_buffer_t* blob = crabs_serialize_state(fixture.state);
+  ASSERT_NE(blob, nullptr);
+
+  state_attach_raft_module(fixture.state, nullptr);
+  crabs_raft_module_destroy(fixture.module);
+  state_destroy(fixture.state);
+  fixture.module = nullptr;
+  fixture.state = nullptr;
+  fixture.keypair = nullptr;
+  fixture.attr_machine = nullptr;
+
+  state_t* restored = crabs_deserialize_state(blob->data, blob->len);
+  serialized_buffer_destroy(blob);
+  ASSERT_NE(restored, nullptr);
+  ASSERT_TRUE(state_raft_shelf_active(restored));
+  // The consecutive-failure count rides along (poison visibility continues).
+  EXPECT_EQ(state_raft_shelf_attempt_count(restored), 1u);
+
+  // The host handoff: a fresh module object carries the persisted module
+  // section (the pump needs a module to drain notifications from).
+  crabs_raft_config_t config;
+  crabs_raft_config_defaults(&config);
+  config.seed = 99;
+  crabs_raft_module_t* revived = crabs_raft_module_create(&config);
+  ASSERT_NE(revived, nullptr);
+  ASSERT_EQ(state_attach_raft_module(restored, revived), CRABS_SUCCESS);
+
+  EXPECT_EQ(state_machine_register_handler(restored, "council_write",
+                                           sim_handler_council_write),
+            CRABS_SUCCESS);
+  EXPECT_EQ(state_raft_process_notifications_at(restored, 2 * CRABS_RAFT_SHELF_BACKOFF_CAP_MS),
+            CRABS_SUCCESS);
+  EXPECT_FALSE(state_raft_shelf_active(restored));
+  const lww_register_t* carried = sim_council_register(restored);
+  ASSERT_NE(carried, nullptr);
+  EXPECT_EQ(memcmp(carried->value, "shelf-carry", 11), 0);
+
+  state_attach_raft_module(restored, nullptr);
+  crabs_raft_module_destroy(revived);
+  state_destroy(restored);
+  ecdsa_keypair_t* surviving_key = nullptr;   // fixture key was consumed above
+  (void)surviving_key;
+  (void)surviving_key;
+}
+
+// ============================================================
+// Phase 3: joint-consensus membership change (Raft §6) on the module's own
+// config log. The C_old,new and C_new entries ride the log like ordinary
+// entries (never machine ops); quorum/vote rules span BOTH lists during the
+// joint phase; the C_new successor appends automatically once C_old,new
+// commits (or when a new leader resumes the transition); nodes excluded by
+// a committed change step down.
+// ============================================================
+
+// Predicate: node 0 runs a plain committed config of the expected size and
+// no joint phase. Set sim_pred_config_expected before sim_run_until.
+static uint32_t sim_pred_config_expected = 0;
+
+static bool sim_pred_config_count(sim_host_t* host) {
+  crabs_raft_module_t* module = host->nodes[0].module;
+  return crabs_raft_module_joint_members(module, nullptr) == 0 &&
+         crabs_raft_module_committed_members(module, nullptr) ==
+             sim_pred_config_expected;
+}
+
+// Predicate: node 0 sits in an ACTIVE joint phase (config entry committed,
+// C_new successor pending).
+static bool sim_pred_joint_active(sim_host_t* host) {
+  return crabs_raft_module_joint_members(host->nodes[0].module, nullptr) > 0;
+}
+
+// A 2-node sim cluster where node 0 starts as a single-member config
+// (the degenerate boot shape) and node 1 is a provisioned standby that
+// already knows both ids but holds no log.
+static void sim_membership_pair_attach(sim_host_t* host, const char* a_id,
+                                       const char* b_id, uint64_t seed_a,
+                                       uint64_t seed_b) {
+  ASSERT_EQ(host->node_count, 0u);
+  for (uint32_t node_slot = 0; node_slot < 2; node_slot++) {
+    sim_node_t* node = &host->nodes[node_slot];
+    memset(node, 0, sizeof(*node));
+    node->partition_group = 0;
+    node->auto_persist = true;
+    const char* self = node_slot == 0 ? a_id : b_id;
+    node->node_id = self;
+    node->keypair = crypto_ecdsa_generate();
+    ASSERT_NE(node->keypair, nullptr);
+    node->state = state_create();
+    sim_setup_council_state(node->state);
+    node->attr_machine = attribute_machine_create("admin",
+                                                  node->keypair->public_key);
+    ASSERT_NE(node->attr_machine, nullptr);
+    node->state->attr_machine = node->attr_machine;
+    crabs_raft_config_t config;
+    crabs_raft_config_defaults(&config);
+    strncpy(config.node_id, self, CRABS_MAX_USER_ID - 1);
+    // Node 0 boots as a ONE-member cluster; node 1 is provisioned with the
+    // pair (it holds no log until the leader's appends reach it).
+    uint32_t member_count = node_slot == 0 ? 1 : 2;
+    strncpy(config.peer_ids[0], node_slot == 0 ? a_id : a_id,
+            CRABS_MAX_USER_ID - 1);
+    if (member_count == 2) {
+      strncpy(config.peer_ids[1], node_slot == 0 ? b_id : b_id,
+              CRABS_MAX_USER_ID - 1);
+    }
+    config.peer_count = member_count;
+    config.seed = node_slot == 0 ? seed_a : seed_b;
+    node->module = crabs_raft_module_create(&config);
+    ASSERT_NE(node->module, nullptr);
+    ASSERT_EQ(state_attach_raft_module(node->state, node->module),
+              CRABS_SUCCESS);
+    host->node_count = node_slot + 1;
+  }
+  host->node_count = 2;
+}
+
+TEST(RaftMembership, SingleNodeJointAddThenRemoveCompletesSafely) {
+  // The §6 round trip on a pair: the single-member leader adds its standby
+  // through C_old,new -> C_new, then removes it. Every step quorum-checks
+  // BOTH lists while joint, and the removal evicts the standby.
+  sim_host_t host = sim_host_make();
+  sim_membership_pair_attach(&host, "node-0", "alpha", 7, 8);
+
+  // node-0 elects itself (its boot config is ONE member); alpha can never
+  // win anything alone, so exactly-one-leader means node-0 leads.
+  sim_run_until(&host, 100, 40, sim_pred_any_leader);
+  int leader = sim_find_leader(&host);
+  ASSERT_EQ(leader, 0);
+
+  // ADD: C_old=[node-0], C_new=[node-0, alpha]. The joint entry commits
+  // only when BOTH majorities hold it — alpha's durable match is required.
+  const char* add_list[2] = {"node-0", "alpha"};
+  uint64_t change_id = 0;
+  EXPECT_EQ(crabs_raft_module_change_membership(host.nodes[0].module, add_list,
+                                                2, &change_id),
+            CRABS_SUCCESS);
+  ASSERT_GT(change_id, 0u);
+  // The joint entry commits (alpha acked; the sim target predicate may
+  // overshoot once the leader's auto C_new commits right behind it).
+  // The joint entry commits (alpha acked), the leader auto-appends C_new,
+  // that entry commits under the joint rules, and the transition ends with
+  // the pair as the plain committed config.
+  sim_target_tip = change_id;
+  sim_run_until(&host, 100, 40, sim_pred_joint_active);
+  sim_target_tip = 0;
+  sim_pred_config_expected = 2;
+  sim_run_until(&host, 100, 40, sim_pred_config_count);
+  for (uint32_t node_index = 0; node_index < host.node_count; node_index++) {
+    EXPECT_EQ(crabs_raft_module_joint_members(
+                  host.nodes[node_index].module, nullptr), 0u);
+    EXPECT_EQ(crabs_raft_module_committed_members(
+                  host.nodes[node_index].module, nullptr), 2u);
+    EXPECT_FALSE(crabs_raft_module_is_leader(host.nodes[1].module));
+  }
+  // A fresh change is legal once the previous one ended...
+  uint64_t second_change = 999;
+  EXPECT_EQ(crabs_raft_module_change_membership(host.nodes[0].module, add_list,
+                                                2, &second_change),
+            CRABS_SUCCESS);
+  // ...but it is in flight now: a SECOND concurrent change refuses.
+  EXPECT_EQ(crabs_raft_module_change_membership(host.nodes[0].module, add_list,
+                                                2, &second_change),
+            CRABS_ERR_ORDERING_CHANGE_IN_FLIGHT);
+  // Roll this in-flight change forward so the REMOVE below starts clean:
+  // the identical C_old,new/C_new pair commits (both lists' majorities are
+  // the same) and the config stays 2.
+  sim_run_until(&host, 100, 60, [](sim_host_t* pending_host) {
+    return !crabs_raft_module_config_change_pending(
+        pending_host->nodes[0].module);
+  });
+
+  // REMOVE: alpha evicted by the committed change; node-0 keeps leading and
+  // committing with its single-member config (quorum math reads the config
+  // lists, not the address book).
+  const char* remove_list[1] = {"node-0"};
+  uint64_t remove_id = 0;
+  EXPECT_EQ(crabs_raft_module_change_membership(host.nodes[0].module,
+                                                remove_list, 1, &remove_id),
+            CRABS_SUCCESS);
+  sim_pred_config_expected = 1;
+  sim_run_until(&host, 100, 60, sim_pred_config_count);
+  EXPECT_FALSE(crabs_raft_module_is_leader(host.nodes[1].module));
+
+  // A post-removal decree commits on the single-member cluster and
+  // materializes exactly once.
+  uint8_t decree_uuid[CRABS_UUID_SIZE];
+  ASSERT_EQ(sim_submit_write(&host, 0, "council_write", "council",
+                             "post-remove", decree_uuid),
+            CRABS_ERR_ORDERING_PENDING);
+  sim_target_tip = crabs_raft_module_log_length(host.nodes[0].module);
+  sim_run_until(&host, 100, 40, sim_pred_target_tips);
+  EXPECT_EQ(sim_state_uuid_occurrences(host.nodes[0].state, decree_uuid), 1u);
+
+  sim_host_destroy(&host);
+}
+
+// Predicate: no membership change is pending anywhere and the committed
+// tip reached sim_target_tip (settled joint + C_new).
+static bool sim_pred_change_settled(sim_host_t* host) {
+  for (uint32_t node_index = 0; node_index < host->node_count; node_index++) {
+    if (crabs_raft_module_config_change_pending(
+            host->nodes[node_index].module)) {
+      return false;
+    }
+    if (sim_target_tip > 0 &&
+        crabs_raft_module_committed_tip(host->nodes[node_index].module) <
+            sim_target_tip) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// A membership grid: old members boot with each other; the newcomer boots
+// provisioned with EVERY id but holds no log until the joint change. These
+// scenarios exercise the MODULE's config/quorum mechanics only (no machine
+// materialization asserts), so nodes carry bare modules — the pipeline
+// fixtures stay with the cluster attach above.
+static void sim_membership_grid_attach(sim_host_t* host,
+                                       const char* const* ids,
+                                       uint32_t old_count) {
+  ASSERT_LE(old_count + 1u, (uint32_t)kSimMaxNodes);
+  ASSERT_EQ(host->node_count, 0u);
+  for (uint32_t node_slot = 0; node_slot < old_count + 1u; node_slot++) {
+    sim_node_t* node = &host->nodes[node_slot];
+    memset(node, 0, sizeof(*node));
+    node->partition_group = 0;
+    node->auto_persist = true;
+    node->node_id = ids[node_slot];
+    crabs_raft_config_t config;
+    crabs_raft_config_defaults(&config);
+    strncpy(config.node_id, ids[node_slot], CRABS_MAX_USER_ID - 1);
+    bool is_newcomer = node_slot >= old_count;
+    uint32_t member_count = is_newcomer ? old_count + 1u : old_count;
+    for (uint32_t member_slot = 0; member_slot < member_count; member_slot++) {
+      strncpy(config.peer_ids[member_slot], ids[member_slot],
+              CRABS_MAX_USER_ID - 1);
+    }
+    config.peer_count = member_count;
+    config.seed = 100 + node_slot;
+    node->module = crabs_raft_module_create(&config);
+    ASSERT_NE(node->module, nullptr);
+    host->node_count = node_slot + 1;
+  }
+}
+
+static const char* kGridIds[4] = {"grid-a", "grid-b", "grid-c", "grid-d"};
+
+TEST(RaftMembership, PartitionOfTheOldMajorityStallsTheChangeAndHealFinishes) {
+  // 3 old members + provisioned grid-d. The change IN FLIGHT (appended,
+  // not committed) stalls when TWO of the three old members partition away:
+  // the joint C_old,new entry needs the OLD list's majority (2 of 3) which
+  // the lone remaining old member cannot hold, and the committed config —
+  // therefore the quorum rules — does not move until the heal.
+  sim_host_t host = sim_host_make();
+  sim_membership_grid_attach(&host, kGridIds, 3);
+  sim_run_until(&host, 100, 40, sim_pred_any_leader);
+  int leader = sim_find_leader(&host);
+  ASSERT_GE(leader, 0);
+
+  const char* new_list[4] = {"grid-a", "grid-b", "grid-c", "grid-d"};
+  uint64_t change_id = 0;
+  EXPECT_EQ(crabs_raft_module_change_membership(
+                host.nodes[leader].module, new_list, 4, &change_id),
+            CRABS_SUCCESS);
+
+  // Partition TWO old members away (grid-b, grid-c — whoever they are on
+  // this seed, they are the non-leader old members): group 8 is theirs
+  // alone; the leader keeps group 1 WITH grid-d (the newcomer rides the
+  // majority-side links).
+  uint32_t partitioned_old[2];
+  uint32_t partitioned_n = 0;
+  for (uint32_t node_index = 0; node_index < host.node_count; node_index++) {
+    if ((int)node_index == leader || node_index == 3u) {
+      host.nodes[node_index].partition_group = 1;
+      continue;
+    }
+    host.nodes[node_index].partition_group = 8;
+    partitioned_old[partitioned_n++] = node_index;
+  }
+  ASSERT_EQ(partitioned_n, 2u);
+
+  // Settle the leader's pre-change tail (its no-op) so the stall baseline
+  // only measures the blocked change.
+  sim_step(&host, 100, nullptr);
+  sim_step(&host, 100, nullptr);
+  const uint64_t leader_tip =
+      crabs_raft_module_committed_tip(host.nodes[leader].module);
+  for (uint32_t step = 0; step < 6; step++) {
+    sim_step(&host, 100, nullptr);
+  }
+  // The change is STILL in flight: the old list's majority is out of reach,
+  // the committed membership is frozen at 3, and a second change refuses.
+  EXPECT_TRUE(crabs_raft_module_config_change_pending(
+      host.nodes[leader].module));
+  EXPECT_EQ(crabs_raft_module_committed_members(
+                host.nodes[leader].module, nullptr), 3u);
+  EXPECT_EQ(crabs_raft_module_committed_tip(host.nodes[leader].module),
+            leader_tip);
+  uint64_t refused_id = 0;
+  EXPECT_EQ(crabs_raft_module_change_membership(
+                host.nodes[leader].module, new_list, 4, &refused_id),
+            CRABS_ERR_ORDERING_CHANGE_IN_FLIGHT);
+
+  // --- HEAL: the partitioned old members return, their matches land, the
+  // joint entry commits, the auto C_new commits, and all four members run
+  // the finished plain config (including grid-d, provisioned into the
+  // change while it was partitioned-... no — grid-d was connected all
+  // along).
+  for (uint32_t node_index = 0; node_index < host.node_count; node_index++) {
+    host.nodes[node_index].partition_group = 0;
+  }
+  sim_target_tip = change_id;
+  sim_run_until(&host, 100, 60, sim_pred_change_settled);
+  sim_target_tip = 0;
+  for (uint32_t node_index = 0; node_index < host.node_count; node_index++) {
+    EXPECT_EQ(crabs_raft_module_committed_members(
+                  host.nodes[node_index].module, nullptr), 4u);
+    EXPECT_EQ(crabs_raft_module_joint_members(
+                  host.nodes[node_index].module, nullptr), 0u);
+    EXPECT_FALSE(crabs_raft_module_config_change_pending(
+        host.nodes[node_index].module));
+    EXPECT_EQ(crabs_raft_module_rejected_message_count(
+                  host.nodes[node_index].module), 0u);
+  }
+  sim_host_destroy(&host);
+}
+
+TEST(RaftMembership, LeadershipChurnDuringJointResumesTheTransition) {
+  // The leader is partitioned AWAY the moment the joint entry commits: the
+  // two-group majority elects a NEW leader (still under the joint quorum
+  // rules — both majorities must hold the votes), and that new leader
+  // RESUMES the transition by appending the C_new successor itself. The
+  // heal converges the full cluster onto the finished 4-member config.
+  sim_host_t host = sim_host_make();
+  sim_membership_grid_attach(&host, kGridIds, 3);
+  sim_run_until(&host, 100, 40, sim_pred_any_leader);
+  int old_leader = sim_find_leader(&host);
+  ASSERT_GE(old_leader, 0);
+
+  const char* new_list[4] = {"grid-a", "grid-b", "grid-c", "grid-d"};
+  uint64_t change_id = 0;
+  EXPECT_EQ(crabs_raft_module_change_membership(
+                host.nodes[old_leader].module, new_list, 4, &change_id),
+            CRABS_SUCCESS);
+
+  // --- PARTITION the old leader off as soon as its joint entry may have
+  // landed: the majority keeps running and finishing the change.
+  sim_target_tip = change_id;
+  sim_run_until(&host, 100, 20, sim_pred_change_settled);
+  host.nodes[old_leader].partition_group = 9;
+  for (uint32_t node_index = 0; node_index < host.node_count; node_index++) {
+    if ((int)node_index != old_leader) host.nodes[node_index].partition_group = 1;
+  }
+
+  // The majority: a NEW leader emerges (if the old leader's group was the
+  // one that still leads, the group's own election wins — either way the
+  // majority ends with exactly one leader that finishes the transition).
+  uint32_t majority_steps = 0;
+  int new_leader = -1;
+  while (majority_steps < 40) {
+    sim_step(&host, 100, nullptr);
+    majority_steps++;
+    for (uint32_t node_index = 0; node_index < host.node_count; node_index++) {
+      if ((int)node_index != old_leader &&
+          crabs_raft_module_is_leader(host.nodes[node_index].module)) {
+        new_leader = (int)node_index;
+      }
+    }
+    if (new_leader >= 0) break;
+  }
+  ASSERT_GE(new_leader, 0);
+
+  // The transition finished INSIDE the majority: the joint phase closed
+  // even though the original leader never got to append its C_new.
+  sim_target_tip = change_id;
+  sim_run_until(&host, 100, 60, sim_pred_change_settled);
+  for (uint32_t node_index = 0; node_index < host.node_count; node_index++) {
+    if ((int)node_index == old_leader) continue;
+    EXPECT_EQ(crabs_raft_module_committed_members(
+                  host.nodes[node_index].module, nullptr), 4u);
+    EXPECT_EQ(crabs_raft_module_joint_members(
+                  host.nodes[node_index].module, nullptr), 0u);
+  }
+
+  // --- HEAL: the old leader catches up, absorbs the finished transition,
+  // steps down for good, and the cluster converges with ONE leader.
+  for (uint32_t node_index = 0; node_index < host.node_count; node_index++) {
+    host.nodes[node_index].partition_group = 0;
+  }
+  // Converge: the connected cluster elects ONE leader (the stale old
+  // leader steps down on the first higher-term traffic) and everyone
+  // carries the finished 4-member config.
+  sim_run_until(&host, 100, 60, sim_pred_any_leader);
+  sim_step(&host, 100, nullptr);
+  sim_step(&host, 100, nullptr);
+  for (uint32_t node_index = 0; node_index < host.node_count; node_index++) {
+    EXPECT_EQ(crabs_raft_module_committed_members(
+                  host.nodes[node_index].module, nullptr), 4u);
+    EXPECT_EQ(crabs_raft_module_joint_members(
+                  host.nodes[node_index].module, nullptr), 0u);
+  }
+  EXPECT_EQ(sim_leader_count(&host), 1u);
+  EXPECT_FALSE(crabs_raft_module_is_leader(host.nodes[old_leader].module));
+  sim_host_destroy(&host);
 }

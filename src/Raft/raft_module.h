@@ -30,15 +30,20 @@
 // the persist request with persist_complete(handle, true). Nothing counts
 // for commit before that (the persistence contract).
 //
-// Growth model (log compaction decision is a later phase, never silently
-// unbounded): the module log holds at most CRABS_RAFT_MAX_LOG_ENTRIES
-// entries. Each entry carries at most CRABS_RAFT_MAX_OP_WIRE_BYTES of
-// serialized op wire. Proposals beyond the caps are REFUSED (the module
-// stays healthy and keeps its committed prefix); a single-node cluster's
-// commit tip therefore bounds retained state at
-// cap * (entry bytes + per-op wire) — a documented, finite bound the host
-// can plan storage around. Phase 3 revisits compaction with harness
-// evidence; these caps are the current, explicit answer.
+// Growth model (compaction decision CLOSED under Phase 3 harness evidence,
+// never silently unbounded): the module log holds at most
+// CRABS_RAFT_MAX_LOG_ENTRIES entries. Each entry carries at most
+// CRABS_RAFT_MAX_OP_WIRE_BYTES of serialized op wire. Proposals beyond the
+// caps are REFUSED (the module stays healthy and keeps its committed prefix,
+// surfacing RAFT_NOTIFY_LOG_FULL); a single-node cluster's commit tip
+// therefore bounds retained state at cap * (entry + per-op wire) — a
+// documented, finite bound the host can plan storage around. Phase 3
+// evidence (test_raft_module.cpp, RaftLogBound.ReachesCapAndRefusesBeyond):...
+// DECISION: compaction-as-snapshot is DEFERRED to its own follow-up plan —
+// discarding committed prefixes requires persisting machine-state snapshots
+// alongside the log prefix and an install-on-demand path; the 4096-entry
+// ceiling with refusal at the cap is the honest shipped answer for now, and
+// the harness stress test pins the behavior AT the bound.
 
 // Cluster shape: peers counts ALL members including this node (1 = the
 // degenerate single-node cluster: self-election without vote exchange).
@@ -130,7 +135,9 @@ typedef enum {
   RAFT_NOTIFY_LOST_LEADERSHIP    = 2,
   RAFT_NOTIFY_COMMITTED_OP       = 3,
   RAFT_NOTIFY_PROPOSAL_NOT_LEADER = 4,
-  RAFT_NOTIFY_PERSIST_FAILED     = 5
+  RAFT_NOTIFY_PERSIST_FAILED     = 5,
+  RAFT_NOTIFY_LOG_FULL           = 6,  // a proposal hit the CRABS_RAFT_MAX_LOG_ENTRIES ceiling
+  RAFT_NOTIFY_CONFIG_EXCLUDED    = 7   // a membership change committed this node OUT of the config
 } raft_notification_e;
 
 typedef struct {
@@ -194,6 +201,32 @@ crabs_error_e crabs_raft_module_propose(crabs_raft_module_t* module,
 crabs_error_e crabs_raft_module_persist_complete(crabs_raft_module_t* module,
                                                  uint64_t handle, bool ok);
 
+// Joint-consensus membership change (Raft §6, on the module's OWN config
+// log): the leader appends a joint C_old,new entry carrying BOTH peer lists
+// like an ordinary entry; when committed the leader appends the final C_new
+// entry automatically, and that entry's commit ends the transition. Voting
+// and commit quorums during the joint phase require majorities of BOTH
+// lists; only ONE change may be in flight (an appended-but-uncommitted
+// config entry, or an active joint phase refuses further changes with
+// CRABS_ERR_ORDERING_CHANGE_IN_FLIGHT). A node excluded by the committed
+// config steps down (RAFT_NOTIFY_CONFIG_EXCLUDED). new_member_ids entries
+// replace the whole membership — copy id arrays that must outlive the call
+// is NOT required; the module copies the strings.
+crabs_error_e crabs_raft_module_change_membership(
+    crabs_raft_module_t* module, const char* const* new_member_ids,
+    uint32_t member_count, uint64_t* proposal_id);
+
+// Crash recovery from the HOST's durable raft record: parse a stored persist
+// batch blob (the bytes the host copied when serving a poll_persist window)
+// and merge it into the module's durable state — the term/votedFor HEADER
+// record rides every batch (carry item A: election safety requires the vote
+// to be durable BEFORE the vote response is effective, so restart must play
+// back the stored batches over the machine-state blob, which may predate the
+// last grants). Entries under the committed prefix are never rewritten
+// (contradiction fails closed).
+crabs_error_e crabs_raft_module_recover_from_persist(
+    crabs_raft_module_t* module, const uint8_t* batch, size_t batch_len);
+
 // ============================================================
 // Outbound drains — each poll moves the head event out; the pointer stays
 // valid until the next poll of that queue.
@@ -218,6 +251,21 @@ uint64_t crabs_raft_module_next_election_deadline(const crabs_raft_module_t* mod
 // Fail-closed deserializer discipline: malformed inbound messages are
 // dropped, never crash or corrupt state. The counter reports rejections.
 uint32_t crabs_raft_module_rejected_message_count(const crabs_raft_module_t* module);
+
+// Membership queries (harness assertions, host glue): the ACTIVE committed
+// config lists — "committed" peers (the election/voting list, empty only for
+// the never-configured degenerate create... the create-time boot config is
+// the committed config until a config entry commits) and the SECOND list of
+// an active joint consensus (0 members when the cluster runs a plain single
+// consensus). out gets up to CRABS_RAFT_MAX_PEERS id strings; the return is
+// the member count of that list.
+uint32_t crabs_raft_module_committed_members(
+    const crabs_raft_module_t* module, char (*out)[CRABS_MAX_USER_ID]);
+uint32_t crabs_raft_module_joint_members(
+    const crabs_raft_module_t* module, char (*out)[CRABS_MAX_USER_ID]);
+// A membership change is appended-but-uncommitted, or the committed joint
+// phase still spans both lists.
+bool crabs_raft_module_config_change_pending(const crabs_raft_module_t* module);
 
 // ============================================================
 // Persisted-state export/import (v16 serialization support)

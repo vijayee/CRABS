@@ -145,13 +145,21 @@ TEST(RaftModuleLifecycle, TickPastDeadlineElectsSelfWithoutVoteExchange) {
 
 // The full degenerate path: propose → persist request → (and ONLY after)
 // persist_complete(true) → commit tip advances → COMMITTED_OP carries the op
-// wire.
+// wire. The leadership NO-OP entry (Raft §8) commits at index 1 first and
+// never materializes as a machine op.
 TEST(RaftSingleNodeCommit, ProposePersistsThenCommits) {
   crabs_raft_config_t config = make_single_config(42, 0);
   crabs_raft_module_t* module = crabs_raft_module_create(&config);
   ASSERT_NE(module, nullptr);
   uint64_t now_ms = 0;
   drive_to_leader(module, &now_ms);
+
+  // The leader-start no-op sits at index 1, undurable until the host acks.
+  EXPECT_EQ(crabs_raft_module_log_length(module), 1u);
+  crabs_raft_persist_request_t persist;
+  ASSERT_TRUE(crabs_raft_module_poll_persist(module, &persist));
+  EXPECT_EQ(persist.handle, 1u);
+  ASSERT_GE(persist.len, 4u);
 
   const char* payload = "mint-one";
   operation_t* op = make_signed_op("mint", "admin",
@@ -163,19 +171,13 @@ TEST(RaftSingleNodeCommit, ProposePersistsThenCommits) {
   EXPECT_EQ(crabs_raft_module_propose(module, op, &proposal_id),
             CRABS_SUCCESS);
   operation_destroy(op);
-  EXPECT_EQ(proposal_id, 1u);
-  EXPECT_EQ(crabs_raft_module_log_length(module), 1u);
+  EXPECT_EQ(proposal_id, 2u);   // index 1 = the no-op
+  EXPECT_EQ(crabs_raft_module_log_length(module), 2u);
   // Nothing counts for commit before the host acked durability.
   EXPECT_EQ(crabs_raft_module_committed_tip(module), 0u);
 
-  // The persist event exists IMMEDIATELY (no tick required).
-  crabs_raft_persist_request_t persist;
-  ASSERT_TRUE(crabs_raft_module_poll_persist(module, &persist));
-  EXPECT_EQ(persist.handle, 1u);
-  ASSERT_GE(persist.len, 4u);
-
-  // The same outstanding request is reported until completion (single
-  // window): the blob pointer is stable.
+  // The single window is busy with the no-op batch; the same outstanding
+  // request is reported until completion (blob pointer stable).
   crabs_raft_persist_request_t persist_again;
   ASSERT_TRUE(crabs_raft_module_poll_persist(module, &persist_again));
   EXPECT_EQ(persist_again.handle, persist.handle);
@@ -183,12 +185,22 @@ TEST(RaftSingleNodeCommit, ProposePersistsThenCommits) {
 
   EXPECT_EQ(crabs_raft_module_persist_complete(module, persist.handle, true),
             CRABS_SUCCESS);
+  // The no-op committed (index 1) but emitted NO COMMITTED_OP: control
+  // entries never materialize as machine ops.
   EXPECT_EQ(crabs_raft_module_committed_tip(module), 1u);
+  EXPECT_EQ(drain_committed(module).size(), 0u);
+
+  // The op entry follows on the next window (re-armed by the completion).
+  ASSERT_TRUE(crabs_raft_module_poll_persist(module, &persist));
+  EXPECT_EQ(persist.handle, 2u);
+  EXPECT_EQ(crabs_raft_module_persist_complete(module, persist.handle, true),
+            CRABS_SUCCESS);
+  EXPECT_EQ(crabs_raft_module_committed_tip(module), 2u);
 
   std::vector<crabs_raft_notification_t> committed = drain_committed(module);
   ASSERT_EQ(committed.size(), 1u);
-  EXPECT_EQ(committed[0].proposal_id, 1u);
-  EXPECT_EQ(committed[0].commit_index, 1u);
+  EXPECT_EQ(committed[0].proposal_id, 2u);
+  EXPECT_EQ(committed[0].commit_index, 2u);
   ASSERT_NE(committed[0].op_bytes, nullptr);
   operation_t* restored = crabs_deserialize_operation(committed[0].op_bytes,
                                                       committed[0].op_len);
@@ -204,15 +216,15 @@ TEST(RaftSingleNodeCommit, ProposePersistsThenCommits) {
   EXPECT_EQ(crabs_raft_module_propose(module, op, &proposal_id),
             CRABS_SUCCESS);
   operation_destroy(op);
-  EXPECT_EQ(proposal_id, 2u);
+  EXPECT_EQ(proposal_id, 3u);
   ASSERT_TRUE(crabs_raft_module_poll_persist(module, &persist));
-  EXPECT_EQ(persist.handle, 2u);
+  EXPECT_EQ(persist.handle, 3u);
   EXPECT_EQ(crabs_raft_module_persist_complete(module, persist.handle, true),
             CRABS_SUCCESS);
-  EXPECT_EQ(crabs_raft_module_committed_tip(module), 2u);
+  EXPECT_EQ(crabs_raft_module_committed_tip(module), 3u);
   committed = drain_committed(module);
   ASSERT_EQ(committed.size(), 1u);
-  EXPECT_EQ(committed[0].proposal_id, 2u);
+  EXPECT_EQ(committed[0].proposal_id, 3u);
 
   // Stale handles (already resolved, or unknown) refuse loudly.
   crabs_raft_persist_request_t empty;
@@ -237,13 +249,15 @@ TEST(RaftSingleNodeCommit, FailedPersistNeverCommitsAndRetries) {
   operation_t* op = make_signed_op("mint", "admin", (const uint8_t*)"x", 1);
   ASSERT_NE(op, nullptr);
   uint64_t proposal_id = 0;
-  EXPECT_EQ(crabs_raft_module_propose(module, op, &proposal_id), CRABS_SUCCESS);
+  EXPECT_EQ(crabs_raft_module_propose(module, op, &proposal_id),
+            CRABS_SUCCESS);   // index 2; index 1 is the leadership no-op
   operation_destroy(op);
 
   crabs_raft_persist_request_t persist;
   ASSERT_TRUE(crabs_raft_module_poll_persist(module, &persist));
   // Copy the batch bytes BEFORE completing: the blob is module-owned and is
-  // released when the window resolves.
+  // released when the window resolves. (The window covers the no-op — the
+  // single outstanding window held when the proposal arrived.)
   std::vector<uint8_t> stored_batch(persist.bytes,
                                     persist.bytes + persist.len);
   EXPECT_EQ(crabs_raft_module_persist_complete(module, persist.handle, false),
@@ -254,19 +268,29 @@ TEST(RaftSingleNodeCommit, FailedPersistNeverCommitsAndRetries) {
   ASSERT_TRUE(crabs_raft_module_poll_notification(module, &notification));
   EXPECT_EQ(notification.kind, RAFT_NOTIFY_PERSIST_FAILED);
 
-  // The tick re-arms persistence for the undurable tail with a fresh handle.
+  // The tick re-arms persistence for the whole undurable tail with a fresh
+  // handle: the failed batch re-issues unchanged, PLUS the op entry that
+  // joined the log after the window was armed.
   now_ms++;
   EXPECT_EQ(crabs_raft_module_tick(module, now_ms), CRABS_SUCCESS);
   crabs_raft_persist_request_t retry;
   ASSERT_TRUE(crabs_raft_module_poll_persist(module, &retry));
   EXPECT_EQ(retry.handle, persist.handle + 1);
-  // Same batch bytes: the undurable tail re-issues unchanged.
-  EXPECT_EQ(retry.len, stored_batch.size());
-  EXPECT_EQ(memcmp(retry.bytes, stored_batch.data(), stored_batch.size()), 0);
+  // The retry batch re-issues the SAME header record (version u8 + first
+  // index u64 + header term u64 + votedFor string16: 25 bytes for
+  // "node-0"); the tail grew, so the entry_count field and the body differ.
+  constexpr size_t kPersistHeaderPrefix = 1 + 8 + 8 + 2 + 6;
+  ASSERT_GT(retry.len, stored_batch.size());
+  EXPECT_EQ(memcmp(retry.bytes, stored_batch.data(), kPersistHeaderPrefix), 0);
   EXPECT_EQ(crabs_raft_module_persist_complete(module, retry.handle, true),
             CRABS_SUCCESS);
-  EXPECT_EQ(crabs_raft_module_committed_tip(module), 1u);
-  EXPECT_EQ(drain_committed(module).size(), 1u);
+  // The no-op committed silently (no machine op); the op committed right
+  // behind it on the same batch.
+  EXPECT_EQ(crabs_raft_module_committed_tip(module), 2u);
+  std::vector<crabs_raft_notification_t> committed = drain_committed(module);
+  ASSERT_EQ(committed.size(), 1u);
+  EXPECT_EQ(committed[0].proposal_id, 2u);
+  EXPECT_EQ(committed[0].commit_index, 2u);
 
   crabs_raft_module_destroy(module);
 }
@@ -311,7 +335,8 @@ TEST(RaftProposalGate, OverCapOpWireRefused) {
             CRABS_ERR_SERIALIZATION_ERROR);
   operation_destroy(op);
   EXPECT_EQ(proposal_id, 0u);
-  EXPECT_EQ(crabs_raft_module_log_length(module), 0u);
+  // Only the leadership no-op occupies the log; the refused op added nothing.
+  EXPECT_EQ(crabs_raft_module_log_length(module), 1u);
   crabs_raft_module_destroy(module);
 }
 
@@ -398,7 +423,10 @@ TEST(RaftInboundDiscipline, MalformedMessagesDropWithoutStateCorruption) {
 }
 
 // Round-trip: a marshaled vote request parses cleanly on a real peer (zero
-// rejections) and the answer round-trips back — the full wire path.
+// rejections) and the answer round-trips back — the full wire path. Carry
+// item A: BOTH directions are gated on the term/votedFor header batch being
+// durable — the candidacy solicitation waits for its own self-vote persist,
+// and the grant response waits for the grant persist.
 TEST(RaftWireRoundTrip, VoteRequestResponseBetweenTwoModules) {
   crabs_raft_config_t config_a = make_single_config(42, 0);
   crabs_raft_config_t config_b = make_single_config(42, 0);
@@ -416,23 +444,37 @@ TEST(RaftWireRoundTrip, VoteRequestResponseBetweenTwoModules) {
   ASSERT_NE(module_a, nullptr);
   ASSERT_NE(module_b, nullptr);
 
-  // A's deadline fires → candidate → vote solicitations to B.
+  // A's deadline fires → candidate → its solicitation is HELD (no vote
+  // traffic leaves before the term/votedFor header batch is durable).
   uint64_t deadline_a = crabs_raft_module_next_election_deadline(module_a);
   EXPECT_EQ(crabs_raft_module_tick(module_a, deadline_a), CRABS_SUCCESS);
   EXPECT_EQ(crabs_raft_module_current_term(module_a), 1u);
 
   crabs_raft_outbound_message_t outbound;
+  crabs_raft_persist_request_t persist_a;
+  ASSERT_TRUE(crabs_raft_module_poll_persist(module_a, &persist_a));
+  EXPECT_FALSE(crabs_raft_module_poll_outbound(module_a, &outbound));
+  EXPECT_EQ(crabs_raft_module_persist_complete(module_a, persist_a.handle,
+                                               true), CRABS_SUCCESS);
+
+  // Durable candidacy: the solicitation flows now.
   ASSERT_TRUE(crabs_raft_module_poll_outbound(module_a, &outbound));
   EXPECT_EQ(outbound.kind, RAFT_MSG_VOTE_REQ);
   EXPECT_STREQ(outbound.to_peer, "nodeB");
 
   // B (still term 0 follower) grants the vote: wire parses with zero
-  // rejections.
+  // rejections — but B's grant is HELD behind ITS OWN header batch.
   EXPECT_EQ(crabs_raft_module_inbound(module_b, "nodeA", outbound.bytes,
                                       outbound.len, deadline_a), CRABS_SUCCESS);
   free((void*)outbound.bytes);
   EXPECT_EQ(crabs_raft_module_rejected_message_count(module_b), 0u);
   EXPECT_EQ(crabs_raft_module_current_term(module_b), 1u);
+  crabs_raft_persist_request_t persist_b;
+  ASSERT_TRUE(crabs_raft_module_poll_persist(module_b, &persist_b));
+  EXPECT_FALSE(crabs_raft_module_poll_outbound(module_b, &outbound));
+  // ... and flows exactly when the grant's persist completes.
+  EXPECT_EQ(crabs_raft_module_persist_complete(module_b, persist_b.handle,
+                                               true), CRABS_SUCCESS);
   ASSERT_TRUE(crabs_raft_module_poll_outbound(module_b, &outbound));
   EXPECT_EQ(outbound.kind, RAFT_MSG_VOTE_RESP);
   EXPECT_STREQ(outbound.to_peer, "nodeA");
@@ -442,6 +484,140 @@ TEST(RaftWireRoundTrip, VoteRequestResponseBetweenTwoModules) {
 
   crabs_raft_module_destroy(module_a);
   crabs_raft_module_destroy(module_b);
+}
+
+// Carry item A — election safety across a crash: the persisted batch is a
+// complete election record. A grant + crash + fresh module that recovers
+// from the host's stored batch CANNOT re-vote for a different candidate in
+// the same term, and the vote response never left the reactor before the
+// header batch was durable.
+TEST(RaftVoteDurability, GrantPersistsBeforeResponseAndSurvivesCrash) {
+  crabs_raft_config_t config_b = make_single_config(42, 0);
+  strncpy(config_b.node_id, "nodeB", CRABS_MAX_USER_ID - 1);
+  strncpy(config_b.peer_ids[0], "nodeB", CRABS_MAX_USER_ID - 1);
+  strncpy(config_b.peer_ids[1], "nodeA", CRABS_MAX_USER_ID - 1);
+  strncpy(config_b.peer_ids[2], "nodeC", CRABS_MAX_USER_ID - 1);
+  config_b.peer_count = 3;
+
+  crabs_raft_module_t* module_b = crabs_raft_module_create(&config_b);
+  ASSERT_NE(module_b, nullptr);
+
+  // Hand-marshal a term-7 vote request from nodeA (the public wire format).
+  std::vector<uint8_t> vote_req;
+  auto push_u8 = [&](uint8_t value) { vote_req.push_back(value); };
+  auto push_u64 = [&](uint64_t value) {
+    for (int byte_index = 0; byte_index < 8; byte_index++) {
+      push_u8((uint8_t)((value >> (byte_index * 8)) & 0xFF));
+    }
+  };
+  auto push_str16 = [&](const char* text) {
+    uint16_t len = (uint16_t)strlen(text);
+    push_u8((uint8_t)(len & 0xFF));
+    push_u8((uint8_t)(len >> 8));
+    for (uint16_t char_index = 0; char_index < len; char_index++) {
+      push_u8((uint8_t)text[char_index]);
+    }
+  };
+  push_u8(0x52); push_u8(1); push_u8(1);
+  push_u64(7);
+  push_str16("nodeA");
+  push_u64(9);    // last_log_term
+  push_u64(12);   // last_log_index
+
+  EXPECT_EQ(crabs_raft_module_inbound(module_b, "nodeA", vote_req.data(),
+                                      vote_req.size(), 100), CRABS_SUCCESS);
+  EXPECT_EQ(crabs_raft_module_rejected_message_count(module_b), 0u);
+  EXPECT_EQ(crabs_raft_module_current_term(module_b), 7u);
+
+  // The grant is HELD: nothing leaves the reactor...
+  crabs_raft_outbound_message_t outbound;
+  EXPECT_FALSE(crabs_raft_module_poll_outbound(module_b, &outbound));
+  // ...until the header batch carrying (7, nodeA) is durable. The host
+  // copies the batch bytes as its durable record (the crash artifact).
+  crabs_raft_persist_request_t persist_b;
+  ASSERT_TRUE(crabs_raft_module_poll_persist(module_b, &persist_b));
+  std::vector<uint8_t> stored_batch(persist_b.bytes,
+                                    persist_b.bytes + persist_b.len);
+  EXPECT_EQ(crabs_raft_module_persist_complete(module_b, persist_b.handle,
+                                               true), CRABS_SUCCESS);
+  ASSERT_TRUE(crabs_raft_module_poll_outbound(module_b, &outbound));
+  EXPECT_EQ(outbound.kind, RAFT_MSG_VOTE_RESP);
+  free((void*)outbound.bytes);
+
+  // --- crash: object destroyed, only the stored batch survives ---
+  crabs_raft_module_destroy(module_b);
+  crabs_raft_module_t* revived = crabs_raft_module_create(&config_b);
+  ASSERT_NE(revived, nullptr);
+  EXPECT_EQ(crabs_raft_module_recover_from_persist(
+                revived, stored_batch.data(), stored_batch.size()),
+            CRABS_SUCCESS);
+  // The recovered durable election record: term 7, voted nodeA, and the
+  // header record is acknowledged durable for restart-continued committing.
+  crabs_raft_module_state_t* exported = crabs_raft_module_export_state(revived);
+  ASSERT_NE(exported, nullptr);
+  EXPECT_EQ(exported->term, 7u);
+  EXPECT_STREQ(exported->voted_for, "nodeA");
+  crabs_raft_module_state_destroy(exported);
+
+  // A second candidate (nodeC) solicits the SAME term: refused — the node
+  // cannot re-vote/revote incorrectly in the term it already granted.
+  // (Wire layout: header 11 bytes, then string16 = 2 length bytes + chars.)
+  std::vector<uint8_t> vote_req_c(vote_req);
+  memcpy(&vote_req_c[13], "nodeC", 5);
+  EXPECT_EQ(crabs_raft_module_inbound(revived, "nodeC", vote_req_c.data(),
+                                      vote_req_c.size(), 101), CRABS_SUCCESS);
+  // The deny flows IMMEDIATELY (a denial carries no vote, no durability
+  // gate) — and it denies.
+  ASSERT_TRUE(crabs_raft_module_poll_outbound(revived, &outbound));
+  EXPECT_EQ(outbound.kind, RAFT_MSG_VOTE_RESP);
+  EXPECT_STREQ(outbound.to_peer, "nodeC");
+  EXPECT_EQ(outbound.bytes[11], 0);
+  free((void*)outbound.bytes);
+
+  crabs_raft_module_destroy(revived);
+}
+
+// Carry item A — the same crash leg on the CANDIDACY side: a fresh module
+// recovered from its stored batch knows durably that it self-voted at term 7
+// (its own solicitation was durable before it ever left).
+TEST(RaftVoteDurability, CandidacySelfVoteDurableBeforeSolicitation) {
+  crabs_raft_config_t config = make_single_config(42, 0);
+  strncpy(config.node_id, "nodeA", CRABS_MAX_USER_ID - 1);
+  strncpy(config.peer_ids[0], "nodeA", CRABS_MAX_USER_ID - 1);
+  strncpy(config.peer_ids[1], "nodeB", CRABS_MAX_USER_ID - 1);
+  config.peer_count = 2;
+
+  crabs_raft_module_t* module_a = crabs_raft_module_create(&config);
+  ASSERT_NE(module_a, nullptr);
+  uint64_t deadline = crabs_raft_module_next_election_deadline(module_a);
+  EXPECT_EQ(crabs_raft_module_tick(module_a, deadline), CRABS_SUCCESS);
+  EXPECT_EQ(crabs_raft_module_current_term(module_a), 1u);
+
+  // Solicitation held behind the header batch; the host stores the bytes.
+  crabs_raft_outbound_message_t outbound;
+  EXPECT_FALSE(crabs_raft_module_poll_outbound(module_a, &outbound));
+  crabs_raft_persist_request_t persist;
+  ASSERT_TRUE(crabs_raft_module_poll_persist(module_a, &persist));
+  std::vector<uint8_t> stored_batch(persist.bytes,
+                                    persist.bytes + persist.len);
+  EXPECT_EQ(crabs_raft_module_persist_complete(module_a, persist.handle, true),
+            CRABS_SUCCESS);
+  ASSERT_TRUE(crabs_raft_module_poll_outbound(module_a, &outbound));
+  EXPECT_EQ(outbound.kind, RAFT_MSG_VOTE_REQ);
+  free((void*)outbound.bytes);
+
+  crabs_raft_module_destroy(module_a);
+  crabs_raft_module_t* revived = crabs_raft_module_create(&config);
+  ASSERT_NE(revived, nullptr);
+  EXPECT_EQ(crabs_raft_module_recover_from_persist(
+                revived, stored_batch.data(), stored_batch.size()),
+            CRABS_SUCCESS);
+  crabs_raft_module_state_t* exported = crabs_raft_module_export_state(revived);
+  ASSERT_NE(exported, nullptr);
+  EXPECT_EQ(exported->term, 1u);
+  EXPECT_STREQ(exported->voted_for, "nodeA");
+  crabs_raft_module_state_destroy(exported);
+  crabs_raft_module_destroy(revived);
 }
 
 // Hand-marshal an APPEND_REQ (the layout is the module's public wire
@@ -538,13 +714,16 @@ TEST(RaftPersistedState, ExportImportRoundTripSurvivesRestart) {
   uint64_t throwaway_proposal = 0;
   EXPECT_EQ(crabs_raft_module_propose(module, op, &throwaway_proposal),
             CRABS_SUCCESS);
-  EXPECT_EQ(throwaway_proposal, 1u);
+  EXPECT_EQ(throwaway_proposal, 2u);   // index 1 is the leadership no-op
   operation_destroy(op);
 
   crabs_raft_persist_request_t persist;
   ASSERT_TRUE(crabs_raft_module_poll_persist(module, &persist));
   EXPECT_EQ(crabs_raft_module_persist_complete(module, persist.handle, true),
-            CRABS_SUCCESS);
+            CRABS_SUCCESS);              // no-op window → tip 1
+  ASSERT_TRUE(crabs_raft_module_poll_persist(module, &persist));
+  EXPECT_EQ(crabs_raft_module_persist_complete(module, persist.handle, true),
+            CRABS_SUCCESS);              // op window → tip 2
   drain_committed(module);
 
   // Export matches the live module.
@@ -552,14 +731,18 @@ TEST(RaftPersistedState, ExportImportRoundTripSurvivesRestart) {
   ASSERT_NE(export_a, nullptr);
   EXPECT_EQ(export_a->module_id, 3);
   EXPECT_EQ(export_a->term, crabs_raft_module_current_term(module));
-  EXPECT_EQ(export_a->commit_index, 1u);
-  EXPECT_EQ(export_a->log_count, 1u);
+  EXPECT_EQ(export_a->commit_index, 2u);
+  EXPECT_EQ(export_a->log_count, 2u);
   ASSERT_NE(export_a->log, nullptr);
+  // Entry 1 is the leadership no-op: zero-length wire, never a machine op.
   EXPECT_EQ(export_a->log->term, 1u);
   EXPECT_EQ(export_a->log->proposal_id, 1u);
-  // The entry carries the serialized OP WIRE (a full CRABS op blob), not
-  // the raw payload.
-  EXPECT_GT(export_a->log->wire_len, 3u);
+  EXPECT_EQ(export_a->log->wire_len, 0u);
+  ASSERT_NE(export_a->log->next, nullptr);
+  EXPECT_EQ(export_a->log->next->proposal_id, 2u);
+  // The data entry carries the serialized OP WIRE (a full CRABS op blob),
+  // not the raw payload.
+  EXPECT_GT(export_a->log->next->wire_len, 3u);
   crabs_raft_module_state_destroy(export_a);
 
   // Import into a FRESH module (the restart: object recreated, state kept).
@@ -580,18 +763,25 @@ TEST(RaftPersistedState, ExportImportRoundTripSurvivesRestart) {
   crabs_raft_notification_t notification;
   EXPECT_FALSE(crabs_raft_module_poll_notification(revived, &notification));
 
-  // Committing CONTINUES on the revived module.
+  // Committing CONTINUES on the revived module. A new leadership start
+  // appends ITS OWN no-op first (§8: every leadership term appends one), so
+  // the op lands at index 4 after the revived no-op at 3.
   drive_to_leader(revived, &now_ms);
+  EXPECT_EQ(crabs_raft_module_log_length(revived), 3u);
   op = make_signed_op("mint", "admin", (const uint8_t*)"two", 3);
   ASSERT_NE(op, nullptr);
   uint64_t proposal_id = 0;
   EXPECT_EQ(crabs_raft_module_propose(revived, op, &proposal_id), CRABS_SUCCESS);
   operation_destroy(op);
-  EXPECT_EQ(proposal_id, 2u);
+  EXPECT_EQ(proposal_id, 4u);
+  EXPECT_EQ(crabs_raft_module_log_length(revived), 4u);
   ASSERT_TRUE(crabs_raft_module_poll_persist(revived, &persist));
   EXPECT_EQ(crabs_raft_module_persist_complete(revived, persist.handle, true),
-            CRABS_SUCCESS);
-  EXPECT_EQ(crabs_raft_module_committed_tip(revived), 2u);
+            CRABS_SUCCESS);              // revived no-op → tip 3
+  ASSERT_TRUE(crabs_raft_module_poll_persist(revived, &persist));
+  EXPECT_EQ(crabs_raft_module_persist_complete(revived, persist.handle, true),
+            CRABS_SUCCESS);              // op → tip 4
+  EXPECT_EQ(crabs_raft_module_committed_tip(revived), 4u);
 
   crabs_raft_module_destroy(module);
   crabs_raft_module_destroy(revived);
@@ -645,7 +835,10 @@ TEST(RaftPersistedState, MachineBlobRoundTripCarriesModuleSection) {
   crabs_raft_persist_request_t persist;
   ASSERT_TRUE(crabs_raft_module_poll_persist(module, &persist));
   EXPECT_EQ(crabs_raft_module_persist_complete(module, persist.handle, true),
-            CRABS_SUCCESS);
+            CRABS_SUCCESS);              // no-op → tip 1
+  ASSERT_TRUE(crabs_raft_module_poll_persist(module, &persist));
+  EXPECT_EQ(crabs_raft_module_persist_complete(module, persist.handle, true),
+            CRABS_SUCCESS);              // op → tip 2
   drain_committed(module);
 
   serialized_buffer_t* blob = crabs_serialize_state(env.state);
@@ -663,17 +856,19 @@ TEST(RaftPersistedState, MachineBlobRoundTripCarriesModuleSection) {
   ASSERT_NE(parsed, nullptr);
   EXPECT_EQ(parsed->module_id, 5);
   EXPECT_EQ(parsed->term, 1u);
-  EXPECT_EQ(parsed->commit_index, 1u);
-  EXPECT_EQ(parsed->log_count, 1u);
+  EXPECT_EQ(parsed->commit_index, 2u);
+  EXPECT_EQ(parsed->log_count, 2u);
   ASSERT_NE(parsed->log, nullptr);
+  // The carried history begins with the leadership no-op (zero wire length).
   EXPECT_EQ(parsed->log->proposal_id, 1u);
+  EXPECT_EQ(parsed->log->wire_len, 0u);
 
   // The host handoff: create a fresh module with the SAME cfg and import.
   crabs_raft_module_t* revived_module = crabs_raft_module_create(&config);
   ASSERT_NE(revived_module, nullptr);
   EXPECT_EQ(crabs_raft_module_import_state(revived_module, parsed),
             CRABS_SUCCESS);
-  EXPECT_EQ(crabs_raft_module_committed_tip(revived_module), 1u);
+  EXPECT_EQ(crabs_raft_module_committed_tip(revived_module), 2u);
   crabs_raft_module_destroy(revived_module);
 
   // The snapshot is state-owned: state_destroy must release it (no leak
@@ -690,4 +885,237 @@ TEST(RaftPersistedState, MachineBlobRoundTripCarriesModuleSection) {
   state_destroy(empty_restored);
   serialized_buffer_destroy(empty_blob);
   state_destroy(empty_state);
+}
+// Carry item D (P2-review nit): the EMPTY-range AppendEntries round trip —
+// an up-to-date leader's heartbeat (entry_count 0) parses on a real follower
+// with zero rejections and gets a success/match response.
+TEST(RaftWireRoundTrip, EmptyRangeHeartbeatRoundTrips) {
+  crabs_raft_config_t config_f = make_single_config(42, 0);
+  strncpy(config_f.node_id, "nodeF", CRABS_MAX_USER_ID - 1);
+  strncpy(config_f.peer_ids[0], "nodeF", CRABS_MAX_USER_ID - 1);
+  strncpy(config_f.peer_ids[1], "nodeL", CRABS_MAX_USER_ID - 1);
+  config_f.peer_count = 2;
+  crabs_raft_config_t config_l = make_single_config(42, 0);
+  strncpy(config_l.node_id, "nodeL", CRABS_MAX_USER_ID - 1);
+  strncpy(config_l.peer_ids[0], "nodeL", CRABS_MAX_USER_ID - 1);
+  strncpy(config_l.peer_ids[1], "nodeF", CRABS_MAX_USER_ID - 1);
+  config_l.peer_count = 2;
+
+  crabs_raft_module_t* follower = crabs_raft_module_create(&config_f);
+  crabs_raft_module_t* leader = crabs_raft_module_create(&config_l);
+  ASSERT_NE(follower, nullptr);
+  ASSERT_NE(leader, nullptr);
+
+  // Leader: elected, §8 no-op appended, header batch durable; the first
+  // AppendEntries (with the no-op) reaches the follower, whose ack feeds
+  // back through the same wire helpers.
+  // Mini two-node wire: tick, settle each node's persist windows, and
+  // shuttle every queued message across (until the leader wins over the
+  // follower's grants). Carry item A rides along: every vote hop is durably
+  // gated by its own header batch.
+  uint64_t now_ms = 0;
+  crabs_raft_persist_request_t persist;
+  crabs_raft_outbound_message_t outbound;
+  for (int settle_round = 0; settle_round < 1000 &&
+                            !crabs_raft_module_is_leader(leader); settle_round++) {
+    now_ms += 100;
+    EXPECT_EQ(crabs_raft_module_tick(leader, now_ms), CRABS_SUCCESS);
+    for (int window_round = 0; window_round < 4; window_round++) {
+      crabs_raft_persist_request_t leader_persist;
+      if (crabs_raft_module_poll_persist(leader, &leader_persist)) {
+        EXPECT_EQ(crabs_raft_module_persist_complete(leader, leader_persist.handle,
+                                                     true), CRABS_SUCCESS);
+      }
+    }
+    for (int shuttle = 0; shuttle < 8; shuttle++) {
+      while (crabs_raft_module_poll_outbound(leader, &outbound)) {
+        crabs_raft_module_inbound(follower, "nodeL", outbound.bytes, outbound.len,
+                                  now_ms);
+        free((void*)outbound.bytes);
+        while (crabs_raft_module_poll_persist(follower, &persist)) {
+          EXPECT_EQ(crabs_raft_module_persist_complete(follower, persist.handle,
+                                                       true), CRABS_SUCCESS);
+        }
+        while (crabs_raft_module_poll_outbound(follower, &outbound)) {
+          crabs_raft_module_inbound(leader, "nodeF", outbound.bytes,
+                                    outbound.len, now_ms);
+          free((void*)outbound.bytes);
+        }
+      }
+      while (crabs_raft_module_poll_outbound(follower, &outbound)) {
+        crabs_raft_module_inbound(leader, "nodeF", outbound.bytes, outbound.len,
+                                  now_ms);
+        free((void*)outbound.bytes);
+        while (crabs_raft_module_poll_persist(leader, &persist)) {
+          EXPECT_EQ(crabs_raft_module_persist_complete(leader, persist.handle,
+                                                       true), CRABS_SUCCESS);
+        }
+      }
+    }
+  }
+  ASSERT_TRUE(crabs_raft_module_is_leader(leader));
+  ASSERT_TRUE(crabs_raft_module_poll_persist(leader, &persist));
+  EXPECT_EQ(crabs_raft_module_persist_complete(leader, persist.handle, true),
+            CRABS_SUCCESS);
+  // Feed every queued leader Append to the follower (and its ack back).
+  while (crabs_raft_module_poll_outbound(leader, &outbound)) {
+    EXPECT_EQ(outbound.kind, RAFT_MSG_APPEND_REQ);
+    EXPECT_EQ(crabs_raft_module_inbound(follower, "nodeL", outbound.bytes,
+                                        outbound.len, now_ms), CRABS_SUCCESS);
+    free((void*)outbound.bytes);
+    crabs_raft_persist_request_t follower_persist;
+    ASSERT_TRUE(crabs_raft_module_poll_persist(follower, &follower_persist));
+    EXPECT_EQ(crabs_raft_module_persist_complete(follower, follower_persist.handle,
+                                                 true), CRABS_SUCCESS);
+    while (crabs_raft_module_poll_outbound(follower, &outbound)) {
+      EXPECT_EQ(outbound.kind, RAFT_MSG_APPEND_RESP);
+      crabs_raft_module_inbound(leader, "nodeF", outbound.bytes, outbound.len,
+                                now_ms);
+      free((void*)outbound.bytes);
+    }
+  }
+  EXPECT_EQ(crabs_raft_module_log_length(follower), 1u);   // the no-op tail
+
+  // Follower caught up: a fresh leader tick emits the EMPTY-range heartbeat.
+  now_ms += CRABS_RAFT_HEARTBEAT_INTERVAL_MS;
+  EXPECT_EQ(crabs_raft_module_tick(leader, now_ms), CRABS_SUCCESS);
+  {
+    crabs_raft_persist_request_t heartbeat_persist;
+    while (crabs_raft_module_poll_persist(leader, &heartbeat_persist)) {
+      EXPECT_EQ(crabs_raft_module_persist_complete(leader, heartbeat_persist.handle,
+                                                   true), CRABS_SUCCESS);
+    }
+  }
+  bool heartbeat_seen = false;
+  while (crabs_raft_module_poll_outbound(leader, &outbound)) {
+    if (outbound.kind != RAFT_MSG_APPEND_REQ) {
+      free((void*)outbound.bytes);
+      continue;
+    }
+    // Entry count at the fixed wire offset (header 11 + leader string16
+    // 2+5 + prev_term 8 + prev_index 8 + commit 8 = byte 42): 0 == empty.
+    uint32_t entry_count = (uint32_t)outbound.bytes[42] |
+                           ((uint32_t)outbound.bytes[43] << 8) |
+                           ((uint32_t)outbound.bytes[44] << 16) |
+                           ((uint32_t)outbound.bytes[45] << 24);
+    if (outbound.len == 46) {
+      heartbeat_seen = true;
+      EXPECT_EQ(entry_count, 0u);
+      EXPECT_EQ(crabs_raft_module_inbound(follower, "nodeL", outbound.bytes,
+                                          outbound.len, now_ms), CRABS_SUCCESS);
+      free((void*)outbound.bytes);
+      ASSERT_TRUE(crabs_raft_module_poll_outbound(follower, &outbound));
+      EXPECT_EQ(outbound.kind, RAFT_MSG_APPEND_RESP);
+      EXPECT_EQ(outbound.bytes[11], 1);   // success
+      uint64_t match_index = 0;
+      for (int byte_index = 0; byte_index < 8; byte_index++) {
+        match_index |=
+            ((uint64_t)outbound.bytes[12 + byte_index]) << (byte_index * 8);
+      }
+      EXPECT_EQ(match_index, 1u);   // the leader's tail, adopted
+      free((void*)outbound.bytes);
+    } else {
+      free((void*)outbound.bytes);
+    }
+  }
+  EXPECT_TRUE(heartbeat_seen);
+  EXPECT_EQ(crabs_raft_module_rejected_message_count(follower), 0u);
+
+  crabs_raft_module_destroy(follower);
+  crabs_raft_module_destroy(leader);
+}
+
+// ============================================================
+// Log compaction decision (Phase 3): the bounded log REACHES the cap and
+// refuses beyond it, loudly; the module stays healthy and the full log
+// round-trips the v17 section and the persist recovery.
+// ============================================================
+TEST(RaftLogBound, ReachesCapAndRefusesBeyond) {
+  crabs_raft_config_t config = make_single_config(42, 3);
+  crabs_raft_module_t* module = crabs_raft_module_create(&config);
+  ASSERT_NE(module, nullptr);
+  uint64_t now_ms = 0;
+  drive_to_leader(module, &now_ms);
+  // The §8 no-op occupies index 1 (its window is open; the fill below
+  // shares the single window until the host acks).
+  crabs_raft_persist_request_t persist_window;
+  ASSERT_TRUE(crabs_raft_module_poll_persist(module, &persist_window));
+  EXPECT_EQ(crabs_raft_module_persist_complete(module, persist_window.handle,
+                                               true), CRABS_SUCCESS);
+
+  // Stress: fill the log TO the cap with small ops (the per-op wire stays
+  // tiny; the bound is on ENTRY COUNT).
+  const char* payload = "x";
+  for (uint64_t entry_index = 2; entry_index <= CRABS_RAFT_MAX_LOG_ENTRIES;
+       entry_index++) {
+    operation_t* op = make_signed_op("mint", "admin", (const uint8_t*)payload,
+                                     (uint32_t)strlen(payload));
+    ASSERT_NE(op, nullptr);
+    uint64_t proposal_id = 0;
+    crabs_error_e rc = crabs_raft_module_propose(module, op, &proposal_id);
+    operation_destroy(op);
+    ASSERT_EQ(rc, CRABS_SUCCESS);
+    ASSERT_EQ(proposal_id, entry_index);
+  }
+  EXPECT_EQ(crabs_raft_module_log_length(module), CRABS_RAFT_MAX_LOG_ENTRIES);
+
+  // Evidence for the growth model: the retained wire bytes (the host's
+  // planning number at the bound is cap * (entry + wire) worst case; the
+  // tiny-op reality here is printed for the record).
+  crabs_raft_module_state_t* export_state = crabs_raft_module_export_state(module);
+  ASSERT_NE(export_state, nullptr);
+  size_t total_wire = 0;
+  uint32_t count_entries = 0;
+  for (const crabs_raft_entry_persisted_t* entry = export_state->log;
+       entry != NULL; entry = entry->next) {
+    total_wire += entry->wire_len;
+    count_entries++;
+  }
+  printf("bound evidence: %u entries, %zu op-wire bytes retained "
+         "(worst-case planning bound: %d * %d = %d bytes)\n",
+         count_entries, total_wire, CRABS_RAFT_MAX_LOG_ENTRIES,
+         CRABS_RAFT_MAX_OP_WIRE_BYTES,
+         CRABS_RAFT_MAX_LOG_ENTRIES * CRABS_RAFT_MAX_OP_WIRE_BYTES);
+  EXPECT_EQ(count_entries, CRABS_RAFT_MAX_LOG_ENTRIES);
+  EXPECT_LE(total_wire, (size_t)CRABS_RAFT_MAX_LOG_ENTRIES *
+                            CRABS_RAFT_MAX_OP_WIRE_BYTES);
+
+  // AT the bound: another proposal REFUSES, loudly (notification), leaving
+  // the log and the committed prefix intact.
+  operation_t* over = make_signed_op("mint", "admin", (const uint8_t*)"y", 1);
+  ASSERT_NE(over, nullptr);
+  uint64_t refused_id = 7;
+  EXPECT_EQ(crabs_raft_module_propose(module, over, &refused_id),
+            CRABS_ERR_INTERNAL);
+  operation_destroy(over);
+  EXPECT_EQ(refused_id, 0u);
+  EXPECT_EQ(crabs_raft_module_log_length(module), CRABS_RAFT_MAX_LOG_ENTRIES);
+  crabs_raft_notification_t notification;
+  bool saw_log_full = false;
+  while (crabs_raft_module_poll_notification(module, &notification)) {
+    if (notification.kind == RAFT_NOTIFY_LOG_FULL) saw_log_full = true;
+  }
+  EXPECT_TRUE(saw_log_full);
+
+  // Restart at the bound: import the full section; the module stays
+  // bounded and healthy (still refuses, still has its committed prefix).
+  crabs_raft_module_state_t* carried = crabs_raft_module_export_state(module);
+  ASSERT_NE(carried, nullptr);
+  EXPECT_EQ(carried->log_count, CRABS_RAFT_MAX_LOG_ENTRIES);
+  crabs_raft_module_t* revived = crabs_raft_module_create(&config);
+  ASSERT_NE(revived, nullptr);
+  EXPECT_EQ(crabs_raft_module_import_state(revived, carried), CRABS_SUCCESS);
+  crabs_raft_module_state_destroy(carried);
+  EXPECT_EQ(crabs_raft_module_log_length(revived), CRABS_RAFT_MAX_LOG_ENTRIES);
+  drive_to_leader(revived, &now_ms);
+  operation_t* over2 = make_signed_op("mint", "admin", (const uint8_t*)"z", 1);
+  ASSERT_NE(over2, nullptr);
+  uint64_t refused_id2 = 7;
+  EXPECT_EQ(crabs_raft_module_propose(revived, over2, &refused_id2),
+            CRABS_ERR_INTERNAL);
+  operation_destroy(over2);
+
+  crabs_raft_module_state_destroy(export_state);
+  crabs_raft_module_destroy(module);
+  crabs_raft_module_destroy(revived);
 }

@@ -3513,7 +3513,7 @@ TEST(StateSerialize, V14ItemDomainRoundTrip) {
 
   serialized_buffer_t* buf = crabs_serialize_state(original);
   ASSERT_NE(buf, nullptr);
-  ASSERT_EQ((uint32_t)CRABS_SERIAL_VERSION, 16u);   // v16: Raft module section appended
+  ASSERT_EQ((uint32_t)CRABS_SERIAL_VERSION, 17u);   // v17: no-op entries + retry-shelf tail
 
   state_t* restored = crabs_deserialize_state(buf->data, buf->len);
   ASSERT_NE(restored, nullptr);

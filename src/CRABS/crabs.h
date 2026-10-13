@@ -129,7 +129,9 @@ typedef enum {
   CRABS_ERR_QUARANTINED      = 0xA005,  // writer present in the item's fork-evidence set
   // Raft ordering module (raft-ordering plan, Phase 1)
   CRABS_ERR_ORDERING_PENDING = 0xA006,  // accepted by the ordering module, NOT executed — pending commit
-  CRABS_ERR_ORDERING_NOT_LEADER = 0xA007 // ordering module refused the proposal: this node is not the leader
+  CRABS_ERR_ORDERING_NOT_LEADER = 0xA007, // ordering module refused the proposal: this node is not the leader
+  // Raft ordering module joint consensus (raft-ordering plan, Phase 3):
+  CRABS_ERR_ORDERING_CHANGE_IN_FLIGHT = 0xA008 // one membership change at a time (Raft §6)
 } crabs_error_e;
 
 // ============================================================
