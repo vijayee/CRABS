@@ -1659,6 +1659,11 @@ class Node {
       throw new Error('abeDecrypt: expected the ABE container encrypt() returned');
     }
     const M = this._M;
+    // Refuse sub-minimum containers BEFORE any DataView read — getUint16 on
+    // a shorter view would throw a raw RangeError instead of this typed one.
+    if (encrypted.length < 2 + 4) {
+      throw new Error('abeDecrypt: malformed container (truncated header)');
+    }
     const view = new DataView(encrypted.buffer, encrypted.byteOffset,
                               encrypted.byteLength);
     const policyByteLen = view.getUint16(0, true);

@@ -241,11 +241,12 @@ refusals, readback, decrypt — is executable from this binding.
 
 ### crabs-node (native Node.js)
 
-The same flow — this binding maps `keyVersion` and `status` directly, so
-the revocation is observable as a `1 -> 2 -> 3` bump plus the terminal
-`revoked` status, and it streams as an `attribute`-kind change event (the
-wasm binding shows the same readback since the real-`getUser` mapping —
-recipe-level parity; see the RESIDUAL SCOPE note for what is left).
+The same flow — this binding maps `keyVersion` and `status` directly from
+the machine, so the revocation is observable as a `1 -> 2 -> 3` bump plus
+the terminal `revoked` status, and it streams as an `attribute`-kind change
+event. (The wasm binding maps the same readback too — the recipe-level
+parity the RESIDUAL SCOPE note above records; what remains wasm/node-odd
+is only in the C-only keyring lifecycle, not the readback.)
 
 ```snippet:node/16-revocable-data.js
 ```
