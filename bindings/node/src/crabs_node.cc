@@ -1991,8 +1991,8 @@ private:
   Napi::Value SetScheduleOccurrenceBudget(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
     if (info.Length() < 1 || !info[0].IsNumber())
-      throw Napi::RangeError::New(env,
-          "setScheduleOccurrenceBudget: maxPerTick must be an integer 0..2^32-1");
+      throw Napi::TypeError::New(env,
+          "setScheduleOccurrenceBudget: maxPerTick must be a number");
     const double max_per_tick = info[0].As<Napi::Number>().DoubleValue();
     if (max_per_tick < 0 || max_per_tick > (double)UINT32_MAX ||
         max_per_tick != floor(max_per_tick))
