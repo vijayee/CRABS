@@ -228,6 +228,17 @@ function createRaftHost(node, options = {}) {
     raftPollOutbound() { return node.raftPollOutbound(); },
     raftPollPersistRequest() { return node.raftPollPersistRequest(); },
     raftPersistComplete(handle, ok) { node.raftPersistComplete(handle, ok); },
+
+    // Crash recovery: replay one stored persist batch into the module's
+    // durable state — the host's persist-batch record is the durable raft
+    // history that survives a module/host restart whose machine blob is
+    // stale (restored from a pre-commit snapshot). Batches replay in
+    // arrival order; corrupt/contradictory batches fail closed (throws).
+    raftRecoverFromPersist(batch) {
+      if (this._destroyed) throw new Error('RaftHost destroyed');
+      const rc = node.raftRecoverFromPersist(toBuffer(batch));
+      if (rc !== 0) throw raftError(rc, 'raftRecoverFromPersist');
+    },
     raftPollNotifications() { return node.raftPollNotifications(); },
     raftPump(nowMs) { return node.raftPump(nowMs === undefined ? Date.now() : nowMs); },
 

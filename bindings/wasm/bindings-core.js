@@ -1956,6 +1956,23 @@ class RaftHost {
            'raftPersistComplete');
   }
 
+  // Crash recovery: replay one stored persist batch into the module's
+  // durable state — the host's persist-batch record (crabs_wasm_raft_poll_persist_request
+  // bytes kept by the storage seam) is the durable raft history that
+  // survives a module/host restart whose machine blob is stale (restored
+  // from a pre-commit snapshot: empty election record, empty log). Batches
+  // replay in arrival order; corrupt or contradictory batches fail closed
+  // (crabsError — the C contract in Raft/raft_module.c).
+  raftRecoverFromPersist(batch) {
+    if (this._destroyed) throw new Error('RaftHost destroyed');
+    const bytes = batch instanceof Uint8Array ? batch : new Uint8Array(batch);
+    const { ptr, len } = writeBytes(this._M, bytes);
+    const rc = this._M._crabs_wasm_raft_recover_from_persist(
+      this._modulePtr, ptr, len);
+    freeAll(this._M, ptr);
+    wrapRc(rc, 'raftRecoverFromPersist');
+  }
+
   // Raw notification drain — NOT for state-attached reference hosts (use
   // raftPump; the pump consumes this queue itself and double-draining here
   // would silently drop committed ops). Returns

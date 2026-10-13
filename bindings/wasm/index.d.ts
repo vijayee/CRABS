@@ -298,6 +298,14 @@ export interface RaftHost {
   /** Acknowledge a window from raftPollPersistRequest. */
   raftPersistComplete(handle: bigint, ok: boolean): void;
   /**
+   * Crash recovery: replay one stored persist batch into the module's
+   * durable state — the host's batch record (the storage seam's kept
+   * persist bytes) is the durable raft history that survives a module/host
+   * restart whose machine blob is stale. Batches replay in arrival order;
+   * corrupt or contradictory batches fail closed (crabsError).
+   */
+  raftRecoverFromPersist(batch: Uint8Array): void;
+  /**
    * Raw notification drain — for hosts driving the module WITHOUT the
    * state pipeline ONLY. State-attached hosts use raftPump (the pump
    * consumes this queue itself; double-draining drops committed ops).

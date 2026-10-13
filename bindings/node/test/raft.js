@@ -31,6 +31,7 @@ async function main() {
   const nodes = [];
   const hosts = [];
   const hostById = {};
+  const storageById = {};   // crash-recovery leg replays these batches
   const aliceKey = KeyPair.generate();
 
   let nodeIndex = 0;
@@ -60,6 +61,7 @@ async function main() {
     hostById[adminId] = host;
 
     const storage = new Map();
+    storageById[adminId] = storage;
     host.setRaftStorage(async (handle, blob) => { storage.set(Number(handle), blob); });
     // Full-mesh async in-memory transport; `partitioned` isolates one node.
     host.setRaftTransport((to, blob) => {
@@ -195,6 +197,89 @@ async function main() {
     (entry) => Buffer.compare(Buffer.from(entry.opBytes), op2.serialize()) === 0),
     'the healed node must receive the second decree only after the heal');
   console.log('    heal: nodeC converged');
+
+  // ---- Crash recovery: module state lost, batch storage retained — the
+  // smaller raw-mode mirror of the wasm suite's recovery leg. nodeB loses
+  // its module state (a fresh machine: no raft term/log — the stale machine
+  // blob's shape) while ITS persist-batch record survives in the storage
+  // capture. The host re-drives the retained batches into a fresh module
+  // via raftRecoverFromPersist; the next group write then lands as the same
+  // byte-identical committed-op wire. ----
+  {
+    const crashedId = 'nodeB';
+    const crashedIndex = NODE_IDS.indexOf(crashedId);
+    const retainedBatches = [...storageById[crashedId].values()];
+    assert.ok(retainedBatches.length > 0,
+      'the storage capture must hold the crash-recovery batches');
+    hosts[crashedIndex].destroy();
+    assert.strictEqual(nodes[crashedIndex].raftStatus(), null,
+      'the crashed module detaches before recovery');
+
+    // Fresh machine, same roster/policy/item registration — the shape of a
+    // restored pre-commit machine blob (module term/log empty).
+    const recoveredNode = new Node(crashedId, { ordering: 'hlc' });
+    recoveredNode.registerUser('alice', aliceKey.publicKeyHex(), '');
+    recoveredNode.grantRole('alice', 'role', 'member', crashedId);
+    recoveredNode.setPolicy(OP_TYPE, 'role:member');
+    recoveredNode.defineItem(ITEM, 'register', 'lww_reg',
+      { domain: 'group', orderingModule: 0 });
+    const recoveredHost = createRaftHost(recoveredNode, {
+      peers: NODE_IDS,
+      timers: { electionMinMs: 80, electionMaxMs: 160, heartbeatMs: 50 },
+      tickMs: 20,
+      seed: 313,   // fresh seed — the old one is retired with the module
+      pumpNotifications: false,
+    });
+    hosts[crashedIndex] = recoveredHost;
+    hostById[crashedId] = recoveredHost;
+    nodes[crashedIndex] = recoveredNode;
+    // Fail-closed surface: a corrupted batch (bad version byte) throws and
+    // invents no durable state.
+    const corruptBatch = Buffer.from(retainedBatches[0]);
+    corruptBatch[0] = 0xEE;
+    assert.throws(() => recoveredHost.raftRecoverFromPersist(corruptBatch),
+      /raftRecoverFromPersist/,
+      'a corrupted batch must fail closed');
+    // Replay the retained batches in arrival order.
+    for (const batch of retainedBatches) {
+      recoveredHost.raftRecoverFromPersist(batch);
+    }
+    recoveredHost.setRaftStorage(async (handle, blob) => {
+      storageById[crashedId].set(Number(handle), blob);
+    });
+    recoveredHost.setRaftTransport((to, blob) => {
+      if (global.__partitioned &&
+          (crashedId === global.__partitioned) !== (to === global.__partitioned)) {
+        return;
+      }
+      setTimeout(() => hostById[to].pumpInbound(crashedId, blob), 0);
+    });
+    recoveredHost.startRaftHost();
+    console.log(`    recovery: nodeB module rebuilt from ` +
+      `${retainedBatches.length} stored batches`);
+  }
+
+  // ---- Resume committing: the next decree lands on the recovered node. ----
+  await waitFor(
+    () => hosts.filter((host) => host.status().isLeader).length === 1,
+    'the cluster to settle one leader after the recovery');
+  const resumeIndex = hosts.findIndex((host) => host.status().isLeader);
+  const op3 = new Operation(OP_TYPE);
+  op3.signerId = 'alice';
+  op3.addResource(ITEM);
+  nodes[resumeIndex].sign(op3, aliceKey);
+  const op3Wire = op3.serialize();
+  nodes[resumeIndex].execute(op3);
+  await waitFor(() =>
+    hosts[NODE_IDS.indexOf('nodeB')].raftPollNotifications().some(
+      (entry) => entry.kind === RAFT_NOTIFY_COMMITTED_OP && entry.opBytes &&
+                 Buffer.compare(Buffer.from(entry.opBytes), op3Wire) === 0),
+    'the recovered node to surface the post-recovery committed op');
+  await waitFor(() => {
+    const tips = new Set(hosts.map((host) => host.status().commitTip));
+    return tips.size === 1;
+  }, 'the recovered cluster to converge on one commit tip');
+  console.log('    recovery: nodeB resumed committing (byte-identical committed op)');
 
   // ---- Diagnostics surface sanity. ----
   for (const host of hosts) {

@@ -10,6 +10,10 @@
 //     commit → materialized on ALL THREE nodes (change events fire too).
 //   • partition one node: group writes halt THERE while the surviving
 //     quorum still proposes/commits; heal → the partitioned node converges.
+//   • crash-recovery: nodeB loses its module state (machine blob reverted
+//     to the pre-commit shape) while its stored persist batches survive —
+//     the host replays them through raftRecoverFromPersist and the node
+//     restores its committed content and resumes committing.
 //
 // This is also the executable documentation of the reference-host seams:
 // transport / storage / timer are user-replaceable (WebSocket/relay,
@@ -93,7 +97,13 @@ async function main() {
             (from.adminId === partitioned) !== (to === partitioned)) {
           return;                                   // dropped in transit
         }
-        setTimeout(() => nodesById[to].raftDeliver(from.adminId, blob), 0);
+        setTimeout(() => {
+          const target = nodesById[to];
+          // A module torn down mid-flight drops the blob (a real transport
+          // delivering to a dead node loses the message too).
+          if (target.raftStatus() === null) return;
+          target.raftDeliver(from.adminId, blob);
+        }, 0);
       });
     }
   }
@@ -226,6 +236,98 @@ async function main() {
                        'persist window must be a re-reported view');
     leaderHost.raftPersistComplete(window.handle, true);
   }
+
+  // ---- Crash recovery: module state lost, batch storage retained. ----
+  // nodeB loses its module state (its machine blob reverts to the stale
+  // pre-commit shape) while ITS persist-batch record survives in the
+  // in-memory storage capture — the host's durable raft history. The host
+  // re-drives the retained batches into a fresh module via
+  // raftRecoverFromPersist and the node resumes committing.
+  {
+    const crashedId = 'nodeB';
+    const crashedIndex = nodes.findIndex(
+      (entry) => entry.adminId === crashedId);
+    const retainedBatches = [...hostStorage[crashedId].values()];
+    assert.ok(retainedBatches.length > 0,
+              'the storage capture must hold the crash-recovery batches');
+    hosts[crashedId].destroy();
+    assert.strictEqual(nodes[crashedIndex].raftStatus(), null,
+                       'the crashed module detaches before recovery');
+
+    // Fresh machine, same roster/handler/item registration — the shape of
+    // a restored pre-commit machine blob (module term/log empty).
+    const recoveredNode = await Node.create(crashedId);
+    recoveredNode.registerUser('alice', aliceKey.publicKeyHex(), '');
+    recoveredNode.grantRole('alice', 'role', 'member', crashedId);
+    recoveredNode.registerHandlerJs(OP_TYPE, (state, op) => {
+      state.setRegisterBytes(ITEM, encoder.encode(op.payload), 'alice');
+      return 0;
+    });
+    recoveredNode.setPolicy(OP_TYPE, 'role:member');
+    recoveredNode.defineItem(ITEM, 'register', 'lww_reg', { domain: 'group' });
+    const recoveredHost = recoveredNode.attachRaft({
+      peers: NODE_IDS,
+      timers: { electionMinMs: 80, electionMaxMs: 160, heartbeatMs: 50 },
+      seed: 313,   // fresh seed — the old one is retired with the module
+    });
+    recoveredHost.setRaftStorage(async (handle, blob) => {
+      hostStorage[crashedId].set(Number(handle), blob);
+    });
+    hosts[crashedId] = recoveredHost;
+    nodes[crashedIndex] = recoveredNode;
+    nodesById[crashedId] = recoveredNode;
+    wireTransport();   // re-wire: the replacement host needs the seam too
+
+    // Fail-closed surface: a corrupted batch (bad version byte) is
+    // refused — replay never invents durable state from garbage.
+    const corrupt = Uint8Array.from(retainedBatches[0]);
+    corrupt[0] = 0xEE;
+    assert.throws(() => recoveredHost.raftRecoverFromPersist(corrupt),
+                  /raftRecoverFromPersist/,
+                  'a corrupted batch must fail closed');
+
+    // Replay the retained batches in arrival order.
+    for (const batch of retainedBatches) {
+      recoveredHost.raftRecoverFromPersist(batch);
+    }
+    recoveredHost.startRaftHost();
+    console.log(`    recovery: nodeB module rebuilt from ` +
+                `${retainedBatches.length} stored batches`);
+
+    // The rejoin re-learns the committed prefix: nodeB's LAST pre-crash
+    // content (decree-9; the register is LWW so later commits overwrite
+    // earlier ones) materializes on the stale machine blob's register.
+    await waitFor(() =>
+      registerContains(recoveredNode, ITEM, 'decree-9'),
+      'the recovered node to restore its pre-crash committed content');
+  }
+
+  // ---- Resume committing: the recovered node re-learns its committed
+  // prefix as the live quorum advances, restoring its pre-crash
+  // materialized content AND taking the next decree. ----
+  await waitFor(() =>
+    nodes.filter((entry) => entry.raftStatus().isLeader).length === 1,
+    'the cluster to settle one leader after the recovery');
+  const resumeLeader = nodes.find((entry) => entry.raftStatus().isLeader);
+  const op3 = await Operation.create(OP_TYPE);
+  op3.signerId = 'alice';
+  op3.payload = 'decree-11\x00';
+  op3.addResource(ITEM);
+  resumeLeader.sign(op3, aliceKey);
+  resumeLeader.execute(op3);
+  await waitFor(() => {
+    const recovered = nodes.find((entry) => entry.adminId === 'nodeB');
+    return registerContains(recovered, ITEM, 'decree-11');
+  }, 'the recovered node to commit the next decree', 30000);
+  assert.ok(registerContains(nodesById['nodeB'], ITEM, 'decree-11'),
+            'the recovered node carries the next decree');
+  // The whole cluster settles on ONE shared tip: the recovered node is a
+  // full voting member again, not a catching-up straggler.
+  await waitFor(() =>
+    new Set(nodes.map((entry) => entry.raftStatus().commitTip)).size === 1,
+    'the recovered cluster to converge on one commit tip', 30000);
+  console.log(`    recovery: nodeB resumed committing (tip ` +
+              `${nodesById['nodeB'].raftStatus().commitTip})`);
 
   // ---- Host teardown: stop cleanly (destroy detaches + destroys modules).
   for (const node of nodes) {

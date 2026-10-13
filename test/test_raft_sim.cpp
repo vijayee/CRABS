@@ -24,6 +24,7 @@
 #include <cstdio>
 #include <cstring>
 #include <deque>
+#include <openssl/sha.h>
 #include <string>
 #include <vector>
 
@@ -2013,6 +2014,99 @@ TEST(RaftSimShelf, RestartCarriesTheShelfAndResumesOrdering) {
   ecdsa_keypair_t* surviving_key = nullptr;   // fixture key was consumed above
   (void)surviving_key;
   (void)surviving_key;
+}
+
+// Attach-on-old-state: a PRE-16 (v15-shaped) state blob carries no raft
+// module section at all (the module machinery postdates the wire format it
+// was saved with). The missing recovery-family scenario: loading such a
+// blob (the deserialize gate leaves the module snapshot NULL), attaching a
+// fresh module, and committing a group write through it — the old state is
+// a first-class attach base, not only same-version restarts. Construct by
+// downgrading an honest module-less v17 blob to the v15 shape: strip the
+// single 0x00 module-flag byte (the whole module section for a module-less
+// blob), stamp the version, and re-fix the hash-chain digest.
+TEST(RaftSimHarness, AttachOnPreModuleStateCommitsGroupWrites) {
+  sim_single_fixture_t fixture;
+  // Module-less init (the attach happens post-load): every sim_single_*
+  // member except the module object.
+  fixture.keypair = crypto_ecdsa_generate();
+  fixture.state = state_create();
+  sim_setup_council_state(fixture.state);
+  fixture.attr_machine = attribute_machine_create(
+      "admin", fixture.keypair->public_key);
+  fixture.state->attr_machine = fixture.attr_machine;
+  fixture.module = nullptr;
+
+  serialized_buffer_t* blob = crabs_serialize_state(fixture.state);
+  ASSERT_NE(blob, nullptr);
+  // The module section of a module-less blob is exactly one 0x00 flag byte
+  // before the checksum (asserted in test_serialization's v15→13 downgrade;
+  // re-asserted here before surgery).
+  size_t module_flag_offset = blob->len - CRABS_HASH_SIZE - 1;
+  ASSERT_EQ(blob->data[module_flag_offset], 0x00);
+  memmove(blob->data + module_flag_offset,
+          blob->data + module_flag_offset + 1,
+          blob->len - module_flag_offset - 1);
+  blob->len -= 1;
+  blob->data[4] = 15;   // pre-16 wire version
+  uint8_t recomputed_hash[CRABS_HASH_SIZE];
+  SHA256(blob->data, blob->len - CRABS_HASH_SIZE, recomputed_hash);
+  memcpy(blob->data + blob->len - CRABS_HASH_SIZE, recomputed_hash,
+         CRABS_HASH_SIZE);
+
+  state_t* loaded = crabs_deserialize_state(blob->data, blob->len);
+  serialized_buffer_destroy(blob);
+  ASSERT_NE(loaded, nullptr);
+  ASSERT_EQ(loaded->raft_module_state, nullptr)
+      << "a pre-16 blob carries no module snapshot";
+  ASSERT_NE(state_find_item(loaded, "council"), nullptr)
+      << "the group item rides the v15 domain tail";
+
+  // Attach a fresh module to the old-shape state and commit a group write
+  // through the ordinary two-phase path.
+  crabs_raft_config_t config;
+  crabs_raft_config_defaults(&config);
+  config.seed = 99;
+  crabs_raft_module_t* revived = crabs_raft_module_create(&config);
+  ASSERT_NE(revived, nullptr);
+  ASSERT_EQ(state_attach_raft_module(loaded, revived), CRABS_SUCCESS);
+  // Signing a NEW op on the loaded state needs the fixture's authority back
+  // (the deserialize leaves the attr-machine back-pointer unset).
+  loaded->attr_machine = fixture.attr_machine;
+  uint64_t deadline = crabs_raft_module_next_election_deadline(revived);
+  EXPECT_EQ(crabs_raft_module_tick(revived, deadline), CRABS_SUCCESS);
+  EXPECT_TRUE(crabs_raft_module_is_leader(revived));
+
+  operation_t* op = sim_build_write_op(loaded, fixture.keypair, "council_write",
+                                       "council", "old-state-decree", false);
+  ASSERT_NE(op, nullptr);
+  EXPECT_EQ(state_machine_execute(loaded, op), CRABS_ERR_ORDERING_PENDING);
+  operation_destroy(op);
+  crabs_raft_persist_request_t persist;
+  ASSERT_TRUE(crabs_raft_module_poll_persist(revived, &persist));
+  EXPECT_EQ(crabs_raft_module_persist_complete(revived, persist.handle, true),
+            CRABS_SUCCESS);
+  ASSERT_TRUE(crabs_raft_module_poll_persist(revived, &persist));
+  EXPECT_EQ(crabs_raft_module_persist_complete(revived, persist.handle, true),
+            CRABS_SUCCESS);
+  // The materialization pipeline needs its handler re-registered on the
+  // loaded state (handlers are runtime-registry, not serialized).
+  ASSERT_EQ(state_machine_register_handler(loaded, "council_write",
+                                           sim_handler_council_write),
+            CRABS_SUCCESS);
+  EXPECT_EQ(state_raft_process_notifications(loaded), CRABS_SUCCESS);
+  const lww_register_t* committed = sim_council_register(loaded);
+  ASSERT_NE(committed, nullptr);
+  EXPECT_EQ(memcmp(committed->value, "old-state-decree", 16), 0);
+
+  state_attach_raft_module(loaded, nullptr);
+  crabs_raft_module_destroy(revived);
+  loaded->attr_machine = NULL;
+  state_destroy(loaded);
+  // Explicit teardown (sim_single_fixture_destroy assumes attached-module
+  // ownership this scenario never took on).
+  attribute_machine_destroy(fixture.attr_machine);
+  crypto_ecdsa_keypair_destroy(fixture.keypair);
 }
 
 // ============================================================

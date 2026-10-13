@@ -328,6 +328,13 @@ export interface Node {
   /** Acknowledge a persist window from raftPollPersistRequest. Returns the crabs_error_e. */
   raftPersistComplete(handle: bigint | number, ok: boolean): number;
   /**
+   * Crash recovery: replay one stored persist batch into the module's
+   * durable state — the host's batch record is the durable raft history
+   * that survives a module/host restart whose machine blob is stale.
+   * Corrupt/contradictory batches fail closed. Returns the crabs_error_e.
+   */
+  raftRecoverFromPersist(batch: Buffer): number;
+  /**
    * Materialize committed ops through the machine's pipeline (fires
    * 'change' events, shelves ordered retries). Returns the crabs_error_e.
    */
@@ -438,6 +445,8 @@ export function createRaftHost(node: Node, options?: {
   raftPollOutbound(): Array<{ kind: number; to: string; blob: Buffer }>;
   raftPollPersistRequest(): { handle: bigint; blob: Buffer } | undefined;
   raftPersistComplete(handle: bigint | number, ok: boolean): void;
+  /** Replay one stored persist batch (crash recovery); throws on refusal. */
+  raftRecoverFromPersist(batch: Buffer): void;
   raftPollNotifications(): Array<{ kind: number; peerId: string;
                                    proposalId: number; commitIndex: number;
                                    opBytes?: Buffer }>;

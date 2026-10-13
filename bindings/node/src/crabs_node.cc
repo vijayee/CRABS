@@ -849,6 +849,7 @@ public:
       InstanceMethod("raftTick", &Node::RaftTick),
       InstanceMethod("raftDeliver", &Node::RaftDeliver),
       InstanceMethod("raftPersistComplete", &Node::RaftPersistComplete),
+      InstanceMethod("raftRecoverFromPersist", &Node::RaftRecoverFromPersist),
       InstanceMethod("raftPump", &Node::RaftPump),
       InstanceMethod("raftPollOutbound", &Node::RaftPollOutbound),
       InstanceMethod("raftPollPersistRequest", &Node::RaftPollPersistRequest),
@@ -2103,6 +2104,24 @@ private:
         : (uint64_t)info[0].As<Napi::Number>().DoubleValue();
     crabs_error_e rc = crabs_raft_module_persist_complete(
         raft_module_, handle, info[1].As<Napi::Boolean>().Value());
+    return Napi::Number::New(env, (double)rc);
+  }
+
+  // Crash recovery: replay one stored persist batch into the module's
+  // durable state — the host's persist-batch record is the durable raft
+  // history that survives a module/host restart whose machine blob is
+  // stale (restored from a pre-commit snapshot). Corrupt/contradictory
+  // batches fail closed per the C contract (Raft/raft_module.c); the rc is
+  // returned and index.js surfaces it as a thrown error.
+  Napi::Value RaftRecoverFromPersist(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    ensure_raft_attached(env, "raftRecoverFromPersist");
+    if (info.Length() < 1 || !info[0].IsBuffer())
+      throw Napi::TypeError::New(env,
+        "raftRecoverFromPersist: stored batch must be a Buffer");
+    auto batch = info[0].As<Napi::Buffer<uint8_t>>();
+    crabs_error_e rc = crabs_raft_module_recover_from_persist(
+        raft_module_, batch.Data(), batch.Length());
     return Napi::Number::New(env, (double)rc);
   }
 
