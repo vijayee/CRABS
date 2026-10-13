@@ -1706,6 +1706,19 @@ static crabs_error_e sim_handler_always_failing(state_t* state, operation_t* op)
   return CRABS_ERR_INTERNAL;
 }
 
+// A DEAD time-source vtable (the HLC seam state_get_time_ms reads through):
+// every query reports no valid physical time — the clock-failure test seam.
+static crabs_physical_time_t sim_clock_fail_get_time(void* ctx) {
+  (void)ctx;
+  crabs_physical_time_t invalid = {0, 0, false};
+  return invalid;
+}
+
+static bool sim_clock_fail_available(void* ctx) {
+  (void)ctx;
+  return false;
+}
+
 TEST(RaftSimShelf, FailedMaterializationBlocksThenStreamResumesInOrder) {
   sim_single_fixture_t fixture;
   sim_single_fixture_init(&fixture);
@@ -1844,6 +1857,59 @@ TEST(RaftSimShelf, PoisonPillFailuresSurfaceNotificationsLoudly) {
   EXPECT_TRUE(state_raft_shelf_active(fixture.state));
   EXPECT_EQ(memcmp(sim_council_register(fixture.state)->value, "origin", 6), 0);
 
+  sim_single_fixture_destroy(&fixture);
+}
+
+TEST(RaftSimShelf, PumpRetriesEveryInvocationWhenClockFails) {
+  // The no-time pump bypasses the backoff gate ENTIRELY: a failed clock
+  // must not install `0 + backoff` deadlines that later `0 < deadline`
+  // comparisons silently block on forever. Every pump invocation retries
+  // the shelf head despite the failures; a healing clock and handler
+  // resume the normal gated behavior.
+  sim_single_fixture_t fixture;
+  sim_single_fixture_init(&fixture);
+  EXPECT_EQ(state_machine_register_handler(fixture.state, "council_write",
+                                           sim_handler_always_failing),
+            CRABS_SUCCESS);
+  uint64_t deadline = crabs_raft_module_next_election_deadline(fixture.module);
+  EXPECT_EQ(crabs_raft_module_tick(fixture.module, deadline), CRABS_SUCCESS);
+  operation_t* op = sim_signed_council_write(&fixture, "no-time-poison");
+  ASSERT_NE(op, nullptr);
+  EXPECT_EQ(state_machine_execute(fixture.state, op), CRABS_ERR_ORDERING_PENDING);
+  operation_destroy(op);
+  crabs_raft_persist_request_t persist;
+  while (crabs_raft_module_poll_persist(fixture.module, &persist)) {
+    EXPECT_EQ(crabs_raft_module_persist_complete(fixture.module, persist.handle,
+                                                 true), CRABS_SUCCESS);
+  }
+  EXPECT_EQ(state_raft_process_notifications(fixture.state), CRABS_ERR_INTERNAL);
+  EXPECT_TRUE(state_raft_shelf_active(fixture.state));
+
+  // FAIL the clock: a dead time-source vtable on the state's HLC seam makes
+  // state_get_time_ms fail closed (no authenticated time).
+  static crabs_time_source_ops_t dead_ops = {
+      sim_clock_fail_get_time, sim_clock_fail_available, NULL};
+  fixture.state->hlc_state.time_source_ops = &dead_ops;
+
+  for (uint32_t attempt = 1; attempt <= 4; attempt++) {
+    // (The committed path's own clock gate fails the retry loudly before
+    // the handler is reached — the error kind is not the point: the pump
+    // ATTEMPTED, instead of silently sitting on its backoff.)
+    EXPECT_NE(state_raft_process_notifications(fixture.state), CRABS_SUCCESS);
+    EXPECT_EQ(state_raft_shelf_attempt_count(fixture.state), attempt);
+  }
+  // The stream stayed blocked the whole time (order over availability).
+  EXPECT_TRUE(state_raft_shelf_active(fixture.state));
+  EXPECT_EQ(memcmp(sim_council_register(fixture.state)->value, "origin", 6), 0);
+
+  // Recovery when the clock (and the handler) come back: the trusted pump
+  // releases the shelf and drains in commit order.
+  EXPECT_EQ(state_machine_register_handler(fixture.state, "council_write",
+                                           sim_handler_council_write),
+            CRABS_SUCCESS);
+  fixture.state->hlc_state.time_source_ops = NULL;
+  EXPECT_EQ(state_raft_process_notifications(fixture.state), CRABS_SUCCESS);
+  EXPECT_FALSE(state_raft_shelf_active(fixture.state));
   sim_single_fixture_destroy(&fixture);
 }
 

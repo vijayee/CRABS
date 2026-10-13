@@ -1369,11 +1369,18 @@ static void _raft_shelf_release(state_t* state) {
 }
 
 // One retry/pump attempt at the shelf head. Returns the materialization
-// result; on success the shelf is released.
-static crabs_error_e _raft_shelf_attempt(state_t* state, uint64_t now_ms) {
+// result; on success the shelf is released. A clock-untrusted invocation
+// (the time source failed) never writes a backoff deadline — the caller
+// bypasses the gate below, so stamping `now_ms` garbage would poison the
+// gate against later trusted pumps too.
+static crabs_error_e _raft_shelf_attempt(state_t* state, uint64_t now_ms,
+                                         bool clock_trusted) {
   raft_retry_shelf_t* shelf = (raft_retry_shelf_t*)state->raft_retry_shelf;
   shelf->attempt_count++;
-  shelf->retry_not_before_ms = now_ms + _raft_shelf_backoff_ms(shelf->attempt_count);
+  if (clock_trusted) {
+    shelf->retry_not_before_ms =
+        now_ms + _raft_shelf_backoff_ms(shelf->attempt_count);
+  }
   operation_t* op = crabs_deserialize_operation(shelf->op_wire, shelf->op_len);
   crabs_error_e rc = CRABS_ERR_SERIALIZATION_ERROR;
   if (op != NULL) {
@@ -1399,8 +1406,13 @@ static crabs_error_e _raft_shelf_attempt(state_t* state, uint64_t now_ms) {
   return rc;
 }
 
-crabs_error_e state_raft_process_notifications_at(state_t* state,
-                                                  uint64_t now_ms) {
+// Shared pump body. clock_trusted distinguishes the two entry points: an
+// EXPLICIT `now_ms` (host clock) participates in the backoff gate; a failed
+// time source does not — every pump retries the shelf head despite the
+// failures (the no-time path runs without a backoff gate, as promised).
+static crabs_error_e _raft_pump_notifications_at(state_t* state,
+                                                 uint64_t now_ms,
+                                                 bool clock_trusted) {
   if (state == NULL || state->raft_module == NULL) return CRABS_ERR_INVALID_PARAM;
   crabs_raft_module_t* module = (crabs_raft_module_t*)state->raft_module;
   // 1. The shelf BLOCKS the stream: while its head is failing (or its
@@ -1408,11 +1420,12 @@ crabs_error_e state_raft_process_notifications_at(state_t* state,
   //    preservation beats availability — a skip would fold newer group-item
   //    content before the failed op carried older state.
   while (state->raft_retry_shelf != NULL) {
-    if (now_ms < ((const raft_retry_shelf_t*)state->raft_retry_shelf)
+    if (clock_trusted &&
+        now_ms < ((const raft_retry_shelf_t*)state->raft_retry_shelf)
                      ->retry_not_before_ms) {
       return CRABS_SUCCESS;   // backoff window: try again on a later pump
     }
-    crabs_error_e shelf_rc = _raft_shelf_attempt(state, now_ms);
+    crabs_error_e shelf_rc = _raft_shelf_attempt(state, now_ms, clock_trusted);
     if (state->raft_retry_shelf != NULL) {
       // Still blocked (the retry failed): nothing newer may attempt.
       return shelf_rc;
@@ -1453,12 +1466,21 @@ crabs_error_e state_raft_process_notifications_at(state_t* state,
     memcpy(shelf->op_wire, notification.op_bytes, notification.op_len);
     shelf->op_len = notification.op_len;
     shelf->attempt_count = 0;
-    shelf->retry_not_before_ms = now_ms;   // first retry: the next pump call
+    // A clock-trusted pump anchors the backoff at now (first retry: the
+    // next pump call); a failed clock leaves the gate unset — the shelf
+    // head retries on every pump until real time returns.
+    shelf->retry_not_before_ms = clock_trusted ? now_ms : 0;
     shelf->next = NULL;
     state->raft_retry_shelf = shelf;
     return rc;
   }
   return CRABS_SUCCESS;
+}
+
+crabs_error_e state_raft_process_notifications_at(state_t* state,
+                                                  uint64_t now_ms) {
+  // The explicit host clock is the trusted backoff source.
+  return _raft_pump_notifications_at(state, now_ms, true);
 }
 
 crabs_error_e state_raft_process_notifications(state_t* state) {
@@ -1467,9 +1489,9 @@ crabs_error_e state_raft_process_notifications(state_t* state) {
   if (!state_get_time_ms(state, &now_ms)) {
     // No authenticated time available: run the pump without a backoff gate
     // (backoff comparisons against a zero clock would never fire).
-    return state_raft_process_notifications_at(state, 0);
+    return _raft_pump_notifications_at(state, 0, false);
   }
-  return state_raft_process_notifications_at(state, now_ms);
+  return _raft_pump_notifications_at(state, now_ms, true);
 }
 
 bool state_raft_shelf_active(const state_t* state) {
