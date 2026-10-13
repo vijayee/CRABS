@@ -206,11 +206,6 @@ seal is opened by a key minted for that same attribute set.
   unless the wasm-only self-perpetuating variants
   (`create_trigger`/`delete_trigger`/`disable_trigger`) are specifically
   needed.
-- Installing a trigger is *itself* an authorized op, and the installer's
-  identity is the machine admin's real id — each run stamps the id the
-  node key / wasm wrapper is registered under, so any admin id works;
-  the node snippet pins this by running with a deliberately non-default
-  admin id (`'chair'`).
 
 ## Verified against the code
 
@@ -228,7 +223,7 @@ policy grammar (post-A5): gate accepts prefix and infix; single-clause 'AND x' c
 seal round trip (post-A11): encrypt → abeKeygen(attrs) → abeDecrypt exists on BOTH bindings; container layout = u16le policy length + policy bytes + u32le ct length + ct — pinned by bindings/wasm/test/abe-decrypt.js + bindings/node/test/abe.js (round trip, refusals, token map, tamper fail-closed) and bindings/wasm/test/smoke.js:111-130 (container layout).
 C owns the tick: trigger_process_all src/Trigger/trigger.h:81-82 — the C snippet calls it explicitly; wasm/node run it post-execute (trigger_ticking defer note, trigger.h:80).
 node narrower TriggerConfig: effectType 'issue_attribute' | 'change_policy' only; wasm adds the trigger-management effects — bindings/node/index.d.ts:224-245 vs bindings/wasm/index.d.ts:295-307.
-node createTrigger stamps the machine's REAL admin id (the id the node key is registered under) and signs with the node key — bindings/node/src/crabs_node.cc:2772 (stub) + :2842-2843 (signer stamp); admin_id_ is set at construction, :1288.
+node createTrigger stamps the machine's REAL admin id (the id the node key is registered under) and signs with the node key — bindings/node/src/crabs_node.cc:2772 (stub) + :2842-2843 (signer stamp); admin_id_ is set at construction, :1288 — so any admin id works; the node snippet pins that by running with the deliberately non-default admin id 'chair'.
 refused ops still stream: an event with a nonzero result field is emitted for refused ops — bindings/node/src/crabs_node.cc:1376 ("the gate opened" = result === 0).
 
 target: crabs-wasm (snippet wasm/06-moderation.js)

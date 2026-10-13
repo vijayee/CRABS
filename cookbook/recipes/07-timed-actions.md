@@ -242,7 +242,7 @@ symbols:
   KeyPair.publicKeyHex      bindings/node/index.d.ts:28
   Operation.new             bindings/node/index.d.ts:139 (OperationStatic :138)
   Operation.addResource     bindings/node/index.d.ts:83
-  (submission validate gate)      bindings/node/src/crabs_node.cc:2628-2646 + recurring :2658-2673
+  (submission validate gate)      bindings/node/src/crabs_node.cc:2628-2646 + recurring :2658-2690
   (wall-clock tick default)       bindings/node/src/crabs_node.cc:2713-2718
   C engine unchanged: scheduler_schedule / _recurring / cancel / process_due / count / first / budget
                                   src/Scheduler/scheduler.h:20-55
