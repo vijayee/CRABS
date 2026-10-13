@@ -2489,6 +2489,10 @@ TEST(TestLineage, DissolveAfterRevokeIsLegal) {
             CRABS_ERR_ALREADY_PERFORMED);
   operation_destroy(again);
 
+  // The dissolve dropped the child from the registry, so its owner must
+  // destroy it — the post-dissolution destroy path
+  // (OutOfBandChildDestroyIsSafeForDissolve) must stay safe here too.
+  attribute_machine_destroy(child);
   machine_blueprint_destroy(blueprint);
   spawn_parent_destroy(&harness);
 }
