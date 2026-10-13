@@ -71,6 +71,21 @@ for (const page of pages) {
 }
 indexTable.push('</table>');
 
+// --- start-here learning path (above the status table) ---
+const SECTION_ORDER = ['Basics', 'Conditions', 'Convergence', 'Coordination', 'Composition', 'Ground truth'];
+const sections = SECTION_ORDER
+  .map(section => ({ section, sectionPages: pages.filter(page => page.meta.section === section) }))
+  .filter(({ sectionPages }) => sectionPages.length > 0);
+const learningPath = [
+  '<h2>Start here</h2>',
+  '<p>Learn CRDTs, ordering, and coordination by building them — every recipe verified against the code it teaches. Read the sections in order; each line says what the recipe teaches.</p>',
+  ...sections.flatMap(({ section, sectionPages }) => [
+    `<h2>${escapeHtml(section)}</h2>`,
+    ...sectionPages.map(page =>
+      `<p><a href="/cookbook/${escapeHtml(page.meta.slug)}/">${escapeHtml(page.meta.title)}</a><br><span class="teaches">${escapeHtml(page.meta.teaches || '')}</span></p>`),
+  ]),
+];
+
 // --- sidebar (shared across cookbook pages) ---
 const BADGE_LABEL = { COMPLETE: 'COMP', PARTIAL: 'PART', UNSUPPORTED: 'GAP' };
 const sidebarLinks = pages.map(page =>
@@ -79,7 +94,7 @@ const sidebarLinks = pages.map(page =>
 function sidebarFor() {
   return `<div class="sidebar">
   <h1><a href="/">CRABS</a></h1>
-  <p style="font-size:12px; margin: 4px 0 12px">Verified recipes.<br>Run in CI. Gaps stay visible.</p>
+  <p style="font-size:12px; margin: 4px 0 12px">Learn by building.<br>Every recipe verified against<br>the code it teaches.</p>
   <nav>${sidebarLinks}</nav>
 </div>`;
 }
@@ -136,7 +151,8 @@ writeFileSync(join(dist, 'cookbook', 'index.html'), pageShell({
   title: 'The CRABS Cookbook',
   mainHtml: `<h1>The CRABS Cookbook</h1><p>Fifteen recipes with runnable code, plus one honest gap page. STATUS and
   maturity badges are honest: PARTIAL means gaps are documented on the page.
-  UNSUPPORTED means the codebase cannot deliver it yet.</p>${indexTable.join('\n')}
+  UNSUPPORTED means the codebase cannot deliver it yet.</p>${learningPath.join('\n')}
+  <h2>Recipe index</h2>${indexTable.join('\n')}
   <div class="callout"><img src="/assets/Unlockster.png"><p>Trust caveat: recipes
   only claim what the code proves today. DESIGNED symbols never appear in
   COMPLETE recipes.</p></div>`,

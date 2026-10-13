@@ -7,6 +7,7 @@ status: COMPLETE
 maturity: STABLE
 target: crabs-wasm
 languages: c wasm node
+teaches: revocation, key versions and epoch re-encryption
 ---
 ## Intent
 

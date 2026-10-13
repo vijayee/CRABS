@@ -7,6 +7,7 @@ status: COMPLETE
 maturity: STABLE
 target: crabs-wasm
 languages: c wasm node
+teaches: attenuating authority down a machine tree
 ---
 ## Intent
 

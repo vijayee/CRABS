@@ -7,6 +7,7 @@ status: PARTIAL
 maturity: STABLE
 target: native-c
 languages: c wasm node
+teaches: concurrent edits to one ordered list via transform ops
 ---
 ## Intent
 

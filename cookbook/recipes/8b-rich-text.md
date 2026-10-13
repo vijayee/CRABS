@@ -6,6 +6,7 @@ section: Convergence
 status: UNSUPPORTED
 maturity: EXPERIMENTAL
 target: native-c
+teaches: why rich text is a different (unmeasured) order of hard
 ---
 ## What this page is
 

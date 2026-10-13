@@ -7,6 +7,7 @@ status: COMPLETE
 maturity: STABLE
 target: crabs-wasm
 languages: c wasm node
+teaches: append-only personal ledgers no admin can rewrite
 ---
 ## Intent
 

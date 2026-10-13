@@ -8,6 +8,7 @@ maturity: STABLE
 target: crabs-wasm
 languages: c wasm node
 interactive: true
+teaches: counting with replicas: why max-per-lane beats one integer
 ---
 ## Intent
 

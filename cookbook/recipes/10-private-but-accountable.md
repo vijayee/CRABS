@@ -7,6 +7,7 @@ status: COMPLETE
 maturity: STABLE
 target: crabs-wasm
 languages: wasm node
+teaches: sovereign write domains — integrity without confidentiality
 ---
 ## Intent
 

@@ -7,6 +7,7 @@ status: COMPLETE
 maturity: STABLE
 target: crabs-wasm
 languages: c wasm node
+teaches: last-writer-wins registers and per-member data
 ---
 ## Intent
 

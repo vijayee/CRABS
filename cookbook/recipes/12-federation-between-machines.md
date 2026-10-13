@@ -7,6 +7,7 @@ status: COMPLETE
 maturity: STABLE
 target: crabs-wasm
 languages: c wasm node
+teaches: attestations — vouches that cross machines and expire
 ---
 ## Intent
 

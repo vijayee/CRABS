@@ -7,6 +7,7 @@ status: COMPLETE
 maturity: STABLE
 target: all-bindings
 languages: c wasm node
+teaches: resource locking — what machines can and cannot promise
 ---
 ## Intent
 

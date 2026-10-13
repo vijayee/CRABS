@@ -7,6 +7,7 @@ status: COMPLETE
 maturity: STABLE
 target: crabs-wasm
 languages: c wasm node
+teaches: authorization as state — attributes deciding what runs
 ---
 ## Intent
 

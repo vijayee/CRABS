@@ -7,6 +7,7 @@ status: COMPLETE
 maturity: STABLE
 target: crabs-wasm
 languages: wasm node
+teaches: strict ordering from an elected leader (raft module)
 ---
 ## Intent
 
