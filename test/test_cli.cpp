@@ -12,6 +12,8 @@
 extern "C" {
 #include "../src/CLI/cli.h"
 #include "../src/CRABS/data_model.h"
+#include "../src/StateMachine/state_machine.h"
+#include "../src/Raft/raft_module.h"
 #include "../src/Lineage/lineage.h"
 #include "../src/Serialization/serialization.h"
 #include "../src/CRDT/one_shot.h"
@@ -1765,6 +1767,95 @@ TEST(TestCliWriteDomains, ItemInfoPrintsDomainFields) {
   EXPECT_EQ(cli_dispatch(node, 3, short_argv), CLI_ERR_ARGS);
 
   remove(capture_path);
+  cli_node_destroy(node);
+}
+
+// Raft ordering module diagnostics (Phase 4): item-info group rows report
+// the state's module pointer, and `raft status` / `raft attach` surface the
+// module's point diagnostics.
+TEST(TestCliWriteDomains, ItemInfoGroupRowReportsModuleStatus) {
+  cli_node_t* node = cli_node_create();
+  ASSERT_EQ(cli_node_init(node, "nodeA"), CLI_OK);
+  state_t* state = &node->attr_machine->base_state;
+
+  data_item_options_t options;
+  memset(&options, 0, sizeof(options));
+  options.write_domain = CRABS_DOMAIN_GROUP_ORDERED;
+  options.ordering_module = 0;
+  data_item_t* group_item = nullptr;
+  ASSERT_EQ(data_item_create_with_options("council", DATA_TYPE_REGISTER,
+                                          CRDT_LWW_REG, &options,
+                                          &group_item),
+            CRABS_SUCCESS);
+  ASSERT_EQ(state_add_item(state, group_item), CRABS_SUCCESS);
+
+  // Detached: the fail-closed row.
+  const char* capture_path = "/tmp/crabs-raft-cli-captured.log";
+  cli_result_e result = CLI_ERR_ARGS;
+  std::string text;
+  char* info_argv[] = {(char*)"crabs_node", (char*)"item", (char*)"info",
+                       (char*)"council"};
+  ASSERT_TRUE(test_capture_dispatch_stdout(node, 4, info_argv, &result,
+                                           &text, capture_path));
+  EXPECT_EQ(result, CLI_OK);
+  EXPECT_NE(text.find("group"), std::string::npos);
+  EXPECT_NE(text.find("detached (group writes fail closed)"), std::string::npos);
+
+  // Attach through the CLI command.
+  char* attach_argv[] = {(char*)"crabs_node", (char*)"raft", (char*)"attach",
+                         (char*)"nodeA"};
+  ASSERT_EQ(cli_dispatch(node, 4, attach_argv), CLI_OK);
+  // A second attach refuses.
+  EXPECT_EQ(cli_dispatch(node, 4, attach_argv), CLI_ERR_EXEC);
+
+  // The group row now reports the attached module (follower — no host loop
+  // has run). Status prints the module diagnostics.
+  char* attach_again_status[] = {(char*)"crabs_node", (char*)"raft",
+                                 (char*)"status"};
+  ASSERT_TRUE(test_capture_dispatch_stdout(node, 3, attach_again_status,
+                                           &result, &text, capture_path));
+  EXPECT_EQ(result, CLI_OK);
+  EXPECT_NE(text.find("term:            0"), std::string::npos);
+  EXPECT_NE(text.find("commit tip:      0"), std::string::npos);
+  EXPECT_NE(text.find("nodeA"), std::string::npos);
+
+  // Becoming leader (degenerate self-election) moves the group row and the
+  // status output.
+  crabs_raft_module_t* module =
+      (crabs_raft_module_t*)state_raft_module(state);
+  ASSERT_NE(module, nullptr);
+  ASSERT_EQ(crabs_raft_module_tick(module,
+            crabs_raft_module_next_election_deadline(module)), CRABS_SUCCESS);
+  ASSERT_TRUE(crabs_raft_module_is_leader(module));
+  ASSERT_TRUE(test_capture_dispatch_stdout(node, 3, attach_again_status,
+                                           &result, &text, capture_path));
+  EXPECT_NE(text.find("term:            1"), std::string::npos);
+  EXPECT_NE(text.find("this node"), std::string::npos);
+
+  ASSERT_TRUE(test_capture_dispatch_stdout(node, 4, info_argv, &result,
+                                           &text, capture_path));
+  EXPECT_NE(text.find("attached — leader, commit tip"), std::string::npos)
+      << "group row should report the live module";
+
+  remove(capture_path);
+  cli_node_destroy(node);
+}
+
+TEST(TestCliWriteDomains, RaftAttachRefusesBadConfiguration) {
+  cli_node_t* node = cli_node_create();
+  ASSERT_EQ(cli_node_init(node, "nodeA"), CLI_OK);
+
+  // Missing arguments / unknown subcommand are argument errors. (A
+  // self-not-a-member config is NOT constructible through the CLI — argv[3]
+  // always doubles as the first peer — so that refusal stays covered by the
+  // raft module's own suite.)
+  char* bare_argv[] = {(char*)"crabs_node", (char*)"raft"};
+  EXPECT_EQ(cli_dispatch(node, 2, bare_argv), CLI_ERR_ARGS);
+  char* wrong_sub_argv[] = {(char*)"crabs_node", (char*)"raft",
+                            (char*)"detach"};
+  EXPECT_EQ(cli_dispatch(node, 3, wrong_sub_argv), CLI_ERR_ARGS);
+
+  remove("/tmp/crabs-raft-cli-captured.log");
   cli_node_destroy(node);
 }
 
