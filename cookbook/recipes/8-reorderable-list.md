@@ -6,7 +6,7 @@ section: Convergence
 status: PARTIAL
 maturity: STABLE
 target: native-c
-languages: c
+languages: c wasm node
 ---
 ## Intent
 
@@ -78,31 +78,43 @@ so both replicas compute the same sequence without talking.
   takes the *larger* placement_id per element (with the op-id byte compare as
   the deterministic tie-break, `src/OT/ot_ordered_set.c:20-28`), wins
   deletions, and re-materializes one order.
-- It is integrated as machine state, C-side: OT types register as real items
+- It is integrated as machine state: OT types register as real items
   (`crabs_register_ot_type`, `src/OT/ot_execution.h:69-72`) and the executor
   dispatches a `__execute_ot__` op through extract → transform → apply
   (`src/OT/ot_execution.h:38-54`; op type `src/CRABS/crabs.h:165`; executor
-  branch `src/StateMachine/state_machine.c:1401-1403`).
+  branch `src/StateMachine/state_machine.c:1792-1794`). Both bindings bind
+  this branch: item creation with the eager ordered-set wrapper
+  (`crabs_wasm_add_ordered_set`, `src/Util/wasm_helpers.c:626`; node
+  `AddOrderedSet`, `bindings/node/src/crabs_node.cc:1809`) and op application
+  whose payload a wire encoder builds (`crabs_ot_ops_to_wire`,
+  `src/OT/ot_execution.h:49-54` — the inverse of `crabs_extract_ot_ops`).
 
-This is the *paper's* shape (`docs/CRABS Extended.md` §4). The part a recipe
-can drive today is the C surface above — everything in it is implemented,
-compiled into `libcrabs`, and tested. What no surface can do yet is call any
-of it from JavaScript, which is exactly what the two GAP blocks below
-document.
+This is the *paper's* shape (`docs/CRABS Extended.md` §4). Two layers of it
+are JS-bound today: the *op* layer — both bindings build ordered-set items
+and apply INSERT/DELETE/MOVE/SWAP ops through the machine executor with
+readback (the wasm/node snippets below) — and the *merge* layer, which is
+still C-only: `crabs_ot_ordered_set_merge` has no JS map entry, so the
+merge-preflight guarantees below are demonstrated in C and cited, not
+re-run from JavaScript. That residual gap is stated per section.
 
 ## What it guarantees / what it doesn't
 
-Guaranteed, on the C surface exercised in the snippet: after two replicas
-merge, they hold the same element set and the same materialized order;
-concurrent inserts at the same position are *both* kept (nothing
-silently vanishes — the merge adds src-only elements rather than
-overwriting, and the C suite asserts merge is order-commutative for
-concurrent singletons, `test/test_ot_ordered_set.cpp:347-375`); a
-duplicated op id whose payload disagrees refuses to merge at all instead of
-pick-a-winner (`:377-393`); and a delete beats a concurrent live element —
-deletion wins (`:395-420`). The reorder itself is also deterministic: a MOVE
-re-stamps the placement of every element it knew
-(`src/OT/ot_ordered_set.c:432-470`), and both replicas re-derive the same
+Guaranteed, on the surfaces exercised in the snippets: sequential ordered
+ops land in issue order and read back materialized (tombstones skipped);
+concurrent inserts at the same position are *both* kept — replica pairs
+that exchange their ops with declared causal context converge on one
+identical order through the transform tie-break (both binding snippets pin
+the converged equality, and the C suite asserts the same property for
+`merge` directly, `test/test_ot_ordered_set.cpp:347-375`); a duplicated op
+id with the same payload is a no-op on replay (`_op_already_applied`,
+`src/OT/ot_execution.c`). Still C-only — `crabs_ot_ordered_set_merge`'s
+preflight guarantees: a duplicated op id whose *payload disagrees* refuses
+to merge at all instead of pick-a-winner (`:377-393`), and a delete beats
+a concurrent live element through the *merged position map*
+(`:395-420`) — the executor path cannot observe either, because no binding
+exposes `merge` (see the ledger note below). The reorder itself is also
+deterministic: a MOVE re-stamps the placement of every element it knew
+(`src/OT/ot_ordered_set.c:432-470`), and merged replicas re-derive the same
 sequence from the merged placements.
 
 Not guaranteed — and say this before building on it:
@@ -114,30 +126,36 @@ Not guaranteed — and say this before building on it:
   and the other member's reorder is displaced rather than merged. Members
   who only insert and delete lose nothing; members who concurrently
   *reorder* get one converged order, not both reorderings.
-- *SWAP is a value exchange, not a placement op* (`src/OT/ot_ordered_set.c:478-493`
-  swaps the two positions' payloads): a swap that travels across replicas
-  while the same element ids also diverge elsewhere is constrained by the
-  merge's per-element payload preflight — the snippet therefore demonstrates
-  swap locally, exactly as its test does (`test_ot_ordered_set.cpp:231-261`).
-- *No JavaScript access, today.* Neither binding exposes an OT surface —
-  see the GAP blocks below. Rich-text/word-processing is a different and
-  harder problem (cursor stability, IME composition, styled spans) with its
-  own unbenchmarked status: that is Recipe 8b's page, not this one.
+- *The executor's transform is dep-driven, not merge-driven.* Replicas that
+  exchange *ops* converge through the insert-insert tie-break (exactly one
+  replica shifts; both snippets below pin one converged order from divergent
+  machines), but an op replay carries its causal context *explicitly* —
+  `options.deps` — because the C transform only skips log entries it can
+  prove causally before or depended-on (`src/OT/ot_transform.c:32-63`).
+  Replaying a peer op *without* its deps mis-shifts it (the binding tests pin
+  the discriminating case, `bindings/*/test/ordered-set.js`). The
+  merge-preflight refuses to reconcile replicas whose same-op-id elements
+  carry different payloads — that check lives in `crabs_ot_ordered_set_merge`
+  (`test_ot_ordered_set.cpp:377-393`) and no JS surface reaches it.
+- *Rich-text/word-processing is a different and harder problem* (cursor
+  stability, IME composition, styled spans) with its own unbenchmarked
+  status: that is Recipe 8b's page, not this one.
 
 ## Variations
 
 - Tree-shaped reordering: the same OT machinery ships an `OT_TREE` type
   (`DATA_TYPE_OT_TREE = 0x13`, `src/CRABS/data_model.h:35`) with
   `insert_node / delete_node / reparent / reorder` ops
-  (`src/OT/ot_types.h:36-39`), C-only like everything in this recipe.
+  (`src/OT/ot_types.h:36-39`) — C-only: no binding creates or applies tree
+  items (recipe 8b's document type likewise).
 - Bigger lists: the op log behind a set is bounded
   (`CRABS_OT_OP_LOG_MAX`, `src/OT/ot_types.h:91`) and prunable
   (`crabs_prune_ot_log`, `src/OT/ot_execution.h:56-58`) — the log-pruning
   and compaction story is the design doc's stated mitigation for OT merge
   cost (`docs/CRABS Extended.md` §11.1, :585).
 - Ordered map variant: `DATA_TYPE_OT_ORDERED_MAP = 0x14`
-  (`src/CRABS/data_model.h:37`) exists as a type word, with the same
-  JS-absence caveat as everything on this page.
+  (`src/CRABS/data_model.h:37`) exists as a type word, still without item
+  machinery or bindings.
 - Moderated review queues, i.e. ranked lists that a permission tree governs,
   compose this shape with Recipe 4's policies — the convergence machinery is
   independent of authorization; whoever may write applies the ops.
@@ -146,73 +164,73 @@ Not guaranteed — and say this before building on it:
 
 ### crabs-wasm (browser / Node / edge)
 
-No reorderable-list surface exists on the wasm binding — nothing to drive.
+The op layer is bound: `addOrderedSet` creates the item, the four
+`ordered*` methods apply ops through the `__execute_ot__` executor (each call
+composes, node-key-signs as the bootstrap admin and executes one
+wire-encoded op — the createTrigger idiom: install the op type's policy
+first with `setPolicy('__execute_ot__', 'role:admin')`), and `getOrderedSet`
+reads the materialized order back (`bindings/wasm/index.d.ts:466-498`). Two
+things to know before running it:
 
-> [!WARNING] GAP
->
-> **Prose describes:** the Recipe's whole demo on crabs-wasm — building an
-> ordered list, two browser members inserting/moving/swapping concurrently,
-> and converging both replicas to one order through `merge`.
->
-> **Codebase status:** the capability is implemented and tested — in C.
-> `crabs_ot_ordered_set_create/destroy`, the five `apply_*` ops, and
-> `crabs_ot_ordered_set_merge` + `crabs_ot_ordered_set_merge_position_maps`
-> live at `src/OT/ot_ordered_set.h:63-117` behind 19 test cases
-> (`test/test_ot_ordered_set.cpp`); the executor branch
-> (`src/StateMachine/state_machine.c:1401-1403`) and item registration
-> (`src/OT/ot_execution.h:69-72`) exist too, exercised by
-> `test/test_ot_execution.cpp:37-136`.
->
-> **Divergence:** none of that is reachable from this binding. Grepping
-> `bindings/wasm/index.d.ts` for `ot`, `ordered`, `document`, `tree`
-> (case-insensitive) returns zero OT exports — the module's `DATA_TYPE`
-> const (`:63`) exposes only the non-OT types, and `Node` declares no
-> `addOrderedSet`/`addDocument`-style item, no op builder for
-> `__execute_ot__` (`src/CRABS/crabs.h:165`), and no OT read-back. api-map
-> §17 records the gap: "R8 | OT ordered set surface — **Not JS-bound**".
->
-> **Tracking:** api-map §17, R8. No JS-binding work is scheduled; the C
-> surface is the only callable implementation today.
->
-> **Agent action:** code block omitted. Do not invent
-> `addOrderedSet(...)`/`item.move(...)` onto the wasm d.ts — call the C
-> surface directly from native code (see the C section), or wait for a
-> JS-bound OT surface before promising this behavior to a wasm consumer.
+- every op's identity is caller-supplied (`options.id = {node, seq, ts?}`) —
+  replaying the same id with the same payload is a silent no-op (the
+  executor's `_op_already_applied` skip, `src/OT/ot_execution.c`);
+- a *cross-replica replay* must carry the issuing replica's causal context in
+  `options.deps` (max 16), or the transform treats the replica's earlier ops
+  as concurrent and mis-shifts the position.
+
+```snippet:wasm/08-reorderable-list.js
+```
+
+<!-- PROVENANCE
+target: crabs-wasm
+verified: executed
+symbols:
+  Node.addOrderedSet         bindings/wasm/index.d.ts:466
+  Node.getOrderedSet         bindings/wasm/index.d.ts:472
+  Node.orderedInsert         bindings/wasm/index.d.ts:485
+  Node.orderedDelete         bindings/wasm/index.d.ts:488
+  Node.orderedMove           bindings/wasm/index.d.ts:491
+  Node.orderedSwap           bindings/wasm/index.d.ts:497
+  OrderedSetOpId/OrderedSetApplyOptions bindings/wasm/index.d.ts:103-122
+  crabs_wasm_add_ordered_set src/Util/wasm_helpers.c:626
+  crabs_wasm_ot_apply        src/Util/wasm_helpers.c:712
+  crabs_wasm_ot_ordered_count/element src/Util/wasm_helpers.c:681/688
+  crabs_ot_ops_to_wire       src/OT/ot_execution.h:49-54
+  (__op_already_applied skip) src/OT/ot_execution.c
+  (executor branch)          src/StateMachine/state_machine.c:1792-1794
+maturity: all STABLE
+test_ref: bindings/wasm/test/ordered-set.js (seed order, MOVE 0->2, SWAP, DELETE, idempotent replay, deps-carry pin, policy refusal, two-machine op-exchange convergence)
+-->
 
 ### crabs-node (native Node.js)
 
-Same story one door over: the node binding even *parses* the type word, and
-that parse leads nowhere a user can go.
+The same surface direct-to-C (`bindings/node/index.d.ts:287-319`): the
+sugar builds the op in-process, signs it under this machine's admin with
+the node key (the reportEquivocation idiom) and runs the machine executor;
+same policy requirement, same op-id and deps contract.
 
-> [!WARNING] GAP
->
-> **Prose describes:** the same demo on crabs-node — a native Node process
-> building an ordered list and merging a second member's concurrent
-> reorder into it.
->
-> **Codebase status:** identical C capability as above
-> (`src/OT/ot_ordered_set.h:63-117`, 19 test cases). The node binding comes
-> the closest of the two: its internal item-word parser accepts
-> `'ot_ordered_set'` → `DATA_TYPE_OT_ORDERED_SET` = `0x10`
-> (`bindings/node/src/crabs_node.cc:212`; constant
-> `src/CRABS/data_model.h:33`) and the same for the wire number
-> (`crabs_node.cc:193`).
->
-> **Divergence:** the parse stops at the word. No `d.ts` export uses the
-> type — `bindings/node/index.d.ts` has zero OT symbols (grep for
-> `ot|ordered|document|tree` case-insensitive returns nothing binding-side),
-> `DATA_TYPE` at `:326-335` lists only the non-OT types, and there is no op
-> builder for `__execute_ot__` and no OT read surface. api-map §15 calls
-> this honestly: "PRESENT (parsed, but see §17 — no OT item machinery is
-> wired for v1 recipes)".
->
-> **Tracking:** api-map §17, R8 (same gap as the wasm row).
->
-> **Agent action:** code block omitted. Do not pass
-> `'ot_ordered_set'` as a data-type word and expect an ordered list — the
-> word is accepted, no item machinery answers it. Call the C surface from a
-> native process (next section) or from a custom wasm handler that reaches
-> a bound surface, once one exists.
+```snippet:node/08-reorderable-list.js
+```
+
+<!-- PROVENANCE
+target: crabs-node
+verified: executed
+symbols:
+  Node.addOrderedSet    bindings/node/index.d.ts:287
+  Node.getOrderedSet    bindings/node/index.d.ts:293
+  Node.orderedInsert    bindings/node/index.d.ts:306
+  Node.orderedDelete    bindings/node/index.d.ts:309
+  Node.orderedMove      bindings/node/index.d.ts:312
+  Node.orderedSwap      bindings/node/index.d.ts:318
+  OrderedSetOpId/OrderedSetApplyOptions bindings/node/index.d.ts:508-527
+  AddOrderedSet         bindings/node/src/crabs_node.cc:1809
+  GetOrderedSet         bindings/node/src/crabs_node.cc:1833
+  OrderedSetApply       bindings/node/src/crabs_node.cc:1868
+  (eager set + ot_data attach) src/OT/ot_execution.c (crabs_register_ot_type)
+maturity: all STABLE
+test_ref: bindings/node/test/ordered-set.js (same scenarios as the wasm block)
+-->
 
 ### C (native)
 
@@ -271,10 +289,23 @@ test_ref: test/test_ot_ordered_set.cpp:190-225 (MOVE) + :347-375 (merge commutat
   the maps merge through `crabs_bst_merge`, which copies src's deleted
   entries into dest (`src/OT/position_map.h:64-65`) — the snippet calls
   `crabs_ot_ordered_set_merge_position_maps` directly to show the seam.
-- A real JS-facing story for ranked lists today is Recipe 2's OR-set with an
-  integer rank held in the element's tags, plus Recipe 6-style triggers to
-  promote items — last-writer-wins per element, weaker than this page's C
-  merge, but reachable. Do not present it as convergent reordering.
+- Status note (why the page stays PARTIAL with `languages: c wasm node`):
+  the *op* layer is bound on both bindings and the snippets actually run;
+  the *merge* layer — `crabs_ot_ordered_set_merge` +
+  `merge_position_maps` (`src/OT/ot_ordered_set.h:114-118`, and the
+  preflight/refusal/merge-commutativity tests cited above) — has no JS map
+  entry, so a JS-only replica cannot merge a peer's serialized state; it
+  converges by exchanging ops *with declared deps*, and the payload-conflict
+  refusal plus merged position-map guarantees remain demonstrable only in C
+  (`test/test_ot_ordered_set.cpp:377-420`). api-map §17 R8 tracks the row.
+  Until a binding ships the merge, don't present op-exchange as full
+  CRDT-merge parity: it is transform-based convergence, driven by the deps
+  the issuer declares.
+- A fallback for plain membership + rank (no order guarantees between
+  members) is Recipe 2's OR-set with an integer rank held in the element's
+  tags, plus Recipe 6-style triggers to promote items —
+  last-writer-wins per element, weaker than this page's machinery, but
+  reachable from day one. Do not present it as convergent reordering.
 - The related JS-reachable primitives `itemChainHead` and
   `reportEquivocation` (api-map §11) give you tamper-evidence over writes to
   a replicated list, but they say nothing about *order*: order still needs
