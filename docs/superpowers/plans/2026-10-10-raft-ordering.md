@@ -58,6 +58,14 @@ bool raft_module_is_leader(module); uint64_t raft_module_committed_tip(module);
   - dropped/duplicated/reordered messages (host models loss/duplication/reorder in the script — module idempotent); slow-persist follower;
   - restart: module state round-trips through the v16 serializer, commit continues (persistence events re-drive);
   - mixed-machine property test: group items halt while SOVEREIGN/FREE items execute on all replicas (DOMAIN_CHECK unaffected).
+- [ ] **P1 carried items (from the P1 review — all load-bearing at P2):**
+  1. Follower materialization: Step-0's pending-uuid gate blocks follower-side COMMITTED_OP delivery (followers never propose locally). Materialization must require ONLY the module-own notification queue (the pump's sole source); keep the leader-side pending lifecycle; uuid dedup at execution still guards resubmission.
+  2. Vote grants MUST include the up-to-dateness check (candidate term/lastLogIndex/lastLogTerm) — P1 landed `(void)last_log_*`; correctness-critical once elections are real.
+  3. Restart + pending tail: serialize the pending list into the v16 module section (uuid + op bytes) so leader restarts resume; follower deliveries unaffected via item 1.
+  4. Import/emit state-drop hazard: saving a state whose module section wasn't re-imported emits `attached=0` and DROPS the log — the attach API must carry the imported section so the WRITER re-emits last-known module state; test save→load→save identity.
+  5. Tighten caps: 65536×16384 B ≈ 1 GB worst section — sane bounds (e.g. 4096 entries); compaction decision still open.
+  6. Merge wiring (plan-scope slip acknowledged): crdt_merge GROUP_ORDERED hold-stub → adopt-by-committed-position, in this phase.
+  7. Clarify poll-ownership comment (transfer-on-poll) at raft_module.h:97.
 - [ ] Commit: `feat: Raft elections and replicated log — deterministic simulations for partitions and message faults`.
 
 ### Phase 3: Membership change (joint consensus) + log compaction decision
