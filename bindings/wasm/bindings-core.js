@@ -1069,6 +1069,64 @@ class Node {
     wrapRc(rcExec, 'createTrigger execute');
   }
 
+  // DedupSpec op-type registration (v1.4 §7): register a machine-enforced
+  // dedup spec for a USER-DEFINED operation type. The C export composes,
+  // node-key-signs (as the machine's bootstrap admin) and executes a
+  // '__define_operation_type__' op whose resources[0] carries opType and
+  // whose dedup struct carries the spec; the machine registry stores it
+  // (state_register_op_type_def) and the executor resolves it for every
+  // later op of that type — registered specs win over anything the op
+  // carries on the wire (the F-2 bypass shape fails closed).
+  //
+  // options.dedup: 'per-user' (options.trackerPath: a ONE_SHOT_SET item
+  // name, created with addOneShotSet — the executor validates it exists
+  // before any handler runs) | 'global' (options.flagPath: an
+  // addOneShotFlag item name) | 'none' (disables a previously defined
+  // guard for the type and seals it against op-carried specs). The
+  // 'custom' shape stays C-native: its condition evaluator and its
+  // spec-carried mutation target are not reason-able from JS.
+  // options.rejectionMessage is stored metadata on the spec; the refusal
+  // itself surfaces as the machine's dedup domain error
+  // ('already_performed' / 'already_executed').
+  //
+  // Like createTrigger, the caller installs the define type's own policy
+  // first (node.setPolicy('__define_operation_type__', 'role:admin')) —
+  // the bootstrap admin holds role:admin, so an admin-owned policy is the
+  // natural wiring.
+  defineOperationType(opType, options) {
+    const M = this._M;
+    if (!options || typeof options !== 'object') {
+      throw new Error('defineOperationType: expected an options object with a dedup field');
+    }
+    if (typeof opType !== 'string' || opType.length === 0) {
+      throw new Error('defineOperationType: opType must be a non-empty string');
+    }
+    const DEDUP_NUMBERS = { none: 0, 'per-user': 1, global: 2 };
+    const dedupType = DEDUP_NUMBERS[options.dedup];
+    if (dedupType === undefined) {
+      throw new Error("defineOperationType: dedup must be 'per-user' | 'global' | 'none' (" +
+        "the 'custom' shape is C-native and not surfaceable)");
+    }
+    if (options.dedup === 'per-user' && !options.trackerPath) {
+      throw new Error("defineOperationType: dedup 'per-user' requires a trackerPath (the ONE_SHOT_SET once-record)");
+    }
+    if (options.dedup === 'none' && options.trackerPath) {
+      throw new Error("defineOperationType: dedup 'none' takes no trackerPath (a 'none' definition removes the guard; nothing to track)");
+    }
+    if (options.dedup === 'global' && !options.flagPath) {
+      throw new Error("defineOperationType: dedup 'global' requires a flagPath (the ONE_SHOT_FLAG once-record)");
+    }
+    const opTypePtr = writeString(M, opType);
+    const trackerPtr = options.trackerPath ? writeString(M, options.trackerPath) : 0;
+    const flagPtr = options.flagPath ? writeString(M, options.flagPath) : 0;
+    const conditionPtr = options.condition ? writeString(M, options.condition) : 0;
+    const messagePtr = options.rejectionMessage ? writeString(M, options.rejectionMessage) : 0;
+    const rc = M._crabs_wasm_define_operation_type(
+      this._am, opTypePtr, dedupType, trackerPtr, flagPtr, conditionPtr, messagePtr);
+    freeAll(M, opTypePtr, trackerPtr, flagPtr, conditionPtr, messagePtr);
+    wrapRc(rc, 'defineOperationType');
+  }
+
   encrypt(data, policy) {
     const M = this._M;
     let b = data;

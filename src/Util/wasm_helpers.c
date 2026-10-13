@@ -421,6 +421,99 @@ crabs_error_e crabs_wasm_execute(attribute_machine_t* am, operation_t* op) {
   return state_machine_execute(&am->base_state, op);
 }
 
+// Forward declaration: the op type registration below reuses the shared
+// resources-array growth helper (defined lower, with the write-domains
+// surfaces).
+crabs_error_e crabs_wasm_op_add_resource(operation_t* op, const char* name);
+
+// ============================================================
+// DedupSpec op-type registration (v1.4 §7)
+// ============================================================
+// Compose, sign and execute a __define_operation_type__ op in one call:
+// resources[0] carries the op-type name being registered, op->dedup carries
+// the spec (state_machine_op_define_operation copies it into the machine
+// registry via state_register_op_type_def). Signing uses the machine's node
+// key with the bootstrap admin as the signer — the same
+// __create_trigger__/__report_equivocation__ admin-op idiom; the caller
+// installs the type's own policy first (setPolicy('__define_operation_type__',
+// 'role:admin')) or the executor refuses the op with unauthorized.
+//
+// Exposed dedup types are the machine-enforceable ones (per-user tracker /
+// global flag registrations whose guard+mutation are C-native) plus a 'none'
+// registration, which is the documented way to replace (unregister the guard
+// of) a previously defined spec — state_register_op_type_def updates the
+// entry in place. DEDUP_CUSTOM is deliberately NOT surfaceable from JS: a
+// custom spec is guarded AND mutated through the C condition evaluator and
+// the spec's state_mutation_t update field, whose targets are C-native
+// surfaces (the JS binding would mint specs whose post-handler mutation it
+// cannot reason about).
+EMSCRIPTEN_KEEPALIVE
+crabs_error_e crabs_wasm_define_operation_type(attribute_machine_t* am,
+                                               const char* op_type,
+                                               int32_t dedup_type,
+                                               const char* tracker_path,
+                                               const char* flag_path,
+                                               const char* condition,
+                                               const char* rejection_message) {
+  if (!am || !op_type || op_type[0] == '\0') return CRABS_ERR_INVALID_PARAM;
+  dedup_type_e type = (dedup_type_e)dedup_type;
+  if (type != DEDUP_NONE && type != DEDUP_PER_USER && type != DEDUP_GLOBAL) {
+    return CRABS_ERR_INVALID_PARAM;
+  }
+  if (type == DEDUP_PER_USER &&
+      (!tracker_path || tracker_path[0] == '\0')) {
+    return CRABS_ERR_INVALID_PARAM;
+  }
+  if (type == DEDUP_GLOBAL && (!flag_path || flag_path[0] == '\0')) {
+    return CRABS_ERR_INVALID_PARAM;
+  }
+
+  operation_t* op = operation_create(CRABS_OP_DEFINE_OPERATION);
+  if (!op) return CRABS_ERR_OOM;
+  crabs_error_e rc = crabs_wasm_op_add_resource(op, op_type);
+  if (rc != CRABS_SUCCESS) {
+    operation_destroy(op);
+    return rc;
+  }
+  op->dedup.type = type;
+  if (type == DEDUP_PER_USER) {
+    strncpy(op->dedup.tracker_path, tracker_path, CRABS_MAX_DEDUP_PATH - 1);
+    op->dedup.tracker_path[CRABS_MAX_DEDUP_PATH - 1] = '\0';
+  } else if (type == DEDUP_GLOBAL) {
+    strncpy(op->dedup.flag_path, flag_path, CRABS_MAX_DEDUP_PATH - 1);
+    op->dedup.flag_path[CRABS_MAX_DEDUP_PATH - 1] = '\0';
+  }
+  // rejection_message is metadata carried on the spec (serialized with it);
+  // the enforcement error itself is still the type's domain error.
+  if (rejection_message != NULL && rejection_message[0] != '\0') {
+    strncpy(op->dedup.rejection_message, rejection_message,
+            CRABS_MAX_DEDUP_MESSAGE - 1);
+    op->dedup.rejection_message[CRABS_MAX_DEDUP_MESSAGE - 1] = '\0';
+  }
+  // The state_mutation_t update field stays zeroed: for the surfaceable
+  // types the mutation is built-in (tracker membership / flag set) and is
+  // applied by dedup_apply_mutation_spec regardless of the update field.
+
+  // Sign with the node key under the bootstrap admin's identity — the
+  // admin-op idiom shared with createTrigger/reportEquivocation. Signing
+  // stamps HLC and the signer's key_version (crabs_wasm_sign_operation).
+  const char* admin_id = am->base_state.config.bootstrap_admin;
+  op->signer_id[0] = '\0';
+  op->node_id[0] = '\0';
+  if (admin_id != NULL && admin_id[0] != '\0') {
+    strncpy(op->signer_id, admin_id, CRABS_MAX_USER_ID - 1);
+    strncpy(op->node_id, admin_id, CRABS_MAX_USER_ID - 1);
+  }
+  rc = crabs_wasm_sign_with_node_key(am, op);
+  if (rc != CRABS_SUCCESS) {
+    operation_destroy(op);
+    return rc;
+  }
+  rc = state_machine_execute(&am->base_state, op);
+  operation_destroy(op);
+  return rc;
+}
+
 // ============================================================
 // Serialization helpers
 // ============================================================
