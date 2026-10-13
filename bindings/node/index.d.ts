@@ -506,7 +506,7 @@ export const TRUST_MODE: {
 
 /** An OT op identity: (node, seq) is the dedup key, ts the issuing stamp. */
 export interface OrderedSetOpId {
-  /** Issuing replica's id (max 63 characters). */
+  /** Issuing replica's id (max 63 bytes, UTF-8). */
   node: string;
   /** Per-replica sequence number (integer >= 0). */
   seq: number;

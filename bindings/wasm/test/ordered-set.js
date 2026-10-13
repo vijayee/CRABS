@@ -54,9 +54,21 @@ const { Node } = require('..');
   // ---- Scenario 5: replaying the SAME op id is a silent no-op --------------
   // The executor skips an op whose id is already in the item's op log
   // (ot_execution.c _op_already_applied) — the replayed MOVE must not
-  // duplicate or reshuffle anything.
-  node.orderedMove('list', 0, 2, { id: { node: 'reorderer', seq: 4, ts: 1001 } });
+  // duplicate or reshuffle anything. The replay must be byte-identical to
+  // the op it mirrors: a same-node HIGHER-seq id would take the raw path
+  // (scenario 2's contract) and a different-node id would take the transform
+  // path — neither exercises the dedup check.
+  node.orderedMove('list', 0, 2, { id: { node: 'node-a', seq: 4, ts: 1001 } });
   assertOrder(node, 'list', ['a', 'b', 'd'], 'replayed op id is idempotent');
+
+  // A genuinely NEW move from a fresh author is not a replay: it is
+  // concurrent with every op in this list's log, so the transform pushes its
+  // source/target positions back against those ops (here clamping both into
+  // each other's position — an observable no-effect), unlike the same-machine
+  // move in scenario 2 which applied raw. Pin: transformed, not reapplied.
+  node.orderedMove('list', 0, 2, { id: { node: 'fresh-author', seq: 1, ts: 1001 } });
+  assertOrder(node, 'list', ['a', 'b', 'd'],
+    'fresh-author move is transform-pushed back, not re-applied raw');
 
   // ---- Argument guards ------------------------------------------------------
   const mustThrowWith = (invoke, fragment, label) => {
@@ -97,14 +109,37 @@ const { Node } = require('..');
   // ---- Deps are carried on the wire: a dep-declared replay skips the ------
   // transform for everything it names (ot_transform.c crabs_op_depends_on) —
   // the replayed insert applies at its RAW position (0 → head), not at the
-  // transformed shifted one. Pin: x before m, not [m, x].
+  // transformed shifted one. Element ids are 'aaa'/'zzz' precisely so neither
+  // outcome can be explained by lexicographic name ordering: the shifted
+  // result is [aaa, zzz] (peer pushed AFTER the seed) and the raw result is
+  // the reverse — the two pins are mutually opposite under any readback sort.
+  // Both lists use the same seed id and the same peer op id; only the peer's
+  // `deps` presence differs.
   const depNode = await Node.create('dep-check', { ordering: 'hlc' });
   depNode.setPolicy('__execute_ot__', 'role:admin');
-  depNode.addOrderedSet('deps-list');
-  depNode.orderedInsert('deps-list', 'm', 0, { id: { node: 'dep-check', seq: 1, ts: 2000 } });
-  depNode.orderedInsert('deps-list', 'x', 0,
-    { id: { node: 'remote-node', seq: 1, ts: 5 }, deps: [{ node: 'dep-check', seq: 1 }] });
-  assertOrder(depNode, 'deps-list', ['x', 'm'],
+  depNode.addOrderedSet('shift-list');
+  depNode.addOrderedSet('raw-list');
+  const seedOp = { id: { node: 'dep-check', seq: 1, ts: 2000 } };
+  const peerOp = { id: { node: 'peer-replica', seq: 1, ts: 5 } };
+  // packOrderedDeps guard: a dep without a seq is rejected before any wire
+  // encoding (the 80-byte dep record cannot be built without the u64 seq).
+  mustThrowWith(() =>
+    depNode.orderedInsert('shift-list', 'zzz', 0,
+      { ...peerOp, deps: [{ node: 'dep-check' }] }),
+    'needs an integer seq', 'dep without seq');
+  depNode.orderedInsert('shift-list', 'aaa', 0, { ...seedOp });
+  depNode.orderedInsert('raw-list', 'aaa', 0, { ...seedOp });
+  // No deps: the seed insert is unseen concurrency, so the transform pushes
+  // the peer's position-0 insert one slot down — the peer lands BEHIND the
+  // seed, reversing its declared raw position.
+  depNode.orderedInsert('shift-list', 'zzz', 0, { ...peerOp });
+  assertOrder(depNode, 'shift-list', ['aaa', 'zzz'],
+    'no-deps peer insert must be transformed to its shifted position');
+  // With deps naming the seed op: that insert is no unseen concurrency, so
+  // the peer applies at its RAW position 0 — before the seed.
+  depNode.orderedInsert('raw-list', 'zzz', 0,
+    { ...peerOp, deps: [{ node: 'dep-check', seq: 1 }] });
+  assertOrder(depNode, 'raw-list', ['zzz', 'aaa'],
     'dep-declared replay must skip the transform (deps travel the wire)');
   depNode.destroy();
 

@@ -1184,7 +1184,7 @@ class Node {
       elementBytes.ptr, elementBytes.len,
       idNodePtr, BigInt(id.seq), BigInt(id.ts === undefined ? 0 : id.ts),
       depsPtr.ptr, deps.length);
-    freeAll(M, namePtr, idNodePtr, elementBytes.ptr, depsPtr);
+    freeAll(M, namePtr, idNodePtr, elementBytes.ptr, depsPtr.ptr);
     wrapRc(rc, ctx);
   }
 

@@ -60,6 +60,19 @@ assert.throws(() => node.orderedDelete('list', 99,
   { id: { node: 'node-a', seq: 9 } }),
   /ot_position_bounds|invalid_param/, 'delete past the end');
 
+// ---- Duplicate addOrderedSet is a typed refusal (leak guard) ---------------
+// AddOrderedSet allocates the item + its crabs_ot_ordered_set_t BEFORE
+// state_add_item runs; a state_add_item failure (duplicate_operation) runs
+// data_item_destroy on the uninserted item before throwing — mirroring
+// crabs_wasm_add_ordered_set's failure path (src/Util/wasm_helpers.c). The C
+// suite has no JS-visible allocator, so this pins the typed refusal and the
+// machine staying usable after it; the destroy itself is verified by code
+// read (data_item_destroy dispatches DATA_TYPE_OT_ORDERED_SET).
+assert.throws(() => node.addOrderedSet('list'), /duplicate_operation/,
+  'duplicate addOrderedSet must refuse, not crash or leak');
+assertOrder(node, 'list', ['a', 'b', 'd'],
+  'the machine is still usable after the refused addOrderedSet');
+
 // ---- A machine without the op-type policy refuses the op ------------------
 const unpoliced = new Node('node-plain', { ordering: 'hlc' });
 unpoliced.addOrderedSet('list');
@@ -70,14 +83,37 @@ assert.throws(() => unpoliced.orderedInsert('list', 'a', 0,
 // ---- Deps are carried on the wire: a dep-declared replay skips the --------
 // transform for everything it names (ot_transform.c crabs_op_depends_on) —
 // the replayed insert applies at its RAW position (0 -> head), not at the
-// transformed shifted one. Pin: x before m, not [m, x].
+// transformed shifted one. Element ids are 'aaa'/'zzz' precisely so neither
+// outcome can be explained by lexicographic name ordering: the shifted
+// result is [aaa, zzz] (peer pushed AFTER the seed) and the raw result is
+// the reverse — the two pins are mutually opposite under any readback sort.
+// Both lists use the same seed id and the same peer op id; only the peer's
+// `deps` presence differs.
 const depNode = new Node('dep-check', { ordering: 'hlc' });
 depNode.setPolicy('__execute_ot__', 'role:admin');
-depNode.addOrderedSet('deps-list');
-depNode.orderedInsert('deps-list', 'm', 0, { id: { node: 'dep-check', seq: 1, ts: 2000 } });
-depNode.orderedInsert('deps-list', 'x', 0,
-  { id: { node: 'remote-node', seq: 1, ts: 5 }, deps: [{ node: 'dep-check', seq: 1 }] });
-assertOrder(depNode, 'deps-list', ['x', 'm'],
+depNode.addOrderedSet('shift-list');
+depNode.addOrderedSet('raw-list');
+const seedOp = { id: { node: 'dep-check', seq: 1, ts: 2000 } };
+const peerOp = { id: { node: 'peer-replica', seq: 1, ts: 5 } };
+// The node binding's require path re-validates each dep on its way to
+// crabs_ot_op_id_init: a dep without a seq is rejected before any C call.
+assert.throws(() =>
+  depNode.orderedInsert('shift-list', 'zzz', 0,
+    { ...peerOp, deps: [{ node: 'dep-check' }] }),
+  /needs integer seq/, 'dep without seq');
+depNode.orderedInsert('shift-list', 'aaa', 0, { ...seedOp });
+depNode.orderedInsert('raw-list', 'aaa', 0, { ...seedOp });
+// No deps: the seed insert is unseen concurrency, so the transform pushes
+// the peer's position-0 insert one slot down — the peer lands BEHIND the
+// seed, reversing its declared raw position.
+depNode.orderedInsert('shift-list', 'zzz', 0, { ...peerOp });
+assertOrder(depNode, 'shift-list', ['aaa', 'zzz'],
+  'no-deps peer insert must be transformed to its shifted position');
+// With deps naming the seed op: that insert is no unseen concurrency, so
+// the peer applies at its RAW position 0 — before the seed.
+depNode.orderedInsert('raw-list', 'zzz', 0,
+  { ...peerOp, deps: [{ node: 'dep-check', seq: 1 }] });
+assertOrder(depNode, 'raw-list', ['zzz', 'aaa'],
   'dep-declared replay must skip the transform (deps travel the wire)');
 
 // ---- Two machines converge by exchanging ops ------------------------------

@@ -1823,7 +1823,13 @@ private:
     // dispatches OT destruction by type.
     item->value_repr = DATA_VALUE_REPR_CRDT_STRUCT;
     crabs_error_e rc = state_add_item(&am_->base_state, item);
-    if (rc != CRABS_SUCCESS) throw crabs_error(env, rc, "addOrderedSet");
+    // A failure here (e.g. duplicate_operation) leaves the item uninserted —
+    // destroy it before throwing or the item, its struct value and its
+    // ot_data all leak (mirrors crabs_wasm_add_ordered_set's failure path).
+    if (rc != CRABS_SUCCESS) {
+      data_item_destroy(item);
+      throw crabs_error(env, rc, "addOrderedSet");
+    }
     return env.Undefined();
   }
 
