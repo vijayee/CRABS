@@ -446,7 +446,10 @@ crabs_error_e crabs_wasm_op_add_resource(operation_t* op, const char* name);
 // custom spec is guarded AND mutated through the C condition evaluator and
 // the spec's state_mutation_t update field, whose targets are C-native
 // surfaces (the JS binding would mint specs whose post-handler mutation it
-// cannot reason about).
+// cannot reason about). The `condition` parameter is therefore dead for
+// every surfaced type — it is kept in the signature so the export mirrors
+// the dedup_spec_t layout end to end and a future C-side decision to expose
+// 'custom' does not change the ABI.
 EMSCRIPTEN_KEEPALIVE
 crabs_error_e crabs_wasm_define_operation_type(attribute_machine_t* am,
                                                const char* op_type,

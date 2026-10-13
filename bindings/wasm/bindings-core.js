@@ -1110,20 +1110,29 @@ class Node {
     if (options.dedup === 'per-user' && !options.trackerPath) {
       throw new Error("defineOperationType: dedup 'per-user' requires a trackerPath (the ONE_SHOT_SET once-record)");
     }
-    if (options.dedup === 'none' && options.trackerPath) {
-      throw new Error("defineOperationType: dedup 'none' takes no trackerPath (a 'none' definition removes the guard; nothing to track)");
+    if (options.dedup === 'none' && (options.trackerPath || options.flagPath)) {
+      throw new Error("defineOperationType: dedup 'none' takes no trackerPath/flagPath (a 'none' definition removes the guard; nothing to track)");
     }
     if (options.dedup === 'global' && !options.flagPath) {
       throw new Error("defineOperationType: dedup 'global' requires a flagPath (the ONE_SHOT_FLAG once-record)");
     }
+    // The C spec fields are CRABS_MAX_DEDUP_PATH (128) bytes — a longer path
+    // would be silently truncated into a tracker/flag lookup that never
+    // resolves, so refuse loudly instead.
+    const DEDUP_PATH_MAX = 127;
+    if (options.trackerPath && options.trackerPath.length > DEDUP_PATH_MAX) {
+      throw new Error(`defineOperationType: trackerPath exceeds ${DEDUP_PATH_MAX} bytes`);
+    }
+    if (options.flagPath && options.flagPath.length > DEDUP_PATH_MAX) {
+      throw new Error(`defineOperationType: flagPath exceeds ${DEDUP_PATH_MAX} bytes`);
+    }
     const opTypePtr = writeString(M, opType);
     const trackerPtr = options.trackerPath ? writeString(M, options.trackerPath) : 0;
     const flagPtr = options.flagPath ? writeString(M, options.flagPath) : 0;
-    const conditionPtr = options.condition ? writeString(M, options.condition) : 0;
     const messagePtr = options.rejectionMessage ? writeString(M, options.rejectionMessage) : 0;
     const rc = M._crabs_wasm_define_operation_type(
-      this._am, opTypePtr, dedupType, trackerPtr, flagPtr, conditionPtr, messagePtr);
-    freeAll(M, opTypePtr, trackerPtr, flagPtr, conditionPtr, messagePtr);
+      this._am, opTypePtr, dedupType, trackerPtr, flagPtr, 0, messagePtr);
+    freeAll(M, opTypePtr, trackerPtr, flagPtr, messagePtr);
     wrapRc(rc, 'defineOperationType');
   }
 

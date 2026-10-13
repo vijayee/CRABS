@@ -1998,15 +1998,27 @@ private:
           "defineOperationType: dedup 'per-user' requires a trackerPath "
           "(the ONE_SHOT_SET once-record)");
     }
-    if (dedup_type == DEDUP_NONE && !tracker_path.empty()) {
+    if (dedup_type == DEDUP_NONE &&
+        (!tracker_path.empty() || !flag_path.empty())) {
       throw Napi::TypeError::New(env,
-          "defineOperationType: dedup 'none' takes no trackerPath "
+          "defineOperationType: dedup 'none' takes no trackerPath/flagPath "
           "(a 'none' definition removes the guard; nothing to track)");
     }
     if (dedup_type == DEDUP_GLOBAL && flag_path.empty()) {
       throw Napi::TypeError::New(env,
           "defineOperationType: dedup 'global' requires a flagPath "
           "(the ONE_SHOT_FLAG once-record)");
+    }
+    // The C spec fields are CRABS_MAX_DEDUP_PATH (128) bytes — a longer
+    // path would be silently truncated into a tracker/flag lookup that
+    // never resolves, so refuse loudly instead.
+    if (tracker_path.length() >= CRABS_MAX_DEDUP_PATH) {
+      throw Napi::RangeError::New(env,
+          "defineOperationType: trackerPath exceeds 127 bytes");
+    }
+    if (flag_path.length() >= CRABS_MAX_DEDUP_PATH) {
+      throw Napi::RangeError::New(env,
+          "defineOperationType: flagPath exceeds 127 bytes");
     }
     if (options.Has("rejectionMessage")) {
       rejection_message = require_js_string(
