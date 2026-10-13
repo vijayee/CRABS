@@ -10,13 +10,23 @@ languages: c wasm node
 interactive: true
 teaches: counting with replicas: why max-per-lane beats one integer
 ---
-## Intent
+## The problem
 
-You want a count — opens, likes, uses — that many nodes can increment at once,
-while the records holding it stay divergent for a while and then agree. The
-requirement has two halves: no increment is ever counted twice, and every node
-ends up with the same total, no matter what order the increments arrived in
-and no coordination step at the end.
+Three laptops each count opens of the same document. They are offline half the
+time. Each laptop starts its copy of the count at zero and adds 1 whenever its
+user opens the document; when two laptops sync, whatever they send each other
+has to add up.
+
+Today the count is one integer on each laptop. Laptop A counts 5 opens, laptop
+B counts 5 opens, and the two sync. `5` meets `5` — and neither copy can tell
+whether that is the *same* five opens seen twice or *ten* different opens. The
+number that arrives cannot say what happened to it. Whichever laptop's value
+wins the sync, one of two things goes silently wrong for good: either an
+increment disappears (the copies overwrite each other's), or a real open never
+gets recounted because no copy remembers it. Retrying the sync changes
+nothing, because no copy is missing information about the network — each copy
+is missing information about *itself*. The problem is that `5` is the entire
+state, and CRABS' counter is designed around exactly that failure.
 
 ## The naive version, and where it breaks
 
@@ -39,76 +49,56 @@ that the correct representation is nearly free: keep a small table of
 `node -> count seen from that node`, and merge by taking the larger value per
 node. That table has no ordering requirement at all.
 
-## The shape
+## The idea
 
-- A counter is a named item on the node: `addCounter('opens')` (G-counter).
-- Each increment is attributed to a node id: `incrementCounter('opens', 1, 'counter')`.
+Give each replica its own *lane*, and let the count live in the lanes instead
+of a single cell. Three laptops produce three lanes: `A -> 4`, `B -> 3`,
+`C -> 2`. A laptop only ever adds to its own lane, so lanes never fight over
+the same slot. A sync merges lane tables by keeping the *larger* value per
+lane:
+
+| lane | laptop A | laptop B | merged |
+|---|---|---|---|
+| A | 4 | 2 | 4 |
+| B | 3 | 1 | 3 |
+| C | 2 | 0 | 2 |
+
+Both sides can arrive at that table and both get the same answer — `max` is
+deterministic, commutative, and idempotent. A lane only grows, so a value that
+synced twice adds nothing, a late-arriving older snapshot loses to the newer
+one, and no lane needs to know what order anything arrived in.
+
+The trade is baked into the design: the counter counts *what each lane saw*,
+not what happened in the world. Two laptops that both counted a genuinely
+different open each grow their own lane — right. One laptop that counted the
+same open twice grows its lane by 2 — the counter cannot object, because from
+inside the lane both adds look alike. If "this specific event, exactly once"
+is the requirement, the state needs a different shape (Recipe 3 takes it).
+
+## How CRABS encodes it
+
+- A counter is a named item on the machine: `addCounter('opens')` — a
+  G-counter, the lane table above.
+- Each increment names the node it came from:
+  `incrementCounter('opens', 1, 'counter')`.
 - A read, `getCounter('opens')`, sums the per-node table; merging two replicas
   keeps the larger value per node id, so replicas converge without
-  double-counting increments that the same node recorded (or re-recorded).
-- The item lives in the free-merge domain — `CRABS_DOMAIN_FREE_MERGE`
-  (`src/CRABS/crabs.h:55`), any authorized writer, CRDT merge semantics. This
-  is the G-counter: increments only, counts up. PN counters (`addPNCounter` /
-  `incrementPNCounter` / `decrementPNCounter`, api-map §4) exist for the case
-  where decrements are needed, and give up a little guaranteed simplicity for it.
+  double-counting an increment the same node recorded twice.
+- Retries are safe for the same reason: re-applying an increment bumps the
+  same lane toward its own max, so delivery replays cannot double-count.
+  What a retry *can* do is record a real second event from the same node.
+- The item lives in the free-merge domain — any authorized writer, CRDT
+  merge semantics. This is the increments-only counter; for negative
+  attribution there is a PN-counter family in the same surface.
+- Counter values are `int64_t` in C and numbers in both JS bindings; keep
+  deltas ordinary integers regardless.
 
-## What it guarantees / what it doesn't
-
-Guaranteed: under concurrent increments from many nodes, the counter converges
-to the same value everywhere, and no increment is double-counted — because
-increments are attributed per node and merge takes the per-node maximum, an
-increment that arrives twice (or from two replicas that both saw it) merges
-into one entry. Nothing about arrival order matters.
-
-Not guaranteed: strict per-event accounting. Free-merge combines per-node
-deltas — it is not a global ordered ledger of individual opens. If two nodes
-independently record the same logical event under different node ids, the
-merged total is their sum, not one entry; if the same node records an event
-twice, the merge cannot distinguish a retry from a second event on its own.
-The C snippet's second half shows both edges of this: `node-1` saw 3 opens,
-`node-2` saw 2, and the merge of the two is `max(3) + max(2) = 5` — converge
-without a leader, but count attribution is per node, not per event. If you
-need "this specific event, exactly once, from anywhere", that is dedup, and
-it is Recipe 3's problem, not the counter's.
-
-## Variations
-
-- Need decrements too? Swap `addCounter`/`incrementCounter` for
-  `addPNCounter`/`incrementPNCounter` and use `decrementPNCounter` to add
-  negative attribution — the merge keeps the per-node maximum on each side of
-  the entry, so decrements converge the same way. (Note the maturity split:
-  `decrementPNCounter` is declared but not exercised by any test we found —
-  see the Notes below.)
-- Same shape across process boundaries: attribution is by whatever node id
-  string you pass, so two processes each with their own `Node` and distinct
-  ids merge without coordination — nothing about the counter is per-machine.
-- Watch instead of poll: the change event stream (`on('change')`,
-  `bindings/wasm/test/change-events.js`) fires for counter mutations, so a
-  UI can render the count without polling `getCounter`.
-
-## Recipe
+## Try it
 
 ### crabs-wasm (browser / Node / edge)
 
 ```snippet:wasm/01-shared-count.js
 ```
-
-<!-- PROVENANCE
-target: crabs-wasm
-verified: executed
-symbols:
-  Node.create            bindings/wasm/index.d.ts:372
-  KeyPair.generate       bindings/wasm/index.d.ts:21
-  publicKeyHex           bindings/wasm/index.d.ts:15
-  KeyPair.destroy        bindings/wasm/index.d.ts:17
-  registerUser           bindings/wasm/index.d.ts:213
-  addCounter             bindings/wasm/index.d.ts:223
-  incrementCounter       bindings/wasm/index.d.ts:286
-  getCounter             bindings/wasm/index.d.ts:254
-  Node.destroy           bindings/wasm/index.d.ts:368
-maturity: all STABLE
-test_ref: bindings/wasm/test/smoke.js:1
--->
 
 <div class="interactive">
 
@@ -121,28 +111,74 @@ test_ref: bindings/wasm/test/smoke.js:1
 ```snippet:node/01-shared-count.js
 ```
 
-<!-- PROVENANCE
-target: crabs-node
-verified: executed
-symbols:
-  NodeStatic.new         bindings/node/index.d.ts:312
-  KeyPair.generate       bindings/node/index.d.ts:14
-  publicKeyHex           bindings/node/index.d.ts:8
-  registerUser           bindings/node/index.d.ts:182
-  addCounter             bindings/node/index.d.ts:193
-  incrementCounter       bindings/node/index.d.ts:238
-  getCounter             bindings/node/index.d.ts:224
-maturity: all STABLE
-test_ref: bindings/node/test/test.js:1
--->
-
 ### C (native)
 
 ```snippet:c/01-shared-count.c
 ```
 
+## What it guarantees / what it doesn't
+
+- Converges: under concurrent increments from many nodes, replicas end at
+  the same total regardless of arrival order.
+- No double-counting: an increment that arrives twice (or from two replicas
+  that both saw it) merges into one per-node entry.
+- Not a global ordered ledger: free-merge combines per-node deltas, so two
+  nodes independently recording the same logical event count it twice.
+  The C snippet's second half shows both edges: `node-1 -> 3` and
+  `node-2 -> 2` merge to `max(3) + max(2) = 5` — convergence without a
+  leader, attribution per node and not per event.
+- If you need "this specific event, exactly once, from anywhere", that is
+  dedup, and Recipe 3's problem, not the counter's.
+
+## Variations
+
+- Need decrements too? Swap `addCounter`/`incrementCounter` for the
+  PN-counter family (`addPNCounter`/`incrementPNCounter`/`decrementPNCounter`)
+  — the merge keeps the per-node maximum on each side of the entry, so
+  decrements converge the same way. The decrement method itself is PRESENT
+  (declared, see the footer) rather than smoke-tested.
+- Same shape across process boundaries: attribution is by whatever node id
+  string you pass, so two processes each with their own `Node` and distinct
+  ids merge without coordination — nothing about the counter is per-machine.
+- Watch instead of poll: the change event stream (`on('change')`) fires for
+  counter mutations, so a UI can render the count without polling
+  `getCounter`.
+
+## Verified against the code
+
 <!-- PROVENANCE
-target: native-c
+counter type: CRABS_DOMAIN_FREE_MERGE enum — src/CRABS/crabs.h:55
+g_counter surface: g_counter_create src/CRDT/crdt_merge.h:27 · increment :29 (int64_t delta) · value :30 · merge :31 (per-node max) · destroy :28
+
+target: crabs-wasm (snippet wasm/01-shared-count.js)
+verified: executed
+symbols:
+  Node.create            bindings/wasm/index.d.ts:774
+  KeyPair.generate       bindings/wasm/index.d.ts:44
+  publicKeyHex           bindings/wasm/index.d.ts:38
+  KeyPair.destroy        bindings/wasm/index.d.ts:42
+  registerUser           bindings/wasm/index.d.ts:480
+  addCounter             bindings/wasm/index.d.ts:490
+  incrementCounter       bindings/wasm/index.d.ts:586
+  getCounter             bindings/wasm/index.d.ts:554
+  Node.destroy           bindings/wasm/index.d.ts:770
+maturity: all STABLE
+test_ref: bindings/wasm/test/smoke.js:6-28 (addCounter/incrementCounter/getCounter idiom) + smoke.js:135 (Node.destroy)
+
+target: crabs-node (snippet node/01-shared-count.js)
+verified: executed
+symbols:
+  NodeStatic.new         bindings/node/index.d.ts:642 (new Node)
+  KeyPair.generate       bindings/node/index.d.ts:71
+  publicKeyHex           bindings/node/index.d.ts:28
+  registerUser           bindings/node/index.d.ts:304
+  addCounter             bindings/node/index.d.ts:315
+  incrementCounter       bindings/node/index.d.ts:396
+  getCounter             bindings/node/index.d.ts:382
+maturity: all STABLE
+test_ref: bindings/node/test/test.js:31 (new Node + hlc) · test.js:66-78 (direct increments, getCounter readback)
+
+target: native-c (snippet c/01-shared-count.c)
 verified: executed
 symbols:
   g_counter_create       src/CRDT/crdt_merge.h:27
@@ -152,26 +188,10 @@ symbols:
   g_counter_merge        src/CRDT/crdt_merge.h:31
   CRABS_SUCCESS          src/CRABS/crabs.h:65
 maturity: all STABLE
-test_ref: test/test_crdt.cpp:38
+test_ref: test/test_crdt.cpp:38 (TestMerge — max(5,0) + max(3,7) + max(0,2) = 14 over four node ids) · :61 (TestMergeSameNode — replayed increments stay max)
+
+PN counters: addPNCounter wasm bindings/wasm/index.d.ts:491 · node bindings/node/index.d.ts:316 — STABLE (both test suites).
+incrementPNCounter :587 / :397 — STABLE. decrementPNCounter :588 / :398 — PRESENT (declared; no test exercises it).
+Counter reads fire 'change' events: Node.on wasm :485 · node :310 (bindings/wasm/test/change-events.js:44-52).
+Counter values: int64_t deltas in C, numbers in both JS bindings (integer discipline on the int64-carrying register surface is recipe 5's; counter deltas stay plain integers).
 -->
-
-### Notes
-
-- Counter values are `int64_t` in C (`src/CRDT/crdt_merge.h:29`) and numbers in
-  both JS bindings; the JS-side integer discipline (fractions, NaN, and — on the
-  node binding — BigInt are rejected on the int64-carrying register surface,
-  `bindings/node/index.d.ts:227-234`) applies to registers, not to counter
-  deltas, but keep deltas ordinary integers anyway.
-- Need negative deltas? `addPNCounter` / `incrementPNCounter` (`wasm:224,287` /
-  `node:194,239`) are STABLE; `decrementPNCounter` (`wasm:288, node:240`) is
-  PRESENT — declared but not exercised by any test we found.
-- The merge is per-node-max, not sum: the C snippet's two replicas hold
-  `node-1 -> 3` and `node-2 -> 2` and merge to 5, and the C test suite asserts
-  the same shape over four node ids (`test/test_crdt.cpp:38` — `max(5,0) +
-  max(3,7) + max(0,2) = 14`).
-- Retries are safe precisely because attribution is per node: re-applying
-  `incrementCounter('opens', 1, 'counter')` to a replica that already counted
-  that open bumps the same per-node entry toward its own max, so delivery
-  retries and replay cannot double-count. What they *can* do is merge a real
-  second event from the same node — the counter counts node-attribution, not
-  events (see the guarantee discussion above).
