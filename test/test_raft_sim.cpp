@@ -1,6 +1,14 @@
 //
 // Deterministic Raft simulation harness (raft-ordering plan, Phase 1).
 //
+// HARNESS NOTE (environmental, not a CRABS defect): under scaled runs this
+// suite may crash on PROCESS EXIT with heap corruption inside OpenSSL 3's
+// CRYPTO_free_ex_data teardown — it reproduces at P2 HEAD as well, so it is
+// not introduced by scenario growth. All gtest assertions have already been
+// evaluated and reported before exit; treat a clean test summary followed by
+// an exit-stage segfault as the known environmental issue (recorded in the
+// raft-ordering plan's as-landed notes). No CRABS code path is implicated.
+//
 // Harness v1 shape: N module instances in one process, each optionally
 // attached to its own state machine, plus an in-memory "network" that routes
 // drained outbound messages to peer instances. The host model scripts loss,

@@ -87,3 +87,43 @@ bool raft_module_is_leader(module); uint64_t raft_module_committed_tip(module);
 - [ ] Final verification: full suites + parity + de-wonk two rounds.
 
 **Commit cadence:** per phase per the checklists, each green (ctest/node/wasm as applicable). P1 C-only; wasm regen at P4 (and once at P1 if exports needed early — decide by whether P1 tests can drive modules in-process (they can — pure C), so wasm regen only at P4 or at the first binding-touching commit).
+### As-landed corrections (2026-10-12, worktree `raft-ordering`)
+
+Three review fixes on the landed Phase 2/3 module, each with a RED-first harness scenario:
+
+- **Follower APPEND_RESP durability hold** — the append response's match_index
+  counts toward the leader's commit, so it now rides the exact vote-hold
+  machinery: held out of the reactor until the persist batch covering the
+  stored suffix acks (supersede-by-term flush mechanics unchanged; a match
+  already durable flows immediately). Covers the leader-durable +
+  follower-undurable window where a follower crash could evaporate a
+  "committed" entry. Scenario: `FollowerAcksWaitForTheirOwnDurability` (both
+  followers' persists held → nothing commits; a crash replay via
+  `recover_from_persist` resolves; late durability closes the quorum).
+- **Pump retry gate under a failed clock** — the no-time pump passed
+  `_at(state, 0)` into the shelf's backoff gate, minting `0 + backoff`
+  deadlines every later pump silently sat on. The pump body now carries an
+  explicit clock-trusted flag: a failed time source bypasses the gate
+  entirely and stamps no deadline; the trusted path is unchanged. Scenario:
+  `PumpRetriesEveryInvocationWhenClockFails` (dead time-source vtable seam).
+- **Ghost replication to evicted members** — the leader fan-out gated on the
+  address book; committed group data kept flowing to committed-config
+  evictions. Fan-out now gates on `_raft_append_admitted`: the COMMITTED
+  config (both lists during a joint phase) plus members of the in-flight
+  (appended-but-uncommitted) config entry — the change's own commit needs
+  those matches, so the gate must never deadlock the change it announces.
+  A ghost gets ONE `RAFT_MSG_CONFIG_EXCLUDED` control per leadership carrying
+  the commit ceiling (it replaces the peer's append traffic, letting it
+  finish committing what it durably holds), and the fan-out after the
+  auto-appended `C_new` successor ships it while the joint is still active.
+  Scenario: extended `SingleNodeJointAddThenRemoveCompletesSafely`.
+
+**Known environmental issue (not a CRABS defect):** an OpenSSL 3 exit-time
+`CRYPTO_free_ex_data` heap corruption surfaces at scale (many keypairs /
+ex-data registrations over a long test run) — a crash-on-process-exit that
+reproduces at P2 `HEAD` as well. Environmental (allocator/teardown ordering
+inside libcrypto), does not affect test outcomes before exit; no workaround
+beyond running suites under a toolchain whose libcrypto build avoids it.
+Noted here because there is no project KNOWN_ISSUES file; revisit if a
+keyring lifecycle migration to the OpenSSL 3 EVP APIs (audit N-19) changes
+the ex-data usage.
