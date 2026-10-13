@@ -874,19 +874,17 @@ private:
           "Expected addAttestation({ parentId, childId, userId, attributes, "
           "notBefore?, expiresAt?, parentKeyVersion, signatureHex })");
     Napi::Object fields = info[0].As<Napi::Object>();
-    auto require_string_field =
-        [&](const char* name, const char* ctx) -> std::string {
+    auto require_string_field = [&](const char* name) -> std::string {
       Napi::Value value = fields.Get(name);
       if (!value.IsString())
         throw Napi::TypeError::New(env,
             std::string("addAttestation: ") + name + " must be a string");
       return value.As<Napi::String>().Utf8Value();
     };
-    std::string parent_id = require_string_field("parentId", "addAttestation");
-    std::string child_id = require_string_field("childId", "addAttestation");
-    std::string user_id = require_string_field("userId", "addAttestation");
-    std::string attributes =
-        require_string_field("attributes", "addAttestation");
+    std::string parent_id = require_string_field("parentId");
+    std::string child_id = require_string_field("childId");
+    std::string user_id = require_string_field("userId");
+    std::string attributes = require_string_field("attributes");
     // Capacity-bound ids: a field the canonical body writer cannot
     // null-terminate would verify differently after transport than it was
     // staged here. Refuse loudly, mirroring AddLockClaim's invalid-param
@@ -906,8 +904,7 @@ private:
     // optional (default 0 — epoch, i.e. no lower fence), parentKeyVersion is
     // REQUIRED (the chain-TIP version the parent stamped; the executor's
     // tip-only gate compares it exactly with the child's chain tip).
-    auto stamp_field = [&](const char* name, bool required,
-                           const char* ctx) -> uint64_t {
+    auto stamp_field = [&](const char* name, bool required) -> uint64_t {
       Napi::Value value = fields.Get(name);
       if (value.IsUndefined() || value.IsNull()) {
         if (required)
@@ -929,18 +926,21 @@ private:
             " must be an integer 0..2^53-1");
       return (uint64_t)stamp;
     };
-    uint64_t not_before = stamp_field("notBefore", false, "addAttestation");
-    uint64_t expires_at = stamp_field("expiresAt", false, "addAttestation");
-    uint64_t parent_key_version =
-        stamp_field("parentKeyVersion", true, "addAttestation");
+    uint64_t not_before = stamp_field("notBefore", false);
+    uint64_t expires_at = stamp_field("expiresAt", false);
+    uint64_t parent_key_version = stamp_field("parentKeyVersion", true);
 
-    // The carried ECDSA: exactly 128 hex chars (64 bytes = CRABS_SIG_SIZE).
-    Napi::Value signature_value = fields.Get("signatureHex");
-    if (!signature_value.IsString()
-        || signature_value.As<Napi::String>().Utf8Value().length()
-               != CRABS_SIG_SIZE * 2)
+    // The carried ECDSA: decoded BEFORE any resize so a failed attach
+    // changes NOTHING (the reject-before-mutating contract).
+    std::string signature_hex =
+        require_string_field("signatureHex");
+    uint8_t signature[CRABS_SIG_SIZE];
+    if (signature_hex.length() != CRABS_SIG_SIZE * 2 ||
+        !hex_decode(signature_hex, signature, CRABS_SIG_SIZE)) {
+      OPENSSL_cleanse(signature, CRABS_SIG_SIZE);
       throw Napi::RangeError::New(env,
           "addAttestation: signatureHex must be 128 hex chars (64 bytes)");
+    }
 
     if (op_->attestation_count >= CRABS_MAX_OP_ATTESTATIONS)
       throw Napi::RangeError::New(env,
@@ -949,17 +949,11 @@ private:
     attestation_t* grown_attestations = (attestation_t*)realloc(
         op_->attestations,
         (op_->attestation_count + 1) * sizeof(attestation_t));
-    if (grown_attestations == NULL)
-      throw crabs_error(env, CRABS_ERR_OOM, "addAttestation");
-    op_->attestations = grown_attestations;
-
-    uint8_t signature[CRABS_SIG_SIZE];
-    std::string signature_hex = signature_value.As<Napi::String>().Utf8Value();
-    if (!hex_decode(signature_hex, signature, CRABS_SIG_SIZE)) {
+    if (grown_attestations == NULL) {
       OPENSSL_cleanse(signature, CRABS_SIG_SIZE);
-      throw Napi::RangeError::New(env,
-          "addAttestation: signatureHex must be 128 hex chars (64 bytes)");
+      throw crabs_error(env, CRABS_ERR_OOM, "addAttestation");
     }
+    op_->attestations = grown_attestations;
     attestation_t* attestation =
         &op_->attestations[op_->attestation_count];
     memset(attestation, 0, sizeof(*attestation));
