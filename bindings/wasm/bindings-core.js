@@ -203,9 +203,93 @@ const OT_OP_DELETE = 2; // CRABS_OT_OP_DELETE
 const OT_OP_MOVE   = 4; // CRABS_OT_OP_MOVE
 const OT_OP_SWAP   = 5; // CRABS_OT_OP_SWAP
 
+// Document type-specific op words (src/OT/ot_types.h) — see otDocumentApply.
+const OT_OP_INSERT_TEXT  = 0x11; // CRABS_OT_OP_INSERT_TEXT
+const OT_OP_DELETE_RANGE = 0x12; // CRABS_OT_OP_DELETE_RANGE
+const OT_OP_APPLY_STYLE  = 0x13; // CRABS_OT_OP_STYLE
+const OT_OP_MERGE_SPANS  = 0x14; // CRABS_OT_OP_MERGE_SPANS
+const OT_OP_SPLIT_SPAN   = 0x15; // CRABS_OT_OP_SPLIT_SPAN
+// Tree type-specific op words — see otTreeApply.
+const OT_TREE_OP_INSERT_NODE = 0x21; // CRABS_OT_OP_INSERT_NODE
+const OT_TREE_OP_DELETE_NODE = 0x22; // CRABS_OT_OP_DELETE_NODE
+const OT_TREE_OP_REPARENT    = 0x23; // CRABS_OT_OP_REPARENT
+const OT_TREE_OP_REORDER     = 0x24; // CRABS_OT_OP_REORDER
+
 const OT_MAX_DEPS = 16;          // CRABS_OT_MAX_DEPS
 const OT_ELEMENT_MAX_BYTES = 4096; // CRABS_OT_MAX_PAYLOAD (wasm export copies
                                   // at most this per element)
+const OT_TREE_NODE_ID_MAX = 64;  // CRABS_TREE_NODE_ID_MAX
+
+// The OT op identity + causal deps every ot* apply op sugar carries — the
+// same contract the ordered-set sugar validates inline (see
+// _orderedSetApply): id { node, seq, ts? } is required, deps is an
+// optional array of at most OT_MAX_DEPS such ids.
+function _otOpIdentity(options, context) {
+  if (!options || typeof options.id !== 'object' || options.id === null) {
+    throw new Error(
+      `${context}: id is required — { node, seq, ts? } fixes the op's OT identity`);
+  }
+  const id = options.id;
+  if (typeof id.node !== 'string' || id.node.length === 0) {
+    throw new Error(
+      `${context}: id.node is required (string, the issuing replica's id)`);
+  }
+  if (!Number.isInteger(id.seq) || id.seq < 0) {
+    throw new Error(
+      `${context}: id.seq is required (integer >= 0, unique per ${id.node})`);
+  }
+  if (id.ts !== undefined && (!Number.isInteger(id.ts) || id.ts < 0)) {
+    throw new Error(`${context}: id.ts must be a non-negative integer ms stamp`);
+  }
+  const deps = options.deps === undefined ? [] : options.deps;
+  if (!Array.isArray(deps) || deps.length > OT_MAX_DEPS) {
+    throw new Error(
+      `${context}: deps must be an array of at most ${OT_MAX_DEPS} { node, seq, ts? } ids`);
+  }
+  return { id, deps };
+}
+
+// Parse one packed document-span record:
+//   [u32le style_count][u32le text_len][text][styles: u32le len + bytes]
+function _otDocumentSpanParse(M, bufPtr, writtenSize) {
+  if (writtenSize <= 0) throw crabsError(0x5001, 'getOTDocument');
+  const bytes = new Uint8Array(M.HEAPU8.subarray(bufPtr, bufPtr + writtenSize));
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const styleCount = view.getUint32(0, true);
+  const textLen = view.getUint32(4, true);
+  const text = OT_TEXT_DECODER.decode(bytes.subarray(8, 8 + textLen));
+  let offset = 8 + textLen;
+  const styles = new Array(styleCount);
+  for (let styleIndex = 0; styleIndex < styleCount; styleIndex++) {
+    const styleNameLen = view.getUint32(offset, true); offset += 4;
+    const styleName = OT_TEXT_DECODER.decode(bytes.subarray(offset, offset + styleNameLen));
+    offset += styleNameLen;
+    const styleValueLen = view.getUint32(offset, true); offset += 4;
+    const styleValue = OT_TEXT_DECODER.decode(bytes.subarray(offset, offset + styleValueLen));
+    offset += styleValueLen;
+    styles[styleIndex] = { name: styleName, value: styleValue };
+  }
+  // textLen is the C byte count (the visible_char_count currency — the C
+  // document counts bytes); a JS consumer reading charCount gets that
+  // number back verbatim.
+  return { text, textLen, styles };
+}
+
+// Parse one packed tree-node record:
+//   [id 64 NUL-padded][parent_id 64 NUL-padded][u32le value_len][value]
+function _otTreeNodeParse(M, bufPtr, writtenSize) {
+  if (writtenSize < 128) throw crabsError(0x5001, 'getOTTree');
+  const bytes = new Uint8Array(M.HEAPU8.subarray(bufPtr, bufPtr + writtenSize));
+  const readFixed64 = (offset) => {
+    let end = offset;
+    while (end < offset + 64 && bytes[end] !== 0) end++;
+    return OT_TEXT_DECODER.decode(bytes.subarray(offset, end));
+  };
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const valueLen = view.getUint32(128, true);
+  const value = valueLen === 0 ? '' : OT_TEXT_DECODER.decode(bytes.subarray(132, 132 + valueLen));
+  return { id: readFixed64(0), parentId: readFixed64(64), value };
+}
 
 const OT_TEXT_ENCODER = { encode: (text) => encodeText(text) };
 const OT_TEXT_DECODER = typeof TextDecoder !== 'undefined'
@@ -1650,6 +1734,343 @@ class Node {
       idNodePtr, BigInt(id.seq), BigInt(id.ts === undefined ? 0 : id.ts),
       depsPtr.ptr, deps.length);
     freeAll(M, namePtr, idNodePtr, elementBytes.ptr, depsPtr.ptr);
+    wrapRc(rc, ctx);
+  }
+
+  // ============================================================
+  // OT document (OT_DOCUMENT, v1.5 §6) + OT tree (v1.5 §7) — parity-fill P6
+  //
+  // PRESENT but EXPLICITLY UNBLESSED: the document/tree paths are
+  // implemented (the __execute_ot__ executor routes both item types) but
+  // never benchmarked — the O(N) span/ops cost of document-style
+  // concurrency is a design-table claim, not a measured property, and the
+  // priority tie-break's generator (crabs_ot_data_item_next_priority) has
+  // no production caller (binding-composed ops carry priority 0; the
+  // transform's tie-break falls back to the (node_id, seq) total order).
+  // NEITHER type has a merge function: mergeState of one of their
+  // snapshots is HELD (__merge_held__, CRABS_ERR_TYPE_MISMATCH 0x3004) and
+  // the item does not land. Do not build rich text on this until a
+  // benchmark exists.
+  //
+  // Mirrors the ordered-set sugar: addOTDocument, the ot* op sugars, and
+  // otDocumentApply/otTreeApply take a required options bag
+  // { id: { node, seq, ts? }, deps?: [...] } with the same replay
+  // (deps-declared ops replay; same-id replays are silent no-ops) and
+  // transform semantics. Positions and the per-op shape are validated in
+  // C against the live item BEFORE anything is signed.
+  // ============================================================
+
+  addOTDocument(name) {
+    this._callAdd(this._M._crabs_wasm_add_ot_document, name, 'addOTDocument');
+  }
+
+  // Readback of one OT document: `text` — the visible characters in
+  // document order concatenated; `spans` — one record per VISIBLE span
+  // (skipping tombstones), each { text, styles: [{ name, value }, ...] };
+  // `charCount` — the live visible character count. Throws
+  // resource_not_found for an unknown or non-document name.
+  getOTDocument(name) {
+    const M = this._M;
+    const namePtr = writeString(M, name);
+    try {
+      const count = Number(M._crabs_wasm_ot_document_span_count(this._am, namePtr));
+      if (count < 0) throw crabsError(0x3002, 'getOTDocument');
+      const spans = new Array(count);
+      let text = '';
+      let charCount = 0;
+      for (let spanIndex = 0; spanIndex < count; spanIndex++) {
+        // Probe first (out = 0): the export returns the packed size to
+        // allocate, refusing nothing — then fetch into the sized buffer.
+        const size = Number(M._crabs_wasm_ot_document_span(
+          this._am, namePtr, spanIndex, 0, 0));
+        if (size < 0) throw crabsError(0x3002, 'getOTDocument');
+        const bufPtr = M._malloc(size);
+        try {
+          const span = _otDocumentSpanParse(M, bufPtr, Number(
+            M._crabs_wasm_ot_document_span(this._am, namePtr, spanIndex,
+                                           bufPtr, size)));
+          spans[spanIndex] = span;
+          text += span.text;
+          charCount += span.textLen;
+        } finally {
+          M._free(bufPtr);
+        }
+      }
+      return { text, spans, charCount };
+    } finally {
+      M._free(namePtr);
+    }
+  }
+
+  addOTTree(name) {
+    this._callAdd(this._M._crabs_wasm_add_ot_tree, name, 'addOTTree');
+  }
+
+  // Readback of one OT tree: `nodes` — every VISIBLE node in DFS order
+  // (roots first, then each node's children left to right; a tombstoned
+  // subtree is skipped wholesale), each { id, parentId, value, childIds }.
+  // An empty parentId marks a root. The array order IS the sibling order,
+  // so a consumer can rebuild the hierarchy from parentId alone; childIds
+  // is pre-resolved here for convenience. Throws resource_not_found for
+  // an unknown or non-tree name.
+  getOTTree(name) {
+    const M = this._M;
+    const namePtr = writeString(M, name);
+    try {
+      const count = Number(M._crabs_wasm_ot_tree_count(this._am, namePtr));
+      if (count < 0) throw crabsError(0x3002, 'getOTTree');
+      const records = new Array(count);
+      for (let nodeIndex = 0; nodeIndex < count; nodeIndex++) {
+        const size = Number(M._crabs_wasm_ot_tree_node(
+          this._am, namePtr, nodeIndex, 0, 0));
+        if (size < 0) throw crabsError(0x3002, 'getOTTree');
+        const bufPtr = M._malloc(size);
+        try {
+          records[nodeIndex] = _otTreeNodeParse(M, bufPtr, Number(
+            M._crabs_wasm_ot_tree_node(this._am, namePtr, nodeIndex,
+                                       bufPtr, size)));
+        } finally {
+          M._free(bufPtr);
+        }
+      }
+      // The DFS record order encodes sibling order; group the children under
+      // their parent (records appear after their parent, parents before).
+      const byId = new Map(records.map((entry) => [entry.id, entry]));
+      const rootIds = [];
+      const childIdsByParent = new Map();
+      for (const entry of records) {
+        if (entry.parentId === '') {
+          rootIds.push(entry.id);
+          continue;
+        }
+        const parent = byId.get(entry.parentId);
+        if (!parent) { rootIds.push(entry.id); continue; }
+        let siblings = childIdsByParent.get(entry.parentId);
+        if (!siblings) {
+          siblings = [];
+          childIdsByParent.set(entry.parentId, siblings);
+        }
+        siblings.push(entry.id);
+      }
+      return { nodes: records.map((entry) => ({
+        ...entry,
+        childIds: childIdsByParent.get(entry.id) || [],
+      })), rootIds };
+    } finally {
+      M._free(namePtr);
+    }
+  }
+
+  // ---- OT document mutation sugar (one __execute_ot__ op per call) ------
+  //
+  //   otInsertText(name, position, text, options)
+  //   otDeleteRange(name, position, length, options)
+  //   otApplyStyle(name, position, length, style, options)
+  //   otMergeSpans(name, spanPosA, spanPosB, options)   — SPAN indexes
+  //   otSplitSpan(name, position, options)              — mid-span offset
+  //   otDocumentApply(name, op) — the same ops behind op.kind words
+
+  otInsertText(name, position, text, options) {
+    this._otDocumentApply(name, OT_OP_INSERT_TEXT, {
+      position: validateOrderedPosition(position, 'otInsertText.position', 0),
+    }, text, null, null, options, 'otInsertText');
+  }
+
+  otDeleteRange(name, position, length, options) {
+    this._otDocumentApply(name, OT_OP_DELETE_RANGE, {
+      position: validateOrderedPosition(position, 'otDeleteRange.position', 0),
+      second: validateOrderedPosition(length, 'otDeleteRange.length', 1),
+    }, null, null, null, options, 'otDeleteRange');
+  }
+
+  otApplyStyle(name, position, length, style, options) {
+    if (!style || typeof style !== 'object' ||
+        typeof style.name !== 'string' || style.name.length === 0) {
+      throw new TypeError(
+        "otApplyStyle: style is required — { name: string, value?: string }");
+    }
+    if (typeof style.value !== 'undefined' && typeof style.value !== 'string') {
+      throw new TypeError('otApplyStyle: style.value must be a string');
+    }
+    this._otDocumentApply(name, OT_OP_APPLY_STYLE, {
+      position: validateOrderedPosition(position, 'otApplyStyle.position', 0),
+      second: validateOrderedPosition(length, 'otApplyStyle.length', 1),
+    }, null, style.name, style.value === undefined ? '' : style.value,
+    options, 'otApplyStyle');
+  }
+
+  otMergeSpans(name, spanPositionA, spanPositionB, options) {
+    this._otDocumentApply(name, OT_OP_MERGE_SPANS, {
+      position: validateOrderedPosition(spanPositionA, 'otMergeSpans.spanPositionA', 0),
+      second: validateOrderedPosition(spanPositionB, 'otMergeSpans.spanPositionB', 0),
+    }, null, null, null, options, 'otMergeSpans');
+  }
+
+  otSplitSpan(name, position, options) {
+    this._otDocumentApply(name, OT_OP_SPLIT_SPAN, {
+      position: validateOrderedPosition(position, 'otSplitSpan.position', 0),
+    }, null, null, null, options, 'otSplitSpan');
+  }
+
+  // Generic document-op route: op = { kind, position, length?, text?,
+  // style?, id, deps? } — kind is one of 'insertText' | 'deleteRange' |
+  // 'applyStyle' | 'mergeSpans' | 'splitSpan'.
+  otDocumentApply(name, op) {
+    if (!op || typeof op !== 'object') {
+      throw new TypeError('otDocumentApply: op object is required');
+    }
+    const kinds = {
+      insertText: OT_OP_INSERT_TEXT, deleteRange: OT_OP_DELETE_RANGE,
+      applyStyle: OT_OP_APPLY_STYLE, mergeSpans: OT_OP_MERGE_SPANS,
+      splitSpan: OT_OP_SPLIT_SPAN,
+    };
+    const opKind = kinds[op.kind];
+    if (!opKind) throw new TypeError('otDocumentApply: unknown op.kind');
+    if (opKind === OT_OP_INSERT_TEXT) {
+      this._otDocumentApply(name, opKind, {
+        position: validateOrderedPosition(op.position, 'otDocumentApply.position', 0),
+      }, op.text, null, null, op, 'otDocumentApply');
+    } else if (opKind === OT_OP_MERGE_SPANS) {
+      this._otDocumentApply(name, opKind, {
+        position: validateOrderedPosition(op.position, 'otDocumentApply.position', 0),
+        second: validateOrderedPosition(op.second, 'otDocumentApply.second', 0),
+      }, null, null, null, op, 'otDocumentApply');
+    } else if (opKind === OT_OP_SPLIT_SPAN) {
+      this._otDocumentApply(name, opKind, {
+        position: validateOrderedPosition(op.position, 'otDocumentApply.position', 0),
+      }, null, null, null, op, 'otDocumentApply');
+    } else {
+      this._otDocumentApply(name, opKind, {
+        position: validateOrderedPosition(op.position, 'otDocumentApply.position', 0),
+        second: validateOrderedPosition(op.length, 'otDocumentApply.length', 1),
+      }, null,
+      op.style && op.style.name ? String(op.style.name) : null,
+      op.style && op.style.value !== undefined ? String(op.style.value) : null,
+      op, 'otDocumentApply');
+    }
+  }
+
+  // ---- OT tree mutation sugar --------------------------------------------
+  //
+  //   otInsertNode(name, parentId, position, nodeId, value, options)
+  //   otDeleteNode(name, nodeId, options)
+  //   otReparent(name, nodeId, newParentId, position, options)
+  //   otReorder(name, nodeId, position, options)
+  //   otTreeApply(name, op) — the same ops behind op.kind words
+
+  otInsertNode(name, parentId, position, nodeId, value, options) {
+    if (value !== null && value !== undefined &&
+        typeof value !== 'string') {
+      throw new TypeError('otInsertNode: value must be a string or null');
+    }
+    this._otTreeApply(name, OT_TREE_OP_INSERT_NODE, {
+      position: validateOrderedPosition(position, 'otInsertNode.position', 0),
+    }, nodeId, parentId, value, options, 'otInsertNode');
+  }
+
+  otDeleteNode(name, nodeId, options) {
+    this._otTreeApply(name, OT_TREE_OP_DELETE_NODE, {
+      position: 0,
+    }, nodeId, '', null, options, 'otDeleteNode');
+  }
+
+  otReparent(name, nodeId, newParentId, position, options) {
+    this._otTreeApply(name, OT_TREE_OP_REPARENT, {
+      position: validateOrderedPosition(position, 'otReparent.position', 0),
+    }, nodeId, newParentId, null, options, 'otReparent');
+  }
+
+  otReorder(name, nodeId, position, options) {
+    this._otTreeApply(name, OT_TREE_OP_REORDER, {
+      position: validateOrderedPosition(position, 'otReorder.position', 0),
+    }, nodeId, '', null, options, 'otReorder');
+  }
+
+  // Generic tree-op route: op = { kind, nodeId, parentId?, newParentId?,
+  // position, value?, id, deps? } — kind is one of 'insertNode' |
+  // 'deleteNode' | 'reparent' | 'reorder'.
+  otTreeApply(name, op) {
+    if (!op || typeof op !== 'object') {
+      throw new TypeError('otTreeApply: op object is required');
+    }
+    if (op.kind === 'insertNode') {
+      this.otInsertNode(name, op.parentId || '', op.position, op.nodeId,
+        op.value, op);
+    } else if (op.kind === 'deleteNode') {
+      this.otDeleteNode(name, op.nodeId, op);
+    } else if (op.kind === 'reparent') {
+      this.otReparent(name, op.nodeId, op.newParentId || '', op.position, op);
+    } else if (op.kind === 'reorder') {
+      this.otReorder(name, op.nodeId, op.position, op);
+    } else {
+      throw new TypeError('otTreeApply: unknown op.kind');
+    }
+  }
+
+  _otDocumentApply(name, opKind, positions, text, styleName, styleValue,
+                   options, ctx) {
+    const M = this._M;
+    const { id, deps } = _otOpIdentity(options, ctx);
+    const textBytes = text === null || text === undefined
+      ? { ptr: 0, len: 0 }
+      : writeBytes(M, OT_TEXT_ENCODER.encode(text));
+    const depsPtr = writeBytes(M, packOrderedDeps(deps, ctx));
+    const namePtr = writeString(M, name);
+    const idNodePtr = writeString(M, id.node);
+    const styleNamePtr = styleName === null || styleName === undefined
+      ? 0 : writeString(M, styleName);
+    const styleValuePtr = styleValue === null || styleValue === undefined
+      ? 0 : writeString(M, styleValue);
+    const rc = M._crabs_wasm_ot_document_apply(
+      this._am, namePtr, opKind,
+      BigInt(positions.position),
+      BigInt(positions.second === undefined ? 0 : positions.second),
+      textBytes.ptr, textBytes.len, styleNamePtr, styleValuePtr,
+      idNodePtr, BigInt(id.seq), BigInt(id.ts === undefined ? 0 : id.ts),
+      depsPtr.ptr, deps.length);
+    freeAll(M, namePtr, idNodePtr, styleNamePtr, styleValuePtr);
+    freeAll(M, textBytes.ptr === 0 ? 0 : textBytes.ptr, depsPtr.ptr);
+    wrapRc(rc, ctx);
+  }
+
+  _otTreeApply(name, opKind, positions, nodeId, parentId, value, options,
+               ctx) {
+    if (typeof nodeId !== 'string' || nodeId.length === 0 ||
+        nodeId.length >= OT_TREE_NODE_ID_MAX) {
+      throw new RangeError(
+        `${ctx}: nodeId must be 1..${OT_TREE_NODE_ID_MAX - 1} characters`);
+    }
+    if (parentId !== null && parentId !== undefined &&
+        (typeof parentId !== 'string' ||
+         parentId.length >= OT_TREE_NODE_ID_MAX)) {
+      throw new RangeError(
+        `${ctx}: parentId must be at most ${OT_TREE_NODE_ID_MAX - 1} characters`);
+    }
+    if (value !== null && value !== undefined) {
+      const valueBytes = OT_TEXT_ENCODER.encode(String(value));
+      if (valueBytes.length > OT_ELEMENT_MAX_BYTES - 2 * OT_TREE_NODE_ID_MAX) {
+        throw new RangeError(
+          `${ctx}: node value payload exceeds the ${OT_ELEMENT_MAX_BYTES - 2 * OT_TREE_NODE_ID_MAX}-byte OT limit`);
+      }
+    }
+    const M = this._M;
+    const { id, deps } = _otOpIdentity(options, ctx);
+    const valueBytes = value === null || value === undefined
+      ? { ptr: 0, len: 0 }
+      : writeBytes(M, OT_TEXT_ENCODER.encode(String(value)));
+    const depsPtr = writeBytes(M, packOrderedDeps(deps, ctx));
+    const namePtr = writeString(M, name);
+    const idNodePtr = writeString(M, id.node);
+    const nodeIdPtr = writeString(M, nodeId);
+    const parentIdPtr = parentId === null || parentId === undefined || parentId === ''
+      ? 0 : writeString(M, parentId);
+    const rc = M._crabs_wasm_ot_tree_apply(
+      this._am, namePtr, opKind, BigInt(positions.position), nodeIdPtr,
+      parentIdPtr, valueBytes.ptr, valueBytes.len,
+      idNodePtr, BigInt(id.seq), BigInt(id.ts === undefined ? 0 : id.ts),
+      depsPtr.ptr, deps.length);
+    freeAll(M, namePtr, idNodePtr, nodeIdPtr, parentIdPtr);
+    freeAll(M, valueBytes.ptr === 0 ? 0 : valueBytes.ptr, depsPtr.ptr);
     wrapRc(rc, ctx);
   }
 

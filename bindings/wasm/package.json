@@ -17,7 +17,7 @@
   },
   "scripts": {
     "build": "cd ../.. && OPENSSL_SRC=/tmp/openssl-3.4.0 bash build_wasm.sh",
-    "test": "node test/smoke.js && node test/change-events.js && node test/devtools.js && node test/registers.js && node test/getuser-readback.js && node test/dedup-surface.js && node test/schedules.js && node test/time-source.js && node test/write-domains.js && node test/handler-reads.js && node test/ordered-set.js && node test/locks-tx.js && node test/attestations.js && node test/abe-decrypt.js && node test/key-transport.js && node test/keyring.js && node test/roles-admin.js && node test/wire-versions.js && node test/raft.js && node test/state-restore.js"
+    "test": "node test/smoke.js && node test/change-events.js && node test/devtools.js && node test/registers.js && node test/getuser-readback.js && node test/dedup-surface.js && node test/schedules.js && node test/time-source.js && node test/write-domains.js && node test/handler-reads.js && node test/ordered-set.js && node test/ot-document-tree.js && node test/locks-tx.js && node test/attestations.js && node test/abe-decrypt.js && node test/key-transport.js && node test/keyring.js && node test/roles-admin.js && node test/wire-versions.js && node test/raft.js && node test/state-restore.js"
   },
   "files": [
     "crabs.wasm",

@@ -29,6 +29,8 @@
 #include "../OT/ot_execution.h"
 #include "allocator.h"
 #include "../OT/ot_ordered_set.h"
+#include "../OT/ot_document.h"
+#include "../OT/ot_tree.h"
 #include "../TxManager/tx_manager.h"
 #include "../TxManager/tx_manager_memory.h"
 
@@ -1105,8 +1107,625 @@ crabs_error_e crabs_wasm_ot_apply(attribute_machine_t* am, const char* name,
 }
 
 // ============================================================
-// Write-domains v1 surfaces
+// OT document + OT tree (v1.5 §6 / §7) — parity-fill P6
+//
+// PRESENT but UNBLESSED: the document/tree op paths are real (the executor
+// routes DATA_TYPE_OT_DOCUMENT and DATA_TYPE_OT_TREE items through
+// crabs_apply_ot_op already) and now bound, but NO benchmark exists for the
+// O(N) span/ops cost of document-style concurrency, and NEITHER type has a
+// merge function (a mergeState of an OT_DOCUMENT/OT_TREE item is HELD —
+// __merge_held__ + CRABS_ERR_TYPE_MISMATCH — crdt_merge.c has no dispatch).
+// Do not build rich text on this until a benchmark exists.
 // ============================================================
+
+// Item creation mirrors crabs_register_ot_type (ot_execution.c) and
+// crabs_wasm_add_ordered_set above: the OT wrapper allocates its own
+// struct into item->value (document/tree structs create their own
+// op-log + transform-matrix ot_data) and item->ot_data aliases it —
+// crabs_apply_ot_op dereferences both unconditionally. Default domain:
+// FREE_MERGE (data_item_create enforces COUNTER/REGISTER-only for
+// SOVEREIGN; OT types are FREE_MERGE-legal, and held on merge anyway).
+// Every failure path destroys the item (which destroys the struct by
+// type), never leaks either side.
+
+EMSCRIPTEN_KEEPALIVE
+crabs_error_e crabs_wasm_add_ot_document(attribute_machine_t* am,
+                                         const char* name) {
+  if (!am || !name) return CRABS_ERR_INVALID_PARAM;
+  data_item_t* item = data_item_create(name, DATA_TYPE_OT_DOCUMENT,
+                                       CRDT_CUSTOM);
+  if (!item) return CRABS_ERR_OOM;
+  crabs_ot_document_t* doc = crabs_ot_document_create();
+  item->value = doc;
+  if (!doc) {
+    data_item_destroy(item);  // NULL value: destroy is safe on every field
+    return CRABS_ERR_OOM;
+  }
+  item->ot_data = doc->ot_data;
+  // Struct-backed value (crabs_ot_document_t) — data_item_destroy
+  // dispatches OT destruction by type.
+  item->value_repr = DATA_VALUE_REPR_CRDT_STRUCT;
+  crabs_error_e rc = state_add_item(&am->base_state, item);
+  if (rc != CRABS_SUCCESS) data_item_destroy(item);
+  return rc;
+}
+
+EMSCRIPTEN_KEEPALIVE
+crabs_error_e crabs_wasm_add_ot_tree(attribute_machine_t* am,
+                                     const char* name) {
+  if (!am || !name) return CRABS_ERR_INVALID_PARAM;
+  data_item_t* item = data_item_create(name, DATA_TYPE_OT_TREE, CRDT_CUSTOM);
+  if (!item) return CRABS_ERR_OOM;
+  crabs_ot_tree_t* tree = crabs_ot_tree_create();
+  item->value = tree;
+  if (!tree) {
+    data_item_destroy(item);  // NULL value: destroy is safe on every field
+    return CRABS_ERR_OOM;
+  }
+  item->ot_data = tree->ot_data;
+  // Struct-backed value (crabs_ot_tree_t) — data_item_destroy
+  // dispatches OT destruction by type.
+  item->value_repr = DATA_VALUE_REPR_CRDT_STRUCT;
+  crabs_error_e rc = state_add_item(&am->base_state, item);
+  if (rc != CRABS_SUCCESS) data_item_destroy(item);
+  return rc;
+}
+
+static crabs_ot_document_t* _ot_document_find(attribute_machine_t* am,
+                                              const char* name) {
+  if (!am || !name) return NULL;
+  data_item_t* item = state_find_item(&am->base_state, name);
+  if (!item || item->type != DATA_TYPE_OT_DOCUMENT) return NULL;
+  return (crabs_ot_document_t*)item->value;
+}
+
+static crabs_ot_tree_t* _ot_tree_find(attribute_machine_t* am,
+                                      const char* name) {
+  if (!am || !name) return NULL;
+  data_item_t* item = state_find_item(&am->base_state, name);
+  if (!item || item->type != DATA_TYPE_OT_TREE) return NULL;
+  return (crabs_ot_tree_t*)item->value;
+}
+
+// ---- Document readback -----------------------------------------------------
+//
+// crabs_wasm_ot_document_span_count reports the VISIBLE (tombstone-free)
+// span count, and crabs_wasm_ot_document_span packs span `index` (over the
+// visible spans, in document order) into `out`:
+//   [u32 LE style_count][u32 LE text_len][text bytes]
+//   [per style: u32 LE name_len][name][u32 LE value_len][value]
+// Return: -1 unknown item / bad params; -2 index out of range; otherwise
+// the packed byte size — when `cap` is too small the caller gets the size
+// to allocate WITHOUT the buffer being written (a probe-first idiom).
+
+EMSCRIPTEN_KEEPALIVE
+int64_t crabs_wasm_ot_document_span_count(attribute_machine_t* am,
+                                          const char* name) {
+  crabs_ot_document_t* doc = _ot_document_find(am, name);
+  if (!doc) return -1;
+  uint32_t visible = 0;
+  for (const crabs_span_t* span = doc->head; span != NULL; span = span->next) {
+    if (span->deleted) continue;
+    visible++;
+  }
+  return (int64_t)visible;
+}
+
+static int64_t _ot_document_span_pack(const crabs_span_t* span,
+                                      uint8_t* out, uint32_t cap) {
+  uint64_t needed = 8 + span->text_size;
+  for (uint32_t style_index = 0; style_index < span->style_count;
+       style_index++) {
+    const crabs_style_t* style = &span->styles[style_index];
+    // The C structs carry NUL-padded fixed arrays; the record stores
+    // lengths, so the NULs are not copied.
+    needed += 4 + strnlen(style->name, CRABS_STYLE_NAME_MAX);
+    needed += 4 + strnlen(style->value, CRABS_STYLE_VALUE_MAX);
+  }
+  if (out == NULL || cap < needed) return (int64_t)needed;  // probe answer
+
+  uint64_t offset = 0;
+  uint32_t text_len = span->text_size;
+  memcpy(out + offset, &span->style_count, 4);
+  memcpy(out + offset + 4, &text_len, 4);
+  offset = 8;
+  if (text_len > 0) memcpy(out + offset, span->text, text_len);
+  offset += text_len;
+  for (uint32_t style_index = 0; style_index < span->style_count;
+       style_index++) {
+    const crabs_style_t* style = &span->styles[style_index];
+    uint32_t name_len = (uint32_t)strnlen(style->name, CRABS_STYLE_NAME_MAX);
+    uint32_t value_len =
+        (uint32_t)strnlen(style->value, CRABS_STYLE_VALUE_MAX);
+    memcpy(out + offset, &name_len, 4);
+    offset += 4;
+    memcpy(out + offset, style->name, name_len);
+    offset += name_len;
+    memcpy(out + offset, &value_len, 4);
+    offset += 4;
+    memcpy(out + offset, style->value, value_len);
+    offset += value_len;
+  }
+  return (int64_t)offset;
+}
+
+EMSCRIPTEN_KEEPALIVE
+int64_t crabs_wasm_ot_document_span(attribute_machine_t* am, const char* name,
+                                    uint32_t visible_index, uint8_t* out,
+                                    uint32_t cap) {
+  crabs_ot_document_t* doc = _ot_document_find(am, name);
+  if (!doc) return -1;
+  if (out != NULL && cap == 0) return -1;
+  uint32_t seen = 0;
+  for (const crabs_span_t* span = doc->head; span != NULL; span = span->next) {
+    if (span->deleted) continue;
+    if (seen == visible_index) return _ot_document_span_pack(span, out, cap);
+    seen++;
+  }
+  return -2;
+}
+
+// ---- Tree readback ---------------------------------------------------------
+//
+// crabs_wasm_ot_tree_count reports the VISIBLE node count, and
+// crabs_wasm_ot_tree_node packs visible node `index` in DFS order
+// (roots first, then each node's children left to right, skipping
+// tombstones):
+//   [id 64 NUL-padded][parent_id 64 NUL-padded][u32 LE value_len][value]
+// Empty parent_id = the node is a root. Return codes as the span export.
+
+EMSCRIPTEN_KEEPALIVE
+int64_t crabs_wasm_ot_tree_count(attribute_machine_t* am, const char* name) {
+  crabs_ot_tree_t* tree = _ot_tree_find(am, name);
+  if (!tree) return -1;
+  return (int64_t)tree->visible_count;
+}
+
+// The visible node list in DFS order — an explicit worklist (children
+// pushed in reverse so the leftmost pops first) keeps an
+// attacker-shaped deep tree from overflowing the C stack.
+static const crabs_tree_node_t* _ot_tree_visible_at(
+    const crabs_ot_tree_t* tree, uint32_t visible_index) {
+  crabs_tree_node_t** stack = NULL;
+  uint32_t cap = 0;
+  uint32_t top = 0;
+  uint32_t ordinal = 0;
+  for (crabs_tree_node_t* root = tree->root; root != NULL;
+       root = root->next_sibling) {
+    void* grown = realloc(stack, sizeof(crabs_tree_node_t*) * (cap + 1));
+    if (!grown) { free(stack); return NULL; }
+    stack = grown;
+    cap++;
+    stack[top++] = root;
+  }
+  const crabs_tree_node_t* found = NULL;
+  while (top > 0) {
+    crabs_tree_node_t* node = stack[--top];
+    if (node->deleted) continue;
+    // Push children in reverse so the leftmost pops first.
+    uint32_t child_top = top;
+    for (crabs_tree_node_t* child = node->first_child; child != NULL;
+         child = child->next_sibling) {
+      if (top == cap) {
+        crabs_tree_node_t** grown = (crabs_tree_node_t**)realloc(
+            stack, sizeof(crabs_tree_node_t*) * cap * 2);
+        if (!grown) { free(stack); return NULL; }
+        stack = grown;
+        cap *= 2;
+      }
+      stack[top++] = child;
+    }
+    for (uint32_t left_index = child_top, right_index = top;
+         left_index < right_index; left_index++, right_index--) {
+      crabs_tree_node_t* swing = stack[left_index];
+      stack[left_index] = stack[right_index - 1];
+      stack[right_index - 1] = swing;
+    }
+    if (ordinal == visible_index) { found = node; break; }
+    ordinal++;
+  }
+  free(stack);
+  return found;
+}
+
+EMSCRIPTEN_KEEPALIVE
+int64_t crabs_wasm_ot_tree_node(attribute_machine_t* am, const char* name,
+                                uint32_t visible_index, uint8_t* out,
+                                uint32_t cap) {
+  crabs_ot_tree_t* tree = _ot_tree_find(am, name);
+  if (!tree) return -1;
+  if (out != NULL && cap == 0) return -1;
+  const crabs_tree_node_t* node = _ot_tree_visible_at(tree, visible_index);
+  if (!node) return -2;
+  uint64_t needed = 2 * (uint64_t)CRABS_TREE_NODE_ID_MAX + 4 +
+                    node->value_size;
+  if (out == NULL || cap < needed) return (int64_t)needed;  // probe answer
+
+  memset(out, 0, 2 * CRABS_TREE_NODE_ID_MAX);
+  memcpy(out, node->id, strnlen(node->id, CRABS_TREE_NODE_ID_MAX));
+  memcpy(out + CRABS_TREE_NODE_ID_MAX, node->parent_id,
+         strnlen(node->parent_id, CRABS_TREE_NODE_ID_MAX));
+  uint32_t value_len = node->value_size;
+  memcpy(out + 2 * CRABS_TREE_NODE_ID_MAX, &value_len, 4);
+  if (value_len > 0) {
+    memcpy(out + 2 * CRABS_TREE_NODE_ID_MAX + 4, node->value, value_len);
+  }
+  return (int64_t)needed;
+}
+
+// ---- Apply exports ---------------------------------------------------------
+
+// Compose, node-key-sign (bootstrap admin — the __create_trigger__ idiom;
+// the caller must install the '__execute_ot__' policy first) and execute
+// ONE op through the machine executor (CRABS_OP_EXECUTE_OT carrying the
+// wire-encoded crabs_ot_operation_t via crabs_ot_ops_to_wire). Shared by
+// the document and tree exporters below; `payload` is the per-op body the
+// executor parses (the type-gated cases in crabs_apply_ot_op).
+static crabs_error_e _ot_struct_apply_execute(
+    attribute_machine_t* am, const char* name,
+    const crabs_ot_operation_t* ot_op) {
+  uint8_t wire[4 + 4 + CRABS_MAX_USER_ID + 8 * 5 + 4 +
+               CRABS_OT_MAX_PAYLOAD + 2 * CRABS_TREE_NODE_ID_MAX +
+               4 + CRABS_OT_MAX_DEPS * (CRABS_MAX_USER_ID + 8 + 8)];
+  uint32_t wire_size = crabs_ot_ops_to_wire(ot_op, 1, wire, sizeof(wire));
+  if (wire_size == 0) return CRABS_ERR_INTERNAL;
+
+  operation_t* op = operation_create(CRABS_OP_EXECUTE_OT);
+  if (!op) return CRABS_ERR_OOM;
+  crabs_error_e rc = crabs_wasm_op_add_resource(op, name);
+  if (rc != CRABS_SUCCESS) {
+    operation_destroy(op);
+    return rc;
+  }
+  op->payload = (uint8_t*)malloc(wire_size);
+  if (!op->payload) {
+    operation_destroy(op);
+    return CRABS_ERR_OOM;
+  }
+  memcpy(op->payload, wire, wire_size);
+  op->payload_size = wire_size;
+  crypto_random_bytes(op->uuid, CRABS_UUID_SIZE);
+  const char* admin_id = am->base_state.config.bootstrap_admin;
+  if (admin_id != NULL && admin_id[0] != '\0') {
+    strncpy(op->signer_id, admin_id, CRABS_MAX_USER_ID - 1);
+    strncpy(op->node_id, admin_id, CRABS_MAX_USER_ID - 1);
+  }
+  rc = crabs_wasm_sign_with_node_key(am, op);
+  if (rc != CRABS_SUCCESS) {
+    operation_destroy(op);
+    return rc;
+  }
+  rc = state_machine_execute(&am->base_state, op);
+  operation_destroy(op);
+  return rc;
+}
+
+// Shared pre-flight: argument sanity, item lookup and type gate, op id and
+// dep reconstruction. Returns the resolved item through `out_item`; the
+// freshly init'ed op through `ot_op`. Positions are VALIDATED CALLER-SIDE
+// (each exporter against its own live semantics) — nothing is signed here.
+static crabs_error_e _ot_struct_apply_preflight(
+    attribute_machine_t* am, const char* name, data_type_e expected_type,
+    const char* id_node_id, uint64_t id_sequence, uint64_t id_timestamp,
+    const uint8_t* deps_wire, uint32_t dep_count,
+    crabs_ot_operation_t* ot_op, data_item_t** out_item) {
+  if (!am || !name) return CRABS_ERR_INVALID_PARAM;
+  if (!id_node_id || id_node_id[0] == '\0' ||
+      strlen(id_node_id) >= CRABS_MAX_USER_ID) {
+    return CRABS_ERR_INVALID_PARAM;
+  }
+  if (dep_count > CRABS_OT_MAX_DEPS) return CRABS_ERR_INVALID_PARAM;
+
+  data_item_t* item = state_find_item(&am->base_state, name);
+  if (!item) return CRABS_ERR_RESOURCE_NOT_FOUND;
+  if (item->type != expected_type) return CRABS_ERR_NOT_OT_TYPE;
+  if (item->value == NULL) return CRABS_ERR_INTERNAL;
+
+  crabs_ot_operation_init(ot_op);
+  crabs_ot_op_id_init(&ot_op->id, id_node_id, id_sequence, id_timestamp);
+  if (dep_count > 0) {
+    for (uint32_t dep_index = 0; dep_index < dep_count; dep_index++) {
+      crabs_ot_op_id_t dep;
+      _ot_dep_read_le(deps_wire + (size_t)dep_index * OT_DEP_RECORD_SIZE,
+                      &dep);
+      if (!crabs_ot_operation_add_dep(ot_op, &dep)) {
+        return CRABS_ERR_INVALID_PARAM;
+      }
+    }
+  }
+  *out_item = item;
+  return CRABS_SUCCESS;
+}
+
+// Apply ONE document op. `op_kind` is a crabs_ot_op_type_e restricted to
+// the document vocabulary (0x11-0x15). Position pairs are validated against
+// the LIVE document before anything is signed:
+//   INSERT_TEXT  pos = char offset (<= char_count), text 1..MAX_PAYLOAD bytes
+//   DELETE_RANGE pos = char offset, pos2 = length (pos+pos2 <= char_count)
+//   APPLY_STYLE  pos = char offset, pos2 = length, style_name/style_value
+//                packed into the executor's fixed crabs_style_t payload
+//   MERGE_SPANS  pos/pos2 = VISIBLE SPAN indexes (distinct)
+//   SPLIT_SPAN   pos = char offset strictly inside a span
+EMSCRIPTEN_KEEPALIVE
+crabs_error_e crabs_wasm_ot_document_apply(
+    attribute_machine_t* am, const char* name, int op_kind, uint64_t pos,
+    uint64_t pos2, const uint8_t* text, uint32_t text_len,
+    const char* style_name, const char* style_value, const char* id_node_id,
+    uint64_t id_sequence, uint64_t id_timestamp, const uint8_t* deps_wire,
+    uint32_t dep_count) {
+  crabs_ot_document_t* doc = _ot_document_find(am, name);
+  if (!doc) return CRABS_ERR_RESOURCE_NOT_FOUND;
+  uint32_t char_count = crabs_ot_document_char_count(doc);
+
+  if (text_len > 0 && (!text || text_len > CRABS_OT_MAX_PAYLOAD)) {
+    return CRABS_ERR_INVALID_PARAM;
+  }
+
+  crabs_ot_operation_t ot_op;
+  crabs_ot_operation_init(&ot_op);
+  data_item_t* item = NULL;
+  crabs_error_e rc = _ot_struct_apply_preflight(
+      am, name, DATA_TYPE_OT_DOCUMENT, id_node_id, id_sequence, id_timestamp,
+      deps_wire, dep_count, &ot_op, &item);
+  if (rc != CRABS_SUCCESS) return rc;
+  doc = (crabs_ot_document_t*)item->value;  // resolved through the executor item
+
+  ot_op.op_type = (crabs_ot_op_type_e)op_kind;
+  ot_op.visible_pos = pos;
+
+  switch (op_kind) {
+    case CRABS_OT_OP_INSERT_TEXT: {
+      if (pos > char_count) return CRABS_ERR_OT_POSITION_BOUNDS;
+      if (text == NULL || text_len == 0 || text_len > CRABS_OT_MAX_PAYLOAD) {
+        return CRABS_ERR_INVALID_PARAM;
+      }
+      if (!crabs_ot_operation_set_payload(&ot_op, text, text_len)) {
+        return CRABS_ERR_INVALID_PARAM;
+      }
+      break;
+    }
+    case CRABS_OT_OP_DELETE_RANGE: {
+      if (pos2 == 0) return CRABS_ERR_INVALID_PARAM;
+      if (pos > char_count || pos2 > char_count || pos + pos2 > char_count) {
+        return CRABS_ERR_OT_POSITION_BOUNDS;
+      }
+      ot_op.visible_pos_2 = pos2;
+      break;
+    }
+    case CRABS_OT_OP_STYLE: {
+      if (!style_name || strlen(style_name) == 0 ||
+          strlen(style_name) >= CRABS_STYLE_NAME_MAX) {
+        return CRABS_ERR_INVALID_PARAM;
+      }
+      if (style_value != NULL &&
+          strlen(style_value) >= CRABS_STYLE_VALUE_MAX) {
+        return CRABS_ERR_INVALID_PARAM;
+      }
+      if (pos2 == 0) return CRABS_ERR_INVALID_PARAM;
+      if (pos > char_count || pos2 > char_count || pos + pos2 > char_count) {
+        return CRABS_ERR_OT_POSITION_BOUNDS;
+      }
+      ot_op.visible_pos_2 = pos2;
+      crabs_style_t style;
+      memset(&style, 0, sizeof(style));
+      strncpy(style.name, style_name, CRABS_STYLE_NAME_MAX - 1);
+      if (style_value != NULL) {
+        strncpy(style.value, style_value, CRABS_STYLE_VALUE_MAX - 1);
+      }
+      if (!crabs_ot_operation_set_payload(
+              &ot_op, (const uint8_t*)&style, sizeof(style))) {
+        return CRABS_ERR_INVALID_PARAM;
+      }
+      break;
+    }
+    case CRABS_OT_OP_MERGE_SPANS: {
+      uint32_t span_count = crabs_ot_document_span_count(doc);
+      if (pos >= span_count || pos2 >= span_count || pos == pos2) {
+        return CRABS_ERR_OT_POSITION_BOUNDS;
+      }
+      ot_op.visible_pos_2 = pos2;
+      break;
+    }
+    case CRABS_OT_OP_SPLIT_SPAN: {
+      uint32_t offset = 0;
+      const crabs_span_t* span = NULL;
+      uint64_t remaining = pos;
+      for (const crabs_span_t* s = doc->head; s != NULL; s = s->next) {
+        if (s->deleted) continue;
+        if (remaining < s->text_size) { span = s; offset = (uint32_t)remaining; break; }
+        remaining -= s->text_size;
+      }
+      // A split at a span boundary (offset 0) or past the end is a silent
+      // no-op in the C op — refuse instead of signing a null op.
+      if (span == NULL || offset == 0) return CRABS_ERR_OT_POSITION_BOUNDS;
+      break;
+    }
+    default:
+      return CRABS_ERR_INVALID_PARAM;
+  }
+
+  rc = _ot_struct_apply_execute(am, name, &ot_op);
+  free(ot_op.payload);
+  return rc;
+}
+
+// Apply ONE tree op. `op_kind` is a crabs_ot_op_type_e restricted to the
+// tree vocabulary (0x21-0x24). Validated against the LIVE tree before
+// anything is signed:
+//   INSERT_NODE  parent_id '' = a root; else the parent must exist;
+//                node_id must be NEW; pos = child ordinal (0 prepends)
+//   DELETE_NODE  node must exist and still be visible
+//   REPARENT     node_id -> new_parent_id ('' = becomes a root) at pos;
+//                cycles (a self/descendant parent) are refused
+//   REORDER      node's position among its siblings (root-level nodes are
+//                refused — the C op requires a parent)
+EMSCRIPTEN_KEEPALIVE
+crabs_error_e crabs_wasm_ot_tree_apply(
+    attribute_machine_t* am, const char* name, int op_kind, uint64_t pos,
+    const char* node_id, const char* parent_id, const uint8_t* value,
+    uint32_t value_len, const char* id_node_id, uint64_t id_sequence,
+    uint64_t id_timestamp, const uint8_t* deps_wire, uint32_t dep_count) {
+  if (!node_id || strlen(node_id) == 0 ||
+      strlen(node_id) >= CRABS_TREE_NODE_ID_MAX) {
+    return CRABS_ERR_INVALID_PARAM;
+  }
+  if (parent_id != NULL && strlen(parent_id) >= CRABS_TREE_NODE_ID_MAX) {
+    return CRABS_ERR_INVALID_PARAM;
+  }
+  // The insert payload = parent_id + node_id + value must fit ONE op's
+  // MAX_PAYLOAD budget (the wire extractor refuses anything larger).
+  if (value_len > 0 && (!value ||
+        value_len > CRABS_OT_MAX_PAYLOAD - 2 * CRABS_TREE_NODE_ID_MAX)) {
+    return CRABS_ERR_INVALID_PARAM;
+  }
+
+  crabs_ot_tree_t* tree = _ot_tree_find(am, name);
+  if (!tree) return CRABS_ERR_RESOURCE_NOT_FOUND;
+
+  crabs_ot_operation_t ot_op;
+  crabs_ot_operation_init(&ot_op);
+  data_item_t* item = NULL;
+  crabs_error_e rc = _ot_struct_apply_preflight(
+      am, name, DATA_TYPE_OT_TREE, id_node_id, id_sequence, id_timestamp,
+      deps_wire, dep_count, &ot_op, &item);
+  if (rc != CRABS_SUCCESS) return rc;
+  tree = (crabs_ot_tree_t*)item->value;  // resolved through the executor item
+
+  ot_op.op_type = (crabs_ot_op_type_e)op_kind;
+  ot_op.visible_pos = pos;
+
+  uint8_t payload[2 * CRABS_TREE_NODE_ID_MAX + CRABS_OT_MAX_PAYLOAD];
+  uint32_t payload_size = 0;
+
+  switch (op_kind) {
+    case CRABS_OT_OP_INSERT_NODE: {
+      if (crabs_ot_tree_find(tree, node_id) != NULL) {
+        // A duplicate id would mint a second pool node the find-by-id
+        // surface can never address.
+        return CRABS_ERR_INVALID_PARAM;
+      }
+      uint64_t sibling_count;
+      memset(payload, 0, 2 * CRABS_TREE_NODE_ID_MAX);
+      if (parent_id == NULL || parent_id[0] == '\0') {
+        // Root level: positions are ordinals along the root chain. The
+        // payload's parent_id field stays ZEROED — the executor maps an
+        // empty parent_id to a NULL parent (a root).
+        sibling_count = 0;
+        for (const crabs_tree_node_t* root_node = tree->root; root_node != NULL;
+             root_node = root_node->next_sibling) {
+          if (!root_node->deleted) sibling_count++;
+        }
+        if (pos > sibling_count) return CRABS_ERR_OT_POSITION_BOUNDS;
+        memcpy(payload + CRABS_TREE_NODE_ID_MAX, node_id, strlen(node_id));
+      } else {
+        const crabs_tree_node_t* parent_node =
+            crabs_ot_tree_find(tree, parent_id);
+        if (parent_node == NULL) return CRABS_ERR_INVALID_PARAM;
+        sibling_count = 0;
+        for (const crabs_tree_node_t* child = parent_node->first_child;
+             child != NULL; child = child->next_sibling) {
+          if (!child->deleted) sibling_count++;
+        }
+        if (pos > sibling_count) return CRABS_ERR_OT_POSITION_BOUNDS;
+        memcpy(payload, parent_id, strlen(parent_id));
+        memcpy(payload + CRABS_TREE_NODE_ID_MAX, node_id, strlen(node_id));
+      }
+      payload_size = 2 * CRABS_TREE_NODE_ID_MAX;
+      if (value_len > 0) {
+        memcpy(payload + payload_size, value, value_len);
+        payload_size += value_len;
+      }
+      break;
+    }
+    case CRABS_OT_OP_DELETE_NODE: {
+      const crabs_tree_node_t* doomed = crabs_ot_tree_find(tree, node_id);
+      if (doomed == NULL || doomed->deleted) {
+        // Both are signed no-ops in the C op (delete returns the deleted
+        // node unchanged) — refuse before anything is signed.
+        return CRABS_ERR_INVALID_PARAM;
+      }
+      memset(payload, 0, CRABS_TREE_NODE_ID_MAX);
+      memcpy(payload, node_id, strlen(node_id));
+      payload_size = CRABS_TREE_NODE_ID_MAX;
+      break;
+    }
+    case CRABS_OT_OP_REPARENT: {
+      crabs_tree_node_t* moved = crabs_ot_tree_find(tree, node_id);
+      if (moved == NULL || moved->deleted) {
+        // A missing (or tombstoned) node is a signed no-op in the C op.
+        return CRABS_ERR_INVALID_PARAM;
+      }
+      const crabs_tree_node_t* new_parent = NULL;
+      bool to_root = (parent_id == NULL || parent_id[0] == '\0');
+      if (!to_root) {
+        new_parent = crabs_ot_tree_find(tree, parent_id);
+        if (new_parent == NULL) return CRABS_ERR_INVALID_PARAM;
+        // Mirror the cycles check the C op applies (it returns NULL, a
+        // silent no-op on the executor path — refuse before signing).
+        if (new_parent == moved) return CRABS_ERR_INVALID_PARAM;
+        uint32_t steps = 0;
+        const crabs_tree_node_t* ancestor = new_parent->parent;
+        while (ancestor != NULL && steps <= tree->node_count) {
+          if (ancestor == moved) return CRABS_ERR_INVALID_PARAM;
+          ancestor = ancestor->parent;
+          steps++;
+        }
+      }
+      // Position along the target sibling list.
+      if (to_root) {
+        uint64_t sibling_count = 0;
+        for (const crabs_tree_node_t* root_node = tree->root; root_node != NULL;
+             root_node = root_node->next_sibling) {
+          if (!root_node->deleted) sibling_count++;
+        }
+        if (pos > sibling_count) return CRABS_ERR_OT_POSITION_BOUNDS;
+      } else if (new_parent != NULL) {
+        uint64_t sibling_count = 0;
+        for (const crabs_tree_node_t* child = new_parent->first_child;
+             child != NULL; child = child->next_sibling) {
+          if (!child->deleted) sibling_count++;
+        }
+        if (pos > sibling_count) return CRABS_ERR_OT_POSITION_BOUNDS;
+      }
+      memset(payload, 0, 2 * CRABS_TREE_NODE_ID_MAX);
+      memcpy(payload, node_id, strlen(node_id));
+      if (!to_root) memcpy(payload + CRABS_TREE_NODE_ID_MAX, parent_id, strlen(parent_id));
+      payload_size = 2 * CRABS_TREE_NODE_ID_MAX;
+      break;
+    }
+    case CRABS_OT_OP_REORDER: {
+      const crabs_tree_node_t* moved = crabs_ot_tree_find(tree, node_id);
+      if (moved == NULL || moved->deleted) {
+        return CRABS_ERR_INVALID_PARAM;
+      }
+      if (moved->parent == NULL) {
+        // The C op refuses a parentless (root-level) node — refuse here so
+        // no signed no-op is minted.
+        return CRABS_ERR_INVALID_PARAM;
+      }
+      uint64_t sibling_count = 0;
+      for (const crabs_tree_node_t* sibling = moved->parent->first_child;
+           sibling != NULL; sibling = sibling->next_sibling) {
+        if (!sibling->deleted) sibling_count++;
+      }
+      if (pos > sibling_count) return CRABS_ERR_OT_POSITION_BOUNDS;
+      memset(payload, 0, CRABS_TREE_NODE_ID_MAX);
+      memcpy(payload, node_id, strlen(node_id));
+      payload_size = CRABS_TREE_NODE_ID_MAX;
+      break;
+    }
+    default:
+      return CRABS_ERR_INVALID_PARAM;
+  }
+
+  if (!crabs_ot_operation_set_payload(&ot_op, payload, payload_size)) {
+    return CRABS_ERR_INVALID_PARAM;
+  }
+
+  rc = _ot_struct_apply_execute(am, name, &ot_op);
+  free(ot_op.payload);
+  return rc;
+}
 
 // Item creation with an explicit write-domain declaration. The options
 // mirror data_item_options_t as scalars: write_domain is the

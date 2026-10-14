@@ -49,6 +49,8 @@ extern "C" {
 #include "Raft/raft_module.h"
 #include "OT/ot_execution.h"
 #include "OT/ot_ordered_set.h"
+#include "OT/ot_document.h"
+#include "OT/ot_tree.h"
 #include "TxManager/tx_manager.h"
 #include "Util/allocator.h"
 #include "TxManager/tx_manager_memory.h"
@@ -1227,6 +1229,21 @@ public:
       InstanceMethod("orderedDelete", &Node::OrderedDelete),
       InstanceMethod("orderedMove", &Node::OrderedMove),
       InstanceMethod("orderedSwap", &Node::OrderedSwap),
+      InstanceMethod("addOTDocument", &Node::AddOTDocument),
+      InstanceMethod("getOTDocument", &Node::GetOTDocument),
+      InstanceMethod("otInsertText", &Node::OtInsertText),
+      InstanceMethod("otDeleteRange", &Node::OtDeleteRange),
+      InstanceMethod("otApplyStyle", &Node::OtApplyStyle),
+      InstanceMethod("otMergeSpans", &Node::OtMergeSpans),
+      InstanceMethod("otSplitSpan", &Node::OtSplitSpan),
+      InstanceMethod("otDocumentApply", &Node::OtDocumentApply),
+      InstanceMethod("addOTTree", &Node::AddOTTree),
+      InstanceMethod("getOTTree", &Node::GetOTTree),
+      InstanceMethod("otInsertNode", &Node::OtInsertNode),
+      InstanceMethod("otDeleteNode", &Node::OtDeleteNode),
+      InstanceMethod("otReparent", &Node::OtReparent),
+      InstanceMethod("otReorder", &Node::OtReorder),
+      InstanceMethod("otTreeApply", &Node::OtTreeApply),
       InstanceMethod("setPolicy", &Node::SetPolicy),
       InstanceMethod("defineOperationType", &Node::DefineOperationType),
       InstanceMethod("execute", &Node::Execute),
@@ -2729,6 +2746,63 @@ private:
     if (rc != CRABS_SUCCESS) throw crabs_error(env, rc, ctx);
   }
 
+  // Attach the op identity + causal deps from an { id, deps? } options bag
+  // onto a composed OT op — the same contract the ordered-set sugar
+  // validates inline (OrderedSetApply). Shared by the document and tree
+  // appliers.
+  void _ot_attach_identity(const Napi::CallbackInfo& info, Napi::Object options,
+                           crabs_ot_operation_t* ot_op, const char* ctx) {
+    Napi::Env env = info.Env();
+    Napi::Object id = options.Get("id").As<Napi::Object>();
+    std::string id_node = require_js_string(id.Get("node"), ctx, "id.node");
+    if (id_node.empty() || id_node.length() >= CRABS_MAX_USER_ID)
+      throw Napi::RangeError::New(env, std::string(ctx) +
+          ": id.node must be 1..63 characters");
+    uint64_t id_sequence = require_u64_numeric(id.Get("seq"), ctx, "id.seq");
+    uint64_t id_timestamp = id.Has("ts") && !id.Get("ts").IsUndefined()
+        ? require_u64_numeric(id.Get("ts"), ctx, "id.ts") : 0;
+    crabs_ot_op_id_init(&ot_op->id, id_node.c_str(), id_sequence, id_timestamp);
+
+    if (options.Has("deps") && !options.Get("deps").IsUndefined()) {
+      if (!options.Get("deps").IsArray())
+        throw Napi::TypeError::New(env,
+            std::string(ctx) + ": deps must be an array of { node, seq, ts? }");
+      Napi::Array raw_deps = options.Get("deps").As<Napi::Array>();
+      if (raw_deps.Length() > CRABS_OT_MAX_DEPS)
+        throw Napi::RangeError::New(env,
+            std::string(ctx) + ": at most 16 causal deps per op");
+      for (uint32_t dep_index = 0; dep_index < raw_deps.Length(); dep_index++) {
+        Napi::Value raw_dep = raw_deps.Get(dep_index);
+        if (!raw_dep.IsObject())
+          throw Napi::TypeError::New(env,
+              std::string(ctx) + ": each dep must be { node, seq, ts? }");
+        Napi::Object dep = raw_dep.As<Napi::Object>();
+        if (!dep.Has("node") || !dep.Get("node").IsString())
+          throw Napi::TypeError::New(env,
+              std::string(ctx) + ": dep node is required (string)");
+        std::string dep_node = require_js_string(dep.Get("node"), ctx,
+                                                 "dep.node");
+        if (dep_node.empty() || dep_node.length() >= CRABS_MAX_USER_ID)
+          throw Napi::RangeError::New(env,
+              std::string(ctx) + ": dep node must be 1..63 characters");
+        if (!dep.Has("seq"))
+          throw Napi::TypeError::New(env,
+              std::string(ctx) + ": dep \"" + dep_node + "\" needs integer seq");
+        uint64_t dep_sequence = require_u64_numeric(dep.Get("seq"), ctx,
+                                                    "dep.seq");
+        uint64_t dep_timestamp = dep.Has("ts") && !dep.Get("ts").IsUndefined()
+            ? require_u64_numeric(dep.Get("ts"), ctx, "dep.ts") : 0;
+        crabs_ot_op_id_t dep_id;
+        crabs_ot_op_id_init(&dep_id, dep_node.c_str(), dep_sequence,
+                            dep_timestamp);
+        if (!crabs_ot_operation_add_dep(ot_op, &dep_id)) {
+          free(ot_op->payload);
+          throw crabs_error(env, CRABS_ERR_INVALID_PARAM, ctx);
+        }
+      }
+    }
+  }
+
   // The options object's position varies by method (last arg) — resolve it
   // once here so OrderedSetApply receives the parsed object.
   static Napi::Object require_ordered_options(const Napi::CallbackInfo& info,
@@ -2800,6 +2874,872 @@ private:
                                               "positionB");
     OrderedSetApply(info, options, name, CRABS_OT_OP_SWAP, position_a,
                     position_b, NULL, 0, "orderedSwap");
+    return env.Undefined();
+  }
+
+  // ============================================================
+  // OT document (OT_DOCUMENT, v1.5 §6) + OT tree (v1.5 §7) — parity-fill P6
+  //
+  // PRESENT but EXPLICITLY UNBLESSED: the document/tree op paths are real
+  // (the __execute_ot__ executor routes both item types through
+  // crabs_apply_ot_op) and now bound, but never benchmarked — the O(N) ops
+  // cost of document-style concurrency is a design-table claim, not a
+  // measured property, and the priority tie-break's generator
+  // (crabs_ot_data_item_next_priority) has no production caller
+  // (binding-composed ops carry priority 0; the transform's tie-break
+  // falls back to the (node_id, seq) total order). NEITHER type has a
+  // merge function: a mergeState of one of their snapshots is HELD
+  // (__merge_held__, CRABS_ERR_TYPE_MISMATCH 0x3004) and the item does not
+  // land. Do not build rich text on this until a benchmark exists.
+  // ============================================================
+
+  Napi::Value AddOTDocument(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    std::string name = require_js_string(info[0], "addOTDocument", "name");
+    data_item_t* item = data_item_create(name.c_str(),
+        DATA_TYPE_OT_DOCUMENT, CRDT_CUSTOM);
+    if (!item) throw crabs_error(env, CRABS_ERR_OOM, "addOTDocument");
+    crabs_ot_document_t* doc = crabs_ot_document_create();
+    item->value = doc;
+    if (!doc) {
+      data_item_destroy(item);  // NULL value: destroy is safe on every field
+      throw crabs_error(env, CRABS_ERR_OOM, "addOTDocument");
+    }
+    item->ot_data = doc->ot_data;
+    // Struct-backed value (crabs_ot_document_t) — data_item_destroy
+    // dispatches OT destruction by type.
+    item->value_repr = DATA_VALUE_REPR_CRDT_STRUCT;
+    crabs_error_e rc = state_add_item(&am_->base_state, item);
+    // A failure here (e.g. duplicate_operation) leaves the item uninserted
+    // — destroy it before throwing or the item, its struct value and its
+    // ot_data all leak (mirrors AddOrderedSet's failure path).
+    if (rc != CRABS_SUCCESS) {
+      data_item_destroy(item);
+      throw crabs_error(env, rc, "addOTDocument");
+    }
+    return env.Undefined();
+  }
+
+  // Readback of one OT document: text — the visible characters in document
+  // order concatenated; spans — one record per VISIBLE span (tombstones
+  // skipped), each { text, styles: [{ name, value }...] }; charCount — the
+  // live visible character count (a byte count in C).
+  Napi::Value GetOTDocument(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    std::string name = require_js_string(info[0], "getOTDocument", "name");
+    data_item_t* item = state_find_item(&am_->base_state, name.c_str());
+    if (!item || item->type != DATA_TYPE_OT_DOCUMENT)
+      throw crabs_error(env, CRABS_ERR_RESOURCE_NOT_FOUND, "getOTDocument");
+    crabs_ot_document_t* doc = (crabs_ot_document_t*)item->value;
+    if (!doc) throw crabs_error(env, CRABS_ERR_INTERNAL, "getOTDocument");
+
+    Napi::Array spans = Napi::Array::New(env);
+    std::string text;
+    uint64_t char_count = 0;
+    uint32_t span_position = 0;
+    for (crabs_span_t* span = doc->head; span != NULL; span = span->next) {
+      if (span->deleted) continue;
+      std::string span_text = span->text == NULL || span->text_size == 0
+          ? std::string("")
+          : std::string(reinterpret_cast<const char*>(span->text),
+                        span->text_size);
+      Napi::Object span_obj = Napi::Object::New(env);
+      span_obj.Set("text", Napi::String::New(env, span_text));
+      Napi::Array styles = Napi::Array::New(env);
+      for (uint32_t style_index = 0; style_index < span->style_count;
+           style_index++) {
+        Napi::Object style_obj = Napi::Object::New(env);
+        style_obj.Set("name", Napi::String::New(env, span->styles[style_index].name));
+        style_obj.Set("value", Napi::String::New(env, span->styles[style_index].value));
+        styles.Set(style_index, style_obj);
+      }
+      span_obj.Set("styles", styles);
+      spans.Set(span_position++, span_obj);
+      text += span_text;
+      char_count += span->text_size;
+    }
+    Napi::Object result = Napi::Object::New(env);
+    result.Set("text", Napi::String::New(env, text));
+    result.Set("spans", spans);
+    // Number-typed like the other count readbacks (double loses precision
+    // past 2^53 bytes — no realistic document does).
+    result.Set("charCount", Napi::Number::New(env, (double)char_count));
+    return result;
+  }
+
+  // Position validation + type gate for the document op sugars: mirrors the
+  // wasm exporter (src/Util/wasm_helpers.c crabs_wasm_ot_document_apply) —
+  // nothing is signed for an out-of-range or otherwise no-op apply.
+  crabs_ot_document_t* OtDocumentGate(
+      const Napi::CallbackInfo& info, const std::string& name,
+      const char* ctx) {
+    Napi::Env env = info.Env();
+    data_item_t* item = state_find_item(&am_->base_state, name.c_str());
+    if (!item) throw crabs_error(env, CRABS_ERR_RESOURCE_NOT_FOUND, ctx);
+    if (item->type != DATA_TYPE_OT_DOCUMENT)
+      throw crabs_error(env, CRABS_ERR_NOT_OT_TYPE, ctx);
+    crabs_ot_document_t* doc = (crabs_ot_document_t*)item->value;
+    if (!doc) throw crabs_error(env, CRABS_ERR_INTERNAL, ctx);
+    return doc;
+  }
+
+  uint64_t OtDocumentCharCount(crabs_ot_document_t* doc) {
+    uint64_t char_count = 0;
+    for (crabs_span_t* span = doc->head; span != NULL; span = span->next) {
+      if (!span->deleted) char_count += span->text_size;
+    }
+    return char_count;
+  }
+
+  uint64_t OtDocumentVisibleSpanCount(crabs_ot_document_t* doc) {
+    uint64_t span_count = 0;
+    for (crabs_span_t* span = doc->head; span != NULL; span = span->next) {
+      if (!span->deleted) span_count++;
+    }
+    return span_count;
+  }
+
+  // Validate the document op args against the LIVE document and compose the
+  // crabs_ot_operation_t the executor parses (crabs_apply_ot_op's
+  // DATA_TYPE_OT_DOCUMENT cases).
+  crabs_ot_operation_t OtDocumentCompose(
+      const Napi::CallbackInfo& info, Napi::Object options,
+      const std::string& name, uint32_t op_kind, uint64_t pos, uint64_t pos2,
+      const std::string& text, const std::string& style_name,
+      const std::string& style_value, const char* ctx) {
+    Napi::Env env = info.Env();
+    crabs_ot_document_t* doc = OtDocumentGate(info, name, ctx);
+    uint64_t char_count = OtDocumentCharCount(doc);
+
+    if (op_kind != CRABS_OT_OP_INSERT_TEXT && op_kind != CRABS_OT_OP_DELETE_RANGE &&
+        op_kind != CRABS_OT_OP_STYLE && op_kind != CRABS_OT_OP_MERGE_SPANS &&
+        op_kind != CRABS_OT_OP_SPLIT_SPAN) {
+      throw Napi::TypeError::New(env, std::string(ctx) + ": unknown op.kind");
+    }
+    if (text.size() > CRABS_OT_MAX_PAYLOAD) {
+      throw Napi::RangeError::New(env,
+          std::string(ctx) +
+          ": text payload exceeds the 4096-byte OT limit");
+    }
+
+    crabs_ot_operation_t ot_op;
+    crabs_ot_operation_init(&ot_op);
+    ot_op.op_type = (crabs_ot_op_type_e)op_kind;
+    ot_op.visible_pos = pos;
+    uint8_t style_payload[sizeof(crabs_style_t)];
+
+    switch (op_kind) {
+      case CRABS_OT_OP_INSERT_TEXT: {
+        if (pos > char_count)
+          throw crabs_error(env, CRABS_ERR_OT_POSITION_BOUNDS, ctx);
+        if (text.empty()) {
+          throw Napi::TypeError::New(env,
+              std::string(ctx) + ": text must be 1..4096 bytes");
+        }
+        break;
+      }
+      case CRABS_OT_OP_DELETE_RANGE: {
+        if (pos2 == 0 || pos > char_count || pos2 > char_count ||
+            pos + pos2 > char_count)
+          throw crabs_error(env, CRABS_ERR_OT_POSITION_BOUNDS, ctx);
+        ot_op.visible_pos_2 = pos2;
+        break;
+      }
+      case CRABS_OT_OP_STYLE: {
+        if (style_name.empty() || style_name.size() >= CRABS_STYLE_NAME_MAX) {
+          throw Napi::RangeError::New(env,
+              std::string(ctx) + ": style.name must be 1..31 characters");
+        }
+        if (style_value.size() >= CRABS_STYLE_VALUE_MAX) {
+          throw Napi::RangeError::New(env,
+              std::string(ctx) + ": style.value must be at most 63 characters");
+        }
+        if (pos2 == 0 || pos > char_count || pos2 > char_count ||
+            pos + pos2 > char_count)
+          throw crabs_error(env, CRABS_ERR_OT_POSITION_BOUNDS, ctx);
+        ot_op.visible_pos_2 = pos2;
+        memset(style_payload, 0, sizeof(style_payload));
+        strncpy(reinterpret_cast<char*>(style_payload), style_name.c_str(),
+                CRABS_STYLE_NAME_MAX - 1);
+        if (!style_value.empty()) {
+          strncpy(reinterpret_cast<char*>(style_payload) + CRABS_STYLE_NAME_MAX,
+                  style_value.c_str(), CRABS_STYLE_VALUE_MAX - 1);
+        }
+        if (!crabs_ot_operation_set_payload(&ot_op, style_payload,
+                                            sizeof(style_payload))) {
+          throw crabs_error(env, CRABS_ERR_INVALID_PARAM, ctx);
+        }
+        return ot_op;
+      }
+      case CRABS_OT_OP_MERGE_SPANS: {
+        uint64_t span_count = OtDocumentVisibleSpanCount(doc);
+        if (pos >= span_count || pos2 >= span_count || pos == pos2) {
+          throw crabs_error(env, CRABS_ERR_OT_POSITION_BOUNDS, ctx);
+        }
+        ot_op.visible_pos_2 = pos2;
+        break;
+      }
+      case CRABS_OT_OP_SPLIT_SPAN: {
+        // A split at a span boundary (offset 0 within its span) or past the
+        // end is a silent no-op in the C op — refuse before anything is
+        // signed.
+        uint64_t remaining = pos;
+        uint32_t offset = 0;
+        bool inside = false;
+        for (crabs_span_t* span = doc->head; span != NULL; span = span->next) {
+          if (span->deleted) continue;
+          if (remaining < span->text_size) {
+            offset = (uint32_t)remaining;
+            inside = true;
+            break;
+          }
+          remaining -= span->text_size;
+        }
+        if (!inside || offset == 0) {
+          throw crabs_error(env, CRABS_ERR_OT_POSITION_BOUNDS, ctx);
+        }
+        break;
+      }
+      default:
+        break;
+    }
+
+    if (!text.empty() && op_kind == CRABS_OT_OP_INSERT_TEXT) {
+      if (!crabs_ot_operation_set_payload(
+              &ot_op, reinterpret_cast<const uint8_t*>(text.data()),
+              (uint32_t)text.size())) {
+        throw crabs_error(env, CRABS_ERR_INVALID_PARAM, ctx);
+      }
+    }
+    return ot_op;
+  }
+
+  // Compose, node-key-sign and execute ONE OT op through the machine
+  // executor — the tail shared by the document and tree appliers (the
+  // ordered-set sugar OrderedSetApply carries its own copy of this).
+  void OtOpExecute(const Napi::CallbackInfo& info, const char* ctx,
+                   const std::string& name, crabs_ot_operation_t* ot_op) {
+    Napi::Env env = info.Env();
+    std::vector<uint8_t> wire(4 + 4 + CRABS_MAX_USER_ID + 8 * 5 + 4 +
+                              CRABS_OT_MAX_PAYLOAD + 4 +
+                              CRABS_OT_MAX_DEPS * (CRABS_MAX_USER_ID + 8 + 8));
+    uint32_t wire_size = crabs_ot_ops_to_wire(ot_op, 1, wire.data(),
+                                              (uint32_t)wire.size());
+    free(ot_op->payload);
+    ot_op->payload = NULL;
+    if (wire_size == 0)
+      throw crabs_error(env, CRABS_ERR_INTERNAL, ctx);
+
+    if (node_key_ == nullptr)
+      throw Napi::Error::New(env,
+          std::string(ctx) + ": this machine carries no own node key");
+    operation_t* op = operation_create(CRABS_OP_EXECUTE_OT);
+    if (op == NULL) throw crabs_error(env, CRABS_ERR_OOM, ctx);
+    operation_append_resource(op, name, env, ctx);
+    op->payload = (uint8_t*)malloc(wire_size);
+    if (op->payload == NULL) {
+      operation_destroy(op);
+      throw crabs_error(env, CRABS_ERR_OOM, ctx);
+    }
+    memcpy(op->payload, wire.data(), wire_size);
+    op->payload_size = wire_size;
+    crypto_random_bytes(op->uuid, CRABS_UUID_SIZE);
+    strncpy(op->signer_id, admin_id_.c_str(), CRABS_MAX_USER_ID - 1);
+    strncpy(op->node_id, admin_id_.c_str(), CRABS_MAX_USER_ID - 1);
+
+    // Stamp the signer's current key version (R7-04) and HLC when the
+    // machine is HLC-ordered, then sign — the same pre-sign stamping
+    // node.sign() performs.
+    if (am_->base_state.hlc_state_initialized) {
+      op->ordering_system = CRABS_ORDERING_HLC;
+      op->hlc = crabs_hlc_next(&am_->base_state.hlc_state);
+      strncpy(op->node_id, am_->base_state.hlc_state.last.node_id,
+              CRABS_MAX_USER_ID - 1);
+    }
+    user_t* signer_user = attribute_machine_find_user(am_, op->signer_id);
+    if (signer_user != NULL) {
+      op->signer_key_version = signer_user->key_version;
+    }
+    serialized_buffer_t* ser = crabs_serialize_for_signing(op);
+    if (ser == NULL) {
+      operation_destroy(op);
+      throw crabs_error(env, CRABS_ERR_SERIALIZATION_ERROR, ctx);
+    }
+    crabs_error_e rc = crypto_ecdsa_sign(node_key_->private_key, ser->data,
+                                         ser->len, op->signature);
+    serialized_buffer_destroy(ser);
+    if (rc != CRABS_SUCCESS) {
+      operation_destroy(op);
+      throw crabs_error(env, rc, (std::string(ctx) + " sign").c_str());
+    }
+
+    rc = state_machine_execute(&am_->base_state, op);
+    operation_destroy(op);
+    if (rc != CRABS_SUCCESS) throw crabs_error(env, rc, ctx);
+  }
+
+  // The doc/tree apply driver: identity from the options bag (the ordered-
+  // set contract), compose against the live item, execute through the
+  // machine.
+  void OtDocumentExecute(const Napi::CallbackInfo& info, Napi::Object options,
+                         const std::string& name, uint32_t op_kind,
+                         uint64_t pos, uint64_t pos2,
+                         const std::string& text,
+                         const std::string& style_name,
+                         const std::string& style_value, const char* ctx) {
+    crabs_ot_operation_t ot_op = OtDocumentCompose(info, options, name,
+        op_kind, pos, pos2, text, style_name, style_value, ctx);
+    _ot_attach_identity(info, options, &ot_op, ctx);
+    OtOpExecute(info, ctx, name, &ot_op);  // frees the op's payload itself
+  }
+
+  Napi::Value OtInsertText(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 4 || !info[3].IsObject())
+      throw Napi::TypeError::New(env,
+          "Expected otInsertText(name, position, text, options)");
+    Napi::Object options = require_ordered_options(info, 3, "otInsertText");
+    std::string name = require_js_string(info[0], "otInsertText", "name");
+    uint64_t position = require_u64_numeric(info[1], "otInsertText", "position");
+    std::string text = require_js_string(info[2], "otInsertText", "text");
+    if (text.empty())
+      throw Napi::TypeError::New(env, "otInsertText: text must be 1..4096 bytes");
+    OtDocumentExecute(info, options, name, CRABS_OT_OP_INSERT_TEXT, position,
+                      0, text, "", "", "otInsertText");
+    return env.Undefined();
+  }
+
+  Napi::Value OtDeleteRange(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 4 || !info[3].IsObject())
+      throw Napi::TypeError::New(env,
+          "Expected otDeleteRange(name, position, length, options)");
+    Napi::Object options = require_ordered_options(info, 3, "otDeleteRange");
+    std::string name = require_js_string(info[0], "otDeleteRange", "name");
+    uint64_t position = require_u64_numeric(info[1], "otDeleteRange", "position");
+    uint64_t length = require_u64_numeric(info[2], "otDeleteRange", "length");
+    OtDocumentExecute(info, options, name, CRABS_OT_OP_DELETE_RANGE, position,
+                      length, "", "", "", "otDeleteRange");
+    return env.Undefined();
+  }
+
+  Napi::Value OtApplyStyle(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 5 || !info[4].IsObject())
+      throw Napi::TypeError::New(env,
+          "Expected otApplyStyle(name, position, length, style, options)");
+    Napi::Object options = require_ordered_options(info, 4, "otApplyStyle");
+    std::string name = require_js_string(info[0], "otApplyStyle", "name");
+    uint64_t position = require_u64_numeric(info[1], "otApplyStyle", "position");
+    uint64_t length = require_u64_numeric(info[2], "otApplyStyle", "length");
+    if (!info[3].IsObject())
+      throw Napi::TypeError::New(env,
+          "otApplyStyle: style is required — { name: string, value?: string }");
+    Napi::Object style = info[3].As<Napi::Object>();
+    if (!style.Has("name") || !style.Get("name").IsString())
+      throw Napi::TypeError::New(env,
+          "otApplyStyle: style.name must be a string");
+    std::string style_name = require_js_string(style.Get("name"),
+        "otApplyStyle", "style.name");
+    if (style_name.empty())
+      throw Napi::RangeError::New(env,
+          "otApplyStyle: style.name must be 1..31 characters");
+    std::string style_value = style.Has("value") &&
+        style.Get("value").IsString()
+        ? require_js_string(style.Get("value"), "otApplyStyle", "style.value")
+        : std::string("");
+    OtDocumentExecute(info, options, name, CRABS_OT_OP_STYLE, position,
+                      length, "", style_name, style_value, "otApplyStyle");
+    return env.Undefined();
+  }
+
+  Napi::Value OtMergeSpans(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 4 || !info[3].IsObject())
+      throw Napi::TypeError::New(env,
+          "Expected otMergeSpans(name, spanPositionA, spanPositionB, options)");
+    Napi::Object options = require_ordered_options(info, 3, "otMergeSpans");
+    std::string name = require_js_string(info[0], "otMergeSpans", "name");
+    uint64_t position_a = require_u64_numeric(info[1], "otMergeSpans",
+                                              "spanPositionA");
+    uint64_t position_b = require_u64_numeric(info[2], "otMergeSpans",
+                                              "spanPositionB");
+    OtDocumentExecute(info, options, name, CRABS_OT_OP_MERGE_SPANS, position_a,
+                      position_b, "", "", "", "otMergeSpans");
+    return env.Undefined();
+  }
+
+  Napi::Value OtSplitSpan(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 3 || !info[2].IsObject())
+      throw Napi::TypeError::New(env,
+          "Expected otSplitSpan(name, position, options)");
+    Napi::Object options = require_ordered_options(info, 2, "otSplitSpan");
+    std::string name = require_js_string(info[0], "otSplitSpan", "name");
+    uint64_t position = require_u64_numeric(info[1], "otSplitSpan", "position");
+    OtDocumentExecute(info, options, name, CRABS_OT_OP_SPLIT_SPAN, position,
+                      0, "", "", "", "otSplitSpan");
+    return env.Undefined();
+  }
+
+  // Sugar-level option validation shared by the generic routers below:
+  // throws unless options carries a well-formed id (+ optional deps).
+  void OtRequireOpOptions(const Napi::CallbackInfo& info, Napi::Object options,
+                          const char* ctx) {
+    if (!options.Has("id") ||
+        !options.Get("id").IsObject()) {
+      throw Napi::TypeError::New(info.Env(),
+          std::string(ctx) +
+          ": id is required — { node, seq, ts? } fixes the op's OT identity");
+    }
+    Napi::Object id = options.Get("id").As<Napi::Object>();
+    if (!id.Has("node") || !id.Get("node").IsString() ||
+        id.Get("node").As<Napi::String>().Utf8Value().empty()) {
+      throw Napi::TypeError::New(info.Env(),
+          std::string(ctx) +
+          ": id.node is required (string, the issuing replica's id)");
+    }
+    if (!id.Has("seq")) {
+      throw Napi::TypeError::New(info.Env(),
+          std::string(ctx) +
+          ": id.seq is required (integer >= 0, unique per id.node)");
+    }
+    require_u64_numeric(id.Get("seq"), ctx, "id.seq");
+    if (id.Has("ts") && !id.Get("ts").IsUndefined())
+      require_u64_numeric(id.Get("ts"), ctx, "id.ts");
+  }
+
+  // The generic document-op route: op = { kind, position, length?, text?,
+  // style?, id, deps? } — kind is one of 'insertText' | 'deleteRange' |
+  // 'applyStyle' | 'mergeSpans' | 'splitSpan'.
+  Napi::Value OtDocumentApply(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 2 || !info[0].IsString() || !info[1].IsObject())
+      throw Napi::TypeError::New(env,
+          "Expected otDocumentApply(name, op)");
+    std::string name = require_js_string(info[0], "otDocumentApply", "name");
+    Napi::Object op = info[1].As<Napi::Object>();
+    if (!op.Has("kind") || !op.Get("kind").IsString())
+      throw Napi::TypeError::New(env, "otDocumentApply: op.kind is required");
+    std::string kind = to_lower_ascii(op.Get("kind").As<Napi::String>().Utf8Value());
+    OtRequireOpOptions(info, op, "otDocumentApply");
+
+    if (kind == "inserttext") {
+      if (!op.Has("text") || !op.Get("text").IsString())
+        throw Napi::TypeError::New(env, "otDocumentApply: text is required");
+      OtDocumentExecute(info, op, name, CRABS_OT_OP_INSERT_TEXT,
+          require_u64_numeric(op.Get("position"), "otDocumentApply", "position"),
+          0, require_js_string(op.Get("text"), "otDocumentApply", "text"),
+          "", "", "otDocumentApply");
+    } else if (kind == "deleterange") {
+      OtDocumentExecute(info, op, name, CRABS_OT_OP_DELETE_RANGE,
+          require_u64_numeric(op.Get("position"), "otDocumentApply", "position"),
+          require_u64_numeric(op.Get("length"), "otDocumentApply", "length"),
+          "", "", "", "otDocumentApply");
+    } else if (kind == "applystyle") {
+      if (!op.Has("style") || !op.Get("style").IsObject())
+        throw Napi::TypeError::New(env,
+            "otDocumentApply: style is required — { name: string, value?: string }");
+      Napi::Object style = op.Get("style").As<Napi::Object>();
+      if (!style.Has("name") || !style.Get("name").IsString())
+        throw Napi::TypeError::New(env,
+            "otDocumentApply: style.name must be a string");
+      std::string style_name = require_js_string(style.Get("name"),
+          "otDocumentApply", "style.name");
+      std::string style_value = style.Has("value") &&
+          style.Get("value").IsString()
+          ? require_js_string(style.Get("value"), "otDocumentApply",
+                              "style.value") : std::string("");
+      OtDocumentExecute(info, op, name, CRABS_OT_OP_STYLE,
+          require_u64_numeric(op.Get("position"), "otDocumentApply", "position"),
+          require_u64_numeric(op.Get("length"), "otDocumentApply", "length"),
+          "", style_name, style_value, "otDocumentApply");
+    } else if (kind == "mergespans") {
+      OtDocumentExecute(info, op, name, CRABS_OT_OP_MERGE_SPANS,
+          require_u64_numeric(op.Get("position"), "otDocumentApply", "position"),
+          require_u64_numeric(op.Get("second"), "otDocumentApply", "second"),
+          "", "", "", "otDocumentApply");
+    } else if (kind == "splitspan") {
+      OtDocumentExecute(info, op, name, CRABS_OT_OP_SPLIT_SPAN,
+          require_u64_numeric(op.Get("position"), "otDocumentApply", "position"),
+          0, "", "", "", "otDocumentApply");
+    } else {
+      throw Napi::TypeError::New(env, "otDocumentApply: unknown op.kind");
+    }
+    return env.Undefined();
+  }
+
+  // ============================================================
+  // OT tree (OT_TREE, v1.5 §7) — same unblessed caveat as the document
+  // ============================================================
+
+  Napi::Value AddOTTree(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    std::string name = require_js_string(info[0], "addOTTree", "name");
+    data_item_t* item = data_item_create(name.c_str(), DATA_TYPE_OT_TREE,
+                                         CRDT_CUSTOM);
+    if (!item) throw crabs_error(env, CRABS_ERR_OOM, "addOTTree");
+    crabs_ot_tree_t* tree = crabs_ot_tree_create();
+    item->value = tree;
+    if (!tree) {
+      data_item_destroy(item);  // NULL value: destroy is safe on every field
+      throw crabs_error(env, CRABS_ERR_OOM, "addOTTree");
+    }
+    item->ot_data = tree->ot_data;
+    // Struct-backed value (crabs_ot_tree_t) — data_item_destroy
+    // dispatches OT destruction by type.
+    item->value_repr = DATA_VALUE_REPR_CRDT_STRUCT;
+    crabs_error_e rc = state_add_item(&am_->base_state, item);
+    if (rc != CRABS_SUCCESS) {
+      data_item_destroy(item);
+      throw crabs_error(env, rc, "addOTTree");
+    }
+    return env.Undefined();
+  }
+
+  // Readback of one OT tree: nodes — every VISIBLE node in DFS order
+  // (roots first, then each node's children left to right; a tombstoned
+  // subtree is skipped wholesale), each { id, parentId, value, childIds }.
+  // An empty parentId marks a root; the array order IS the sibling order.
+  Napi::Value GetOTTree(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    std::string name = require_js_string(info[0], "getOTTree", "name");
+    data_item_t* item = state_find_item(&am_->base_state, name.c_str());
+    if (!item || item->type != DATA_TYPE_OT_TREE)
+      throw crabs_error(env, CRABS_ERR_RESOURCE_NOT_FOUND, "getOTTree");
+    crabs_ot_tree_t* tree = (crabs_ot_tree_t*)item->value;
+    if (!tree) throw crabs_error(env, CRABS_ERR_INTERNAL, "getOTTree");
+
+    // DFS over the root chain + children with an explicit worklist
+    // (children pushed in reverse so the leftmost pops first) — deep or
+    // attacker-shaped trees must not overflow the C++ stack.
+    std::vector<crabs_tree_node_t*> stack;
+    std::vector<crabs_tree_node_t*> roots;
+    for (crabs_tree_node_t* root = tree->root; root != NULL;
+         root = root->next_sibling) {
+      roots.push_back(root);
+    }
+    for (size_t reverse_index = roots.size(); reverse_index-- > 0;) {
+      stack.push_back(roots[reverse_index]);
+    }
+
+    Napi::Array nodes = Napi::Array::New(env);
+    uint32_t node_position = 0;
+    while (!stack.empty()) {
+      crabs_tree_node_t* node = stack.back();
+      stack.pop_back();
+      if (node->deleted) continue;
+
+      Napi::Object node_obj = Napi::Object::New(env);
+      node_obj.Set("id", Napi::String::New(env, node->id));
+      node_obj.Set("parentId", Napi::String::New(env, node->parent_id));
+      node_obj.Set("value",
+          node->value == NULL || node->value_size == 0
+              ? Napi::String::New(env, "")
+              : Napi::String::New(env,
+                  reinterpret_cast<const char*>(node->value),
+                  node->value_size));
+      // childIds in sibling order — the node's own position among its
+      // siblings is this record's index relative to equal-parent records.
+      Napi::Array child_ids = Napi::Array::New(env);
+      std::vector<crabs_tree_node_t*> children;
+      for (crabs_tree_node_t* child = node->first_child; child != NULL;
+           child = child->next_sibling) {
+        if (!child->deleted) children.push_back(child);
+      }
+      for (size_t child_index = 0; child_index < children.size();
+           child_index++) {
+        child_ids.Set(child_index,
+            Napi::String::New(env, children[child_index]->id));
+        stack.push_back(children[children.size() - 1 - child_index]);
+      }
+      node_obj.Set("childIds", child_ids);
+      nodes.Set(node_position++, node_obj);
+    }
+    Napi::Object result = Napi::Object::New(env);
+    result.Set("nodes", nodes);
+    return result;
+  }
+
+  crabs_ot_tree_t* OtTreeGate(const Napi::CallbackInfo& info,
+                              const std::string& name, const char* ctx) {
+    Napi::Env env = info.Env();
+    data_item_t* item = state_find_item(&am_->base_state, name.c_str());
+    if (!item) throw crabs_error(env, CRABS_ERR_RESOURCE_NOT_FOUND, ctx);
+    if (item->type != DATA_TYPE_OT_TREE)
+      throw crabs_error(env, CRABS_ERR_NOT_OT_TYPE, ctx);
+    crabs_ot_tree_t* tree = (crabs_ot_tree_t*)item->value;
+    if (!tree) throw crabs_error(env, CRABS_ERR_INTERNAL, ctx);
+    return tree;
+  }
+
+  // Compose the tree op against the live tree (crabs_apply_ot_op's
+  // DATA_TYPE_OT_TREE cases) — same no-silent-noop discipline as the wasm
+  // exporter: unknown/duplicate ids and no-op applies are refused BEFORE
+  // anything is signed.
+  crabs_ot_operation_t OtTreeCompose(
+      const Napi::CallbackInfo& info, const std::string& name, uint32_t op_kind,
+      uint64_t pos, const std::string& node_id, const std::string& parent_id,
+      const std::string& value, const char* ctx) {
+    Napi::Env env = info.Env();
+    crabs_ot_tree_t* tree = OtTreeGate(info, name, ctx);
+
+    if (node_id.empty() || node_id.size() >= CRABS_TREE_NODE_ID_MAX)
+      throw Napi::RangeError::New(env,
+          std::string(ctx) + ": nodeId must be 1..63 characters");
+    if (parent_id.size() >= CRABS_TREE_NODE_ID_MAX)
+      throw Napi::RangeError::New(env,
+          std::string(ctx) + ": parentId must be at most 63 characters");
+    if (value.size() >
+        CRABS_OT_MAX_PAYLOAD - 2 * CRABS_TREE_NODE_ID_MAX)
+      throw Napi::RangeError::New(env,
+          std::string(ctx) +
+          ": node value payload exceeds the 3968-byte OT limit");
+
+    crabs_ot_operation_t ot_op;
+    crabs_ot_operation_init(&ot_op);
+    ot_op.op_type = (crabs_ot_op_type_e)op_kind;
+    ot_op.visible_pos = pos;
+    std::vector<uint8_t> payload(2 * CRABS_TREE_NODE_ID_MAX + value.size(), 0);
+    uint32_t payload_size = 2 * CRABS_TREE_NODE_ID_MAX;
+
+    switch (op_kind) {
+      case CRABS_OT_OP_INSERT_NODE: {
+        if (crabs_ot_tree_find(tree, node_id.c_str()) != NULL) {
+          // A duplicate id would mint a second pool node the find-by-id
+          // surface can never address — the wasm exporter refuses with the
+          // typed invalid_param (crabs_wasm_ot_tree_apply); mirror it.
+          throw crabs_error(env, CRABS_ERR_INVALID_PARAM, ctx);
+        }
+        // The executor maps an EMPTY parent to a NULL parent (a root).
+        if (parent_id.empty()) {
+          uint64_t sibling_count = 0;
+          for (crabs_tree_node_t* root_node = tree->root; root_node != NULL;
+               root_node = root_node->next_sibling) {
+            if (!root_node->deleted) sibling_count++;
+          }
+          if (pos > sibling_count)
+            throw crabs_error(env, CRABS_ERR_OT_POSITION_BOUNDS, ctx);
+        } else {
+          crabs_tree_node_t* parent_node =
+              crabs_ot_tree_find(tree, parent_id.c_str());
+          if (parent_node == NULL)
+            throw crabs_error(env, CRABS_ERR_INVALID_PARAM, ctx);
+          uint64_t sibling_count = 0;
+          for (crabs_tree_node_t* child = parent_node->first_child;
+               child != NULL; child = child->next_sibling) {
+            if (!child->deleted) sibling_count++;
+          }
+          if (pos > sibling_count)
+            throw crabs_error(env, CRABS_ERR_OT_POSITION_BOUNDS, ctx);
+          memcpy(payload.data(), parent_id.c_str(), parent_id.size());
+        }
+        memcpy(payload.data() + CRABS_TREE_NODE_ID_MAX, node_id.c_str(),
+               node_id.size());
+        if (!value.empty()) {
+          memcpy(payload.data() + payload_size, value.data(), value.size());
+          payload_size += (uint32_t)value.size();
+        }
+        break;
+      }
+      case CRABS_OT_OP_DELETE_NODE: {
+        crabs_tree_node_t* doomed = crabs_ot_tree_find(tree, node_id.c_str());
+        if (doomed == NULL || doomed->deleted)
+          throw crabs_error(env, CRABS_ERR_INVALID_PARAM, ctx);
+        memcpy(payload.data(), node_id.c_str(), node_id.size());
+        payload_size = CRABS_TREE_NODE_ID_MAX;
+        break;
+      }
+      case CRABS_OT_OP_REPARENT: {
+        crabs_tree_node_t* moved = crabs_ot_tree_find(tree, node_id.c_str());
+        if (moved == NULL || moved->deleted)
+          throw crabs_error(env, CRABS_ERR_INVALID_PARAM, ctx);
+        bool to_root = parent_id.empty();
+        crabs_tree_node_t* new_parent = NULL;
+        if (!to_root) {
+          new_parent = crabs_ot_tree_find(tree, parent_id.c_str());
+          if (new_parent == NULL)
+            throw crabs_error(env, CRABS_ERR_INVALID_PARAM, ctx);
+          // Mirror the C cycle check (a cycle returns NULL = a signed
+          // no-op): the new parent must not be the node or its descendant.
+          if (new_parent == moved)
+            throw crabs_error(env, CRABS_ERR_INVALID_PARAM, ctx);
+          uint32_t steps = 0;
+          crabs_tree_node_t* ancestor = new_parent->parent;
+          while (ancestor != NULL && steps <= tree->node_count) {
+            if (ancestor == moved)
+              throw crabs_error(env, CRABS_ERR_INVALID_PARAM, ctx);
+            ancestor = ancestor->parent;
+            steps++;
+          }
+        }
+        if (to_root) {
+          uint64_t sibling_count = 0;
+          for (crabs_tree_node_t* root_node = tree->root; root_node != NULL;
+               root_node = root_node->next_sibling) {
+            if (!root_node->deleted) sibling_count++;
+          }
+          if (pos > sibling_count)
+            throw crabs_error(env, CRABS_ERR_OT_POSITION_BOUNDS, ctx);
+        } else {
+          uint64_t sibling_count = 0;
+          for (crabs_tree_node_t* child = new_parent->first_child;
+               child != NULL; child = child->next_sibling) {
+            if (!child->deleted) sibling_count++;
+          }
+          if (pos > sibling_count)
+            throw crabs_error(env, CRABS_ERR_OT_POSITION_BOUNDS, ctx);
+          memcpy(payload.data() + CRABS_TREE_NODE_ID_MAX, parent_id.c_str(),
+                 parent_id.size());
+        }
+        memcpy(payload.data(), node_id.c_str(), node_id.size());
+        payload_size = 2 * CRABS_TREE_NODE_ID_MAX;
+        break;
+      }
+      case CRABS_OT_OP_REORDER: {
+        crabs_tree_node_t* moved = crabs_ot_tree_find(tree, node_id.c_str());
+        if (moved == NULL || moved->deleted ||
+            moved->parent == NULL)  // the C op refuses root-level nodes
+          throw crabs_error(env, CRABS_ERR_INVALID_PARAM, ctx);
+        uint64_t sibling_count = 0;
+        for (crabs_tree_node_t* sibling = moved->parent->first_child;
+             sibling != NULL; sibling = sibling->next_sibling) {
+          if (!sibling->deleted) sibling_count++;
+        }
+        if (pos > sibling_count)
+          throw crabs_error(env, CRABS_ERR_OT_POSITION_BOUNDS, ctx);
+        memcpy(payload.data(), node_id.c_str(), node_id.size());
+        payload_size = CRABS_TREE_NODE_ID_MAX;
+        break;
+      }
+      default:
+        throw Napi::TypeError::New(env, std::string(ctx) + ": unknown op.kind");
+    }
+
+    if (!crabs_ot_operation_set_payload(&ot_op, payload.data(), payload_size))
+      throw crabs_error(env, CRABS_ERR_INVALID_PARAM, ctx);
+    return ot_op;
+  }
+
+  void OtTreeExecute(const Napi::CallbackInfo& info, Napi::Object options,
+                     const std::string& name, uint32_t op_kind, uint64_t pos,
+                     const std::string& node_id, const std::string& parent_id,
+                     const std::string& value, const char* ctx) {
+    crabs_ot_operation_t ot_op = OtTreeCompose(info, name, op_kind, pos,
+        node_id, parent_id, value, ctx);
+    _ot_attach_identity(info, options, &ot_op, ctx);
+    OtOpExecute(info, ctx, name, &ot_op);
+  }
+
+  Napi::Value OtInsertNode(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 6 || !info[5].IsObject())
+      throw Napi::TypeError::New(env,
+          "Expected otInsertNode(name, parentId, position, nodeId, value, options)");
+    Napi::Object options = require_ordered_options(info, 5, "otInsertNode");
+    std::string name = require_js_string(info[0], "otInsertNode", "name");
+    std::string parent_id = info[1].IsString()
+        ? require_js_string(info[1], "otInsertNode", "parentId")
+        : std::string("");
+    uint64_t position = require_u64_numeric(info[2], "otInsertNode", "position");
+    std::string node_id = require_js_string(info[3], "otInsertNode", "nodeId");
+    std::string value = info[4].IsString()
+        ? require_js_string(info[4], "otInsertNode", "value")
+        : std::string("");
+    OtTreeExecute(info, options, name, CRABS_OT_OP_INSERT_NODE, position,
+                  node_id, parent_id, value, "otInsertNode");
+    return env.Undefined();
+  }
+
+  Napi::Value OtDeleteNode(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 3 || !info[2].IsObject())
+      throw Napi::TypeError::New(env,
+          "Expected otDeleteNode(name, nodeId, options)");
+    Napi::Object options = require_ordered_options(info, 2, "otDeleteNode");
+    std::string name = require_js_string(info[0], "otDeleteNode", "name");
+    std::string node_id = require_js_string(info[1], "otDeleteNode", "nodeId");
+    OtTreeExecute(info, options, name, CRABS_OT_OP_DELETE_NODE, 0,
+                  node_id, "", "", "otDeleteNode");
+    return env.Undefined();
+  }
+
+  Napi::Value OtReparent(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 5 || !info[4].IsObject())
+      throw Napi::TypeError::New(env,
+          "Expected otReparent(name, nodeId, newParentId, position, options)");
+    Napi::Object options = require_ordered_options(info, 4, "otReparent");
+    std::string name = require_js_string(info[0], "otReparent", "name");
+    std::string node_id = require_js_string(info[1], "otReparent", "nodeId");
+    std::string new_parent_id = info[2].IsString()
+        ? require_js_string(info[2], "otReparent", "newParentId")
+        : std::string("");
+    uint64_t position = require_u64_numeric(info[3], "otReparent", "position");
+    OtTreeExecute(info, options, name, CRABS_OT_OP_REPARENT, position,
+                  node_id, new_parent_id, "", "otReparent");
+    return env.Undefined();
+  }
+
+  Napi::Value OtReorder(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 4 || !info[3].IsObject())
+      throw Napi::TypeError::New(env,
+          "Expected otReorder(name, nodeId, position, options)");
+    Napi::Object options = require_ordered_options(info, 3, "otReorder");
+    std::string name = require_js_string(info[0], "otReorder", "name");
+    std::string node_id = require_js_string(info[1], "otReorder", "nodeId");
+    uint64_t position = require_u64_numeric(info[2], "otReorder", "position");
+    OtTreeExecute(info, options, name, CRABS_OT_OP_REORDER, position,
+                  node_id, "", "", "otReorder");
+    return env.Undefined();
+  }
+
+  // Generic tree-op route: op = { kind, nodeId, parentId?, newParentId?,
+  // position, value?, id, deps? } — kind is one of 'insertNode' |
+  // 'deleteNode' | 'reparent' | 'reorder'.
+  Napi::Value OtTreeApply(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 2 || !info[0].IsString() || !info[1].IsObject())
+      throw Napi::TypeError::New(env, "Expected otTreeApply(name, op)");
+    std::string name = require_js_string(info[0], "otTreeApply", "name");
+    Napi::Object op = info[1].As<Napi::Object>();
+    if (!op.Has("kind") || !op.Get("kind").IsString())
+      throw Napi::TypeError::New(env, "otTreeApply: op.kind is required");
+    std::string kind = to_lower_ascii(op.Get("kind").As<Napi::String>().Utf8Value());
+    OtRequireOpOptions(info, op, "otTreeApply");
+
+    if (kind == "insertnode") {
+      OtTreeExecute(info, op, name, CRABS_OT_OP_INSERT_NODE,
+          require_u64_numeric(op.Get("position"), "otTreeApply", "position"),
+          require_js_string(op.Get("nodeId"), "otTreeApply", "nodeId"),
+          op.Has("parentId") && op.Get("parentId").IsString()
+              ? require_js_string(op.Get("parentId"), "otTreeApply", "parentId")
+              : std::string(""),
+          op.Has("value") && op.Get("value").IsString()
+              ? require_js_string(op.Get("value"), "otTreeApply", "value")
+              : std::string(""),
+          "otTreeApply");
+    } else if (kind == "deletenode") {
+      OtTreeExecute(info, op, name, CRABS_OT_OP_DELETE_NODE, 0,
+          require_js_string(op.Get("nodeId"), "otTreeApply", "nodeId"),
+          "", "", "otTreeApply");
+    } else if (kind == "reparent") {
+      OtTreeExecute(info, op, name, CRABS_OT_OP_REPARENT,
+          require_u64_numeric(op.Get("position"), "otTreeApply", "position"),
+          require_js_string(op.Get("nodeId"), "otTreeApply", "nodeId"),
+          op.Has("newParentId") && op.Get("newParentId").IsString()
+              ? require_js_string(op.Get("newParentId"), "otTreeApply",
+                                  "newParentId") : std::string(""),
+          "", "otTreeApply");
+    } else if (kind == "reorder") {
+      OtTreeExecute(info, op, name, CRABS_OT_OP_REORDER,
+          require_u64_numeric(op.Get("position"), "otTreeApply", "position"),
+          require_js_string(op.Get("nodeId"), "otTreeApply", "nodeId"),
+          "", "", "otTreeApply");
+    } else {
+      throw Napi::TypeError::New(env, "otTreeApply: unknown op.kind");
+    }
     return env.Undefined();
   }
 

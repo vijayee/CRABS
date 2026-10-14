@@ -198,7 +198,7 @@ export interface OrderedSetOpId {
   ts?: number;
 }
 
-/** Options for orderedInsert/orderedDelete/orderedMove/orderedSwap. */
+/** Options for the ordered*/ot* OT op sugars (the same id/deps contract). */
 export interface OrderedSetApplyOptions {
   /** Required — the op's OT identity (see Node's ordered* docs). */
   id: OrderedSetOpId;
@@ -719,6 +719,155 @@ export interface Node {
    */
   orderedSwap(name: string, positionA: number, positionB: number,
               options: OrderedSetApplyOptions): void;
+
+  // ============================================================
+  // OT document (OT_DOCUMENT, v1.5 §6) + OT tree (v1.5 §7) — parity-fill P6
+  //
+  // PRESENT maturity, EXPLICITLY UNBLESSED — the recipe-8b boundary bars
+  // re-verified against the current tree (see the facts below):
+  //
+  // - MERGE: there is NO merge function for documents and NO dispatch for
+  //   trees — crdt_merge.c holds every OT_DOCUMENT/OT_TREE item on a
+  //   mergeState fresh arrival (__merge_held__,
+  //   CRABS_ERR_TYPE_MISMATCH 0x3004) and silently no-ops a same-name
+  //   merge. Held-on-merge IS this type's honest merge status; the tree's
+  //   crabs_ot_tree_merge (src/OT/ot_tree.c:583) exists but is not wired
+  //   into any merge state flow.
+  // - TIE-BREAK: the priority GENERATOR (crabs_ot_data_item_next_priority,
+  //   src/OT/ot_types.c:200) has no production caller — ops composed here
+  //   carry priority 0, so concurrent-same-position inserts resolve through
+  //   the transform's (node_id, seq) total order (ot_transform.c:57-85),
+  //   which is deterministic but is NOT the named priority mechanism.
+  // - BENCHMARK: none. The O(N) transform/per-op cost of document-style
+  //   concurrency is a design-table claim, unmeasured.
+  //
+  // => implemented, unbenchmarked. Do not build rich text on this until a
+  //    benchmark exists (recipe 8's rich-text boundary note).
+  // ============================================================
+  /**
+   * Create an OT document item (data type 0x11) on this machine. The item
+   * carries its own op log + transform matrix; apply ops with
+   * otInsertText/otDeleteRange/otApplyStyle/otMergeSpans/otSplitSpan (or
+   * the generic otDocumentApply), read it back with getOTDocument.
+   */
+  addOTDocument(name: string): void;
+  /**
+   * Readback of one OT document: `text` — the visible characters in
+   * document order concatenated; `spans` — one record per VISIBLE span
+   * (tombstones skipped), each { text, styles: [{name, value}, ...] };
+   * `charCount` — the live visible character count (a BYTE count in C).
+   * Throws resource_not_found for an unknown or non-document name.
+   */
+  getOTDocument(name: string):
+    { text: string;
+      spans: { text: string; styles: { name: string; value: string }[] }[];
+      charCount: number };
+  /**
+   * Apply ONE document op through the machine executor, signed with the
+   * node key under the bootstrap admin (the createTrigger idiom — install
+   * the op type's policy first: setPolicy('__execute_ot__', 'role:admin')).
+   *
+   * options.id is required ({ node, seq, ts? } — the op's OT identity; a
+   * replayed same id is a silent no-op); options.deps (optional, max 16)
+   * is the causal context the ISSUER had — cross-replica replays need it
+   * or the transform treats the replica's prior ops as concurrent.
+   *
+   * The args are validated in C against the LIVE document before anything
+   * is signed (an out-of-range offset or a boundary split is refused with
+   * ot_position_bounds, never logged as a doing-nothing op).
+   */
+  otInsertText(name: string, position: number, text: string,
+               options: OrderedSetApplyOptions): void;
+  /** Delete `length` characters at `position` (a tombstoning range op). */
+  otDeleteRange(name: string, position: number, length: number,
+                options: OrderedSetApplyOptions): void;
+  /**
+   * Apply one style (style = { name: string, value?: string }, the C
+   * crabs_style_t model) to `length` characters at `position`.
+   */
+  otApplyStyle(name: string, position: number, length: number,
+               style: { name: string; value?: string },
+               options: OrderedSetApplyOptions): void;
+  /** Merge the two VISIBLE SPAN indexes' texts in place (b is tombstoned). */
+  otMergeSpans(name: string, spanPositionA: number, spanPositionB: number,
+               options: OrderedSetApplyOptions): void;
+  /** Split the span crossing `position` (a mid-span character offset). */
+  otSplitSpan(name: string, position: number,
+              options: OrderedSetApplyOptions): void;
+  /**
+   * The generic document-op route: op = { kind, position, length?, text?,
+   * style?, id, deps? } — kind is one of 'insertText' | 'deleteRange' |
+   * 'applyStyle' | 'mergeSpans' | 'splitSpan'. The five ot* sugars above
+   * are thin fronts over the same path.
+   */
+  otDocumentApply(name: string, op: {
+    kind: 'insertText' | 'deleteRange' | 'applyStyle' |
+          'mergeSpans' | 'splitSpan';
+    position: number;
+    length?: number;
+    second?: number;
+    text?: string;
+    style?: { name: string; value?: string };
+  } & OrderedSetApplyOptions): void;
+
+  // ============================================================
+  // OT tree (OT_TREE, v1.5 §7) — same UNBLESSED caveat as the document
+  // (no merge dispatch — mergeState holds it; no tie-break generator
+  // caller; no benchmark).
+  // ============================================================
+  /**
+   * Create an OT tree item (data type 0x13) on this machine. Apply ops
+   * with otInsertNode/otDeleteNode/otReparent/otReorder (or the generic
+   * otTreeApply), read it back with getOTTree.
+   */
+  addOTTree(name: string): void;
+  /**
+   * Readback of one OT tree: `nodes` — every VISIBLE node in DFS order
+   * (roots first, then each node's children left to right; a tombstoned
+   * subtree is skipped wholesale), each { id, parentId, value, childIds }.
+   * An empty parentId marks a root; the array order IS the sibling order.
+   * Throws resource_not_found for an unknown or non-tree name.
+   */
+  getOTTree(name: string):
+    { nodes: { id: string; parentId: string; value: string;
+               childIds: string[] }[] };
+  /**
+   * Insert node `nodeId` under `parentId` ('' = a root node) at the child
+   * ordinal `position` (0 prepends). The parent must exist and `nodeId`
+   * must be NEW (an id is minted once).
+   */
+  otInsertNode(name: string, parentId: string, position: number,
+               nodeId: string, value: string | null,
+               options: OrderedSetApplyOptions): void;
+  /** Delete the node (its subtree tombstones with it). */
+  otDeleteNode(name: string, nodeId: string,
+               options: OrderedSetApplyOptions): void;
+  /**
+   * Move `nodeId` under `newParentId` ('' = becomes a root) at `position`.
+   * A cycle (the new parent is the node or its descendant) is refused with
+   * invalid_param.
+   */
+  otReparent(name: string, nodeId: string, newParentId: string,
+             position: number, options: OrderedSetApplyOptions): void;
+  /**
+   * Reorder `nodeId` to child ordinal `position` under its CURRENT parent
+   * (root-level nodes can't be reordered — the C op requires a parent).
+   */
+  otReorder(name: string, nodeId: string, position: number,
+            options: OrderedSetApplyOptions): void;
+  /**
+   * The generic tree-op route: op = { kind, nodeId, parentId?,
+   * newParentId?, position, value?, id, deps? } — kind is one of
+   * 'insertNode' | 'deleteNode' | 'reparent' | 'reorder'.
+   */
+  otTreeApply(name: string, op: {
+    kind: 'insertNode' | 'deleteNode' | 'reparent' | 'reorder';
+    nodeId: string;
+    parentId?: string;
+    newParentId?: string;
+    position: number;
+    value?: string;
+  } & OrderedSetApplyOptions): void;
 
   setPolicy(opType: string, expression: string): void;
   /**
