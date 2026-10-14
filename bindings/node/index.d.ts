@@ -148,6 +148,28 @@ export interface Operation {
 
 export interface OperationStatic {
   new (type: string): Operation;
+  /**
+   * Parse a wire image (any Operation.serialize() output, from either
+   * binding) into an op object. The wrapper adopts the CRABS
+   * `crabs_deserialize_operation` result (Serialization/serialization.h:102)
+   * directly: type/signerId/nodeId/resources/payload/signature/uuid ride the
+   * wire, `getWireVersion()` reports the version declared on the image, and
+   * re-serializing is byte-identical. A malformed image refuses loudly
+   * (never a silent empty op); the adopted op signs, executes and schedules
+   * exactly like a locally-created one — this is the transport surface the
+   * cross-machine op flows (report equivocation, attestation carriers, the
+   * raft pipeline's persisted ops) consume. The deserialized op keeps the
+   * SIGNATURE it carried; it is NOT re-signed at the door.
+   */
+  deserialize(wire: Buffer): Operation;
+}
+
+/** Pagination options for getSetElements (Node and the wasm HandlerState). */
+export interface GetSetElementsOptions {
+  /** 0-based start index into the sorted distinct-element list. Default 0. */
+  offset?: number;
+  /** Page size, integer in [1, 256]. Default 256. Anything larger throws. */
+  limit?: number;
 }
 
 export interface UserInfo {
@@ -493,13 +515,58 @@ export interface Node {
   getRegister(name: string): number | undefined;
   /**
    * Integer-only: a register carries an int64. Numbers must be integers
-   * within ±Number.MAX_SAFE_INTEGER (the node binding accepts numbers only;
-   * for full int64 range use crabs-wasm's BigInt acceptance). Fractional
-   * values are rejected — encode scaled units instead
+   * within ±Number.MAX_SAFE_INTEGER; for the full int64 range pass a
+   * BigInt (accepted on BOTH bindings since the parity-fill alignment —
+   * the exact int64 is stored, getRegister renders it as a number).
+   * Fractional values are rejected — encode scaled units instead
    * (e.g. store 12.5% as 125 per-mille).
    */
-  setRegister(name: string, value: number, nodeId?: string): void;
+  setRegister(name: string, value: number | bigint, nodeId?: string): void;
+  /**
+   * Store arbitrary bytes as a register payload — the byte-exact inverse
+   * of getRegisterBytes (an opaque payload beside the integer register
+   * API). LWW bookkeeping is the same as setRegister (timestamp = the
+   * state's next version, state version advances). Typed refusals mirror
+   * the wasm export exactly: an unknown name OR a non-register item is
+   * `resource_not_found` on the write path, and a payload over UINT32_MAX
+   * bytes refuses rather than truncating the recorded length.
+   */
+  setRegisterBytes(name: string, bytes: Buffer, nodeId?: string): void;
+  /**
+   * Raw bytes of an LWW register — the byte-exact inverse of
+   * setRegisterBytes. Empty register → an empty Buffer. Known name that is
+   * not a register · type_mismatch; unknown name · resource_not_found.
+   * A register payload shorter than an int64 is INVISIBLE to getRegister
+   * (the integer view only reports a full int64 payload) — byte registers
+   * are opaque by design.
+   */
+  getRegisterBytes(name: string): Buffer;
   setContains(name: string, element: string): boolean;
+  /**
+   * Distinct visible element count of an OR-set / one-shot set (alive
+   * after tombstones, deduped at the element level). 0 for an unknown name
+   * or a non-set item. Pair with getSetElements for pagination math.
+   */
+  getSetSize(name: string): number;
+  /**
+   * Bounded enumerator: a page of DISTINCT LIVE elements sorted ascending
+   * by byte-wise strcmp (OR-set insertion order is not stable across
+   * replicas; the sort is). Hard cap 256 per call — larger limits throw;
+   * use getSetSize + successive offsets to paginate bigger sets. Each call
+   * is an independent point-in-time snapshot, not a cursor — if elements
+   * are added/removed between page calls, offsets shift (re-read
+   * getSetSize when paginating a set that may be changing). Unknown name ·
+   * resource_not_found, non-set item · type_mismatch.
+   */
+  getSetElements(name: string, options?: GetSetElementsOptions): string[];
+  /**
+   * LIVE tags of `element` of an OR-set, sorted ascending (pair semantics
+   * post-Task-1: one element may be carried by several tags — all live
+   * ones read back). Unknown name · resource_not_found, a one-shot set (an
+   * element list with no tag axis) or any other non-OR-set ·
+   * type_mismatch, an element with no live tags · [].
+   */
+  getSetTags(name: string, element: string): string[];
 
   // Direct counter operations (for setup/testing)
   incrementCounter(name: string, delta?: number, nodeId?: string): void;
@@ -766,6 +833,19 @@ export interface Node {
 
   // Triggers
   createTrigger(config: TriggerConfig): void;
+  /**
+   * The explicit trigger tick (C trigger_process_all, Trigger/trigger.h:80)
+   * — prune-expires-temp-attrs plus one condition pass over the machine's
+   * triggers that drives every matched effect. The executor ALSO runs this
+   * pass after each executed op (state_machine.c step 9), so op-driven
+   * mutations tick the triggers themselves; call this when the machine's
+   * state was mutated WITHOUT the op path (direct read/mutation surface
+   * writes) or for deterministic ticking in tests. Returns the number of
+   * triggers fired this tick; a machine clock that cannot report time
+   * fails closed; a nested tick (this call inside a change hook's own
+   * trigger pass) is a guarded no-op, mirroring the C reentrancy rule.
+   */
+  evaluateTriggers(): number;
 
   // ABE
   encrypt(payload: Buffer, policy: string): Buffer;

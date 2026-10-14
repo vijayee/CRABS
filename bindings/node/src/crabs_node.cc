@@ -28,6 +28,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <cmath>
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <string>
@@ -186,6 +187,7 @@ struct NodeAddonInstanceData {
   Napi::FunctionReference abe_key_ctor;
   Napi::FunctionReference blueprint_ctor;
   Napi::FunctionReference node_ctor;
+  Napi::FunctionReference operation_ctor;
 };
 
 // Adoption packet carried through a Napi::External so the Node constructor
@@ -205,6 +207,62 @@ static std::string require_js_string(const Napi::Value& value,
         std::string(method) + ": " + field + " must be a string");
   }
   return value.As<Napi::String>().Utf8Value();
+}
+
+// Parity-fill P10 (binding alignment): the getSetElements page cap — the
+// node mirror of CRABS_WASM_HANDLER_SET_PAGE_CAP (wasm_helpers.c:3083).
+static const uint32_t CRABS_NODE_SET_PAGE_CAP = 256u;
+
+// Byte-wise strcmp ordering for the pagination sort (stable across
+// replicas — mirrors _handler_cstr_cmp in wasm_helpers.c).
+static bool _crabs_node_cstr_less(const char* left, const char* right) {
+  return strcmp(left, right) < 0;
+}
+
+// Collect the DISTINCT LIVE elements of an OR-set / one-shot set into
+// `elements` (pair-tombstoned entries skipped, one entry per element even
+// when several live tags carry it — the wasm binding's
+// _handler_set_live_distinct, wasm_helpers.c:3088, entry for entry).
+static void _collect_live_distinct(const data_item_t* item,
+                                   std::vector<const char*>& elements) {
+  elements.clear();
+  if (item == NULL) return;
+  if (item->crdt_type == CRDT_OR_SET) {
+    const or_set_t* set = (const or_set_t*)item->value;
+    if (!set) return;
+    for (uint32_t entry_index = 0; entry_index < set->element_count;
+         entry_index++) {
+      const char* element = set->elements[entry_index].element;
+      bool tombstoned = false;
+      for (uint32_t tombstone_index = 0;
+           tombstone_index < set->tombstone_count; tombstone_index++) {
+        if (strcmp(set->tombstones[tombstone_index].element, element) == 0 &&
+            strcmp(set->tombstones[tombstone_index].tag,
+                   set->elements[entry_index].tag) == 0) {
+          tombstoned = true;
+          break;
+        }
+      }
+      if (tombstoned) continue;
+      bool seen = false;
+      for (const char* known : elements) {
+        if (strcmp(known, element) == 0) { seen = true; break; }
+      }
+      if (!seen) elements.push_back(element);
+    }
+  } else if (item->crdt_type == CRDT_ONE_SHOT_SET) {
+    const one_shot_set_t* set = (const one_shot_set_t*)item->value;
+    if (!set) return;
+    for (uint32_t entry_index = 0; entry_index < set->element_count;
+         entry_index++) {
+      const char* element = set->elements[entry_index];
+      bool seen = false;
+      for (const char* known : elements) {
+        if (strcmp(known, element) == 0) { seen = true; break; }
+      }
+      if (!seen) elements.push_back(element);
+    }
+  }
 }
 
 static std::string to_lower_ascii(const std::string& value) {
@@ -870,6 +928,10 @@ class Operation : public Napi::ObjectWrap<Operation> {
 public:
   static Napi::Object Init(Napi::Env env, Napi::Object exports) {
     Napi::Function func = DefineClass(env, "Operation", {
+      // Parity-fill P10 (binding alignment): adopt a wire op — the wasm
+      // binding's Operation.deserialize round trip (smoke.js:33,
+      // attestations.js:219).
+      StaticMethod("deserialize", &Operation::DeserializeStatic),
       InstanceMethod("sign", &Operation::Sign),
       InstanceMethod("signWithPrivateKey", &Operation::SignWithPrivateKey),
       InstanceMethod("addResource", &Operation::AddResource),
@@ -889,15 +951,34 @@ public:
       InstanceMethod("getWireVersion", &Operation::GetWireVersion),
     });
     exports.Set("Operation", func);
+    auto* inst = env.GetInstanceData<NodeAddonInstanceData>();
+    inst->operation_ctor = Napi::Persistent(func);
     return exports;
   }
 
+  // Two construction paths on one constructor (the Blueprint(wire) shape):
+  //   new Operation(type) — a fresh op with a minted UUID.
+  //   new Operation(wireBuffer) — parse a wire image (Operation.deserialize
+  //   delegates here through the persistent constructor). The op's UUID and
+  //   signature are whatever the wire carries.
   Operation(const Napi::CallbackInfo& info) : Napi::ObjectWrap<Operation>(info) {
+    Napi::Env env = info.Env();
+    op_ = nullptr;
+
+    if (info.Length() > 0 && info[0].IsBuffer()) {
+      auto wire = info[0].As<Napi::Buffer<uint8_t>>();
+      op_ = crabs_deserialize_operation(wire.Data(), wire.Length());
+      if (!op_)
+        throw Napi::Error::New(env,
+            "Operation.deserialize: malformed operation wire (parse failed)");
+      return;
+    }
+
     std::string type = "unknown";
     if (info.Length() > 0 && info[0].IsString())
       type = info[0].As<Napi::String>().Utf8Value();
     op_ = operation_create(type.c_str());
-    if (!op_) throw Napi::Error::New(info.Env(), "Failed to create operation");
+    if (!op_) throw Napi::Error::New(env, "Failed to create operation");
     // Generate a random UUID so the idempotency check in state_machine_execute
     // doesn't treat this as a duplicate of a prior operation (all-zeros UUID
     // would match any prior all-zeros UUID, causing the op to be silently
@@ -907,6 +988,21 @@ public:
 
   ~Operation() {
     if (op_) operation_destroy(op_);
+  }
+
+  // Static deserialize(wire) → the Operation wrapper over the parsed op
+  // (crabs_deserialize_operation, serialization.h:102). Mirrors the wasm
+  // binding's Operation.deserialize: a malformed image refuses loudly, a
+  // well-formed image round-trips byte-identically on re-serialize, and
+  // the adopted op executes exactly like a locally-created one.
+  static Napi::Value DeserializeStatic(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 1 || (!info[0].IsBuffer() && !info[0].IsTypedArray()))
+      throw Napi::TypeError::New(env,
+          "Operation.deserialize: expected a wire Buffer (op.serialize() bytes)");
+    auto* inst = env.GetInstanceData<NodeAddonInstanceData>();
+    Napi::Object restored = inst->operation_ctor.Value().New({info[0]});
+    return restored;
   }
 
   operation_t* raw() { return op_; }
@@ -1359,6 +1455,14 @@ public:
       InstanceMethod("getRegister", &Node::GetRegister),
       InstanceMethod("setRegister", &Node::SetRegister),
       InstanceMethod("setContains", &Node::SetContains),
+      // Parity-fill P10 (binding alignment): the wasm read surface mirrored.
+      InstanceMethod("getSetSize", &Node::GetSetSize),
+      InstanceMethod("getSetElements", &Node::GetSetElements),
+      InstanceMethod("getSetTags", &Node::GetSetTags),
+      InstanceMethod("setRegisterBytes", &Node::SetRegisterBytes),
+      InstanceMethod("getRegisterBytes", &Node::GetRegisterBytes),
+      // Parity-fill P10: the explicit trigger tick (trigger_process_all).
+      InstanceMethod("evaluateTriggers", &Node::EvaluateTriggers),
       InstanceMethod("setAdd", &Node::SetAdd),
       InstanceMethod("setRemove", &Node::SetRemove),
       InstanceMethod("flagSet", &Node::FlagSet),
@@ -2609,21 +2713,32 @@ private:
     if (info.Length() < 2)
       throw Napi::TypeError::New(env, "Expected (name, value[, nodeId])");
     std::string name = require_js_string(info[0], "setRegister", "name");
-    // Consumption finding 1: registers are integer-only (int64 in C). Reject
-    // NaN, Infinity, fractional values, and unsafe integers before the C call
-    // — mirroring the wasm wrapper — so fractional quantities are encoded as
-    // scaled integers (per-mille pattern) instead of silently truncated.
-    if (!info[1].IsNumber())
+    // Consumption finding 1: registers are integer-only (int64 in C).
+    // Parity-fill P10: BigInt accepted TOO (the wasm wrapper's contract) —
+    // a BigInt carries the full int64 range, so the safe-integer number
+    // ceiling only applies to Number inputs. Fractional values are still
+    // rejected — encode scaled units instead (e.g. store 12.5% as 125
+    // per-mille).
+    int64_t value = 0;
+    if (info[1].IsBigInt()) {
+      bool lossless = true;
+      value = info[1].As<Napi::BigInt>().Int64Value(&lossless);
+      if (!lossless)
+        throw Napi::TypeError::New(env,
+          "setRegister: registers carry a signed 64-bit integer; the BigInt value is outside the int64 range");
+    } else if (info[1].IsNumber()) {
+      double num_value = info[1].As<Napi::Number>().DoubleValue();
+      if (!std::isfinite(num_value) || std::floor(num_value) != num_value)
+        throw Napi::TypeError::New(env,
+          "setRegister: registers are integer-only; encode fractional values in register units (e.g. per-mille)");
+      if (std::fabs(num_value) > 9007199254740991.0 /* 2^53 - 1 */)
+        throw Napi::TypeError::New(env,
+          "setRegister: registers are integer-only; |value| exceeds Number.MAX_SAFE_INTEGER — pass a BigInt for the full int64 range");
+      value = (int64_t)num_value;
+    } else {
       throw Napi::TypeError::New(env,
-        "setRegister: registers are integer-only; value must be an integer number (encode fractional values in register units, e.g. per-mille)");
-    double num_value = info[1].As<Napi::Number>().DoubleValue();
-    if (!std::isfinite(num_value) || std::floor(num_value) != num_value)
-      throw Napi::TypeError::New(env,
-        "setRegister: registers are integer-only; encode fractional values in register units (e.g. per-mille)");
-    if (std::fabs(num_value) > 9007199254740991.0 /* 2^53 - 1 */)
-      throw Napi::TypeError::New(env,
-        "setRegister: registers are integer-only; |value| exceeds Number.MAX_SAFE_INTEGER — the node binding accepts safe-integer numbers only");
-    int64_t value = (int64_t)num_value;
+        "setRegister: value must be an integer Number or a BigInt (encode fractional values in register units, e.g. per-mille)");
+    }
     std::string node_id = info.Length() > 2
         ? require_js_string(info[2], "setRegister", "nodeId") : "system";
     data_item_t* item = state_find_item(&am_->base_state, name.c_str());
@@ -2658,6 +2773,218 @@ private:
     else if (item->crdt_type == CRDT_ONE_SHOT_SET)
       contains = one_shot_set_contains((one_shot_set_t*)item->value, element.c_str());
     return Napi::Boolean::New(env, contains);
+  }
+
+  // --- Parity-fill P10 (binding alignment): the wasm read surface ---
+
+  // Distinct LIVE elements of an OR-set / one-shot set: pair-tombstoned
+  // entries skipped, deduped at the element level (the same element may be
+  // carried by several live tags post-Task-1; it counts once here). Unknown
+  // names and non-set items report 0 — the same readback contract the wasm
+  // export (crabs_wasm_handler_set_size) gives JS.
+  //
+  // The OR-set arm mirrors _handler_set_live_distinct (wasm_helpers.c:3088)
+  // entry-for-entry; the JS-visible facts (distinct, live, count) are
+  // identical — direct C instead of a wasm round trip.
+  Napi::Value GetSetSize(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    std::string name = require_js_string(info[0], "getSetSize", "name");
+    data_item_t* item = state_find_item(&am_->base_state, name.c_str());
+    if (!item || (item->crdt_type != CRDT_OR_SET &&
+                  item->crdt_type != CRDT_ONE_SHOT_SET))
+      return Napi::Number::New(env, 0);
+    std::vector<const char*> elements;
+    _collect_live_distinct(item, elements);
+    return Napi::Number::New(env, (double)elements.size());
+  }
+
+  // Bounded enumerator: one page of DISTINCT LIVE elements, sorted
+  // ascending (byte-wise strcmp, stable across replicas). 256-hard-cap,
+  // snapshot semantics — page at a fixed getSetSize when the set may be
+  // changing. Mirrors crabs_wasm_handler_set_elements' contract exactly,
+  // including the typed refusals (unknown name → resource_not_found, a
+  // non-set item → type_mismatch, limit outside [1, 256] → RangeError).
+  Napi::Value GetSetElements(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    std::string name = require_js_string(info[0], "getSetElements", "name");
+    // Options bag: 0-based offset (default 0, monotone-truncated on the C
+    // side), page size in [1, 256] (default 256 — the full small set; the
+    // cap is mirrored from CRABS_WASM_HANDLER_SET_PAGE_CAP in
+    // wasm_helpers.c:3083).
+    uint32_t offset = 0;
+    uint32_t limit = CRABS_NODE_SET_PAGE_CAP;
+    if (info.Length() > 1) {
+      if (!info[1].IsObject())
+        throw Napi::TypeError::New(env,
+            "getSetElements: expected an options object ({offset?, limit?})");
+      Napi::Object options = info[1].As<Napi::Object>();
+      if (options.Has("offset")) {
+        if (!options.Get("offset").IsNumber())
+          throw Napi::TypeError::New(env,
+              "getSetElements: offset must be a number");
+        double offset_value = options.Get("offset").As<Napi::Number>().DoubleValue();
+        if (offset_value < 0 || std::floor(offset_value) != offset_value)
+          throw Napi::TypeError::New(env,
+              "getSetElements: offset must be a non-negative integer");
+        offset = (uint32_t)offset_value;
+      }
+      if (options.Has("limit")) {
+        if (!options.Get("limit").IsNumber())
+          throw Napi::TypeError::New(env,
+              "getSetElements: limit must be a number");
+        double limit_value = options.Get("limit").As<Napi::Number>().DoubleValue();
+        if (limit_value < 1 || limit_value > (double)CRABS_NODE_SET_PAGE_CAP ||
+            std::floor(limit_value) != limit_value) {
+          throw Napi::Error::New(env,
+              "getSetElements: limit must be an integer in [1, "
+              + std::to_string(CRABS_NODE_SET_PAGE_CAP) + "]");
+        }
+        limit = (uint32_t)limit_value;
+      }
+    }
+    data_item_t* item = state_find_item(&am_->base_state, name.c_str());
+    if (!item) throw crabs_error(env, CRABS_ERR_RESOURCE_NOT_FOUND,
+                                 "getSetElements");
+    if (item->crdt_type != CRDT_OR_SET &&
+        item->crdt_type != CRDT_ONE_SHOT_SET)
+      throw crabs_error(env, CRABS_ERR_TYPE_MISMATCH, "getSetElements");
+    std::vector<const char*> elements;
+    _collect_live_distinct(item, elements);
+    std::sort(elements.begin(), elements.end(), _crabs_node_cstr_less);
+    Napi::Array page = Napi::Array::New(env);
+    uint32_t start = offset < elements.size() ? offset : (uint32_t)elements.size();
+    uint32_t page_count = (uint32_t)elements.size() - start;
+    if (page_count > limit) page_count = limit;
+    for (uint32_t index = 0; index < page_count; index++) {
+      page.Set(index, Napi::String::New(env, elements[start + index]));
+    }
+    return page;
+  }
+
+  // LIVE tags carrying `element` of an OR-set, sorted ascending. Pair
+  // semantics (post-Task-1) may carry an element on several tags — every
+  // live one reads back. Unknown name → resource_not_found; a one-shot set
+  // (element list, no tag axis) or any other non-OR-set → type_mismatch;
+  // an element with no live tags → []. Mirrors crabs_wasm_handler_set_tags.
+  Napi::Value GetSetTags(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    std::string name = require_js_string(info[0], "getSetTags", "name");
+    std::string element = require_js_string(info[1], "getSetTags", "element");
+    data_item_t* item = state_find_item(&am_->base_state, name.c_str());
+    if (!item) throw crabs_error(env, CRABS_ERR_RESOURCE_NOT_FOUND,
+                                 "getSetTags");
+    if (item->crdt_type != CRDT_OR_SET)
+      throw crabs_error(env, CRABS_ERR_TYPE_MISMATCH, "getSetTags");
+    const or_set_t* set = (const or_set_t*)item->value;
+    if (!set) throw crabs_error(env, CRABS_ERR_INTERNAL, "getSetTags");
+    std::vector<const char*> tags;
+    tags.reserve(set->element_count);
+    for (uint32_t entry_index = 0; entry_index < set->element_count;
+         entry_index++) {
+      if (element != set->elements[entry_index].element) continue;
+      const char* tag = set->elements[entry_index].tag;
+      bool tombstoned = false;
+      for (uint32_t tombstone_index = 0;
+           tombstone_index < set->tombstone_count; tombstone_index++) {
+        if (element == set->tombstones[tombstone_index].element &&
+            strcmp(tag, set->tombstones[tombstone_index].tag) == 0) {
+          tombstoned = true;
+          break;
+        }
+      }
+      if (tombstoned) continue;
+      tags.push_back(tag);
+    }
+    std::sort(tags.begin(), tags.end(), _crabs_node_cstr_less);
+    Napi::Array tag_list = Napi::Array::New(env);
+    for (uint32_t tag_index = 0; tag_index < tags.size(); tag_index++) {
+      tag_list.Set(tag_index, Napi::String::New(env, tags[tag_index]));
+    }
+    return tag_list;
+  }
+
+  // Opaque byte payload of an LWW register — the byte-exact inverse of
+  // setRegisterBytes. Empty register → an empty Buffer. Mirrors
+  // crabs_wasm_handler_get_register_bytes: unknown name → resource_not_found,
+  // a non-register item → type_mismatch.
+  Napi::Value GetRegisterBytes(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    std::string name = require_js_string(info[0], "getRegisterBytes", "name");
+    data_item_t* item = state_find_item(&am_->base_state, name.c_str());
+    if (!item) throw crabs_error(env, CRABS_ERR_RESOURCE_NOT_FOUND,
+                                 "getRegisterBytes");
+    if (item->crdt_type != CRDT_LWW_REG)
+      throw crabs_error(env, CRABS_ERR_TYPE_MISMATCH, "getRegisterBytes");
+    const lww_register_t* reg = (const lww_register_t*)item->value;
+    if (!reg) throw crabs_error(env, CRABS_ERR_INTERNAL, "getRegisterBytes");
+    return Napi::Buffer<uint8_t>::Copy(env, reg->value, reg->value_size);
+  }
+
+  // Store ARBITRARY bytes as a register payload (the byte-exact inverse of
+  // getRegisterBytes). Mirrors crabs_wasm_set_register_bytes: unknown name
+  // or a non-LWW-register item → resource_not_found; an over-size payload
+  // (payload_size is u32) refuses with RangeError instead of truncating.
+  Napi::Value SetRegisterBytes(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 2)
+      throw Napi::TypeError::New(env,
+          "Expected (name, bytes[, nodeId])");
+    std::string name = require_js_string(info[0], "setRegisterBytes", "name");
+    std::string node_id = info.Length() > 2
+        ? require_js_string(info[2], "setRegisterBytes", "nodeId") : "system";
+    if (!info[1].IsBuffer() && !info[1].IsTypedArray())
+      throw Napi::TypeError::New(env,
+          "setRegisterBytes: bytes must be a Buffer or Uint8Array");
+    Napi::Buffer<uint8_t> input = info[1].IsBuffer()
+        ? info[1].As<Napi::Buffer<uint8_t>>()
+        : Napi::Buffer<uint8_t>::Copy(env,
+              info[1].As<Napi::Uint8Array>().Data(),
+              info[1].As<Napi::Uint8Array>().ByteLength());
+    if (input.Length() > UINT32_MAX)
+      throw Napi::RangeError::New(env,
+          "setRegisterBytes: payload exceeds UINT32_MAX bytes");
+    data_item_t* item = state_find_item(&am_->base_state, name.c_str());
+    if (!item || item->crdt_type != CRDT_LWW_REG)
+      throw crabs_error(env, CRABS_ERR_RESOURCE_NOT_FOUND, "setRegisterBytes");
+    lww_register_t* reg = (lww_register_t*)item->value;
+    if (!reg) throw crabs_error(env, CRABS_ERR_INTERNAL, "setRegisterBytes");
+    uint8_t* copy = NULL;
+    if (input.Length() > 0) {
+      copy = (uint8_t*)malloc(input.Length());
+      if (!copy) throw crabs_error(env, CRABS_ERR_OOM, "setRegisterBytes");
+      memcpy(copy, input.Data(), input.Length());
+    }
+    if (reg->value) free(reg->value);
+    reg->value = copy;
+    reg->value_size = (uint32_t)input.Length();
+    // LWW bookkeeping identical to setRegister: timestamp = version + 1,
+    // then the machine's version advances.
+    reg->timestamp = am_->base_state.version + 1;
+    strncpy(reg->node_id, node_id.c_str(), CRABS_MAX_USER_ID - 1);
+    reg->node_id[CRABS_MAX_USER_ID - 1] = '\0';
+    am_->base_state.version++;
+    return env.Undefined();
+  }
+
+  // The explicit trigger tick (C trigger_process_all, Trigger/trigger.h:80):
+  // prune-expired-temp-attrs + one condition pass over the machine's
+  // triggers, driving every matched effect. The executor ALSO runs this pass
+  // after each executed op (state_machine.c, step 9) — this surface is for
+  // hosts whose state mutations bypass the op path (direct CRDT writers) and
+  // for deterministic ticking in tests. Mirrors the executor's clock rule:
+  // the machine's own time source (state_get_time_ms) stamps now_ms, and an
+  // unreadable clock fails closed. Returns the number of triggers fired —
+  // the wasm wrapper discards it (void); node reports it.
+  Napi::Value EvaluateTriggers(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    uint64_t now_ms = 0;
+    if (!state_get_time_ms(&am_->base_state, &now_ms))
+      throw crabs_error(env, CRABS_ERR_CRYPTOGRAPHIC_ERROR, "evaluateTriggers");
+    uint32_t fired = trigger_process_all(&am_->base_state,
+                                         am_->base_state.triggers,
+                                         am_->base_state.trigger_count,
+                                         am_, now_ms);
+    return Napi::Number::New(env, (double)fired);
   }
 
   // --- Set operations (direct, for testing/setup) ---
