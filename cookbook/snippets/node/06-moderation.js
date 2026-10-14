@@ -1,9 +1,11 @@
 'use strict';
 // Recipe 6 — progressive disclosure moderation (crabs-node, driven directly).
-// crabs-node has createTrigger + encrypt but NO custom-handler surface and NO
-// evaluateTriggers (api-map §7, §8): the counter is driver-written and the
+// crabs-node has createTrigger + encrypt but NO custom-handler surface
+// (api-map §7, §8 — deliberate). The counter is driver-written and the
 // trigger's post-execute pass runs whenever a LANDING op executes — here a
-// resource-carrying custom op whose wildcard path applies nothing.
+// resource-carrying custom op whose wildcard path applies nothing. (Node
+// also gained the DIRECT `evaluateTriggers()` tick in parity-fill P10 —
+// this snippet pins the op-driven tick instead: both feed the same C pass.)
 
 const { Node, KeyPair, Operation } = require('../../../bindings/node');
 
@@ -52,10 +54,11 @@ node.on('change', (event) => {
 });
 
 // The tick: any landing op runs the post-execute trigger pass
-// (src/StateMachine/state_machine.c:1508-1520). This binding has no
-// evaluateTriggers, so the tick is a SIGN op of a resource-carrying custom
-// type — wildcard path applies nothing (the item is a counter, not a
-// RESOURCE) but lands, logs, and ticks triggers.
+// (src/StateMachine/state_machine.c step 9). A landing op IS a legal tick —
+// here a SIGN op of a resource-carrying custom type whose wildcard path
+// applies nothing (the item is a counter, not a RESOURCE) but lands, logs,
+// and ticks triggers. (`node.evaluateTriggers()` would run the same C pass
+// directly now; this keeps the recipe's op-driven shape pinned.)
 node.setPolicy('tick', 'role:admin');
 const tickAs = (signerName, signerKey) => {
   const op = new Operation('tick');

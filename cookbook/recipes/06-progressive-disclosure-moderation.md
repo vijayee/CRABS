@@ -137,9 +137,10 @@ seal is opened by a key minted for that same attribute set.
   `verifiedBy: 'trigger'` and an `expiresAt` — match on `verifiedBy`/
   `temporary` in UI code, not on the string.
 - **C owns its tick:** the C snippet calls `trigger_process_all`
-  explicitly; both JS bindings run the pass for you after each execute —
-  on wasm `evaluateTriggers()` can also force a pass by executing an
-  admin no-op, and on crabs-node any landing op is the tick.
+  explicitly; both JS bindings run the pass for you after each execute,
+  and BOTH now expose `evaluateTriggers()` (the same `trigger_process_all`
+  primitive driven directly — parity-fill P10; it returns the fired count
+  and needs no 'noop' policy).
 
 ## Try it
 
@@ -181,9 +182,10 @@ seal is opened by a key minted for that same attribute set.
 ## Variations
 
 - Explicit ticking — when a machine is mostly idle but the rule should
-  still be checked anyway: `evaluateTriggers()` (wasm) signs and executes
-  an admin no-op purely to run the trigger pass. On crabs-node there is
-  no such method; any landing op is the tick (see the node snippet).
+  still be checked anyway: `evaluateTriggers()` on BOTH bindings runs the
+  trigger pass directly (the wasm tick that used to sign+execute an admin
+  noop is gone; on crabs-node the method is new, so the node snippet's
+  op-driven tick below still works — any landing op is also a tick).
 - Self-extinguishing escalation — when the consequence should fire only
   once (a one-time promotion): `oneShot: true` disables the trigger after
   its first fire, while `cooldownMs` shapes the *repeatable* one.
@@ -210,7 +212,7 @@ seal is opened by a key minted for that same attribute set.
 ## Verified against the code
 
 <!-- PROVENANCE
-trigger pass: machine-evaluated after every executed op — Step 9, src/StateMachine/state_machine.c:1907-1919; wasm evaluateTriggers signs+executes an admin no-op to run the pass (bindings/wasm/index.d.ts:738).
+trigger pass: machine-evaluated after every executed op — Step 9, src/StateMachine/state_machine.c:1907-1919; evaluateTriggers is the explicit tick on BOTH bindings (C trigger_process_all, Trigger/trigger.h:81; wasm crabs_wasm_evaluate_triggers in src/Util/wasm_helpers.c, node direct-C in bindings/node/src/crabs_node.cc — parity-fill P10); it returns the fired count.
 resolve path: FULL item path → logical value; missing path resolves 0, no sibling aliasing — condition_resolve_path src/Condition/condition.c:916-943.
 creation-time parse refusal: unparseable condition is rejected instead of stored as a silently-dead NULL AST — src/Trigger/trigger.c:432-437.
 skip discipline: cooldown :219-221 (clock-regression guard) · expired :224-226 · one-shot :228 (also :269) — src/Trigger/trigger.c.

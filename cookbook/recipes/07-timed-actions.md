@@ -109,8 +109,11 @@ another, and the machine guarantees the bridge between them.
   failure reports invalid time, never a local-clock fallback. On wasm the
   source is module-shared (re-attach after loading a machine); on
   crabs-node it is machine-local (a sibling wrapper's destroy silently
-  strips it — re-apply on the survivor). Node additionally exposes the
-  machine's hybrid logical clock via `getHLC()` (wasm has no HLC getter).
+  strips it — re-apply on the survivor). BOTH bindings expose the machine's
+  hybrid logical clock via `getHLC()` — a read-only watermark readback
+  `{seconds, nanos, logicalCounter, nodeId, formatted}` (parity-fill P10
+  unified the shape and the semantics; the clock advances only when an op
+  executes).
 
 ## Try it
 
@@ -166,8 +169,9 @@ another, and the machine guarantees the bridge between them.
   a recurring escalation tick whose embedded op is itself policy-gated.
   Both run through the same pipeline's post-authorization steps.
 - Time-ordered reads — when reasoning about event order across replicas:
-  `getHLC()` (node only) exposes the machine's hybrid logical clock; the
-  C surface implements the same timestamps the executor stamps.
+  `getHLC()` (both bindings since parity-fill P10) exposes the machine's
+  hybrid logical clock; the C surface implements the same timestamps the
+  executor stamps.
 
 ## Verified against the code
 
@@ -235,8 +239,10 @@ symbols:
   Node.pendingSchedules     bindings/node/index.d.ts:500-503
   Node.setTimeSource        bindings/node/index.d.ts:551
   Node.getTimeSource        bindings/node/index.d.ts:552
-  Node.getHLC               bindings/node/index.d.ts:535
-  HLC interface             bindings/node/index.d.ts:206-212
+  Node.getHLC               bindings/node/index.d.ts:1047 (read-only
+                            watermark; wasm CrabsHLC/getHLC mirrors it —
+                            bindings/wasm/index.d.ts:1165, parity-fill P10)
+  HLC interface             bindings/node/index.d.ts:294-300
   NodeStatic.new            bindings/node/index.d.ts:641-642 (new Node)
   KeyPair.generate          bindings/node/index.d.ts:71 (KeyPairStatic :69-73)
   KeyPair.publicKeyHex      bindings/node/index.d.ts:28
