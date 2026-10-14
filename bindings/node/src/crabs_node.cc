@@ -161,6 +161,10 @@ static Napi::Error crabs_error(Napi::Env env, crabs_error_e err, const char* ctx
     case CRABS_ERR_SEQ_MISMATCH:           msg = "seq_mismatch"; break;
     case CRABS_ERR_FORK_DETECTED:          msg = "fork_detected"; break;
     case CRABS_ERR_ORDERING_PATH:          msg = "ordering_path"; break;
+    case CRABS_ERR_ORDERING_PENDING:       msg = "ordering_pending"; break;
+    case CRABS_ERR_ORDERING_NOT_LEADER:    msg = "ordering_not_leader"; break;
+    case CRABS_ERR_ORDERING_CHANGE_IN_FLIGHT:
+                                           msg = "ordering_change_in_flight"; break;
     case CRABS_ERR_QUARANTINED:            msg = "quarantined"; break;
     // 0x8xxx: OT errors (v1.5 §8)
     case CRABS_ERR_NO_OT_OPS:              msg = "no_ot_ops"; break;
@@ -1443,6 +1447,9 @@ public:
       InstanceMethod("raftPollPersistRequest", &Node::RaftPollPersistRequest),
       InstanceMethod("raftPollNotifications", &Node::RaftPollNotifications),
       InstanceMethod("raftStatus", &Node::RaftStatus),
+      InstanceMethod("raftChangeMembership", &Node::RaftChangeMembership),
+      InstanceMethod("raftJointMembers", &Node::RaftJointMembers),
+      InstanceMethod("raftCommittedMembers", &Node::RaftCommittedMembers),
       InstanceMethod("raftDetach", &Node::RaftDetach),
       // The bootstrap admin id — the node's HLC identity and default raft
       // node id (property for parity with the wasm wrapper's readonly
@@ -5217,6 +5224,11 @@ private:
 
     std::vector<std::string> peer_ids;
     std::vector<const char*> peer_id_ptrs;
+    // reserve() first: the char* pointers below borrow the strings' buffers
+    // — a push_back reallocation would move (short ids are SSO) and dangle
+    // the captured pointers.
+    peer_ids.reserve(peer_count);
+    peer_id_ptrs.reserve(peer_count);
     for (uint32_t index = 0; index < peer_count; index++) {
       peer_ids.push_back(require_js_string(peers.Get(index),
                                            "attachRaft.peers", "peer id"));
@@ -5404,6 +5416,76 @@ private:
     entry.Set("peerCount", crabs_raft_module_committed_members(raft_module_,
                                                               member_ids));
     return entry;
+  }
+
+  // Joint-consensus membership change (Raft §6, parity-fill P9): the
+  // leader appends the C_old,new joint entry to its OWN config log; when
+  // committed it auto-appends the C_new successor, and that entry's commit
+  // ends the transition (raft_module.h:216). ONE change at a time — an
+  // appended-but-uncommitted entry or an active joint phase refuses with
+  // CRABS_ERR_ORDERING_CHANGE_IN_FLIGHT. Throws crabsError on every refusal
+  // (not-leader / in-flight / invalid members); returns the assigned
+  // proposal_id (= the config entry's log index) on success.
+  Napi::Value RaftChangeMembership(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    ensure_raft_attached(env, "raftChangeMembership");
+    if (info.Length() < 1 || !info[0].IsArray())
+      throw Napi::TypeError::New(env,
+        "raftChangeMembership: members must be an id array");
+    Napi::Array members = info[0].As<Napi::Array>();
+    uint32_t member_count = members.Length();
+    if (member_count == 0 || member_count > CRABS_RAFT_MAX_PEERS)
+      throw Napi::RangeError::New(env,
+        "raftChangeMembership: members must have 1..16 ids");
+    // reserve() first: the char* array below borrows each string's buffer —
+    // a push_back reallocation would move (short ids are SSO) and dangle
+    // the already-captured pointers into freed memory.
+    std::vector<std::string> member_ids;
+    std::vector<const char*> member_ptrs;
+    member_ids.reserve(member_count);
+    member_ptrs.reserve(member_count);
+    for (uint32_t index = 0; index < member_count; index++) {
+      member_ids.push_back(require_js_string(
+          members.Get(index), "raftChangeMembership.members", "member id"));
+      member_ptrs.push_back(member_ids.back().c_str());
+    }
+    uint64_t proposal_id = 0;
+    crabs_error_e rc = crabs_raft_module_change_membership(
+        raft_module_, member_ptrs.data(), member_count, &proposal_id);
+    if (rc != CRABS_SUCCESS) {
+      throw crabs_error(env, rc, "raftChangeMembership");
+    }
+    return Napi::Number::New(env, (double)proposal_id);
+  }
+
+  // Membership queries (parity-fill P9): the ACTIVE committed config list
+  // (the election/voting list) and the SECOND list of an active joint
+  // consensus (empty while the cluster runs a plain single consensus) —
+  // raft_module.h:264. Order is C config order (not sorted); callers sort.
+  Napi::Value RaftCommittedMembers(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    ensure_raft_attached(env, "raftCommittedMembers");
+    char member_ids[CRABS_RAFT_MAX_PEERS][CRABS_MAX_USER_ID];
+    uint32_t count =
+        crabs_raft_module_committed_members(raft_module_, member_ids);
+    Napi::Array out = Napi::Array::New(env);
+    for (uint32_t index = 0; index < count; index++) {
+      out.Set(index, Napi::String::New(env, member_ids[index]));
+    }
+    return out;
+  }
+
+  Napi::Value RaftJointMembers(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    ensure_raft_attached(env, "raftJointMembers");
+    char member_ids[CRABS_RAFT_MAX_PEERS][CRABS_MAX_USER_ID];
+    uint32_t count =
+        crabs_raft_module_joint_members(raft_module_, member_ids);
+    Napi::Array out = Napi::Array::New(env);
+    for (uint32_t index = 0; index < count; index++) {
+      out.Set(index, Napi::String::New(env, member_ids[index]));
+    }
+    return out;
   }
 
   Napi::Value RaftDetach(const Napi::CallbackInfo& info) {

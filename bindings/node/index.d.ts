@@ -1085,6 +1085,29 @@ export interface Node {
   raftStatus(): { nodeId: string; isLeader: boolean; term: number;
                   commitTip: number; logLength: number;
                   configChangePending: boolean; peerCount: number } | null;
+  /**
+   * Joint-consensus membership change (Raft §6, parity-fill P9): the leader
+   * appends the C_old,new joint entry to its own config log; when committed
+   * the module auto-appends C_new, and THAT entry's commit ends the
+   * transition. Returns the assigned proposal_id (the config entry's log
+   * index); throws on every refusal — ordering_not_leader (leader-only),
+   * ordering_change_in_flight (one change at a time: an
+   * appended-but-uncommitted config entry or an active joint phase blocks),
+   * invalid_param (0 or >16 members, empty ids).
+   */
+  raftChangeMembership(members: string[]): number;
+  /**
+   * The ACTIVE committed config member list (the election/voting list) in
+   * C config order (not sorted). Throws when no module is attached.
+   */
+  raftCommittedMembers(): string[];
+  /**
+   * The SECOND list of an active joint consensus — empty while the cluster
+   * runs a plain single consensus (visible between the joint C_old,new
+   * entry's commit and the automatic C_new successor's commit).
+   * Throws when no module is attached.
+   */
+  raftJointMembers(): string[];
   /** Detach and destroy the attached module (the destructor does this too). */
   raftDetach(): void;
 }
@@ -1198,6 +1221,18 @@ export function createRaftHost(node: Node, options?: {
                                    proposalId: number; commitIndex: number;
                                    opBytes?: Buffer }>;
   raftPump(nowMs?: number): void;
+  /**
+   * Joint-consensus membership change (Raft §6): leader-only; appends the
+   * C_old,new joint entry to the module's own config log, auto-appends C_new
+   * after its commit, and returns the assigned proposal_id. Throws on every
+   * refusal (ordering_change_in_flight / ordering_not_leader / invalid
+   * members — see Node.raftChangeMembership).
+   */
+  changeMembership(members: string[]): number;
+  /** Joint second list of an active joint consensus; empty when plain. */
+  jointMembers(): string[];
+  /** The ACTIVE committed config member list (C config order, not sorted). */
+  committedMembers(): string[];
   status(): { nodeId: string; isLeader: boolean; term: number; commitTip: number;
               logLength: number; configChangePending: boolean; peerCount: number };
   destroy(): void;

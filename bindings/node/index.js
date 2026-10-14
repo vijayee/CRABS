@@ -242,6 +242,33 @@ function createRaftHost(node, options = {}) {
     raftPollNotifications() { return node.raftPollNotifications(); },
     raftPump(nowMs) { return node.raftPump(nowMs === undefined ? Date.now() : nowMs); },
 
+    // Joint-consensus membership change (Raft §6, parity-fill P9): the
+    // leader appends the C_old,new joint entry to its own config log; when
+    // committed it auto-appends C_new, and that commit ends the transition.
+    // ONE change at a time (ordering_change_in_flight otherwise); the
+    // returned number is the assigned proposal_id (the config entry's log
+    // index). Leader-only — refusals throw (raftError via the raw rc).
+    changeMembership(members) {
+      if (this._destroyed) throw new Error('RaftHost destroyed');
+      if (!Array.isArray(members) ||
+          members.some((id) => typeof id !== 'string' || id.length === 0)) {
+        throw new TypeError('changeMembership: members must be an array of non-empty id strings');
+      }
+      if (members.length === 0 || members.length > 16) {
+        throw new RangeError('changeMembership: members must have 1..16 ids');
+      }
+      const proposalId = node.raftChangeMembership(members);
+      // The appended entry produces persist + fan-out work immediately —
+      // move it without waiting for the next tick (mirrors pumpInbound).
+      this._dispatch();
+      return proposalId;
+    },
+    // Membership reads (C config order, not sorted): the ACTIVE committed
+    // config (the election/voting list) and the SECOND list of an active
+    // joint consensus — empty while a plain single consensus runs.
+    jointMembers() { return node.raftJointMembers(); },
+    committedMembers() { return node.raftCommittedMembers(); },
+
     // Point diagnostics of the attached module.
     status() { return node.raftStatus(); },
 

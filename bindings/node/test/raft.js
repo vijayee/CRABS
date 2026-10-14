@@ -18,12 +18,12 @@ const OP_TYPE = 'council_write';
 const ITEM = 'council';
 const RAFT_NOTIFY_COMMITTED_OP = 3;
 
-async function waitFor(predicate, what, timeoutMs = 30000) {
+async function waitFor(predicate, what, timeoutMs = 30000, intervalMs = 20) {
   const deadline = Date.now() + timeoutMs;
   for (;;) {
     if (predicate()) return;
     if (Date.now() > deadline) throw new Error(`timeout waiting for: ${what}`);
-    await new Promise((resolve) => setTimeout(resolve, 20));
+    await new Promise((resolve) => setTimeout(resolve, intervalMs));
   }
 }
 
@@ -281,10 +281,105 @@ async function main() {
   }, 'the recovered cluster to converge on one commit tip');
   console.log('    recovery: nodeB resumed committing (byte-identical committed op)');
 
+  // ---- Membership change (Raft §6 joint consensus — node mirror of the
+  // C sim's RaftMembership scenarios): the 3-node cluster shrinks to 2.
+  // The two-phase evolution is pinned: the leader appends C_old,new; when
+  // that entry commits the joint second list is visible while the committed
+  // config STILL counts three; the automatic C_new successor's commit then
+  // ends the transition on the plain two-member config. Ops keep landing on
+  // the reduced cluster; the removed node is excluded (ghost replication
+  // stops) but converges onto the same committed config. ----
+  {
+    await waitFor(
+      () => hosts.filter((host) => host.status().isLeader).length === 1,
+      'one leader to settle before the membership change');
+    const changeLeader = hosts.find((host) => host.status().isLeader);
+    const changeId = changeLeader.changeMembership(['nodeA', 'nodeB']);
+    assert.ok(changeId > 0,
+      'the change returns the assigned proposal_id (the log index)');
+
+    // ONE change at a time (§6): an appended-but-uncommitted config entry
+    // refuses a second change immediately.
+    assert.throws(() => changeLeader.changeMembership(['nodeA', 'nodeB']),
+      /ordering_change_in_flight/,
+      'a second concurrent change must refuse');
+
+    // Appended-but-uncommitted: pending, and the committed config still
+    // counts the three boot members (phase 0: nothing visible yet).
+    assert.strictEqual(changeLeader.status().configChangePending, true,
+      'the change must be pending before its joint commit');
+    assert.deepStrictEqual(
+      [...changeLeader.committedMembers()].sort(),
+      ['nodeA', 'nodeB', 'nodeC'],
+      'the committed config must stay the old three pre-commit');
+
+    // Phase 1 → 2: the joint C_old,new commits (old-list majority 2/3); the
+    // joint second list spans both configs while the automatic C_new
+    // successor commits under BOTH lists' majorities. That window closes
+    // within one replication round, so the poll LATCHES whatever joint list
+    // any host surfaces while waiting for the transition to settle.
+    let jointSecondList = null;
+    await waitFor(() => {
+      for (const host of hosts) {
+        const joint = host.jointMembers();
+        if (joint.length > 0) jointSecondList = [...joint].sort();
+      }
+      return hosts.every((host) => host.jointMembers().length === 0 &&
+                                 host.status().configChangePending === false);
+    }, 'the transition to settle through the joint phase', 30000, 5);
+    assert.deepStrictEqual(jointSecondList, ['nodeA', 'nodeB'],
+      'the joint phase must have been visible between the two commits');
+
+    // Transition ends plain: exactly {nodeA, nodeB} as the committed config
+    // everywhere — including the excluded node, which learns through the
+    // committed entry the exclusion control carries.
+    await waitFor(
+      () => hosts.every((host) => host.committedMembers().length === 2),
+      'every node (including the excluded one) to settle on the final config');
+    for (const host of hosts) {
+      assert.deepStrictEqual([...host.committedMembers()].sort(),
+        ['nodeA', 'nodeB'],
+        `${host.status().nodeId}: committed config must be exactly the pair`);
+    }
+    assert.strictEqual(changeLeader.status().configChangePending, false,
+      'no change may stay pending after C_new commits');
+
+    // Ops keep landing on the reduced cluster: the reduced leader proposes;
+    // the fellow survivor surfaces the committed op; nodeC does not.
+    global.__partitioned = null;
+    await waitFor(
+      () => hosts.filter((host) =>
+        host.status().isLeader && host.status().nodeId !== 'nodeC').length === 1,
+      'a leader among the surviving pair to settle');
+    const reducedIndex = hosts.findIndex(
+      (host) => host.status().isLeader && host.status().nodeId !== 'nodeC');
+    assert.notStrictEqual(reducedIndex, -1,
+      'the reduced cluster must settle a leader from the survivors');
+    const reducedLeader = nodes[reducedIndex];
+    const op4 = new Operation(OP_TYPE);
+    op4.signerId = 'alice';
+    op4.addResource(ITEM);
+    reducedLeader.sign(op4, aliceKey);
+    const op4Wire = op4.serialize();
+    reducedLeader.execute(op4);
+    await waitFor(() =>
+      hosts[1 - reducedIndex].raftPollNotifications().some(
+        (entry) => entry.kind === RAFT_NOTIFY_COMMITTED_OP && entry.opBytes &&
+          Buffer.compare(Buffer.from(entry.opBytes), op4Wire) === 0),
+      'the fellow survivor to surface the post-change committed op');
+    await new Promise((resolve) => setTimeout(resolve, 800));
+    assert.ok(hosts[2].raftPollNotifications().every(
+      (entry) => !entry.opBytes ||
+        Buffer.compare(Buffer.from(entry.opBytes), op4Wire) !== 0),
+      'the excluded node must not receive post-change committed ops');
+    console.log(`    membership: 3 → 2 via joint consensus ` +
+      `(change proposal ${changeId}); ops continue on the reduced cluster`);
+  }
+
   // ---- Diagnostics surface sanity. ----
   for (const host of hosts) {
     const status = host.status();
-    assert.ok(status.peerCount === 3, 'peerCount = 3');
+    assert.ok(status.peerCount === 2, 'peerCount = 2 (post-change)');
     assert.ok(status.term >= 1, 'term advanced');
     assert.strictEqual(status.nodeId !== undefined, true, 'nodeId present');
     host.destroy();
