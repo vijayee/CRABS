@@ -189,7 +189,7 @@ Not guaranteed — the clock honesty and the shape boundary:
   surfaced READ-side wire parsing from JS: `Node.attestationFromWire`
   fields an attestation wire image on both bindings — that is op-transport
   staging, still not the verifier.) What stays C-only is the
-  verifier surface itself: `attestation_deserialize` has no JS map entry,
+  verifier surface itself: `attestation_verify` / `attestation_verify_by_lineage_key` (src/Lineage/lineage.h:639,654) remain JS-free,
   and the two fail-closed cases a JS harness cannot produce — a FORGED
   parent (the bindings only mint REAL parent-node-key attestations through
   `crabs_issue_attestation`) and an UNBOUND machine (spawn always binds;
@@ -266,7 +266,7 @@ consume:
   attestation carries its own parent ECDSA) but rides op wire v5+
   wasm export crabs_wasm_op_add_attestation src/Util/wasm_helpers.c:810-865;
   node direct fill Operation::AddAttestation bindings/node/src/crabs_node.cc:870-979
-  no JS verifier surface: attestation_deserialize src/Lineage/lineage.h:666
+  no JS verifier surface — the verify gate attestation_verify / attestation_verify_by_lineage_key src/Lineage/lineage.h:639,654 (the reader-side parse is node.attestationFromWire)
   stays C-only — JS verifies by EXECUTING
 early stop: __revoke_attestation__ flips the manifest entry to
   attestation_revoked; new vouches refuse, machine keeps living
