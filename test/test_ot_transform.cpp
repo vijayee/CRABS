@@ -142,11 +142,51 @@ TEST(OTTransform, DeleteDeleteSamePosition) {
 // T5: MOVE vs MOVE
 // ============================================================
 
-TEST(OTTransform, MoveMoveSameSource) {
+TEST(OTTransform, MoveMoveSameSourceEqualEverythingStaysNoOp) {
+  // Same node, same priority, same source: not concurrent (same-node
+  // sequence semantics) — keep the current no-shape-change behavior.
   crabs_ot_operation_t op1 = make_op(CRABS_OT_OP_MOVE, 3, 7);
   crabs_ot_operation_t op2 = make_op(CRABS_OT_OP_MOVE, 3, 9);
   crabs_transform_move_move(&op1, &op2);
   EXPECT_EQ(op1.op_type, 0);
+}
+
+TEST(OTTransform, MoveMoveSameSourceHigherPriorityWins) {
+  crabs_ot_operation_t op1 = make_op(CRABS_OT_OP_MOVE, 3, 7);
+  crabs_ot_op_id_init(&op1.id, "nodeA", 1, 1000);
+  op1.priority = 1;
+  crabs_ot_operation_t op2 = make_op(CRABS_OT_OP_MOVE, 3, 9);
+  crabs_ot_op_id_init(&op2.id, "nodeB", 1, 1000);
+  op2.priority = 1;
+  // Higher (priority, node_id) wins — nodeB wins, so op1 is no-op'd.
+  crabs_transform_move_move(&op1, &op2);
+  EXPECT_EQ(op1.op_type, 0);
+}
+
+TEST(OTTransform, MoveMoveSameSourceLowerPriorityLoses) {
+  crabs_ot_operation_t op1 = make_op(CRABS_OT_OP_MOVE, 3, 7);
+  crabs_ot_op_id_init(&op1.id, "nodeB", 1, 1000);
+  op1.priority = 2;
+  crabs_ot_operation_t op2 = make_op(CRABS_OT_OP_MOVE, 3, 9);
+  crabs_ot_op_id_init(&op2.id, "nodeA", 1, 1000);
+  op2.priority = 1;
+  // op1 has the larger (priority, node_id): op1 keeps its op_type.
+  crabs_transform_move_move(&op1, &op2);
+  EXPECT_EQ(op1.op_type, CRABS_OT_OP_MOVE);
+  EXPECT_EQ(op1.visible_pos, 3u);
+  EXPECT_EQ(op1.visible_pos_2, 7u);
+}
+
+TEST(OTTransform, MoveMoveSamePriorityNodeIdTiebreak) {
+  crabs_ot_operation_t op1 = make_op(CRABS_OT_OP_MOVE, 3, 7);
+  crabs_ot_op_id_init(&op1.id, "nodeZ", 1, 1000);
+  op1.priority = 1;
+  crabs_ot_operation_t op2 = make_op(CRABS_OT_OP_MOVE, 3, 9);
+  crabs_ot_op_id_init(&op2.id, "nodeA", 1, 1000);
+  op2.priority = 1;
+  // Equal priority; "nodeZ" > "nodeA" lexicographically: op1 wins.
+  crabs_transform_move_move(&op1, &op2);
+  EXPECT_EQ(op1.op_type, CRABS_OT_OP_MOVE);
 }
 
 TEST(OTTransform, MoveMoveDifferentSource) {

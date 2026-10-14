@@ -130,10 +130,27 @@ crabs_ot_operation_t* crabs_transform_move_move(
   // op2: move from visible_pos to visible_pos_2
   // Transform op1's source and destination against op2
 
-  // Transform source (delete) against op2's source (delete)
+  // Audit pass-3 H-1: same-source concurrent MOVEs previously no-op'd the
+  // incoming op unconditionally on ALL replicas — each replica kept its own
+  // move, diverging content AND op logs (the serialized state then refuses
+  // to merge, permanently forking the replicas). TP1 requires a strict total
+  // order: the larger (priority, node_id) wins and the loser is no-op'd on
+  // BOTH replicas, mirroring the F-4 insert/insert convention (see
+  // crabs_transform_insert_insert above). The winner's source/destination
+  // need no further shift: the loser's delete+insert is no-op'd on every
+  // replica, so nothing shifts against it.
   if (op1->visible_pos == op2->visible_pos) {
-    // Same source: no-op
-    op1->op_type = 0;
+    bool op1_wins;
+    if (op1->priority != op2->priority) {
+      op1_wins = (op1->priority > op2->priority);
+    } else {
+      int cmp = strncmp(op1->id.node_id, op2->id.node_id, CRABS_MAX_USER_ID);
+      op1_wins = (cmp > 0);
+      // Equal ids (same-node reentry) cannot be concurrent — sequence_num is
+      // unique per node. Default to the no-op to avoid symmetric behavior
+      // (same convention as F-4 above).
+    }
+    if (!op1_wins) op1->op_type = 0;
     return op1;
   }
   // Adjust source position for op2's delete
