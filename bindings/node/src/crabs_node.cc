@@ -480,10 +480,16 @@ private:
       throw Napi::TypeError::New(env, "Expected private key hex string");
     std::string hex = info[0].As<Napi::String>().Utf8Value();
     uint8_t priv[32], pub[33];
-    if (!hex_decode(hex, priv, 32))
+    if (!hex_decode(hex, priv, 32)) {
+      OPENSSL_cleanse(priv, sizeof(priv));
       throw Napi::Error::New(env, "Invalid private key hex");
+    }
     crabs_error_e rc = crypto_ecdsa_derive_public_key(priv, pub);
-    if (rc != CRABS_SUCCESS) throw crabs_error(env, rc, "derivePublicHex");
+    OPENSSL_cleanse(priv, sizeof(priv));  // key bytes never leave this frame
+    if (rc != CRABS_SUCCESS) {
+      OPENSSL_cleanse(pub, sizeof(pub));
+      throw crabs_error(env, rc, "derivePublicHex");
+    }
     return Napi::String::New(env, hex_encode(pub, 33));
   }
 };
@@ -1238,10 +1244,23 @@ private:
               std::string("addAttestation: ") + name + " is required");
         return 0;
       }
+      // Stamps arrive as BigInt (attestationFromWire hands exactly this
+      // shape back) or as a legacy Number. A double past 2^53 would truncate
+      // silently — Numbers keep the 0..2^53-1 gate; BigInts refuse only a
+      // value that does not fit u64.
+      if (value.IsBigInt()) {
+        bool lossless = false;
+        uint64_t stamp = value.As<Napi::BigInt>().Uint64Value(&lossless);
+        if (!lossless)
+          throw Napi::RangeError::New(env,
+              std::string("addAttestation: ") + name +
+              " does not fit in uint64");
+        return stamp;
+      }
       if (!value.IsNumber())
         throw Napi::RangeError::New(env,
             std::string("addAttestation: ") + name +
-            " must be a number (epoch ms)");
+            " must be a number or BigInt (epoch ms)");
       double stamp = value.As<Napi::Number>().DoubleValue();
       // A non-integer or a value past JS's exact-integer range (2^53) would
       // truncate silently on the double -> uint64 conversion; refuse loudly.
@@ -4900,6 +4919,8 @@ private:
       throw crabs_error(env, rc, "abeDecrypt");
     }
     Napi::Buffer<uint8_t> plain = Napi::Buffer<uint8_t>::Copy(env, out, out_len);
+    // The JS caller owns a copy; the C staging copy must not linger in the heap.
+    OPENSSL_cleanse(out, out_len);
     free(out);
     return plain;
   }
@@ -5104,7 +5125,11 @@ private:
     if (!envelope) {
       rc = CRABS_ERR_INVALID_PARAM;   // malformed envelope wire
     } else {
-      if (!crypto_key_envelope_verify(verify_pub, envelope)) {
+      // Audit M-3: expiry is enforced — machine clock, fail closed on no clock.
+      uint64_t now_ms = 0;
+      if (!state_get_time_ms(&am_->base_state, &now_ms)) {
+        rc = CRABS_ERR_CRYPTOGRAPHIC_ERROR;
+      } else if (!crypto_key_envelope_verify(verify_pub, envelope, now_ms)) {
         rc = CRABS_ERR_UNAUTHORIZED;  // wrong issuer key or tampered header/blob
       } else if (crypto_key_envelope_decrypt_sk(
                      envelope, user_private_key, plain,
@@ -6212,14 +6237,13 @@ private:
     fields.Set("childId", Napi::String::New(env, attestation->child_id));
     fields.Set("userId", Napi::String::New(env, attestation->user_id));
     fields.Set("attributes", Napi::String::New(env, attestation->attributes));
-    // Stamps ride as JS safe-integer numbers (the node convention); the
-    // epoch-ms stamps the C body carries stay far below 2^53.
-    fields.Set("notBefore",
-               Napi::Number::New(env, (double)attestation->not_before));
-    fields.Set("expiresAt",
-               Napi::Number::New(env, (double)attestation->expires_at));
+    // Stamps ride as BigInts — same as the wasm binding and the inbound
+    // addAttestation side (this used to double-cast through (double), the
+    // only leg of the wire that silently lost precision past 2^53).
+    fields.Set("notBefore", Napi::BigInt::New(env, attestation->not_before));
+    fields.Set("expiresAt", Napi::BigInt::New(env, attestation->expires_at));
     fields.Set("parentKeyVersion",
-               Napi::Number::New(env, (double)attestation->parent_key_version));
+               Napi::BigInt::New(env, attestation->parent_key_version));
     fields.Set("signatureHex",
                Napi::String::New(env, hex_encode(attestation->signature,
                                                  CRABS_SIG_SIZE)));

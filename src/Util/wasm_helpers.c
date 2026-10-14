@@ -292,6 +292,20 @@ void crabs_wasm_node_destroy(attribute_machine_t* am) {
         (crabs_tx_manager_t*)am->base_state.tx_manager);
     am->base_state.tx_manager = NULL;
   }
+  // The leaked machine's SECRETS still must not sit in linear memory until the
+  // process dies: cleanse the node private key in place, and strip the
+  // recoverable MSK wire images (serialized authority + public params copies)
+  // from the heap via crypto_abe_master_key_cleanse_wire_copies — the API
+  // built for exactly this wasm lifetime. NO frees: the OpenABE context
+  // teardown is the crash path documented above, so the context (and only its
+  // live scalars) stays allocated. A borrowed authority pointer belongs to the
+  // lending machine and is left untouched.
+  OPENSSL_cleanse(am->base_state.node_private_key,
+                  sizeof(am->base_state.node_private_key));
+  if (am->base_state.abe_mk != NULL && !am->base_state.abe_mk_borrowed) {
+    crypto_abe_master_key_cleanse_wire_copies(
+        (abe_master_key_t*)am->base_state.abe_mk);
+  }
   state_set_time_source(&am->base_state, NULL);
   _time_source_unregister_machine(am);
 }
@@ -368,9 +382,11 @@ uint32_t crabs_wasm_op_get_wire_version(const operation_t* op) {
 }
 
 EMSCRIPTEN_KEEPALIVE
-void crabs_wasm_op_init_uuid(operation_t* op) {
-  if (!op) return;
-  crypto_random_bytes(op->uuid, CRABS_UUID_SIZE);
+int32_t crabs_wasm_op_init_uuid(operation_t* op) {
+  if (!op) return (int32_t)CRABS_ERR_INVALID_PARAM;
+  // A zero/partial uuid feeds op dedup (replay-collision hazard), so the RNG
+  // result is surfaced to the caller instead of swallowed.
+  return (int32_t)crypto_random_bytes(op->uuid, CRABS_UUID_SIZE);
 }
 
 // ============================================================
@@ -1090,7 +1106,10 @@ crabs_error_e crabs_wasm_ot_apply(attribute_machine_t* am, const char* name,
   }
   memcpy(op->payload, wire, wire_size);
   op->payload_size = wire_size;
-  crypto_random_bytes(op->uuid, CRABS_UUID_SIZE);
+  if (crypto_random_bytes(op->uuid, CRABS_UUID_SIZE) != CRABS_SUCCESS) {
+    operation_destroy(op);
+    return CRABS_ERR_CRYPTOGRAPHIC_ERROR;
+  }
   const char* admin_id = am->base_state.config.bootstrap_admin;
   if (admin_id != NULL && admin_id[0] != '\0') {
     strncpy(op->signer_id, admin_id, CRABS_MAX_USER_ID - 1);
@@ -1394,7 +1413,10 @@ static crabs_error_e _ot_struct_apply_execute(
   }
   memcpy(op->payload, wire, wire_size);
   op->payload_size = wire_size;
-  crypto_random_bytes(op->uuid, CRABS_UUID_SIZE);
+  if (crypto_random_bytes(op->uuid, CRABS_UUID_SIZE) != CRABS_SUCCESS) {
+    operation_destroy(op);
+    return CRABS_ERR_CRYPTOGRAPHIC_ERROR;
+  }
   const char* admin_id = am->base_state.config.bootstrap_admin;
   if (admin_id != NULL && admin_id[0] != '\0') {
     strncpy(op->signer_id, admin_id, CRABS_MAX_USER_ID - 1);
@@ -1929,7 +1951,12 @@ crabs_error_e crabs_wasm_report_equivocation(attribute_machine_t* am,
   memcpy(payload + offset, op_b, op_b_len);
   offset += op_b_len;
 
-  crypto_random_bytes(op->uuid, CRABS_UUID_SIZE);
+  // A zero/partial uuid feeds the dedup layer (replay-collision hazard), so
+  // a CSPRNG failure refuses the op.
+  if (crypto_random_bytes(op->uuid, CRABS_UUID_SIZE) != CRABS_SUCCESS) {
+    free(payload);
+    return CRABS_ERR_CRYPTOGRAPHIC_ERROR;
+  }
   if (op->payload != NULL) free(op->payload);
   op->payload = payload;
   op->payload_size = payload_len;
@@ -2742,6 +2769,7 @@ int32_t crabs_wasm_key_envelope_import(attribute_machine_t* am,
   uint8_t plain[4096];
   size_t plain_len = 0;
   const uint8_t* verify_pub = node_public_key;
+  uint64_t now_ms = 0;
   crabs_error_e rc;
 
   if (!am || !wire || wire_len == 0 || !user_private_key || !out_key) {
@@ -2761,8 +2789,11 @@ int32_t crabs_wasm_key_envelope_import(attribute_machine_t* am,
       (abe_master_key_t*)am->base_state.abe_mk, wire, (size_t)wire_len);
   if (!envelope) {
     rc = CRABS_ERR_INVALID_PARAM;   // malformed envelope wire
-  } else if (!crypto_key_envelope_verify(verify_pub, envelope)) {
-    rc = CRABS_ERR_UNAUTHORIZED;    // wrong issuer key or tampered header/blob
+  } else if (!state_get_time_ms(&am->base_state, &now_ms)) {
+    // No usable clock: expiry cannot be checked — fail closed.
+    rc = CRABS_ERR_CRYPTOGRAPHIC_ERROR;
+  } else if (!crypto_key_envelope_verify(verify_pub, envelope, now_ms)) {
+    rc = CRABS_ERR_UNAUTHORIZED;    // wrong issuer key, expired, or tampered
   } else if (crypto_key_envelope_decrypt_sk(envelope, user_private_key, plain,
                                             sizeof(plain), &plain_len)
                != CRABS_SUCCESS) {
@@ -3855,6 +3886,10 @@ serialized_buffer_t* crabs_wasm_lineage_key_rotate(
     return NULL;
   }
   state_set_node_key(&am->base_state, new_private_key, new_public_key);
+  // The staging frame is the caller's JS-side buffer, but its 32 private-key
+  // bytes live in module heap either way — strip them at the last C-side use
+  // (the JS wrapper wipes the same bytes again before its own free).
+  OPENSSL_cleanse((void*)new_private_key, 32);
   serialized_buffer_t* buffer = serialized_buffer_create(record_len);
   if (buffer == NULL) {
     free(record);

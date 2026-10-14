@@ -379,6 +379,16 @@ function freeAll(M, ...ptrs) {
   for (const p of ptrs) { if (p) M._free(p); }
 }
 
+// Zeroize then free — for staging buffers whose bytes include key material
+// (a private key, a bearer token, decrypted plaintext). dlmalloc's free list
+// recycles chunks verbatim, so releasing secrets without wiping hands those
+// bytes to the next allocation in module heap.
+function wipeFree(M, ptr, len) {
+  if (!ptr) return;
+  M.HEAPU8.fill(0, ptr, ptr + len);
+  M._free(ptr);
+}
+
 // Protocol states (protocol_state_e, src/CRABS/data_model.h:58-65) as the
 // JS words the recipes use; the executor consumes the numbers 0..4 in the
 // op's per-resource required_state / next_state arrays.
@@ -426,9 +436,9 @@ class KeyPair {
     const M = await getModule();
     const ptr = M._malloc(65);
     const len = hexDecode(M, hex, ptr, 32);
-    if (len !== 32) { M._free(ptr); throw new Error('Invalid private key hex'); }
+    if (len !== 32) { wipeFree(M, ptr, 32); throw new Error('Invalid private key hex'); }
     const rc = M._crypto_ecdsa_derive_public_key(ptr, ptr + 32);
-    if (rc !== 0) { M._free(ptr); throw crabsError(rc, 'fromPrivateHex'); }
+    if (rc !== 0) { wipeFree(M, ptr, 32); throw crabsError(rc, 'fromPrivateHex'); }
     const kp = new KeyPair(M, ptr);
     kp._raw = true;
     return kp;
@@ -439,10 +449,11 @@ class KeyPair {
     const priv = M._malloc(32);
     const pub = M._malloc(33);
     const len = hexDecode(M, hex, priv, 32);
-    if (len !== 32) { freeAll(M, priv, pub); throw new Error('Invalid private key hex'); }
+    if (len !== 32) { M._free(pub); wipeFree(M, priv, 32); throw new Error('Invalid private key hex'); }
     const rc = M._crypto_ecdsa_derive_public_key(priv, pub);
     const out = rc === 0 ? hexEncode(M.HEAPU8.subarray(pub, pub + 33), 33) : '';
-    freeAll(M, priv, pub);
+    M._free(pub);
+    wipeFree(M, priv, 32);
     if (rc !== 0) throw crabsError(rc, 'derivePublicHex');
     return out;
   }
@@ -457,7 +468,9 @@ class KeyPair {
 
   destroy() {
     if (this._ptr) {
-      if (this._raw) this._M._free(this._ptr);
+      // The _raw form is a bare 65-byte frame whose first 32 bytes are the
+      // private key — wipe before free (the C destroy path cleanses itself).
+      if (this._raw) wipeFree(this._M, this._ptr, 32);
       else this._M._crypto_ecdsa_keypair_destroy(this._ptr);
       this._ptr = null;
     }
@@ -532,7 +545,7 @@ class Operation {
     const ptr = M._operation_create(typePtr);
     if (typePtr) M._free(typePtr);
     if (!ptr) throw new Error('Operation.create failed');
-    M._crabs_wasm_op_init_uuid(ptr);
+    wrapRc(M._crabs_wasm_op_init_uuid(ptr), 'Operation.create');
     return new Operation(M, ptr);
   }
 
@@ -1572,7 +1585,9 @@ class Node {
       (ownerEnd === -1 ? 64 : ownerEnd));
     const lockTokenHex = tokenValid
       ? hexEncode(M.HEAPU8.subarray(bufPtr + 88, bufPtr + 120), 32) : '';
-    M._free(bufPtr);
+    // bufPtr's frame carries the live 32-byte bearer lock token — wipe before
+    // it returns to the free list.
+    wipeFree(M, bufPtr, 120);
     return {
       protocolState: protocolState || 'idle',
       lockOwner,
@@ -2268,7 +2283,7 @@ class Node {
       freeAll(M, signerPtr, nodePtr);
       throw new Error('createTrigger: operation_create failed');
     }
-    M._crabs_wasm_op_init_uuid(opPtr);
+    wrapRc(M._crabs_wasm_op_init_uuid(opPtr), 'createTrigger');
     M._crabs_wasm_op_set_signer(opPtr, signerPtr);
     M._crabs_wasm_op_set_node(opPtr, nodePtr);
     freeAll(M, signerPtr, nodePtr);
@@ -2472,7 +2487,7 @@ class Node {
       const outPtr = M.getValue(outPtrPtr, 'i32');
       const outLen = M.getValue(outLenPtr, 'i32');
       const plain = new Uint8Array(M.HEAPU8.subarray(outPtr, outPtr + outLen));  // copy
-      M._free(outPtr);  // copied into `plain` above — free before returning
+      wipeFree(M, outPtr, outLen);  // copied into `plain` above — the heap copy must not linger
       return plain;
     } finally {
       freeAll(M, outPtrPtr, outLenPtr);
@@ -3526,11 +3541,13 @@ class Node {
     const pub = M._malloc(33);
     if (hexDecode(M, newKey.privateKeyHex(), priv, 32) !== 32 ||
         hexDecode(M, newKey.publicKeyHex(), pub, 33) !== 33) {
-      freeAll(M, priv, pub);
+      M._free(pub);
+      wipeFree(M, priv, 32);
       throw new Error('lineageRotateKey: the new keypair did not decode');
     }
     const ser = M._crabs_wasm_lineage_key_rotate(this._am, priv, pub);
-    freeAll(M, priv, pub);
+    M._free(pub);
+    wipeFree(M, priv, 32);
     if (!ser) throw new Error('lineageRotateKey failed (the C gate refused — see the lineage_key_rotate contract)');
     const len = M._crabs_wasm_buffer_len(ser);
     const data = M._crabs_wasm_buffer_data(ser);

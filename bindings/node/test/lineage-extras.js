@@ -123,7 +123,7 @@ function expectRefusal(runnable, expected, what) {
       'attestation must bind the parent id');
     assert.strictEqual(pre.childId, 'rot-child',
       'attestation must bind the child id');
-    assert.strictEqual(pre.parentKeyVersion, 1,
+    assert.strictEqual(pre.parentKeyVersion, 1n,
       'fresh parent stamps the spawn generation');
 
     const executeEndorsed = (fields) => {
@@ -147,7 +147,7 @@ function expectRefusal(runnable, expected, what) {
     // Parent attestations now mint under the NEW chain version.
     const post = child.attestationFromWire(
       parent.lineageAttest('rot-child', 'alice', 'role:member'));
-    assert.strictEqual(post.parentKeyVersion, 2,
+    assert.strictEqual(post.parentKeyVersion, 2n,
       'rotation advances the parent lineage key version');
 
     // Pre-accept, the child's tip is still the spawn pin: the NEW
@@ -192,10 +192,10 @@ function expectRefusal(runnable, expected, what) {
     assert.strictEqual(fields.childId, 'parse-child');
     assert.strictEqual(fields.userId, 'carol');
     assert.strictEqual(fields.attributes, 'role:member');
-    assert(Number.isInteger(fields.notBefore) &&
-           Number.isInteger(fields.expiresAt) &&
-           Number.isInteger(fields.parentKeyVersion),
-      'the stamps arrive as numbers (the node JS-safe-integer convention)');
+    assert(typeof fields.notBefore === 'bigint' &&
+           typeof fields.expiresAt === 'bigint' &&
+           typeof fields.parentKeyVersion === 'bigint',
+      'the stamps arrive as BigInts (same as wasm and the addAttestation side)');
     assert.strictEqual(fields.signatureHex.length, 128,
       'signatureHex must be 128 hex chars (64 bytes)');
     assert(/^[0-9a-f]+$/.test(fields.signatureHex),

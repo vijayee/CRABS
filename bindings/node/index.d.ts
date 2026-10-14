@@ -68,11 +68,11 @@ export interface AttestationFields {
    *  list CONTAINS the token exactly. */
   attributes: string;
   /** Epoch ms; 0 = no lower fence. */
-  notBefore?: number;
+  notBefore?: bigint;
   /** Epoch ms; 0 is a legal (instant-then-expired) window. */
-  expiresAt?: number;
+  expiresAt?: bigint;
   /** The chain TIP version the parent stamped (required — tip-only verify). */
-  parentKeyVersion: number;
+  parentKeyVersion: bigint;
   /** 128 hex chars (64 bytes = CRABS_SIG_SIZE). */
   signatureHex: string;
 }
