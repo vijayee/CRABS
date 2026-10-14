@@ -372,6 +372,9 @@ export interface Node {
    * suspend/activate bump the user's keyVersion readback (the R7-04
    * staleness anchor: ops stamped pre-bump refuse with key_stale).
    */
+  // Keyring-direct helpers carry NO signer gate and emit NO change event
+  // (only user key_version moves) — unlike the __suspend_key__ wire ops, they
+  // leave no op-log trail; replicas observe the change only via state sync.
   suspendKey(userId: string, keyId: string): void;
   activateKey(userId: string, keyId: string): void;
   rotateKey(userId: string, oldKeyId: string, newKeyId: string,

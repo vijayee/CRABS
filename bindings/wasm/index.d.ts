@@ -546,6 +546,9 @@ export interface Node {
    * (R8-A-5), so ops stamped pre-suspension replay into key_stale.
    */
   activateUser(userId: string, signerId?: string): void;
+  // Keyring-direct helpers carry NO signer gate and emit NO change event
+  // (only user key_version moves) — unlike the __suspend_key__ wire ops, they
+  // leave no op-log trail; replicas observe the change only via state sync.
   suspendKey(userId: string, keyId: string): void;
   activateKey(userId: string, keyId: string): void;
   rotateKey(userId: string, oldKeyId: string, newKeyId: string, opts: RotateKeyOptions): void;
