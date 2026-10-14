@@ -1648,6 +1648,14 @@ crabs_error_e lineage_spawn_machine(state_t* parent,
             manifest_entry->spawned_at = 0;
           }
           manifest_entry->status = LINEAGE_ACTIVE;
+          // Audit M-8: stamp the parent key version this attestation was
+          // signed under — the same normalization the child's chain pin
+          // uses — so provenance keeps resolving after lineage_key_rotate
+          // replaces the parent's current key.
+          manifest_entry->key_version_at_spawn =
+              parent->lineage_key_version != 0
+                  ? parent->lineage_key_version
+                  : (uint64_t)CRABS_LINEAGE_KEY_VERSION_START;
           parent->child_count += 1;
 
           // Attribute the spawn to the parent's node identity (same HLC-id
@@ -1760,8 +1768,37 @@ crabs_error_e lineage_verify_child_provenance(const state_t* parent_state,
   // The stored hash IS the ECDSA digest (see the header contract): the
   // digest-level verify proves the parent's node key attested exactly this
   // genesis hash at spawn, without needing the (unrecoverable) blob.
+  // Audit M-8: the attestation is verified under the key that ACTUALLY
+  // signed it. A stamped entry (v19+) resolves its spawn version — the
+  // current key for an up-to-date stamp, the retirement history otherwise;
+  // falling back to the current key can only produce an honest FALSE
+  // negative (the current key never signed old attestations), never a false
+  // positive. Unstamped entries (pre-v19 manifests) keep the pre-v19
+  // behavior — they verify against the current key.
+  uint64_t current_key_version =
+      parent_state->lineage_key_version != 0
+          ? parent_state->lineage_key_version
+          : (uint64_t)CRABS_LINEAGE_KEY_VERSION_START;
+  const uint8_t* provenance_key = NULL;
+  if (manifest_entry->key_version_at_spawn == 0 ||
+      manifest_entry->key_version_at_spawn == current_key_version) {
+    provenance_key = parent_state->node_public_key;
+  } else {
+    for (uint32_t retired_index = 0;
+         retired_index < parent_state->lineage_retired_keys_count;
+         retired_index++) {
+      if (parent_state->lineage_retired_keys[retired_index].key_version ==
+          manifest_entry->key_version_at_spawn) {
+        provenance_key = parent_state->lineage_retired_keys[retired_index].public_key;
+        break;
+      }
+    }
+    if (provenance_key == NULL) {
+      provenance_key = parent_state->node_public_key;
+    }
+  }
   return crypto_ecdsa_verify_digest(
-             parent_state->node_public_key,
+             provenance_key,
              manifest_entry->genesis_snapshot_hash,
              manifest_entry->genesis_attestation_signature)
              ? CRABS_SUCCESS
@@ -2347,6 +2384,33 @@ crabs_error_e lineage_key_rotate(state_t* parent_state,
     return CRABS_ERR_OOM;
   }
   memcpy(stashed, record, record_len);
+  // Audit M-8: RETAIN the retiring key's public half before it stops being
+  // the node key — historical genesis attestations stamp manifest entries
+  // with key_version_at_spawn and verify against THIS retained public key.
+  // The private half is discarded with the rotation; a retained public key
+  // verifies but cannot sign. Bounded like the child key chain; growth is
+  // the last fallible step before the mutation tail, so an OOM here aborts
+  // the whole rotation fail-closed instead of leaving a gap in the history.
+  if (parent_state->lineage_retired_keys_count >= CRABS_MAX_LINEAGE_KEY_CHAIN) {
+    free(record);
+    free(stashed);
+    return CRABS_ERR_INVALID_PARAM;
+  }
+  lineage_key_chain_entry_t* grown_retired = realloc(
+      parent_state->lineage_retired_keys,
+      (size_t)(parent_state->lineage_retired_keys_count + 1) *
+          sizeof(lineage_key_chain_entry_t));
+  if (grown_retired == NULL) {
+    free(record);
+    free(stashed);
+    return CRABS_ERR_OOM;
+  }
+  parent_state->lineage_retired_keys = grown_retired;
+  lineage_key_chain_entry_t* retired_entry =
+      &parent_state->lineage_retired_keys[parent_state->lineage_retired_keys_count];
+  retired_entry->key_version = current_key_version;
+  memcpy(retired_entry->public_key, parent_state->node_public_key, 33);
+  parent_state->lineage_retired_keys_count++;
   if (parent_state->lineage_last_key_transition != NULL) {
     free(parent_state->lineage_last_key_transition);
   }

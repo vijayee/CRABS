@@ -1433,8 +1433,14 @@ static bool _deserialize_data_item(read_buf_t* buf, data_item_t* item, uint32_t 
     // First pass: compute total string space needed
     size_t str_space = 0;
     size_t saved_offset = buf->offset;
-    uint8_t* msg_lens = get_clear_memory(inv_count * sizeof(uint8_t) + inv_count * sizeof(uint16_t));
-    uint16_t* msg_lens_arr = (uint16_t*)(msg_lens + inv_count);
+    // The uint16 lens live after the uint8 count section in the same block;
+    // the u16 section starts at an EVEN offset so the uint16_t stores are
+    // correctly aligned (UBSan: the previous odd-offset cast stored u16s
+    // misaligned).
+    size_t u8_section = (size_t)inv_count;
+    size_t u16_start = (u8_section + 1) & ~(size_t)1;
+    uint8_t* msg_lens = get_clear_memory(u16_start + inv_count * sizeof(uint16_t));
+    uint16_t* msg_lens_arr = (uint16_t*)(msg_lens + u16_start);
     for (uint8_t i = 0; i < inv_count; i++) {
       uint8_t inv_type;
       if (!_read_uint8(buf, &inv_type)) { free(msg_lens); return false; }
@@ -1519,6 +1525,42 @@ serialized_buffer_t* crabs_serialize_data_item(const data_item_t* item) {
   free(buf->data);
   free(buf);
   return result;
+}
+
+// Public single-item reader for the __add_item__ op payload (audit M-11):
+// parses exactly the bytes crabs_serialize_data_item emits, at the current
+// serial version, with FULL consumption required and the wire-carried-item
+// validation gate (canonical type/crdt pair, non-empty name, IDLE protocol
+// state) applied before the item is handed out — see the header contract.
+data_item_t* crabs_deserialize_data_item(const uint8_t* data, size_t len) {
+  if (data == NULL || len == 0 || len > UINT32_MAX) return NULL;
+  read_buf_t buf;
+  buf.data = data;
+  buf.len = len;
+  buf.offset = 0;
+  data_item_t* item = get_clear_memory(sizeof(data_item_t));
+  if (!_deserialize_data_item(&buf, item, CRABS_SERIAL_VERSION)) {
+    data_item_destroy(item);
+    return NULL;
+  }
+  // Full consumption: the payload must be exactly one item — trailing bytes
+  // would be an unvalidated smuggled tail.
+  if (buf.offset != buf.len) {
+    data_item_destroy(item);
+    return NULL;
+  }
+  // The wire-carried-item gate (data_model.h): refuse a non-canonical
+  // (type, crdt_type) pair (every repr/crdt-dispatched consumer would
+  // miscast it), an empty name, or a carried runtime protocol_state other
+  // than IDLE — a wire-minted item has never been through the lock pipeline
+  // and must arrive in the same shape data_item_create_with_options mints.
+  if (item->name[0] == '\0' ||
+      !data_item_type_crdt_pair_canonical(item->type, item->crdt_type) ||
+      item->protocol_state != PROTOCOL_IDLE) {
+    data_item_destroy(item);
+    return NULL;
+  }
+  return item;
 }
 
 // Public single-item chain-preimage form (write-domains v1): delegates to
@@ -2102,6 +2144,10 @@ static serialized_buffer_t* _serialize_state_internal(const state_t* state,
     _write_uint64_le(buf, manifest_entry->attestation_ttl_ms);
     _write_uint64_le(buf, manifest_entry->spawned_at);
     _write_uint8(buf, (uint8_t)manifest_entry->status);
+    // v19 (audit M-8): the parent key version the genesis attestation was
+    // signed under; 0 for entries restored from pre-v19 manifests (the
+    // verifier falls back to the current key — the pre-v19 behavior).
+    _write_uint64_le(buf, manifest_entry->key_version_at_spawn);
   }
 
   // parent binding (v11): present only for spawned children. lineage_self_id
@@ -2290,6 +2336,25 @@ static serialized_buffer_t* _serialize_state_internal(const state_t* state,
     }
   }
 
+  // Retired lineage keys (v19, audit M-8): the parent's retention of the
+  // public halves of keys lineage_key_rotate has retired, so historical
+  // child-manifest attestations (stamped key_version_at_spawn) stay
+  // verifiable after rotation. Bounded by the same cap as the child key
+  // chain; fail loud rather than emit a blob the reader would refuse.
+  if (state->lineage_retired_keys_count > CRABS_MAX_LINEAGE_KEY_CHAIN ||
+      (state->lineage_retired_keys_count > 0 &&
+       state->lineage_retired_keys == NULL)) {
+    free(buf->data);
+    free(buf);
+    return NULL;
+  }
+  _write_uint32_le(buf, state->lineage_retired_keys_count);
+  for (uint32_t retired_index = 0; retired_index < state->lineage_retired_keys_count;
+       retired_index++) {
+    _write_uint64_le(buf, state->lineage_retired_keys[retired_index].key_version);
+    _write_bytes(buf, state->lineage_retired_keys[retired_index].public_key, 33);
+  }
+
   // Checksum: SHA-256 of all preceding bytes.
   // NOTE: this is an INTEGRITY/CORRUPTION check, NOT authentication. An
   // attacker who can modify the blob can recompute this hash. Loading state
@@ -2332,6 +2397,11 @@ static bool _deserialize_user(read_buf_t* buf, attribute_machine_t* machine) {
   if (user == NULL) return false;
 
   if (!_read_string16(buf, user->user_id, CRABS_MAX_USER_ID)) goto fail;
+  // Audit H-3: the live registration path refuses ids outside the safe
+  // charset (policy-keyword/placeholder injection and ':' separators); a
+  // crafted snapshot must not be able to install what registration would
+  // reject. Key ids and labels carry the same wire-id discipline below.
+  if (!attribute_machine_is_safe_user_id(user->user_id)) goto fail;
   uint8_t user_status;
   if (!_read_uint8(buf, &user_status)) goto fail;
   user->status = (user_status_e)user_status;
@@ -2746,6 +2816,14 @@ static state_t* _deserialize_state_internal(const uint8_t* data, size_t len,
           // without a format bump — the status stays a u8).
           if (entry_status > (uint8_t)LINEAGE_ATTESTATION_REVOKED) goto fail;
           manifest_entry->status = (lineage_status_e)entry_status;
+          // v19 (audit M-8): the parent key version the genesis attestation
+          // was signed under; pre-v19 entries keep the zero default — the
+          // verifier falls back to the current key (the pre-v19 behavior).
+          if (version >= 19) {
+            if (!_read_uint64_le(&buf, &manifest_entry->key_version_at_spawn)) {
+              goto fail;
+            }
+          }
         }
       }
 
@@ -3052,6 +3130,35 @@ static state_t* _deserialize_state_internal(const uint8_t* data, size_t len,
         }
       }
       state->raft_module_state = module_state;
+    }
+  }
+
+  // Retired lineage keys (v19, audit M-8): {key_version, public_key} pairs
+  // retained by lineage_key_rotate so stamped manifest attestations stay
+  // verifiable after rotation. Pre-v19 blobs carry none (the fields stay at
+  // their state_create defaults).
+  if (version >= 19) {
+    uint32_t retired_keys_count = 0;
+    if (!_read_uint32_le(&buf, &retired_keys_count)) goto fail;
+    if (retired_keys_count > CRABS_MAX_LINEAGE_KEY_CHAIN ||
+        (size_t)retired_keys_count > buf.len - buf.offset) {
+      goto fail;
+    }
+    if (retired_keys_count > 0) {
+      state->lineage_retired_keys =
+          get_clear_memory((size_t)retired_keys_count *
+                           sizeof(lineage_key_chain_entry_t));
+      if (state->lineage_retired_keys == NULL) goto fail;
+      state->lineage_retired_keys_count = retired_keys_count;
+      for (uint32_t retired_index = 0; retired_index < retired_keys_count;
+           retired_index++) {
+        lineage_key_chain_entry_t* retired_entry =
+            &state->lineage_retired_keys[retired_index];
+        if (!_read_uint64_le(&buf, &retired_entry->key_version) ||
+            !_read_bytes(&buf, retired_entry->public_key, 33)) {
+          goto fail;
+        }
+      }
     }
   }
 

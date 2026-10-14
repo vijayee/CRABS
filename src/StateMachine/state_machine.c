@@ -117,6 +117,11 @@ crabs_error_e state_machine_op_suspend_key(state_t* s, operation_t* o);
 crabs_error_e state_machine_op_activate_key(state_t* s, operation_t* o);
 crabs_error_e state_machine_op_rotate_key(state_t* s, operation_t* o);
 crabs_error_e state_machine_op_compact(state_t* s, operation_t* o);
+crabs_error_e state_machine_op_add_item(state_t* s, operation_t* o);
+crabs_error_e state_machine_op_add_policy(state_t* s, operation_t* o);
+crabs_error_e state_machine_op_grant_role(state_t* s, operation_t* o);
+crabs_error_e state_machine_op_revoke_role(state_t* s, operation_t* o);
+crabs_error_e state_machine_op_suspend_user(state_t* s, operation_t* o);
 crabs_error_e state_machine_op_schedule(state_t* s, operation_t* o);
 crabs_error_e state_machine_op_cancel_schedule(state_t* s, operation_t* o);
 crabs_error_e state_machine_op_report_equivocation(state_t* s, operation_t* o);
@@ -233,6 +238,11 @@ bool operation_is_builtin(const char* type) {
           strcmp(type, CRABS_OP_CHECK_DEDUP) == 0 ||
           strcmp(type, CRABS_OP_EXECUTE_OT) == 0 ||
           strcmp(type, CRABS_OP_COMPACT) == 0 ||
+          strcmp(type, CRABS_OP_ADD_ITEM) == 0 ||
+          strcmp(type, CRABS_OP_ADD_POLICY) == 0 ||
+          strcmp(type, CRABS_OP_GRANT_ROLE) == 0 ||
+          strcmp(type, CRABS_OP_REVOKE_ROLE) == 0 ||
+          strcmp(type, CRABS_OP_SUSPEND_USER) == 0 ||
           strcmp(type, CRABS_OP_SCHEDULE) == 0 ||
           strcmp(type, CRABS_OP_CANCEL_SCHEDULE) == 0 ||
           strcmp(type, CRABS_OP_REPORT_EQUIVOCATION) == 0);
@@ -1836,6 +1846,17 @@ static crabs_error_e state_machine_execute_internal(state_t* state, operation_t*
   } else if (strcmp(op->type, CRABS_OP_COMPACT) == 0) {
     // Compaction operation (v1.5.2 §4.3)
     result = state_machine_op_compact(state, op);
+  } else if (strcmp(op->type, CRABS_OP_ADD_ITEM) == 0) {
+    // Administrative state mutations (audit M-11): signed pipeline forms
+    result = state_machine_op_add_item(state, op);
+  } else if (strcmp(op->type, CRABS_OP_ADD_POLICY) == 0) {
+    result = state_machine_op_add_policy(state, op);
+  } else if (strcmp(op->type, CRABS_OP_GRANT_ROLE) == 0) {
+    result = state_machine_op_grant_role(state, op);
+  } else if (strcmp(op->type, CRABS_OP_REVOKE_ROLE) == 0) {
+    result = state_machine_op_revoke_role(state, op);
+  } else if (strcmp(op->type, CRABS_OP_SUSPEND_USER) == 0) {
+    result = state_machine_op_suspend_user(state, op);
   } else if (strcmp(op->type, CRABS_OP_SCHEDULE) == 0) {
     // Timed transactions (v1)
     result = state_machine_op_schedule(state, op);
@@ -2135,6 +2156,53 @@ crabs_error_e state_machine_op_cancel_schedule(state_t* state, operation_t* op) 
 // Built-in Operations (§7.3)
 // ============================================================
 
+// Audit M-5: ownership proof for extend/verify-adjacent lock transitions.
+// A NAMED lock owner is authenticated by signer identity (and any carried
+// claim must match the stored token); an ANONYMOUS lock owner ("/"" empty)
+// has no identity to compare, so the op must present the bearer token as a
+// lock claim on exactly this resource, compared constant-time.
+static const lock_claim_t* _op_lock_claim_for(const operation_t* op,
+                                              const char* resource) {
+  for (uint32_t claim_index = 0; claim_index < op->lock_claim_count; claim_index++) {
+    if (strcmp(op->lock_claims[claim_index].resource, resource) == 0) {
+      return &op->lock_claims[claim_index];
+    }
+  }
+  return NULL;
+}
+
+static crabs_error_e _lock_owner_access_check(const operation_t* op,
+                                              const char* resource,
+                                              const data_item_t* item) {
+  if (!item->lock_state.lock_token_valid) {
+    return CRABS_ERR_LOCK_OWNER_MISMATCH;
+  }
+  if (op->lock_claims == NULL && op->lock_claim_count > 0) {
+    return CRABS_ERR_INVALID_PARAM;
+  }
+  const lock_claim_t* claim = _op_lock_claim_for(op, resource);
+  if (item->lock_state.lock_owner[0] != '\0') {
+    if (strcmp(item->lock_state.lock_owner, op->signer_id) != 0) {
+      return CRABS_ERR_LOCK_OWNER_MISMATCH;
+    }
+    if (claim != NULL &&
+        CRYPTO_memcmp(item->lock_state.lock_token, claim->lock_token,
+                      CRABS_LOCK_TOKEN_SIZE) != 0) {
+      return CRABS_ERR_LOCK_TOKEN_MISMATCH;
+    }
+    return CRABS_SUCCESS;
+  }
+  // Anonymous owner: nothing to strcmp against — the claim is mandatory.
+  if (claim == NULL) {
+    return CRABS_ERR_LOCK_OWNER_MISMATCH;
+  }
+  if (CRYPTO_memcmp(item->lock_state.lock_token, claim->lock_token,
+                    CRABS_LOCK_TOKEN_SIZE) != 0) {
+    return CRABS_ERR_LOCK_TOKEN_MISMATCH;
+  }
+  return CRABS_SUCCESS;
+}
+
 crabs_error_e state_machine_op_lock(state_t* state, operation_t* op, lock_response_t* response) {
   for (uint32_t i = 0; i < op->resource_count; i++) {
     data_item_t* item = state_find_item(state, op->resources[i]);
@@ -2268,12 +2336,15 @@ crabs_error_e state_machine_op_extend(state_t* state, operation_t* op) {
     data_item_t* item = state_find_item(state, op->resources[i]);
     if (item == NULL) return CRABS_ERR_RESOURCE_NOT_FOUND;
     if (item->protocol_state != PROTOCOL_LOCKED) return CRABS_ERR_PROTOCOL_VIOLATION;
-    // R8-S-1: only the lock owner may extend. The Step-5 lock-claim check only
-    // runs when the op carries claims; an op without claims must still be
-    // rejected if the signer is not the owner.
-    if (!item->lock_state.lock_token_valid ||
-        strcmp(item->lock_state.lock_owner, op->signer_id) != 0) {
-      return CRABS_ERR_LOCK_OWNER_MISMATCH;
+    // R8-S-1 + audit M-5: named-owned locks accept only their owner (a
+    // carried claim, if any, must match the stored token); anonymous-owned
+    // locks have no owner to compare — only possession of the BEARER token
+    // (a claim on this op matching the stored token, constant-time) proves
+    // access. Previously `strcmp("", "")` let ANY anonymous op extend any
+    // anonymous lock.
+    crabs_error_e access_rc = _lock_owner_access_check(op, op->resources[i], item);
+    if (access_rc != CRABS_SUCCESS) {
+      return access_rc;
     }
     if (item->lock_state.lock_extensions >= state->config.max_lock_extensions) {
       return CRABS_ERR_MAX_EXTENSIONS_REACHED;
@@ -2371,12 +2442,12 @@ crabs_error_e state_machine_op_unlock(state_t* state, operation_t* op) {
     data_item_t* item = state_find_item(state, op->resources[i]);
     if (item == NULL) return CRABS_ERR_RESOURCE_NOT_FOUND;
     if (item->protocol_state != PROTOCOL_VERIFIED) return CRABS_ERR_PROTOCOL_VIOLATION;
-    // R8-S-1: only the lock owner may unlock. The Step-5 lock-claim check only
-    // runs when the op carries claims; an op without claims must still be
-    // rejected if the signer is not the owner.
-    if (!item->lock_state.lock_token_valid ||
-        strcmp(item->lock_state.lock_owner, op->signer_id) != 0) {
-      return CRABS_ERR_LOCK_OWNER_MISMATCH;
+    // R8-S-1 + audit M-5: same bearer discipline as extend — anonymous-owned
+    // locks require possession of the token, named-owned locks require the
+    // owner signer (and token match for any carried claim).
+    crabs_error_e access_rc = _lock_owner_access_check(op, op->resources[i], item);
+    if (access_rc != CRABS_SUCCESS) {
+      return access_rc;
     }
     item->protocol_state = PROTOCOL_IDLE;
     item->lock_state.lock_token_valid = false;
@@ -2616,6 +2687,27 @@ crabs_error_e state_machine_op_register_key(state_t* state, operation_t* op) {
     return CRABS_ERR_INVALID_PARAM;
   }
 
+  // Audit H-1: public key bytes must belong to exactly ONE identity. A user
+  // registering a VICTIM's key would be scanned first by Mode B verification
+  // (newest user first), hijacking audit attribution for the victim's valid
+  // signatures and failing victim ops whose attributes do not satisfy the
+  // attacker's policy. Reject cross-user key reuse; the caller's own
+  // existing keys are exempt (their bytes are already theirs). The NODE's
+  // public key is likewise protected — with the bootstrap-admin exception,
+  // whose registered capability is the node key by design.
+  bool signer_is_bootstrap_admin =
+      state->config.bootstrap_admin[0] != '\0' &&
+      strcmp(op->signer_id, state->config.bootstrap_admin) == 0;
+  if (state->node_key_valid && !signer_is_bootstrap_admin && pk_len == 33 &&
+      memcmp(state->node_public_key, pk_data, 33) == 0) {
+    return CRABS_ERR_INVALID_PARAM;
+  }
+  if (!signer_is_bootstrap_admin &&
+      attribute_machine_public_key_in_use(state->attr_machine, pk_data, pk_len,
+                                          op->signer_id)) {
+    return CRABS_ERR_DUPLICATE_OPERATION;
+  }
+
   return user_key_register(user, key_id, scheme, pk_data, pk_len,
                            label[0] != '\0' ? label : NULL);
 }
@@ -2822,6 +2914,24 @@ crabs_error_e state_machine_op_rotate_key(state_t* state, operation_t* op) {
   uint32_t remaining = op->payload_size - (uint32_t)config_len;
   if (remaining < pk_len) return CRABS_ERR_INVALID_PARAM;
 
+  // Audit H-1: the replacement key must not already belong to another
+  // principal — the cross-user uniqueness rule from register_key applies to
+  // rotation with the same Mode B attribution-hijack consequence. The
+  // bootstrap-admin exemption carries over (the admin's identity IS the
+  // node key).
+  bool rotator_is_bootstrap_admin =
+      state->config.bootstrap_admin[0] != '\0' &&
+      strcmp(op->signer_id, state->config.bootstrap_admin) == 0;
+  if (state->node_key_valid && !rotator_is_bootstrap_admin && pk_len == 33 &&
+      memcmp(state->node_public_key, pk_data, 33) == 0) {
+    return CRABS_ERR_INVALID_PARAM;
+  }
+  if (!rotator_is_bootstrap_admin &&
+      attribute_machine_public_key_in_use(state->attr_machine, pk_data, pk_len,
+                                          op->signer_id)) {
+    return CRABS_ERR_DUPLICATE_OPERATION;
+  }
+
   return user_key_rotate(user, old_key_id, new_key_id, new_scheme, pk_data, pk_len, NULL);
 }
 
@@ -2921,6 +3031,226 @@ crabs_error_e state_machine_op_compact(state_t* state, operation_t* op) {
   crabs_compaction_engine_destroy(&engine);
 
   return err;
+}
+
+// ============================================================
+// Administrative State-Mutation Operations (audit M-10/M-11)
+// ============================================================
+// The signed, durability-logged forms of mutations the CLI historically
+// applied with a direct state call (no signature, no log entry, no policy
+// check). Authorization lives in the pipeline: these ops execute only after
+// the op type's registered policy verifies against the signer's attributes
+// (default "role:admin" when seeded via
+// state_machine_seed_admin_builtin_policies). The user-registry handlers
+// additionally re-gate the CONCRETE op signer through the attribute
+// machine's own active-admin check, so a Mode-B-authorized op with an empty
+// signer_id still cannot mutate the registry namelessly.
+
+crabs_error_e state_machine_op_add_item(state_t* state, operation_t* op) {
+  if (state == NULL || op == NULL) return CRABS_ERR_INVALID_PARAM;
+  // Payload: exactly one canonical item wire image
+  // (crabs_serialize_data_item); the deserializer applies the
+  // wire-carried-item validation gate (canonical type/crdt pair, non-empty
+  // name, IDLE protocol state, full consumption).
+  if (op->payload == NULL || op->payload_size == 0) {
+    return CRABS_ERR_INVALID_PARAM;
+  }
+  data_item_t* item = crabs_deserialize_data_item(op->payload, op->payload_size);
+  if (item == NULL) return CRABS_ERR_SERIALIZATION_ERROR;
+
+  // state_add_item takes ownership on success and re-checks the domain and
+  // the duplicate-name rule; on failure the item stays with this handler.
+  crabs_error_e add_rc = state_add_item(state, item);
+  if (add_rc != CRABS_SUCCESS) {
+    data_item_destroy(item);
+    return add_rc;
+  }
+  return CRABS_SUCCESS;
+}
+
+crabs_error_e state_machine_op_add_policy(state_t* state, operation_t* op) {
+  if (state == NULL || op == NULL) return CRABS_ERR_INVALID_PARAM;
+  // Payload: "operation=<op_type>;expression=<expr>" — the expression is the
+  // remainder VERBATIM (it may contain spaces, e.g. "role:admin OR
+  // role:member", and even ';'), so the boundary parse is strict prefix
+  // matching, never strstr (M-A discipline). An over-cap payload is REFUSED,
+  // not truncated — a shortened expression is a weakened policy.
+  if (op->payload == NULL || op->payload_size == 0) {
+    return CRABS_ERR_INVALID_PARAM;
+  }
+  char payload_buf[CRABS_MAX_OP_NAME + CRABS_MAX_POLICY_EXPR + 32];
+  if (op->payload_size >= (uint32_t)sizeof(payload_buf)) {
+    return CRABS_ERR_INVALID_PARAM;
+  }
+  memcpy(payload_buf, op->payload, op->payload_size);
+  payload_buf[op->payload_size] = '\0';
+
+  static const char operation_prefix[] = "operation=";
+  static const char expression_prefix[] = "expression=";
+  if (strncmp(payload_buf, operation_prefix,
+              sizeof(operation_prefix) - 1) != 0) {
+    return CRABS_ERR_INVALID_PARAM;
+  }
+  char* separator =
+      strchr(payload_buf + sizeof(operation_prefix) - 1, ';');
+  if (separator == NULL) return CRABS_ERR_INVALID_PARAM;
+  *separator = '\0';
+  const char* op_name = payload_buf + sizeof(operation_prefix) - 1;
+  if (op_name[0] == '\0') return CRABS_ERR_INVALID_PARAM;
+  const char* expression_field = separator + 1;
+  if (strncmp(expression_field, expression_prefix,
+              sizeof(expression_prefix) - 1) != 0) {
+    return CRABS_ERR_INVALID_PARAM;
+  }
+  const char* expression = expression_field + sizeof(expression_prefix) - 1;
+
+  // state_add_policy updates in place for an existing operation name — this
+  // preserves the pre-pipeline CLI semantics (an admin may re-declare any
+  // policy, including this op type's own: the machine trusts role:admin).
+  return state_add_policy(state, op_name, expression);
+}
+
+// Shared parse for the user-registry op payloads:
+//   "user_id=<id>"                     (suspend)
+//   "user_id=<id>;attribute=<token>"   (grant / revoke — token is the
+//                                       remainder verbatim)
+// The payload is byte-counted with no NUL guarantee, so it is copied into a
+// bounded, NUL-terminated buffer first (the register_key discipline); an
+// over-cap payload is refused rather than truncated. When attribute_out is
+// NULL the payload must not carry an attribute field; when it is non-NULL
+// the field is mandatory and must be non-empty.
+static crabs_error_e _user_op_payload_parse(const operation_t* op,
+                                            char user_id[CRABS_MAX_USER_ID],
+                                            char* attribute_out,
+                                            size_t attribute_size) {
+  if (op->payload == NULL || op->payload_size == 0) {
+    return CRABS_ERR_INVALID_PARAM;
+  }
+  char payload_buf[CRABS_MAX_USER_ID + CRABS_MAX_POLICY_EXPR + 32];
+  if (op->payload_size >= (uint32_t)sizeof(payload_buf)) {
+    return CRABS_ERR_INVALID_PARAM;
+  }
+  memcpy(payload_buf, op->payload, op->payload_size);
+  payload_buf[op->payload_size] = '\0';
+
+  static const char user_prefix[] = "user_id=";
+  static const char attribute_prefix[] = "attribute=";
+  if (strncmp(payload_buf, user_prefix, sizeof(user_prefix) - 1) != 0) {
+    return CRABS_ERR_INVALID_PARAM;
+  }
+  char* id_start = payload_buf + sizeof(user_prefix) - 1;
+  char* separator = strchr(id_start, ';');
+  if (separator == NULL) {
+    if (attribute_out != NULL) return CRABS_ERR_INVALID_PARAM;
+  } else {
+    *separator = '\0';
+    if (attribute_out == NULL) return CRABS_ERR_INVALID_PARAM;
+    const char* attribute_field = separator + 1;
+    if (strncmp(attribute_field, attribute_prefix,
+                sizeof(attribute_prefix) - 1) != 0) {
+      return CRABS_ERR_INVALID_PARAM;
+    }
+    const char* attribute_token =
+        attribute_field + sizeof(attribute_prefix) - 1;
+    size_t token_len = strlen(attribute_token);
+    if (token_len == 0 || token_len >= attribute_size) {
+      return CRABS_ERR_INVALID_PARAM;
+    }
+    memcpy(attribute_out, attribute_token, token_len + 1);
+  }
+  size_t id_len = strlen(id_start);
+  if (id_len == 0 || id_len >= CRABS_MAX_USER_ID) {
+    return CRABS_ERR_INVALID_PARAM;
+  }
+  memcpy(user_id, id_start, id_len + 1);
+  return CRABS_SUCCESS;
+}
+
+crabs_error_e state_machine_op_grant_role(state_t* state, operation_t* op) {
+  if (state == NULL || op == NULL) return CRABS_ERR_INVALID_PARAM;
+  if (state->attr_machine == NULL) return CRABS_ERR_UNAUTHORIZED;
+
+  char user_id[CRABS_MAX_USER_ID];
+  char attribute_token[CRABS_MAX_POLICY_EXPR];
+  crabs_error_e parse_rc =
+      _user_op_payload_parse(op, user_id, attribute_token,
+                             sizeof(attribute_token));
+  if (parse_rc != CRABS_SUCCESS) return parse_rc;
+
+  // Split "name:value" on the first colon (identical to the split
+  // cli_cmd_user_grant applied before its direct grant_role call); a
+  // colonless token grants the name with an empty value.
+  char name_buf[CRABS_MAX_POLICY_EXPR];
+  const char* attr_name = attribute_token;
+  const char* attr_value = "";
+  char* colon = strchr(attribute_token, ':');
+  if (colon != NULL) {
+    size_t name_len = (size_t)(colon - attribute_token);
+    if (name_len >= sizeof(name_buf)) name_len = sizeof(name_buf) - 1;
+    memcpy(name_buf, attribute_token, name_len);
+    name_buf[name_len] = '\0';
+    attr_name = name_buf;
+    attr_value = colon + 1;
+  }
+
+  // The attribute machine re-gates op->signer_id as an ACTIVE role:admin
+  // (R8-A-2) — the pipeline policy check alone does not name the signer for
+  // Mode-B-resolved ops (empty signer_id fails here, closed).
+  return attribute_machine_grant_role(state->attr_machine, user_id, attr_name,
+                                      attr_value, op->signer_id);
+}
+
+crabs_error_e state_machine_op_revoke_role(state_t* state, operation_t* op) {
+  if (state == NULL || op == NULL) return CRABS_ERR_INVALID_PARAM;
+  if (state->attr_machine == NULL) return CRABS_ERR_UNAUTHORIZED;
+
+  char user_id[CRABS_MAX_USER_ID];
+  char attribute_token[CRABS_MAX_POLICY_EXPR];
+  crabs_error_e parse_rc =
+      _user_op_payload_parse(op, user_id, attribute_token,
+                             sizeof(attribute_token));
+  if (parse_rc != CRABS_SUCCESS) return parse_rc;
+
+  // revoke_role matches the attribute by NAME (a full "name:value" token
+  // also matches), so the token passes through unsplit — the same argument
+  // the pre-pipeline CLI handed attribute_machine_revoke_role.
+  return attribute_machine_revoke_role(state->attr_machine, user_id,
+                                       attribute_token, op->signer_id);
+}
+
+crabs_error_e state_machine_op_suspend_user(state_t* state, operation_t* op) {
+  if (state == NULL || op == NULL) return CRABS_ERR_INVALID_PARAM;
+  if (state->attr_machine == NULL) return CRABS_ERR_UNAUTHORIZED;
+
+  char user_id[CRABS_MAX_USER_ID];
+  crabs_error_e parse_rc = _user_op_payload_parse(op, user_id, NULL, 0);
+  if (parse_rc != CRABS_SUCCESS) return parse_rc;
+
+  return attribute_machine_suspend_user(state->attr_machine, user_id,
+                                        op->signer_id);
+}
+
+void state_machine_seed_admin_builtin_policies(state_t* state) {
+  if (state == NULL) return;
+  // Add-only: an already-registered policy is the operator's own choice and
+  // is never rewritten by a reseed (state_find_policy misses are the only
+  // additions).
+  static const char* const seeded_types[] = {
+    CRABS_OP_COMPACT,
+    CRABS_OP_ADD_ITEM,
+    CRABS_OP_ADD_POLICY,
+    CRABS_OP_DEFINE_OPERATION,
+    CRABS_OP_GRANT_ROLE,
+    CRABS_OP_REVOKE_ROLE,
+    CRABS_OP_SUSPEND_USER,
+  };
+  for (uint32_t type_index = 0;
+       type_index < sizeof(seeded_types) / sizeof(seeded_types[0]);
+       type_index++) {
+    if (state_find_policy(state, seeded_types[type_index]) == NULL) {
+      state_add_policy(state, seeded_types[type_index], "role:admin");
+    }
+  }
 }
 
 // Auto-compaction check for items that need compaction (v1.5.2 §4)

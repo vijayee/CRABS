@@ -183,17 +183,6 @@ static void _extract_name(const char* pair, char* name_out, size_t name_size) {
   }
 }
 
-// Extract the "value" part from "name:value" format
-static void _extract_value(const char* pair, char* value_out, size_t value_size) {
-  const char* colon = strchr(pair, ':');
-  if (colon != NULL) {
-    strncpy(value_out, colon + 1, value_size - 1);
-    value_out[value_size - 1] = '\0';
-  } else {
-    value_out[0] = '\0';
-  }
-}
-
 // Check if an attribute matches a given name (from "name:value" format)
 static bool _attribute_matches_name(const attribute_value_t* attr, const char* name) {
   char attr_name[CRABS_MAX_POLICY_EXPR];
@@ -460,6 +449,40 @@ void attribute_machine_destroy(attribute_machine_t* am) {
 // User Operations (§8.4)
 // ============================================================
 
+// Audit H-1: a public key must belong to exactly ONE principal across the
+// whole machine. Mode B verification scans the user registry newest-first
+// and attributes an op to the first user whose keyring verifies it — a
+// duplicate registration would let a LATER registrant hijack an earlier
+// user's attribution (attacker-steerable signer_id) and make the victim's
+// ops fail policy when the attacker's attributes differ. `except_user_id`
+// exempts the named user's own keys (rotation re-offers the owner's bytes).
+// Public keys are not secrets — plain memcmp is correct here.
+bool attribute_machine_public_key_in_use(const attribute_machine_t* am,
+                                         const uint8_t* public_key,
+                                         uint32_t public_key_len,
+                                         const char* except_user_id) {
+  if (am == NULL || public_key == NULL || public_key_len == 0) {
+    return false;
+  }
+  for (const user_t* user = am->users; user != NULL; user = user->next) {
+    if (except_user_id != NULL &&
+        strcmp(user->user_id, except_user_id) == 0) {
+      continue;
+    }
+    if (public_key_len == sizeof(user->public_key) &&
+        memcmp(user->public_key, public_key, public_key_len) == 0) {
+      return true;
+    }
+    for (const user_key_t* key = user->keys; key != NULL; key = key->next) {
+      if (public_key_len == key->public_key_len &&
+          memcmp(key->public_key, public_key, public_key_len) == 0) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
 crabs_error_e attribute_machine_register_user(attribute_machine_t* am, const char* user_id,
                                                const uint8_t public_key[33],
                                                const char* initial_attrs) {
@@ -483,6 +506,22 @@ crabs_error_e attribute_machine_register_user(attribute_machine_t* am, const cha
   // user is ever stored.
   if (!crypto_ecdsa_validate_public_key(public_key)) {
     return CRABS_ERR_INVALID_PARAM;
+  }
+  // Audit H-1: the node's own key must never double as an ORDINARY user
+  // capability — EXCEPT the bootstrap admin, whose registered capability IS
+  // the node key by design (the node operator signs admin ops with it; the
+  // machine's own create path and cli.c's re-enrollment both do exactly
+  // this).
+  bool registering_bootstrap_admin =
+      am->base_state.config.bootstrap_admin[0] != '\0' &&
+      strcmp(user_id, am->base_state.config.bootstrap_admin) == 0;
+  if (am->base_state.node_key_valid && !registering_bootstrap_admin &&
+      memcmp(am->base_state.node_public_key, public_key, 33) == 0) {
+    return CRABS_ERR_INVALID_PARAM;
+  }
+  if (!registering_bootstrap_admin &&
+      attribute_machine_public_key_in_use(am, public_key, 33, NULL)) {
+    return CRABS_ERR_DUPLICATE_OPERATION;
   }
 
   // Create user entry
@@ -1147,6 +1186,32 @@ crabs_error_e user_key_register(user_t* user, const char* key_id,
     strncpy(user->default_key_id, key_id, CRABS_MAX_KEY_ID - 1);
   }
 
+  return CRABS_SUCCESS;
+}
+
+// Audit M-2: the envelope's signed state_version is now CONSUMED. The user's
+// key_version tracks the highest envelope lineage this machine has accepted
+// for that user (state_machine refresh sets it to the minting state's
+// version); an envelope whose state_version is strictly LOWER is a replay or
+// rollback after attribute revocation/rotation and must refuse. `state_-
+// version` equal to the recorded value remains acceptable (idempotent
+// re-import of the same envelope). A newer envelope advances the recorded
+// value monotonically — the caller must still complete its own signature
+// and expiry verification BEFORE this gate so a tampered blob never moves
+// the watermark. A user unknown to this machine imports freely (fresh
+// provisioning).
+crabs_error_e attribute_machine_envelope_import_gate(
+    attribute_machine_t* am, struct key_envelope_t* envelope) {
+  if (am == NULL || envelope == NULL) return CRABS_ERR_INVALID_PARAM;
+  user_t* user = attribute_machine_find_user(am, envelope->user_id);
+  if (user == NULL) return CRABS_SUCCESS;
+  if (envelope->state_version < user->key_version) {
+    return CRABS_ERR_KEY_STALE;
+  }
+  if (envelope->state_version > user->key_version) {
+    user->key_version = envelope->state_version;
+    user->updated_at = am->current_time_ms;
+  }
   return CRABS_SUCCESS;
 }
 

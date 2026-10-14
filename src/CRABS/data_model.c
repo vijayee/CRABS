@@ -335,6 +335,10 @@ state_t* state_create(void) {
   state->lineage_key_version = 0;
   state->lineage_last_key_transition = NULL;
   state->lineage_last_key_transition_len = 0;
+  // Audit M-8 (v19): retired lineage keys — empty until lineage_key_rotate
+  // begins retiring; serialized in the v19 tail section.
+  state->lineage_retired_keys = NULL;
+  state->lineage_retired_keys_count = 0;
   return state;
 }
 
@@ -384,6 +388,7 @@ void state_destroy(state_t* state) {
   // A10-M6 parent key chain + stashed last transition: state-owned heap
   // (accept appends the chain, rotate stashes the record).
   if (state->lineage_key_chain != NULL) free(state->lineage_key_chain);
+  if (state->lineage_retired_keys != NULL) free(state->lineage_retired_keys);
   if (state->lineage_last_key_transition != NULL) {
     free(state->lineage_last_key_transition);
   }

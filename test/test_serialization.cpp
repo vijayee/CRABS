@@ -3133,6 +3133,25 @@ TEST(TestSerialization, V11BoundBlobWithoutDissolvedByteLoadsFalse) {
   ASSERT_NE(buf, nullptr);
   state_destroy(state);
 
+  // v19 strip first (audit M-8): each child-manifest entry gained a trailing
+  // key_version_at_spawn u64 (0 here). Remove it so the v11-shaped entry
+  // image the surgery below restores is what the patched reader walks.
+  const uint8_t manifest_needle[11] = {0x09, 0x00, 'c', 'h', 'i', 'l', 'd', '-', 'r', 'e', 'd'};
+  bool manifest_found = false;
+  for (size_t m_index = 0; m_index + 11 <= buf->len - CRABS_HASH_SIZE; m_index++) {
+    if (memcmp(buf->data + m_index, manifest_needle, 11) == 0) {
+      size_t entry_extra = m_index + 125;  // after status byte (+124)
+      ASSERT_EQ(memcmp(buf->data + entry_extra,
+                       "\x00\x00\x00\x00\x00\x00\x00\x00", 8), 0);
+      memmove(buf->data + entry_extra, buf->data + entry_extra + 8,
+              buf->len - entry_extra - 8);
+      buf->len -= 8;
+      manifest_found = true;
+      break;
+    }
+  }
+  ASSERT_TRUE(manifest_found);
+
   const char self_needle[] = "machine-self-id";
   bool found = false;
   for (size_t index = 0; index + sizeof(self_needle) <= buf->len - CRABS_HASH_SIZE;
@@ -3603,7 +3622,7 @@ TEST(StateSerialize, V14ItemDomainRoundTrip) {
 
   serialized_buffer_t* buf = crabs_serialize_state(original);
   ASSERT_NE(buf, nullptr);
-  ASSERT_EQ((uint32_t)CRABS_SERIAL_VERSION, 18u);   // v18: OT value-presence marker
+  ASSERT_EQ((uint32_t)CRABS_SERIAL_VERSION, 19u);   // v19: manifest stamp + retired-keys tail
 
   state_t* restored = crabs_deserialize_state(buf->data, buf->len);
   ASSERT_NE(restored, nullptr);
@@ -3801,6 +3820,17 @@ TEST(StateSerialize, V13BlobLoadsAllFreeMerge) {
   memmove(buf->data + module_flag_offset, buf->data + module_flag_offset + 1,
           buf->len - module_flag_offset - 1);
   buf->len -= 1;
+
+  // v19 downgrade (audit M-8): the retired-lineage-keys tail is a u32 count
+  // (0 on a rotation-less state) after the module flag — strip it for a
+  // pre-19 blob shape.
+  size_t retired_count_offset = buf->len - CRABS_HASH_SIZE - 4;
+  ASSERT_EQ(memcmp(buf->data + retired_count_offset,
+                   "\x00\x00\x00\x00", 4), 0)
+      << "retired-keys section of a rotation-less v19 blob is exactly four 0x00 bytes";
+  memmove(buf->data + retired_count_offset, buf->data + retired_count_offset + 4,
+          buf->len - retired_count_offset - 4);
+  buf->len -= 4;
 
   buf->data[4] = 13;
   v14_rehash(buf);
@@ -4190,11 +4220,19 @@ TEST(OtValueMarker, PreMarkerBlobStillLoads) {
   const size_t marker_offset = state_header_len + 2 + strlen("set1") + 3;
   ASSERT_EQ(buf->data[marker_offset], CRABS_OT_VALUE_PRESENT);
 
-  // Strip the marker and rewind the version (magic 4B + version u32le at 4)
-  // so the blob is the exact bytes a v17 writer would have emitted.
+  // Strip the marker, the v19 retired-keys tail (four 0x00 count bytes on a
+  // rotation-less state), and rewind the version (magic 4B + version u32le
+  // at 4) so the blob is the exact bytes a v17 writer would have emitted.
   memmove(buf->data + marker_offset, buf->data + marker_offset + 1,
           buf->len - (marker_offset + 1));
   buf->len -= 1;
+  const size_t retired_strip_offset = buf->len - CRABS_HASH_SIZE - 4;
+  ASSERT_EQ(memcmp(buf->data + retired_strip_offset,
+                   "\x00\x00\x00\x00", 4), 0)
+      << "v19 retired-keys count of a rotation-less state must be zero";
+  memmove(buf->data + retired_strip_offset, buf->data + retired_strip_offset + 4,
+          buf->len - retired_strip_offset - 4);
+  buf->len -= 4;
   buf->data[4] = 17;
   buf->data[5] = 0;
   buf->data[6] = 0;

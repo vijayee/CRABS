@@ -1926,14 +1926,15 @@ TEST(TestLineage, ManifestStatusOutOfRangeRejected) {
   ASSERT_NE(buf, nullptr);
   state_destroy(state);
 
-  // Status sits at needle + 125 in the manifest entry image (layout
-  // unchanged since v11; 11-byte id needle;
-  // mode at +11, 32B hash, 64B sig, ttl, spawned_at, status).
+  // Status sits at needle + 124 in the manifest entry image (11-byte id
+  // needle: mode at +11, 32B hash, 64B sig, ttl u64, spawned_at u64,
+  // status at +124; v19 appends key_version_at_spawn AFTER it — the old
+  // +125 offset accidentally corrupted the parent-binding flag instead).
   const uint8_t needle[11] = {0x09, 0x00, 'c', 'h', 'i', 'l', 'd', '-', 'r', 'e', 'd'};
   bool found = false;
   for (size_t index = 0; index + 11 <= buf->len - CRABS_HASH_SIZE; index++) {
     if (memcmp(buf->data + index, needle, 11) == 0) {
-      buf->data[index + 125] = 0x7F;
+      buf->data[index + 124] = 0x7F;
       found = true;
       break;
     }

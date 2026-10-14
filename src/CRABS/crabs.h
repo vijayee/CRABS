@@ -172,6 +172,26 @@ typedef enum {
 // Compaction Operation (v1.5.2 §4.3)
 #define CRABS_OP_COMPACT           "__compact__"
 
+// Administrative state-mutation operations (audit M-10/M-11): signed,
+// durable-log forms of mutations the CLI previously applied directly
+// (no signature, no log entry, no attributability). Payloads:
+//   __add_item__   — the canonical per-item wire form
+//                    (crabs_serialize_data_item / crabs_deserialize_data_item)
+//   __add_policy__ — "operation=<op_type>;expression=<expr>"
+// Both gate on the machine's policy machinery (default "role:admin" when
+// seeded via state_machine_seed_admin_builtin_policies).
+#define CRABS_OP_ADD_ITEM          "__add_item__"
+#define CRABS_OP_ADD_POLICY        "__add_policy__"
+
+// User-registry operations (audit M-11): admin-gated signed forms of the
+// CLI's grant/revoke/suspend flows.
+//   __grant_role__   — "user_id=<id>;attribute=<name:value>"
+//   __revoke_role__  — "user_id=<id>;attribute=<name>"
+//   __suspend_user__ — "user_id=<id>"
+#define CRABS_OP_GRANT_ROLE        "__grant_role__"
+#define CRABS_OP_REVOKE_ROLE       "__revoke_role__"
+#define CRABS_OP_SUSPEND_USER      "__suspend_user__"
+
 // Timed Transactions (v1)
 #define CRABS_OP_SCHEDULE        "__schedule__"
 #define CRABS_OP_CANCEL_SCHEDULE "__cancel_schedule__"

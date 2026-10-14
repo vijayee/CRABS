@@ -342,6 +342,18 @@ crabs_error_e  state_machine_register_handler(state_t* state, const char* op_typ
 void           state_machine_unregister_handler(state_t* state, const char* op_type);
 op_handler_fn  state_machine_find_handler(const state_t* state, const char* op_type);
 
+// Default authorization policies for the administrative built-in op types
+// (audit M-10/M-11): the executor refuses any op type with no registered
+// policy, and these built-ins previously had none because their mutations
+// bypassed the pipeline entirely. Seeding is ADD-ONLY — a policy the state
+// already carries (operator-set, or restored from a snapshot) is never
+// overwritten. The CLI seeds at node init and after snapshot load so the
+// signed forms of compact / item add / policy add / op define / grant /
+// revoke / suspend are authorized for the bootstrap admin out of the box;
+// hosts embedding the machine directly call this when they want the same
+// posture, or register their own policies first.
+void           state_machine_seed_admin_builtin_policies(state_t* state);
+
 // Operation lifecycle
 operation_t*   operation_create(const char* type);
 void           operation_destroy(operation_t* op);

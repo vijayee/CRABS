@@ -429,6 +429,13 @@ typedef struct {
   uint64_t             attestation_ttl_ms;
   uint64_t             spawned_at;
   lineage_status_e     status;
+  // Audit M-8 (v19): the parent's lineage key version AT SPAWN — the key
+  // whose private half signed genesis_attestation_signature. 0 for entries
+  // written by pre-v19 states (their attestations predate version tracking
+  // and verify against the CURRENT key, the pre-v19 behavior). After a
+  // lineage_key_rotate this is the version the historical attestation must
+  // verify under, resolved from lineage_retired_keys.
+  uint64_t             key_version_at_spawn;
 } child_manifest_entry_t;
 
 // A10-M6: one entry of a machine's bounded parent key chain — a parent node
@@ -539,6 +546,16 @@ typedef struct state_t {
   // LINEAGE_KEY_TRANSITION_WIRE_MAX (lineage.h).
   uint8_t*                   lineage_last_key_transition;
   uint32_t                   lineage_last_key_transition_len;
+  // Audit M-8 (v19): RETIRED lineage keys — {key_version, public_key} pairs
+  // THIS machine once used, appended by lineage_key_rotate when the current
+  // key moves on. The current key lives in node_public_key; these retained
+  // PUBLIC halves keep historical genesis attestations (manifest entries
+  // stamped key_version_at_spawn) verifiable after rotation. Retired keys'
+  // private halves are gone on purpose — the public halves cannot forge
+  // anything. Heap array owned by the state — freed by state_destroy; cap
+  // CRABS_MAX_LINEAGE_KEY_CHAIN (lineage.h).
+  lineage_key_chain_entry_t* lineage_retired_keys;
+  uint32_t                   lineage_retired_keys_count;
   // v1.7: THIS machine's own id when spawned — the child_id an attestation
   // resolved against this machine must name. Empty for a root (never-spawned)
   // machine, which cannot resolve endorsements at all. Set at spawn time

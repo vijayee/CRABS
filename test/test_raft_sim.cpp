@@ -2041,7 +2041,17 @@ TEST(RaftSimHarness, AttachOnPreModuleStateCommitsGroupWrites) {
   ASSERT_NE(blob, nullptr);
   // The module section of a module-less blob is exactly one 0x00 flag byte
   // before the checksum (asserted in test_serialization's v15→13 downgrade;
-  // re-asserted here before surgery).
+  // re-asserted here before surgery). The v19 (audit M-8) retired-keys tail
+  // — another four 0x00 count bytes on a rotation-less state — must also
+  // go, or the exact-consumption check would refuse the downgraded blob.
+  size_t retired_strip_offset = blob->len - CRABS_HASH_SIZE - 4;
+  ASSERT_EQ(memcmp(blob->data + retired_strip_offset,
+                   "\x00\x00\x00\x00", 4), 0)
+      << "v19 retired-keys count of a rotation-less state must be zero";
+  memmove(blob->data + retired_strip_offset,
+          blob->data + retired_strip_offset + 4,
+          blob->len - retired_strip_offset - 4);
+  blob->len -= 4;
   size_t module_flag_offset = blob->len - CRABS_HASH_SIZE - 1;
   ASSERT_EQ(blob->data[module_flag_offset], 0x00);
   memmove(blob->data + module_flag_offset,

@@ -1328,6 +1328,9 @@ TEST(TestCliDurability, DispatchSealKeyImportEnablesSave) {
   const char* key_path = "/tmp/crabs_test_seal_key.hex";
   ASSERT_TRUE(test_write_file_bytes(key_path, std::vector<uint8_t>(
       key_hex, key_hex + strlen(key_hex))));
+  // Audit M-9: the import path refuses group/world-readable key files, so
+  // the fixture must be owner-only like a real deployment's seal-key file.
+  ASSERT_EQ(chmod(key_path, 0600), 0);
 
   char* import_argv[] = {(char*)"crabs", (char*)"seal-key", (char*)"import",
                          (char*)key_path};
@@ -1362,12 +1365,44 @@ TEST(TestCliDurability, DispatchSealKeyImportBadFileFails) {
   const char* key_path = "/tmp/crabs_test_short_seal_key.hex";
   ASSERT_TRUE(test_write_file_bytes(key_path, std::vector<uint8_t>(
       {'a', 'b', 'c', 'd'})));
+  // Audit M-9: owner-only mode so the IO (short-file) error is what this
+  // test exercises, not the new readability refusal.
+  ASSERT_EQ(chmod(key_path, 0600), 0);
   char* short_argv[] = {(char*)"crabs", (char*)"seal-key", (char*)"import",
                         (char*)key_path};
   EXPECT_EQ(cli_dispatch(node, 4, short_argv), CLI_ERR_IO);
   EXPECT_FALSE(node->seal_key_valid);
   remove(key_path);
 
+  cli_node_destroy(node);
+}
+
+// Audit M-9: a group-readable key file is refused fail-closed; the explicit
+// --insecure-key-file override accepts the operator's risk.
+TEST(TestCliDurability, DispatchSealKeyImportRefusesInsecureFile) {
+  cli_node_t* node = cli_node_create();
+  ASSERT_NE(node, nullptr);
+  ASSERT_EQ(cli_node_init(node, "admin"), CLI_OK);
+
+  const char* key_hex =
+      "0202030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20";
+  const char* key_path = "/tmp/crabs_test_group_readable_seal_key.hex";
+  ASSERT_TRUE(test_write_file_bytes(key_path, std::vector<uint8_t>(
+      key_hex, key_hex + strlen(key_hex))));
+  ASSERT_EQ(chmod(key_path, 0644), 0);
+
+  char* insecure_argv[] = {(char*)"crabs", (char*)"seal-key", (char*)"import",
+                           (char*)key_path};
+  EXPECT_EQ(cli_dispatch(node, 4, insecure_argv), CLI_ERR_EXEC);
+  EXPECT_FALSE(node->seal_key_valid);
+
+  // The explicit override acknowledges the risk and imports.
+  char* override_argv[] = {(char*)"crabs", (char*)"seal-key", (char*)"import",
+                           (char*)key_path, (char*)"--insecure-key-file"};
+  EXPECT_EQ(cli_dispatch(node, 5, override_argv), CLI_OK);
+  EXPECT_TRUE(node->seal_key_valid);
+
+  remove(key_path);
   cli_node_destroy(node);
 }
 
@@ -2761,6 +2796,9 @@ TEST(ShellLine, PersistsNodeAcrossCommands) {
   ShellTempFileGuard key_file("crabs_shell_seal_key.hex");
   ASSERT_TRUE(test_write_file_bytes(key_file.path.c_str(),
       std::vector<uint8_t>(key_hex, key_hex + strlen(key_hex))));
+  // Audit M-9: the import path refuses group/world-readable key files —
+  // make the fixture owner-only like a real deployment's seal-key file.
+  ASSERT_EQ(chmod(key_file.path.c_str(), 0600), 0);
   char import_line[256];
   snprintf(import_line, sizeof(import_line), "seal-key import %s",
            key_file.path.c_str());

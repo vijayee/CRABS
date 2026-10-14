@@ -11,6 +11,10 @@
 #include "../CRABS/data_model.h"
 #include "../Crypto/sig_scheme.h"
 
+// The body of key_envelope_t lives in Crypto/crypto.h, which includes this
+// header — a file-scope tag declaration avoids the include cycle.
+struct key_envelope_t;
+
 // ============================================================
 // User Status (§8.2)
 // ============================================================
@@ -223,5 +227,23 @@ crabs_error_e user_key_rotate(user_t* user, const char* old_key_id,
                                const uint8_t* new_public_key, uint32_t new_public_key_len,
                                const char* new_label);
 const char*   user_key_status_name(key_status_e status);
+
+// Audit H-1: cross-identity public-key exclusivity. True when the key bytes
+// are already registered by any user OTHER than `except_user_id` (legacy
+// user slots and keyring entries both count). Call before accepting a
+// registration or key rotation.
+bool          attribute_machine_public_key_in_use(const attribute_machine_t* am,
+                                                  const uint8_t* public_key,
+                                                  uint32_t public_key_len,
+                                                  const char* except_user_id);
+
+// Audit M-2: consume an envelope's signed state_version. A user known to the
+// machine refuses an envelope whose state_version is strictly LOWER than the
+// highest version that user's key lineage has accepted (replay/rollback
+// after revocation — CRABS_ERR_KEY_STALE); equal passes (idempotent
+// re-import); a higher version advances the watermark monotonically. The
+// caller must complete signature and expiry verification first.
+crabs_error_e attribute_machine_envelope_import_gate(
+    attribute_machine_t* am, struct key_envelope_t* envelope);
 
 #endif // CRABS_ATTRIBUTE_MACHINE_H

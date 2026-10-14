@@ -15,6 +15,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <unistd.h>
 
 // ============================================================
 // Hex encode/decode utilities
@@ -115,6 +116,17 @@ static const char* _write_domain_word(crabs_write_domain_e domain) {
 // ============================================================
 // Node Lifecycle
 // ============================================================
+
+// Forward declarations: the signed-op submission tail (shared by
+// cli_cmd_op_submit and the audit M-10/M-11 administrative commands) lives
+// in the Operation Submission section below; the administrative command
+// bodies earlier in this file call it through these.
+static uint64_t     _op_next_lamport_time(state_t* state,
+                                            const char* signer_id);
+static crabs_error_e _op_sign_and_execute(cli_node_t* node, operation_t* op);
+static crabs_error_e _cli_submit_admin_op(cli_node_t* node, const char* type,
+                                            const uint8_t* payload,
+                                            size_t payload_len);
 
 cli_node_t* cli_node_create(void) {
   cli_node_t* node = get_clear_memory(sizeof(cli_node_t));
@@ -268,6 +280,11 @@ cli_result_e cli_node_init(cli_node_t* node, const char* admin_id) {
   // Custody the bootstrap admin's signing key under their user id so the CLI
   // signs admin operations with the admin's key (audit M-17).
   cli_node_add_user_key(node, admin_id, node->node_key);
+  // Audit M-10/M-11: the executor refuses any op type without a registered
+  // policy, so a fresh machine needs the default authorization policies for
+  // the administrative built-in ops the CLI now submits signed (compact /
+  // add item / add policy / define op type / grant / revoke / suspend).
+  state_machine_seed_admin_builtin_policies(&node->attr_machine->base_state);
   // A pre-seeded session time-source selection survives the state creation.
   _cli_apply_time_source(node);
   return CLI_OK;
@@ -462,6 +479,11 @@ cli_result_e cli_node_load(cli_node_t* node, const char* path) {
                      node->node_key->public_key);
 
   node->initialized = true;
+  // Audit M-10/M-11: snapshots written before the administrative built-in
+  // ops existed carry no policies for them; seed the missing defaults so a
+  // reloaded machine can still take signed compact / item / policy / user
+  // mutations (add-only — policies the snapshot carries win).
+  state_machine_seed_admin_builtin_policies(&node->attr_machine->base_state);
   // The freshly-loaded state_t knows nothing of the session's time-source
   // selection — re-attach it (or it would silently revert to system clock).
   _cli_apply_time_source(node);
@@ -983,13 +1005,32 @@ cli_result_e cli_cmd_user_grant(cli_node_t* node, const char* user_id,
     val = colon + 1;
   }
 
-  // R8-A-2: the grant signer must hold role:admin. Resolve the signer as the
-  // bootstrap admin (config.bootstrap_admin), NOT the head of the users list:
-  // users are prepended on registration, so users->user_id is the most
-  // recently registered user, who typically holds no privileges.
-  const char* signer_id = node->attr_machine->base_state.config.bootstrap_admin;
-  crabs_error_e err = attribute_machine_grant_role(node->attr_machine, user_id,
-                                                     name, val, signer_id);
+  // Audit M-11: the grant rides the signed pipeline — a __grant_role__ op
+  // carrying "user_id=<id>;attribute=<name>:<value>", signed by the
+  // bootstrap admin (R8-A-2 signer resolution: the users-list head is the
+  // newest registration, not necessarily an admin). The executor logs the
+  // deciding signer; the handler re-gates through the attribute machine's
+  // active-admin check.
+  size_t user_id_len = strlen(user_id);
+  size_t token_len = strlen(name) + 1 + strlen(val);
+  if (user_id_len == 0 || user_id_len >= CRABS_MAX_USER_ID) {
+    printf("Error: user id must be 1..%d bytes.\n", CRABS_MAX_USER_ID - 1);
+    return CLI_ERR_ARGS;
+  }
+  if (token_len >= CRABS_MAX_POLICY_EXPR) {
+    printf("Error: attribute token exceeds %d bytes.\n",
+           CRABS_MAX_POLICY_EXPR - 1);
+    return CLI_ERR_ARGS;
+  }
+  size_t payload_len = strlen("user_id=") + user_id_len +
+                       strlen(";attribute=") + token_len;
+  char* payload = get_clear_memory(payload_len + 1);
+  snprintf(payload, payload_len + 1, "user_id=%s;attribute=%s:%s",
+           user_id, name, val);
+  crabs_error_e err = _cli_submit_admin_op(node, CRABS_OP_GRANT_ROLE,
+                                           (const uint8_t*)payload,
+                                           payload_len);
+  free(payload);
   if (err != CRABS_SUCCESS) {
     printf("Error: %s\n", cli_error_string(err));
     return CLI_ERR_EXEC;
@@ -1004,11 +1045,29 @@ cli_result_e cli_cmd_user_revoke(cli_node_t* node, const char* user_id,
   if (node == NULL || !node->initialized) return CLI_ERR_NOT_INIT;
   if (user_id == NULL || role == NULL) return CLI_ERR_ARGS;
 
-  // Match grant_role: the bootstrap admin is the administrative signer
-  // (users are prepended, so users->user_id is the newest registered user).
-  const char* signer_id = node->attr_machine->base_state.config.bootstrap_admin;
-  crabs_error_e err = attribute_machine_revoke_role(node->attr_machine, user_id,
-                                                      role, signer_id);
+  // Audit M-11: the revoke rides the signed pipeline — a __revoke_role__ op
+  // carrying "user_id=<id>;attribute=<role>", signed by the bootstrap admin
+  // (same signer-resolution rule as grant: users are prepended on
+  // registration, so the list head is not necessarily an admin).
+  size_t user_id_len = strlen(user_id);
+  size_t role_len = strlen(role);
+  if (user_id_len == 0 || user_id_len >= CRABS_MAX_USER_ID) {
+    printf("Error: user id must be 1..%d bytes.\n", CRABS_MAX_USER_ID - 1);
+    return CLI_ERR_ARGS;
+  }
+  if (role_len == 0 || role_len >= CRABS_MAX_POLICY_EXPR) {
+    printf("Error: role must be 1..%d bytes.\n", CRABS_MAX_POLICY_EXPR - 1);
+    return CLI_ERR_ARGS;
+  }
+  size_t payload_len = strlen("user_id=") + user_id_len +
+                       strlen(";attribute=") + role_len;
+  char* payload = get_clear_memory(payload_len + 1);
+  snprintf(payload, payload_len + 1, "user_id=%s;attribute=%s",
+           user_id, role);
+  crabs_error_e err = _cli_submit_admin_op(node, CRABS_OP_REVOKE_ROLE,
+                                           (const uint8_t*)payload,
+                                           payload_len);
+  free(payload);
   if (err != CRABS_SUCCESS) {
     printf("Error: %s\n", cli_error_string(err));
     return CLI_ERR_EXEC;
@@ -1022,12 +1081,23 @@ cli_result_e cli_cmd_user_suspend(cli_node_t* node, const char* user_id) {
   if (node == NULL || !node->initialized) return CLI_ERR_NOT_INIT;
   if (user_id == NULL) return CLI_ERR_ARGS;
 
-  // The CLI acts as the bootstrap admin (same signer resolution as grant/
-  // revoke_role): users may be prepended by later registrations, so the list
-  // head is not necessarily an admin.
-  crabs_error_e err = attribute_machine_suspend_user(
-      node->attr_machine, user_id,
-      node->attr_machine->base_state.config.bootstrap_admin);
+  // Audit M-11: the suspension rides the signed pipeline — a
+  // __suspend_user__ op carrying "user_id=<id>", signed by the bootstrap
+  // admin (same signer-resolution rule as grant/revoke_role: users may be
+  // prepended by later registrations, so the list head is not necessarily
+  // an admin).
+  size_t user_id_len = strlen(user_id);
+  if (user_id_len == 0 || user_id_len >= CRABS_MAX_USER_ID) {
+    printf("Error: user id must be 1..%d bytes.\n", CRABS_MAX_USER_ID - 1);
+    return CLI_ERR_ARGS;
+  }
+  size_t payload_len = strlen("user_id=") + user_id_len;
+  char* payload = get_clear_memory(payload_len + 1);
+  snprintf(payload, payload_len + 1, "user_id=%s", user_id);
+  crabs_error_e err = _cli_submit_admin_op(node, CRABS_OP_SUSPEND_USER,
+                                           (const uint8_t*)payload,
+                                           payload_len);
+  free(payload);
   if (err != CRABS_SUCCESS) {
     printf("Error: %s\n", cli_error_string(err));
     return CLI_ERR_EXEC;
@@ -1105,9 +1175,21 @@ cli_result_e cli_cmd_item_add(cli_node_t* node, const char* name,
     return create_err == CRABS_ERR_TYPE_MISMATCH ? CLI_ERR_ARGS : CLI_ERR_EXEC;
   }
 
-  crabs_error_e err = state_add_item(&node->attr_machine->base_state, item);
+  // Audit M-11: planting goes through a SIGNED __add_item__ op whose payload
+  // is the canonical per-item wire form — the durable log attributes the
+  // creation to the bootstrap admin and the executor's handler applies the
+  // wire-carried-item validation gate before state_add_item. The local item
+  // is only the serialization source; the handler plants its own copy.
+  serialized_buffer_t* wire = crabs_serialize_data_item(item);
+  data_item_destroy(item);
+  if (wire == NULL) {
+    printf("Error: %s\n", cli_error_string(CRABS_ERR_SERIALIZATION_ERROR));
+    return CLI_ERR_EXEC;
+  }
+  crabs_error_e err =
+      _cli_submit_admin_op(node, CRABS_OP_ADD_ITEM, wire->data, wire->len);
+  serialized_buffer_destroy(wire);
   if (err != CRABS_SUCCESS) {
-    data_item_destroy(item);
     printf("Error: %s\n", cli_error_string(err));
     return CLI_ERR_EXEC;
   }
@@ -1287,7 +1369,38 @@ cli_result_e cli_cmd_policy_add(cli_node_t* node, const char* operation,
   if (node == NULL || !node->initialized) return CLI_ERR_NOT_INIT;
   if (operation == NULL || expression == NULL) return CLI_ERR_ARGS;
 
-  crabs_error_e err = state_add_policy(&node->attr_machine->base_state, operation, expression);
+  // Audit M-11: a policy declaration is an administrative mutation and must
+  // ride the signed pipeline — a signed __add_policy__ op whose payload is
+  // "operation=<name>;expression=<expr>" (the expression is the payload
+  // remainder verbatim, so spaces survive). Length-gate here so the handler
+  // never sees a truncated field (a shortened expression is a weakened
+  // policy).
+  size_t operation_len = strlen(operation);
+  size_t expression_len = strlen(expression);
+  if (operation_len == 0 || operation_len >= CRABS_MAX_OP_NAME) {
+    printf("Error: operation name must be 1..%d bytes.\n", CRABS_MAX_OP_NAME - 1);
+    return CLI_ERR_ARGS;
+  }
+  if (expression_len >= CRABS_MAX_POLICY_EXPR) {
+    printf("Error: expression exceeds %d bytes.\n", CRABS_MAX_POLICY_EXPR - 1);
+    return CLI_ERR_ARGS;
+  }
+  if (strchr(operation, ';') != NULL || strchr(operation, '=') != NULL) {
+    // The payload is "operation=<name>;expression=..." — a ';' or '=' in the
+    // name would corrupt the field boundary.
+    printf("Error: operation name may not contain ';' or '='.\n");
+    return CLI_ERR_ARGS;
+  }
+
+  size_t payload_len = strlen("operation=") + operation_len +
+                       strlen(";expression=") + expression_len;
+  char* payload = get_clear_memory(payload_len + 1);
+  snprintf(payload, payload_len + 1, "operation=%s;expression=%s",
+           operation, expression);
+  crabs_error_e err = _cli_submit_admin_op(node, CRABS_OP_ADD_POLICY,
+                                           (const uint8_t*)payload,
+                                           payload_len);
+  free(payload);
   if (err != CRABS_SUCCESS) {
     printf("Error: %s\n", cli_error_string(err));
     return CLI_ERR_EXEC;
@@ -1367,6 +1480,14 @@ cli_result_e cli_cmd_key_revoke(cli_node_t* node, const char* user_id,
 
   // Audit H-B: node-blind rotation. The node records the user's new public
   // key and issues an envelope; it never generates or holds the private key.
+  // Audit M-12: the rotation envelope must carry the node's LIVE clock —
+  // issued_at 0 told the ABE keygen to mint for the base attribute set,
+  // silently dropping the user's unexpired TEMPORARY attributes from the
+  // rotated key.
+  uint64_t rotate_now_ms = 0;
+  if (!state_get_time_ms(&node->attr_machine->base_state, &rotate_now_ms)) {
+    rotate_now_ms = 0;
+  }
   recovery_result_t* result = crypto_revoke_and_rotate(
       (const abe_master_key_t*)node->attr_machine->base_state.abe_mk,
       node->node_key->private_key,
@@ -1374,7 +1495,7 @@ cli_result_e cli_cmd_key_revoke(cli_node_t* node, const char* user_id,
       user_id,
       new_pk,
       node->attr_machine->base_state.version,
-      0);
+      rotate_now_ms);
 
   if (result == NULL) {
     printf("Error: Key revocation failed.\n");
@@ -1449,6 +1570,48 @@ static crabs_error_e _op_sign_and_execute(cli_node_t* node, operation_t* op) {
   }
 
   return state_machine_execute(&node->attr_machine->base_state, op);
+}
+
+// Audit M-10/M-11: shared builder for the CLI's signed administrative ops.
+// Every state-mutating CLI command runs a SIGNED op of the given type
+// through the executor — the durable log then carries WHO decided the
+// mutation (bootstrap admin signer + op uuid) instead of an unattributable
+// direct write. The payload is copied verbatim (NULL for payload-less ops).
+// On failure the caller surfaces cli_error_string(err); the op is always
+// destroyed here.
+static crabs_error_e _cli_submit_admin_op(cli_node_t* node, const char* type,
+                                          const uint8_t* payload,
+                                          size_t payload_len) {
+  if (node == NULL || !node->initialized || type == NULL) {
+    return CRABS_ERR_INVALID_PARAM;
+  }
+  operation_t* op = operation_create(type);
+  if (op == NULL) return CRABS_ERR_OOM;
+
+  // A CSPRNG failure must not hand the dedup layer a zero/partial uuid
+  // (replay-collision hazard) — refuse the submission outright.
+  if (crypto_random_bytes(op->uuid, CRABS_UUID_SIZE) != CRABS_SUCCESS) {
+    operation_destroy(op);
+    return CRABS_ERR_CRYPTOGRAPHIC_ERROR;
+  }
+  // The administrative signer is the bootstrap admin: users are prepended
+  // on registration, so the users-list head is NOT necessarily an admin
+  // (R8-A-2's signer-resolution rule).
+  strncpy(op->signer_id, node->attr_machine->base_state.config.bootstrap_admin,
+          CRABS_MAX_USER_ID - 1);
+  if (payload != NULL && payload_len > 0) {
+    if (payload_len > UINT32_MAX) {
+      operation_destroy(op);
+      return CRABS_ERR_INVALID_PARAM;
+    }
+    op->payload = get_clear_memory(payload_len);
+    memcpy(op->payload, payload, payload_len);
+    op->payload_size = (uint32_t)payload_len;
+  }
+
+  crabs_error_e err = _op_sign_and_execute(node, op);
+  operation_destroy(op);
+  return err;
 }
 
 cli_result_e cli_cmd_op_submit(cli_node_t* node, const char* type,
@@ -1581,14 +1744,27 @@ cli_result_e cli_cmd_op_define(cli_node_t* node, const char* op_type_name,
   op->resource_count = 1;
   op->resources = get_clear_memory(CRABS_MAX_USER_ID);
   strncpy(op->resources[0], op_type_name, CRABS_MAX_USER_ID - 1);
+  // The signing serializer iterates resource_count indexed required_state /
+  // next_state slots, so both arrays must exist for a resourced op even
+  // though __define_operation_type__ is exempt from the transition gate
+  // (its resources[0] names the op TYPE, not an item). Zeroed = IDLE.
+  op->required_state = get_clear_memory(sizeof(protocol_state_e));
+  op->next_state = get_clear_memory(sizeof(protocol_state_e));
   // Use the bootstrap admin as the signer (config.bootstrap_admin): users
   // are prepended on registration, so users->user_id is the newest
-  // registered user. This path invokes the handler directly today (no
-  // pipeline authorization), but if it ever routes through
-  // state_machine_execute, only an admin would pass the
-  // __define_operation_type__ policy check.
+  // registered user. The op runs the full signed pipeline (audit M-11) —
+  // only a signer satisfying the __define_operation_type__ policy (default
+  // role:admin) passes its authorization check.
   strncpy(op->signer_id, node->attr_machine->base_state.config.bootstrap_admin,
           CRABS_MAX_USER_ID - 1);
+
+  // A CSPRNG failure must not hand the dedup layer a zero/partial uuid
+  // (replay-collision hazard) — refuse the submission outright.
+  if (crypto_random_bytes(op->uuid, CRABS_UUID_SIZE) != CRABS_SUCCESS) {
+    operation_destroy(op);
+    printf("Error: CSPRNG failure while assigning operation uuid.\n");
+    return CLI_ERR_EXEC;
+  }
 
   op->dedup.type = dtype;
   if (dtype == DEDUP_PER_USER) {
@@ -1614,7 +1790,13 @@ cli_result_e cli_cmd_op_define(cli_node_t* node, const char* op_type_name,
     strncpy(op->dedup.condition, condition, CRABS_MAX_POLICY_EXPR - 1);
   }
 
-  crabs_error_e err = state_machine_op_define_operation(&node->attr_machine->base_state, op);
+  // Sign with the bootstrap admin's custodied key and execute through the
+  // machine (audit M-11: define-op-type was the last pipeline-bypassing
+  // direct handler call; the durable log must carry the defining signer).
+  // The executor's step-6 carried-spec refusal exempts
+  // __define_operation_type__ — the dedup struct IS the signed registration
+  // payload, never applied as a guard for the define op itself.
+  crabs_error_e err = _op_sign_and_execute(node, op);
   operation_destroy(op);
 
   if (err != CRABS_SUCCESS) {
@@ -1666,24 +1848,45 @@ cli_result_e cli_cmd_op_check_dedup(cli_node_t* node, const char* op_type_name,
 cli_result_e cli_cmd_compact(cli_node_t* node) {
   if (node == NULL || !node->initialized) return CLI_ERR_NOT_INIT;
 
-  crabs_compaction_engine_t engine;
-  crabs_compaction_engine_init(&engine, NULL);
-  crabs_register_crdt_vtables(&engine.registry);
-
-  crabs_error_e err = crabs_op_compact_now(
-      &engine, &node->attr_machine->base_state);
-
-  if (err == CRABS_SUCCESS) {
-    printf("Compaction completed. Items compacted: %llu, Skipped: %llu, Unsafe: %llu\n",
-           (unsigned long long)engine.compaction_count,
-           (unsigned long long)engine.skipped_count,
-           (unsigned long long)engine.unsafe_count);
-    crabs_compaction_engine_destroy(&engine);
-    return CLI_OK;
+  // Audit M-10: compaction is an administrative decision and must be
+  // attributable — submit a SIGNED __compact__ op through the executor so
+  // the durable log carries the deciding signer and op uuid. The handler
+  // (state_machine_op_compact) runs the state's persistent engine when one
+  // is wired (preserving the OT-path local_vc), else a fresh single-replica
+  // engine whose counters die with it — so the per-run stats below are only
+  // reportable from a wired engine (read as deltas around the op).
+  state_t* state = &node->attr_machine->base_state;
+  crabs_compaction_engine_t* wired_engine =
+      (crabs_compaction_engine_t*)state->compaction_engine;
+  uint64_t compacted_before = 0;
+  uint64_t skipped_before = 0;
+  uint64_t unsafe_before = 0;
+  if (wired_engine != NULL) {
+    compacted_before = crabs_engine_compaction_count(wired_engine);
+    skipped_before = crabs_engine_skipped_count(wired_engine);
+    unsafe_before = crabs_engine_unsafe_count(wired_engine);
   }
-  printf("Compaction error: %s\n", cli_error_string(err));
-  crabs_compaction_engine_destroy(&engine);
-  return CLI_ERR_EXEC;
+
+  crabs_error_e err = _cli_submit_admin_op(node, CRABS_OP_COMPACT, NULL, 0);
+  if (err != CRABS_SUCCESS) {
+    printf("Compaction error: %s\n", cli_error_string(err));
+    return CLI_ERR_EXEC;
+  }
+
+  if (wired_engine != NULL) {
+    printf("Compaction completed. Items compacted: %llu, Skipped: %llu, Unsafe: %llu\n",
+           (unsigned long long)(crabs_engine_compaction_count(wired_engine) -
+                                compacted_before),
+           (unsigned long long)(crabs_engine_skipped_count(wired_engine) -
+                                skipped_before),
+           (unsigned long long)(crabs_engine_unsafe_count(wired_engine) -
+                                unsafe_before));
+  } else {
+    printf("Compaction completed (signed __compact__ op logged; no persistent "
+           "compaction engine is wired, so per-run item counters are not "
+           "retained).\n");
+  }
+  return CLI_OK;
 }
 
 // ============================================================
@@ -2696,6 +2899,56 @@ void cli_print_usage(const char* prog) {
   printf("\n  help                     Show this help message\n");
 }
 
+// Audit M-9: a seal key is a bearer credential at rest; the state-save path
+// already fchmods its output to 0600 (cli_node_save_state). Reading a key
+// file that is group/world-readable or owned by another user would silently
+// import material any local account may have tampered with — refuse fail-
+// closed unless the operator passes --insecure-key-file on the same command.
+static bool _cli_argv_has_insecure_key_file(int argc, char** argv) {
+  for (int arg_index = 0; arg_index < argc; arg_index++) {
+    if (strcmp(argv[arg_index], "--insecure-key-file") == 0) return true;
+  }
+  return false;
+}
+
+static cli_result_e cli_read_seal_key_file(const char* key_path, char* hex_out,
+                                           bool permit_insecure) {
+  if (key_path == NULL || hex_out == NULL) return CLI_ERR_ARGS;
+  FILE* seal_file = fopen(key_path, "r");
+  if (seal_file == NULL) return CLI_ERR_IO;
+  struct stat key_file_stat;
+  if (fstat(fileno(seal_file), &key_file_stat) != 0) {
+    fclose(seal_file);
+    return CLI_ERR_IO;
+  }
+  const char* insecure_reason = NULL;
+  if ((key_file_stat.st_mode & 0077) != 0) {
+    insecure_reason = "group/world-readable";
+  } else if (key_file_stat.st_uid != geteuid()) {
+    insecure_reason = "owned by another user";
+  }
+  if (insecure_reason != NULL && !permit_insecure) {
+    fclose(seal_file);
+    fprintf(stderr,
+            "ERROR: key file '%s' is %s — refusing to import. "
+            "chmod 600 the file and correct its owner, or re-run with "
+            "--insecure-key-file to accept the risk.\n",
+            key_path, insecure_reason);
+    return CLI_ERR_EXEC;
+  }
+  if (insecure_reason != NULL) {
+    fprintf(stderr,
+            "WARNING: importing a %s key file (--insecure-key-file).\n",
+            key_path);
+  }
+  if (fread(hex_out, 1, 64, seal_file) != 64) {
+    fclose(seal_file);
+    return CLI_ERR_IO;
+  }
+  fclose(seal_file);
+  return CLI_OK;
+}
+
 cli_result_e cli_dispatch(cli_node_t* node, int argc, char** argv) {
   if (argc < 2) {
     cli_print_usage(argv[0]);
@@ -2746,13 +2999,9 @@ cli_result_e cli_dispatch(cli_node_t* node, int argc, char** argv) {
         return CLI_ERR_ARGS;
       }
       char hex[65] = {0};
-      FILE* seal_file = fopen(argv[3], "r");
-      if (seal_file == NULL) return CLI_ERR_IO;
-      if (fread(hex, 1, 64, seal_file) != 64) {
-        fclose(seal_file);
-        return CLI_ERR_IO;
-      }
-      fclose(seal_file);
+      cli_result_e read_rc = cli_read_seal_key_file(
+          argv[3], hex, _cli_argv_has_insecure_key_file(argc, argv));
+      if (read_rc != CLI_OK) return read_rc;
       cli_result_e result = cli_node_set_seal_key(node, hex);
       OPENSSL_cleanse(hex, sizeof(hex));
       if (result == CLI_OK) printf("Seal key imported (in memory only).\n");
@@ -2768,13 +3017,9 @@ cli_result_e cli_dispatch(cli_node_t* node, int argc, char** argv) {
       return CLI_ERR_ARGS;
     }
     char hex[65] = {0};
-    FILE* seal_file = fopen(argv[3], "r");
-    if (seal_file == NULL) return CLI_ERR_IO;
-    if (fread(hex, 1, 64, seal_file) != 64) {
-      fclose(seal_file);
-      return CLI_ERR_IO;
-    }
-    fclose(seal_file);
+    cli_result_e read_rc = cli_read_seal_key_file(
+        argv[3], hex, _cli_argv_has_insecure_key_file(argc, argv));
+    if (read_rc != CLI_OK) return read_rc;
     cli_result_e result = cli_node_load_sealed(node, argv[2], hex);
     OPENSSL_cleanse(hex, sizeof(hex));
     return result;
@@ -3013,6 +3258,16 @@ cli_result_e cli_dispatch(cli_node_t* node, int argc, char** argv) {
       if (argc < 4) {
         printf("Usage: key import <hex|->\n");
         return CLI_ERR_ARGS;
+      }
+      // Audit LOW: a private key on argv is visible in the process list
+      // (ps/procfs) for the whole process lifetime. The stdin '-' form
+      // avoids that exposure; keep the argv form working but steer
+      // operators to the safe form with a one-time warning.
+      if (strcmp(argv[3], "-") != 0) {
+        fprintf(stderr,
+                "WARNING: node key passed on the command line is readable "
+                "via the process list; prefer: key import - (paste the hex "
+                "on stdin).\n");
       }
       return cli_node_load_key(node, argv[3]);
     }
