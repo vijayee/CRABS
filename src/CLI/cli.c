@@ -1467,8 +1467,14 @@ cli_result_e cli_cmd_op_submit(cli_node_t* node, const char* type,
     strncpy(op->signer_id, signer_id, CRABS_MAX_USER_ID - 1);
   }
 
-  // Generate UUID for the operation
-  crypto_random_bytes(op->uuid, CRABS_UUID_SIZE);
+  // Generate UUID for the operation. A RNG failure here must not hand the
+  // dedup layer a zero/partial uuid (replay-collision hazard), so the submit
+  // is refused outright.
+  if (crypto_random_bytes(op->uuid, CRABS_UUID_SIZE) != CRABS_SUCCESS) {
+    operation_destroy(op);
+    printf("Error: CSPRNG failure while assigning operation uuid.\n");
+    return CLI_ERR_EXEC;
+  }
 
   // Set resources for lock/unlock/verify/rollback/force_unlock/extend operations
   // by finding all RESOURCE-type data items
@@ -2144,7 +2150,13 @@ static cli_result_e _machine_lifecycle_op_submit(cli_node_t* node,
     printf("Error: Failed to build the %s operation.\n", command_name);
     return CLI_ERR_EXEC;
   }
-  crypto_random_bytes(op->uuid, CRABS_UUID_SIZE);
+  // A zero/partial uuid would hand the dedup layer a replay-collision hazard,
+  // so a CSPRNG failure refuses the op outright.
+  if (crypto_random_bytes(op->uuid, CRABS_UUID_SIZE) != CRABS_SUCCESS) {
+    operation_destroy(op);
+    printf("Error: CSPRNG failure while assigning %s uuid.\n", command_name);
+    return CLI_ERR_EXEC;
+  }
   if (payload != NULL && payload_size > 0) {
     op->payload = get_clear_memory(payload_size);
     memcpy(op->payload, payload, payload_size);
