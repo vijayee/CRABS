@@ -1036,6 +1036,55 @@ class Node {
     return readString(M, M._crabs_wasm_user_default_key_id(userPtr)) || '';
   }
 
+  // --- Admin demotion + user suspension (parity-fill P3) ---
+  //
+  // All three drive the C machine calls (attribute_machine_revoke_role /
+  // _suspend_user / _activate_user — attribute_machine.h:145-171), each
+  // ADMIN-GATED in C: the signer must be an ACTIVE user holding
+  // role:admin, or the call refuses (unauthorized for non-admins,
+  // user_suspended for suspended signers — the gate whitelist). The signer
+  // defaults to the node's bootstrap admin id, the same convention the
+  // sibling revokeUser wrapper established.
+
+  _adminSigner(signerId, ctx) {
+    if (signerId === undefined || signerId === null) return this.adminId || 'admin';
+    if (typeof signerId !== 'string' || signerId.length === 0) {
+      throw new TypeError(`${ctx}: signerId must be a non-empty string when given`);
+    }
+    return signerId;
+  }
+
+  revokeRole(targetUser, role, signerId) {
+    const M = this._M;
+    const sPtr = writeString(M, this._adminSigner(signerId, 'revokeRole'));
+    const tPtr = writeString(M, targetUser);
+    const rPtr = writeString(M, role);
+    const rc = M._attribute_machine_revoke_role(this._am, tPtr, rPtr, sPtr);
+    freeAll(M, tPtr, rPtr, sPtr);
+    wrapRc(rc, 'revokeRole');
+  }
+
+  suspendUser(userId, signerId) {
+    const M = this._M;
+    const sPtr = writeString(M, this._adminSigner(signerId, 'suspendUser'));
+    const uidPtr = writeString(M, userId);
+    const rc = M._attribute_machine_suspend_user(this._am, uidPtr, sPtr);
+    freeAll(M, uidPtr, sPtr);
+    wrapRc(rc, 'suspendUser');
+  }
+
+  // Reactivates a SUSPENDED user (the key-compromise recovery path). An
+  // ACTIVE or REVOKED target is not a recovery state — C refuses with
+  // invalid_param; revocation is terminal.
+  activateUser(userId, signerId) {
+    const M = this._M;
+    const sPtr = writeString(M, this._adminSigner(signerId, 'activateUser'));
+    const uidPtr = writeString(M, userId);
+    const rc = M._attribute_machine_activate_user(this._am, uidPtr, sPtr);
+    freeAll(M, uidPtr, sPtr);
+    wrapRc(rc, 'activateUser');
+  }
+
   getUser(userId) {
     const M = this._M;
     const uidPtr = writeString(M, userId);

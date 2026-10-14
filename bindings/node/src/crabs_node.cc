@@ -1170,6 +1170,10 @@ public:
       InstanceMethod("rotateKey", &Node::RotateKey),
       InstanceMethod("listKeys", &Node::ListKeys),
       InstanceMethod("getDefaultKey", &Node::GetDefaultKey),
+      // Admin demotion + user suspension (parity-fill P3, admin-gated)
+      InstanceMethod("revokeRole", &Node::RevokeRole),
+      InstanceMethod("suspendUser", &Node::SuspendUser),
+      InstanceMethod("activateUser", &Node::ActivateUser),
       InstanceMethod("getUser", &Node::GetUser),
       InstanceMethod("getNodeKey", &Node::GetNodeKey),
       InstanceMethod("addCounter", &Node::AddCounter),
@@ -1755,6 +1759,65 @@ private:
     user_t* user = RequireUser(env, "getDefaultKey", user_id);
     if (user->default_key_id[0] == '\0') return Napi::String::New(env, "");
     return Napi::String::New(env, user->default_key_id);
+  }
+
+  // --- Admin demotion + user suspension (parity-fill P3) ---
+  //
+  // All three drive the C machine calls (attribute_machine_revoke_role /
+  // _suspend_user / _activate_user — attribute_machine.h:145-171), each
+  // ADMIN-GATED in C: the signer must be an ACTIVE user holding
+  // role:admin, or the call refuses (unauthorized for non-admins,
+  // user_suspended for suspended signers — the gate whitelist). The signer
+  // defaults to the node's bootstrap admin id, the same convention the
+  // sibling revokeUser wrapper established. revokeRole's C signature takes
+  // NO value (attribute, role, signer) — the role NAME matches by attribute
+  // name, not name:value.
+  static std::string AdminSigner(const Napi::CallbackInfo& info,
+                                  uint32_t signer_index, const char* ctx) {
+    if (info.Length() <= signer_index || info[signer_index].IsUndefined()) {
+      return std::string();
+    }
+    return require_js_string(info[signer_index], ctx, "signerId");
+  }
+
+  Napi::Value RevokeRole(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 2)
+      throw Napi::TypeError::New(env, "Expected (targetUser, role[, signerId])");
+    std::string target = require_js_string(info[0], "revokeRole", "targetUser");
+    std::string role = require_js_string(info[1], "revokeRole", "role");
+    std::string signer = AdminSigner(info, 2, "revokeRole");
+    if (signer.empty()) signer = admin_id_;
+    crabs_error_e rc = attribute_machine_revoke_role(am_, target.c_str(),
+                                                      role.c_str(),
+                                                      signer.c_str());
+    if (rc != CRABS_SUCCESS) throw crabs_error(env, rc, "revokeRole");
+    return env.Undefined();
+  }
+
+  Napi::Value SuspendUser(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    std::string user_id = require_js_string(info[0], "suspendUser", "userId");
+    std::string signer = AdminSigner(info, 1, "suspendUser");
+    if (signer.empty()) signer = admin_id_;
+    crabs_error_e rc = attribute_machine_suspend_user(am_, user_id.c_str(),
+                                                       signer.c_str());
+    if (rc != CRABS_SUCCESS) throw crabs_error(env, rc, "suspendUser");
+    return env.Undefined();
+  }
+
+  // Reactivates a SUSPENDED user (the key-compromise recovery path). An
+  // ACTIVE or REVOKED target is not a recovery state — C refuses with
+  // invalid_param; revocation is terminal.
+  Napi::Value ActivateUser(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    std::string user_id = require_js_string(info[0], "activateUser", "userId");
+    std::string signer = AdminSigner(info, 1, "activateUser");
+    if (signer.empty()) signer = admin_id_;
+    crabs_error_e rc = attribute_machine_activate_user(am_, user_id.c_str(),
+                                                        signer.c_str());
+    if (rc != CRABS_SUCCESS) throw crabs_error(env, rc, "activateUser");
+    return env.Undefined();
   }
 
   Napi::Value GetUser(const Napi::CallbackInfo& info) {

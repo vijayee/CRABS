@@ -1128,7 +1128,7 @@ try {
   // persist window resolves).
   raftHost.setRaftStorage(async (handle, blob) => { /* in-memory map */ });
 
-  return (async () => {
+  await (async () => {
     raftHost.startRaftHost();
     await waitFor(() => raftNode.raftStatus() !== null && raftNode.raftStatus().isLeader,
                   'the single-node cluster to elect its only member');
@@ -1315,6 +1315,149 @@ try {
     assert(keyNode.listKeys('bob').length === 1 &&
            keyNode.listKeys('bob')[0].keyId === 'b1',
       'keyring: lifecycle touches only the target user');
+  }
+
+  const keyMustThrowHelper = (invoke, fragment, label) => {
+    let caught = null;
+    try { invoke(); } catch (caughtError) { caught = caughtError; }
+    assert(caught !== null, `${label}: expected a throw`);
+    assert(caught && caught.message.includes(fragment),
+      `${label}: expected message containing "${fragment}", got "${caught && caught.message}"`);
+  };
+
+  // Test: admin demotion + user suspension (parity-fill P3) — revokeRole /
+  // suspendUser / activateUser drive the admin-gated C machine calls
+  // (attribute_machine_revoke_role/_suspend_user/_activate_user,
+  // attribute_machine.h:145-171); the signer resolves the gates and
+  // defaults to the node's bootstrap admin id (the revokeUser convention).
+  // Pinned facts mirror the C tests (test_attribute_machine.cpp:190-535):
+  // fail-closed policy gate flip after revoke (the machine re-evaluates at
+  // execution), the suspended signer's wall, and the R8-A-5 double bump
+  // that turns a pre-suspension stamp into a genuine key_stale replay
+  // after reactivation (the P2 keyring.js note's promise).
+  {
+    // ---- revokeRole: the fine demotion + the gate flip ----
+    const roleNode = new Node('admin', { ordering: 'hlc' });
+    const editorKey = KeyPair.generate();
+    roleNode.registerUser('alice', editorKey.publicKeyHex(), '');
+    roleNode.grantRole('alice', 'role', 'editor', 'admin');
+    roleNode.setPolicy('bump', 'role:editor');
+
+    // Pre-revoke: alice's signed op AUTHORIZES (then lands on the pinned
+    // declared-but-unimplemented shape, resource_not_found).
+    const preOp = new Operation('bump');
+    preOp.signerId = 'alice';
+    roleNode.sign(preOp, editorKey);
+    let preRefused = '';
+    try { roleNode.execute(preOp); }
+    catch (refusal) { preRefused = refusal.message.split(': ')[1] || ''; }
+    assert(preRefused === 'resource_not_found',
+      `admin: pre-revoke the op must authorize (got "${preRefused}")`);
+
+    roleNode.revokeRole('alice', 'role', 'admin');
+    assert(roleNode.getUser('alice').attributes.length === 0,
+      'admin: revokeRole strips the one role attribute');
+    let gateFlipped = '';
+    try { roleNode.execute(preOp); }
+    catch (refusal) { gateFlipped = refusal.message.split(': ')[1] || ''; }
+    assert(gateFlipped === 'unauthorized',
+      `admin: post-revoke the same op must refuse at the gate (got "${gateFlipped}")`);
+
+    keyMustThrowHelper(() => roleNode.revokeRole('alice', 'role', 'admin'),
+      'resource_not_found', 'admin: revoking an absent role');
+    keyMustThrowHelper(() => roleNode.revokeRole('ghost', 'role', 'admin'),
+      'user_not_found', 'admin: revoking from an unknown user');
+    const rogueKey = KeyPair.generate();
+    roleNode.registerUser('rogue', rogueKey.publicKeyHex(), '');
+    keyMustThrowHelper(() => roleNode.revokeRole('alice', 'role', 'rogue'),
+      'unauthorized', 'admin: a non-admin signer cannot strip roles');
+
+    // Works on a REVOKED target by design (the decommission path, R4-4).
+    const victimKey = KeyPair.generate();
+    roleNode.registerUser('victim', victimKey.publicKeyHex(), '');
+    roleNode.grantRole('victim', 'role', 'user', 'admin');
+    roleNode.revokeUser('victim', 'admin');
+    roleNode.revokeRole('victim', 'role', 'admin');
+    assert(roleNode.getUser('victim').attributes.length === 0,
+      'admin: revokeRole works on a revoked target (R4-4)');
+
+    // ---- suspendUser + activateUser: suspension + the stale replay ----
+    const susNode = new Node('admin', { ordering: 'hlc' });
+    const memberKey = KeyPair.generate();
+    susNode.registerUser('alice', memberKey.publicKeyHex(), '');
+    susNode.grantRole('alice', 'role', 'member', 'admin');
+    // A REGISTERED non-admin signer (the gate whitelists ACTIVE + role:admin
+    // — an unregistered signer refuses user_not_found instead).
+    const lowKey = KeyPair.generate();
+    susNode.registerUser('lowrank', lowKey.publicKeyHex(), '');
+    susNode.grantRole('lowrank', 'role', 'user', 'admin');
+    susNode.setPolicy('bump', 'role:member');
+
+    const preSuspendVersion = susNode.getUser('alice').keyVersion;
+    const staleOp = new Operation('bump');
+    staleOp.signerId = 'alice';
+    susNode.sign(staleOp, memberKey);
+
+    susNode.suspendUser('alice', 'admin');
+    assert(susNode.getUser('alice').status === 'suspended',
+      'admin: suspendUser reads back status suspended');
+    assert(susNode.getUser('alice').keyVersion === preSuspendVersion + 1,
+      'admin: suspension bumps the epoch (attribute_machine.c:878)');
+    const suspendedOp = new Operation('bump');
+    suspendedOp.signerId = 'alice';
+    susNode.sign(suspendedOp, memberKey);
+    keyMustThrowHelper(() => susNode.execute(suspendedOp),
+      'unauthorized', 'admin: a suspended signer refuses at verification');
+    keyMustThrowHelper(() => susNode.execute(staleOp),
+      'unauthorized', 'admin: the pre-suspension replay refuses while suspended');
+
+    // activateUser: restore + second bump (R8-A-5) — then the stale replay.
+    susNode.activateUser('alice', 'admin');
+    assert(susNode.getUser('alice').status === 'active',
+      'admin: activateUser reads back status active');
+    assert(susNode.getUser('alice').keyVersion === preSuspendVersion + 2,
+      'admin: activation bumps the epoch again (R8-A-5)');
+    keyMustThrowHelper(() => susNode.execute(staleOp),
+      'key_stale', 'admin: the pre-suspension replay refuses key_stale now');
+    const freshOp = new Operation('bump');
+    freshOp.signerId = 'alice';
+    susNode.sign(freshOp, memberKey);
+    let freshRefused = '';
+    try { susNode.execute(freshOp); }
+    catch (refusal) { freshRefused = refusal.message.split(': ')[1] || ''; }
+    assert(freshRefused === 'resource_not_found',
+      `admin: a fresh post-activation op authorizes again (got "${freshRefused}")`);
+
+    keyMustThrowHelper(() => susNode.activateUser('alice', 'admin'),
+      'invalid_param', 'admin: activating an ACTIVE user');
+    keyMustThrowHelper(() => susNode.suspendUser('ghost', 'admin'),
+      'user_not_found', 'admin: suspending an unknown user');
+    keyMustThrowHelper(() => susNode.activateUser('ghost', 'admin'),
+      'user_not_found', 'admin: activating an unknown user');
+    keyMustThrowHelper(() => susNode.suspendUser('alice', 'lowrank'),
+      'unauthorized', 'admin: a non-admin signer cannot suspend');
+    keyMustThrowHelper(() => susNode.activateUser('alice', 'lowrank'),
+      'unauthorized', 'admin: a non-admin signer cannot reactivate');
+
+    // R8-C-4: revocation is terminal on both paths.
+    const doomedKey = KeyPair.generate();
+    susNode.registerUser('doomed', doomedKey.publicKeyHex(), '');
+    susNode.revokeUser('doomed', 'admin');
+    keyMustThrowHelper(() => susNode.suspendUser('doomed', 'admin'),
+      'invalid_param', 'admin: suspending a revoked user');
+    keyMustThrowHelper(() => susNode.activateUser('doomed', 'admin'),
+      'invalid_param', 'admin: activating a revoked user');
+
+    // The default signer id honours the revokeUser convention.
+    const defaultNode = new Node('admin', { ordering: 'hlc' });
+    const zoeKey = KeyPair.generate();
+    defaultNode.registerUser('zoe', zoeKey.publicKeyHex(), '');
+    defaultNode.suspendUser('zoe');
+    assert(defaultNode.getUser('zoe').status === 'suspended',
+      'admin: suspendUser defaults the signer to the node admin id');
+    defaultNode.activateUser('zoe');
+    assert(defaultNode.getUser('zoe').status === 'active',
+      'admin: activateUser defaults the signer to the node admin id');
   }
 })().then(() => {
   console.log(`\n${passed} passed, ${failed} failed`);

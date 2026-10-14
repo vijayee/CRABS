@@ -64,7 +64,7 @@ cookbook/api-map.md                     ledger + rows as each lands
 - [x] **Step 3:** green + battery. **Commit** `feat: key suspend/activate/rotate from JS`.
 
 ### Task P3: revokeRole / suspendUser / activateUser
-Same TDD pattern; C: attribute_machine.h:147/149/168 (read the real signatures — `revoke_role(am, target_user, role, value?, signer?)`); policies re-eval fail-closed after revoke (pinned); battery. **Commit** `feat: revokeRole, suspendUser and activateUser from JS`.
+Same TDD pattern; C: attribute_machine.h:147/149/168 (read the real signatures — Landed reality: `revoke_role(am, target_user, role, signer_id)` — NO value arg; the role matches by attribute NAME. All three admin-gated (`_check_signer_is_active_admin`); the binding signerId defaults to the node's bootstrap admin id (the revokeUser convention). The fail-closed gate flip pinned from JS; plus the P2 note's key_stale promise: suspension+reactivation bump key_version twice (R8-A-5) so a pre-suspension stamp replays into a genuine `key_stale` (pinned roles-admin.js + node admin block). Same TDD pattern; battery. **Commit** `feat: revokeRole, suspendUser and activateUser from JS`.
 
 ### Task P4: ABE key transport envelopes (SECURITY-CRITICAL — adversarial review mandatory)
 

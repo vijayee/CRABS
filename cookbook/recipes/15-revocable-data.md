@@ -217,12 +217,17 @@ Not guaranteed — the bearer-instrument boundary:
   > serialize/deserialize pair remains outside the JS surface by design
   > (the machine, not the file system, holds the key material).
 
-- *Fine demotion is not JS-reachable.* `attribute_machine_revoke_role`
-  strips ONE role and works on suspended/revoked targets by design — but
-  no JS binding exposes it; the JS-reachable tools are the user-level
-  `revokeUser` (terminal) and nothing finer. A JS consumer who wants
-  demotion cannot get it today (this is the wasm/node surface of the gap
-  above).
+- *Fine demotion is JS-reachable now (parity-fill P3).* `revokeRole(userId,
+  role, signerId?)` on BOTH bindings drives `attribute_machine_revoke_role`
+  — strips ONE role, works on suspended/revoked targets by design (R4-4),
+  is admin-gated like its siblings, and the fail-closed flip pins: a policy
+  gate that consulted the revoked role refuses at the NEXT execution
+  (`bindings/wasm/test/roles-admin.js` + the admin block of node
+  `test/test.js`). The user-level `revokeUser` stays the terminal tool;
+  `suspendUser` / `activateUser` are the recoverable middle (suspension and
+  reactivation each bump `keyVersion` — R8-A-5 — so a pre-suspension stamp
+  replays into a genuine `key_stale` after the user returns, pinned from
+  JS in the same tests).
 
 ## Variations
 
@@ -236,10 +241,11 @@ Not guaranteed — the bearer-instrument boundary:
   system + ABE; the *convention* of what an epoch means (who bumps it,
   when re-seal happens) is yours.
 - *Suspension vs revocation*: for the recoverable middle case
-  (key-compromise recovery), user-level suspension is the C-surface tool —
-  KEY_SUSPENDED → activate with a version bump — so signatures made during
-  the suspended window die even though the user returns. The
-  recoverable/terminal pair is the C surface's honest split.
+  (key-compromise recovery), user-level suspension is the JS-reachable
+  tool now (parity-fill P3 — `suspendUser` / `activateUser`, both
+  bindings) — KEY_SUSPENDED → activate with a version bump — so
+  signatures made during the suspended window die even though the user
+  returns. The recoverable/terminal pair is the surface's honest split.
 - *Observability of the revocation*: to instrument a revocation UI, the
   same three signals exist on both JS bindings — the attribute-kind change
   event (`kind: 'attribute'`, `type: 'revoke_user'`) the engine fires
@@ -316,11 +322,16 @@ keyring lifecycle JS-reachable (parity-fill P2, user-id-scoped over the
   __set_default_key__ wire ops cover them) and the key_id-declaring sign
   path (a keyring-ed user's legacy stamp refuses unauthorized, R8-C-2 —
   crypto.c:1349-1357, pinned in keyring.js)
-fine demotion (C-only, no JS map): attribute_machine_revoke_role
-  src/Attribute/attribute_machine.h:147 — works on suspended/revoked
-  targets by design (R4-4; whitelist-bypass comment + body .c:772-820)
-user-level suspension (C-only): attribute_machine_suspend_user
-  src/Attribute/attribute_machine.c:821-857 (key-compromise recovery uses
+fine demotion JS-reachable (parity-fill P3): node.revokeRole /
+  suspendUser / activateUser — wasm bindings-core.js:1039-1087 over
+  attribute_machine_revoke_role / _suspend_user / _activate_user
+  (src/Attribute/attribute_machine.h:145-171; admin-gated — active +
+  role:admin signer, .c:772-820), node crabs_node.cc:1783-1821; d.ts wasm
+  :534-548, node :352-366; pinned bindings/wasm/test/roles-admin.js (strip,
+  revoked-target R4-4, gate flip fail-closed, suspended-signer walls,
+  key_stale replay after reactivation) + node test/test.js admin block
+user-level suspension: suspension itself (attribute_machine_suspend_user
+  src/Attribute/attribute_machine.c:821-857; key-compromise recovery uses
   its internal form, crypto.c:2035)
 key-version bump sites: .c:495 (register), :597/:617 (grant), :878
   (suspend_user), :901 (revoke_user), :1231 (key suspend), :1265 (key

@@ -83,6 +83,7 @@ BASE_EXPORTS='[
   "_attribute_machine_verify_identity",
   "_attribute_machine_revoke_role",
   "_attribute_machine_suspend_user",
+  "_attribute_machine_activate_user",
   "_attribute_machine_revoke_user",
   "_attribute_machine_find_user",
   "_attribute_machine_user_has_role",

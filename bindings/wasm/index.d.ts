@@ -522,6 +522,30 @@ export interface Node {
   registerUser(userId: string, publicKeyHex: string, initialAttrs?: string): void;
   grantRole(targetUser: string, role: string, value: string, signerId: string): void;
   revokeUser(userId: string, signerId?: string): void;
+  /**
+   * Admin demotion (parity-fill P3): strip ONE role attribute (attribute
+   * NAME match, no value — the C signature is (targetUser, role, signer)).
+   * Works on suspended/REVOKED targets by design (audit R4-4 — the
+   * decommission path); ADMIN-GATED: the signer must be an ACTIVE user
+   * holding role:admin (unauthorized / user_suspended refusals otherwise).
+   * signerId defaults to the node's bootstrap admin id (the revokeUser
+   * convention). Bumps the target's keyVersion readback.
+   */
+  revokeRole(targetUser: string, role: string, signerId?: string): void;
+  /**
+   * Suspend a user (parity-fill P3, admin-gated). Recoverable — a REVOKED
+   * user refuses (revocation is terminal, audit R8-C-4); bumps the user's
+   * keyVersion (the suspension kills the stamps made before it) and the
+   * suspended signer fails every authorization gate after it.
+   */
+  suspendUser(userId: string, signerId?: string): void;
+  /**
+   * Reactivate a SUSPENDED user (parity-fill P3, admin-gated) — the
+   * key-compromise recovery path. ACTIVE/REVOKED targets refuse
+   * (invalid_param: revocation is terminal). Bumps keyVersion again
+   * (R8-A-5), so ops stamped pre-suspension replay into key_stale.
+   */
+  activateUser(userId: string, signerId?: string): void;
   suspendKey(userId: string, keyId: string): void;
   activateKey(userId: string, keyId: string): void;
   rotateKey(userId: string, oldKeyId: string, newKeyId: string, opts: RotateKeyOptions): void;
