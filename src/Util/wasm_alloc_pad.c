@@ -33,10 +33,12 @@
 // THE FIX HERE
 //
 // `-Wl,--wrap=malloc -Wl,--wrap=calloc` in build_wasm.sh routes every
-// allocation in the module — CRABS, OpenSSL, relic, OpenABE alike — through
-// this padding shim, which requests 32 extra bytes from dlmalloc. The
-// overflow then always lands in the pad, never in dlmalloc's metadata or a
-// neighbor's live bytes. Cost: 32 bytes per allocation. The native build
+// malloc/calloc allocation in the module — CRABS, OpenSSL, relic, OpenABE
+// alike — through this padding shim, which requests 32 extra bytes from
+// dlmalloc (realloc keeps dlmalloc's own path: the observed overflow comes
+// from zalloc/malloc-sized BN buffers). The overflow then always lands in
+// the pad, never in dlmalloc's metadata or a neighbor's live bytes. Cost:
+// 32 bytes per allocation. The native build
 // compiles this file out (guarded by __EMSCRIPTEN__) and needs no padding —
 // glibc's own chunk granularity already absorbs the few-byte overflow.
 //
