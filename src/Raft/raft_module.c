@@ -606,6 +606,7 @@ typedef struct {
 static void _raft_write_bytes(raft_wire_writer_t* writer, const uint8_t* data,
                               size_t len) {
   if (writer->failed) return;
+  if (len == 0) return;  // memcpy(NULL, 0) is UB by nonnull contract — skip
   if (writer->offset + len > writer->len) {
     writer->failed = true;
     return;
@@ -1139,6 +1140,7 @@ static void _raft_handle_vote_response(crabs_raft_module_s* module,
 static void _raft_handle_append_request(crabs_raft_module_s* module,
                                         uint64_t term,
                                         raft_wire_reader_t* reader,
+                                        const char* sender_id,
                                         uint64_t now_ms) {
   char leader_id[CRABS_MAX_USER_ID];
   uint64_t prev_log_term;
@@ -1154,6 +1156,18 @@ static void _raft_handle_append_request(crabs_raft_module_s* module,
     return;
   }
   if (leader_id[0] == '\0') {
+    module->rejected_message_count++;
+    return;
+  }
+  // Audit C-1: the claimed leader is bound to the transport-authenticated
+  // sender. The header is unauthenticated wire, so without this check any
+  // member (or current/once-committed member under the host transport) could
+  // impersonate another member as leader: step the victim down mid-election,
+  // dictate truncation of its uncommitted suffix, and write attacker-chosen
+  // terms into its log. Vote/append responses already key off the transport
+  // identity; the request side now does too.
+  if (sender_id == NULL ||
+      strncmp(leader_id, sender_id, CRABS_MAX_USER_ID) != 0) {
     module->rejected_message_count++;
     return;
   }
@@ -1241,6 +1255,14 @@ static void _raft_handle_append_request(crabs_raft_module_s* module,
     if (!_raft_read_u64(reader, &entry_term) ||
         !_raft_read_u64(reader, &entry_proposal_id) ||
         !_raft_read_u32(reader, &entry_wire_len)) {
+      module->rejected_message_count++;
+      return;
+    }
+    // Audit C-1 companion: entries carry the leader's CURRENT term by
+    // construction — a future-term entry is a forged artifact meant to poison
+    // the §5.4.1 up-to-dateness checks so honest candidates can never win a
+    // vote against it. Refuse the stream outright.
+    if (entry_term > module->current_term) {
       module->rejected_message_count++;
       return;
     }
@@ -1381,7 +1403,13 @@ static void _raft_handle_append_response(crabs_raft_module_s* module,
     module->rejected_message_count++;
     return;
   }
-  if (success != 1) {
+  // Audit M-1a: a response claiming replication beyond the leader's own log
+  // tip cannot be a statement about THIS leadership — no entry past it was
+  // ever sent under the current term (entries beyond the tip are, at most, a
+  // stale prior leader's uncommitted tail this probe will rediscover). Fold
+  // it into the log-matching failure path instead of letting a phantom
+  // match_index inflate the commit tally or set next_index past the log.
+  if (success != 1 || match_index > module->last_log_index) {
     // Log-matching failure (Raft §5.3): backtrack next_index one entry and
     // retry immediately — the next probe finds the conflict point (or the
     // follower's tail) without waiting for the heartbeat.
@@ -1433,7 +1461,7 @@ static void _raft_process_inbound(crabs_raft_module_s* module,
       _raft_handle_vote_response(module, term, &reader, peer_id, now_ms);
       break;
     case RAFT_MSG_APPEND_REQ:
-      _raft_handle_append_request(module, term, &reader, now_ms);
+      _raft_handle_append_request(module, term, &reader, peer_id, now_ms);
       break;
     case RAFT_MSG_APPEND_RESP:
       _raft_handle_append_response(module, term, &reader, peer_id, now_ms);

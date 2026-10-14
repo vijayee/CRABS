@@ -1119,3 +1119,159 @@ TEST(RaftLogBound, ReachesCapAndRefusesBeyond) {
   crabs_raft_module_destroy(module);
   crabs_raft_module_destroy(revived);
 }
+
+// ============================================================
+// Audit C-1: the claimed leader is bound to the transport-authenticated
+// sender; MEDIUM follow: impossible commit receipts fold into the repair
+// path instead of inflating the commit tally.
+// ============================================================
+
+// AppendEntries carrying ANOTHER member's leader_id is leader impersonation:
+// rejected on the identity binding alone (no step-down, no log rewrite).
+TEST(RaftWireRoundTrip, AppendRequestLeaderClaimMustMatchTransportSender) {
+  crabs_raft_config_t config = make_single_config(42, 0);
+  strncpy(config.node_id, "nodeF", CRABS_MAX_USER_ID - 1);
+  strncpy(config.peer_ids[0], "nodeF", CRABS_MAX_USER_ID - 1);
+  strncpy(config.peer_ids[1], "nodeL", CRABS_MAX_USER_ID - 1);
+  config.peer_count = 2;
+
+  crabs_raft_module_t* follower = crabs_raft_module_create(&config);
+  ASSERT_NE(follower, nullptr);
+
+  std::vector<uint8_t> blob;
+  auto push_u8 = [&](uint8_t value) { blob.push_back(value); };
+  auto push_u64 = [&](uint64_t value) {
+    for (int byte_index = 0; byte_index < 8; byte_index++) {
+      push_u8((uint8_t)((value >> (byte_index * 8)) & 0xFF));
+    }
+  };
+  auto push_u32 = [&](uint32_t value) {
+    push_u8((uint8_t)(value & 0xFF));
+    push_u8((uint8_t)((value >> 8) & 0xFF));
+    push_u8((uint8_t)((value >> 16) & 0xFF));
+    push_u8((uint8_t)((value >> 24) & 0xFF));
+  };
+  auto push_str16 = [&](const char* text) {
+    uint16_t len = (uint16_t)strlen(text);
+    push_u8((uint8_t)(len & 0xFF));
+    push_u8((uint8_t)(len >> 8));
+    for (uint16_t char_index = 0; char_index < len; char_index++) {
+      push_u8((uint8_t)text[char_index]);
+    }
+  };
+
+  // APPEND_REQ with term 5, leadership "nodeL" — delivered under the
+  // authenticated identity of a DIFFERENT member ("nodeA").
+  push_u8(0x52); push_u8(1); push_u8(3);
+  push_u64(5);
+  push_str16("nodeL");
+  push_u64(0);   // prev_term
+  push_u64(0);   // prev_index
+  push_u64(0);   // leader commit
+  push_u32(0);   // entry count
+
+  EXPECT_EQ(crabs_raft_module_inbound(follower, "nodeA", blob.data(),
+                                      blob.size(), 100), CRABS_SUCCESS);
+  EXPECT_EQ(crabs_raft_module_rejected_message_count(follower), 1u);
+  EXPECT_EQ(crabs_raft_module_current_term(follower), 0u);
+  EXPECT_EQ(crabs_raft_module_log_length(follower), 0u);
+  crabs_raft_module_destroy(follower);
+}
+
+// A well-formed APPEND_REQ still applies when the claimed leader matches the
+// transport sender (C-1 must not break the legitimate flow).
+TEST(RaftWireRoundTrip, AppendRequestMatchingSenderStillAppends) {
+  crabs_raft_config_t config = make_single_config(42, 0);
+  strncpy(config.node_id, "nodeF", CRABS_MAX_USER_ID - 1);
+  strncpy(config.peer_ids[0], "nodeF", CRABS_MAX_USER_ID - 1);
+  strncpy(config.peer_ids[1], "nodeL", CRABS_MAX_USER_ID - 1);
+  config.peer_count = 2;
+
+  crabs_raft_module_t* follower = crabs_raft_module_create(&config);
+  ASSERT_NE(follower, nullptr);
+
+  std::vector<uint8_t> blob;
+  auto push_u8 = [&](uint8_t value) { blob.push_back(value); };
+  auto push_u64 = [&](uint64_t value) {
+    for (int byte_index = 0; byte_index < 8; byte_index++) {
+      push_u8((uint8_t)((value >> (byte_index * 8)) & 0xFF));
+    }
+  };
+  auto push_u32 = [&](uint32_t value) {
+    push_u8((uint8_t)(value & 0xFF));
+    push_u8((uint8_t)((value >> 8) & 0xFF));
+    push_u8((uint8_t)((value >> 16) & 0xFF));
+    push_u8((uint8_t)((value >> 24) & 0xFF));
+  };
+  auto push_str16 = [&](const char* text) {
+    uint16_t len = (uint16_t)strlen(text);
+    push_u8((uint8_t)(len & 0xFF));
+    push_u8((uint8_t)(len >> 8));
+    for (uint16_t char_index = 0; char_index < len; char_index++) {
+      push_u8((uint8_t)text[char_index]);
+    }
+  };
+
+  push_u8(0x52); push_u8(1); push_u8(3);
+  push_u64(5);
+  push_str16("nodeL");
+  push_u64(0); push_u64(0); push_u64(0); push_u32(0);
+
+  EXPECT_EQ(crabs_raft_module_inbound(follower, "nodeL", blob.data(),
+                                      blob.size(), 100), CRABS_SUCCESS);
+  EXPECT_EQ(crabs_raft_module_rejected_message_count(follower), 0u);
+  EXPECT_EQ(crabs_raft_module_current_term(follower), 5u);
+  crabs_raft_module_destroy(follower);
+}
+
+// A commit receipt claiming replication beyond the leader's own log tip is
+// impossible for the current term; it must fold into the repair path, never
+// inflate the commit tally or push next_index off the log.
+TEST(RaftWireRoundTrip, CommitReceiptBeyondLeaderLogTipTreatedAsRepair) {
+  crabs_raft_config_t config = make_single_config(42, 0);
+  crabs_raft_module_t* module = crabs_raft_module_create(&config);
+  ASSERT_NE(module, nullptr);
+  uint64_t now_ms = 0;
+  drive_to_leader(module, &now_ms);
+
+  operation_t* op = make_signed_op("mint", "admin",
+                                   (const uint8_t*)"receipt-check", 13);
+  ASSERT_NE(op, nullptr);
+  uint64_t proposal_id = 0;
+  EXPECT_EQ(crabs_raft_module_propose(module, op, &proposal_id),
+            CRABS_SUCCESS);
+  operation_destroy(op);
+  crabs_raft_persist_request_t persist;
+  ASSERT_TRUE(crabs_raft_module_poll_persist(module, &persist));
+  EXPECT_EQ(crabs_raft_module_persist_complete(module, persist.handle, true),
+            CRABS_SUCCESS);
+  ASSERT_TRUE(crabs_raft_module_poll_persist(module, &persist));
+  EXPECT_EQ(crabs_raft_module_persist_complete(module, persist.handle, true),
+            CRABS_SUCCESS);
+  drain_committed(module);          // the legit tip (2) committed
+  EXPECT_EQ(crabs_raft_module_committed_tip(module), 2u);
+  uint64_t tip_before = crabs_raft_module_committed_tip(module);
+  uint32_t rejects_before =
+      crabs_raft_module_rejected_message_count(module);
+
+  // Leader's log tip is 2; the receipt claims 99 — beyond-top claim. Wire:
+  // magic, version 1, kind APPEND_RESP, term = current, success 1,
+  // match_index 99.
+  std::vector<uint8_t> blob;
+  blob.push_back(0x52); blob.push_back(1); blob.push_back(4);
+  for (int byte_index = 0; byte_index < 8; byte_index++) {
+    blob.push_back((uint8_t)((crabs_raft_module_current_term(module) >>
+                              (byte_index * 8)) & 0xFF));
+  }
+  blob.push_back(1);
+  for (int byte_index = 0; byte_index < 8; byte_index++) {
+    blob.push_back((uint8_t)((99u >> (byte_index * 8)) & 0xFF));
+  }
+  // Self-delivery keeps the peer registered in the single-node module.
+  EXPECT_EQ(crabs_raft_module_inbound(module, config.node_id, blob.data(),
+                                      blob.size(), 10), CRABS_SUCCESS);
+  EXPECT_EQ(crabs_raft_module_rejected_message_count(module),
+            rejects_before);
+  EXPECT_EQ(crabs_raft_module_committed_tip(module), tip_before);
+  crabs_raft_module_destroy(module);
+}
