@@ -185,7 +185,10 @@ Not guaranteed — the clock honesty and the shape boundary:
   is the trust caveat the README carries, not a footnote.
 - *The consume is JS-bound as operator staging, NOT as a verifier.*
   `Operation.addAttestation` stages the credential onto the op and the
-  snippets execute the endorsed op end-to-end. What stays C-only is the
+  snippets execute the endorsed op end-to-end. (Parity-fill P8 also
+  surfaced READ-side wire parsing from JS: `Node.attestationFromWire`
+  fields an attestation wire image on both bindings — that is op-transport
+  staging, still not the verifier.) What stays C-only is the
   verifier surface itself: `attestation_deserialize` has no JS map entry,
   and the two fail-closed cases a JS harness cannot produce — a FORGED
   parent (the bindings only mint REAL parent-node-key attestations through
