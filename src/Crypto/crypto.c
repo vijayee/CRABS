@@ -1387,11 +1387,19 @@ verify_result_t crypto_verify_operation_auth(
           user_ok = (user->keys == NULL) &&
               crypto_ecdsa_verify(user->public_key, serialized_op, op_len, signature);
         } else {
+          // Audit M-3: NO short-circuit — the `&&` chain skipped the ECDSA
+          // trial for users failing the policy, so per-candidate work varied
+          // by attribute match and a remote prover could distinguish which
+          // registered users satisfy the op's policy (attribute enumeration
+          // via timing), contradicting R7-L-8's equal-work claim below.
+          // Every factor is evaluated unconditionally; only the RESULT
+          // combines.
           char attr_string[CRABS_ATTR_STRING_MAX];
           _build_attr_string(user, attr_string, sizeof(attr_string), attr_machine->current_time_ms);
-          user_ok = crypto_abe_eval_policy(abe_policy, attr_string) &&
-              (user->keys == NULL) &&
-              crypto_ecdsa_verify(user->public_key, serialized_op, op_len, signature);
+          bool policy_ok = crypto_abe_eval_policy(abe_policy, attr_string);
+          bool key_ok = (user->keys == NULL);
+          bool sig_ok = crypto_ecdsa_verify(user->public_key, serialized_op, op_len, signature);
+          user_ok = policy_ok && key_ok && sig_ok;
         }
         // R7-L-8 for Mode B: no early exit — every active user's verification
         // runs to the same total work regardless of where (or whether) the
@@ -1596,38 +1604,40 @@ verify_result_t crypto_verify_operation_auth_v2(
     bool matched = false;
     while (user != NULL) {
       if (user->status == USER_ACTIVE) {
+        // Audit M-3: same equal-work discipline as v1 Mode B — the policy
+        // trial must not gate the signature attempt (`if (attr_ok)` skipped
+        // the ECDSA work for users failing the policy, leaking attribute
+        // matching through latency). Evaluate both unconditionally.
+        crabs_error_e sig_rc;
+        if (sig_scheme != SCHEME_UNSPECIFIED || (key_id != NULL && key_id[0] != '\0')) {
+          sig_rc = _verify_user_signature(user, key_id, sig_scheme,
+                                           attr_machine->current_time_ms,
+                                           serialized_op, op_len,
+                                           signature, signature_len);
+        } else {
+          // R8-C-2: route the legacy path through _verify_user_signature so
+          // a user with a keyring cannot authorize with the rotated-away
+          // bootstrap key.
+          sig_rc = _verify_user_signature(user, NULL, SCHEME_UNSPECIFIED,
+                                           attr_machine->current_time_ms,
+                                           serialized_op, op_len,
+                                           signature, signature_len);
+        }
         bool attr_ok = true;
         if (has_attr_policy) {
           char attr_string[CRABS_ATTR_STRING_MAX];
           _build_attr_string(user, attr_string, sizeof(attr_string), attr_machine->current_time_ms);
           attr_ok = crypto_abe_eval_policy(abe_policy, attr_string);
         }
-        if (attr_ok) {
-          crabs_error_e sig_rc;
-          if (sig_scheme != SCHEME_UNSPECIFIED || (key_id != NULL && key_id[0] != '\0')) {
-            sig_rc = _verify_user_signature(user, key_id, sig_scheme,
-                                             attr_machine->current_time_ms,
-                                             serialized_op, op_len,
-                                             signature, signature_len);
-          } else {
-            // R8-C-2: route the legacy path through _verify_user_signature so
-            // a user with a keyring cannot authorize with the rotated-away
-            // bootstrap key.
-            sig_rc = _verify_user_signature(user, NULL, SCHEME_UNSPECIFIED,
-                                             attr_machine->current_time_ms,
-                                             serialized_op, op_len,
-                                             signature, signature_len);
-          }
-          // R7-L-8 for v2 Mode B (mirroring v1): no early exit — every active
-          // user's verification runs to the same total work regardless of
-          // where (or whether) the signer sits in the list, so latency cannot
-          // leak the registered-user count or the matching position. The FIRST
-          // matching user in registration order still fills signer_id.
-          if (sig_rc == CRABS_SUCCESS && !matched) {
-            matched = true;
-            strncpy(result.signer_id, user->user_id, CRABS_MAX_USER_ID - 1);
-            result.signer_id[CRABS_MAX_USER_ID - 1] = '\0';
-          }
+        // R7-L-8 for v2 Mode B (mirroring v1): no early exit — every active
+        // user's verification runs to the same total work regardless of
+        // where (or whether) the signer sits in the list, so latency cannot
+        // leak the registered-user count or the matching position. The FIRST
+        // matching user in registration order still fills signer_id.
+        if (attr_ok && sig_rc == CRABS_SUCCESS && !matched) {
+          matched = true;
+          strncpy(result.signer_id, user->user_id, CRABS_MAX_USER_ID - 1);
+          result.signer_id[CRABS_MAX_USER_ID - 1] = '\0';
         }
       }
       user = user->next;
