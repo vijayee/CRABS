@@ -1590,17 +1590,50 @@ static crabs_error_e state_machine_execute_internal(state_t* state, operation_t*
     attribute_machine_prune_expired_temporary(state->attr_machine);
   }
 
-  // Step 3: Authorization — skipped for scheduled materialization, where
-  // authorization was already enforced at submission time
-  // (state_machine_validate). Declared unconditionally so the co-signature
-  // helper can take its address in either mode.
+  // Step 3: Authorization — for normal submissions the full gate; for
+  // materializations the audit M-1 re-authorization (see below).
   policy_preprocess_result_t pp = {0};
   char resolved_signer[CRABS_MAX_USER_ID];
   resolved_signer[0] = '\0';
+  // Audit M-1: materialization-time re-authorization. skip_authorization no
+  // longer means "trust the submission-time decision unconditionally": the
+  // DETERMINISTIC signer state (registered, ACTIVE, key version current,
+  // scheme constraints) re-checks against the CURRENT registry for BOTH
+  // materialization modes (scheduled fire and raft commit delivery). A
+  // signer suspended, rotated (compromise recovery), or demoted between
+  // submission and materialization must not ride the stale credential to
+  // execution. The full signature + policy re-run is deliberately NOT
+  // repeated here:
+  //   - recurring scheduler occurrences carry a uuid derived from the
+  //     embedded op's (the stored signature only covers the embedded form);
+  //   - policy evaluation consults the local wall clock (Step 1 injects it),
+  //     so re-running the ABE trial for committed ops would diverge
+  //     replicas;
+  //   - anonymous Mode-B signers cannot be resolved without that policy
+  //     trial: a committed op with an empty signer_id keeps that residual.
+  // A refused materialization fails CLOSED: the scheduler records
+  // __schedule_failed__; raft deliveries shelf with the order-preserving
+  // pump surfacing poison-pill attempts (same posture as a stale
+  // DOMAIN_CHECK chain).
   if (!skip_authorization) {
     crabs_error_e auth_rc = _verify_operation_authorization(state, op, &pp, resolved_signer);
     if (auth_rc != CRABS_SUCCESS) {
       return auth_rc;
+    }
+  } else if (op->signer_id[0] != '\0' && state->attr_machine != NULL) {
+    user_t* materialized_signer = attribute_machine_find_user(state->attr_machine,
+                                                              op->signer_id);
+    if (materialized_signer == NULL ||
+        materialized_signer->status != USER_ACTIVE) {
+      return CRABS_ERR_UNAUTHORIZED;
+    }
+    crabs_error_e key_version_rc = _check_key_version(state, op, op->signer_id);
+    if (key_version_rc != CRABS_SUCCESS) {
+      return key_version_rc;
+    }
+    crabs_error_e scheme_rc = _check_scheme_constraints(state, op, op->signer_id);
+    if (scheme_rc != CRABS_SUCCESS) {
+      return scheme_rc;
     }
   }
 
@@ -1714,10 +1747,11 @@ static crabs_error_e state_machine_execute_internal(state_t* state, operation_t*
     }
   }
 
-  // Steps 6, 6b, 6c: key staleness, scheme constraints, co-signatures.
-  // Skipped for scheduled materialization — all three were enforced at
-  // submission time via state_machine_validate, against the same signer and
-  // key state the scheduled op carries.
+  // Steps 6, 6b, 6c: key staleness, scheme constraints, co-signatures. The
+  // key/scheme subset already re-ran at Step 3 for materializations (audit
+  // M-1); the co-signature gate stays submission-time (a materialization's
+  // signature verification is skipped by design — see the Step 3 comment
+  // about recurring scheduler occurrences and committed replicas).
   if (!skip_authorization) {
     crabs_error_e key_version_rc = _check_key_version(state, op, resolved_signer);
     if (key_version_rc != CRABS_SUCCESS) {

@@ -897,7 +897,7 @@ TEST_F(TestStateMachine, TestRefreshKey) {
   EXPECT_STREQ(env->user_id, "alice");
 
   // Envelope should be verifiable with node's public key
-  EXPECT_TRUE(crypto_key_envelope_verify(state->node_public_key, env));
+  EXPECT_TRUE(crypto_key_envelope_verify(state->node_public_key, env, 5000));
 
   operation_destroy(op);
 }
@@ -2423,4 +2423,30 @@ TEST_F(TestStateMachine, ConcurrentSameWriterRaceOutcomeDiffersByDomain) {
   EXPECT_EQ(slot_a->item_seq, (uint64_t)1);
   destroy_writer_replica(&sov_a);
   destroy_writer_replica(&sov_b);
+}
+
+// Audit M-1: a committed (raft) entry must not materialize under a
+// credential suspended after submission. This is the DETERMINISTIC subset of
+// re-authorization (signer active + key-version + scheme constraints) —
+// policy evaluation consults the wall clock and would diverge replicas, so
+// the committed branch checks only registry-derived state.
+TEST_F(TestStateMachine, CommittedMaterializationRefusesSuspendedSigner) {
+  operation_t* op = make_lock_op();
+  ASSERT_NE(op, nullptr);
+
+  // Suspend the signer after the (otherwise authorized) submission.
+  user_t* signer = attribute_machine_find_user(am, "alice");
+  ASSERT_NE(signer, nullptr);
+  signer->status = USER_SUSPENDED;
+
+  // Mirror the pump's commit-delivery marker (state_machine.c sets
+  // raft_commit_delivery=true around state_machine_execute_committed for
+  // deliveries off the module's notification queue).
+  state->raft_commit_delivery = true;
+  crabs_error_e rc = state_machine_execute_committed(state, op);
+  state->raft_commit_delivery = false;
+
+  EXPECT_EQ(rc, CRABS_ERR_UNAUTHORIZED);
+  EXPECT_EQ(state->log_count, 0u);
+  operation_destroy(op);
 }

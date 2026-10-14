@@ -1357,3 +1357,48 @@ TEST(SchedulerList, SubmissionChangeEventCarriesNodeId) {
 
   crabs_test_env_destroy(&env);
 }
+
+// Audit M-1: a scheduled credential must not outlive its authorization. The
+// op was validated when the __schedule__ op was submitted; a signer whose key
+// rotates (compromise recovery) between submission and the fire time must
+// have the materialization refuse — not execute on a stale key.
+TEST(SchedulerMaterialize, DueOpRefusedWhenSignerKeyRotatedAfterSubmission) {
+  crabs_test_env_t env;
+  crabs_test_env_init(&env);
+  register_schedule_test_policies(&env);
+  state_t* state = env.state;
+  state_set_time_source(state, &g_sched_mock_ops);
+
+  g_sched_mock_time.seconds = 1000000;
+  g_sched_mock_time.nanos = 0;
+  g_sched_mock_time.valid = true;
+
+  operation_t* embedded = make_counter_op("mint", "admin");
+  stamp_unique_uuid(embedded);
+  crabs_test_sign_op_with(state->attr_machine, env.admin_key, embedded);
+
+  operation_t* schedule_op = make_schedule_op(&env, 1000005000, embedded);
+  ASSERT_EQ(state_machine_execute(state, schedule_op), CRABS_SUCCESS);
+  ASSERT_EQ(scheduler_count(state), 1u);
+
+  // Rotate the signer's key version after submission (compromise recovery).
+  user_t* signer = attribute_machine_find_user(state->attr_machine, "admin");
+  ASSERT_NE(signer, nullptr);
+  signer->key_version = signer->key_version + 1;
+
+  // Due tick: the fire must refuse under the stale credential. The refusal
+  // is durably recorded as a __schedule_failed__ log entry with the
+  // occurrence's uuid — the log must carry NO record of the op itself
+  // executing under the rotated signer state.
+  ASSERT_EQ(scheduler_process_due(state, 1000005000u), CRABS_SUCCESS);
+
+  for (uint64_t entry_index = 0; entry_index < state->log_count; entry_index++) {
+    if (memcmp(state->log[entry_index].uuid, embedded->uuid, CRABS_UUID_SIZE) == 0) {
+      EXPECT_STREQ(state->log[entry_index].type, "__schedule_failed__");
+    }
+  }
+
+  operation_destroy(embedded);
+  operation_destroy(schedule_op);
+  crabs_test_env_destroy(&env);
+}
