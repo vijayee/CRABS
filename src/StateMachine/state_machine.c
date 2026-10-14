@@ -490,6 +490,10 @@ static bool append_log(state_t* state, const uint8_t uuid[CRABS_UUID_SIZE],
   state->log = new_log;
   state->log_count = new_count;
   log_entry_t* entry = &state->log[state->log_count - 1];
+  // Audit H-2: a locally materialized entry is the watermark's authority.
+  // Merged/deserialized entries must never enter as barriers (their signer
+  // attribution is unverified) — see log_entry_t.replay_barrier.
+  entry->replay_barrier = true;
   entry->version = state->version;
   // v1.6 Amd6: record the ordering system and HLC so the R7-11 replay
   // backstop can compare HLC-ordered ops by HLC. Zero the HLC for lamport
@@ -510,6 +514,17 @@ static bool append_log(state_t* state, const uint8_t uuid[CRABS_UUID_SIZE],
   strncat(entry->node_id, node_id, CRABS_MAX_USER_ID - 1);
   _compute_log_chain_hash(state, entry);
   return true;
+}
+
+void state_restore_log_barriers(state_t* state) {
+  if (state == NULL || state->log == NULL) return;
+  for (uint64_t entry_index = 0; entry_index < state->log_count; entry_index++) {
+    // Audit H-2: the caller authenticated this state's provenance (state
+    // trailer signature over the whole payload, log included), so every
+    // logged entry attests to the signer's own ordering stamp — its watermark
+    // authority is re-armed for the post-restart R7-11 backstop.
+    state->log[entry_index].replay_barrier = true;
+  }
 }
 
 // ============================================================
@@ -605,6 +620,13 @@ static bool state_signer_has_replay(const state_t* state, const operation_t* op)
   if (state == NULL || op == NULL) return false;
   for (uint64_t entry_index = state->log_count; entry_index > 0; entry_index--) {
     const log_entry_t* entry = &state->log[entry_index - 1];
+    // Audit H-2: only locally materialized entries carry watermark
+    // authority. An attacker-supplied merged (or blob) entry claiming the
+    // victim's signer_id with a far-future stamp would otherwise reject
+    // every future op from that signer as ALREADY_EXECUTED — a permanent,
+    // restart-surviving DoS. Non-barrier entries stay in the log (chain
+    // hash, uuid dedup) but never poison the watermark.
+    if (!entry->replay_barrier) continue;
     if (strcmp(entry->signer_id, op->signer_id) != 0) continue;
     if (strcmp(entry->type, "__schedule_failed__") == 0) continue;
 
@@ -1610,10 +1632,13 @@ static crabs_error_e state_machine_execute_internal(state_t* state, operation_t*
   // DETERMINISTIC signer state (registered, ACTIVE, key version current,
   // scheme constraints) re-checks against the CURRENT registry for BOTH
   // materialization modes (scheduled fire and raft commit delivery). A
-  // signer suspended, rotated (compromise recovery), or demoted between
-  // submission and materialization must not ride the stale credential to
-  // execution. The full signature + policy re-run is deliberately NOT
-  // repeated here:
+  // signer suspended, rotated (compromise recovery) between submission and
+  // materialization must not ride the stale credential to execution. Note
+  // the audit H-1 clarification: "demoted" (a remove_role/revoke_role that
+  // strips ATTRIBUTES but leaves status ACTIVE) is NOT caught by this
+  // re-gate — catching it needs the ABE policy trial, which stays out of
+  // materialization for the wall-clock divergence reasons below.
+  // The full ABE policy re-run is deliberately NOT repeated here:
   //   - recurring scheduler occurrences carry a uuid derived from the
   //     embedded op's (the stored signature only covers the embedded form);
   //   - policy evaluation consults the local wall clock (Step 1 injects it),
@@ -1631,6 +1656,18 @@ static crabs_error_e state_machine_execute_internal(state_t* state, operation_t*
       return auth_rc;
     }
   } else if (op->signer_id[0] != '\0' && state->attr_machine != NULL) {
+    // Audit H-1 rework: re-verifying op SIGNATURES at materialization was
+    // tried and reverted — cross-machine raft replication carries ops under
+    // signer identities whose keys are machine-local to the proposing node
+    // (each replica registers its own "admin" under its own node key), so
+    // no follower can credential-check the leader's signers without a
+    // protocol change (registry replication, or raft wire authentication
+    // binding proposals to the leader). Within the crash-fault ordering
+    // trust model the facts-only re-gate below is the sound boundary:
+    // forged-identity material requires a BYZANTINE ordering peer, which is
+    // outside the model (see state_machine.h / README trust model). Forged
+    // network material is caught by the transport authentication
+    // requirement plus the C-1 sender binding in raft_module.c.
     user_t* materialized_signer = attribute_machine_find_user(state->attr_machine,
                                                               op->signer_id);
     if (materialized_signer == NULL ||

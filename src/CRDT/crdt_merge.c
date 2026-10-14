@@ -1208,7 +1208,16 @@ crabs_error_e crdt_merge_state(state_t* dst, const state_t* src) {
           }
         }
         if (!found) {
-          dst->log[dst->log_count++] = src->log[i];
+          // Audit H-2: adopted entries carry NO watermark authority — the
+          // source replica's signer_id/ordering stamps are unverifiable from
+          // this side, and a forged entry ({signer_id=Victim, lamport=
+          // UINT64_MAX}) would otherwise flip state_signer_has_replay into a
+          // permanent ALREADY_EXECUTED denial for the victim's future ops.
+          // dst log entries are the watermark's authority only when dst
+          // materialized them itself (append_log sets the flag).
+          dst->log[dst->log_count] = src->log[i];
+          dst->log[dst->log_count].replay_barrier = false;
+          dst->log_count++;
         }
       }
       qsort(dst->log, dst->log_count, sizeof(log_entry_t), _compare_log_entries);

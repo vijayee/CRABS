@@ -298,6 +298,15 @@ uint32_t state_raft_shelf_attempt_count(const state_t* state);
 // Free the pending-proposal list (called from state_destroy).
 void state_raft_destroy_pending(state_t* state);
 
+// Audit H-2: re-arm the per-signer replay-watermark authority of every log
+// entry after a caller has AUTHENTICATED the state's provenance (e.g. the CLI
+// verifies a state blob's node-key signature). Never call this on a state
+// whose provenance is unverified — the flag anchors the watermark, and a
+// forged log would otherwise poison it into a permanent ALREADY_EXECUTED
+// denial. Loaded entries default to barrier=false exactly so an
+// unauthenticated load is poison-resistant by construction.
+void state_restore_log_barriers(state_t* state);
+
 uint32_t       state_machine_prune_expired(state_t* state, uint64_t now_ms);
 
 // Built-in trigger operations (Amendment 1, §4) — defined in trigger.c

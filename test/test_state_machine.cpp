@@ -2450,3 +2450,92 @@ TEST_F(TestStateMachine, CommittedMaterializationRefusesSuspendedSigner) {
   EXPECT_EQ(state->log_count, 0u);
   operation_destroy(op);
 }
+
+// ============================================================
+// Audit H-2: merged foreign log entries must not poison the per-signer
+// replay watermark, and loaded log entries only re-arm through an
+// authenticated source.
+// ============================================================
+
+// A malicious replica ships a log entry claiming the victim's signer_id with
+// a far-future stamp; before the fix, every future op from that signer was
+// rejected ALREADY_EXECUTED — a permanent, restart-surviving denial. The
+// barrier rule makes merged entries watermark-inert.
+TEST_F(TestStateMachine, MergedForeignLogEntryCannotPoisonReplayWatermark) {
+  state_t* poisoned_src = state_create();
+  ASSERT_NE(poisoned_src, nullptr);
+  poisoned_src->log = (log_entry_t*)malloc(sizeof(log_entry_t));
+  poisoned_src->log_count = 1;
+  log_entry_t* poison = &poisoned_src->log[0];
+  memset(poison, 0, sizeof(*poison));
+  poison->version = 1;
+  memset(poison->uuid, 0x11, CRABS_UUID_SIZE);
+  strncpy(poison->type, "forged", CRABS_MAX_OP_NAME - 1);
+  strncpy(poison->signer_id, "alice", CRABS_MAX_USER_ID - 1);
+  poison->lamport_time = UINT64_MAX;   // far-future stamp under alice's name
+  strncpy(poison->node_id, "attacker", CRABS_MAX_USER_ID - 1);
+  poison->ordering_system = CRABS_ORDERING_LAMPORT;  // HLC stays zeroed
+  poison->replay_barrier = true;       // even claiming local authority
+
+  EXPECT_EQ(crdt_merge_state(state, poisoned_src), CRABS_SUCCESS);
+
+  // Alice's next op still executes: the adopted entry is not a watermark
+  // barrier, so the far-future stamp under her name cannot reject it.
+  operation_t* op = make_lock_op();
+  ASSERT_NE(op, nullptr);
+  EXPECT_EQ(state_machine_execute(state, op), CRABS_SUCCESS);
+
+  // The barrier came from LOCAL materialization (append_log), not the merge.
+  ASSERT_EQ(state->log_count, 2u);
+  EXPECT_FALSE(state->log[0].replay_barrier);
+  EXPECT_TRUE(state->log[1].replay_barrier);
+
+  operation_destroy(op);
+  state_destroy(poisoned_src);
+}
+
+// A locally materialized entry IS a watermark barrier: a same-signer op with
+// a lower stamp is rejected as a replay while the barrier is live.
+TEST_F(TestStateMachine, LocalMaterializedEntryIsReplayBarrier) {
+  operation_t* first = make_lock_op();     // lamport 1
+  ASSERT_NE(first, nullptr);
+  EXPECT_EQ(state_machine_execute(state, first), CRABS_SUCCESS);
+
+  operation_t* replay = make_lock_op();    // new uuid, lamport 2
+  ASSERT_NE(replay, nullptr);
+  replay->lamport_time = 1;                // at-or-below alice's watermark
+  // Re-sign: the signature envelope includes the op fields; ordering
+  // monotonicity (R7-11) is checked before the crypto result matters here.
+  serialized_buffer_t* ser = crabs_serialize_for_signing(replay);
+  ASSERT_NE(ser, nullptr);
+  crypto_sign_operation(alice_key->private_key, ser->data, ser->len,
+                        replay->signature);
+  serialized_buffer_destroy(ser);
+
+  EXPECT_EQ(state_machine_execute(state, replay), CRABS_ERR_ALREADY_EXECUTED);
+  operation_destroy(first);
+  operation_destroy(replay);
+}
+
+// Deserialized log entries load WITHOUT watermark authority (an unsigned or
+// attacker-written blob must not poison the watermark); only an
+// authenticated source re-arms them (state_restore_log_barriers).
+TEST_F(TestStateMachine, DeserializedLogReArmsBarriersOnlyThroughAuthenticatedRestore) {
+  operation_t* op = make_lock_op();
+  ASSERT_NE(op, nullptr);
+  EXPECT_EQ(state_machine_execute(state, op), CRABS_SUCCESS);
+  operation_destroy(op);
+  ASSERT_EQ(state->log_count, 1u);
+
+  serialized_buffer_t* buf = crabs_serialize_state(state);
+  ASSERT_NE(buf, nullptr);
+  state_t* restored = crabs_deserialize_state(buf->data, buf->len);
+  ASSERT_NE(restored, nullptr);
+  EXPECT_FALSE(restored->log[0].replay_barrier);   // fail-safe by default
+
+  state_restore_log_barriers(restored);
+  EXPECT_TRUE(restored->log[0].replay_barrier);    // authenticated re-arm
+
+  state_destroy(restored);
+  serialized_buffer_destroy(buf);
+}

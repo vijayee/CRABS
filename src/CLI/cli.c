@@ -606,6 +606,11 @@ cli_result_e cli_node_load_key(cli_node_t* node, const char* private_key_hex) {
     memset(node->state_sig_signature, 0, CRABS_SIG_SIZE);
     node->state_sig_pending = false;
     printf("State snapshot signature verified against the imported node key.\n");
+    // Audit H-2: the verified trailer attests the snapshot's log, so its
+    // entries re-arm as replay-watermark barriers. (Ops executed after the
+    // load but before this verification are barrier=true already; merged-in
+    // entries from the same window stay false — fail-closed.)
+    state_restore_log_barriers(&node->attr_machine->base_state);
   }
 
   // Find the registered user whose public key matches the derived key. A

@@ -464,6 +464,16 @@ typedef struct {
   // v1.6 Amd6: Ordering system support
   crabs_ordering_system_e ordering_system;  // LAMPORT (default) or HLC
   crabs_hlc_t        hlc;                   // HLC timestamp (used when ordering_system == HLC)
+  // Audit H-2: true only for entries the LOCAL machine materialized
+  // (signature-verified through execute) — these carry the per-signer replay
+  // watermark's authority. Entries adopted from a merged replica's log or
+  // deserialized from a blob are NOT trusted as watermark barriers (their
+  // signer_id/ordering stamps are unverified and could poison a signer's
+  // watermark into a permanent ALREADY_EXECUTED denial). Deliberately not
+  // serialized: a blob's entries re-arm only through a locally verified
+  // source (state_restore_log_barriers after a state-trailer signature
+  // verifies), never through the wire format itself.
+  bool replay_barrier;
 } log_entry_t;
 
 // ============================================================
