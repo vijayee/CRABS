@@ -388,9 +388,16 @@ class KeyPair {
 // from the machine's OWN master authority, so JS never touches the master
 // secret — the machine mints it, JS holds only the derived key. JS OWNS
 // the pointer: release it with destroy() (the KeyPair contract; it is
-// idempotent). NOT a portable byte format in v1 — no serialized reader
-// key crosses a module/machine boundary; crypto_abe_user_key_serialize /
-// deserialize remain C-only.
+// idempotent). Portable bytes exist only through toWire(): the C
+// crypto_abe_user_key_serialize form — a SELF-SUFFICIENT BEARER image of the
+// key: restored on ANY machine (Node.abeKeyFromWire asks only that the
+// machine holds an authority; the C deserialize takes mk, but OpenABE's key
+// import binds capability to the key's own minting domain, so the restored
+// key opens EXACTLY what its minting authority sealed — verified
+// cross-machine in key-transport.js), with no integrity check of its own.
+// Transport it authenticated, or use the key envelope flow
+// (mintKeyEnvelope/decryptKeyEnvelope): the signed, ECIES-wrapped transport
+// for channels you do not trust.
 class AbeKey {
   constructor(M, ptr) {
     this._M = M;
@@ -402,6 +409,23 @@ class AbeKey {
       this._M._crabs_wasm_abe_key_destroy(this._ptr);
       this._ptr = null;
     }
+  }
+
+  // Portable reader-key wire image (crypto_abe_user_key_serialize). The
+  // bytes ARE the key — a bearer instrument; toWire() on a destroyed key
+  // refuses (the bytes cannot outlive the key object).
+  toWire() {
+    if (!this._ptr) {
+      throw new Error('abeKey.toWire: a destroyed key refuses');
+    }
+    const M = this._M;
+    const ser = M._crabs_wasm_abe_key_serialize(this._ptr);
+    if (!ser) throw new Error('abeKey.toWire: serialization failed');
+    const len = M._crabs_wasm_buffer_len(ser);
+    const data = M._crabs_wasm_buffer_data(ser);
+    const out = new Uint8Array(M.HEAPU8.subarray(data, data + len));
+    M._crabs_wasm_buffer_destroy(ser);
+    return out;
   }
 }
 
@@ -1890,6 +1914,203 @@ class Node {
     } finally {
       freeAll(M, outPtrPtr, outLenPtr);
       M._crabs_wasm_abe_ciphertext_destroy(ctPtr);
+    }
+  }
+
+  // --- ABE key transport (parity-fill P4) ---
+
+  // abeKeyFromWire(wire) re-imports a reader key the AbeKey.toWire() form
+  // carries. The C deserialize signature takes the master key
+  // (crypto_abe_user_key_deserialize(mk, buf, len) — the header comment says
+  // "the master key provides the public params") — so the restore runs on
+  // THIS machine's authority and REFUSES without one — but the CAPABILITY is
+  // the wire's OWN: OpenABE's key import binds the restored key to its
+  // MINTING domain, whatever machine re-imports it (pinned cross-machine in
+  // key-transport.js: an n1 wire restored on a stranger machine still opens
+  // n1's secrets and refuses a stranger authority's. That is the bearer
+  // truth of the wire, not a restore accident). The wire is integrity-blind
+  // (no checksum): carry it over an authenticated channel, or use the key
+  // envelope flow below. A returned key is JS-owned (idempotent destroy);
+  // malformed or empty wire throws.
+  abeKeyFromWire(wire) {
+    requireWireBytes(wire, 'abeKeyFromWire');
+    if (wire.length === 0) {
+      throw new Error('abeKeyFromWire: empty wire refuses');
+    }
+    if (this._am === null) {
+      throw new Error('abeKeyFromWire: a destroyed node cannot restore keys');
+    }
+    const M = this._M;
+    const { ptr, len } = writeBytes(M, wire);
+    const keyPtr = M._crabs_wasm_abe_key_deserialize(this._am, ptr, len);
+    M._free(ptr);
+    if (!keyPtr) {
+      throw new Error('abeKeyFromWire: refused — malformed wire or no machine authority');
+    }
+    return new AbeKey(M, keyPtr);
+  }
+
+  // mintKeyEnvelope(userId, options?) — the refresh_key materialization
+  // shape (state_machine.c:2797) without the protocol bookkeeping: the
+  // machine's own authority + node private key issue a real CP-ABE key for
+  // the user's CURRENT attribute set, verified by the node's ECDSA
+  // signature, and the key travels ECIES-wrapped to the user's REGISTERED
+  // public key (never cleartext). Gates mirrored from the refresh path
+  // (fail-closed): only ACTIVE users receive envelopes (suspended →
+  // user_suspended, unknown → user_not_found), a live node key and authority
+  // are required. Unlike the refresh protocol op this mutates NOTHING (no
+  // key_version bump). options.expiresAt — epoch-ms expiry stamped into the
+  // envelope (default 0 = no expiry, exactly what refresh issues; expiry
+  // READBACK/enforcement is integrator-side, C carries it unenforced).
+  // Returns the envelope wire (crypto_key_envelope_serialize flat form).
+  mintKeyEnvelope(userId, options) {
+    if (typeof userId !== 'string' || userId.length === 0) {
+      throw new Error('mintKeyEnvelope: userId must be a non-empty string');
+    }
+    if (options !== undefined && options !== null &&
+        (typeof options !== 'object' || Array.isArray(options))) {
+      throw new Error('mintKeyEnvelope: options must be an object {expiresAt?}');
+    }
+    const expiresAtValue = options?.expiresAt;
+    if (expiresAtValue !== undefined && expiresAtValue !== null &&
+        (!(typeof expiresAtValue === 'number' || typeof expiresAtValue === 'bigint') ||
+        expiresAtValue < 0 || expiresAtValue > Number.MAX_SAFE_INTEGER)) {
+      throw new RangeError('mintKeyEnvelope: expiresAt must be a non-negative epoch-ms number');
+    }
+    if (this._am === null) {
+      throw new Error('mintKeyEnvelope: a destroyed node cannot mint envelopes');
+    }
+    const M = this._M;
+    const userPtr = writeString(M, userId);
+    const rcPtr = M._malloc(4);
+    let env = null;
+    try {
+      env = M._crabs_wasm_mint_key_envelope(this._am, userPtr,
+          expiresAtValue === undefined || expiresAtValue === null
+            ? 0n : BigInt(expiresAtValue), rcPtr);
+      if (!env) {
+        throw crabsError(M.getValue(rcPtr, 'i32'), 'mintKeyEnvelope');
+      }
+      const len = M._crabs_wasm_buffer_len(env);
+      const data = M._crabs_wasm_buffer_data(env);
+      const out = new Uint8Array(M.HEAPU8.subarray(data, data + len));
+      M._crabs_wasm_buffer_destroy(env);
+      env = null;
+      return out;
+    } finally {
+      freeAll(M, userPtr, rcPtr);
+      if (env) M._crabs_wasm_buffer_destroy(env);
+    }
+  }
+
+  // decryptKeyEnvelope(envelope, options) opens a mintKeyEnvelope wire on
+  // the recipient side and returns the restored AbeKey — the C
+  // KeyEnvelope battery's flow (test_crypto.cpp:963-1032): parse (against
+  // THIS machine's authority — the envelope carries no public params),
+  // verify the ISSUER's ECDSA signature over the canonical envelope, then
+  // open the ECIES blob with the recipient's private key and import the
+  // recovered reader key against this authority. Both tamper paths fail
+  // closed with the typed 'unauthorized' — a tampered envelope wire breaks
+  // the signature, a wrong recipient private key or tampered blob breaks the
+  // GCM tag. options.privateKeyHex — the recipient's 64-hex private key (the
+  // KeyPair your public key was registered with); options.nodePublicKeyHex —
+  // the ISSUER node's public key for out-of-machine verification (default:
+  // this machine's own node key, which refuses envelopes another machine
+  // issued — fail-closed). Staging discipline: the recipient private key
+  // bytes are zeroed in the module heap on EVERY path (including type
+  // refusals thrown before the call), and the recovered plaintext ABE key
+  // never leaves C — it is cleansed inside the export before this returns.
+  decryptKeyEnvelope(envelope, options) {
+    if (!ArrayBuffer.isView(envelope) || envelope.length === 0) {
+      throw new Error('decryptKeyEnvelope: expected the mintKeyEnvelope wire (Uint8Array)');
+    }
+    if (options === undefined || options === null || typeof options !== 'object' ||
+        Array.isArray(options)) {
+      throw new TypeError(
+        'decryptKeyEnvelope: expected options { privateKeyHex, nodePublicKeyHex? }');
+    }
+    const privateKeyHex = options.privateKeyHex;
+    if (typeof privateKeyHex !== 'string' || !/^[0-9a-fA-F]{64}$/.test(privateKeyHex)) {
+      throw new TypeError('decryptKeyEnvelope: privateKeyHex must be 64 hex characters (32 bytes)');
+    }
+    const nodePublicKeyHex = options.nodePublicKeyHex;
+    if (nodePublicKeyHex !== undefined && nodePublicKeyHex !== null &&
+        (typeof nodePublicKeyHex !== 'string' ||
+         !/^[0-9a-fA-F]{66}$/.test(nodePublicKeyHex))) {
+      throw new TypeError('decryptKeyEnvelope: nodePublicKeyHex must be 66 hex characters (33 bytes)');
+    }
+    if (this._am === null) {
+      throw new Error('decryptKeyEnvelope: a destroyed node cannot import keys');
+    }
+    const M = this._M;
+    const privPtr = stageSealKey32(M, privateKeyHex, 'decryptKeyEnvelope');
+    const wire = new Uint8Array(
+        envelope.buffer, envelope.byteOffset, envelope.byteLength);
+    const { ptr: wirePtr } = writeBytes(M, wire);
+    let pubPtr = 0;
+    if (nodePublicKeyHex !== undefined && nodePublicKeyHex !== null) {
+      pubPtr = M._malloc(33);
+      hexDecode(M, nodePublicKeyHex, pubPtr, 33);
+    }
+    const outKeyPtr = M._malloc(4);
+    try {
+      const rc = M._crabs_wasm_key_envelope_import(this._am, wirePtr, wire.length,
+          privPtr, pubPtr, outKeyPtr);
+      if (rc !== 0) throw crabsError(rc, 'decryptKeyEnvelope');
+      const keyPtr = M.getValue(outKeyPtr, 'i32');
+      if (!keyPtr) throw new Error('decryptKeyEnvelope: import staged no key');
+      return new AbeKey(M, keyPtr);
+    } finally {
+      // The staged recipient private key never lingers past the call.
+      M.HEAPU8.fill(0, privPtr, privPtr + 32);
+      freeAll(M, privPtr, wirePtr, pubPtr, outKeyPtr);
+    }
+  }
+
+  // serializeMasterKey() — the §11.5 durability backup (the C battery's
+  // MasterKeySerializeRoundTripPreservesAuthority): the machine's authority
+  // in its 'MK' wire form, restorable into a machine via masterKeyFromWire.
+  //
+  // TRUST FACT (the d.ts prose must keep saying it): THIS IS THE MACHINE'S
+  // CROWN JEWEL — whoever holds these bytes mints reader keys for ANY policy
+  // and decrypts EVERYTHING the authority ever sealed. Treat the return like
+  // an unencrypted private key.
+  serializeMasterKey() {
+    if (this._am === null) {
+      throw new Error('serializeMasterKey: a destroyed node refuses');
+    }
+    const M = this._M;
+    const ser = M._crabs_wasm_master_key_serialize(this._am);
+    if (!ser) {
+      throw new Error("serializeMasterKey: the machine carries no live master authority");
+    }
+    const len = M._crabs_wasm_buffer_len(ser);
+    const data = M._crabs_wasm_buffer_data(ser);
+    const out = new Uint8Array(M.HEAPU8.subarray(data, data + len));
+    M._crabs_wasm_buffer_destroy(ser);
+    return out;
+  }
+
+  // masterKeyFromWire(wire) REPLACES this machine's authority with the one
+  // the wire carries (the recovery path a sealed snapshot's MSK section
+  // already runs, serialization.c:2862-2866). A fresh authority makes the
+  // machine mint keys in the restored domain — mirror of the C battery's
+  // "restored authority is a full authority" fact. Refuses: malformed wire
+  // (bad magic/overrun lengths — the C battery's garbage/overrun pins) with
+  // the typed 'invalid_param', and a machine whose authority is merely
+  // BORROWED (a delegated lineage child) with protocol_violation — never
+  // replaces a borrowed authority.
+  masterKeyFromWire(wire) {
+    requireWireBytes(wire, 'masterKeyFromWire');
+    if (this._am === null) {
+      throw new Error('masterKeyFromWire: a destroyed node cannot plant authorities');
+    }
+    const M = this._M;
+    const { ptr, len } = writeBytes(M, wire);
+    try {
+      wrapRc(M._crabs_wasm_master_key_restore(this._am, ptr, len), 'masterKeyFromWire');
+    } finally {
+      M._free(ptr);
     }
   }
 

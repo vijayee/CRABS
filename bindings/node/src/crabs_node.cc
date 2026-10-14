@@ -432,13 +432,21 @@ private:
 // machine's OWN master authority (state->abe_mk), so JS never touches the
 // master secret — the machine mints it, JS holds only the derived key. JS
 // OWNS the pointer: destroy() releases it (the destructor releases it too,
-// matching the KeyPair/Blueprint convention). NOT a portable byte format in
-// v1 — no serialized reader key crosses a process/machine boundary; the
-// C-side user_key serialize/deserialize pair stays C-only.
+// matching the KeyPair/Blueprint convention). Portable bytes exist only
+// through toWire(): the C crypto_abe_user_key_serialize form — a
+// SELF-SUFFICIENT BEARER image of the key: restored on ANY machine
+// (Node.abeKeyFromWire asks only that the machine holds an authority; the C
+// deserialize takes mk, but OpenABE's key import binds capability to the
+// key's own minting domain, so the restored key opens EXACTLY what its
+// minting authority sealed — verified cross-machine in test/abe.js), with no
+// integrity check of its own. Transport it authenticated, or use the key
+// envelope flow (Node.mintKeyEnvelope / Node.decryptKeyEnvelope): the
+// signed, ECIES-wrapped transport for channels you do not trust.
 class AbeKey : public Napi::ObjectWrap<AbeKey> {
 public:
   static Napi::Object Init(Napi::Env env, Napi::Object exports) {
     Napi::Function func = DefineClass(env, "AbeKey", {
+      InstanceMethod("toWire", &AbeKey::ToWire),
       InstanceMethod("destroy", &AbeKey::Destroy),
     });
     // Stored in the shared NodeAddonInstanceData set up by the module Init —
@@ -470,6 +478,20 @@ public:
 
 private:
   abe_user_key_t* sk_;
+
+  Napi::Value ToWire(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (sk_ == nullptr)
+      throw Napi::Error::New(env, "abeKey.toWire: a destroyed key refuses");
+    size_t needed = crypto_abe_user_key_serialize(sk_, nullptr, 0);
+    if (needed == 0)
+      throw Napi::Error::New(env, "abeKey.toWire: serialization failed");
+    Napi::Buffer<uint8_t> out = Napi::Buffer<uint8_t>::New(env, needed);
+    size_t written = crypto_abe_user_key_serialize(sk_, out.Data(), needed);
+    if (written != needed)
+      throw Napi::Error::New(env, "abeKey.toWire: serialization failed");
+    return out;
+  }
 
   Napi::Value Destroy(const Napi::CallbackInfo& info) {
     if (sk_) {
@@ -1224,6 +1246,13 @@ public:
       InstanceMethod("encrypt", &Node::Encrypt),
       InstanceMethod("abeKeygen", &Node::AbeKeygen),
       InstanceMethod("abeDecrypt", &Node::AbeDecrypt),
+      // ABE key transport (parity-fill P4: reader-key wire + key envelopes
+      // + master-key durability)
+      InstanceMethod("abeKeyFromWire", &Node::AbeKeyFromWire),
+      InstanceMethod("mintKeyEnvelope", &Node::MintKeyEnvelope),
+      InstanceMethod("decryptKeyEnvelope", &Node::DecryptKeyEnvelope),
+      InstanceMethod("serializeMasterKey", &Node::SerializeMasterKey),
+      InstanceMethod("masterKeyFromWire", &Node::MasterKeyFromWire),
       InstanceMethod("serialize", &Node::Serialize),
       InstanceMethod("deserialize", &Node::Deserialize),
       InstanceMethod("mergeState", &Node::MergeState),
@@ -3401,6 +3430,254 @@ private:
     Napi::Buffer<uint8_t> plain = Napi::Buffer<uint8_t>::Copy(env, out, out_len);
     free(out);
     return plain;
+  }
+
+  // --- ABE key transport (parity-fill P4) ---
+
+  // abeKeyFromWire(wire) re-imports a reader key the AbeKey.toWire() form
+  // carries. The C deserialize signature takes the master key
+  // (crypto_abe_user_key_deserialize(mk, buf, len) — the header comment says
+  // "the master key provides the public params") — so the restore runs on
+  // THIS machine's authority and REFUSES without one — but the CAPABILITY is
+  // the wire's OWN: OpenABE's key import binds the restored key to its
+  // MINTING domain, whatever machine re-imports it (pinned cross-machine in
+  // test/abe.js: an n1 wire restored on a stranger machine still opens n1's
+  // secrets and refuses another authority's). That is the bearer truth of
+  // the wire, not a restore accident. The wire is integrity-blind (no
+  // checksum): carry it authenticated or use the envelope flow below.
+  Napi::Value AbeKeyFromWire(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 1 || !info[0].IsBuffer())
+      throw Napi::TypeError::New(env,
+        "Expected a reader-key wire Buffer (AbeKey.toWire form)");
+    if (am_->base_state.abe_mk == nullptr)
+      throw crabs_error(env, CRABS_ERR_CRYPTOGRAPHIC_ERROR, "abeKeyFromWire");
+    auto wire = info[0].As<Napi::Buffer<uint8_t>>();
+    abe_user_key_t* sk = crypto_abe_user_key_deserialize(
+        (const abe_master_key_t*)am_->base_state.abe_mk,
+        wire.Data(), wire.Length());
+    if (!sk)
+      throw crabs_error(env, CRABS_ERR_INVALID_PARAM, "abeKeyFromWire");
+    return AbeKey::NewInstance(env, sk);
+  }
+
+  // mintKeyEnvelope(userId, options?) — the refresh_key materialization
+  // shape (state_machine.c:2797) without the protocol bookkeeping: the
+  // machine's own authority + node private key issue a real CP-ABE key for
+  // the user's CURRENT attribute set, node-ECDSA-signed, with the key
+  // ECIES-wrapped to the user's REGISTERED public key (never cleartext).
+  // Gates mirrored from the refresh path (fail-closed): ACTIVE users only, a
+  // live node key and authority required. Mutates NOTHING (no key_version
+  // bump — the transport primitive, not the refresh protocol op).
+  // options.expiresAt stamps an epoch-ms expiry into the envelope (default 0
+  // = no expiry, what refresh issues; expiry enforcement is integrator-side
+  // in C). Returns the envelope wire (crypto_key_envelope_serialize flat
+  // form). The envelope staging buffer holds only an ECIES-wrapped key + a
+  // signature — cleansed anyway before anything crosses to JS.
+  Napi::Value MintKeyEnvelope(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 1)
+      throw Napi::TypeError::New(env, "Expected (userId, options?)");
+    std::string user_id = require_js_string(info[0], "mintKeyEnvelope", "userId");
+    uint64_t expires_at = 0;
+    if (info.Length() > 1 && !info[1].IsUndefined() && !info[1].IsNull()) {
+      if (!info[1].IsObject() || info[1].As<Napi::Object>().IsArray())
+        throw Napi::TypeError::New(env,
+          "mintKeyEnvelope: options must be an object {expiresAt?}");
+      Napi::Object opts = info[1].As<Napi::Object>();
+      if (opts.Has("expiresAt")) {
+        Napi::Value expiry = opts.Get("expiresAt");
+        if (!expiry.IsNumber())
+          throw Napi::TypeError::New(env, "mintKeyEnvelope: expiresAt must be a number");
+        double expires_ms = expiry.As<Napi::Number>().DoubleValue();
+        if (!(expires_ms >= 0.0) || expires_ms > 9007199254740991.0)
+          throw Napi::RangeError::New(env,
+            "mintKeyEnvelope: expiresAt must be a non-negative epoch-ms number");
+        expires_at = (uint64_t)expires_ms;
+      }
+    }
+    // Gates mirrored from refresh_key (audit H-C): live authority + node key,
+    // and only ACTIVE users receive envelopes.
+    if (am_->base_state.abe_mk == nullptr || !am_->base_state.node_key_valid)
+      throw crabs_error(env, CRABS_ERR_CRYPTOGRAPHIC_ERROR, "mintKeyEnvelope");
+    user_t* user = attribute_machine_find_user(am_, user_id.c_str());
+    if (!user)
+      throw crabs_error(env, CRABS_ERR_USER_NOT_FOUND, "mintKeyEnvelope");
+    if (user->status != USER_ACTIVE)
+      throw crabs_error(env,
+          (user->status == USER_SUSPENDED) ? CRABS_ERR_USER_SUSPENDED
+                                           : CRABS_ERR_USER_NOT_FOUND,
+          "mintKeyEnvelope");
+    uint64_t now_ms;
+    if (!state_get_time_ms(&am_->base_state, &now_ms))
+      throw crabs_error(env, CRABS_ERR_CRYPTOGRAPHIC_ERROR, "mintKeyEnvelope");
+
+    key_envelope_t* envelope = crypto_key_envelope_create(
+        (const abe_master_key_t*)am_->base_state.abe_mk,
+        am_->base_state.node_private_key, user, am_->base_state.version,
+        now_ms, expires_at);
+    if (!envelope)
+      throw crabs_error(env, CRABS_ERR_CRYPTOGRAPHIC_ERROR, "mintKeyEnvelope");
+    uint8_t wire[CRABS_KEY_ENVELOPE_MAX_SIZE];
+    size_t wire_len = crypto_key_envelope_serialize(envelope, wire, sizeof(wire));
+    crypto_key_envelope_destroy(envelope);   // cleanses the embedded ECIES copy
+    if (wire_len == 0)
+      throw crabs_error(env, CRABS_ERR_INTERNAL, "mintKeyEnvelope");
+    Napi::Buffer<uint8_t> out = Napi::Buffer<uint8_t>::Copy(env, wire, wire_len);
+    OPENSSL_cleanse(wire, sizeof(wire));     // ECIES-wrapped — defense in depth
+    return out;
+  }
+
+  // decryptKeyEnvelope(envelope, options) opens a mintKeyEnvelope wire on
+  // the recipient side and returns the restored AbeKey — the C KeyEnvelope
+  // battery's flow (test_crypto.cpp:963-1032): parse (against THIS machine's
+  // authority — the envelope carries no public params), verify the ISSUER's
+  // ECDSA signature over the canonical envelope, then open the ECIES blob
+  // with the recipient's private key and import the recovered reader key
+  // against this authority. Both tamper paths fail closed with the typed
+  // 'unauthorized' — a tampered wire breaks the signature, a wrong recipient
+  // key or tampered blob breaks the GCM tag. options.privateKeyHex — the
+  // recipient's 64-hex private key; options.nodePublicKeyHex — the ISSUER
+  // node's public key for out-of-machine verification (default: this
+  // machine's own node key, which refuses an envelope another machine
+  // issued — fail-closed). Staging discipline: the recovered plaintext ABE
+  // key never leaves C (cleansed inside before anything returns); the
+  // recipient private key bytes AND their JS-side hex-string copies are
+  // cleansed on every path (including refusals thrown before the C call).
+  Napi::Value DecryptKeyEnvelope(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 2 || !info[0].IsBuffer() || !info[1].IsObject())
+      throw Napi::TypeError::New(env,
+        "Expected (envelope Buffer, { privateKeyHex, nodePublicKeyHex? })");
+    if (am_->base_state.abe_mk == nullptr)
+      throw crabs_error(env, CRABS_ERR_CRYPTOGRAPHIC_ERROR, "decryptKeyEnvelope");
+    Napi::Object opts = info[1].As<Napi::Object>();
+    if (!opts.Get("privateKeyHex").IsString())
+      throw Napi::TypeError::New(env,
+        "decryptKeyEnvelope: privateKeyHex must be 64 hex characters (32 bytes)");
+    std::string private_hex = require_js_string(
+        opts.Get("privateKeyHex"), "decryptKeyEnvelope", "privateKeyHex");
+    uint8_t user_private_key[32];
+    uint8_t issuer_pub[33];
+    bool explicit_issuer = false;
+    std::string issuer_hex;
+    if (private_hex.length() != 64 ||
+        !hex_decode(private_hex, user_private_key, sizeof(user_private_key))) {
+      OPENSSL_cleanse(private_hex.data(), private_hex.size());
+      OPENSSL_cleanse(user_private_key, sizeof(user_private_key));
+      throw Napi::TypeError::New(env,
+        "decryptKeyEnvelope: privateKeyHex must be 64 hex characters (32 bytes)");
+    }
+    if (opts.Has("nodePublicKeyHex")) {
+      if (!opts.Get("nodePublicKeyHex").IsString()) {
+        OPENSSL_cleanse(user_private_key, sizeof(user_private_key));
+        OPENSSL_cleanse(private_hex.data(), private_hex.size());
+        throw Napi::TypeError::New(env,
+          "decryptKeyEnvelope: nodePublicKeyHex must be 66 hex characters (33 bytes)");
+      }
+      issuer_hex = require_js_string(
+          opts.Get("nodePublicKeyHex"), "decryptKeyEnvelope", "nodePublicKeyHex");
+      if (issuer_hex.length() != 66 ||
+          !hex_decode(issuer_hex, issuer_pub, sizeof(issuer_pub))) {
+        OPENSSL_cleanse(issuer_hex.data(), issuer_hex.size());
+        OPENSSL_cleanse(user_private_key, sizeof(user_private_key));
+        OPENSSL_cleanse(private_hex.data(), private_hex.size());
+        throw Napi::TypeError::New(env,
+          "decryptKeyEnvelope: nodePublicKeyHex must be 66 hex characters (33 bytes)");
+      }
+      explicit_issuer = true;
+    }
+
+    const uint8_t* verify_pub = issuer_pub;
+    if (!explicit_issuer) {
+      if (!am_->base_state.node_key_valid) {
+        OPENSSL_cleanse(user_private_key, sizeof(user_private_key));
+        OPENSSL_cleanse(private_hex.data(), private_hex.size());
+        throw crabs_error(env, CRABS_ERR_CRYPTOGRAPHIC_ERROR, "decryptKeyEnvelope");
+      }
+      verify_pub = am_->base_state.node_public_key;
+    }
+
+    auto wire = info[0].As<Napi::Buffer<uint8_t>>();
+    abe_user_key_t* sk = nullptr;
+    uint8_t plain[4096];
+    size_t plain_len = 0;
+    crabs_error_e rc = CRABS_ERR_INTERNAL;
+    key_envelope_t* envelope = crypto_key_envelope_deserialize(
+        (const abe_master_key_t*)am_->base_state.abe_mk,
+        wire.Data(), wire.Length());
+    if (!envelope) {
+      rc = CRABS_ERR_INVALID_PARAM;   // malformed envelope wire
+    } else {
+      if (!crypto_key_envelope_verify(verify_pub, envelope)) {
+        rc = CRABS_ERR_UNAUTHORIZED;  // wrong issuer key or tampered header/blob
+      } else if (crypto_key_envelope_decrypt_sk(
+                     envelope, user_private_key, plain,
+                     sizeof(plain), &plain_len) != CRABS_SUCCESS) {
+        rc = CRABS_ERR_UNAUTHORIZED;  // tag mismatch: wrong recipient or tamper
+      } else {
+        sk = crypto_abe_user_key_deserialize(
+            (const abe_master_key_t*)am_->base_state.abe_mk, plain, plain_len);
+        rc = (sk != nullptr) ? CRABS_SUCCESS : CRABS_ERR_CRYPTOGRAPHIC_ERROR;
+      }
+    }
+    // The recovered plaintext key bytes never linger past this frame.
+    OPENSSL_cleanse(plain, sizeof(plain));
+    if (envelope) crypto_key_envelope_destroy(envelope);  // cleanses the ECIES copy
+    OPENSSL_cleanse(user_private_key, sizeof(user_private_key));
+    OPENSSL_cleanse(private_hex.data(), private_hex.size());
+    if (explicit_issuer) OPENSSL_cleanse(issuer_hex.data(), issuer_hex.size());
+    if (rc != CRABS_SUCCESS)
+      throw crabs_error(env, rc, "decryptKeyEnvelope");
+    return AbeKey::NewInstance(env, sk);
+  }
+
+  // --- Master-key durability (§11.5 — see the d.ts docblocks; these are
+  // the CROWN JEWEL surfaces and marked so in both bindings' typings). ---
+
+  // serializeMasterKey(): the machine's authority in its 'MK' wire form —
+  // the C battery's backup round trip
+  // (TestDurability.MasterKeySerializeRoundTripPreservesAuthority; the
+  // restored form is a FULL authority minting keys in the same domain).
+  Napi::Value SerializeMasterKey(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (am_->base_state.abe_mk == nullptr)
+      throw crabs_error(env, CRABS_ERR_CRYPTOGRAPHIC_ERROR, "serializeMasterKey");
+    size_t needed = crypto_master_key_serialize(
+        (const abe_master_key_t*)am_->base_state.abe_mk, nullptr, 0);
+    if (needed == 0)
+      throw crabs_error(env, CRABS_ERR_CRYPTOGRAPHIC_ERROR, "serializeMasterKey");
+    Napi::Buffer<uint8_t> out = Napi::Buffer<uint8_t>::New(env, needed);
+    size_t written = crypto_master_key_serialize(
+        (const abe_master_key_t*)am_->base_state.abe_mk, out.Data(), needed);
+    if (written != needed)
+      throw crabs_error(env, CRABS_ERR_INTERNAL, "serializeMasterKey");
+    return out;
+  }
+
+  // masterKeyFromWire(wire): plants a serialized authority as THIS machine's
+  // master key — the recovery path a sealed snapshot's MSK section already
+  // runs (serialization.c:2862-2866). The previous (owned) authority is
+  // destroyed; a BORROWED authority (a delegated lineage child's) refuses
+  // without mutating anything; malformed / garbage / overrun-length wire
+  // refuses (the C battery's pins). The deserialized authority carries the
+  // master secret; nothing but the machine-owned pointer survives the call.
+  void MasterKeyFromWire(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 1 || !info[0].IsBuffer())
+      throw Napi::TypeError::New(env,
+        "Expected a master-key wire Buffer (serializeMasterKey form)");
+    if (am_->base_state.abe_mk != nullptr && am_->base_state.abe_mk_borrowed)
+      throw crabs_error(env, CRABS_ERR_PROTOCOL_VIOLATION, "masterKeyFromWire");
+    auto wire = info[0].As<Napi::Buffer<uint8_t>>();
+    abe_master_key_t* restored = crypto_master_key_deserialize(
+        wire.Data(), wire.Length());
+    if (!restored)
+      throw crabs_error(env, CRABS_ERR_INVALID_PARAM, "masterKeyFromWire");
+    if (am_->base_state.abe_mk != nullptr) {
+      crypto_abe_master_key_destroy((abe_master_key_t*)am_->base_state.abe_mk);
+    }
+    am_->base_state.abe_mk = restored;
   }
 
   // --- Serialization ---

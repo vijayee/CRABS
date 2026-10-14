@@ -11,6 +11,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <openssl/crypto.h>
 
 #include "../CRABS/crabs.h"
 #include "../CRABS/data_model.h"
@@ -1828,6 +1829,239 @@ int32_t crabs_wasm_abe_decrypt(abe_user_key_t* sk, abe_ciphertext_t* ct,
   }
   *out = plain;
   *out_len = (uint32_t)plain_len;
+  return (int32_t)CRABS_SUCCESS;
+}
+
+// ============================================================
+// ABE key transport (parity-fill P4)
+// ============================================================
+
+// Serialize a machine-derived reader key into the portable wire form
+// (crypto_abe_user_key_serialize — the OpenABE key bytestring). The wire IS
+// the bearer reader key: transport it only over an AUTHENTICATED channel
+// (it carries no integrity check of its own).
+EMSCRIPTEN_KEEPALIVE
+serialized_buffer_t* crabs_wasm_abe_key_serialize(abe_user_key_t* sk) {
+  if (!sk) return NULL;
+  size_t needed = crypto_abe_user_key_serialize(sk, NULL, 0);
+  if (needed == 0) return NULL;
+  serialized_buffer_t* buffer = serialized_buffer_create(needed);
+  if (!buffer) return NULL;
+  size_t written = crypto_abe_user_key_serialize(sk, buffer->data, buffer->len);
+  if (written != needed) {
+    serialized_buffer_destroy(buffer);
+    return NULL;
+  }
+  return buffer;
+}
+
+// Deserialize a reader-key wire image on THIS machine (crypto_abe_user_key_
+// deserialize takes the master key — required, but it only supplies the
+// public params: OpenABE's key import binds the CAPABILITY to the key's own
+// minting domain, so a wire restored on a foreign-authority machine still
+// opens exactly what its minting authority sealed — and refuses others).
+// Returns NULL on a refused wire or a machine without authority.
+EMSCRIPTEN_KEEPALIVE
+abe_user_key_t* crabs_wasm_abe_key_deserialize(attribute_machine_t* am,
+                                               const uint8_t* wire,
+                                               uint32_t wire_len) {
+  if (!am || !am->base_state.abe_mk || !wire || wire_len == 0) return NULL;
+  return crypto_abe_user_key_deserialize(
+      (abe_master_key_t*)am->base_state.abe_mk, wire, (size_t)wire_len);
+}
+
+// Mint a key envelope for a REGISTERED user (parity-fill P4 — the refresh_key
+// materialization shape, state_machine.c:2797, without the protocol
+// bookkeeping): the machine's own authority + node private key sign a
+// real CP-ABE key for the user's CURRENT attributes, and the key travels
+// ECIES-wrapped to the user's registered public key (never in cleartext).
+// Fail-closed gates mirrored from the refresh path: ACTIVE users only
+// (suspension refuses user_suspended), a live node key, and a live
+// authority. Mutates NOTHING (no key_version bump — this is the transport
+// primitive, not the refresh protocol op). On refusal *out_rc carries the
+// typed crabs_error_e and NULL is returned.
+EMSCRIPTEN_KEEPALIVE
+serialized_buffer_t* crabs_wasm_mint_key_envelope(attribute_machine_t* am,
+                                                  const char* user_id,
+                                                  uint64_t expires_at,
+                                                  int32_t* out_rc) {
+  serialized_buffer_t* buffer = NULL;
+  key_envelope_t* envelope = NULL;
+  uint8_t wire[CRABS_KEY_ENVELOPE_MAX_SIZE];
+  size_t wire_len = 0;
+  user_t* user = NULL;
+  uint64_t now_ms = 0;
+  crabs_error_e rc = CRABS_ERR_INVALID_PARAM;
+
+  if (!am || !user_id || !out_rc) goto stage_fail;
+  *out_rc = (int32_t)CRABS_ERR_INTERNAL;
+  if (!am->base_state.node_key_valid || !am->base_state.abe_mk) {
+    rc = CRABS_ERR_CRYPTOGRAPHIC_ERROR;
+    goto stage_fail;
+  }
+  user = attribute_machine_find_user(am, user_id);
+  if (!user) {
+    rc = CRABS_ERR_USER_NOT_FOUND;
+    goto stage_fail;
+  }
+  // Mirror refresh_key's whitelist (audit H-C): only ACTIVE users may
+  // receive a fresh key envelope.
+  if (user->status != USER_ACTIVE) {
+    rc = (user->status == USER_SUSPENDED) ? CRABS_ERR_USER_SUSPENDED
+                                          : CRABS_ERR_USER_NOT_FOUND;
+    goto stage_fail;
+  }
+  if (!state_get_time_ms(&am->base_state, &now_ms)) {
+    rc = CRABS_ERR_CRYPTOGRAPHIC_ERROR;
+    goto stage_fail;
+  }
+  envelope = crypto_key_envelope_create(
+      (abe_master_key_t*)am->base_state.abe_mk, am->base_state.node_private_key,
+      user, am->base_state.version, now_ms, expires_at);
+  if (!envelope) {
+    rc = CRABS_ERR_CRYPTOGRAPHIC_ERROR;
+    goto stage_fail;
+  }
+  wire_len = crypto_key_envelope_serialize(envelope, wire, sizeof(wire));
+  crypto_key_envelope_destroy(envelope);   // cleanses the embedded ECIES copy
+  envelope = NULL;
+  if (wire_len == 0) {
+    rc = CRABS_ERR_INTERNAL;
+    goto stage_fail;
+  }
+  buffer = serialized_buffer_create(wire_len);
+  if (!buffer) {
+    rc = CRABS_ERR_OOM;
+    goto stage_fail;
+  }
+  memcpy(buffer->data, wire, wire_len);
+  OPENSSL_cleanse(wire, sizeof(wire));  // ECIES-wrapped — defense in depth
+  *out_rc = (int32_t)CRABS_SUCCESS;
+  return buffer;
+
+stage_fail:
+  OPENSSL_cleanse(wire, sizeof(wire));
+  if (envelope) crypto_key_envelope_destroy(envelope);
+  *out_rc = (int32_t)rc;
+  return NULL;
+}
+
+// Import a key envelope the C battery documents (test_crypto.cpp KeyEnvelope
+// flow): parse (against THIS machine's authority — the envelope carries no
+// public params of its own), verify the ISSUER's ECDSA signature
+// (node_public_key; NULL verifies against the machine's OWN node key, so an
+// envelope from a different machine refuses fail-closed), then open the
+// ECIES blob with the recipient's private key and import the recovered
+// reader key against the machine's authority. Both tamper paths (wire
+// tamper → signature, recipient key or blob tamper → GCM tag) refuse with
+// the typed CRABS_ERR_UNAUTHORIZED. The recovered plaintext ABE key exists
+// only inside this frame and is CLEANSED on every path before returning.
+EMSCRIPTEN_KEEPALIVE
+int32_t crabs_wasm_key_envelope_import(attribute_machine_t* am,
+                                       const uint8_t* wire,
+                                       uint32_t wire_len,
+                                       const uint8_t* user_private_key,
+                                       const uint8_t* node_public_key,
+                                       abe_user_key_t** out_key) {
+  key_envelope_t* envelope = NULL;
+  abe_user_key_t* sk = NULL;
+  uint8_t plain[4096];
+  size_t plain_len = 0;
+  const uint8_t* verify_pub = node_public_key;
+  crabs_error_e rc;
+
+  if (!am || !wire || wire_len == 0 || !user_private_key || !out_key) {
+    return (int32_t)CRABS_ERR_INVALID_PARAM;
+  }
+  *out_key = NULL;
+  if (!am->base_state.abe_mk) return (int32_t)CRABS_ERR_CRYPTOGRAPHIC_ERROR;
+  if (verify_pub == NULL) {
+    if (!am->base_state.node_key_valid) {
+      return (int32_t)CRABS_ERR_CRYPTOGRAPHIC_ERROR;
+    }
+    verify_pub = am->base_state.node_public_key;
+  }
+
+  rc = CRABS_ERR_INTERNAL;
+  envelope = crypto_key_envelope_deserialize(
+      (abe_master_key_t*)am->base_state.abe_mk, wire, (size_t)wire_len);
+  if (!envelope) {
+    rc = CRABS_ERR_INVALID_PARAM;   // malformed envelope wire
+  } else if (!crypto_key_envelope_verify(verify_pub, envelope)) {
+    rc = CRABS_ERR_UNAUTHORIZED;    // wrong issuer key or tampered header/blob
+  } else if (crypto_key_envelope_decrypt_sk(envelope, user_private_key, plain,
+                                            sizeof(plain), &plain_len)
+               != CRABS_SUCCESS) {
+    rc = CRABS_ERR_UNAUTHORIZED;    // tag mismatch: wrong recipient or tamper
+  } else {
+    sk = crypto_abe_user_key_deserialize(
+        (abe_master_key_t*)am->base_state.abe_mk, plain, plain_len);
+    rc = (sk != NULL) ? CRABS_SUCCESS : CRABS_ERR_CRYPTOGRAPHIC_ERROR;
+  }
+  // The recovered plaintext key bytes never linger past this frame — whether
+  // the import succeeded, failed a gate, or never started.
+  OPENSSL_cleanse(plain, sizeof(plain));
+  crypto_key_envelope_destroy(envelope);   // cleanses the embedded ECIES copy
+  if (rc != CRABS_SUCCESS) return (int32_t)rc;
+  *out_key = sk;
+  return (int32_t)CRABS_SUCCESS;
+}
+
+// Master-key durability (§11.5 — the C battery's backup/recovery round trip,
+// TestDurability.MasterKeySerializeRoundTripPreservesAuthority): the 'MK'
+// wire form of the machine's own authority. THIS IS THE CROWN JEWEL —
+// whoever holds this wire mints keys for ANY policy and decrypts EVERYTHING
+// the authority ever sealed. The machine-bound wrappers keep it behind an
+// explicit, documented step.
+EMSCRIPTEN_KEEPALIVE
+serialized_buffer_t* crabs_wasm_master_key_serialize(attribute_machine_t* am) {
+  const abe_master_key_t* master_key;
+  size_t needed = 0;
+  serialized_buffer_t* buffer = NULL;
+  size_t written = 0;
+
+  if (!am || !am->base_state.abe_mk) return NULL;
+  master_key = (const abe_master_key_t*)am->base_state.abe_mk;
+  needed = crypto_master_key_serialize(master_key, NULL, 0);
+  if (needed == 0) return NULL;
+  buffer = serialized_buffer_create(needed);
+  if (!buffer) return NULL;
+  written = crypto_master_key_serialize(master_key, buffer->data, buffer->len);
+  if (written != needed) {
+    serialized_buffer_destroy(buffer);
+    return NULL;
+  }
+  return buffer;
+}
+
+// Plant a serialized authority into THIS machine (the recovery path the C
+// restore already runs for a sealed snapshot's MSK section,
+// serialization.c:2862-2866): the deserialized full authority REPLACES the
+// machine's current one (the current authority is destroyed — never a
+// borrowed one). A machine whose authority is merely borrowed refuses
+// without mutating anything; malformed wire refuses (garbage, bad magic,
+// overrun-length blobs all fail closed per the C battery).
+EMSCRIPTEN_KEEPALIVE
+int32_t crabs_wasm_master_key_restore(attribute_machine_t* am,
+                                      const uint8_t* wire,
+                                      uint32_t wire_len) {
+  abe_master_key_t* restored = NULL;
+
+  if (!am || !wire || wire_len == 0) return (int32_t)CRABS_ERR_INVALID_PARAM;
+  if (am->base_state.abe_mk != NULL && am->base_state.abe_mk_borrowed) {
+    return (int32_t)CRABS_ERR_PROTOCOL_VIOLATION;   // authority is not ours to replace
+  }
+  restored = crypto_master_key_deserialize(wire, (size_t)wire_len);
+  if (!restored) return (int32_t)CRABS_ERR_INVALID_PARAM;
+  // The REPLACED authority is LEAKED, not destroyed: in the wasm build
+  // oabe_context_cp_free of an in-use ABE context poisons later OpenABE
+  // calls (a memory trap — the same teardown hazard crabs_wasm_node_destroy
+  // documents above, where full C teardown is avoided for exactly this
+  // reason). Wasm machines and everything they hold are module-lifetime
+  // allocations; the native binding runs the real destroy in its own
+  // counterpart. Keygen on the restored authority is pinned usable
+  // (key-transport.js's durability round trip).
+  am->base_state.abe_mk = restored;
   return (int32_t)CRABS_SUCCESS;
 }
 

@@ -30,15 +30,26 @@ export interface KeyPair {
 }
 
 /**
- * A machine-derived CP-ABE reader key (gap-fill A11): Node.abeKeygen derives
- * it from the machine's OWN master authority, so JS never touches the master
- * secret — the machine mints it, JS holds only the derived key. JS OWNS the
- * pointer: destroy() releases it (the destructor releases it too, matching
- * the KeyPair/Blueprint convention). NOT a portable byte format in v1 — no
- * serialized reader key crosses a process/machine boundary; the C-side
- * user_key serialize/deserialize pair stays C-only.
+ * A machine-derived CP-ABE reader key (gap-fill A11 + parity-fill P4):
+ * Node.abeKeygen derives it from the machine's OWN master authority, so JS
+ * never touches the master secret — the machine mints it, JS holds only the
+ * derived key. JS OWNS the pointer: destroy() releases it (the destructor
+ * releases it too, matching the KeyPair/Blueprint convention). Portable
+ * bytes exist through toWire() (parity-fill P4): a SELF-SUFFICIENT BEARER
+ * image of the key (crypto_abe_user_key_serialize) — it carries its own
+ * minting domain, restores on any machine via Node.abeKeyFromWire (the
+ * restored key opens exactly what its minting authority sealed, wherever it
+ * was restored), and has NO integrity check — carry it over an
+ * authenticated channel, or move keys with the key envelope flow
+ * (Node.mintKeyEnvelope / Node.decryptKeyEnvelope) instead.
  */
 export interface AbeKey {
+  /**
+   * Portable reader-key wire image (crypto_abe_user_key_serialize). The
+   * bytes ARE the key — treat the return like a bearer token. Refuses on a
+   * destroyed key.
+   */
+  toWire(): Buffer;
   destroy(): void;
 }
 
@@ -604,6 +615,74 @@ export interface Node {
    * `key` must be the AbeKey abeKeygen returned (a destroyed key refuses).
    */
   abeDecrypt(key: AbeKey, encrypted: Buffer): Buffer;
+
+  // ============================================================
+  // ABE key transport (parity-fill P4)
+  // ============================================================
+  /**
+   * Re-import a reader key the AbeKey.toWire() form carries. The restore
+   * runs on THIS machine's authority (crypto_abe_user_key_deserialize takes
+   * mk) and refuses on a machine without one — but the CAPABILITY is the
+   * wire's own: the restored key binds to its MINTING domain (pinned
+   * cross-machine in test/abe.js). The wire is integrity-blind: carry it
+   * authenticated or use the envelope flow.
+   */
+  abeKeyFromWire(wire: Buffer): AbeKey;
+  /**
+   * Mint a key envelope for a REGISTERED user — the refresh_key
+   * materialization shape (state_machine.c:2797) without the protocol
+   * bookkeeping: the machine's authority + node key issue a real CP-ABE key
+   * for the user's CURRENT attribute set (one value per attribute NAME, the
+   * token map applies), node-ECDSA-signed, with the key ECIES-wrapped to the
+   * user's REGISTERED public key (never cleartext — audit H-A). Fail-closed
+   * gates mirrored from the refresh path: ACTIVE users only (suspended →
+   * user_suspended, unknown → user_not_found), a live node key and
+   * authority required. Mutates NOTHING. options.expiresAt — epoch-ms expiry
+   * stamped into the envelope (default 0 = no expiry, what refresh issues;
+   * expiry enforcement is integrator-side in C). Returns the envelope wire
+   * (crypto_key_envelope_serialize flat form).
+   */
+  mintKeyEnvelope(userId: string, options?: { expiresAt?: number }): Buffer;
+  /**
+   * Open a mintKeyEnvelope wire on the recipient side and return the
+   * restored AbeKey — the C KeyEnvelope battery's flow: parse (against THIS
+   * machine's authority), verify the ISSUER's ECDSA signature, open the
+   * ECIES blob with the recipient's private key, import the recovered key.
+   * Both tamper paths fail closed with the typed 'unauthorized' (wrong
+   * recipient key or tampered blob → GCM tag; tampered wire → signature).
+   * options.privateKeyHex — the recipient's 64-hex private key (the KeyPair
+   * whose public key was registered); options.nodePublicKeyHex — the ISSUER
+   * node's public key (66 hex) for out-of-machine verification (default:
+   * this machine's own node key, which refuses envelopes another machine
+   * issued — fail-closed). The recovered plaintext key never leaves C:
+   * staging is cleansed on every path, the recipient private key bytes and
+   * their hex-string copies included.
+   */
+  decryptKeyEnvelope(envelope: Buffer,
+                     options: { privateKeyHex: string;
+                                nodePublicKeyHex?: string }): AbeKey;
+  /**
+   * TRUST FACT — this is the machine's CROWN JEWEL: whoever holds these
+   * bytes mints keys for ANY policy and decrypts EVERYTHING the authority
+   * ever sealed. serializeMasterKey() emits the authority in its 'MK' wire
+   * form (crypto_master_key_serialize, §11.5) for durability backup — the
+   * C battery's MasterKeySerializeRoundTripPreservesAuthority: the restored
+   * form is a FULL authority minting keys in the same domain. Treat the
+   * return like an unencrypted private key; ship it only encrypted.
+   */
+  serializeMasterKey(): Buffer;
+  /**
+   * Plant a serialized authority as THIS machine's master key
+   * (masterKeyFromWire — the recovery path a sealed snapshot's MSK section
+   * already runs, serialization.c:2862-2866). A fresh authority makes the
+   * machine mint keys in the restored domain; the replaced (owned)
+   * authority is destroyed and cleansed. Refuses: malformed wire (bad
+   * magic, overrun lengths — the C battery's garbage/overrun pins) with
+   * invalid_param, and a machine whose authority is merely BORROWED (a
+   * delegated lineage child) with protocol_violation — never replaces a
+   * borrowed authority.
+   */
+  masterKeyFromWire(wire: Buffer): void;
 
   // Serialization
   /**
