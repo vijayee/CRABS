@@ -141,6 +141,10 @@ size_t crypto_abe_user_key_serialize(const abe_user_key_t* sk,
                                        uint8_t* out_buf, size_t buf_len);
 // Deserialize a user key from bytes (the master key provides the public params
 // needed to reconstruct a decrypt-capable context). Returns NULL on failure.
+// The 'MK' master-key magic is REFUSED here (cross-wire confusion): a
+// bytestring wearing it is an authority image, not a reader key — the mirror
+// image of crypto_master_key_deserialize, which refuses everything NOT
+// wearing the magic.
 abe_user_key_t* crypto_abe_user_key_deserialize(const abe_master_key_t* mk,
                                                    const uint8_t* buf, size_t len);
 
@@ -158,6 +162,16 @@ size_t crypto_master_key_serialize(const abe_master_key_t* mk,
 // Reconstruct a full authority (context + params + secret) from bytes.
 // Returns NULL on malformed input.
 abe_master_key_t* crypto_master_key_deserialize(const uint8_t* buf, size_t len);
+
+// Cleanse + release an authority's recoverable WIRE copies (the serialized
+// master secret and public params bytestrings) WITHOUT touching its context —
+// for wasm-style lifetimes where the full teardown of an in-use authority
+// poisons later OpenABE calls, but the serialized 'MK'/'params' images must
+// not linger on the heap. Pointers are nulled, so crypto_abe_master_key_-
+// destroy stays safe afterwards. An authority that has passed through this is
+// no longer serializeable (the copies are gone) and its context is not
+// guaranteed usable for keygen — it is meant for REPLACE-and-forget reuse.
+void crypto_abe_master_key_cleanse_wire_copies(abe_master_key_t* mk);
 
 // Policy evaluation (AND/OR/attribute matching) — a lightweight string-based
 // check used by the authorization path; NOT a confidentiality mechanism.

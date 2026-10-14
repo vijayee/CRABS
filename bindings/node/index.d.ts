@@ -640,9 +640,10 @@ export interface Node {
    * authority required. Mutates NOTHING. options.expiresAt — epoch-ms expiry
    * stamped into the envelope (default 0 = no expiry, what refresh issues;
    * expiry enforcement is integrator-side in C). Returns the envelope wire
-   * (crypto_key_envelope_serialize flat form).
+   * (crypto_key_envelope_serialize flat form). expiresAt accepts number or
+   * BigInt (the wasm wrapper's shared shape), capped at MAX_SAFE_INTEGER.
    */
-  mintKeyEnvelope(userId: string, options?: { expiresAt?: number }): Buffer;
+  mintKeyEnvelope(userId: string, options?: { expiresAt?: number | bigint }): Buffer;
   /**
    * Open a mintKeyEnvelope wire on the recipient side and return the
    * restored AbeKey — the C KeyEnvelope battery's flow: parse (against THIS
@@ -667,8 +668,11 @@ export interface Node {
    * ever sealed. serializeMasterKey() emits the authority in its 'MK' wire
    * form (crypto_master_key_serialize, §11.5) for durability backup — the
    * C battery's MasterKeySerializeRoundTripPreservesAuthority: the restored
-   * form is a FULL authority minting keys in the same domain. Treat the
-   * return like an unencrypted private key; ship it only encrypted.
+   * form is a FULL authority minting keys in the same domain. Refuses with
+   * protocol_violation on a machine whose authority is merely BORROWED (a
+   * SHARED_ROOT lineage child — only the OWNING machine may export the
+   * 'MK' wire). Treat the return like an unencrypted private key; ship it
+   * only encrypted.
    */
   serializeMasterKey(): Buffer;
   /**

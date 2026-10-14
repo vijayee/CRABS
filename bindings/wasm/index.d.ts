@@ -844,8 +844,11 @@ export interface Node {
    * ever sealed. serializeMasterKey() emits the authority in its 'MK' wire
    * form (crypto_master_key_serialize, §11.5) for durability backup — the
    * C battery's MasterKeySerializeRoundTripPreservesAuthority: the restored
-   * form is a FULL authority minting keys in the same domain. Treat the
-   * return like an unencrypted private key; ship it only encrypted.
+   * form is a FULL authority minting keys in the same domain. Refuses with
+   * protocol_violation on a machine whose authority is merely BORROWED (a
+   * SHARED_ROOT lineage child — only the OWNING machine may export the
+   * 'MK' wire). Treat the return like an unencrypted private key; ship it
+   * only encrypted.
    */
   serializeMasterKey(): Uint8Array;
   /**

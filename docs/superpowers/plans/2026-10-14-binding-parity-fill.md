@@ -84,9 +84,13 @@ Same TDD pattern; C: attribute_machine.h:147/149/168 (read the real signatures �
     refresh-path ACTIVE gate; expiry is stamped-but-integrator-enforced, as
     in C. Staging: wasm exports cleanse the ECIES wire/plaintext frames; the
     node binding cleanses the recipient private key + issuer hex strings on
-    every path; wasm's `masterKeyFromWire` LEAKS the replaced authority (the
-    `crabs_wasm_node_destroy` OpenABE-teardown hazard) while the native
-    destroy+cleanse runs — documented at the export and api-map.)
+    every path; wasm's `masterKeyFromWire` leaks only the replaced
+    authority's OpenABE CONTEXT (the `crabs_wasm_node_destroy`
+    teardown hazard) — its serialized MPK/MSK wire copies are cleansed +
+    released before the pointer swap (`crypto_abe_master_key_cleanse_wire_
+    copies`), and key-wire staging is destroyed via the cleanse-then-free
+    `crabs_wasm_key_wire_buffer_destroy` on both copy-out directions —
+    documented at the export and api-map.)
 - [x] **Step 4:** green + battery + adversarial review (staging cleanse, GCM/tag checks, no MSK pointer escape). **Commit** `feat: ABE key envelopes and key transport from JS`.
 
 ### Task P5: OT ordered-set merge layer (recipe 8 → COMPLETE)

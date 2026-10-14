@@ -3445,6 +3445,13 @@ private:
   // secrets and refuses another authority's). That is the bearer truth of
   // the wire, not a restore accident. The wire is integrity-blind (no
   // checksum): carry it authenticated or use the envelope flow below.
+  // Cross-wire confusion ('MK' master-key magic in the reader slot) refuses
+  // with the typed invalid_param — crypto_abe_user_key_deserialize refuses
+  // an authority image (crypto.c). Staging discipline (P4 review, mirroring
+  // the wasm side's staged-copy cleanse): this method STAGES NOTHING — the
+  // wire is read in place from the caller's Buffer, so no C-side copy
+  // lingers past the call and the caller's copy remains theirs; the
+  // deserialized key object owns its own cleansed-by-destroy copies.
   Napi::Value AbeKeyFromWire(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
     if (info.Length() < 1 || !info[0].IsBuffer())
@@ -3486,14 +3493,30 @@ private:
           "mintKeyEnvelope: options must be an object {expiresAt?}");
       Napi::Object opts = info[1].As<Napi::Object>();
       if (opts.Has("expiresAt")) {
+        // `number | bigint` — the wasm wrapper's shape (BigInt-tolerant epoch
+        // ms), kept to the same MAX_SAFE_INTEGER ceiling so both bindings
+        // accept exactly the same values.
         Napi::Value expiry = opts.Get("expiresAt");
-        if (!expiry.IsNumber())
-          throw Napi::TypeError::New(env, "mintKeyEnvelope: expiresAt must be a number");
-        double expires_ms = expiry.As<Napi::Number>().DoubleValue();
-        if (!(expires_ms >= 0.0) || expires_ms > 9007199254740991.0)
-          throw Napi::RangeError::New(env,
+        if (!expiry.IsNumber() && !expiry.IsBigInt())
+          throw Napi::TypeError::New(env,
             "mintKeyEnvelope: expiresAt must be a non-negative epoch-ms number");
-        expires_at = (uint64_t)expires_ms;
+        if (expiry.IsBigInt()) {
+          bool lossless = true;
+          uint64_t bigint_ms = expiry.As<Napi::BigInt>().Uint64Value(&lossless);
+          // No-loss: negatives and > 2^64-1 wrap (lossless=false); anything
+          // past the JS-safe number ceiling is rejected for parity with the
+          // wasm wrapper's range gate.
+          if (!lossless || bigint_ms > 9007199254740991ULL)
+            throw Napi::RangeError::New(env,
+              "mintKeyEnvelope: expiresAt must be a non-negative epoch-ms number");
+          expires_at = bigint_ms;
+        } else {
+          double expires_ms = expiry.As<Napi::Number>().DoubleValue();
+          if (!(expires_ms >= 0.0) || expires_ms > 9007199254740991.0)
+            throw Napi::RangeError::New(env,
+              "mintKeyEnvelope: expiresAt must be a non-negative epoch-ms number");
+          expires_at = (uint64_t)expires_ms;
+        }
       }
     }
     // Gates mirrored from refresh_key (audit H-C): live authority + node key,
@@ -3639,10 +3662,16 @@ private:
   // the C battery's backup round trip
   // (TestDurability.MasterKeySerializeRoundTripPreservesAuthority; the
   // restored form is a FULL authority minting keys in the same domain).
+  // A machine whose authority is merely BORROWED (a SHARED_ROOT lineage
+  // child) refuses protocol_violation (P4 review): only the machine that
+  // OWNS the authority may export it — the child uses the parent's MSK
+  // pointer, it is not entrusted with the MSK bytes at rest.
   Napi::Value SerializeMasterKey(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
     if (am_->base_state.abe_mk == nullptr)
       throw crabs_error(env, CRABS_ERR_CRYPTOGRAPHIC_ERROR, "serializeMasterKey");
+    if (am_->base_state.abe_mk_borrowed)
+      throw crabs_error(env, CRABS_ERR_PROTOCOL_VIOLATION, "serializeMasterKey");
     size_t needed = crypto_master_key_serialize(
         (const abe_master_key_t*)am_->base_state.abe_mk, nullptr, 0);
     if (needed == 0)
@@ -3658,10 +3687,16 @@ private:
   // masterKeyFromWire(wire): plants a serialized authority as THIS machine's
   // master key — the recovery path a sealed snapshot's MSK section already
   // runs (serialization.c:2862-2866). The previous (owned) authority is
-  // destroyed; a BORROWED authority (a delegated lineage child's) refuses
-  // without mutating anything; malformed / garbage / overrun-length wire
-  // refuses (the C battery's pins). The deserialized authority carries the
-  // master secret; nothing but the machine-owned pointer survives the call.
+  // destroyed — which cleanses its serialized MPK/MSK wire copies (Audit
+  // N-17 discipline through crypto_abe_master_key_destroy); a BORROWED
+  // authority (a delegated lineage child's) refuses without mutating
+  // anything; malformed / garbage / overrun-length wire refuses (the C
+  // battery's pins). Staging discipline (P4 review, mirroring the wasm
+  // side's staged-copy cleanse): this method STAGES NOTHING — the wire is
+  // read in place from the caller's Buffer, so no C-side copy lingers past
+  // the call and the caller's copy remains theirs; the deserialized
+  // authority carries the master secret and nothing else but the
+  // machine-owned pointer survives the call.
   void MasterKeyFromWire(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
     if (info.Length() < 1 || !info[0].IsBuffer())

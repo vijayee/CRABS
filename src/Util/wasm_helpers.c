@@ -1836,6 +1836,26 @@ int32_t crabs_wasm_abe_decrypt(abe_user_key_t* sk, abe_ciphertext_t* ct,
 // ABE key transport (parity-fill P4)
 // ============================================================
 
+// Key-transport staging buffers carry key material (the reader-key or 'MK'
+// wire IS the secret). They are destroyed ONLY after JS has copied the bytes
+// out — at which point the payload must be cleansed, not merely freed (P4
+// review: the shared crabs_wasm_buffer_destroy above is the general
+// checksummed-op/protocol-blob teardown and stays untouchable; key-transport
+// call sites use this cleansed teardown instead, on the export's internal
+// failure paths and as the dedicated export JS calls after its copy-out).
+static void _key_wire_buffer_destroy_cleansed(serialized_buffer_t* buf) {
+  if (!buf) return;
+  if (buf->data) OPENSSL_cleanse(buf->data, buf->len);
+  serialized_buffer_destroy(buf);
+}
+
+// The JS-copy-out companion: call this (NOT _crabs_wasm_buffer_destroy) after
+// reading the bytes of a reader-key or master-key serialized buffer.
+EMSCRIPTEN_KEEPALIVE
+void crabs_wasm_key_wire_buffer_destroy(serialized_buffer_t* buf) {
+  _key_wire_buffer_destroy_cleansed(buf);
+}
+
 // Serialize a machine-derived reader key into the portable wire form
 // (crypto_abe_user_key_serialize — the OpenABE key bytestring). The wire IS
 // the bearer reader key: transport it only over an AUTHENTICATED channel
@@ -1849,7 +1869,7 @@ serialized_buffer_t* crabs_wasm_abe_key_serialize(abe_user_key_t* sk) {
   if (!buffer) return NULL;
   size_t written = crypto_abe_user_key_serialize(sk, buffer->data, buffer->len);
   if (written != needed) {
-    serialized_buffer_destroy(buffer);
+    _key_wire_buffer_destroy_cleansed(buffer);
     return NULL;
   }
   return buffer;
@@ -1859,15 +1879,25 @@ serialized_buffer_t* crabs_wasm_abe_key_serialize(abe_user_key_t* sk) {
 // deserialize takes the master key — required, but it only supplies the
 // public params: OpenABE's key import binds the CAPABILITY to the key's own
 // minting domain, so a wire restored on a foreign-authority machine still
-// opens exactly what its minting authority sealed — and refuses others).
-// Returns NULL on a refused wire or a machine without authority.
+// opens exactly what its minting authority sealed — and refuses others; a
+// wire wearing the 'MK' master-key magic is refused as cross-wire
+// confusion, crypto.c). Returns NULL on a refused wire or a machine without
+// authority; on a refusal *out_rc carries the typed crabs_error_e.
 EMSCRIPTEN_KEEPALIVE
 abe_user_key_t* crabs_wasm_abe_key_deserialize(attribute_machine_t* am,
                                                const uint8_t* wire,
-                                               uint32_t wire_len) {
-  if (!am || !am->base_state.abe_mk || !wire || wire_len == 0) return NULL;
-  return crypto_abe_user_key_deserialize(
+                                               uint32_t wire_len,
+                                               int32_t* out_rc) {
+  if (!out_rc) return NULL;
+  *out_rc = (int32_t)CRABS_ERR_CRYPTOGRAPHIC_ERROR;
+  if (!am || !am->base_state.abe_mk || !wire || wire_len == 0) {
+    return NULL;
+  }
+  abe_user_key_t* sk = crypto_abe_user_key_deserialize(
       (abe_master_key_t*)am->base_state.abe_mk, wire, (size_t)wire_len);
+  *out_rc = (sk != NULL) ? (int32_t)CRABS_SUCCESS
+                         : (int32_t)CRABS_ERR_INVALID_PARAM;
+  return sk;
 }
 
 // Mint a key envelope for a REGISTERED user (parity-fill P4 — the refresh_key
@@ -2009,29 +2039,55 @@ int32_t crabs_wasm_key_envelope_import(attribute_machine_t* am,
 
 // Master-key durability (§11.5 — the C battery's backup/recovery round trip,
 // TestDurability.MasterKeySerializeRoundTripPreservesAuthority): the 'MK'
-// wire form of the machine's own authority. THIS IS THE CROWN JEWEL —
+// wire form of the machine's OWN authority. THIS IS THE CROWN JEWEL —
 // whoever holds this wire mints keys for ANY policy and decrypts EVERYTHING
 // the authority ever sealed. The machine-bound wrappers keep it behind an
-// explicit, documented step.
+// explicit, documented step, and a machine whose authority is merely BORROWED
+// (a SHARED_ROOT lineage child) refuses protocol_violation: only the machine
+// that owns the authority may export it — the child USES the pointer, it is
+// not entrusted with the machine's MSK bytes at rest.
 EMSCRIPTEN_KEEPALIVE
-serialized_buffer_t* crabs_wasm_master_key_serialize(attribute_machine_t* am) {
+serialized_buffer_t* crabs_wasm_master_key_serialize(attribute_machine_t* am,
+                                                     int32_t* out_rc) {
   const abe_master_key_t* master_key;
   size_t needed = 0;
   serialized_buffer_t* buffer = NULL;
   size_t written = 0;
+  crabs_error_e rc = CRABS_ERR_INVALID_PARAM;   // covers !am / !out_rc fallback
 
-  if (!am || !am->base_state.abe_mk) return NULL;
+  if (!am || !out_rc) goto stage_fail;
+  *out_rc = (int32_t)CRABS_ERR_INTERNAL;
+  if (!am->base_state.abe_mk) {
+    rc = CRABS_ERR_CRYPTOGRAPHIC_ERROR;
+    goto stage_fail;
+  }
+  if (am->base_state.abe_mk_borrowed) {
+    rc = CRABS_ERR_PROTOCOL_VIOLATION;   // a borrower never exports 'MK' wire
+    goto stage_fail;
+  }
   master_key = (const abe_master_key_t*)am->base_state.abe_mk;
   needed = crypto_master_key_serialize(master_key, NULL, 0);
-  if (needed == 0) return NULL;
+  if (needed == 0) {
+    rc = CRABS_ERR_CRYPTOGRAPHIC_ERROR;
+    goto stage_fail;
+  }
   buffer = serialized_buffer_create(needed);
-  if (!buffer) return NULL;
+  if (!buffer) {
+    rc = CRABS_ERR_OOM;
+    goto stage_fail;
+  }
   written = crypto_master_key_serialize(master_key, buffer->data, buffer->len);
   if (written != needed) {
-    serialized_buffer_destroy(buffer);
+    _key_wire_buffer_destroy_cleansed(buffer);
+    *out_rc = (int32_t)CRABS_ERR_CRYPTOGRAPHIC_ERROR;
     return NULL;
   }
+  *out_rc = (int32_t)CRABS_SUCCESS;
   return buffer;
+
+stage_fail:
+  *out_rc = (int32_t)rc;
+  return NULL;
 }
 
 // Plant a serialized authority into THIS machine (the recovery path the C
@@ -2053,14 +2109,27 @@ int32_t crabs_wasm_master_key_restore(attribute_machine_t* am,
   }
   restored = crypto_master_key_deserialize(wire, (size_t)wire_len);
   if (!restored) return (int32_t)CRABS_ERR_INVALID_PARAM;
-  // The REPLACED authority is LEAKED, not destroyed: in the wasm build
-  // oabe_context_cp_free of an in-use ABE context poisons later OpenABE
-  // calls (a memory trap — the same teardown hazard crabs_wasm_node_destroy
-  // documents above, where full C teardown is avoided for exactly this
-  // reason). Wasm machines and everything they hold are module-lifetime
-  // allocations; the native binding runs the real destroy in its own
-  // counterpart. Keygen on the restored authority is pinned usable
-  // (key-transport.js's durability round trip).
+  if (am->base_state.abe_mk != NULL) {
+    // The replaced authority's serialized MPK + MSK bytestrings are cleansed
+    // + released BEFORE the pointer swap (P4 review): they are exactly the
+    // bytes the wire form carries — the recoverable copies — but zeroing
+    // them costs the machine nothing, because the replaced authority is
+    // abandoned anyway. THE CONTEXT IS LEFT ALONE: in the wasm build
+    // oabe_context_cp_free of an in-use ABE context poisons later OpenABE
+    // calls (a memory trap — the same teardown hazard
+    // crabs_wasm_node_destroy documents above, where full C teardown is
+    // avoided for exactly this reason), so the old authority's context —
+    // and the struct holding its leaked pointer — still leaks by wasm
+    // policy (module-lifetime allocations); the native binding runs the
+    // real destroy + cleanse in its own counterpart. What no longer leaks
+    // is the recoverable wire material: cleanse_wire_copies zeroes the
+    // serialized MPK/MSK heap copies, so the only recoverable authority
+    // image is the wire the RESTORE step itself planted (the machine's new
+    // live authority). Keygen on the restored authority is pinned usable
+    // (key-transport.js's durability round trip).
+    crypto_abe_master_key_cleanse_wire_copies(
+        (abe_master_key_t*)am->base_state.abe_mk);
+  }
   am->base_state.abe_mk = restored;
   return (int32_t)CRABS_SUCCESS;
 }

@@ -1255,6 +1255,68 @@ TEST(TestDurability, MasterKeyDeserializeRejectsOverrun) {
   EXPECT_EQ(crypto_master_key_deserialize(overrun, sizeof(overrun)), nullptr);
 }
 
+// P4 review: cross-wire confusion. A bytestring wearing the 'MK' magic is an
+// AUTHORITY image, not a reader key — crypto_abe_user_key_deserialize used to
+// accept it and hand back a "key" that only failed at decrypt time; the
+// mirror of crypto_master_key_deserialize's fail-closed on non-'MK' input.
+TEST(TestDurability, UserKeyDeserializeRefusesMasterKeyWire) {
+  abe_master_key_t* mk = crypto_abe_setup();
+  ASSERT_NE(mk, nullptr);
+
+  size_t needed = crypto_master_key_serialize(mk, nullptr, 0);
+  ASSERT_GT(needed, (size_t)0);
+  std::vector<uint8_t> blob(needed);
+  ASSERT_EQ(crypto_master_key_serialize(mk, blob.data(), blob.size()), needed);
+
+  EXPECT_EQ(crypto_abe_user_key_deserialize(mk, blob.data(), blob.size()),
+            nullptr);
+
+  // A genuine reader key still deserializes (the magic gate must not clip
+  // the round trip the whole transport surface rests on).
+  abe_user_key_t* sk = crypto_abe_keygen(mk, "role:admin");
+  ASSERT_NE(sk, nullptr);
+  size_t key_needed = crypto_abe_user_key_serialize(sk, nullptr, 0);
+  ASSERT_GT(key_needed, (size_t)0);
+  std::vector<uint8_t> key_blob(key_needed);
+  ASSERT_EQ(crypto_abe_user_key_serialize(sk, key_blob.data(), key_blob.size()),
+            key_needed);
+  abe_user_key_t* restored = crypto_abe_user_key_deserialize(
+      mk, key_blob.data(), key_blob.size());
+  ASSERT_NE(restored, nullptr);
+  crypto_abe_user_key_destroy(restored);
+
+  crypto_abe_user_key_destroy(sk);
+  crypto_abe_master_key_destroy(mk);
+}
+
+// P4 review: an authority that is about to be REPLACED still leaks its
+// serialized MPK/MSK wire copies when only its context is left untouched
+// (the wasm teardown hazard). cleanse_wire_copies zeroes + releases the two
+// recoverable wire images so nothing but the (by-policy leaked, in-heap)
+// context remains — and a subsequent full destroy stays safe (no double
+// free, because the released pointers are nulled).
+TEST(TestDurability, MasterKeyCleanseWireCopiesReleasesOnlyTheCopies) {
+  abe_master_key_t* mk = crypto_abe_setup();
+  ASSERT_NE(mk, nullptr);
+
+  // Before: the authority serializeable (both wire copies live).
+  ASSERT_GT(crypto_master_key_serialize(mk, nullptr, 0), (size_t)0);
+
+  crypto_abe_master_key_cleanse_wire_copies(mk);
+
+  // After: the serialized 'MK' image needs both copies — it is gone.
+  EXPECT_EQ(crypto_master_key_serialize(mk, nullptr, 0), (size_t)0);
+
+  // Full destroy on the cleansed authority must be safe (no double free).
+  crypto_abe_master_key_destroy(mk);
+}
+
+// P4 review: a NULL authority (and a borrowed-shape no-op contract) must not
+// crash the helper.
+TEST(TestDurability, MasterKeyCleanseWireCopiesNullIsNoop) {
+  crypto_abe_master_key_cleanse_wire_copies(nullptr);
+}
+
 // At-rest sealing (§11.5): AES-256-GCM envelope. Sealed layout is
 // IV(12) + ciphertext + tag(16); unseal restores the plaintext exactly and
 // rejects any tampering with ciphertext or key authentication.

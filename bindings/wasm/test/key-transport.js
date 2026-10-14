@@ -173,10 +173,17 @@ const { Node, KeyPair } = require('..');
 
   // Expiry is stamped (the C envelope carries it; enforcement is
   // integrator-side) — minting + decrypt with an expiry set still round-trips.
+  // expiresAt accepts BigInt too (the shared number | bigint shape, capped
+  // at MAX_SAFE_INTEGER).
   const expiringEnvelope = node.mintKeyEnvelope('alice', { expiresAt: 4102444800000 });
   const expiringKey = node.decryptKeyEnvelope(expiringEnvelope,
     { privateKeyHex: aliceKey.privateKeyHex() });
   expiringKey.destroy();
+  const bigIntExpiringEnvelope = node.mintKeyEnvelope('alice',
+    { expiresAt: 4102444800000n });
+  const bigIntExpiringKey = node.decryptKeyEnvelope(bigIntExpiringEnvelope,
+    { privateKeyHex: aliceKey.privateKeyHex() });
+  bigIntExpiringKey.destroy();
 
   // Argument-shape refusals: bad option types throw before any staging.
   assert.throws(() => node.decryptKeyEnvelope(envelope,
@@ -209,10 +216,47 @@ const { Node, KeyPair } = require('..');
   // A user-key wire is a bearer secret but NOT an authority: master wire
   // refuses on user-key input, user-key wire refuses on master wire input.
   assert.throws(() => node.masterKeyFromWire(wire), /invalid_param/);
+  // Reverse shape confusion (P4 review): the 'MK' crown-jewel wire is an
+  // AUTHORITY image, not a reader key — the reader-key import refuses it
+  // typed (an authority image restores only through masterKeyFromWire).
+  assert.throws(() => node.abeKeyFromWire(crownJewel), /invalid_param/);
+
+  // ------------------------------------------------------------------
+  // 4. Borrowed authority refuses the crown-jewel surface (P4 review).
+  // ------------------------------------------------------------------
+  // A SHARED_ROOT lineage child BORROWS the parent's live authority pointer.
+  // The child may USE it (keygen/decrypt), but it is not entrusted with the
+  // parent's MSK bytes at rest: serializeMasterKey refuses protocol_violation
+  // (only the OWNING machine exports the 'MK' wire) and masterKeyFromWire
+  // refuses to replace a borrowed authority (protocol_violation) — both
+  // without mutating anything. The wrapper shape mirrors attestations.js:
+  // the exported Node class wraps the borrowed pointer.
+  const { Blueprint, TRUST_MODE, getModule } = require('..');
+  const borrowBlueprint = await Blueprint.create('borrow-child',
+    TRUST_MODE.SHARED_ROOT, 'borrow-admin', 3600000);
+  const borrowChildPtr = node.lineageSpawn(borrowBlueprint);
+  const moduleForChild = await getModule();
+  const borrowChild = new Node(moduleForChild, borrowChildPtr);
+  borrowChild.adminId = 'borrow-admin';
+  assert.throws(
+    () => borrowChild.serializeMasterKey(),
+    (refusal) => /protocol_violation/.test(refusal.message),
+    'a borrowed authority must refuse the crown-jewel export');
+  assert.throws(
+    () => borrowChild.masterKeyFromWire(crownJewel),
+    (refusal) => /protocol_violation/.test(refusal.message),
+    'a borrowed authority must refuse re-planting');
+  // No either refusal mutated anything: the borrowed child still keys and
+  // decrypts in the SHARED domain (a SHARED_ROOT child resolves the
+  // parent's authority — same registry + same MSK).
+  const stillMember = borrowChild.abeKeygen('moderator,member');
+  borrowChild.abeDecrypt(stillMember, sealed);
+  stillMember.destroy();
+  borrowBlueprint.destroy();
 
   stranger.destroy();
   otherNode.destroy();
-  console.log('key-transport OK: wire round trip == capability, wrong-attrs refusal, bearer cross-machine semantics, envelope flow + tamper fail-closed, master-key durability round trip');
+  console.log('key-transport OK: wire round trip == capability, wrong-attrs refusal, bearer cross-machine semantics, envelope flow + tamper fail-closed, master-key durability round trip, cross-wire + borrowed-authority refusals');
   node.destroy();
   aliceKey.destroy();
   bobKey.destroy();

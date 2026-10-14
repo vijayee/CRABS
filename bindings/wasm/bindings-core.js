@@ -413,7 +413,10 @@ class AbeKey {
 
   // Portable reader-key wire image (crypto_abe_user_key_serialize). The
   // bytes ARE the key — a bearer instrument; toWire() on a destroyed key
-  // refuses (the bytes cannot outlive the key object).
+  // refuses (the bytes cannot outlive the key object). The C staging buffer
+  // is destroyed through the KEY-WIRE cleansed teardown once this copy-out
+  // has read it (P4 review: the staged key bytes never linger in the module
+  // heap — the shared buffer destroy would merely free them).
   toWire() {
     if (!this._ptr) {
       throw new Error('abeKey.toWire: a destroyed key refuses');
@@ -424,7 +427,7 @@ class AbeKey {
     const len = M._crabs_wasm_buffer_len(ser);
     const data = M._crabs_wasm_buffer_data(ser);
     const out = new Uint8Array(M.HEAPU8.subarray(data, data + len));
-    M._crabs_wasm_buffer_destroy(ser);
+    M._crabs_wasm_key_wire_buffer_destroy(ser);
     return out;
   }
 }
@@ -1931,7 +1934,12 @@ class Node {
   // truth of the wire, not a restore accident). The wire is integrity-blind
   // (no checksum): carry it over an authenticated channel, or use the key
   // envelope flow below. A returned key is JS-owned (idempotent destroy);
-  // malformed or empty wire throws.
+  // malformed or empty wire throws (the 'MK' master-key magic refuses with
+  // the typed invalid_param — an authority image is not a reader key).
+  //
+  // Staging discipline (P4 review, mirroring stageSealKey32): the wire bytes
+  // are staged into the module heap for the call and ZEROED + freed in the
+  // finally — the staged copy of a key wire is as sensitive as the key.
   abeKeyFromWire(wire) {
     requireWireBytes(wire, 'abeKeyFromWire');
     if (wire.length === 0) {
@@ -1942,12 +1950,17 @@ class Node {
     }
     const M = this._M;
     const { ptr, len } = writeBytes(M, wire);
-    const keyPtr = M._crabs_wasm_abe_key_deserialize(this._am, ptr, len);
-    M._free(ptr);
-    if (!keyPtr) {
-      throw new Error('abeKeyFromWire: refused — malformed wire or no machine authority');
+    const rcPtr = M._malloc(4);
+    try {
+      const keyPtr = M._crabs_wasm_abe_key_deserialize(this._am, ptr, len, rcPtr);
+      if (!keyPtr) {
+        throw crabsError(M.getValue(rcPtr, 'i32'), 'abeKeyFromWire');
+      }
+      return new AbeKey(M, keyPtr);
+    } finally {
+      M.HEAPU8.fill(0, ptr, ptr + len);
+      freeAll(M, ptr, rcPtr);
     }
-    return new AbeKey(M, keyPtr);
   }
 
   // mintKeyEnvelope(userId, options?) — the refresh_key materialization
@@ -2070,25 +2083,38 @@ class Node {
   // serializeMasterKey() — the §11.5 durability backup (the C battery's
   // MasterKeySerializeRoundTripPreservesAuthority): the machine's authority
   // in its 'MK' wire form, restorable into a machine via masterKeyFromWire.
+  // A machine whose authority is merely BORROWED (a SHARED_ROOT lineage
+  // child) refuses protocol_violation — the child USES the parent's
+  // authority pointer, it is not entrusted with the MSK bytes at rest.
   //
   // TRUST FACT (the d.ts prose must keep saying it): THIS IS THE MACHINE'S
   // CROWN JEWEL — whoever holds these bytes mints reader keys for ANY policy
   // and decrypts EVERYTHING the authority ever sealed. Treat the return like
   // an unencrypted private key.
+  //
+  // Staging discipline (P4 review): the C staging buffer is torn down through
+  // the KEY-WIRE cleansed destroy once this copy-out has read it, so the
+  // crown-jewel bytes linger nowhere in the module heap past the call.
   serializeMasterKey() {
     if (this._am === null) {
       throw new Error('serializeMasterKey: a destroyed node refuses');
     }
     const M = this._M;
-    const ser = M._crabs_wasm_master_key_serialize(this._am);
-    if (!ser) {
-      throw new Error("serializeMasterKey: the machine carries no live master authority");
+    const rcPtr = M._malloc(4);
+    let ser = null;
+    try {
+      ser = M._crabs_wasm_master_key_serialize(this._am, rcPtr);
+      if (!ser) {
+        throw crabsError(M.getValue(rcPtr, 'i32'), 'serializeMasterKey');
+      }
+      const len = M._crabs_wasm_buffer_len(ser);
+      const data = M._crabs_wasm_buffer_data(ser);
+      const out = new Uint8Array(M.HEAPU8.subarray(data, data + len));
+      return out;
+    } finally {
+      if (ser) M._crabs_wasm_key_wire_buffer_destroy(ser);
+      M._free(rcPtr);
     }
-    const len = M._crabs_wasm_buffer_len(ser);
-    const data = M._crabs_wasm_buffer_data(ser);
-    const out = new Uint8Array(M.HEAPU8.subarray(data, data + len));
-    M._crabs_wasm_buffer_destroy(ser);
-    return out;
   }
 
   // masterKeyFromWire(wire) REPLACES this machine's authority with the one
@@ -2099,7 +2125,14 @@ class Node {
   // (bad magic/overrun lengths — the C battery's garbage/overrun pins) with
   // the typed 'invalid_param', and a machine whose authority is merely
   // BORROWED (a delegated lineage child) with protocol_violation — never
-  // replaces a borrowed authority.
+  // replaces a borrowed authority. The restore cleanses the REPLACED
+  // authority's serialized MPK/MSK wire copies in C (its context remains
+  // the wasm policy leak); what survives the swap is only the new live
+  // authority.
+  //
+  // Staging discipline (P4 review, mirroring stageSealKey32): the staged
+  // 'MK' wire copy is zeroed in the module heap on every path — the staged
+  // copy IS the crown jewel.
   masterKeyFromWire(wire) {
     requireWireBytes(wire, 'masterKeyFromWire');
     if (this._am === null) {
@@ -2110,6 +2143,7 @@ class Node {
     try {
       wrapRc(M._crabs_wasm_master_key_restore(this._am, ptr, len), 'masterKeyFromWire');
     } finally {
+      M.HEAPU8.fill(0, ptr, ptr + len);
       M._free(ptr);
     }
   }

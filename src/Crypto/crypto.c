@@ -802,6 +802,38 @@ void crypto_abe_master_key_destroy(abe_master_key_t* mk) {
   }
 }
 
+// See crypto.h for the contract. The getters at crypto_abe_setup /
+// crypto_master_key_deserialize return CALLER-FREE copies ("Output ByteString
+// (caller must free)", oabe_context.h:172/186) — the context holds its own
+// internal state — so releasing the two bytestrings here leaves the context
+// intact for the wasm-style lifetimes that must avoid a mid-use
+// oabe_context_cp_free (the documented teardown hazard).
+void crypto_abe_master_key_cleanse_wire_copies(abe_master_key_t* mk) {
+  if (!mk) return;
+  if (mk->master_secret) {
+    // Audit N-17 discipline: oabe_bytestring_free never zeroes — the
+    // master secret is cleansed before the free.
+    const uint8_t* secret_data = oabe_bytestring_get_const_ptr(mk->master_secret);
+    size_t secret_len = oabe_bytestring_get_size(mk->master_secret);
+    if (secret_data != NULL && secret_len > 0) {
+      OPENSSL_cleanse((void*)secret_data, secret_len);
+    }
+    oabe_bytestring_free(mk->master_secret);
+    mk->master_secret = NULL;
+  }
+  if (mk->public_params) {
+    // Public params are non-secret (Audit N-17) — released, and cleansed as
+    // defense in depth so the authority leaves NO recoverable wire copy.
+    const uint8_t* params_data = oabe_bytestring_get_const_ptr(mk->public_params);
+    size_t params_len = oabe_bytestring_get_size(mk->public_params);
+    if (params_data != NULL && params_len > 0) {
+      OPENSSL_cleanse((void*)params_data, params_len);
+    }
+    oabe_bytestring_free(mk->public_params);
+    mk->public_params = NULL;
+  }
+}
+
 // ============================================================
 // ABE Keygen — derive a real CP-ABE user secret key (§10.1)
 // ============================================================
@@ -882,6 +914,16 @@ size_t crypto_abe_user_key_serialize(const abe_user_key_t* sk,
 abe_user_key_t* crypto_abe_user_key_deserialize(const abe_master_key_t* mk,
                                                    const uint8_t* buf, size_t len) {
   if (!mk || !buf || len == 0 || !mk->public_params) return NULL;
+  // Cross-wire confusion (P4 review): a bytestring wearing the 'MK' master-
+  // key magic is an AUTHORITY image, not a reader key. This import used to
+  // accept it and hand back a "key" that only failed at decrypt time — the
+  // mirror image of crypto_master_key_deserialize, which fails closed on
+  // everything NOT carrying the magic. Refuse it here, typed invalid_param
+  // through the callers.
+  if (len >= 3 && buf[0] == 0x4D && buf[1] == 0x4B &&
+      buf[2] == CRABS_MSK_FORMAT_VERSION) {
+    return NULL;
+  }
   _ensure_oabe_init();
   abe_user_key_t* sk = get_clear_memory(sizeof(abe_user_key_t));
   if (!sk) return NULL;

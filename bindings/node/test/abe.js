@@ -17,7 +17,7 @@
 // ciphertext.
 
 const assert = require('assert');
-const { Node, KeyPair } = require('..');
+const { Node, KeyPair, Blueprint, TRUST_MODE } = require('..');
 
 // Recipe 16's admin setup: register alice (member + moderator words minted
 // by the machine's keygen) + bob (regular member, no moderator clause).
@@ -252,7 +252,18 @@ const expiringKey = node.decryptKeyEnvelope(
   { privateKeyHex: aliceKey.privateKeyHex() });
 expiringKey.destroy();
 
-console.log('key-transport envelopes OK: mint/open round trip, wrong-recipient + tamper + foreign-issuer fail-closed, ACTIVE gate pinned');
+// expiresAt accepts BigInt too — the wasm wrapper's shared shape
+// (number | bigint), capped at MAX_SAFE_INTEGER on both bindings.
+const bigIntExpiringKey = node.decryptKeyEnvelope(
+  node.mintKeyEnvelope('alice', { expiresAt: 4102444800000n }),
+  { privateKeyHex: aliceKey.privateKeyHex() });
+bigIntExpiringKey.destroy();
+assert.throws(() => node.mintKeyEnvelope('alice', { expiresAt: 9007199254740992n }),
+  /epoch-ms/, 'a past-MAX_SAFE_INTEGER bigint epoch refuses');
+assert.throws(() => node.mintKeyEnvelope('alice', { expiresAt: -1n }),
+  /epoch-ms/, 'a negative bigint epoch refuses');
+
+console.log('key-transport envelopes OK: mint/open round trip, wrong-recipient + tamper + foreign-issuer fail-closed, ACTIVE gate pinned, bigint expiry accepted');
 
 // --- 3. Master-key durability (§11.5) — the CROWN JEWEL backup ---
 const crownJewel = node.serializeMasterKey();
@@ -273,5 +284,36 @@ assert.throws(() => node.masterKeyFromWire(overrun), /invalid_param/);
 
 // Shape confusion refuses: a user-key wire is not authority wire.
 assert.throws(() => node.masterKeyFromWire(transportWire), /invalid_param/);
+// Reverse shape confusion (P4 review): the 'MK' crown-jewel wire is an
+// AUTHORITY image, not a reader key — the reader-key import refuses it
+// typed (an authority image restores only through masterKeyFromWire).
+assert.throws(() => node.abeKeyFromWire(crownJewel), /invalid_param/);
 
-console.log('key-transport master OK: durability round trip into a fresh machine, garbage + shape-confusion refusals');
+// --- 4. Borrowed authority refuses the crown-jewel surface (P4 review) ---
+// A SHARED_ROOT lineage child BORROWS the parent's live authority pointer.
+// The child may USE it (keygen/decrypt), but it is not entrusted with the
+// parent's MSK bytes at rest: serializeMasterKey refuses protocol_violation
+// (only the OWNING machine exports the 'MK' wire) and masterKeyFromWire
+// refuses to replace a borrowed authority (protocol_violation) — both
+// without mutating anything.
+const borrowBlueprint = Blueprint.create('borrow-child',
+  TRUST_MODE.SHARED_ROOT, 'borrow-admin', 3600000);
+const borrowChild = node.lineageSpawn(borrowBlueprint);
+assert.throws(
+  () => borrowChild.serializeMasterKey(),
+  (refusal) => refusal instanceof Error && /protocol_violation/.test(refusal.message),
+  'a borrowed authority must refuse the crown-jewel export');
+assert.throws(
+  () => borrowChild.masterKeyFromWire(crownJewel),
+  (refusal) => refusal instanceof Error && /protocol_violation/.test(refusal.message),
+  'a borrowed authority must refuse re-planting');
+// No either refusal mutated anything: the borrowed child still keys and
+// decrypts in the SHARED domain (a SHARED_ROOT child resolves the parent's
+// authority — same registry + same MSK).
+const stillMember = borrowChild.abeKeygen('moderator,member');
+assert.ok(borrowChild.abeDecrypt(stillMember, sealed).equals(payload),
+  'the borrowed authority survives its refusals unmutated');
+stillMember.destroy();
+borrowBlueprint.destroy();
+
+console.log('key-transport master OK: durability round trip into a fresh machine, garbage + shape-confusion refusals, borrowed-authority refusals');
