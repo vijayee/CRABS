@@ -184,16 +184,29 @@ UI shows row-level movement.
   state merge needs no causal context at all.
 - Rich-text/word-processing is a different and harder problem (cursor
   stability, IME composition, styled spans) — out of the cookbook's
-  scope: the ordered set here covers discrete elements only.
+  scope: the ordered set here covers discrete elements only. The C
+  `OT_DOCUMENT` machinery is real (spans + styles + `insert_text` /
+  `delete_range` / `apply_style` ops, `src/OT/ot_document.h`) and, as of
+  parity-fill P6, bound (`addOTDocument` + `otInsertText`/`otDeleteRange`/
+  `otApplyStyle`, both bindings) — but the page this recipe replaces was
+  deleted for three boundary bars that STILL stand: there is no document
+  merge (a `mergeState` snapshot of one is held, `__merge_held__` +
+  `CRABS_ERR_TYPE_MISMATCH`, `src/CRDT/crdt_merge.c`), the priority
+  tie-break's generator (`crabs_ot_data_item_next_priority`,
+  `src/OT/ot_types.c:200`) still has no production caller, and no
+  benchmark measures the per-op transform cost. Implemented, unbenchmarked
+  — do not build rich text on this until a benchmark exists.
 
 ## Variations
 
 - Tree-shaped reordering — when the list's elements have ancestry: the
   same OT machinery ships an `OT_TREE` type with
   `insert_node / delete_node / reparent / reorder` ops
-  (src/OT/ot_types.h:36-39) — C-only: no
-  binding creates or applies tree items (the document type is the same
-  story).
+  (src/OT/ot_types.h:36-39). Bound but UNBLESSED (see the rich-text
+  bullet): `node.addOTTree(name)` + `otInsertNode` / `otDeleteNode` /
+  `otReparent` / `otReorder` and a `getOTTree` readback — and the document
+  type is the same story (`addOTDocument` + `otInsertText` /
+  `otDeleteRange` / `otApplyStyle`).
 - Bigger lists — when the op log's growth becomes the problem: the log
   behind a set is bounded and prunable, and log pruning + compaction is
   the design's stated mitigation for OT merge cost.
