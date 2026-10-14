@@ -918,7 +918,21 @@ export interface Node {
   // HLC
   getHLC(): HLC | undefined;
   setTime(nowMs: number): void;
-  pruneExpiredTempAttrs(): void;
+  pruneExpiredTempAttrs(): number;
+
+  /**
+   * Direct temporary-attribute issuance (Amendment 1 §7.1) — the
+   * moderation-trigger effect's C call driven by hand. The grant fans out to
+   * EVERY ACTIVE holder of the audience attribute NAME (options.audienceRole
+   * is a NAME match — 'role', never 'role:member'), stamps
+   * issued_at / expires_at from the attribute machine's clock (setTime for
+   * test timelines), and bumps each holder's key_version. Refusals surface
+   * typed: unauthorized for a privileged attribute name (the
+   * 'role'/'admin' blocklist), invalid_param for ttl 0, an unsafe-charset
+   * name, or a comma/space value.
+   */
+  issueTemporary(attribute: string, value: string,
+                 options: { audienceRole: string; ttlMs: number }): void;
 
   // Authenticated time source (A10-L9 wiring, R7-01). Machine-local
   // configuration — adopted child wrappers may set it on their own machine.

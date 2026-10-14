@@ -1104,6 +1104,20 @@ export interface Node {
   setTime(nowMs: number): void;
   pruneExpiredTempAttrs(): number;
 
+  /**
+   * Direct temporary-attribute issuance (Amendment 1 §7.1) — the
+   * moderation-trigger effect's C call driven by hand. The grant fans out to
+   * EVERY ACTIVE holder of the audience attribute NAME (options.audienceRole
+   * is a NAME match — 'role', never 'role:member'), stamps
+   * issued_at / expires_at from the attribute machine's clock (pair with
+   * setTime for test timelines or a live clock), and bumps each holder's
+   * key_version. Refusals surface typed: unauthorized for a privileged
+   * attribute name (the 'role'/'admin' blocklist), invalid_param for ttl 0,
+   * an unsafe-charset name, or a comma/space value.
+   */
+  issueTemporary(attribute: string, value: string,
+                 options: { audienceRole: string; ttlMs: number | bigint }): void;
+
   // Authenticated time source (R7-01 wiring; R7-02 fail closed). WASM-module
   // caveat: the ops object is module-SHARED — one per module instance, not
   // per machine. setTimeSource({mode:'https'}) on any Node replaces the

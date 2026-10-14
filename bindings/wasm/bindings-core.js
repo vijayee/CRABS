@@ -1214,19 +1214,26 @@ class Node {
         temporary: false,
       });
     }
-    const tempName = readString(M, M._crabs_wasm_user_temp_attr_name(userPtr));
-    if (tempName) {
+    // Temporary attributes: full-list walk (count + by-index), mirroring the
+    // node mapper (crabs_node.cc's GetUser) — a user can hold several tokens
+    // (one per grant), not just the most recent one.
+    const tempAttrCount = M._crabs_wasm_user_temp_attr_count(userPtr) | 0;
+    for (let tempIndex = 0; tempIndex < tempAttrCount; tempIndex++) {
       attrs.push({
         // The temp attr name IS the full 'name:value' token the C policy
         // evaluator matches (src/Crypto/crypto.c:1126-1158) — return it
-        // plain, exactly like the node mapper (crabs_node.cc:1199-1211),
-        // rather than concatenating the stored value onto it a second time.
-        value: tempName,
+        // plain, exactly like the node mapper, rather than concatenating the
+        // stored value onto it a second time.
+        value: readString(
+          M, M._crabs_wasm_user_temp_attr_name_at(userPtr, tempIndex)),
+        // The C temp list carries no origin marker, so the shared
+        // 'trigger' label covers both issuance paths (trigger effect and
+        // issueTemporary) — same word the node mapper stamps.
         verifiedBy: 'trigger',
         temporary: true,
-        // Matches the node mapper's expiresAt field (crabs_node.cc:1211);
-        // 0 means no expiry.
-        expiresAt: Number(M._crabs_wasm_user_temp_attr_expires_at(userPtr)),
+        // Matches the node mapper's expiresAt field; 0 means no expiry.
+        expiresAt: Number(
+          M._crabs_wasm_user_temp_attr_expires_at_at(userPtr, tempIndex)),
       });
     }
 
@@ -2766,6 +2773,47 @@ class Node {
   }
 
   pruneExpiredTempAttrs() { return this._M._crabs_wasm_prune_expired_temp_attrs(this._am); }
+
+  // Direct temporary-attribute issuance (Amendment 1 §7.1) — the path the
+  // moderation trigger's issue_attribute effect takes, driven by hand. The
+  // grant fans out to EVERY ACTIVE holder of the audience attribute NAME
+  // (attribute_machine.c:592's name-match; pass 'role', never 'role:member')
+  // and stamps issued_at / expires_at from the machine's attr-machine clock —
+  // pair with setTime for test timelines or a live clock. The C machine owns
+  // every gate (typed refusals surfaced as-is):
+  //   unauthorized — the attribute NAME is in the privileged blocklist
+  //     (the 'role'/'admin'/'verifier' family — issueTemporary('role', ...)
+  //     would forge the admin gate otherwise, Audit N-1);
+  //   invalid_param — ttl 0, a name outside the safe charset, or a value
+  //     carrying comma/space (the attribute-string token-injection guard).
+  issueTemporary(attribute, value, options = {}) {
+    const M = this._M;
+    if (typeof attribute !== 'string' || attribute.length === 0 ||
+        typeof value !== 'string' || value.length === 0) {
+      throw new TypeError('issueTemporary: attribute and value are required non-empty strings');
+    }
+    if (!options || typeof options !== 'object' || Array.isArray(options) ||
+        typeof options.audienceRole !== 'string' || options.audienceRole.length === 0) {
+      throw new TypeError(
+        "issueTemporary: options.audienceRole is required (the audience attribute NAME the fan-out matches — 'role', not 'role:member')");
+    }
+    // u64 wire: a fractional or negative ttl would wrap — refuse at the
+    // wrapper; ttl 0 flows through to the C machine's own invalid_param gate
+    // (the C machine owns every gate).
+    const ttlMs = typeof options.ttlMs === 'bigint'
+      ? options.ttlMs
+      : Number.isInteger(options.ttlMs) ? BigInt(options.ttlMs) : null;
+    if (ttlMs === null || ttlMs < 0n) {
+      throw new RangeError('issueTemporary: ttlMs must be a non-negative integer or BigInt');
+    }
+    const attributePtr = writeString(M, attribute);
+    const valuePtr = writeString(M, value);
+    const rolePtr = writeString(M, options.audienceRole);
+    const rc = M._crabs_wasm_issue_temporary(
+        this._am, attributePtr, valuePtr, rolePtr, ttlMs);
+    freeAll(M, attributePtr, valuePtr, rolePtr);
+    wrapRc(rc, 'issueTemporary');
+  }
 
   // --- Authenticated time source (R7-01 wiring; R7-02 fail closed) ---
   //

@@ -2112,6 +2112,23 @@ uint32_t crabs_wasm_prune_expired_temp_attrs(attribute_machine_t* am) {
   return attribute_machine_prune_expired_temporary(am);
 }
 
+// Direct temporary-attribute issuance (Amendment 1 §7.1). `audience_role` is
+// the audience ATTRIBUTE NAME (the C fan-out matches names, not 'name:value'
+// tokens), and the blocklist / token-injection guards are the C machine's own
+// (privileged names → unauthorized, unsafe values → invalid_param) — the
+// export adds nothing but NULL-arg translation so JS sees the same typed
+// errors the wire ops get.
+EMSCRIPTEN_KEEPALIVE
+crabs_error_e crabs_wasm_issue_temporary(attribute_machine_t* am,
+                                         const char* attribute,
+                                         const char* value,
+                                         const char* audience_role,
+                                         uint64_t duration_ms) {
+  if (am == NULL) return CRABS_ERR_INVALID_PARAM;
+  return attribute_machine_issue_temporary(am, attribute, value,
+                                           audience_role, duration_ms);
+}
+
 // Select the time source for this machine (mirrors the CLI's
 // `time-source https [url]` / `time-source system` and the node binding's
 // setTimeSource). `mode` is CRABS_WASM_TIME_SOURCE_SYSTEM or
@@ -2230,14 +2247,31 @@ const char* crabs_wasm_user_attr_value(user_t* user, uint32_t i) {
   return user->attributes[i].value;
 }
 
+// Temporary-attribute readback. The C temp list is a per-user linked list
+// which can hold MORE than one entry (every grant appends), so the readback
+// is count + by-index instead of the single-head probes this section started
+// with — the JS mapper mirrors the node binding's full-list walk
+// (crabs_node.cc's GetUser).
 EMSCRIPTEN_KEEPALIVE
-const char* crabs_wasm_user_temp_attr_name(user_t* user) {
-  return (user && user->temp_attrs) ? user->temp_attrs->name : NULL;
+uint32_t crabs_wasm_user_temp_attr_count(user_t* user) {
+  if (!user) return 0;
+  uint32_t count = 0;
+  for (temp_attr_list_t* temp = user->temp_attrs; temp != NULL;
+       temp = temp->next) {
+    count++;
+  }
+  return count;
 }
 
 EMSCRIPTEN_KEEPALIVE
-const char* crabs_wasm_user_temp_attr_value(user_t* user) {
-  return (user && user->temp_attrs) ? user->temp_attrs->value : NULL;
+const char* crabs_wasm_user_temp_attr_name_at(user_t* user, uint32_t index) {
+  if (!user) return NULL;
+  uint32_t walked = 0;
+  for (temp_attr_list_t* temp = user->temp_attrs; temp != NULL;
+       temp = temp->next, walked++) {
+    if (walked == index) return temp->name;
+  }
+  return NULL;
 }
 
 EMSCRIPTEN_KEEPALIVE
@@ -2266,8 +2300,14 @@ const char* crabs_wasm_user_attr_verified_by(user_t* user, uint32_t i) {
 }
 
 EMSCRIPTEN_KEEPALIVE
-uint64_t crabs_wasm_user_temp_attr_expires_at(user_t* user) {
-  return (user && user->temp_attrs) ? user->temp_attrs->expires_at : 0;
+uint64_t crabs_wasm_user_temp_attr_expires_at_at(user_t* user, uint32_t index) {
+  if (!user) return 0;
+  uint32_t walked = 0;
+  for (temp_attr_list_t* temp = user->temp_attrs; temp != NULL;
+       temp = temp->next, walked++) {
+    if (walked == index) return temp->expires_at;
+  }
+  return 0;
 }
 
 // ============================================================

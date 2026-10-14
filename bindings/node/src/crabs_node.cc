@@ -1276,6 +1276,7 @@ public:
       InstanceMethod("getHLC", &Node::GetHLC),
       InstanceMethod("setTime", &Node::SetTime),
       InstanceMethod("pruneExpiredTempAttrs", &Node::PruneExpiredTempAttrs),
+      InstanceMethod("issueTemporary", &Node::IssueTemporary),
       // Lineage (v1.7: machines mint machines)
       InstanceMethod("lineageInstall", &Node::LineageInstall),
       InstanceMethod("lineageSpawn", &Node::LineageSpawn),
@@ -2198,6 +2199,58 @@ private:
     item->value_repr = DATA_VALUE_REPR_CRDT_STRUCT;  // one_shot_set_t struct
     crabs_error_e rc = state_add_item(&am_->base_state, item);
     if (rc != CRABS_SUCCESS) throw crabs_error(env, rc, "addOneShotSet");
+    return env.Undefined();
+  }
+
+  // Direct temporary-attribute issuance (Amendment 1 §7.1) — the
+  // moderation-trigger effect's C call driven by hand
+  // (attribute_machine_issue_temporary, attribute_machine.h:200). The grant
+  // fans out to EVERY ACTIVE holder of the audience ATTRIBUTE NAME (the C
+  // role-match is a name match, attribute_machine.c:592) and stamps
+  // issued_at / expires_at from the machine's attr-machine clock. The C
+  // machine owns every gate and the typed errors surface as-is:
+  // unauthorized — a privileged attribute NAME (the blocklist, Audit N-1);
+  // invalid_param — ttl 0, unsafe charset names, or comma/space values.
+  Napi::Value IssueTemporary(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 2 || !info[0].IsString() || !info[1].IsString())
+      throw Napi::TypeError::New(env,
+          "Expected issueTemporary(attribute, value, { audienceRole, ttlMs })");
+    std::string attribute = info[0].As<Napi::String>().Utf8Value();
+    std::string value = info[1].As<Napi::String>().Utf8Value();
+    if (attribute.empty() || value.empty())
+      throw Napi::TypeError::New(env,
+          "issueTemporary: attribute and value are required non-empty strings");
+    if (info.Length() < 3 || !info[2].IsObject())
+      throw Napi::TypeError::New(env,
+          "issueTemporary: options.audienceRole is required (the audience "
+          "attribute NAME the fan-out matches — 'role', not 'role:member')");
+    Napi::Object options = info[2].As<Napi::Object>();
+    if (!options.Has("audienceRole") || !options.Get("audienceRole").IsString())
+      throw Napi::TypeError::New(env,
+          "issueTemporary: options.audienceRole is required (the audience "
+          "attribute NAME the fan-out matches — 'role', not 'role:member')");
+    std::string audience_role =
+        options.Get("audienceRole").As<Napi::String>().Utf8Value();
+    if (audience_role.empty())
+      throw Napi::TypeError::New(env, "issueTemporary: audienceRole must be non-empty");
+    if (!options.Has("ttlMs") || !options.Get("ttlMs").IsNumber())
+      throw Napi::RangeError::New(env,
+          "issueTemporary: ttlMs must be a non-negative integer");
+    double ttl_value = options.Get("ttlMs").As<Napi::Number>().DoubleValue();
+    // 0 flows through to the C machine (its own invalid_param gate — the C
+    // machine owns every gate); only a value a u64 cannot carry refuses at
+    // the wrapper.
+    if (ttl_value < 0.0 || ttl_value != std::floor(ttl_value) ||
+        ttl_value > 9007199254740991.0) {
+      throw Napi::RangeError::New(env,
+          "issueTemporary: ttlMs must be a non-negative integer (safe-integer "
+          "range; use the wasm binding's BigInt path for larger windows)");
+    }
+    crabs_error_e rc = attribute_machine_issue_temporary(
+        am_, attribute.c_str(), value.c_str(), audience_role.c_str(),
+        (uint64_t)ttl_value);
+    if (rc != CRABS_SUCCESS) throw crabs_error(env, rc, "issueTemporary");
     return env.Undefined();
   }
 
@@ -4987,8 +5040,11 @@ private:
   }
 
   Napi::Value PruneExpiredTempAttrs(const Napi::CallbackInfo& info) {
-    attribute_machine_prune_expired_temporary(am_);
-    return info.Env().Undefined();
+    // Mirrors the wasm readback: the caller can pin how many tokens the
+    // prune removed (the execute pipeline's own prune reports through the
+    // machine's behavior, not a count).
+    uint32_t pruned = attribute_machine_prune_expired_temporary(am_);
+    return Napi::Number::New(info.Env(), (double)pruned);
   }
 
   // --- Raft ordering module (GROUP_ORDERED writes) ---
