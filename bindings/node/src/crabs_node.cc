@@ -3379,8 +3379,10 @@ private:
     // previous machine's HLC (last-issued timestamp, logical counter and
     // stats ride over — read BEFORE the previous machine is destroyed), so
     // the inbound-op skew validation stays engaged at the previous
-    // machine's watermark. A borrowed machine loses both (as with the time
-    // source below) — its owner wrapper re-applies them.
+    // machine's watermark. The config pointer check ties the re-apply to
+    // THIS wrapper's own instance: a machine whose config came from
+    // elsewhere (a borrowed previous machine of another wrapper) is not
+    // re-pointed here.
     if (previous_machine->base_state.ordering_config != nullptr &&
         previous_machine->base_state.ordering_config == &ordering_config_) {
       state_set_ordering_config(&restored_machine->base_state,
