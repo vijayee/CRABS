@@ -440,8 +440,12 @@ static bool _ecdsa_verify_prepared_digest(const uint8_t public_key[33],
   }
 
   // Enforce low-S (BIP-62): reject high-S signatures to prevent malleability.
+  // Fail closed on allocation failure: a failed EC_GROUP/BN allocation or an
+  // order lookup failure must NOT silently skip the check and let a high-S
+  // (malleable) signature pass — treat inability to check as unverifiable.
   {
     EC_GROUP* group = EC_GROUP_new_by_curve_name(NID_secp256k1);
+    bool low_s_checked = false;
     bool high_s = false;
     if (group) {
       BIGNUM* order = BN_new();
@@ -449,12 +453,13 @@ static bool _ecdsa_verify_prepared_digest(const uint8_t public_key[33],
       BIGNUM* s = BN_bin2bn(signature + 32, 32, NULL);
       if (order && half && s && EC_GROUP_get_order(group, order, NULL) == 1) {
         BN_rshift1(half, order);
-        if (BN_cmp(s, half) > 0) high_s = true;
+        high_s = (BN_cmp(s, half) > 0);
+        low_s_checked = true;
       }
       BN_free(order); BN_free(half); BN_free(s);
       EC_GROUP_free(group);
     }
-    if (high_s) {
+    if (!low_s_checked || high_s) {
       EC_KEY_free(eckey);
       return false;
     }
@@ -553,6 +558,16 @@ crabs_error_e crypto_random_bytes(uint8_t* buf, size_t len) {
   // bytes. Refuse instead.
   if (len > (size_t)INT_MAX) {
     return CRABS_ERR_INVALID_PARAM;
+  }
+
+  // RAND health check (audit MEDIUM): fail closed when OpenSSL's DRBG is not
+  // properly seeded. RAND_bytes itself returns 0 in that state on most builds,
+  // but RAND_status() is the explicit entropy-sufficiency probe — surfacing it
+  // here means a misconfigured platform (fork without a proper entropy source,
+  // early-boot WASM, restricted chroot) fails with a clear error at the FIRST
+  // use instead of producing weak key material deep inside a signing call.
+  if (RAND_status() != 1) {
+    return CRABS_ERR_CRYPTOGRAPHIC_ERROR;
   }
 
   if (RAND_bytes(buf, (int)len) != 1) {
@@ -855,7 +870,11 @@ void crypto_abe_master_key_cleanse_wire_copies(abe_master_key_t* mk) {
 // ============================================================
 
 abe_user_key_t* crypto_abe_keygen(const abe_master_key_t* mk, const char* attrs) {
-  if (!mk || !attrs || !mk->ctx) return NULL;
+  // mk->public_params is NULLed by crypto_abe_master_key_cleanse_wire_copies —
+  // an authority that has passed through that has no recoverable wire copy of
+  // its params and must not be dereferenced here (mirror of the encrypt-side
+  // guard).
+  if (!mk || !attrs || !mk->ctx || !mk->public_params) return NULL;
   _ensure_oabe_init();
 
   abe_user_key_t* sk = get_clear_memory(sizeof(abe_user_key_t));
@@ -895,6 +914,14 @@ abe_user_key_t* crypto_abe_keygen(const abe_master_key_t* mk, const char* attrs)
       oabe_bytestring_get_const_ptr(mk->public_params),
       oabe_bytestring_get_size(mk->public_params));
   if (!sk->public_params) {
+    // Same cleanse-then-free discipline as crypto_abe_user_key_destroy
+    // (audit N-17): key_bytes is a serialized user SECRET key and
+    // oabe_bytestring_free does not zero the buffer.
+    const uint8_t* key_data = oabe_bytestring_get_const_ptr(sk->key_bytes);
+    size_t key_data_len = oabe_bytestring_get_size(sk->key_bytes);
+    if (key_data != NULL && key_data_len > 0) {
+      OPENSSL_cleanse((void*)key_data, key_data_len);
+    }
     oabe_bytestring_free(sk->key_bytes);
     free(sk);
     return NULL;
@@ -949,6 +976,14 @@ abe_user_key_t* crypto_abe_user_key_deserialize(const abe_master_key_t* mk,
       oabe_bytestring_get_const_ptr(mk->public_params),
       oabe_bytestring_get_size(mk->public_params));
   if (!sk->public_params) {
+    // Same cleanse-then-free discipline as crypto_abe_user_key_destroy
+    // (audit N-17): key_bytes is a serialized user SECRET key and
+    // oabe_bytestring_free does not zero the buffer.
+    const uint8_t* key_data = oabe_bytestring_get_const_ptr(sk->key_bytes);
+    size_t key_data_len = oabe_bytestring_get_size(sk->key_bytes);
+    if (key_data != NULL && key_data_len > 0) {
+      OPENSSL_cleanse((void*)key_data, key_data_len);
+    }
     oabe_bytestring_free(sk->key_bytes);
     free(sk);
     return NULL;
@@ -1275,6 +1310,12 @@ verify_result_t crypto_verify_operation_auth(
     result.error = CRABS_ERR_INVALID_PARAM;
     return result;
   }
+  // op_len is truncated to uint32_t before the scheme dispatch: a size_t above
+  // UINT32_MAX would silently verify only a prefix of the operation. Refuse.
+  if (op_len > (size_t)UINT32_MAX) {
+    result.error = CRABS_ERR_INVALID_PARAM;
+    return result;
+  }
 
   // An empty ABE policy means there is no *attribute* requirement, but a
   // valid signature is still required to prove the signer's identity. Never
@@ -1433,7 +1474,12 @@ static crabs_error_e _verify_user_signature(
     // rejected. R7-10: now_ms == 0 means the platform has not injected a clock
     // yet — treat that as "expiry unknown" and fail closed rather than
     // silently accepting an expired key.
-    if (key->expires_at != 0 && (now_ms == 0 || key->expires_at <= now_ms)) {
+    // Expiry boundary semantics (audit): a key remains VALID at expires_at
+    // itself and is expired only once now_ms > expires_at — matching the
+    // envelope expiry convention (crypto_key_envelope_verify) and the lineage
+    // attestation convention. now_ms == 0 (no clock injected) still fails
+    // closed per R7-10.
+    if (key->expires_at != 0 && (now_ms == 0 || now_ms > key->expires_at)) {
       return CRABS_ERR_UNAUTHORIZED;
     }
     if (sig_scheme != SCHEME_UNSPECIFIED && key->scheme != sig_scheme) {
@@ -1449,7 +1495,12 @@ static crabs_error_e _verify_user_signature(
   if (sig_scheme != SCHEME_UNSPECIFIED) {
     user_key_t* key = user_key_find_active((user_t*)user, sig_scheme);
     if (key == NULL) return CRABS_ERR_RESOURCE_NOT_FOUND;
-    if (key->expires_at != 0 && (now_ms == 0 || key->expires_at <= now_ms)) {
+    // Expiry boundary semantics (audit): a key remains VALID at expires_at
+    // itself and is expired only once now_ms > expires_at — matching the
+    // envelope expiry convention (crypto_key_envelope_verify) and the lineage
+    // attestation convention. now_ms == 0 (no clock injected) still fails
+    // closed per R7-10.
+    if (key->expires_at != 0 && (now_ms == 0 || now_ms > key->expires_at)) {
       return CRABS_ERR_UNAUTHORIZED;
     }
     return _verify_sig_with_scheme(key->scheme,
@@ -1478,6 +1529,12 @@ verify_result_t crypto_verify_operation_auth_v2(
   };
 
   if (!mk || !abe_policy || !serialized_op || op_len == 0 || !signature) {
+    result.error = CRABS_ERR_INVALID_PARAM;
+    return result;
+  }
+  // op_len is truncated to uint32_t before the scheme dispatch: a size_t above
+  // UINT32_MAX would silently verify only a prefix of the operation. Refuse.
+  if (op_len > (size_t)UINT32_MAX) {
     result.error = CRABS_ERR_INVALID_PARAM;
     return result;
   }
@@ -1536,6 +1593,7 @@ verify_result_t crypto_verify_operation_auth_v2(
     }
 
     user_t* user = ((attribute_machine_t*)attr_machine)->users;
+    bool matched = false;
     while (user != NULL) {
       if (user->status == USER_ACTIVE) {
         bool attr_ok = true;
@@ -1560,18 +1618,27 @@ verify_result_t crypto_verify_operation_auth_v2(
                                              serialized_op, op_len,
                                              signature, signature_len);
           }
-          if (sig_rc == CRABS_SUCCESS) {
-            result.authorized = true;
-            result.error = CRABS_SUCCESS;
+          // R7-L-8 for v2 Mode B (mirroring v1): no early exit — every active
+          // user's verification runs to the same total work regardless of
+          // where (or whether) the signer sits in the list, so latency cannot
+          // leak the registered-user count or the matching position. The FIRST
+          // matching user in registration order still fills signer_id.
+          if (sig_rc == CRABS_SUCCESS && !matched) {
+            matched = true;
             strncpy(result.signer_id, user->user_id, CRABS_MAX_USER_ID - 1);
-            return result;
+            result.signer_id[CRABS_MAX_USER_ID - 1] = '\0';
           }
         }
       }
       user = user->next;
     }
 
-    result.error = CRABS_ERR_UNAUTHORIZED;
+    if (matched) {
+      result.authorized = true;
+      result.error = CRABS_SUCCESS;
+    } else {
+      result.error = CRABS_ERR_UNAUTHORIZED;
+    }
   }
 
   return result;
@@ -1593,6 +1660,11 @@ crabs_error_e crypto_verify_co_signature(
       op_len == 0 || signature == NULL) {
     return CRABS_ERR_INVALID_PARAM;
   }
+  // Same truncation guard as crypto_verify_operation_auth/_v2: op_len is
+  // cast to uint32_t in _verify_user_signature.
+  if (op_len > (size_t)UINT32_MAX) {
+    return CRABS_ERR_INVALID_PARAM;
+  }
 
   user_t* user = attribute_machine_find_user((attribute_machine_t*)attr_machine, signer_id);
   // R8-C-6: collapse user-not-found / suspended to UNAUTHORIZED so a caller
@@ -1610,10 +1682,16 @@ crabs_error_e crypto_verify_co_signature(
       return CRABS_ERR_UNAUTHORIZED;
     }
   }
-  return _verify_user_signature(user, key_id, sig_scheme,
-                                  attr_machine->current_time_ms,
-                                  serialized_op, op_len,
-                                  signature, signature_len);
+  // Audit LOW: collapse _verify_user_signature's distinct failures (unknown
+  // key_id → RESOURCE_NOT_FOUND, inactive status, bad signature) to
+  // UNAUTHORIZED — a direct library caller must not be able to probe which
+  // key_ids exist on a co-signer's keyring.
+  return (_verify_user_signature(user, key_id, sig_scheme,
+                                 attr_machine->current_time_ms,
+                                 serialized_op, op_len,
+                                 signature, signature_len) == CRABS_SUCCESS)
+             ? CRABS_SUCCESS
+             : CRABS_ERR_UNAUTHORIZED;
 }
 
 // Canonical envelope data for signing (variable-length sk_abe):
@@ -1723,21 +1801,36 @@ done:
   return rc;
 }
 
+// Decrypts into a private scratch buffer and only copies to the caller's
+// `pt` after the GCM tag verifies. Streaming directly into the caller's
+// buffer would release unauthenticated plaintext to the caller on tag
+// mismatch (audit MEDIUM): EVP_DecryptUpdate emits plaintext before
+// EVP_DecryptFinal_ex checks the tag. Returns 0 on success; on any failure
+// the scratch is cleansed and `pt` is left untouched.
 static int _aes256_gcm_decrypt(const uint8_t key[32], const uint8_t iv[12],
                                  const uint8_t* ct, size_t ct_len,
                                  const uint8_t tag[16], uint8_t* pt) {
-  EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
-  if (!ctx) return -1;
+  // AES-GCM never expands: plaintext length == ciphertext length.
+  size_t scratch_cap = (ct_len > 0) ? ct_len : 1;
+  uint8_t* scratch = get_clear_memory(scratch_cap);
+  if (!scratch) return -1;
+
   int rc = -1, outl = 0, finall = 0;
+  EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
+  if (!ctx) goto cleanup;
   if (EVP_DecryptInit_ex(ctx, EVP_aes_256_gcm(), NULL, NULL, NULL) != 1 ||
       EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_IVLEN, 12, NULL) != 1 ||
-      EVP_DecryptInit_ex(ctx, NULL, NULL, key, iv) != 1) goto done;
-  if (EVP_DecryptUpdate(ctx, pt, &outl, ct, (int)ct_len) != 1) goto done;
-  if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_TAG, 16, (void*)tag) != 1) goto done;
-  if (EVP_DecryptFinal_ex(ctx, pt + outl, &finall) != 1) goto done; // fails on tag mismatch
+      EVP_DecryptInit_ex(ctx, NULL, NULL, key, iv) != 1) goto cleanup;
+  if (EVP_DecryptUpdate(ctx, scratch, &outl, ct, (int)ct_len) != 1) goto cleanup;
+  if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_TAG, 16, (void*)tag) != 1) goto cleanup;
+  // Fails on tag mismatch — only then is the plaintext released.
+  if (EVP_DecryptFinal_ex(ctx, scratch + outl, &finall) != 1) goto cleanup;
+  memcpy(pt, scratch, (size_t)(outl + finall));
   rc = 0;
-done:
+cleanup:
   EVP_CIPHER_CTX_free(ctx);
+  OPENSSL_cleanse(scratch, scratch_cap);
+  free(scratch);
   return rc;
 }
 
@@ -1751,7 +1844,10 @@ crabs_error_e crypto_seal(const uint8_t key[32],
                             uint8_t* sealed, size_t* sealed_len) {
   if (!key || (!plain && plain_len != 0) || !sealed || !sealed_len)
     return CRABS_ERR_INVALID_PARAM;
-  if (plain_len > SIZE_MAX - CRABS_SEAL_OVERHEAD)
+  // EVP_EncryptUpdate takes an int length: a size_t above INT_MAX would
+  // truncate into a negative/partial encrypt (same refusal as
+  // crypto_random_bytes).
+  if (plain_len > (size_t)INT_MAX || plain_len > SIZE_MAX - CRABS_SEAL_OVERHEAD)
     return CRABS_ERR_INVALID_PARAM;
   if (*sealed_len < plain_len + CRABS_SEAL_OVERHEAD)
     return CRABS_ERR_INVALID_PARAM;
@@ -1765,9 +1861,16 @@ crabs_error_e crypto_seal(const uint8_t key[32],
   uint8_t* ciphertext = sealed + 12;
   uint8_t* tag = sealed + 12 + plain_len;
   if (_aes256_gcm_encrypt(key, initialization_vector, plain, plain_len,
-                          ciphertext, tag) != 0)
+                          ciphertext, tag) != 0) {
+    // Fail closed with no partial blob: the IV was already written to `sealed`
+    // and the encrypt may have streamed partial ciphertext. Zero the entire
+    // region this call could have touched (IV + ciphertext + tag) and reset
+    // the out-length so no truncated blob escapes the caller.
+    OPENSSL_cleanse(sealed, plain_len + CRABS_SEAL_OVERHEAD);
+    *sealed_len = 0;
     return CRABS_ERR_CRYPTOGRAPHIC_ERROR;
-  *sealed_len = plain_len + 12 + 16;
+  }
+  *sealed_len = plain_len + CRABS_SEAL_OVERHEAD;
   return CRABS_SUCCESS;
 }
 
@@ -1777,10 +1880,13 @@ crabs_error_e crypto_unseal(const uint8_t key[32],
                               size_t* plain_len) {
   if (!key || !sealed || !plain || !plain_len)
     return CRABS_ERR_INVALID_PARAM;
+  // EVP_DecryptUpdate takes an int length: a size_t above INT_MAX would
+  // truncate into a negative/partial decrypt (same refusal as
+  // crypto_random_bytes).
   if (sealed_len < CRABS_SEAL_OVERHEAD)
     return CRABS_ERR_INVALID_PARAM;
   size_t cipher_len = sealed_len - 12 - 16;
-  if (cipher_len > plain_cap)
+  if (cipher_len > (size_t)INT_MAX || cipher_len > plain_cap)
     return CRABS_ERR_INVALID_PARAM;
 
   const uint8_t* initialization_vector = sealed;
@@ -1846,8 +1952,23 @@ key_envelope_t* crypto_key_envelope_create(
   // issued_at, so temporary attributes are evaluated against that clock.
   char attrs[CRABS_ATTR_STRING_MAX];
   _build_attr_string(user, attrs, sizeof(attrs), issued_at);
+  // The signed attributes_hash must describe the attribute string the ABE key
+  // below is actually minted for (audit MEDIUM). The prior code hashed via
+  // crypto_compute_attributes_hash(user, ...) which uses clock 0, so any
+  // unexpired temporary attribute at issued_at was in the keygen string but
+  // NOT in the signed hash — the envelope's hash did not describe the issued
+  // key. Hash the very string passed to crypto_abe_keygen.
   uint8_t attributes_hash[CRABS_HASH_SIZE];
-  if (crypto_compute_attributes_hash(user, attributes_hash) != CRABS_SUCCESS) return NULL;
+  crabs_error_e hash_rc;
+  if (strlen(attrs) == 0) {
+    // Empty attributes: hash a single zero byte (same convention as
+    // crypto_compute_attributes_hash).
+    uint8_t zero = 0;
+    hash_rc = crypto_sha256(&zero, 1, attributes_hash);
+  } else {
+    hash_rc = crypto_sha256((const uint8_t*)attrs, strlen(attrs), attributes_hash);
+  }
+  if (hash_rc != CRABS_SUCCESS) return NULL;
 
   key_envelope_t* env = get_clear_memory(sizeof(key_envelope_t));
   if (!env) return NULL;
@@ -2131,6 +2252,19 @@ recovery_result_t* crypto_revoke_and_rotate(
   user_t* user = attribute_machine_find_user(attr_machine, user_id);
   if (!user) return NULL;
 
+  // Audit MEDIUM: only an ACTIVE user may be rotated. A SUSPENDED or REVOKED
+  // user minting a fresh, node-signed envelope would let an administratively
+  // decommissioned identity regain a working ABE capability. Refuse before
+  // any state mutation (callers consume NULL as failure — see cli.c's
+  // cli_cmd_key_revoke and the KeyEnvelopeTest suite).
+  if (user->status != USER_ACTIVE) return NULL;
+
+  // Step 6 happens FIRST (audit LOW): allocate the result struct before any
+  // mutation of the user so an allocation failure cannot leave a
+  // suspended-with-rotated-key user behind.
+  recovery_result_t* result = get_clear_memory(sizeof(recovery_result_t));
+  if (!result) return NULL;
+
   // R8-C-3: build the envelope BEFORE mutating the user, so a failed envelope
   // creation leaves the user record untouched. The envelope is encrypted to
   // the new public key, so temporarily swap it in and restore on any failure.
@@ -2142,6 +2276,7 @@ recovery_result_t* crypto_revoke_and_rotate(
       mk, node_private_key, user, state_version, issued_at, 0);
   if (!envelope) {
     memcpy(user->public_key, old_public_key, 33);
+    free(result);
     return NULL;
   }
 
@@ -2153,16 +2288,11 @@ recovery_result_t* crypto_revoke_and_rotate(
       "key-rotation suspension") != CRABS_SUCCESS) {
     memcpy(user->public_key, old_public_key, 33);
     crypto_key_envelope_destroy(envelope);
+    free(result);
     return NULL;
   }
   // public_key stays as new_public_key (already set above).
 
-  // Step 6: Build result (envelope only; no private key on the node)
-  recovery_result_t* result = get_clear_memory(sizeof(recovery_result_t));
-  if (!result) {
-    crypto_key_envelope_destroy(envelope);
-    return NULL;
-  }
   memcpy(result->new_public_key, new_public_key, 33);
   result->new_envelope = envelope;
 

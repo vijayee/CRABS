@@ -71,14 +71,28 @@ crabs_error_e crypto_sha256(const uint8_t* data, size_t len,
 #define CRABS_SEAL_OVERHEAD 28   // 12-byte IV + 16-byte GCM tag
 
 // In: *sealed_len = buffer capacity. Out: *sealed_len = sealed blob length.
+// On failure the written region of `sealed` is zeroed and *sealed_len is set
+// to 0 — no partial blob escapes (audit LOW). Rejects plain_len > INT_MAX
+// (EVP_EncryptUpdate takes an int length; see crypto_random_bytes).
 crabs_error_e crypto_seal(const uint8_t key[32],
                             const uint8_t* plain, size_t plain_len,
                             uint8_t* sealed, size_t* sealed_len);
 // In: plain_cap = plaintext capacity. Out: *plain_len = written length.
+// Postcondition: `plain` is not modified unless the GCM tag verified —
+// unauthenticated plaintext is never released into the caller's buffer
+// (decryption runs into a private scratch that is cleansed on tag failure).
 crabs_error_e crypto_unseal(const uint8_t key[32],
                               const uint8_t* sealed, size_t sealed_len,
                               uint8_t* plain, size_t plain_cap,
                               size_t* plain_len);
+
+// Expiry boundary semantics (§11): throughout the crypto layer, an expiry of
+// `expires_at` means the credential is VALID at the boundary itself and
+// becomes expired once the clock is strictly past it (now_ms > expires_at).
+// This applies to key envelopes (crypto_key_envelope_verify) and to keyring
+// key expiry in the verification paths. An expiry of 0 means "no expiry";
+// a clock of 0 (platform has not injected time) fails closed as
+// "expiry unknown" for any credential with a non-zero expires_at.
 
 // ============================================================
 // CSPRNG (§14.2)
@@ -280,8 +294,11 @@ typedef struct key_envelope_t {
 
 // Create a key envelope: generates a real CP-ABE user key for the user's
 // attributes, embeds its serialized form, and signs the canonical envelope
-// with the node's ECDSA private key. The user's attribute string and its
-// SHA-256 hash are computed internally.
+// with the node's ECDSA private key. The attribute string (including
+// temporary attributes unexpired at `issued_at`) and its SHA-256 hash are
+// computed internally against the SAME `issued_at` clock, so the signed
+// attributes_hash always describes the key actually issued. Returns NULL on
+// failure.
 key_envelope_t* crypto_key_envelope_create(
     const abe_master_key_t* mk,
     const uint8_t node_private_key[32],
@@ -339,6 +356,11 @@ typedef struct {
 // out-of-band and submits the new public key; the node records it, suspends
 // the compromised key, and issues a new ABE envelope bound to the user's
 // current attributes. The envelope is returned for out-of-band delivery.
+// Only a USER_ACTIVE user may be rotated — a SUSPENDED or REVOKED user is
+// refused (NULL) so a decommissioned identity cannot regain a working ABE
+// capability through rotation. NULL is the universal failure signal (invalid
+// params, invalid/unusable new key, unknown or non-active user, or any
+// internal failure); on NULL the user record is left untouched.
 recovery_result_t* crypto_revoke_and_rotate(
     const abe_master_key_t* mk,
     const uint8_t node_private_key[32],

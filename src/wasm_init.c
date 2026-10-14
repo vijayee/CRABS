@@ -11,10 +11,22 @@
 //
 
 #include <openssl/crypto.h>
+#include <openssl/rand.h>
+#include <stdio.h>
+#include <stdlib.h>
 
 #ifdef __EMSCRIPTEN__
 __attribute__((constructor))
 static void _crabs_wasm_openssl_init(void) {
     OPENSSL_init_crypto(OPENSSL_INIT_NO_LOAD_CONFIG, NULL);
+    // RAND health check (audit MEDIUM): an Emscripten build whose DRBG is not
+    // seeded must fail loudly at module load — not deep inside a signing call,
+    // where an unnoticed RAND_bytes failure could mint weak keys. Every CRABS
+    // randomness consumer flows through crypto_random_bytes, so an abort here
+    // guarantees no weak key material is ever produced.
+    if (RAND_status() != 1) {
+        fputs("CRABS: OpenSSL RAND not seeded — aborting WASM startup\n", stderr);
+        abort();
+    }
 }
 #endif
