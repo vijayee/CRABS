@@ -130,8 +130,15 @@ lww_register_t*  lww_register_merge(const lww_register_t* a, const lww_register_
 //     adopted by deep copy, a same-name FREE_MERGE item merges IN PLACE
 //     (src-only elements, larger placement_id per element, deletions win,
 //     re-materialized order), and a preflight refusal (same op id different
-//     payload — writer equivocation — or a conflicting placement) leaves dst
-//     untouched with a "__merge_held__" event (CRABS_ERR_FORK_DETECTED).
+//     payload — writer equivocation — or a conflicting placement, or the
+//     capacity guard on src's element count vs dst's — src->count must fit
+//     beside dest->count in a uint32 placement array) leaves dst untouched
+//     with a "__merge_held__" event (CRABS_ERR_FORK_DETECTED). A same-named
+//     item of a different data type (a crafted snapshot can carry one) is
+//     held with "__merge_type_mismatch__" (CRABS_ERR_TYPE_MISMATCH) before
+//     any cast. A fresh item declaring a domain/type pair the data model
+//     forbids (data_item_type_legal_for_domain — e.g. an OT type under
+//     SOVEREIGN) is held with "__merge_type_mismatch__".
 //     The other OT types (document/table/tree/ordered map) have no merge
 //     machinery yet: fresh arrival is held ("__merge_held__",
 //     CRABS_ERR_TYPE_MISMATCH) and a same-name merge is a silent no-op.

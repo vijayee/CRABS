@@ -546,6 +546,12 @@ crabs_ot_ordered_set_t* crabs_ot_ordered_set_merge(
     }
   }
 
+  // The post-mutation _materialize re-derives the order from the same
+  // deterministic placement union _merge_preflight just walked (both sides'
+  // placements over the merged element id set), so a NULL here cannot occur
+  // via the merge route — the merge layer's held-event contract interprets
+  // this return as a refusal, reachable only from a non-merge caller whose
+  // op stream left inconsistent placements.
   return _materialize(dest) ? dest : NULL;
 }
 
