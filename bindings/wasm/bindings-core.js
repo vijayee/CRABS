@@ -1287,6 +1287,47 @@ class Node {
     wrapRc(rc, 'activateUser');
   }
 
+  // Non-replicated attribute-writing primitives (parity-fill P10 — the
+  // node binding's surface, mirrored). Both drive the C machines directly —
+  // no op, no signature, no policy — so the privileged-name blocklist
+  // (audit C-5), the safe-charset gates (R4-5), the suspended-user gates
+  // (R4-2) and the verified-attribute overwrite rule are the C machine's
+  // own and surface typed as-is:
+
+  // Self-assert a non-privileged attribute: `signerId`'s record gains
+  // `attribute:value` with an EMPTY verified_by. Typed refusals:
+  // unauthorized (a name in the privileged blocklist, or overwriting an
+  // already-VERIFIED attribute — §8.4.3), invalid_param (an unsafe-charset
+  // name, a comma/space value, or empty arguments), user_not_found /
+  // user_suspended for the signer's own record.
+  selfAssert(attribute, value, signerId) {
+    const M = this._M;
+    const attrPtr = writeString(M, attribute);
+    const valPtr = writeString(M, value);
+    const signerPtr = writeString(M, signerId);
+    const rc = M._crabs_wasm_self_assert(this._am, attrPtr, valPtr, signerPtr);
+    freeAll(M, attrPtr, valPtr, signerPtr);
+    wrapRc(rc, 'selfAssert');
+  }
+
+  // Verify another user's attribute (§8.4.4): `attribute:value` is recorded
+  // (or the existing attribute's value updated) with verified_by =
+  // `signerId`. Admin-gated: the verifying signer must hold 'role:admin'.
+  // Typed refusals: unauthorized (a non-admin verifier), user_not_found
+  // (unknown target), user_suspended (a suspended or revoked target),
+  // invalid_param (the same argument gates selfAssert applies).
+  verifyIdentity(targetUser, attribute, value, signerId) {
+    const M = this._M;
+    const targetPtr = writeString(M, targetUser);
+    const attrPtr = writeString(M, attribute);
+    const valPtr = writeString(M, value);
+    const signerPtr = writeString(M, signerId);
+    const rc = M._crabs_wasm_verify_identity(this._am, targetPtr, attrPtr,
+                                             valPtr, signerPtr);
+    freeAll(M, targetPtr, attrPtr, valPtr, signerPtr);
+    wrapRc(rc, 'verifyIdentity');
+  }
+
   getUser(userId) {
     const M = this._M;
     const uidPtr = writeString(M, userId);
@@ -2837,19 +2878,27 @@ class Node {
   setTime(nowMs) { this._M._crabs_wasm_set_time(this._am, BigInt(nowMs)); }
 
   // HLC watermark readback: the machine's LAST-issued hybrid timestamp,
-  // WITHOUT advancing the clock (the native binding's getHLC issues a NEXT
-  // timestamp — this wasm readback stays read-only so restore tests can pin
-  // clock continuity exactly). undefined on an uninitialized clock (a
-  // lamport-ordered machine, or a restored state whose Continuity block
-  // never re-applied the clock).
+  // WITHOUT advancing the clock. Parity-fill P10 unified the semantics: the
+  // native binding's getHLC is now this SAME read-only watermark (advance
+  // happens only when an op executes — every sign/execute path issues
+  // crabs_hlc_next explicitly), so two consecutive reads are identical and
+  // restore continuity pins stay deterministic. The readback carries the
+  // node binding's shape: {seconds, nanos, logicalCounter, nodeId,
+  // formatted}. undefined on an uninitialized clock (a lamport-ordered
+  // machine, or a restored state whose Continuity block never re-applied
+  // the clock).
   // Out-buffer layout: u64le physical_seconds | u64le physical_nanos |
-  // u64le logical_counter.
+  // u64le logical_counter | 64-byte node id | 128-byte formatted stamp.
   getHLC() {
     const M = this._M;
     const outPtr = M._malloc(24);
+    const nodeIdPtr = M._malloc(64);
+    const formattedPtr = M._malloc(128);
     try {
       const watermark = M._crabs_wasm_get_hlc(this._am, outPtr, outPtr + 8,
-                                              outPtr + 16);
+                                              outPtr + 16,
+                                              nodeIdPtr, 64,
+                                              formattedPtr, 128);
       if (!watermark) return undefined;
       const view = new DataView(M.HEAPU8.buffer, M.HEAPU8.byteOffset + outPtr,
                                 24);
@@ -2857,9 +2906,11 @@ class Node {
         seconds: Number(view.getBigUint64(0, true)),
         nanos: Number(view.getBigUint64(8, true)),
         logicalCounter: Number(view.getBigUint64(16, true)),
+        nodeId: M.UTF8ToString(nodeIdPtr),
+        formatted: M.UTF8ToString(formattedPtr),
       };
     } finally {
-      freeAll(M, outPtr);
+      freeAll(M, outPtr, nodeIdPtr, formattedPtr);
     }
   }
 
@@ -3061,25 +3112,22 @@ class Node {
     return schedules;
   }
 
+  // Explicit trigger tick (parity-fill P10): the C primitive the executor
+  // runs post-execute (trigger_process_all, Trigger/trigger.h:81), driven
+  // by hand. The old shape — a signed zero-resource 'noop' execute —
+  // refused resource_not_found on any policy-less machine (the executor's
+  // step-7 rule), so it was replaced by the direct tick export. An
+  // unreadable machine clock fails closed with the typed
+  // 'cryptographic_error' the node binding throws for the same refusal.
+  // Returns the number of triggers fired this tick.
   evaluateTriggers() {
     const M = this._M;
-    const typePtr = writeString(M, 'noop');
-    const signerPtr = writeString(M, this.adminId || 'admin');
-    const nodePtr = writeString(M, this.adminId || 'admin');
-    const opPtr = M._operation_create(typePtr);
-    M._crabs_wasm_op_init_uuid(opPtr);
-    M._crabs_wasm_op_set_signer(opPtr, signerPtr);
-    M._crabs_wasm_op_set_node(opPtr, nodePtr);
-    freeAll(M, typePtr, signerPtr, nodePtr);
-    if (!opPtr) throw new Error('evaluateTriggers: operation_create failed');
-    const rcSign = M._crabs_wasm_sign_with_node_key(this._am, opPtr);
-    if (rcSign !== 0) {
-      M._operation_destroy(opPtr);
-      throw crabsError(rcSign, 'evaluateTriggers sign');
+    const fired = M._crabs_wasm_evaluate_triggers(this._am);
+    if (fired < 0) {
+      throw crabsError(0x4002 /* CRABS_ERR_CRYPTOGRAPHIC_ERROR */,
+                       'evaluateTriggers');
     }
-    const rcExec = M._crabs_wasm_execute(this._am, opPtr);
-    M._operation_destroy(opPtr);
-    wrapRc(rcExec, 'evaluateTriggers execute');
+    return Number(fired);
   }
 
   registerHandler(opType, handler) {

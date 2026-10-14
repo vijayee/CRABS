@@ -2092,17 +2092,31 @@ void crabs_wasm_set_time(attribute_machine_t* am, uint64_t now_ms) {
 
 // HLC watermark readback: reports the machine's LAST-issued HLC timestamp
 // WITHOUT advancing the clock (a diagnostic — the restore tests pin HLC
-// continuity with it). Returns 0 and leaves the out-params untouched on a
-// NULL machine or an uninitialized clock (the JS wrapper turns that into
-// undefined).
+// continuity with it; since the parity-fill alignment the NATIVE binding's
+// getHLC is this same read-only watermark, so the semantics are now
+// binding-agnostic). The out-params carry the node binding's readback shape:
+// u64le seconds | u64le nanos | u64le logical counter + the HLC identity
+// string and `crabs_hlc_format` rendering (out_node_id/out_formatted are
+// caller-provided buffers; a NULL buffer or zero cap skips that field).
+// Returns 0 and leaves the out-params untouched on a NULL machine or an
+// uninitialized clock (the JS wrapper turns that into undefined).
 EMSCRIPTEN_KEEPALIVE
 bool crabs_wasm_get_hlc(attribute_machine_t* am, uint64_t* out_seconds,
-                        uint64_t* out_nanos, uint64_t* out_logical_counter) {
+                        uint64_t* out_nanos, uint64_t* out_logical_counter,
+                        char* out_node_id, uint32_t node_id_cap,
+                        char* out_formatted, uint32_t formatted_cap) {
   if (am == NULL || !am->base_state.hlc_state_initialized) return false;
   const crabs_hlc_t* hlc = &am->base_state.hlc_state.last;
   if (out_seconds != NULL) *out_seconds = hlc->physical_seconds;
   if (out_nanos != NULL) *out_nanos = hlc->physical_nanos;
   if (out_logical_counter != NULL) *out_logical_counter = hlc->logical_counter;
+  if (out_node_id != NULL && node_id_cap > 0) {
+    strncpy(out_node_id, hlc->node_id, node_id_cap - 1);
+    out_node_id[node_id_cap - 1] = '\0';
+  }
+  if (out_formatted != NULL && formatted_cap > 0) {
+    crabs_hlc_format(hlc, out_formatted, formatted_cap);
+  }
   return true;
 }
 
@@ -2127,6 +2141,60 @@ crabs_error_e crabs_wasm_issue_temporary(attribute_machine_t* am,
   if (am == NULL) return CRABS_ERR_INVALID_PARAM;
   return attribute_machine_issue_temporary(am, attribute, value,
                                            audience_role, duration_ms);
+}
+
+// ============================================================
+// Attribute-write primitives (parity-fill P10 — binding alignment)
+// ============================================================
+//
+// The node binding's selfAssert/verifyIdentity (attribute_machine.c:624 /
+// :697) mirrored over: NON-replicated attribute-writing primitives driven
+// directly against the machine — no op, no signature, no policy. The
+// exporter adds nothing but NULL-arg translation: the privileged-name
+// blocklist (audit C-5), the safe-charset gates (R4-5) and the
+// verified-attribute overwrite rule are the C machine's own, so JS sees
+// the same typed errors the node binding reports.
+
+EMSCRIPTEN_KEEPALIVE
+crabs_error_e crabs_wasm_self_assert(attribute_machine_t* am,
+                                     const char* attribute,
+                                     const char* value,
+                                     const char* signer_id) {
+  if (am == NULL) return CRABS_ERR_INVALID_PARAM;
+  return attribute_machine_self_assert(am, attribute, value, signer_id);
+}
+
+EMSCRIPTEN_KEEPALIVE
+crabs_error_e crabs_wasm_verify_identity(attribute_machine_t* am,
+                                         const char* target_user,
+                                         const char* attribute,
+                                         const char* value,
+                                         const char* signer_id) {
+  if (am == NULL) return CRABS_ERR_INVALID_PARAM;
+  return attribute_machine_verify_identity(am, target_user, attribute,
+                                           value, signer_id);
+}
+
+// The explicit trigger tick — the C primitive the executor's post-execute
+// pass runs (trigger_process_all, Trigger/trigger.h:81), driven by hand.
+// The previous wrapper composed a zero-resource 'noop' op and executed it;
+// a policy-less zero-resource op refuses resource_not_found on ANY machine,
+// so the surface was unusable as shipped. Ticking here is unconditional:
+// the machine's own time source stamps now_ms (an unreadable clock fails
+// closed with -1, mirroring state_machine.c step 9's typed refusal — the JS
+// wrapper turns that into the same 'cryptographic_error' the node binding
+// throws), the reentrancy guard makes a nested tick a no-op, and the
+// non-negative return tells the host how many triggers fired. Returns 0 on
+// a NULL machine.
+EMSCRIPTEN_KEEPALIVE
+int64_t crabs_wasm_evaluate_triggers(attribute_machine_t* am) {
+  if (am == NULL) return 0;
+  uint64_t now_ms = 0;
+  if (!state_get_time_ms(&am->base_state, &now_ms)) return -1;
+  return (int64_t)trigger_process_all(&am->base_state,
+                                      am->base_state.triggers,
+                                      am->base_state.trigger_count, am,
+                                      now_ms);
 }
 
 // Select the time source for this machine (mirrors the CLI's

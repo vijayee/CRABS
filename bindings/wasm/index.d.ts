@@ -34,12 +34,18 @@ export interface CrabsChangeEvent {
   result: number;  // crabs_error_e
 }
 
-/** Machine-issued hybrid timestamp (readback shape of getHLC — the native
- *  binding's HLC view minus its formatted/nodeId fields). */
+/** Machine-issued hybrid timestamp — the SHARED getHLC readback shape
+ *  (same fields as the native binding's `HLC`, since the parity-fill P10
+ *  alignment unified semantics: both getters are read-only watermark
+ *  readbacks). */
 export interface CrabsHLC {
   seconds: number;
   nanos: number;
   logicalCounter: number;
+  /** The HLC identity — the issuing machine's id. */
+  nodeId: string;
+  /** Canonical single-string rendering (crabs_hlc_format). */
+  formatted: string;
 }
 
 export interface KeyPair {
@@ -1137,12 +1143,14 @@ export interface Node {
 
   /**
    * HLC watermark readback — the machine's LAST-issued hybrid timestamp,
-   * WITHOUT advancing the clock (the native binding's getHLC issues a NEXT
-   * timestamp instead; this wasm readback stays read-only so restore tests
-   * can pin clock continuity exactly). Returns undefined on an
-   * uninitialized clock (lamport-ordered machine). After a restore the
-   * watermark CONTINUES the previous machine's HLC (deserialize's
-   * Continuity note).
+   * WITHOUT advancing the clock. Parity-fill P10 unified the semantics: the
+   * NATIVE binding's getHLC is now this same read-only watermark too (the
+   * clock advances only when an op executes — every sign/execute path
+   * issues crabs_hlc_next explicitly), so two consecutive reads are
+   * identical and restore-continuity pins stay deterministic. Returns
+   * undefined on an uninitialized clock (lamport-ordered machine). After a
+   * restore the watermark CONTINUES the previous machine's HLC
+   * (deserialize's Continuity note).
    */
   getHLC(): CrabsHLC | undefined;
   setTime(nowMs: number): void;
@@ -1186,7 +1194,50 @@ export interface Node {
                               intervalMs: bigint; repeatCount: bigint;
                               endAt: bigint; submitter: string }>;
 
-  evaluateTriggers(): void;
+  /**
+   * The explicit trigger tick (C trigger_process_all, Trigger/trigger.h:81)
+   * — prune-expired-temp-attrs plus one condition pass over the machine's
+   * triggers that drives every matched effect; returns the number of
+   * triggers fired. The executor ALSO runs this pass after each executed op
+   * (state_machine.c step 9), so op-driven mutations tick the triggers
+   * themselves; call this when the machine's state was mutated WITHOUT the
+   * op path (direct CRDT writer calls) or for deterministic ticking in
+   * tests. A machine clock that cannot report time fails closed with the
+   * typed 'cryptographic_error'; a nested tick (this call inside a change
+   * hook's own trigger pass) is a guarded no-op — the C reentrancy rule.
+   * (Parity-fill P10: the old shape — a signed zero-resource 'noop' execute
+   * — refused resource_not_found on any policy-less machine; the tick no
+   * longer goes through the executor, so no 'noop' policy is needed.)
+   */
+  evaluateTriggers(): number;
+
+  /**
+   * Self-assert a non-privileged attribute — the C
+   * attribute_machine_self_assert (attribute_machine.c:624) driven directly
+   * (no op, no signature, no policy): `signerId`'s record gains
+   * `attribute:value` with an EMPTY verified_by. Typed refusals:
+   * unauthorized for a name in the privileged blocklist (the
+   * 'role'/'admin' families — Audit C-5) or for overwriting an
+   * already-VERIFIED attribute (§8.4.3), invalid_param for an
+   * unsafe-charset name or a comma/space value, user_not_found /
+   * user_suspended for the signer's own record. The node binding carries
+   * the identical surface.
+   */
+  selfAssert(attribute: string, value: string, signerId: string): void;
+  /**
+   * Verify another user's non-replicated attribute (§8.4.4) — the C
+   * attribute_machine_verify_identity (attribute_machine.c:697) driven
+   * directly: `attribute:value` is recorded on `targetUser` (or its
+   * existing attribute updated) with verified_by = signerId and a
+   * verified_at stamp from the machine's clock. Admin-gated: the verifying
+   * signer must hold 'role:admin'. Typed refusals: unauthorized (a
+   * non-admin verifier, or a privileged attribute name), user_not_found
+   * (unknown target), user_suspended (a suspended/revoked target),
+   * invalid_param (the selfAssert argument gates). The node binding
+   * carries the identical surface.
+   */
+  verifyIdentity(targetUser: string, attribute: string, value: string,
+                 signerId: string): void;
 
   // Lineage (v1.7): machines mint machines. Child machines are NEVER owned
   // by JS — the parent's resident-children registry in C anchors their
