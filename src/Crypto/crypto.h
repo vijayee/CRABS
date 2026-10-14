@@ -290,10 +290,14 @@ key_envelope_t* crypto_key_envelope_create(
     uint64_t issued_at,
     uint64_t expires_at);
 
-// Verify the node signature on a key envelope
+// Verify the node signature on a key envelope. `now_ms` is the caller's
+// current time: an envelope with a non-zero `expires_at` is rejected once
+// `now_ms > expires_at` (the boundary itself is still valid, 0 = no expiry).
+// crypto.c stays clockless, so freshness lives with the caller.
 bool crypto_key_envelope_verify(
     const uint8_t node_public_key[33],
-    const key_envelope_t* envelope);
+    const key_envelope_t* envelope,
+    uint64_t now_ms);
 
 // Serialize an envelope into a flat byte buffer (format_version + user_id +
 // state_version + attributes_hash + issued_at + expires_at + sk_abe_len +

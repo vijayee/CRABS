@@ -18,6 +18,7 @@
 #include <openabe/oabe_key.h>
 #include <string.h>
 #include <ctype.h>
+#include <limits.h>
 #include <stdatomic.h>
 
 // ============================================================
@@ -212,20 +213,20 @@ static EC_KEY* _eckey_from_private(const uint8_t private_key[32]) {
   BIGNUM* order = BN_new();
   if (!order || EC_GROUP_get_order(group, order, NULL) != 1) {
     BN_free(order);
-    BN_free(bn_priv);
+    BN_clear_free(bn_priv);
     EC_KEY_free(eckey);
     return NULL;
   }
   if (BN_is_zero(bn_priv) || BN_is_negative(bn_priv) || BN_cmp(bn_priv, order) >= 0) {
     BN_free(order);
-    BN_free(bn_priv);
+    BN_clear_free(bn_priv);
     EC_KEY_free(eckey);
     return NULL;
   }
   BN_free(order);
 
   if (EC_KEY_set_private_key(eckey, bn_priv) != 1) {
-    BN_free(bn_priv);
+    BN_clear_free(bn_priv);
     EC_KEY_free(eckey);
     return NULL;
   }
@@ -233,27 +234,27 @@ static EC_KEY* _eckey_from_private(const uint8_t private_key[32]) {
   // Derive public key from private key
   EC_POINT* pub_point = EC_POINT_new(group);
   if (!pub_point) {
-    BN_free(bn_priv);
+    BN_clear_free(bn_priv);
     EC_KEY_free(eckey);
     return NULL;
   }
 
   if (EC_POINT_mul(group, pub_point, bn_priv, NULL, NULL, NULL) != 1) {
     EC_POINT_free(pub_point);
-    BN_free(bn_priv);
+    BN_clear_free(bn_priv);
     EC_KEY_free(eckey);
     return NULL;
   }
 
   if (EC_KEY_set_public_key(eckey, pub_point) != 1) {
     EC_POINT_free(pub_point);
-    BN_free(bn_priv);
+    BN_clear_free(bn_priv);
     EC_KEY_free(eckey);
     return NULL;
   }
 
   EC_POINT_free(pub_point);
-  BN_free(bn_priv);
+  BN_clear_free(bn_priv);
   return eckey;
 }
 
@@ -295,6 +296,7 @@ ecdsa_keypair_t* crypto_ecdsa_generate(void) {
   const BIGNUM* bn_priv = EC_KEY_get0_private_key(eckey);
   if (BN_num_bytes(bn_priv) > 32) {
     EC_KEY_free(eckey);
+    OPENSSL_cleanse(keypair, sizeof(ecdsa_keypair_t));
     free(keypair);
     return NULL;
   }
@@ -309,6 +311,7 @@ ecdsa_keypair_t* crypto_ecdsa_generate(void) {
     NULL, 0, NULL);
   if (pub_len != 33) {
     EC_KEY_free(eckey);
+    OPENSSL_cleanse(keypair, sizeof(ecdsa_keypair_t));
     free(keypair);
     return NULL;
   }
@@ -545,6 +548,12 @@ crabs_error_e crypto_random_bytes(uint8_t* buf, size_t len) {
   if (!buf) {
     return CRABS_ERR_INVALID_PARAM;
   }
+  // RAND_bytes takes an int length: a size_t len above INT_MAX would truncate
+  // into a negative/partial fill while the contract promises exactly len
+  // bytes. Refuse instead.
+  if (len > (size_t)INT_MAX) {
+    return CRABS_ERR_INVALID_PARAM;
+  }
 
   if (RAND_bytes(buf, (int)len) != 1) {
     return CRABS_ERR_CRYPTOGRAPHIC_ERROR;
@@ -773,8 +782,15 @@ abe_master_key_t* crypto_abe_setup(void) {
     return NULL;
   }
 
-  if (oabe_context_cp_get_public_params(mk->ctx, &mk->public_params) != OABE_SUCCESS ||
-      oabe_context_cp_get_secret_key(mk->ctx, &mk->master_secret) != OABE_SUCCESS) {
+  if (oabe_context_cp_get_public_params(mk->ctx, &mk->public_params) != OABE_SUCCESS) {
+    oabe_context_cp_free(mk->ctx);
+    free(mk);
+    return NULL;
+  }
+  if (oabe_context_cp_get_secret_key(mk->ctx, &mk->master_secret) != OABE_SUCCESS) {
+    // public_params was already acquired — releasing the authority without
+    // freeing it leaks the bytestring (audit L-7).
+    oabe_bytestring_free(mk->public_params);
     oabe_context_cp_free(mk->ctx);
     free(mk);
     return NULL;
@@ -991,6 +1007,9 @@ abe_master_key_t* crypto_master_key_deserialize(const uint8_t* buf, size_t len) 
   // subtractions below are well-defined.
   if ((size_t)pp_len > len - offset) return NULL;
   if ((size_t)ms_len > len - offset - pp_len) return NULL;
+  // Exact-length: bytes after a well-formed authority image are unexamined
+  // slack — refuse them so the wire form stays canonical.
+  if (offset + (size_t)pp_len + (size_t)ms_len != len) return NULL;
 
   abe_master_key_t* mk = get_clear_memory(sizeof(abe_master_key_t));
   if (!mk) return NULL;
@@ -1131,6 +1150,10 @@ crabs_error_e crypto_abe_decrypt(const abe_user_key_t* sk, const abe_ciphertext_
     oabe_context_cp_free(dec_ctx); return CRABS_ERR_CRYPTOGRAPHIC_ERROR;
   }
 
+  // Decrypt capacity bound: the DEM frames the payload as IV(12) + tag(16),
+  // so the recovered plaintext is never LONGER than the serialized ciphertext
+  // itself; the +64 slack absorbs framing evolution in the openabe-c wire
+  // (documented so a fork-side framing change cannot silently truncate).
   size_t cap = oabe_bytestring_get_size(ct->ct_bytes) + 64;
   uint8_t* plain = get_clear_memory(cap);
   if (!plain) { oabe_context_cp_free(dec_ctx); return CRABS_ERR_OOM; }
@@ -1314,34 +1337,41 @@ verify_result_t crypto_verify_operation_auth(
     }
 
     user_t* user = ((attribute_machine_t*)attr_machine)->users;
+    bool matched = false;
     while (user != NULL) {
       if (user->status == USER_ACTIVE) {
         // R8-C-2: skip users with a keyring on the legacy path (see Mode A).
+        bool user_ok = false;
         if (!has_attr_policy) {
-          if (user->keys == NULL &&
-              crypto_ecdsa_verify(user->public_key, serialized_op, op_len, signature)) {
-            result.authorized = true;
-            result.error = CRABS_SUCCESS;
-            strncpy(result.signer_id, user->user_id, CRABS_MAX_USER_ID - 1);
-            return result;
-          }
+          user_ok = (user->keys == NULL) &&
+              crypto_ecdsa_verify(user->public_key, serialized_op, op_len, signature);
         } else {
           char attr_string[CRABS_ATTR_STRING_MAX];
           _build_attr_string(user, attr_string, sizeof(attr_string), attr_machine->current_time_ms);
-          if (crypto_abe_eval_policy(abe_policy, attr_string) &&
-              user->keys == NULL &&
-              crypto_ecdsa_verify(user->public_key, serialized_op, op_len, signature)) {
-            result.authorized = true;
-            result.error = CRABS_SUCCESS;
-            strncpy(result.signer_id, user->user_id, CRABS_MAX_USER_ID - 1);
-            return result;
-          }
+          user_ok = crypto_abe_eval_policy(abe_policy, attr_string) &&
+              (user->keys == NULL) &&
+              crypto_ecdsa_verify(user->public_key, serialized_op, op_len, signature);
+        }
+        // R7-L-8 for Mode B: no early exit — every active user's verification
+        // runs to the same total work regardless of where (or whether) the
+        // signer sits in the list, so latency cannot leak the registered-user
+        // count or the matching position. The FIRST matching user in
+        // registration order still fills signer_id.
+        if (user_ok && !matched) {
+          matched = true;
+          strncpy(result.signer_id, user->user_id, CRABS_MAX_USER_ID - 1);
+          result.signer_id[CRABS_MAX_USER_ID - 1] = '\0';
         }
       }
       user = user->next;
     }
 
-    result.error = CRABS_ERR_UNAUTHORIZED;
+    if (matched) {
+      result.authorized = true;
+      result.error = CRABS_SUCCESS;
+    } else {
+      result.error = CRABS_ERR_UNAUTHORIZED;
+    }
   }
 
   return result;
@@ -1896,9 +1926,14 @@ key_envelope_t* crypto_key_envelope_create(
 
 bool crypto_key_envelope_verify(
     const uint8_t node_public_key[33],
-    const key_envelope_t* envelope) {
+    const key_envelope_t* envelope,
+    uint64_t now_ms) {
   if (!node_public_key || !envelope) return false;
   if (envelope->format_version != KEY_ENVELOPE_FORMAT_V1) return false;
+  // Audit M-3: expiration is enforced here, not just carried. The verify call
+  // site supplies the clock; without one in crypto.c this check silently
+  // never fired and "revocation by expiry" did nothing.
+  if (envelope->expires_at != 0 && now_ms > envelope->expires_at) return false;
 
   size_t sign_len = 0;
   uint8_t* sign_data = _envelope_sign_data_alloc(envelope, &sign_len);
@@ -1989,7 +2024,9 @@ key_envelope_t* crypto_key_envelope_deserialize(const abe_master_key_t* mk,
   uint32_t sk_len = 0;
   for (int i = 0; i < 4; i++) sk_len |= ((uint32_t)buf[pos + i]) << (i * 8);
   pos += 4;
-  if (pos > len || sk_len > len - pos || CRABS_SIG_SIZE > len - pos - sk_len) {
+  // Exact-length: bytes after the signature are unauthenticated slack; the
+  // wire form must be canonical, so refuse anything but an exact fit.
+  if (pos > len || sk_len > len - pos || pos + sk_len + CRABS_SIG_SIZE != len) {
     free(env);
     return NULL;
   }

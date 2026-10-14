@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 #include <cstring>
+#include <climits>
 #include <vector>
 extern "C" {
 #include "../src/Crypto/crypto.h"
@@ -130,6 +131,15 @@ TEST(TestCrypto, TestRandomBytes) {
 
   // Two random buffers should not be identical (extremely unlikely)
   EXPECT_NE(memcmp(buf1, buf2, 32), 0);
+}
+
+// RAND_bytes takes an int length; a size_t len above INT_MAX would truncate
+// into a negative/partial fill while the contract promises `len` bytes. Such
+// a request must be refused outright.
+TEST(TestCrypto, RandomBytesRejectsOversizedLen) {
+  uint8_t buf[16];
+  EXPECT_EQ(crypto_random_bytes(buf, (size_t)INT_MAX + 1),
+            CRABS_ERR_INVALID_PARAM);
 }
 
 TEST(TestCrypto, TestAbeNullParams) {
@@ -980,13 +990,13 @@ TEST_F(KeyEnvelopeTest, CreateAndVerify) {
   EXPECT_NE(env->sk_abe, nullptr);
 
   // Verify with node's public key
-  bool valid = crypto_key_envelope_verify(node_key->public_key, env);
+  bool valid = crypto_key_envelope_verify(node_key->public_key, env, 5000);
   EXPECT_TRUE(valid);
 
   // Verify with wrong key should fail
   ecdsa_keypair_t* wrong_key = crypto_ecdsa_generate();
   ASSERT_NE(wrong_key, nullptr);
-  valid = crypto_key_envelope_verify(wrong_key->public_key, env);
+  valid = crypto_key_envelope_verify(wrong_key->public_key, env, 5000);
   EXPECT_FALSE(valid);
 
   crypto_ecdsa_keypair_destroy(wrong_key);
@@ -1040,7 +1050,7 @@ TEST_F(KeyEnvelopeTest, CreateWithExpiry) {
   ASSERT_NE(env, nullptr);
 
   EXPECT_EQ(env->expires_at, 5000u);
-  EXPECT_TRUE(crypto_key_envelope_verify(node_key->public_key, env));
+  EXPECT_TRUE(crypto_key_envelope_verify(node_key->public_key, env, 5000));
 
   crypto_key_envelope_destroy(env);
 }
@@ -1055,8 +1065,47 @@ TEST_F(KeyEnvelopeTest, NullParams) {
 }
 
 TEST_F(KeyEnvelopeTest, VerifyNullParams) {
-  EXPECT_FALSE(crypto_key_envelope_verify(nullptr, nullptr));
-  EXPECT_FALSE(crypto_key_envelope_verify(node_key->public_key, nullptr));
+  EXPECT_FALSE(crypto_key_envelope_verify(nullptr, nullptr, 0));
+  EXPECT_FALSE(crypto_key_envelope_verify(node_key->public_key, nullptr, 0));
+}
+
+// Audit M-3: expiry is enforced at verify. An envelope expired by one
+// millisecond is rejected; at the boundary itself it is still valid (the
+// lineage attestation convention), and a 0 expiry never expires.
+TEST_F(KeyEnvelopeTest, VerifyRejectsExpiredEnvelope) {
+  user_t* alice = attribute_machine_find_user(am, "alice");
+  ASSERT_NE(alice, nullptr);
+
+  key_envelope_t* env = crypto_key_envelope_create(
+      mk, node_key->private_key, alice, 1, 1000, 5000);
+  ASSERT_NE(env, nullptr);
+
+  EXPECT_TRUE(crypto_key_envelope_verify(node_key->public_key, env, 4999));
+  EXPECT_TRUE(crypto_key_envelope_verify(node_key->public_key, env, 5000));
+  EXPECT_FALSE(crypto_key_envelope_verify(node_key->public_key, env, 5001));
+
+  crypto_key_envelope_destroy(env);
+}
+
+// Trailing bytes after the signature are unauthenticated and unexamined; a
+// deserializer that tolerates them lets two distinct wire blobs decode to the
+// same signed envelope. Exact-length refusal keeps the wire canonical.
+TEST_F(KeyEnvelopeTest, DeserializeRejectsTrailingBytes) {
+  user_t* alice = attribute_machine_find_user(am, "alice");
+  ASSERT_NE(alice, nullptr);
+
+  key_envelope_t* env = crypto_key_envelope_create(
+      mk, node_key->private_key, alice, 1, 1000, 0);
+  ASSERT_NE(env, nullptr);
+
+  std::vector<uint8_t> wire(CRABS_KEY_ENVELOPE_MAX_SIZE);
+  size_t needed = crypto_key_envelope_serialize(env, wire.data(), wire.size());
+  ASSERT_GT(needed, (size_t)0);
+  std::vector<uint8_t> blob(wire.begin(), wire.begin() + needed + 8);
+  crypto_key_envelope_destroy(env);
+
+  EXPECT_EQ(crypto_key_envelope_deserialize(mk, blob.data(), blob.size()),
+            nullptr);
 }
 
 TEST_F(KeyEnvelopeTest, VerifyWrongFormatVersion) {
@@ -1069,7 +1118,7 @@ TEST_F(KeyEnvelopeTest, VerifyWrongFormatVersion) {
 
   // Tamper with format version
   env->format_version = 0x99;
-  EXPECT_FALSE(crypto_key_envelope_verify(node_key->public_key, env));
+  EXPECT_FALSE(crypto_key_envelope_verify(node_key->public_key, env, 5000));
 
   crypto_key_envelope_destroy(env);
 }
@@ -1142,7 +1191,7 @@ TEST_F(KeyEnvelopeTest, RevokeAndRotate) {
   EXPECT_EQ(memcmp(alice->public_key, result->new_public_key, 33), 0);
 
   // Envelope should be verifiable with node key
-  EXPECT_TRUE(crypto_key_envelope_verify(node_key->public_key, result->new_envelope));
+  EXPECT_TRUE(crypto_key_envelope_verify(node_key->public_key, result->new_envelope, 5000));
 
   crypto_recovery_result_destroy(result);
   crypto_ecdsa_keypair_destroy(user_new_key);
@@ -1253,6 +1302,23 @@ TEST(TestDurability, MasterKeyDeserializeRejectsOverrun) {
   memcpy(overrun + 3, &fake_len, 4);   // pp_len (LE)
   memcpy(overrun + 7, &fake_len, 4);   // ms_len (LE)
   EXPECT_EQ(crypto_master_key_deserialize(overrun, sizeof(overrun)), nullptr);
+}
+
+// Trailing bytes after a well-formed authority image must be refused: a wire
+// blob that decodes to the same authority as the canonical one but carries
+// unexamined slack is a canonicalization hazard (dedup/audit keyed on raw
+// wire bytes would treat the two images as different).
+TEST(TestDurability, MasterKeyDeserializeRejectsTrailingBytes) {
+  abe_master_key_t* mk = crypto_abe_setup();
+  ASSERT_NE(mk, nullptr);
+
+  size_t needed = crypto_master_key_serialize(mk, nullptr, 0);
+  ASSERT_GT(needed, (size_t)0);
+  std::vector<uint8_t> blob(needed + 8);
+  ASSERT_EQ(crypto_master_key_serialize(mk, blob.data(), blob.size()), needed);
+  crypto_abe_master_key_destroy(mk);
+
+  EXPECT_EQ(crypto_master_key_deserialize(blob.data(), blob.size()), nullptr);
 }
 
 // P4 review: cross-wire confusion. A bytestring wearing the 'MK' magic is an
