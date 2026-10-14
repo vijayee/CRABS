@@ -1634,6 +1634,122 @@ uint64_t crabs_wasm_user_temp_attr_expires_at(user_t* user) {
 }
 
 // ============================================================
+// Keyring lifecycle (parity-fill P2, v1.3 §9)
+//
+// The C keyring API is user_t-SCOPED (user_key_suspend/activate/rotate take
+// the resolved user record — attribute_machine.h:219-221) and intentionally
+// carries no signer/policy gate: the gate story lives on the WIRE ops
+// (__register_key__ / __suspend_key__ / __activate_key__ /
+// __rotate_key__, state_machine.c). The JS surface resolves the user id with
+// attribute_machine_find_user and drives these primitives directly, reading
+// the same per-key fields the C tests assert (test/test_key_lifecycle.cpp).
+// The readbacks below walk the user's linked key list by index — indices are
+// stable for a read-only scan performed without intervening keyring writes.
+// ============================================================
+
+EMSCRIPTEN_KEEPALIVE
+uint32_t crabs_wasm_user_key_count(user_t* user) {
+  return user ? user->key_count : 0;
+}
+
+// Index i of the user's key list (0 = most recently registered, matching the
+// list-prepend order in user_key_register). Out of range returns NULL and
+// the callers treat it as "gone".
+EMSCRIPTEN_KEEPALIVE
+const char* crabs_wasm_user_key_id(user_t* user, uint32_t i) {
+  if (!user) return NULL;
+  user_key_t* iter = user->keys;
+  for (uint32_t index = 0; iter != NULL; index++, iter = iter->next) {
+    if (index == i) return iter->key_id;
+  }
+  return NULL;
+}
+
+EMSCRIPTEN_KEEPALIVE
+int32_t crabs_wasm_user_key_scheme(user_t* user, uint32_t i) {
+  user_key_t* iter = user ? user->keys : NULL;
+  for (uint32_t index = 0; iter != NULL; index++, iter = iter->next) {
+    if (index == i) return (int32_t)iter->scheme;
+  }
+  return -1;
+}
+
+// Mirrors user_key_status_name's words (attribute_machine.c:1352-1361).
+EMSCRIPTEN_KEEPALIVE
+int32_t crabs_wasm_user_key_status(user_t* user, uint32_t i) {
+  user_key_t* iter = user ? user->keys : NULL;
+  for (uint32_t index = 0; iter != NULL; index++, iter = iter->next) {
+    if (index == i) return (int32_t)iter->status;
+  }
+  return -1;
+}
+
+EMSCRIPTEN_KEEPALIVE
+const char* crabs_wasm_user_key_label(user_t* user, uint32_t i) {
+  user_key_t* iter = user ? user->keys : NULL;
+  for (uint32_t index = 0; iter != NULL; index++, iter = iter->next) {
+    if (index == i) return iter->label;
+  }
+  return NULL;
+}
+
+EMSCRIPTEN_KEEPALIVE
+const char* crabs_wasm_user_key_predecessor(user_t* user, uint32_t i) {
+  user_key_t* iter = user ? user->keys : NULL;
+  for (uint32_t index = 0; iter != NULL; index++, iter = iter->next) {
+    if (index == i) return iter->predecessor_key_id;
+  }
+  return NULL;
+}
+
+// Copies the key's public bytes into out (capacity cap); returns the copied
+// byte count, or 0 when the index is out of range / the buffer is too small.
+EMSCRIPTEN_KEEPALIVE
+int32_t crabs_wasm_user_key_public_key(user_t* user, uint32_t i,
+                                        uint8_t* out, uint32_t cap) {
+  if (!user || !out || cap == 0) return 0;
+  user_key_t* iter = user->keys;
+  for (uint32_t index = 0; iter != NULL; index++, iter = iter->next) {
+    if (index == i) {
+      if (iter->public_key_len > cap) return 0;
+      memcpy(out, iter->public_key, iter->public_key_len);
+      return (int32_t)iter->public_key_len;
+    }
+  }
+  return 0;
+}
+
+EMSCRIPTEN_KEEPALIVE
+const char* crabs_wasm_user_default_key_id(user_t* user) {
+  return (user && user->default_key_id[0] != '\0') ? user->default_key_id : NULL;
+}
+
+EMSCRIPTEN_KEEPALIVE
+crabs_error_e crabs_wasm_user_key_suspend(user_t* user, const char* key_id) {
+  return user_key_suspend(user, key_id);
+}
+
+EMSCRIPTEN_KEEPALIVE
+crabs_error_e crabs_wasm_user_key_activate(user_t* user, const char* key_id) {
+  return user_key_activate(user, key_id);
+}
+
+EMSCRIPTEN_KEEPALIVE
+crabs_error_e crabs_wasm_user_key_rotate(user_t* user, const char* old_key_id,
+                                          const char* new_key_id,
+                                          int32_t new_scheme,
+                                          const uint8_t* new_public_key,
+                                          uint32_t new_public_key_len,
+                                          const char* new_label) {
+  if (new_scheme < SCHEME_UNSPECIFIED || new_scheme > SCHEME_CUSTOM) {
+    return CRABS_ERR_INVALID_PARAM;
+  }
+  return user_key_rotate(user, old_key_id, new_key_id,
+                          (signature_scheme_e)new_scheme,
+                          new_public_key, new_public_key_len, new_label);
+}
+
+// ============================================================
 // ABE helpers
 // ============================================================
 

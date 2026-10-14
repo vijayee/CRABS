@@ -134,6 +134,13 @@ static Napi::Error crabs_error(Napi::Env env, crabs_error_e err, const char* ctx
     case CRABS_ERR_KEY_STALE:             msg = "key_stale"; break;
     case CRABS_ERR_USER_NOT_FOUND:         msg = "user_not_found"; break;
     case CRABS_ERR_USER_SUSPENDED:         msg = "user_suspended"; break;
+    // v1.3 §9 keyring refusals (parity-fill P2): these were previously
+    // unnamed in this switch and collapsed into "unknown_error".
+    case CRABS_ERR_KEY_SUSPENDED:          msg = "key_suspended"; break;
+    case CRABS_ERR_KEY_REVOKED:            msg = "key_revoked"; break;
+    case CRABS_ERR_KEY_EXPIRED:            msg = "key_expired"; break;
+    case CRABS_ERR_KEY_NOT_ACTIVE:         msg = "key_not_active"; break;
+    case CRABS_ERR_VAULT_UNAVAILABLE:      msg = "vault_unavailable"; break;
     case CRABS_ERR_INVARIANT_VIOLATED:     msg = "invariant_violated"; break;
     case CRABS_ERR_RESOURCE_NOT_FOUND:     msg = "resource_not_found"; break;
     case CRABS_ERR_DUPLICATE_OPERATION:    msg = "duplicate_operation"; break;
@@ -1157,6 +1164,12 @@ public:
       InstanceMethod("selfAssert", &Node::SelfAssert),
       InstanceMethod("verifyIdentity", &Node::VerifyIdentity),
       InstanceMethod("revokeUser", &Node::RevokeUser),
+      // Keyring lifecycle (parity-fill P2, v1.3 §9)
+      InstanceMethod("suspendKey", &Node::SuspendKey),
+      InstanceMethod("activateKey", &Node::ActivateKey),
+      InstanceMethod("rotateKey", &Node::RotateKey),
+      InstanceMethod("listKeys", &Node::ListKeys),
+      InstanceMethod("getDefaultKey", &Node::GetDefaultKey),
       InstanceMethod("getUser", &Node::GetUser),
       InstanceMethod("getNodeKey", &Node::GetNodeKey),
       InstanceMethod("addCounter", &Node::AddCounter),
@@ -1566,6 +1579,182 @@ private:
                                                      signer_id.c_str());
     if (rc != CRABS_SUCCESS) throw crabs_error(env, rc, "revokeUser");
     return env.Undefined();
+  }
+
+  // --- Keyring lifecycle (parity-fill P2, v1.3 §9) ---
+  //
+  // The C keyring primitives are user_t-SCOPED (user_key_suspend /
+  // user_key_activate / user_key_rotate — attribute_machine.h:219-221) and
+  // intentionally carry no signer/policy gate: the gate story lives on the
+  // wire ops (__register_key__ / __suspend_key__ / __activate_key__ /
+  // __rotate_key__, state_machine.c). These methods resolve the user id with
+  // attribute_machine_find_user (the same pattern getUser rides) and refuse
+  // with the typed user_not_found, then drive the primitive directly.
+  user_t* RequireUser(Napi::Env env, const char* ctx,
+                      const std::string& user_id) {
+    user_t* user = attribute_machine_find_user(am_, user_id.c_str());
+    if (!user) throw crabs_error(env, CRABS_ERR_USER_NOT_FOUND, ctx);
+    return user;
+  }
+
+  Napi::Value SuspendKey(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 2)
+      throw Napi::TypeError::New(env, "Expected (userId, keyId)");
+    std::string user_id = require_js_string(info[0], "suspendKey", "userId");
+    std::string key_id = require_js_string(info[1], "suspendKey", "keyId");
+    user_t* user = RequireUser(env, "suspendKey", user_id);
+    crabs_error_e rc = user_key_suspend(user, key_id.c_str());
+    if (rc != CRABS_SUCCESS) throw crabs_error(env, rc, "suspendKey");
+    return env.Undefined();
+  }
+
+  Napi::Value ActivateKey(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 2)
+      throw Napi::TypeError::New(env, "Expected (userId, keyId)");
+    std::string user_id = require_js_string(info[0], "activateKey", "userId");
+    std::string key_id = require_js_string(info[1], "activateKey", "keyId");
+    user_t* user = RequireUser(env, "activateKey", user_id);
+    crabs_error_e rc = user_key_activate(user, key_id.c_str());
+    if (rc != CRABS_SUCCESS) throw crabs_error(env, rc, "activateKey");
+    return env.Undefined();
+  }
+
+  // Shape follows the C rotate signature exactly (attribute_machine.h:221):
+  // (old, new, scheme, pk bytes, label) — nothing is auto-generated; the
+  // caller's opts object carries the same fields as explicit values.
+  Napi::Value RotateKey(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 4 || !info[3].IsObject())
+      throw Napi::TypeError::New(env,
+          "Expected (userId, oldKeyId, newKeyId, { publicKeyHex, scheme?, label? })");
+    std::string user_id = require_js_string(info[0], "rotateKey", "userId");
+    std::string old_key_id = require_js_string(info[1], "rotateKey", "oldKeyId");
+    std::string new_key_id = require_js_string(info[2], "rotateKey", "newKeyId");
+    Napi::Object opts = info[3].As<Napi::Object>();
+
+    if (!opts.Has("publicKeyHex") || !opts.Get("publicKeyHex").IsString() ||
+        opts.Get("publicKeyHex").As<Napi::String>().Utf8Value().empty()) {
+      throw Napi::TypeError::New(env,
+          "rotateKey: opts.publicKeyHex is required (the C rotate signs no auto-generated material)");
+    }
+    std::string pk_hex = opts.Get("publicKeyHex").As<Napi::String>().Utf8Value();
+    // The C field is the signature_scheme_e number; unknown words refuse
+    // here so nothing truncates through the int32 wire cast. Defaults to
+    // ECDSA_SECP256K1 (the registry's secp256k1 entry) like the wire op does.
+    uint32_t scheme_number = ECDSA_SECP256K1;
+    if (opts.Has("scheme")) {
+      Napi::Value scheme_value = opts.Get("scheme");
+      if (scheme_value.IsNumber()) {
+        double raw = scheme_value.As<Napi::Number>().DoubleValue();
+        if (raw < 0.0 || raw > 255.0 || raw != static_cast<double>(
+                static_cast<uint32_t>(raw))) {
+          throw Napi::RangeError::New(env,
+              "rotateKey: scheme must be a sig_scheme.h word or id (e.g. 'ecdsa_secp256k1')");
+        }
+        scheme_number = static_cast<uint32_t>(raw);
+      } else if (scheme_value.IsString()) {
+        static const struct { const char* word; uint32_t id; } kSchemeWords[] = {
+            {"ecdsa_secp256k1", ECDSA_SECP256K1}, {"ecdsa_p256", ECDSA_P256},
+            {"ed25519", ED25519}, {"schnorr_secp256k1", SCHNORR_SECP256K1},
+            {"bls_bls12_381", BLS_BLS12_381}, {"rsa_2048", RSA_2048},
+            {"rsa_4096", RSA_4096}, {"dilithium_2", DILITHIUM_2},
+            {"dilithium_3", DILITHIUM_3}, {"dilithium_5", DILITHIUM_5},
+            {"falcon_512", FALCON_512}, {"falcon_1024", FALCON_1024},
+            {"sphincs_plus_128s", SPHINCS_PLUS_128S},
+        };
+        std::string word = scheme_value.As<Napi::String>().Utf8Value();
+        bool matched = false;
+        for (const auto& entry : kSchemeWords) {
+          if (word == entry.word) {
+            scheme_number = entry.id;
+            matched = true;
+            break;
+          }
+        }
+        if (!matched) {
+          throw Napi::RangeError::New(env,
+              "rotateKey: scheme must be a sig_scheme.h word or id (e.g. 'ecdsa_secp256k1')");
+        }
+      } else {
+        throw Napi::RangeError::New(env,
+            "rotateKey: scheme must be a sig_scheme.h word or id (e.g. 'ecdsa_secp256k1')");
+      }
+    }
+
+    // A malformed hex body would leave zero bytes at the C boundary — decode
+    // loudly instead (the same shape check the registerUser path makes).
+    if (pk_hex.size() % 2 != 0 ||
+        pk_hex.find_first_not_of("0123456789abcdefABCDEF") != std::string::npos) {
+      throw Napi::Error::New(env,
+          "rotateKey: publicKeyHex must be even-length hex, at most 512 bytes");
+    }
+    if (pk_hex.size() / 2 > CRABS_MAX_PUBLIC_KEY) {
+      throw Napi::Error::New(env,
+          "rotateKey: publicKeyHex must be even-length hex, at most 512 bytes");
+    }
+    std::vector<uint8_t> pk_bytes;
+    pk_bytes.reserve(pk_hex.size() / 2);
+    for (size_t hex_index = 0; hex_index < pk_hex.size(); hex_index += 2) {
+      pk_bytes.push_back(
+          static_cast<uint8_t>(std::stoul(pk_hex.substr(hex_index, 2), nullptr, 16)));
+    }
+
+    std::string label;
+    if (opts.Has("label") && opts.Get("label").IsString()) {
+      label = opts.Get("label").As<Napi::String>().Utf8Value();
+    }
+
+    user_t* user = RequireUser(env, "rotateKey", user_id);
+    crabs_error_e rc = user_key_rotate(user, old_key_id.c_str(),
+                                        new_key_id.c_str(),
+                                        static_cast<signature_scheme_e>(scheme_number),
+                                        pk_bytes.data(),
+                                        static_cast<uint32_t>(pk_bytes.size()),
+                                        label.empty() ? NULL : label.c_str());
+    if (rc != CRABS_SUCCESS) throw crabs_error(env, rc, "rotateKey");
+    return env.Undefined();
+  }
+
+  // The keyring READBACK (parity-fill P2): walk the user's linked key list
+  // and mirror the fields the C lifecycle tests assert
+  // (test/test_key_lifecycle.cpp). List-prepend order: index 0 is the most
+  // recently registered key.
+  Napi::Value ListKeys(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    std::string user_id = require_js_string(info[0], "listKeys", "userId");
+    user_t* user = RequireUser(env, "listKeys", user_id);
+    Napi::Array keys = Napi::Array::New(env);
+    uint32_t index = 0;
+    for (user_key_t* key = user->keys; key != NULL; key = key->next, ++index) {
+      Napi::Object row = Napi::Object::New(env);
+      row.Set("keyId", Napi::String::New(env, key->key_id));
+      row.Set("schemeId", Napi::Number::New(env, (double)key->scheme));
+      const char* status_str;
+      switch (key->status) {
+        case KEY_ACTIVE:    status_str = "active"; break;
+        case KEY_SUSPENDED: status_str = "suspended"; break;
+        case KEY_REVOKED:   status_str = "revoked"; break;
+        case KEY_EXPIRED:   status_str = "expired"; break;
+        default:            status_str = "unknown"; break;
+      }
+      row.Set("status", Napi::String::New(env, status_str));
+      row.Set("label", Napi::String::New(env, key->label));
+      row.Set("predecessorKeyId", Napi::String::New(env, key->predecessor_key_id));
+      row.Set("publicKeyHex",
+              Napi::String::New(env, hex_encode(key->public_key, key->public_key_len)));
+      keys.Set(index, row);
+    }
+    return keys;
+  }
+
+  Napi::Value GetDefaultKey(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    std::string user_id = require_js_string(info[0], "getDefaultKey", "userId");
+    user_t* user = RequireUser(env, "getDefaultKey", user_id);
+    if (user->default_key_id[0] == '\0') return Napi::String::New(env, "");
+    return Napi::String::New(env, user->default_key_id);
   }
 
   Napi::Value GetUser(const Napi::CallbackInfo& info) {

@@ -152,6 +152,40 @@ export interface UserInfo {
   }>;
 }
 
+/**
+ * One keyring entry (a C `user_key_t`, attribute_machine.h:62-76) mirrored
+ * from the user's linked key list — index 0 is the MOST RECENTLY registered
+ * key (list-prepend order inside user_key_register).
+ */
+export interface UserKeyInfo {
+  keyId: string;
+  /** sig_scheme.h id (1 = ECDSA_SECP256K1). */
+  schemeId: number;
+  /** key_status_e word (attribute_machine.h:48-53). */
+  status: 'active' | 'suspended' | 'revoked' | 'expired' | 'unknown';
+  /** '' when the key was registered without a label. */
+  label: string;
+  /** '' unless the key was minted by rotateKey. */
+  predecessorKeyId: string;
+  /** The key's declared public bytes, hex. */
+  publicKeyHex: string;
+}
+
+/**
+ * Keyring rotation material (parity-fill P2). Shape follows the C rotate
+ * signature exactly (user_key_rotate — attribute_machine.h:221): (old, new,
+ * scheme, pk bytes, label). Nothing is auto-generated — the caller owns the
+ * new key material; the old key is left in the state it had (it must be
+ * ACTIVE) and reads back 'revoked' after the rotation.
+ */
+export interface RotateKeyOptions {
+  /** sig_scheme.h word or raw id; defaults to 'ecdsa_secp256k1'. */
+  scheme?: string | number;
+  /** REQUIRED — the new key's public bytes, hex (even-length, ≤ 512 bytes). */
+  publicKeyHex: string;
+  label?: string;
+}
+
 export interface NodeKey {
   publicKeyHex: string;
   privateKeyHex: string;
@@ -306,6 +340,22 @@ export interface Node {
   selfAssert(attribute: string, value: string, signerId: string): void;
   verifyIdentity(targetUser: string, attribute: string, value: string, signerId: string): void;
   revokeUser(userId: string, signerId?: string): void;
+  /**
+   * Keyring lifecycle (parity-fill P2): suspend/activate/rotate the named
+   * key of the RESOLVED user. The C primitives are user_t-scoped and carry
+   * NO signer gate by design — the wire ops (__suspend_key__ / ...)
+   * own the policy story; these run through the module's own authority.
+   * suspend/activate bump the user's keyVersion readback (the R7-04
+   * staleness anchor: ops stamped pre-bump refuse with key_stale).
+   */
+  suspendKey(userId: string, keyId: string): void;
+  activateKey(userId: string, keyId: string): void;
+  rotateKey(userId: string, oldKeyId: string, newKeyId: string,
+            opts: RotateKeyOptions): void;
+  /** Readback: the user's keyring (see UserKeyInfo). Unknown users refuse. */
+  listKeys(userId: string): UserKeyInfo[];
+  /** Readback: the user's default key id ('' when the user has none). */
+  getDefaultKey(userId: string): string;
   /** Subscribe to state-change events ('change' only). Returns an off() function. */
   on(eventName: 'change', listener: (event: CrabsChangeEvent) => void): () => void;
   getUser(userId: string): UserInfo | undefined;

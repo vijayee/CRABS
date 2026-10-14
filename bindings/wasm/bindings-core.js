@@ -913,6 +913,129 @@ class Node {
     wrapRc(rc, 'revokeUser');
   }
 
+  // --- Keyring lifecycle (parity-fill P2, v1.3 §9) ---
+  //
+  // The C keyring primitives are user_t-scoped; these wrappers resolve the
+  // user id through attribute_machine_find_user and refuse with the same
+  // typed `user_not_found` the C machine would report for an unknown id.
+  // The primitives carry no signer gate by design — the wire ops
+  // (__suspend_key__ / __activate_key__ / __rotate_key__) own the policy
+  // story; these run through the module's own authority.
+
+  _resolveUser(ctx, userId) {
+    const M = this._M;
+    const uidPtr = writeString(M, userId);
+    const userPtr = M._crabs_wasm_find_user(this._am, uidPtr);
+    if (uidPtr) M._free(uidPtr);
+    if (!userPtr) throw crabsError(0x2003, ctx);
+    return userPtr;
+  }
+
+  suspendKey(userId, keyId) {
+    const M = this._M;
+    const userPtr = this._resolveUser('suspendKey', userId);
+    const kidPtr = writeString(M, keyId);
+    const rc = M._crabs_wasm_user_key_suspend(userPtr, kidPtr);
+    if (kidPtr) M._free(kidPtr);
+    wrapRc(rc, 'suspendKey');
+  }
+
+  activateKey(userId, keyId) {
+    const M = this._M;
+    const userPtr = this._resolveUser('activateKey', userId);
+    const kidPtr = writeString(M, keyId);
+    const rc = M._crabs_wasm_user_key_activate(userPtr, kidPtr);
+    if (kidPtr) M._free(kidPtr);
+    wrapRc(rc, 'activateKey');
+  }
+
+  // Shape follows the C rotate signature exactly (attribute_machine.h:221):
+  // (old, new, scheme, pk bytes, label) — the JS opts carry the same fields
+  // as explicit args; nothing is auto-generated. opts.publicKeyHex is
+  // REQUIRED (the C rotate refuses empty material itself, but the wrapper
+  // refuses earlier so the caller gets a typed, actionable error), and
+  // opts.scheme accepts the same lowercase word map the sig_scheme.h ids
+  // take on the wire or a raw number.
+  rotateKey(userId, oldKeyId, newKeyId, opts = {}) {
+    if (!opts || typeof opts !== 'object' || Array.isArray(opts) ||
+        typeof opts.publicKeyHex !== 'string' || opts.publicKeyHex.length === 0) {
+      throw new TypeError('rotateKey: opts.publicKeyHex is required (the C rotate signs no auto-generated material)');
+    }
+    const SCHEME_NUMBERS = {
+      ecdsa_secp256k1: 0x01, ecdsa_p256: 0x02, ed25519: 0x03,
+      schnorr_secp256k1: 0x04, bls_bls12_381: 0x05,
+      rsa_2048: 0x06, rsa_4096: 0x07,
+      dilithium_2: 0x08, dilithium_3: 0x09, dilithium_5: 0x0A,
+      falcon_512: 0x0B, falcon_1024: 0x0C, sphincs_plus_128s: 0x0D,
+    };
+    // The C field is the signature_scheme_e number; unknown words refuse
+    // here so nothing truncates through the int32 wire cast.
+    const schemeNumber = typeof opts.scheme === 'number'
+      ? opts.scheme
+      : SCHEME_NUMBERS[opts.scheme === undefined ? 'ecdsa_secp256k1' : opts.scheme];
+    if (schemeNumber === undefined || !Number.isInteger(schemeNumber) ||
+        schemeNumber < 0 || schemeNumber > 0xFF) {
+      throw new RangeError(
+        "rotateKey: scheme must be a sig_scheme.h word or id (e.g. 'ecdsa_secp256k1')");
+    }
+    // A malformed hex body would coerce to 0 through hexDecode (it trusts
+    // its input) — regex-gate the shape, mirroring addLockClaim.
+    const pkHex = (opts.publicKeyHex.length % 2 === 0 &&
+                   /^[0-9a-fA-F]+$/.test(opts.publicKeyHex))
+      ? opts.publicKeyHex : '';
+    if (pkHex.length === 0 || pkHex.length / 2 > 512) {  // CRABS_MAX_PUBLIC_KEY
+      throw new Error('rotateKey: publicKeyHex must be even-length hex, at most 512 bytes');
+    }
+    const M = this._M;
+    const userPtr = this._resolveUser('rotateKey', userId);
+    const oldPtr = writeString(M, oldKeyId);
+    const newPtr = writeString(M, newKeyId);
+    const labelPtr = opts.label ? writeString(M, opts.label) : 0;
+    const pkCap = pkHex.length / 2;
+    const pkPtr = M._malloc(pkCap);
+    hexDecode(M, pkHex, pkPtr, pkCap);
+    const rc = M._crabs_wasm_user_key_rotate(userPtr, oldPtr, newPtr,
+        schemeNumber, pkPtr, pkCap, labelPtr);
+    freeAll(M, oldPtr, newPtr, labelPtr);
+    M._free(pkPtr);
+    wrapRc(rc, 'rotateKey');
+  }
+
+  // The keyring READBACK: index-walk the user's linked key list and mirror
+  // the fields the C lifecycle tests assert. Indices are stable across the
+  // scan (the JS loop performs no keyring writes between reads).
+  listKeys(userId) {
+    const M = this._M;
+    const userPtr = this._resolveUser('listKeys', userId);
+    // user_key_t key_status_e order: ACTIVE/SUSPENDED/REVOKED/EXPIRED = 0/1/2/3
+    // (attribute_machine.h:48-53); user_key_status_name's words mirrored.
+    const STATUS_NAMES = ['active', 'suspended', 'revoked', 'expired'];
+    const count = M._crabs_wasm_user_key_count(userPtr) | 0;
+    const keys = [];
+    for (let index = 0; index < count; index++) {
+      const pkPtr = M._malloc(512);
+      const pkLen = M._crabs_wasm_user_key_public_key(userPtr, index, pkPtr, 512);
+      const publicKeyHex = pkLen > 0
+        ? hexEncode(M.HEAPU8.subarray(pkPtr, pkPtr + pkLen), pkLen) : '';
+      M._free(pkPtr);
+      keys.push({
+        keyId: readString(M, M._crabs_wasm_user_key_id(userPtr, index)),
+        schemeId: M._crabs_wasm_user_key_scheme(userPtr, index) | 0,
+        status: STATUS_NAMES[M._crabs_wasm_user_key_status(userPtr, index)] || 'unknown',
+        label: readString(M, M._crabs_wasm_user_key_label(userPtr, index)),
+        predecessorKeyId: readString(M, M._crabs_wasm_user_key_predecessor(userPtr, index)),
+        publicKeyHex,
+      });
+    }
+    return keys;
+  }
+
+  getDefaultKey(userId) {
+    const M = this._M;
+    const userPtr = this._resolveUser('getDefaultKey', userId);
+    return readString(M, M._crabs_wasm_user_default_key_id(userPtr)) || '';
+  }
+
   getUser(userId) {
     const M = this._M;
     const uidPtr = writeString(M, userId);

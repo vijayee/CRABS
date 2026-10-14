@@ -50,9 +50,18 @@ cookbook/api-map.md                     ledger + rows as each lands
 ### Task P2: keyring lifecycle
 
 **Files:** wrappers only; Test: both bindings.
-- [ ] **Step 1: Failing tests:** `node.suspendKey('alice', keyId)` where the C test (`test/test_key_lifecycle.cpp:96-140` READ it for the key id shape + who calls: user_t-based) — mirror: suspended user's ops refuse; `activateKey` restores; `rotateKey` bumps key version + old stamps refuse `key_stale` (mirror the C test's asserts).
-- [ ] **Step 2:** implement wasm exports + node direct C (`user_key_suspend`/`activate_user_key`-named variants — grep the real function names at attribute_machine.h:219-221), d.ts both.
-- [ ] **Step 3:** green + battery. **Commit** `feat: key suspend/activate/rotate from JS`.
+- [x] **Step 1: Failing tests:** `node.suspendKey('alice', keyId)` where the C test (`test/test_key_lifecycle.cpp:96-140` READ it for the key id shape + who calls: user_t-based) — mirror: suspended user's ops refuse; `activateKey` restores; `rotateKey` bumps key version + old stamps refuse `key_stale` (mirror the C test's asserts).
+  - (Landed reality: the C keyring API is user_t-scoped and gate-free — the
+    binding surface resolves the user id (`attribute_machine_find_user`) and
+    drives the primitives; seeding rides the C-native `__register_key__` wire
+    op because the bindings expose no registerKey. A genuine `key_stale`
+    replay is NOT pinnable here — a keyring-ed user refuses at verify
+    (unauthorized, R8-C-2) BEFORE the staleness gate (state_machine.c:884) —
+    so keyring.js pins the R8-C-2 fail-closed word and the staleness story
+    moves to P3 (suspendUser on a keyring-less user); rotateKey carries the
+    C material explicitly; `listKeys`/`getDefaultKey` are the readback.)
+- [x] **Step 2:** implement wasm exports + node direct C (`user_key_suspend`/`activate_user_key`-named variants — grep the real function names at attribute_machine.h:219-221), d.ts both.
+- [x] **Step 3:** green + battery. **Commit** `feat: key suspend/activate/rotate from JS`.
 
 ### Task P3: revokeRole / suspendUser / activateUser
 Same TDD pattern; C: attribute_machine.h:147/149/168 (read the real signatures — `revoke_role(am, target_user, role, value?, signer?)`); policies re-eval fail-closed after revoke (pinned); battery. **Commit** `feat: revokeRole, suspendUser and activateUser from JS`.

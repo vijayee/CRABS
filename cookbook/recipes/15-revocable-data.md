@@ -108,11 +108,18 @@ revocation — is refused on its face, so revocation can't rot into a
   what `encrypt` returned — the full seal/open round trip runs from JS on
   both bindings, refusals typed (`unauthorized` on wrong attributes, GCM
   fail-closed on tamper).
-- *The C-only deeper tools*: `user_key_suspend` / `user_key_activate` /
-  `user_key_rotate` — suspension is *recoverable* and *version-bumped on
-  activation* (ops signed during the suspended window are stale even after
-  the key returns); rotation revokes the old key, chains the new one via
-  `predecessor_key_id`, and moves the default.
+- *The keyring mutation tools* (parity-fill P2 — JS-reachable on BOTH
+  bindings, user-id-scoped over the user_t-scoped C primitives
+  `user_key_suspend` / `user_key_activate` / `user_key_rotate`,
+  `src/Attribute/attribute_machine.h:219-221`): `suspendKey(userId, keyId)`
+  (recoverable; bumps `keyVersion`), `activateKey(userId, keyId)`
+  (version-bumped — stamps made during the suspended window are gone;
+  does NOT restore a vacated default), and
+  `rotateKey(userId, oldId, newId, { scheme?, publicKeyHex, label? })`
+  (explicit material, nothing auto-generated — the old key revokes and the
+  new one chains via `predecessor_key_id`). Readback: `listKeys(userId)` +
+  `getDefaultKey(userId)`. Pinned: `bindings/wasm/test/keyring.js` + the
+  keyring block in bindings/node `test/test.js`.
 
 ## Try it
 
@@ -129,9 +136,13 @@ snippet executes too).
 ```snippet:wasm/15-revocable-data.js
 ```
 
-The JS-residual is exactly the keyring lifecycle (suspend / activate /
-rotate — C-only; the residual-scope note below). Everything else — seal,
-refusals, readback, decrypt — is executable from this binding.
+The JS-residual is nearly gone: the keyring mutation tools
+(`suspendKey` / `activateKey` / `rotateKey` — parity-fill P2, §2) are
+executable from wasm too; what stays off the method surface is only the
+`user_key_revoke` / `user_key_set_default` method forms (the wire ops
+`__revoke_key__` / `__set_default_key__` cover them power-side) and the
+key_id-declaring sign path. Everything else — seal, refusals, readback,
+decrypt — is executable from this binding.
 
 ### crabs-node (native Node.js)
 
@@ -139,8 +150,8 @@ The same flow — this binding maps `keyVersion` and `status` directly from
 the machine, so the revocation is observable as a `1 -> 2 -> 3` bump plus
 the terminal `revoked` status, and it streams as an `attribute`-kind change
 event. (The wasm binding maps the same readback too — recipe-level parity;
-what remains wasm/node-odd is only in the C-only keyring lifecycle, not the
-readback.)
+the keyring mutation methods land on BOTH bindings (parity-fill P2), so
+nothing lifecycle-shaped is wasm/node-odd anymore.)
 
 ```snippet:node/15-revocable-data.js
 ```
@@ -195,12 +206,13 @@ Not guaranteed — the bearer-instrument boundary:
   > (api-map §9; executed by both snippets below — including the
   > bearer-instrument demonstration and the epoch-two re-seal).
   >
-  > **What stays C-only in v1:** the keyring mutation tools —
-  > `user_key_suspend` / `user_key_activate` / `user_key_rotate` (the C
-  > tests pin that lifecycle). JS consumers observe their
-  > *effects* (a bumped `keyVersion` on both bindings, refused ops) but
-  > cannot *perform* them; the C snippet is where that lifecycle is
-  > executable. No portable reader-key bytes ship: `AbeKey` is a
+  > **What stays C-only in v1:** the keyring mutation tools'
+  > sibling forms — `user_key_revoke` / `user_key_set_default` (the wire ops
+  > `__revoke_key__` / `__set_default_key__` cover them power-side) and the
+  > key_id-declaring sign path. The suspend/activate/rotate lifecycle is
+  > JS-reachable now (parity-fill P2 — `suspendKey` / `activateKey` /
+  > `rotateKey`, api-map §2; key_stale replays pin in P3's suspension
+  > surface). No portable reader-key bytes ship: `AbeKey` is a
   > destroyable wrapper around the machine-derived key — the C-side
   > serialize/deserialize pair remains outside the JS surface by design
   > (the machine, not the file system, holds the key material).
@@ -286,12 +298,24 @@ fail-closed gates:
     src/Attribute/attribute_machine.c:585-588
   staleness gate CRABS_ERR_KEY_STALE — src/StateMachine/state_machine.c:873-884
     (R7-04; error src/CRABS/crabs.h:78)
-C-only keyring lifecycle: user_key_suspend / user_key_activate /
+keyring lifecycle JS-reachable (parity-fill P2, user-id-scoped over the
+  user_t-scoped primitives): node.suspendKey/activateKey/rotateKey +
+  listKeys/getDefaultKey — wasm bindings-core.js:931-1038 over
+  crabs_wasm_user_key_* (src/Util/wasm_helpers.c:1638-1747), node
+  crabs_node.cc:1593-1760; d.ts wasm :308-336/:525-529, node :160-196/:351-358;
+  pinned bindings/wasm/test/keyring.js + node test/test.js keyring block.
+  Engine facts unchanged: user_key_suspend / user_key_activate /
   user_key_rotate src/Attribute/attribute_machine.h:219-221 — exercised
   src/Attribute/attribute_machine.c key paths + test/test_key_lifecycle.cpp;
   suspension recoverable + version-bumped on activation (R8-A-5 — ops
-  signed during the window stale even after return, .c:1265); rotation
-  revokes old key + chains new via predecessor_key_id (test 258-287)
+  signed during the window stale even after return, .c:1265); activation
+  does NOT restore a vacated default (user_key_activate touches no default
+  slot, .c:1254-1273); rotation revokes old key + chains new via
+  predecessor_key_id (test 258-287). Residual C-only method forms:
+  user_key_revoke / user_key_set_default (the __revoke_key__ /
+  __set_default_key__ wire ops cover them) and the key_id-declaring sign
+  path (a keyring-ed user's legacy stamp refuses unauthorized, R8-C-2 —
+  crypto.c:1349-1357, pinned in keyring.js)
 fine demotion (C-only, no JS map): attribute_machine_revoke_role
   src/Attribute/attribute_machine.h:147 — works on suspended/revoked
   targets by design (R4-4; whitelist-bypass comment + body .c:772-820)

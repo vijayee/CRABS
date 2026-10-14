@@ -1186,6 +1186,136 @@ try {
 
     raftHost.destroy();
   })();
+
+  // Test: keyring lifecycle (parity-fill P2) — suspendKey/activateKey/
+  // rotateKey drive the user_t-scoped C primitives
+  // (user_key_suspend/activate/rotate, attribute_machine.h:219-221) through
+  // a resolved user; listKeys/getDefaultKey are the readback. The keyring is
+  // seeded through the machine's own __register_key__ wire op (the payload
+  // layout test/test_ops pins), NOT through an auto-generated surface.
+  {
+    const keyNode = new Node('key-admin', { ordering: 'hlc' });
+    const keyAlice = KeyPair.generate();
+    const keyBob = KeyPair.generate();
+    keyNode.registerUser('alice', keyAlice.publicKeyHex(), '');
+    keyNode.registerUser('bob', keyBob.publicKeyHex(), '');
+    keyNode.grantRole('alice', 'role', 'member', 'key-admin');
+    keyNode.grantRole('bob', 'role', 'member', 'key-admin');
+    // The seed wire op needs its policy line — the executor fail-closes op
+    // types without a registered policy (audit L-a).
+    keyNode.setPolicy('__register_key__', 'role:member');
+    const keyMustThrow = (invoke, fragment, label) => {
+      let caught = null;
+      try { invoke(); } catch (caughtError) { caught = caughtError; }
+      assert(caught !== null, `${label}: expected a throw`);
+      assert(caught && caught.message.includes(fragment),
+        `${label}: expected message containing "${fragment}", got "${caught && caught.message}"`);
+    };
+
+    const registerKeyWire = (userId, keyPair, keyId) => {
+      const config = `key_id=${keyId};scheme=1;public_key_len=33` + '\0';
+      const payload = Buffer.alloc(config.length + 33);
+      Buffer.from(config, 'binary').copy(payload, 0);
+      Buffer.from(keyPair.publicKeyHex(), 'hex').copy(payload, config.length);
+      const seed = new Operation('__register_key__');
+      seed.signerId = userId;
+      seed.payload = payload;
+      keyNode.sign(seed, keyPair);
+      keyNode.execute(seed);
+    };
+    registerKeyWire('bob', keyBob, 'b1');
+    registerKeyWire('alice', keyAlice, 'k1');
+
+    const preSeedVersion = keyNode.getUser('alice').keyVersion;
+    assert(keyNode.getDefaultKey('alice') === 'k1',
+      'keyring: the first registered key becomes the default');
+
+    // R8-C-2 fail-closed (pinned, not regressed): once the user HAS a
+    // keyring, a legacy-path op (no key_id) refuses at verification —
+    // crypto.c:1349-1357. The same shape succeeded for keyring-less bob.
+    let legacyRefused = '';
+    try { registerKeyWire('alice', keyAlice, 'k1-legacy'); }
+    catch (refusal) { legacyRefused = refusal.message; }
+    assert(legacyRefused.includes('unauthorized'),
+      `keyring: legacy-path signing must refuse R8-C-2, got "${legacyRefused}"`);
+
+    // suspendKey: version bump + status readback + default vacated.
+    keyNode.suspendKey('alice', 'k1');
+    assert(keyNode.getUser('alice').keyVersion === preSeedVersion + 1,
+      'keyring: suspending a key bumps the user keyVersion');
+    assert(keyNode.listKeys('alice')[0].status === 'suspended',
+      'keyring: the suspended key reads back suspended');
+    assert(keyNode.getDefaultKey('alice') === '',
+      'keyring: the last active key suspends to no default');
+    keyMustThrow(() => keyNode.suspendKey('alice', 'k1'),
+      'key_not_active', 'double suspend');
+    keyMustThrow(() => keyNode.suspendKey('alice', 'zz'),
+      'resource_not_found', 'unknown key');
+    keyMustThrow(() => keyNode.suspendKey('ghost', 'k1'),
+      'user_not_found', 'unknown user');
+
+    // activateKey: restore + version bump + idempotent-success.
+    keyNode.activateKey('alice', 'k1');
+    assert(keyNode.listKeys('alice')[0].status === 'active',
+      'keyring: the reactivated key reads back active');
+    assert(keyNode.getUser('alice').keyVersion === preSeedVersion + 2,
+      'keyring: activating a key bumps the user keyVersion again');
+    assert(keyNode.getDefaultKey('alice') === '',
+      'keyring: activating does not restore the vacated default (C fact)');
+    keyNode.activateKey('alice', 'k1');
+    assert(keyNode.listKeys('alice')[0].status === 'active',
+      'keyring: activating an already-active key is idempotent');
+
+    // rotateKey: explicit material (old, new, scheme, pk, label) — the C
+    // rotate signature carried as named args, nothing auto-generated.
+    const preRotateVersion = keyNode.getUser('alice').keyVersion;
+    keyNode.rotateKey('alice', 'k1', 'k2', {
+      scheme: 'ecdsa_secp256k1',
+      publicKeyHex: keyBob.publicKeyHex(),  // alice's "new epoch" material
+      label: 'rotated primary',
+    });
+    assert(keyNode.getUser('alice').keyVersion === preRotateVersion + 1,
+      'keyring: rotation bumps keyVersion once (the old-key revocation)');
+    const keyRows = keyNode.listKeys('alice');
+    assert(keyRows.length === 2, 'keyring: rotation registers the new key');
+    assert(keyRows.find((row) => row.keyId === 'k1').status === 'revoked',
+      'keyring: the rotated-out key reads back revoked');
+    const rotatedRow = keyRows.find((row) => row.keyId === 'k2');
+    assert(rotatedRow.status === 'active' &&
+           rotatedRow.predecessorKeyId === 'k1' &&
+           rotatedRow.label === 'rotated primary' &&
+           rotatedRow.schemeId === 1 &&
+           rotatedRow.publicKeyHex === keyBob.publicKeyHex(),
+      `keyring: the rotated key carries the declared material (${JSON.stringify(rotatedRow)})`);
+    assert(keyNode.getDefaultKey('alice') === 'k2',
+      'keyring: rotation transitions the default');
+
+    // Rotate/activate refusals mirror test_key_lifecycle.cpp.
+    keyMustThrow(() => keyNode.rotateKey('alice', 'zz', 'k3',
+      { scheme: 'ecdsa_secp256k1', publicKeyHex: keyAlice.publicKeyHex() }),
+      'resource_not_found', 'unknown old key');
+    keyMustThrow(() => keyNode.rotateKey('alice', 'k2', 'k2',
+      { scheme: 'ecdsa_secp256k1', publicKeyHex: keyAlice.publicKeyHex() }),
+      'duplicate_operation', 'duplicate new key id');
+    keyMustThrow(() => keyNode.rotateKey('ghost', 'k2', 'k3',
+      { scheme: 'ecdsa_secp256k1', publicKeyHex: keyAlice.publicKeyHex() }),
+      'user_not_found', 'unknown user');
+    keyMustThrow(() => keyNode.rotateKey('alice', 'k2', 'k3',
+      { scheme: 'ecdsa_secp256k1' }),
+      'publicKeyHex', 'missing material');
+    keyMustThrow(() => keyNode.rotateKey('alice', 'k2', 'k3',
+      { scheme: 'feudal', publicKeyHex: keyAlice.publicKeyHex() }),
+      'scheme must be', 'unknown scheme word');
+    keyMustThrow(() => keyNode.rotateKey('alice', 'k1', 'k5',
+      { scheme: 'ecdsa_secp256k1', publicKeyHex: keyAlice.publicKeyHex() }),
+      'key_not_active', 'revoked old key');
+    keyMustThrow(() => keyNode.activateKey('alice', 'k1'),
+      'key_revoked', 'activate a revoked key');
+
+    assert(keyNode.listKeys('bob').length === 1 &&
+           keyNode.listKeys('bob')[0].keyId === 'b1',
+      'keyring: lifecycle touches only the target user');
+  }
 })().then(() => {
   console.log(`\n${passed} passed, ${failed} failed`);
   process.exit(failed > 0 ? 1 : 0);
