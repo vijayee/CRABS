@@ -96,9 +96,9 @@ Same TDD pattern; C: attribute_machine.h:147/149/168 (read the real signatures �
 ### Task P5: OT ordered-set merge layer (recipe 8 → COMPLETE)
 
 **Files:** merge rides P1's `mergeState` (verify: does `crdt_merge_state` dispatch OT items via `crabs_ot_ordered_set_merge`? read crdt_merge.c's group/OT item branch — RE-VERIFY the merge case for DATA_TYPE_OT_ORDERED_SET exists: round-1's review said "merge layer C-only, no binding map entry" but the C fn exists at ot_ordered_set.h:114-117; crdt_merge_state's item dispatch must call it — read and confirm; if it does NOT dispatch OT items, add it + gtest).
-- [ ] **Step 1: Failing test:** two machines build divergent ordered sets WITH DIFFERENT OP LOGS (same element ids), mergeState, converged order == the C test's merge result (`test/test_ot_ordered_set.cpp:347-420` scenarios mirrored: copies src-only elements, larger placement_id per element, deletions win via merged position maps, conflicting payload → merge NULL = dst untouched — the executor's merge returns the error; pin BOTH the refusal case (dst unchanged) and the converge case).
-- [ ] **Step 2:** implement whatever is missing (C dispatch or export only); recipe 8: PARTIAL → COMPLETE (the merge layer now demos from JS via state-merge), the footer + status flip with re-anchored cites.
-- [ ] **Step 3:** battery + **Commit** `feat: ordered-set merge reachable from JS (state-merge dispatch)` + `docs(cookbook): recipe 8 COMPLETE`.
+- [x] **Step 1: Failing test:** two machines build divergent ordered sets WITH DIFFERENT OP LOGS (same element ids), mergeState, converged order == the C test's merge result (`test/test_ot_ordered_set.cpp:347-420` scenarios mirrored: copies src-only elements, larger placement_id per element, deletions win via merged position maps, conflicting payload → merge NULL = dst untouched — the executor's merge returns the error; pin BOTH the refusal case (dst unchanged) and the converge case).
+- [x] **Step 2:** implement whatever is missing (C dispatch or export only); recipe 8: PARTIAL → COMPLETE (the merge layer now demos from JS via state-merge), the footer + status flip with re-anchored cites.
+- [x] **Step 3:** battery + **Commit** `feat: ordered-set merge reachable from JS (state-merge dispatch)` + `docs(cookbook): recipe 8 COMPLETE`.
 
 ### Task P6: OT document + tree — PRESENT, UNBLESSED
 

@@ -3,7 +3,7 @@ number: 8
 slug: reorderable-list
 title: A reorderable list two people can edit at once
 section: Convergence
-status: PARTIAL
+status: COMPLETE
 maturity: STABLE
 target: native-c
 languages: c wasm node
@@ -121,7 +121,9 @@ UI shows row-level movement.
   the executor dispatches a `__execute_ot__` op through extract →
   transform → apply. Both bindings bind the *op* layer: item creation
   (`addOrderedSet`) and op application whose payload a wire encoder
-  builds.
+  builds — and, since the merge layer shipped, `Node.mergeState` carries
+  the CRDT merge: a snapshot's ordered-set item merges (or adopts) into
+  this machine's own.
 - **Op identity is yours to manage**: every op's id is caller-supplied —
   replaying the same id with the same payload is a silent no-op (the
   executor's already-applied skip), and a *cross-replica* replay must
@@ -160,18 +162,26 @@ UI shows row-level movement.
   `merge` directly).
 - A duplicated op id with the same payload is a no-op on replay; the same
   op id with a *different* payload refuses to merge at all instead of
-  picking a winner — C merge property.
+  picking a winner — and through `Node.mergeState` the refusal holds this
+  machine's list untouched and fires a `__merge_held__` change event with
+  the equivocation code (`fork_detected`, 0xA003), on both bindings.
 - Concurrent MOVE/SWAPs converge on one deterministic order — the op id
   that sorts larger wins the *entire* placement (whole-order re-stamp),
   so reordering is displaced rather than interleaved.
 - A delete beats a concurrent live element through the merged position
-  map — C merge property.
-- The binding path converges by exchanging *ops*, and the op transform is
-  dep-driven: it only skips log entries it can prove causally before or
-  depended-on, so replays must carry `options.deps`. This is
-  transform-based convergence, not full state-merge parity — a JS-only
-  replica cannot absorb a peer's serialized state until a binding ships
-  the merge.
+  map — pinned in C (`test/test_ot_ordered_set.cpp`) and, via
+  `Node.mergeState`, from both bindings.
+- Whole-state merge is shipped (parity-fill P5): a JS replica absorbs a
+  peer's serialized state with `Node.mergeState` — an ordered-set item
+  new to the machine adopts whole (value + op-log machinery), a same-name
+  item merges in place by the C merge's rules (src-only elements copy in,
+  the larger placement wins per element, deletions win, the order
+  re-materializes), and the merge returns SUCCESS even when one item was
+  held. There is no item-level merge transport — a C API to merge one
+  serialized item does not exist, so ordered-set item merge happens only
+  inside `mergeState`. The *live-op* path keeps its own trade: the op
+  transform is dep-driven and replays must carry `options.deps`, while a
+  state merge needs no causal context at all.
 - Rich-text/word-processing is a different and harder problem (cursor
   stability, IME composition, styled spans) — out of the cookbook's
   scope: the ordered set here covers discrete elements only.
@@ -214,9 +224,9 @@ transform: one function per op-type pair — 15x15 matrix on the item (src/OT/ot
 type surface: create/destroy/count/visible/get/find/head/tail + five apply_* + merge + merge_position_maps — src/OT/ot_ordered_set.h:69-117.
 merge semantics: copies src-only elements, larger placement_id per element (op-id tie-break), deletions win, re-materialized order from placement metadata — src/OT/ot_ordered_set.c:514+ (_materialize :293-350 rebuilds from anchor chain + placement priority; the snippet's merged replica re-derives its order, not arrival order).
 whole-order re-stamp: apply_move re-stamps every element's placement (src/OT/ot_ordered_set.c:432-478) — one deterministic winner per merged pair, not row-interleaved moves.
-merge preflight: _merge_preflight (src/OT/ot_ordered_set.c:197-257) refuses same-op-id/different-payload or invalid-merged-anchor replicas — merge returns NULL, destination untouched (a failed merge is an error, not a silent overwrite).
-status (why PARTIAL with languages: c wasm node): the op layer is JS-bound on BOTH bindings and the snippets execute; the merge layer — crabs_ot_ordered_set_merge + merge_position_maps, with the conflicting-payload refusal and merged-position-map guarantees — has no JS map entry (api-map §17 R8), so those properties are demonstrated in C: test/test_ot_ordered_set.cpp:347-375 (merge commutative for concurrent singletons) · :377-393 (conflicting payload refuses) · :395-420 (deletion wins).
-paper vs code: the shape is the paper's (docs/CRABS Extended.md §4, :195-279); two layers JS-bound — the op layer (items + apply through the executor, both bindings) and the C-only merge layer. The convergence a JS replica observes is transform-based, driven by the deps the issuer declares — say that before building on it.
+merge preflight: _merge_preflight (src/OT/ot_ordered_set.c:197-257) refuses same-op-id/different-payload or invalid-merged-anchor replicas — merge returns NULL, destination untouched (a failed merge is an error, not a silent overwrite; at the STATE layer the refusal converts to an untouched destination + a __merge_held__ event with CRABS_ERR_FORK_DETECTED, src/CRDT/crdt_merge.c's _merge_free_ot_ordered_set_item).
+status (why COMPLETE): the op layer is JS-bound on BOTH bindings AND the merge layer is reachable from JS — crdt_merge_state dispatches DATA_TYPE_OT_ORDERED_SET items through crabs_ot_ordered_set_merge (fresh-adopt deep copy + in-place merge; refusal held), so mergeState carries them: fresh-adoption + divergent-convergence pinned in bindings/wasm/test/state-restore.js, conflict-refusal hold pinned there and in bindings/node/test/test.js; the C merge properties stay pinned by test/test_ot_ordered_set.cpp:347-375 (merge commutative for concurrent singletons) · :377-393 (conflicting payload refuses) · :395-420 (deletion wins) and the state-level battery in test/test_crdt.cpp (TestCRDTMerge.TestMergeStateOt*).
+paper vs code: the shape is the paper's (docs/CRABS Extended.md §4, :195-279); both layers JS-bound — the op layer (items + apply through the executor, both bindings) and the state-merge layer (crdt_merge_state's ordered-set arm → mergeState, both bindings). The live-op convergence a JS replica observes is still transform-based, driven by the deps the issuer declares; a state merge needs no causal context — say both before building on them.
 fallback note: recipe 2 OR-set + integer rank + recipe 6 triggers is LWW per element, weaker than this machinery.
 
 target: crabs-wasm (snippet wasm/08-reorderable-list.js)
@@ -224,6 +234,7 @@ verified: executed
 symbols:
   Node.addOrderedSet         bindings/wasm/index.d.ts:604
   Node.getOrderedSet         bindings/wasm/index.d.ts:610
+  Node.mergeState            bindings/wasm/index.d.ts:937 (crdt_merge_state's OT dispatch — recipes' recipe-8 merge layer from JS)
   Node.orderedInsert         bindings/wasm/index.d.ts:623-624
   Node.orderedDelete         bindings/wasm/index.d.ts:626-627
   Node.orderedMove           bindings/wasm/index.d.ts:629-632
@@ -236,13 +247,14 @@ symbols:
   (__op_already_applied skip) src/OT/ot_execution.c:428, :605
   (executor branch)          src/StateMachine/state_machine.c:1799-1801
 maturity: all STABLE
-test_ref: bindings/wasm/test/ordered-set.js (seed order, MOVE 0->2, SWAP, DELETE, idempotent replay, deps-carry pin, policy refusal, two-machine op-exchange convergence)
+test_ref: bindings/wasm/test/ordered-set.js (seed order, MOVE 0->2, SWAP, DELETE, idempotent replay, deps-carry pin, policy refusal, two-machine op-exchange convergence) + bindings/wasm/test/state-restore.js (mergeState: fresh adopt, divergent convergence both directions, conflicting-payload hold 0xA003)
 
 target: crabs-node (snippet node/08-reorderable-list.js)
 verified: executed
 symbols:
   Node.addOrderedSet    bindings/node/index.d.ts:415
   Node.getOrderedSet    bindings/node/index.d.ts:421
+  Node.mergeState       bindings/node/index.d.ts:762 (crdt_merge_state's OT dispatch; direct C in crabs_node.cc:4008)
   Node.orderedInsert    bindings/node/index.d.ts:434-435
   Node.orderedDelete    bindings/node/index.d.ts:437-438
   Node.orderedMove      bindings/node/index.d.ts:440-443
@@ -253,7 +265,7 @@ symbols:
   OrderedSetApply       bindings/node/src/crabs_node.cc:2283
   (eager set + ot_data attach) src/OT/ot_execution.h:78-82 (crabs_register_ot_type)
 maturity: all STABLE
-test_ref: bindings/node/test/ordered-set.js (same scenarios as the wasm block)
+test_ref: bindings/node/test/ordered-set.js (same scenarios as the wasm block) + bindings/node/test/test.js (P5 block: mergeState fresh adopt, divergent convergence both directions, conflicting-payload hold 0xA003)
 
 target: native-c (snippet c/08-reorderable-list.c)
 verified: executed
@@ -280,5 +292,5 @@ symbols:
   (op type word)            src/CRABS/crabs.h:170
   (dispatch pipeline: extract → transform → apply) src/OT/ot_execution.h:43-64
 maturity: all STABLE
-test_ref: test/test_ot_ordered_set.cpp:190-225 (MOVE) + :347-375 (merge commutative for concurrent singletons) + :377-393 (conflicting payload refuses to merge) + :395-420 (deletion wins)
+test_ref: test/test_ot_ordered_set.cpp:190-225 (MOVE) + :347-375 (merge commutative for concurrent singletons) + :377-393 (conflicting payload refuses to merge) + :395-420 (deletion wins) + test/test_crdt.cpp (TestCRDTMerge.TestMergeStateOt* — the STATE-level merge battery: fresh adopt, src-only copy, larger placement, deletion wins, commutative convergence, conflict hold, idempotence)
 -->
