@@ -270,6 +270,12 @@ void serialized_buffer_destroy(serialized_buffer_t* buf) {
 // against the remaining buffer (A10-M7).
 #define CRABS_OT_OP_ID_WIRE_SIZE (CRABS_MAX_USER_ID + 2 * sizeof(uint64_t))
 
+// Wire size an op occupies on the wire even when its payload and dependency
+// list are EMPTY: fixed-width id + type + three u64 position fields + payload
+// length + dep count + transform id (A10-M7 family — audit M-1b).
+#define CRABS_OT_OP_MIN_WIRE_SIZE \
+  (CRABS_OT_OP_ID_WIRE_SIZE + 4 * sizeof(uint32_t) + 3 * sizeof(uint64_t))
+
 static void _serialize_ot_op_id(write_buf_t* buf, const crabs_ot_op_id_t* id) {
   _write_bytes(buf, (const uint8_t*)id->node_id, CRABS_MAX_USER_ID);
   _write_uint64_le(buf, id->sequence_num);
@@ -563,6 +569,7 @@ static bool _deserialize_ot_type_state(read_buf_t* buf, data_item_t* item,
       if (span_count > CRABS_DESER_MAX_LOG) return false;
 
       crabs_span_t* tail = NULL;
+      crabs_span_t* span = NULL;
       for (uint32_t i = 0; i < span_count; i++) {
         crabs_ot_op_id_t id;
         if (!_deserialize_ot_op_id(buf, &id)) return false;
@@ -571,23 +578,23 @@ static bool _deserialize_ot_type_state(read_buf_t* buf, data_item_t* item,
         uint32_t text_size = 0;
         if (!_read_bytes32(buf, &text, &text_size)) return false;
 
-        crabs_span_t* span = crabs_span_create(&id, text, text_size);
+        span = crabs_span_create(&id, text, text_size);
         if (text != NULL) free(text);
         if (span == NULL) return false;
 
         uint32_t style_count;
-        if (!_read_uint32_le(buf, &style_count)) return false;
+        if (!_read_uint32_le(buf, &style_count)) goto span_fail;
         // Audit M-E: reject (do not clamp) oversized style_count. Clamping
         // desynced the parse.
-        if (style_count > CRABS_SPAN_MAX_STYLES) return false;
+        if (style_count > CRABS_SPAN_MAX_STYLES) goto span_fail;
         span->style_count = style_count;
         for (uint32_t s = 0; s < span->style_count; s++) {
-          if (!_read_string16(buf, span->styles[s].name, CRABS_STYLE_NAME_MAX)) return false;
-          if (!_read_string16(buf, span->styles[s].value, CRABS_STYLE_VALUE_MAX)) return false;
+          if (!_read_string16(buf, span->styles[s].name, CRABS_STYLE_NAME_MAX)) goto span_fail;
+          if (!_read_string16(buf, span->styles[s].value, CRABS_STYLE_VALUE_MAX)) goto span_fail;
         }
 
         uint8_t deleted;
-        if (!_read_uint8(buf, &deleted)) return false;
+        if (!_read_uint8(buf, &deleted)) goto span_fail;
         span->deleted = (deleted != 0);
 
         if (doc->head == NULL) {
@@ -603,6 +610,10 @@ static bool _deserialize_ot_type_state(read_buf_t* buf, data_item_t* item,
       }
       doc->tail = tail;
       break;
+      span_fail:  // Audit R7-L-6: the allocated span is unlinked — free it
+                  // before the enclosing parse failure unwinds.
+      crabs_span_destroy(span);
+      return false;
     }
     case DATA_TYPE_OT_TREE: {
       crabs_ot_tree_t* tree = (crabs_ot_tree_t*)item->value;
@@ -1331,7 +1342,7 @@ static bool _deserialize_data_item(read_buf_t* buf, data_item_t* item, uint32_t 
         item->type == DATA_TYPE_RESOURCE) {
       int64_t* val = get_memory(sizeof(int64_t));
       *val = 0;
-      for (int i = 0; i < 8 && i < (int)val_len; i++) {
+      for (int i = 0; i < 8 && (size_t)i < val_len; i++) {
         *val |= ((int64_t)val_data[i]) << (i * 8);
       }
       item->value = val;
@@ -1341,7 +1352,7 @@ static bool _deserialize_data_item(read_buf_t* buf, data_item_t* item, uint32_t 
     } else if (item->type == DATA_TYPE_REGISTER) {
       int64_t* val = get_memory(sizeof(int64_t));
       *val = 0;
-      for (int i = 0; i < 8 && i < (int)val_len; i++) {
+      for (int i = 0; i < 8 && (size_t)i < val_len; i++) {
         *val |= ((int64_t)val_data[i]) << (i * 8);
       }
       item->value = val;
@@ -3140,8 +3151,18 @@ static state_t* _deserialize_state_internal(const uint8_t* data, size_t len,
   if (version >= 19) {
     uint32_t retired_keys_count = 0;
     if (!_read_uint32_le(&buf, &retired_keys_count)) goto fail;
+    // Audit M-4: structural validation mirroring the v13 child key chain —
+    // versions strictly increasing (a rotation history cannot revisit or
+    // skip-back a version, which also rejects duplicates), the CURRENT
+    // installed key version must never appear (a key is retired only after
+    // it stops being current), and every stored public key is re-validated
+    // on-curve. Without these, an attacker-written blob could inject a
+    // fabricated "retired" foreign key and then legitimize it inside stamped
+    // manifest provenance. Entry wire is a u64 version + 33-byte key = 41
+    // bytes minimum.
     if (retired_keys_count > CRABS_MAX_LINEAGE_KEY_CHAIN ||
-        (size_t)retired_keys_count > buf.len - buf.offset) {
+        (size_t)retired_keys_count >
+            (buf.len - buf.offset) / (8 + 33)) {
       goto fail;
     }
     if (retired_keys_count > 0) {
@@ -3156,6 +3177,29 @@ static state_t* _deserialize_state_internal(const uint8_t* data, size_t len,
             &state->lineage_retired_keys[retired_index];
         if (!_read_uint64_le(&buf, &retired_entry->key_version) ||
             !_read_bytes(&buf, retired_entry->public_key, 33)) {
+          goto fail;
+        }
+        if (retired_index > 0 &&
+            retired_entry->key_version <= retired_entry[-1].key_version) {
+          goto fail;
+        }
+        if (retired_entry->key_version == state->lineage_key_version) {
+          goto fail;
+        }
+        if (!crypto_ecdsa_validate_public_key(retired_entry->public_key)) {
+          goto fail;
+        }
+      }
+      // Audit M-4 (byte-level complement to the version check): the machine's
+      // current public key can never co-occur in the retired tail — a blob
+      // claiming "the installed key is retired" is self-contradictory.
+      // node_public_key is host-injected AFTER parse on most load paths, so
+      // this fires only where the deserializer embeds it (keys variants
+      // restore it inside the same payload); harmless no-op otherwise.
+      for (uint32_t retired_index = 0; retired_index < retired_keys_count;
+           retired_index++) {
+        if (memcmp(state->lineage_retired_keys[retired_index].public_key,
+                   state->node_public_key, 33) == 0) {
           goto fail;
         }
       }
@@ -3925,11 +3969,12 @@ crabs_ot_data_item_t* crabs_deserialize_ot_data(const uint8_t* data, size_t len,
   uint32_t op_count;
   if (!_read_uint32_le(&buf, &op_count)) goto fail;
   if (op_count > CRABS_OT_OP_LOG_MAX) goto fail;
-  // Audit H-G: bound the allocation to remaining buffer. Each op is at least
-  // a few bytes on the wire; if op_count exceeds the remaining buffer, the
-  // requested allocation (op_count * ~1.4KB) would be far larger than the
-  // input and the aborting allocator turns a few-byte packet into a DoS.
-  if (op_count > (buf.len - buf.offset)) goto fail;
+  // Audit H-G: bound the allocation to remaining buffer. Audit M-1b: the
+  // true per-op wire minimum is ~120 bytes (80-byte op id + fixed-width
+  // fields, zero-length payload and deps), not 1 — the old 1-byte/op bound
+  // let a ~1MB blob drive a ~1.4GB pre-allocation (each op is ~1.4KB in
+  // RAM) and the aborting allocator turned that into a remote crash.
+  if (op_count > (buf.len - buf.offset) / CRABS_OT_OP_MIN_WIRE_SIZE) goto fail;
   if (op_count > 0) {
     free(item->op_log);
     item->op_log = get_clear_memory(sizeof(crabs_ot_operation_t) * op_count);

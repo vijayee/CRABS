@@ -4252,3 +4252,139 @@ TEST(OtValueMarker, PreMarkerBlobStillLoads) {
   state_destroy(state);
   serialized_buffer_destroy(buf);
 }
+
+// ============================================================
+// Audit M-4: the v19 retired-lineage-keys tail gets the same structural
+// validation as the v13 child key chain — strictly increasing versions, the
+// current key version excluded, and on-curve public keys.
+// ============================================================
+
+// Craft the in-memory retired tail and let the writer emit it; the reader
+// must reject structurally invalid histories.
+TEST(StateSerialize, RetiredKeyTailRejectsNonMonotoneVersions) {
+  ecdsa_keypair_t* key = crypto_ecdsa_generate();
+  ASSERT_NE(key, nullptr);
+
+  state_t* state = state_create();
+  state->lineage_key_version = 7;
+  state->lineage_retired_keys_count = 2;
+  state->lineage_retired_keys =
+      (lineage_key_chain_entry_t*)calloc(2, sizeof(lineage_key_chain_entry_t));
+  ASSERT_NE(state->lineage_retired_keys, nullptr);
+  state->lineage_retired_keys[0].key_version = 5;
+  memcpy(state->lineage_retired_keys[0].public_key, key->public_key, 33);
+  state->lineage_retired_keys[1].key_version = 5;   // revisit → reject
+  memcpy(state->lineage_retired_keys[1].public_key,
+         state->lineage_retired_keys[0].public_key, 33);
+
+  serialized_buffer_t* buf = crabs_serialize_state(state);
+  ASSERT_NE(buf, nullptr);
+  EXPECT_EQ(crabs_deserialize_state(buf->data, buf->len), nullptr)
+      << "a rotation history cannot revisit a version";
+
+  serialized_buffer_destroy(buf);
+  state_destroy(state);
+  crypto_ecdsa_keypair_destroy(key);
+}
+
+TEST(StateSerialize, RetiredKeyTailRejectsOffCurveKeys) {
+  state_t* state = state_create();
+  state->lineage_key_version = 7;
+  state->lineage_retired_keys_count = 1;
+  state->lineage_retired_keys =
+      (lineage_key_chain_entry_t*)calloc(1, sizeof(lineage_key_chain_entry_t));
+  ASSERT_NE(state->lineage_retired_keys, nullptr);
+  state->lineage_retired_keys[0].key_version = 5;
+  memset(state->lineage_retired_keys[0].public_key, 0x99, 33);
+  state->lineage_retired_keys[0].public_key[0] = 0x02;
+
+  serialized_buffer_t* buf = crabs_serialize_state(state);
+  ASSERT_NE(buf, nullptr);
+  EXPECT_EQ(crabs_deserialize_state(buf->data, buf->len), nullptr)
+      << "only valid secp256k1 points belong in a key history";
+
+  serialized_buffer_destroy(buf);
+  state_destroy(state);
+}
+
+TEST(StateSerialize, RetiredKeyTailRejectsCurrentKeyVersion) {
+  ecdsa_keypair_t* key = crypto_ecdsa_generate();
+  ASSERT_NE(key, nullptr);
+
+  state_t* state = state_create();
+  state->lineage_key_version = 7;
+  state->lineage_retired_keys_count = 1;
+  state->lineage_retired_keys =
+      (lineage_key_chain_entry_t*)calloc(1, sizeof(lineage_key_chain_entry_t));
+  ASSERT_NE(state->lineage_retired_keys, nullptr);
+  state->lineage_retired_keys[0].key_version = 7;   // the CURRENT version
+  memcpy(state->lineage_retired_keys[0].public_key, key->public_key, 33);
+
+  serialized_buffer_t* buf = crabs_serialize_state(state);
+  ASSERT_NE(buf, nullptr);
+  EXPECT_EQ(crabs_deserialize_state(buf->data, buf->len), nullptr)
+      << "a key is retired only after it stops being current";
+
+  serialized_buffer_destroy(buf);
+  state_destroy(state);
+  crypto_ecdsa_keypair_destroy(key);
+}
+
+// A structurally VALID retired tail still round-trips (the validation must
+// not break legitimate rotation histories).
+TEST(StateSerialize, RetiredKeyTailValidHistoryRoundTrips) {
+  ecdsa_keypair_t* key_a = crypto_ecdsa_generate();
+  ecdsa_keypair_t* key_b = crypto_ecdsa_generate();
+  ASSERT_NE(key_a, nullptr);
+  ASSERT_NE(key_b, nullptr);
+
+  state_t* state = state_create();
+  state->lineage_key_version = 8;
+  state->lineage_retired_keys_count = 2;
+  state->lineage_retired_keys =
+      (lineage_key_chain_entry_t*)calloc(2, sizeof(lineage_key_chain_entry_t));
+  ASSERT_NE(state->lineage_retired_keys, nullptr);
+  state->lineage_retired_keys[0].key_version = 5;
+  memcpy(state->lineage_retired_keys[0].public_key, key_a->public_key, 33);
+  state->lineage_retired_keys[1].key_version = 7;
+  memcpy(state->lineage_retired_keys[1].public_key, key_b->public_key, 33);
+
+  serialized_buffer_t* buf = crabs_serialize_state(state);
+  ASSERT_NE(buf, nullptr);
+  state_t* restored = crabs_deserialize_state(buf->data, buf->len);
+  ASSERT_NE(restored, nullptr);
+  EXPECT_EQ(restored->lineage_retired_keys_count, 2u);
+  EXPECT_EQ(restored->lineage_retired_keys[0].key_version, 5u);
+  EXPECT_EQ(restored->lineage_retired_keys[1].key_version, 7u);
+  EXPECT_EQ(memcmp(restored->lineage_retired_keys[1].public_key,
+                   key_b->public_key, 33), 0);
+
+  state_destroy(restored);
+  serialized_buffer_destroy(buf);
+  state_destroy(state);
+  crypto_ecdsa_keypair_destroy(key_a);
+  crypto_ecdsa_keypair_destroy(key_b);
+}
+
+// ============================================================
+// Audit M-1b (allocation amplification): the OT op-log count must be bounded
+// by remaining-bytes / per-op WIRE MINIMUM (~120 bytes), not 1 byte/op —
+// else a 1 MB blob pre-allocates ~1.4 GB and the aborting allocator turns
+// the packet into a remote crash.
+// ============================================================
+TEST(OTDataWire, OpLogCountBoundedAgainstRemainingWireBytes) {
+  // 8 bytes total: ot_type_id + op_count = 1 000 000 (a legal-looking count
+  // far above the per-op wire minimum the buffer can hold).
+  std::vector<uint8_t> blob;
+  auto push_u32 = [&](uint32_t value) {
+    blob.push_back((uint8_t)(value & 0xFF));
+    blob.push_back((uint8_t)((value >> 8) & 0xFF));
+    blob.push_back((uint8_t)((value >> 16) & 0xFF));
+    blob.push_back((uint8_t)((value >> 24) & 0xFF));
+  };
+  push_u32(1);                        // ot_type_id
+  push_u32(1000000);                  // op_count: 1M × ~120 bytes ≫ 4 bytes left
+
+  EXPECT_EQ(crabs_deserialize_ot_data(blob.data(), blob.size(), 1), nullptr)
+      << "a few-byte packet must not pre-allocate ~1.4 GB of op log";
+}
