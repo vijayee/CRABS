@@ -618,7 +618,12 @@ export interface Node {
   /** Subscribe to state-change events ('change' only). Returns an
    *  unsubscribe function that removes the listener again. */
   on(eventName: 'change', listener: (event: CrabsChangeEvent) => void): () => void;
-  /** Remove a previously registered 'change' listener. */
+  /**
+   * Remove a previously registered 'change' listener. (DELIBERATE
+   * binding divergence: the native binding's `on` relies on the unsubscribe
+   * function it returns and has no off(); both event idioms are per-host
+   * design, not an alignment gap.)
+   */
   off(eventName: 'change', listener: (event: CrabsChangeEvent) => void): void;
   getUser(userId: string): UserInfo | undefined;
 
@@ -968,6 +973,11 @@ export interface Node {
   raftStatus(): RaftStatus | null;
 
   // Low-level handler: receives raw WASM pointers (statePtr, opPtr).
+  // (registerHandlerJs/HandlerState/HandlerOperation are DELIBERATELY
+  // wasm-only — the native binding has no custom-handler surface by
+  // design; node recipes drive state directly through its typed
+  // read/mutation methods. Documented in the api-map's deliberate-
+  // differences ledger.)
   registerHandler(opType: string, handler: (statePtr: number, opPtr: number) => number): void;
   // High-level handler: receives a mutable HandlerState proxy and a HandlerOperation.
   registerHandlerJs(opType: string, handler: (state: HandlerState, op: HandlerOperation) => number): void;

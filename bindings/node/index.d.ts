@@ -298,6 +298,11 @@ export interface HLC {
   nodeId: string;
   formatted: string;
 }
+/* getHLC semantics (parity-fill P10 alignment): the readback above is a
+   READ-ONLY watermark — the machine's last-issued timestamp, identical
+   across consecutive reads. The clock advances only when an op executes
+   (every sign/execute path issues crabs_hlc_next). crabs-wasm's getHLC
+   shares this shape and these semantics verbatim (CrabsHLC). */
 
 /** Write-domains v1 item options for Node.defineItem. */
 export interface DefineItemOptions {
@@ -387,8 +392,21 @@ export interface CrabsChangeEvent {
   result: number;  // crabs_error_e
 }
 
+/**
+ * The machine wrapper. Lifetime note (DELIBERATE divergence, not an
+ * oversight — the two bindings state their ownership models in prose):
+ * node wrappers OWN their machines and are garbage-collected like any JS
+ * object — there is no Node.destroy() here (crabs-wasm's `Node.destroy()`
+ * is its borrow-lifetime counterpart, and its rootIds convenience differs
+ * in `getOTTree` the same way). The custom-handler surface
+ * (`registerHandlerJs`/`HandlerState`) is likewise wasm-only BY DESIGN —
+ * node recipes drive state directly through this typed read/mutation
+ * surface. Everything else is mirrored binding-to-binding (the honest-noise
+ * divergences — pagination, byte registers, BigInt registers,
+ * evaluateTriggers, Operation.deserialize, selfAssert/verifyIdentity,
+ * getHLC — were closed in the parity-fill alignment).
+ */
 export interface Node {
-  // User management
   registerUser(userId: string, publicKeyHex: string, initialAttrs?: string): void;
   grantRole(targetUser: string, role: string, value: string, signerId: string): void;
   selfAssert(attribute: string, value: string, signerId: string): void;
@@ -1017,6 +1035,15 @@ export interface Node {
   mergeState(wire: Buffer): void;
 
   // HLC
+  /**
+   * HLC watermark readback — the machine's LAST-issued hybrid timestamp,
+   * WITHOUT advancing the clock (see the `HLC` interface note: parity-fill
+   * P10 unified this with crabs-wasm — both getters are the read-only
+   * watermark; the clock advances only when an op executes). Returns
+   * undefined on an uninitialized clock (lamport-ordered machine). After a
+   * restore the watermark CONTINUES the previous machine's HLC
+   * (deserialize's Continuity note).
+   */
   getHLC(): HLC | undefined;
   setTime(nowMs: number): void;
   pruneExpiredTempAttrs(): number;
