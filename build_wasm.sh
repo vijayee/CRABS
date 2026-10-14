@@ -225,6 +225,11 @@ build_variant() {
   done
 
   echo "Linking WASM module (${VARIANT_SUFFIX:-prod})..."
+  # -Wl,--wrap=malloc/calloc: every allocation in the module lands through
+  # src/Util/wasm_alloc_pad.c, which pads by 32 bytes — the OpenSSL 3.4.0
+  # wasm EC-group path overflows a few bytes per ECDSA keygen/sign and, unpadded,
+  # corrupts dlmalloc chunk headers (the ot-document-tree.js OOB flake —
+  # diagnosis in src/Util/wasm_alloc_pad.c and the test file).
   emcc $CFLAGS $EXTRA_DEFINES \
     $OBJECTS \
     "$OPENABE_WASM/liboabe_c_wasm.a" \
@@ -241,6 +246,7 @@ build_variant() {
     -s EXPORTED_FUNCTIONS="$EXPORTS_JSON" \
     -s EXPORTED_RUNTIME_METHODS='["ccall","cwrap","getValue","setValue","UTF8ToString","stringToUTF8","lengthBytesUTF8","addFunction","removeFunction","HEAP8","HEAPU8","HEAP16","HEAPU16","HEAP32","HEAPU32","HEAPF32","HEAPF64"]' \
     --js-library "$ROOT_DIR/src/TimeSource/wasm_time_library.js" \
+    -Wl,--wrap=malloc -Wl,--wrap=calloc \
     -O2 \
     2>&1
 }

@@ -6,6 +6,23 @@
 // exists (recipe 8's boundary note). The pinned facts are round-trip,
 // determinism and the merge-held status — NOT performance or
 // convergence-parity claims.
+//
+// FIXED PRE-EXISTING FLAKE (parity-fill P11 investigation, 2026-10-14).
+// This test used to fail standalone on ~15/20 runs with
+// `RuntimeError: memory access out of bounds` inside dlmalloc during a
+// later ECDSA allocation. Root cause (full trail in
+// src/Util/wasm_alloc_pad.c): OpenSSL 3.4.0's wasm EC-group construction
+// (EC_KEY_new_by_curve_name → BN_MONT_CTX_set) overflows a few bytes past
+// an allocation on effectively every ECDSA keygen/sign; with per-op
+// signing the scribbles accumulate (monotonic failure gradient in op
+// count), and once one of them hits a dlmalloc chunk header the next large
+// malloc/free walks unmapped memory — which is why it looked random and
+// why the native binding (glibc's allocator) never reproduced it.
+// Mitigation shipped in build_wasm.sh: every allocation goes through
+// src/Util/wasm_alloc_pad.c (-Wl,--wrap=malloc/calloc, +32-byte pad), so
+// the overflow always lands in pad slack. Drop that shim together with
+// these flags when the wasm OpenSSL is regenerated against a fixed
+// version.
 
 'use strict';
 
