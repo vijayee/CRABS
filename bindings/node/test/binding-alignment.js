@@ -200,6 +200,21 @@ const assert = require('assert');
     'a cooldown-suppressed tick does not re-issue the attribute');
 
   // ==========================================================
+  // getHLC — the read-only watermark (semantics aligned with wasm)
+  // ==========================================================
+  const watermark = node.getHLC();
+  assert.ok(watermark && watermark.seconds > 0,
+    `HLC machine reports its watermark (got ${JSON.stringify(watermark)})`);
+  assert.strictEqual(watermark.nodeId, 'admin', 'watermark identity');
+  assert.ok(typeof watermark.formatted === 'string' && watermark.formatted.length > 0,
+    'formatted stamp present');
+  // READ-ONLY: two consecutive reads are identical — the clock advances
+  // only when an op executes (matching crabs-wasm's getHLC verbatim).
+  assert.deepStrictEqual(JSON.parse(JSON.stringify(node.getHLC())),
+    JSON.parse(JSON.stringify(watermark)),
+    'getHLC is a read-only watermark read');
+
+  // ==========================================================
   // Operation.deserialize — the wire round trip
   // ==========================================================
   const aliceKey = KeyPair.generate();

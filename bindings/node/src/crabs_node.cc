@@ -5491,18 +5491,26 @@ private:
 
   // --- HLC ---
 
+  // HLC watermark readback (parity-fill P10 semantics alignment): the
+  // machine's LAST-issued timestamp, read-only — two consecutive reads are
+  // identical, matching crabs-wasm's getHLC (crabs_wasm_get_hlc). The old
+  // node behavior issued a NEXT timestamp per call; nothing consumed that
+  // side effect (every sign/execute path stamps crabs_hlc_next explicitly,
+  // including all of this binding's op drivers), while an advancing read
+  // made the watermark non-idempotent and the P1 restore-continuity pins
+  // impossible to mirror across bindings.
   Napi::Value GetHLC(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
     if (!am_->base_state.hlc_state_initialized)
       return env.Undefined();
-    crabs_hlc_t hlc = crabs_hlc_next(&am_->base_state.hlc_state);
+    const crabs_hlc_t* hlc = &am_->base_state.hlc_state.last;
     Napi::Object obj = Napi::Object::New(env);
-    obj.Set("seconds", Napi::Number::New(env, (double)hlc.physical_seconds));
-    obj.Set("nanos", Napi::Number::New(env, (double)hlc.physical_nanos));
-    obj.Set("logicalCounter", Napi::Number::New(env, (double)hlc.logical_counter));
-    obj.Set("nodeId", Napi::String::New(env, hlc.node_id));
+    obj.Set("seconds", Napi::Number::New(env, (double)hlc->physical_seconds));
+    obj.Set("nanos", Napi::Number::New(env, (double)hlc->physical_nanos));
+    obj.Set("logicalCounter", Napi::Number::New(env, (double)hlc->logical_counter));
+    obj.Set("nodeId", Napi::String::New(env, hlc->node_id));
     char fmt[128];
-    crabs_hlc_format(&hlc, fmt, sizeof(fmt));
+    crabs_hlc_format(hlc, fmt, sizeof(fmt));
     obj.Set("formatted", Napi::String::New(env, fmt));
     return obj;
   }
