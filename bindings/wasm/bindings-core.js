@@ -3943,6 +3943,84 @@ class RaftHost {
     return this._modulePtr;
   }
 
+  // Joint-consensus membership change (Raft §6, parity-fill P9): the leader
+  // appends the C_old,new joint entry to the module's OWN config log; when
+  // committed the module auto-appends the C_new successor, and that entry's
+  // commit ends the transition (raft_module.h:216). Returns the assigned
+  // proposal_id (the config entry's log index); every refusal throws —
+  // ordering_not_leader (leader-only), ordering_change_in_flight (ONE change
+  // at a time: an appended-but-uncommitted config entry or an active joint
+  // phase blocks), invalid_param (1..16 non-empty member ids).
+  changeMembership(members) {
+    if (this._destroyed) throw new Error('RaftHost destroyed');
+    if (!Array.isArray(members) ||
+        members.some((id) => typeof id !== 'string' || id.length === 0)) {
+      throw new TypeError(
+        'changeMembership: members must be an array of non-empty id strings');
+    }
+    if (members.length === 0 || members.length > 16) {
+      throw new RangeError('changeMembership: members must have 1..16 ids');
+    }
+    const M = this._M;
+    // char*[] like the constructor's peer list (all ids are heap strings).
+    const memberPtrs = members.map((memberId) => writeString(M, memberId));
+    const memberArrayPtr = M._malloc(memberPtrs.length * 4);
+    for (let memberIndex = 0; memberIndex < memberPtrs.length; memberIndex++) {
+      M.setValue(memberArrayPtr + memberIndex * 4, memberPtrs[memberIndex],
+                 'i32');
+    }
+    const outProposalPtr = M._malloc(8);
+    const rc = M._crabs_wasm_raft_change_membership(
+      this._modulePtr, memberArrayPtr, memberPtrs.length, outProposalPtr);
+    const proposalId = Number(M.getValue(outProposalPtr, 'i64'));
+    freeAll(M, memberArrayPtr, outProposalPtr);
+    for (const memberPtr of memberPtrs) M._free(memberPtr);
+    wrapRc(rc, 'changeMembership');
+    // The appended entry produces persist + fan-out work immediately — move
+    // it without waiting for the next tick (mirrors pumpInbound's cascade).
+    this._drainOutbound();
+    this._pumpPersist();
+    return proposalId;
+  }
+
+  // Membership reads (C config order, not sorted): the ACTIVE committed
+  // config (the election/voting list) and the SECOND list of an active
+  // joint consensus — empty while the cluster runs a plain single consensus
+  // (visible between the joint entry's commit and the C_new successor's).
+  _parseMemberList(envelope) {
+    const M = this._M;
+    const out = [];
+    if (envelope) {
+      const dataPtr = M._crabs_wasm_buffer_data(envelope);
+      const len = M._crabs_wasm_buffer_len(envelope);
+      const bytes = M.HEAPU8.subarray(dataPtr, dataPtr + len);
+      const view = new DataView(bytes.buffer, bytes.byteOffset,
+                                bytes.byteLength);
+      const count = view.getUint32(0, true);
+      let cursor = 4;
+      for (let index = 0; index < count; index++) {
+        const idLen = view.getUint16(cursor, true); cursor += 2;
+        out.push(new TextDecoder().decode(
+          bytes.subarray(cursor, cursor + idLen)));
+        cursor += idLen;
+      }
+      M._crabs_wasm_buffer_destroy(envelope);
+    }
+    return out;
+  }
+
+  jointMembers() {
+    if (this._destroyed) throw new Error('RaftHost destroyed');
+    return this._parseMemberList(
+      this._M._crabs_wasm_raft_joint_members(this._modulePtr));
+  }
+
+  committedMembers() {
+    if (this._destroyed) throw new Error('RaftHost destroyed');
+    return this._parseMemberList(
+      this._M._crabs_wasm_raft_committed_members(this._modulePtr));
+  }
+
   status() {
     const M = this._M;
     // The committed-config member list arrives as [u32 count][entries…];

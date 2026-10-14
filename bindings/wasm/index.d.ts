@@ -548,6 +548,26 @@ export interface RaftHost {
   raftPollNotifications(): RaftNotification[];
   /** Borrowed crabs_raft_module_t pointer (raw-propose / membership). */
   moduleHandle(): number;
+  /**
+   * Joint-consensus membership change (Raft §6, parity-fill P9): the leader
+   * appends the C_old,new joint entry to the module's own config log; when
+   * committed the module auto-appends C_new, and THAT entry's commit ends
+   * the transition. Returns the assigned proposal_id (the config entry's
+   * log index); every refusal throws — ordering_not_leader (leader-only),
+   * ordering_change_in_flight (one change at a time: an
+   * appended-but-uncommitted config entry or an active joint phase blocks),
+   * invalid_param (0 or >16 members, empty ids).
+   */
+  changeMembership(members: string[]): number;
+  /**
+   * The SECOND list of an active joint consensus — empty while the cluster
+   * runs a plain single consensus (visible between the joint C_old,new
+   * entry's commit and the automatic C_new successor's commit).
+   * C config order, not sorted.
+   */
+  jointMembers(): string[];
+  /** The ACTIVE committed config member list (C config order, not sorted). */
+  committedMembers(): string[];
   status(): RaftStatus;
   destroy(): void;
 }

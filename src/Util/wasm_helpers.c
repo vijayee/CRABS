@@ -4285,12 +4285,8 @@ uint32_t crabs_wasm_raft_rejected_message_count(
 
 // Committed-config member ids into a flat wasm buffer: u32 count +
 // count × [u16 len][id bytes], max CRABS_RAFT_MAX_PEERS entries.
-EMSCRIPTEN_KEEPALIVE
-serialized_buffer_t* crabs_wasm_raft_committed_members(
-    crabs_raft_module_t* module) {
-  if (module == NULL) return NULL;
-  char ids[CRABS_RAFT_MAX_PEERS][CRABS_MAX_USER_ID];
-  uint32_t count = crabs_raft_module_committed_members(module, ids);
+static serialized_buffer_t* _raft_members_envelope(
+    uint32_t count, const char (*ids)[CRABS_MAX_USER_ID]) {
   size_t body_len = 4;
   for (uint32_t index = 0; index < count; index++) {
     body_len += 2 + strlen(ids[index]);
@@ -4307,6 +4303,26 @@ serialized_buffer_t* crabs_wasm_raft_committed_members(
   serialized_buffer_t* buffer = _raft_envelope(body_len, body);
   free(body);
   return buffer;
+}
+
+EMSCRIPTEN_KEEPALIVE
+serialized_buffer_t* crabs_wasm_raft_committed_members(
+    crabs_raft_module_t* module) {
+  if (module == NULL) return NULL;
+  char ids[CRABS_RAFT_MAX_PEERS][CRABS_MAX_USER_ID];
+  uint32_t count = crabs_raft_module_committed_members(module, ids);
+  return _raft_members_envelope(count, ids);
+}
+
+// The SECOND list of an active joint consensus (empty while a plain single
+// consensus runs), same flat wire shape as the committed list.
+EMSCRIPTEN_KEEPALIVE
+serialized_buffer_t* crabs_wasm_raft_joint_members(
+    crabs_raft_module_t* module) {
+  if (module == NULL) return NULL;
+  char ids[CRABS_RAFT_MAX_PEERS][CRABS_MAX_USER_ID];
+  uint32_t count = crabs_raft_module_joint_members(module, ids);
+  return _raft_members_envelope(count, ids);
 }
 
 // ============================================================

@@ -329,6 +329,90 @@ async function main() {
   console.log(`    recovery: nodeB resumed committing (tip ` +
               `${nodesById['nodeB'].raftStatus().commitTip})`);
 
+  // ---- Membership change (Raft §6 joint consensus — parity-fill P9, the
+  // wasm mirror of the node suite's leg): the 3-node cluster shrinks to 2.
+  // Pinned: pending right after the call (nothing visible yet), the joint
+  // second list between the two commits, then the plain two-member config
+  // everywhere including the excluded node; ops keep landing on the
+  // survivors and are cut off from the excluded node. ----
+  {
+    await waitFor(
+      () => nodes.filter((entry) => entry.raftStatus().isLeader).length === 1,
+      'one leader to settle before the membership change');
+    const changeLeader = nodes.find((entry) => entry.raftStatus().isLeader);
+    const changeHost = hosts[changeLeader.adminId];
+    const changeId = changeHost.changeMembership(['nodeA', 'nodeB']);
+    assert.ok(changeId > 0,
+      'the change returns the assigned proposal_id (the log index)');
+
+    // ONE change at a time (§6): an appended-but-uncommitted config entry
+    // refuses a second change immediately.
+    assert.throws(() => changeHost.changeMembership(['nodeA', 'nodeB']),
+      /ordering_change_in_flight/,
+      'a second concurrent change must refuse');
+    assert.strictEqual(changeLeader.raftStatus().configChangePending, true,
+      'the change must be pending before its joint commit');
+    assert.deepStrictEqual(
+      [...changeHost.committedMembers()].sort(),
+      ['nodeA', 'nodeB', 'nodeC'],
+      'the committed config must stay the old three pre-commit');
+
+    // The joint C_old,new commits (old-list majority 2/3); the joint second
+    // list spans both configs until the automatic C_new successor commits.
+    // The window closes within one replication round, so the poll LATCHES
+    // whatever joint list any host surfaces while waiting for the settle.
+    let jointSecondList = null;
+    await waitFor(() => {
+      for (const id of NODE_IDS) {
+        const joint = hosts[id].jointMembers();
+        if (joint.length > 0) jointSecondList = [...joint].sort();
+      }
+      return NODE_IDS.every((id) =>
+        hosts[id].jointMembers().length === 0 &&
+        nodesById[id].raftStatus().configChangePending === false);
+    }, 'the transition to settle through the joint phase', 30000, 5);
+    assert.deepStrictEqual(jointSecondList, ['nodeA', 'nodeB'],
+      'the joint phase must have been visible between the two commits');
+    await waitFor(() =>
+      NODE_IDS.every((id) =>
+        [...hosts[id].committedMembers()].sort().join(',') ===
+        'nodeA,nodeB'),
+      'every node (including the excluded one) to settle on the final config');
+
+    // Ops keep landing on the reduced cluster — materialized content flows
+    // to the survivors only. The excluded node's tip freezes.
+    await waitFor(() =>
+      nodes.filter((entry) => entry.raftStatus().isLeader &&
+                              entry.adminId !== 'nodeC').length === 1,
+      'a leader among the surviving pair to settle');
+    const reducedLeader = nodes.find((entry) => entry.raftStatus().isLeader &&
+                                                 entry.adminId !== 'nodeC');
+    const nodeCTipBefore = nodesById['nodeC'].raftStatus().commitTip;
+    const op4 = await Operation.create(OP_TYPE);
+    op4.signerId = 'alice';
+    op4.payload = 'decree-13\x00';
+    op4.addResource(ITEM);
+    reducedLeader.sign(op4, aliceKey);
+    reducedLeader.execute(op4);
+    await waitFor(() => registerContains(reducedLeader, ITEM, 'decree-13'),
+      'the reduced leader to materialize the post-change decree');
+    await waitFor(() =>
+      [...hosts['nodeA'].committedMembers()].sort().join(',') ===
+      'nodeA,nodeB' &&
+      [...hosts['nodeB'].committedMembers()].sort().join(',') ===
+      'nodeA,nodeB' &&
+      [...hosts['nodeC'].committedMembers()].sort().join(',') ===
+      'nodeA,nodeB',
+      'the excluded node to learn the final committed config');
+    await new Promise((resolve) => setTimeout(resolve, 800));
+    assert.ok(!registerContains(nodesById['nodeC'], ITEM, 'decree-13'),
+      'the excluded node must not materialize post-change committed ops');
+    assert.ok(nodesById['nodeC'].raftStatus().commitTip >= nodeCTipBefore,
+      'the excluded node may only advance to the exclusion ceiling');
+    console.log(`    membership: 3 → 2 via joint consensus ` +
+      `(change proposal ${changeId}); ops continue on the reduced cluster`);
+  }
+
   // ---- Host teardown: stop cleanly (destroy detaches + destroys modules).
   for (const node of nodes) {
     node.raftStatus().nodeId !== undefined;   // status stays readable
