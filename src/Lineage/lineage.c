@@ -1350,7 +1350,28 @@ void lineage_detach_resident_children(state_t* owner) {
   for (uint32_t slot_index = 0; slot_index < owner->resident_child_count;
        slot_index++) {
     attribute_machine_t* child = owner->resident_children[slot_index];
-    if (child != NULL) child->lineage_owner_state = NULL;
+    if (child == NULL) continue;
+    child->lineage_owner_state = NULL;
+    // Audit H-3: the dying owner's borrowed-authority aliases must not
+    // survive in outliving children. SHARED_ROOT children alias BOTH the
+    // parent's MSK and the parent's user-registry machine; leaving either in
+    // place is a use-after-free the moment the child encrypts/keygens or
+    // touches users. NULLing turns every later call into a fail-closed
+    // NULL-guard rejection (the wasm wrapper's own abandoned-machine path
+    // already treats resident children as an abandoned-machine hazard —
+    // native teardown now matches that posture).
+    if (child->base_state.abe_mk_borrowed) {
+      child->base_state.abe_mk = NULL;
+      child->base_state.abe_mk_borrowed = false;
+    }
+    // Only the SHARED-ROOT borrowing case (child_state->attr_machine =
+    // parent->attr_machine) is unowned: DELEGATED_COPY/SOVEREIGN children
+    // point attr_machine at themselves, and that registry outlives the
+    // parent with them.
+    if (child->base_state.attr_machine != NULL &&
+        (attribute_machine_t*)child != child->base_state.attr_machine) {
+      child->base_state.attr_machine = NULL;
+    }
   }
 }
 
