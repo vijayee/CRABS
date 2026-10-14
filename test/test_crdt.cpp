@@ -1427,6 +1427,17 @@ TEST(TestCRDTMerge, TestMergeHoldsUnmergeableOtItem) {
   g_counter_increment((g_counter_t*)src_counter->value, "b", 9);
   ASSERT_EQ(state_add_item(src, src_counter), CRABS_SUCCESS);
 
+  data_item_t* dst_reg = data_item_create("rank", DATA_TYPE_REGISTER, CRDT_LWW_REG);
+  ASSERT_NE(dst_reg, nullptr);
+  dst_reg->value = lww_register_create((const uint8_t*)"low", 3, 100, "a");
+  dst_reg->value_repr = (data_value_repr_t)DATA_VALUE_REPR_CRDT_STRUCT;
+  ASSERT_EQ(state_add_item(dst, dst_reg), CRABS_SUCCESS);
+  data_item_t* src_reg = data_item_create("rank", DATA_TYPE_REGISTER, CRDT_LWW_REG);
+  ASSERT_NE(src_reg, nullptr);
+  src_reg->value = lww_register_create((const uint8_t*)"high", 4, 200, "b");
+  src_reg->value_repr = (data_value_repr_t)DATA_VALUE_REPR_CRDT_STRUCT;
+  ASSERT_EQ(state_add_item(src, src_reg), CRABS_SUCCESS);
+
   data_item_t* src_set = data_item_create("doc", (data_type_e)DATA_TYPE_OT_ORDERED_SET,
                                           CRDT_CUSTOM);
   ASSERT_NE(src_set, nullptr);
@@ -1452,8 +1463,13 @@ TEST(TestCRDTMerge, TestMergeHoldsUnmergeableOtItem) {
   data_item_t* merged_counter = state_find_item(dst, "hits");
   ASSERT_NE(merged_counter, nullptr);
   // The counter in the same snapshot still merged (max per node, sum across
-  // nodes: dst's a:5 plus src's b:9).
+  // nodes: dst's a:5 plus src's b:9), as does the register (LWW).
   EXPECT_EQ(g_counter_value((g_counter_t*)merged_counter->value), 14);
+  data_item_t* merged_reg = state_find_item(dst, "rank");
+  ASSERT_NE(merged_reg, nullptr);
+  lww_register_t* merged_reg_value = (lww_register_t*)merged_reg->value;
+  ASSERT_NE(merged_reg_value, nullptr);
+  EXPECT_EQ(memcmp(merged_reg_value->value, "high", 4), 0);
   ASSERT_EQ(capture.calls, 1);
   EXPECT_EQ(capture.kind, CRABS_CHANGE_MERGE);
   EXPECT_STREQ(capture.type, "__merge_held__");
