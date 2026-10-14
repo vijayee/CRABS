@@ -1193,6 +1193,12 @@ static void _serialize_data_item_shape(write_buf_t* buf, const data_item_t* item
       }
 
       // Type-specific state
+      // NOTE: with a value present but ot_data unserializable/absent this
+      // emits marker PRESENT + a zero-length value section + type-state —
+      // the reader restores no OT struct and then FAILS on the type-state
+      // read (set == NULL), refusing the blob. Same fail-closed shape as
+      // the pre-marker reader for an in-memory item in that inconsistent
+      // shape (value without an op log); no husk blob can desync.
       _serialize_ot_type_state(buf, item);
     } else if (item->type == DATA_TYPE_SET || item->type == DATA_TYPE_2P_SET ||
                item->type == DATA_TYPE_ONE_SHOT_SET || item->type == DATA_TYPE_ONE_SHOT_FLAG) {
