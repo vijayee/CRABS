@@ -151,10 +151,34 @@ export const TRUST_MODE: {
 // Data item / CRDT strategy numbers for Blueprint.addItem.
 export const DATA_TYPE: Record<string, number>;
 export const CRDT_TYPE: Record<string, number>;
+// Write-domain declaration values (crabs_write_domain_e) for
+// Blueprint.addItem's { domain } option.
+export const WRITE_DOMAIN: Record<string, number>;
 
 export interface Blueprint {
-  /** Append a replicated data item to the child's definition. */
-  addItem(name: string, dataType: number, crdtType: number): void;
+  /**
+   * Append a replicated data item to the child's definition. With an
+   * options object the item carries a write-domains v1 declaration at MINT
+   * time (blueprint_add_item_with_domain, lineage.h:147): a SOVEREIGN item
+   * requires its writer id and stays v1-restricted to COUNTER/REGISTER
+   * (type_mismatch otherwise); a writer on any other domain refuses
+   * invalid_param. Without options the plain FREE-MERGE append runs.
+   */
+  addItem(name: string, dataType: number, crdtType: number,
+          opts?: { domain?: number; writer?: string }): void;
+  /**
+   * Author a dedup spec INTO the spawned child's registry
+   * (blueprint_add_op_type_def, lineage.h:157 → state_register_op_type_def
+   * at spawn): recipe-2 semantics without the child ever running
+   * defineOperationType itself. Same shape/refusal discipline as
+   * Node.defineOperationType (the 'custom' shape is C-native only).
+   */
+  addOpType(opType: string, spec: {
+    dedup: 'per-user' | 'global' | 'none';
+    trackerPath?: string;
+    flagPath?: string;
+    rejectionMessage?: string;
+  }): void;
   /** Append an authorization policy: operation type + condition expression. */
   addPolicy(operation: string, expression: string): void;
   /** Recompute the blueprint's SHA-256 over its canonical body. */
@@ -1169,6 +1193,37 @@ export interface Node {
    *  64-byte parent signature over the body, NO length
    *  prefix. Throws when the child is unknown or not dissolved. */
   lineageTombstone(childId: string): Uint8Array;
+  /**
+   * Rotate this machine's lineage parent key (lineage_key_rotate,
+   * lineage.h:285) and return the signed transition record bytes
+   * (old_pk + new_pk + created_at + 64-byte ECDSA). The wrapper pairs the
+   * rotation with state_set_node_key, so the machine signs its NEXT
+   * transition (and new attestations) under the NEW key immediately — one
+   * record serves EVERY child of this parent through
+   * lineageAcceptKeyTransition (deliver to every child BEFORE the next
+   * rotation: A11-L1's single-slot stash).
+   */
+  lineageRotateKey(newKey: KeyPair): Uint8Array;
+  /**
+   * Child side: ingest a parent-minted transition record (the exact bytes
+   * the parent's lineageRotateKey returned). Refusals surface typed:
+   * invalid_param (malformed image, wrong parent_id, rollback/replay gap),
+   * unauthorized (machine unbound or lineage dissolved), cryptographic_error
+   * (tip or signature mismatch), already_performed (exact re-delivery of an
+   * accepted record, A11-L5). Endorsement verification is TIP-only (A11-4):
+   * pre-rotation attestations refuse once the chain advances.
+   */
+  lineageAcceptKeyTransition(record: Uint8Array): void;
+  /**
+   * Parse a parent-issued attestation wire image (attest's output or any
+   * conforming transport) into the fields Operation.addAttestation
+   * consumes — parse-ONLY (attestation_deserialize, lineage.h:666): no
+   * verdict, verification happens at op attach/execution (a
+   * SIGNATURE-tampered image parses; only malformed STRUCTURE refuses with
+   * a loud 'malformed' error, never a partial parse). Stamps ride as
+   * BigInt (the wasm u64 convention).
+   */
+  attestationFromWire(bytes: Uint8Array): AttestationFields;
 
   // The bootstrap admin id this node was created with — also the node's HLC
   // identity, which signing stamps into op->node_id (used by devtools

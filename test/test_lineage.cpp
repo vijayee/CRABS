@@ -15,6 +15,8 @@ extern "C" {
 #include "../src/CRABS/crabs.h"
 #include "../src/Attribute/attribute_machine.h"
 #include "../src/Crypto/crypto.h"
+#include "../src/CRDT/one_shot.h"
+#include "../src/CRDT/crdt_merge.h"
 #include "../src/StateMachine/state_machine.h"
 #include "../src/Serialization/serialization.h"
 #include "test_helpers.h"
@@ -1068,6 +1070,66 @@ TEST(TestLineage, SpawnSovereignGeneratesOwnMsk) {
   ASSERT_NE(op, nullptr);
   EXPECT_EQ(state_machine_execute(&child->base_state, op), CRABS_SUCCESS);
   operation_destroy(op);
+
+  attribute_machine_destroy(child);
+  machine_blueprint_destroy(blueprint);
+  spawn_parent_destroy(&harness);
+}
+
+// Genesis set/flag items a blueprint carries materialize their EMPTY struct
+// on the spawned child — the same invariant the state-wire load path
+// enforces (it reconstructs these types even from a zero-length value slot,
+// audit M-5). A valueless shell would break every reader that assumes the
+// struct: a carried DEDUP_PER_USER spec's tracker lookup, setContains,
+// and the one-shot merge arms all dereference item->value.
+TEST(TestLineage, SpawnMaterializesGenesisSetValues) {
+  spawn_parent_harness_t harness;
+  spawn_parent_setup(&harness);
+  state_t* parent = &harness.am->base_state;
+
+  machine_blueprint_t* blueprint = machine_blueprint_create();
+  ASSERT_NE(blueprint, nullptr);
+  strncpy(blueprint->child_id, "child-shell", sizeof(blueprint->child_id) - 1);
+  blueprint->trust_mode = LINEAGE_SHARED_ROOT;
+  strncpy(blueprint->bootstrap_admin, "parent-admin",
+          sizeof(blueprint->bootstrap_admin) - 1);
+  blueprint->attestation_ttl_ms = 60000;
+
+  ASSERT_EQ(blueprint_add_item(blueprint, "ballot", DATA_TYPE_ONE_SHOT_SET,
+                               CRDT_ONE_SHOT_SET), CRABS_SUCCESS);
+  ASSERT_EQ(blueprint_add_item(blueprint, "roster", DATA_TYPE_SET,
+                               CRDT_OR_SET), CRABS_SUCCESS);
+  ASSERT_EQ(blueprint_add_policy(blueprint, "noop", "role:admin"),
+            CRABS_SUCCESS);
+  // A carried DEDUP_PER_USER spec whose tracker is the genesis item — the
+  // recipe-2 shape a child inherits straight from the blueprint.
+  dedup_spec_t vote_spec;
+  memset(&vote_spec, 0, sizeof(vote_spec));
+  vote_spec.type = DEDUP_PER_USER;
+  strncpy(vote_spec.tracker_path, "ballot", sizeof(vote_spec.tracker_path) - 1);
+  strncpy(vote_spec.rejection_message, "one vote per signer",
+          sizeof(vote_spec.rejection_message) - 1);
+  ASSERT_EQ(blueprint_add_op_type_def(blueprint, "vote", &vote_spec),
+            CRABS_SUCCESS);
+  ASSERT_EQ(lineage_blueprint_validate(blueprint), CRABS_SUCCESS);
+
+  attribute_machine_t* child = nullptr;
+  ASSERT_EQ(lineage_spawn_machine(parent, blueprint, &child), CRABS_SUCCESS);
+  ASSERT_NE(child, nullptr);
+
+  data_item_t* ballot =
+      state_find_item(&child->base_state, "ballot");
+  ASSERT_NE(ballot, nullptr);
+  EXPECT_EQ(ballot->type, DATA_TYPE_ONE_SHOT_SET);
+  ASSERT_NE(ballot->value, nullptr);
+  EXPECT_EQ(ballot->value_repr, DATA_VALUE_REPR_CRDT_STRUCT);
+  EXPECT_EQ(((one_shot_set_t*)ballot->value)->element_count, 0u);
+
+  data_item_t* roster =
+      state_find_item(&child->base_state, "roster");
+  ASSERT_NE(roster, nullptr);
+  ASSERT_NE(roster->value, nullptr);
+  EXPECT_EQ(((or_set_t*)roster->value)->element_count, 0u);
 
   attribute_machine_destroy(child);
   machine_blueprint_destroy(blueprint);

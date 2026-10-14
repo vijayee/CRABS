@@ -3518,6 +3518,60 @@ crabs_error_e crabs_wasm_lineage_blueprint_add_policy(
   return blueprint_add_policy(blueprint, operation, expression);
 }
 
+// Write-domains v1 blueprint authoring (blueprint_add_item_with_domain,
+// lineage.h:147): declare the item's write domain (and, for SOVEREIGN, its
+// writer) at MINT time so the spawned child's item is born domain-declared
+// (_spawn_apply_blueprint rides the declaration through
+// data_item_create_with_options). `writer` may be NULL/empty for the
+// domains that carry none; the C helper mirrors the item-creation domain
+// rules and fails with the SAME typed errors (invalid_param / type_mismatch
+// / duplicate_operation) — JS sees them via wrapRc unchanged.
+EMSCRIPTEN_KEEPALIVE
+crabs_error_e crabs_wasm_lineage_blueprint_add_item_domain(
+    machine_blueprint_t* blueprint, const char* name, int data_type,
+    int crdt_type, int write_domain, const char* writer,
+    int ordering_module) {
+  if (!blueprint || !name) return CRABS_ERR_INVALID_PARAM;
+  return blueprint_add_item_with_domain(
+      blueprint, name, (data_type_e)data_type, (crdt_type_e)crdt_type,
+      (crabs_write_domain_e)write_domain, writer, (uint8_t)ordering_module);
+}
+
+// Carried dedup-spec authoring (blueprint_add_op_type_def, lineage.h:157):
+// a spec registered in the BLUEPRINT installs into the spawned child's
+// op-type registry at spawn (_spawn_apply_blueprint →
+// state_register_op_type_def), so recipe-2 semantics exist on a child that
+// never ran defineOperationType. The 'custom' dedup shape stays C-native —
+// the binding surfaces the same per-user / global / none subset
+// defineOperationType does. The spec serializes through the blueprint's
+// canonical body (<dedup_spec> mirrors serialization.c's state-wire layout
+// exactly, lineage.c _blueprint_write_body's section comment) and the
+// stamped hash covers it.
+EMSCRIPTEN_KEEPALIVE
+crabs_error_e crabs_wasm_lineage_blueprint_add_op_type(
+    machine_blueprint_t* blueprint, const char* op_type, int dedup_type,
+    const char* tracker_path, const char* flag_path,
+    const char* rejection_message) {
+  if (!blueprint || !op_type) return CRABS_ERR_INVALID_PARAM;
+  dedup_spec_t spec;
+  memset(&spec, 0, sizeof(spec));
+  spec.type = (dedup_type_e)dedup_type;
+  // Fixed-capacity copies are the C append helper's own contract; the JS
+  // layer (blueprint.addOpType) already refuses a path/message past the
+  // buffer length so truncation cannot happen silently.
+  if (tracker_path && tracker_path[0] != '\0') {
+    strncpy(spec.tracker_path, tracker_path, sizeof(spec.tracker_path) - 1);
+  }
+  if (flag_path && flag_path[0] != '\0') {
+    strncpy(spec.flag_path, flag_path, sizeof(spec.flag_path) - 1);
+  }
+  if (rejection_message && rejection_message[0] != '\0') {
+    strncpy(spec.rejection_message, rejection_message,
+            sizeof(spec.rejection_message) - 1);
+  }
+  return blueprint_add_op_type_def(blueprint, op_type, &spec);
+}
+
 EMSCRIPTEN_KEEPALIVE
 crabs_error_e crabs_wasm_lineage_blueprint_stamp_hash(
     machine_blueprint_t* blueprint) {
@@ -3704,6 +3758,123 @@ serialized_buffer_t* crabs_wasm_lineage_tombstone(attribute_machine_t* am,
   }
   buffer->len = written;
   return buffer;
+}
+
+// Parent-key rotation (lineage_key_rotate, lineage.h:285) with the C
+// contract's pairing done HERE: the header's "Does NOT install the new key
+// — the caller pairs this with state_set_node_key AFTER this call" is the
+// wrapper's job, so JS cannot half-rotate the parent (a stashed record
+// whose new private key never landed would sign the NEXT transition with a
+// retired key and strand every child). Returns the signed transition
+// record (old_pk + new_pk + created_at + 64-byte ECDSA over the body) as a
+// serialized_buffer_t for broadcast to every child of this parent; NULL on
+// any C refusal (missing node key, invalid keys, ... — JS throws).
+EMSCRIPTEN_KEEPALIVE
+serialized_buffer_t* crabs_wasm_lineage_key_rotate(
+    attribute_machine_t* am, const uint8_t* new_private_key,
+    const uint8_t* new_public_key) {
+  if (am == NULL || new_private_key == NULL || new_public_key == NULL) {
+    return NULL;
+  }
+  // The record's created_at is informational (never validated) but should
+  // be the machine's own authenticated clock, exactly like attest stamps.
+  uint64_t now_ms = 0;
+  (void)state_get_time_ms(&am->base_state, &now_ms);
+  uint8_t* record = NULL;
+  size_t record_len = 0;
+  if (lineage_key_rotate(&am->base_state, new_private_key, new_public_key,
+                         now_ms, &record, &record_len) != CRABS_SUCCESS) {
+    return NULL;
+  }
+  state_set_node_key(&am->base_state, new_private_key, new_public_key);
+  serialized_buffer_t* buffer = serialized_buffer_create(record_len);
+  if (buffer == NULL) {
+    free(record);
+    return NULL;
+  }
+  memcpy(buffer->data, record, record_len);
+  buffer->len = record_len;
+  free(record);
+  return buffer;
+}
+
+// Child side of the chain (lineage_child_accept_key_transition,
+// lineage.h:318): ingest a parent-minted transition record wire image.
+// Every refusal is the C gate's own and surfaces typed through wrapRc —
+// invalid_param (malformed / wrong parent / rollback-replay), unauthorized
+// (unbound machine or dissolved lineage), cryptographic_error (tip or
+// signature mismatch), already_performed (an exact re-delivery of an
+// accepted record, A11-L5).
+EMSCRIPTEN_KEEPALIVE
+crabs_error_e crabs_wasm_lineage_child_accept_key_transition(
+    attribute_machine_t* am, const uint8_t* record, uint32_t record_len) {
+  if (am == NULL || record == NULL || record_len == 0) {
+    return CRABS_ERR_INVALID_PARAM;
+  }
+  return lineage_child_accept_key_transition(&am->base_state, record,
+                                             (size_t)record_len);
+}
+
+// ============================================================
+// Attestation wire parse (attestation_deserialize, lineage.h:666)
+// ============================================================
+// Parse-ONLY access to a parent-issued attestation wire image: JS gets the
+// canonical fields (exactly what Operation.addAttestation consumes) but no
+// verdict — verification happens at op attach/execution (state_machine.c's
+// _verify_parent_endorsements re-verifies the chain-TIP ECDSA, ids, window,
+// coverage). The returned handle is JS-OWNED: release it with
+// crabs_wasm_attestation_free. NULL on malformed input (JS throws).
+EMSCRIPTEN_KEEPALIVE
+attestation_t* crabs_wasm_attestation_parse(const uint8_t* data,
+                                            uint32_t len) {
+  if (data == NULL || len == 0) return NULL;
+  return attestation_deserialize(data, (size_t)len);
+}
+
+EMSCRIPTEN_KEEPALIVE
+void crabs_wasm_attestation_free(attestation_t* attestation) {
+  if (attestation) attestation_destroy(attestation);
+}
+
+EMSCRIPTEN_KEEPALIVE
+const char* crabs_wasm_attestation_parent_id(attestation_t* attestation) {
+  return attestation ? attestation->parent_id : NULL;
+}
+
+EMSCRIPTEN_KEEPALIVE
+const char* crabs_wasm_attestation_child_id(attestation_t* attestation) {
+  return attestation ? attestation->child_id : NULL;
+}
+
+EMSCRIPTEN_KEEPALIVE
+const char* crabs_wasm_attestation_user_id(attestation_t* attestation) {
+  return attestation ? attestation->user_id : NULL;
+}
+
+EMSCRIPTEN_KEEPALIVE
+const char* crabs_wasm_attestation_attributes(attestation_t* attestation) {
+  return attestation ? attestation->attributes : NULL;
+}
+
+EMSCRIPTEN_KEEPALIVE
+uint64_t crabs_wasm_attestation_not_before(attestation_t* attestation) {
+  return attestation ? attestation->not_before : 0;
+}
+
+EMSCRIPTEN_KEEPALIVE
+uint64_t crabs_wasm_attestation_expires_at(attestation_t* attestation) {
+  return attestation ? attestation->expires_at : 0;
+}
+
+EMSCRIPTEN_KEEPALIVE
+uint64_t crabs_wasm_attestation_parent_key_version(
+    attestation_t* attestation) {
+  return attestation ? attestation->parent_key_version : 0;
+}
+
+EMSCRIPTEN_KEEPALIVE
+const uint8_t* crabs_wasm_attestation_signature(attestation_t* attestation) {
+  return attestation ? attestation->signature : NULL;
 }
 
 // Register the four lineage ops (__spawn_machine__ / __revoke_attestation__ /

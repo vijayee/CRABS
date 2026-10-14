@@ -8,7 +8,7 @@
     "install": "cmake-js compile",
     "build": "cmake-js build",
     "clean": "cmake-js clean",
-    "test": "node test/test.js && node test/ordered-set.js && node test/ot-document-tree.js && node test/locks-tx.js && node test/attestations.js && node test/abe.js && node test/temporary-attributes.js && node test/raft.js"
+    "test": "node test/test.js && node test/ordered-set.js && node test/ot-document-tree.js && node test/locks-tx.js && node test/attestations.js && node test/abe.js && node test/lineage-extras.js && node test/temporary-attributes.js && node test/raft.js"
   },
   "dependencies": {
     "node-addon-api": "^7.1.0"

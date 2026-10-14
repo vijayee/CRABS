@@ -847,6 +847,12 @@ const CRDT_TYPE = {
   ONE_SHOT_SET: 0x08, ONE_SHOT_FLAG: 0x09, CUSTOM: 0xFF,
 };
 
+// crabs_write_domain_e (crabs.h) — the write-domains v1 declaration values
+// Blueprint.addItem's options carry (crabs_wasm_lineage_blueprint_add_item_domain).
+const WRITE_DOMAIN = {
+  FREE: 0x00, SOVEREIGN: 0x01, GROUP_ORDERED: 0x02,
+};
+
 // JS wrapper over the C machine_blueprint_t. JS OWNS the blueprint: it must
 // be released with destroy(). The MACHINE the blueprint spawns is different —
 // C keeps child machines in the parent's resident-children registry (see
@@ -881,14 +887,99 @@ class Blueprint {
     return new Blueprint(M, bpPtr);
   }
 
-  // Append a replicated data item to the child's definition.
-  addItem(name, dataType, crdtType) {
+  // Append a replicated data item to the child's definition. With an
+  // options object ({ domain: WRITE_DOMAIN.*, writer?: string }) the item
+  // carries a write-domains v1 declaration at MINT time
+  // (blueprint_add_item_with_domain, lineage.h:147): a SOVEREIGN item needs
+  // its writer id (and stays v1-restricted to COUNTER/REGISTER — the C
+  // authoring gate refuses type_mismatch), a writer on any other domain
+  // refuses invalid_param. Without options this is the plain FREE-MERGE
+  // append (blueprint_add_item).
+  addItem(name, dataType, crdtType, options = {}) {
     const M = this._M;
     const namePtr = writeString(M, name);
-    const rc = M._crabs_wasm_lineage_blueprint_add_item(
-        this._ptr, namePtr, dataType, crdtType);
+    let rc;
+    if (options && (options.domain !== undefined || options.writer)) {
+      // A writer with no explicit domain is authored against the DEFAULT
+      // domain (FREE, 0x00) — the C helper then refuses it with its own
+      // invalid_param ("writer set on a non-SOVEREIGN domain"), which the
+      // caller sees as-is; only an out-of-table domain number refuses here.
+      const domain = options.domain === undefined
+        ? WRITE_DOMAIN.FREE : options.domain;
+      if (!Number.isInteger(domain) ||
+          Object.values(WRITE_DOMAIN).indexOf(domain) < 0) {
+        freeAll(M, namePtr);
+        throw new Error(
+          'blueprint.addItem: domain must be a WRITE_DOMAIN value (FREE | ' +
+          'SOVEREIGN | GROUP_ORDERED)');
+      }
+      const writerPtr = options.writer ? writeString(M, options.writer) : 0;
+      rc = M._crabs_wasm_lineage_blueprint_add_item_domain(
+          this._ptr, namePtr, dataType, crdtType, domain, writerPtr,
+          0 /* v1: no ordering modules exist; only module 0 is legal */);
+      if (writerPtr) M._free(writerPtr);
+    } else {
+      rc = M._crabs_wasm_lineage_blueprint_add_item(
+          this._ptr, namePtr, dataType, crdtType);
+    }
     if (namePtr) M._free(namePtr);
     wrapRc(rc, 'blueprint.addItem');
+  }
+
+  // Author a dedup spec INTO the child's registry (blueprint_add_op_type_def,
+  // lineage.h:157): at spawn the spec lands in the child's op-type registry
+  // (state_register_op_type_def), so the executor enforces it there exactly
+  // like a machine-local defineOperationType would — same shape, same
+  // refusal words. The 'custom' shape stays C-native (parity with
+  // defineOperationType); paths/messages obey the C buffer caps, refused
+  // loudly rather than silently truncated.
+  addOpType(opType, options = {}) {
+    const M = this._M;
+    if (!options || typeof options !== 'object') {
+      throw new Error('blueprint.addOpType: expected an options object with a dedup field');
+    }
+    if (typeof opType !== 'string' || opType.length === 0) {
+      throw new Error('blueprint.addOpType: opType must be a non-empty string');
+    }
+    const DEDUP_NUMBERS = { none: 0, 'per-user': 1, global: 2 };
+    const dedupType = DEDUP_NUMBERS[options.dedup];
+    if (dedupType === undefined) {
+      throw new Error("blueprint.addOpType: dedup must be 'per-user' | 'global' | 'none' (" +
+        "the 'custom' shape is C-native and not surfaceable)");
+    }
+    if (options.dedup === 'per-user' && !options.trackerPath) {
+      throw new Error("blueprint.addOpType: dedup 'per-user' requires a trackerPath (the ONE_SHOT_SET once-record item, carried in the same blueprint)");
+    }
+    if (options.dedup === 'none' && (options.trackerPath || options.flagPath)) {
+      throw new Error("blueprint.addOpType: dedup 'none' takes no trackerPath/flagPath (a 'none' definition removes the guard; nothing to track)");
+    }
+    if (options.dedup === 'global' && !options.flagPath) {
+      throw new Error("blueprint.addOpType: dedup 'global' requires a flagPath (the ONE_SHOT_FLAG once-record item, carried in the same blueprint)");
+    }
+    // The C spec fields are CRABS_MAX_DEDUP_PATH (128) / CRABS_MAX_DEDUP_MESSAGE
+    // (256) bytes — a longer string would be silently truncated into a
+    // tracker/flag lookup that never resolves (or a cut-off message), so
+    // refuse loudly instead. The C buffers count BYTES, so measure the UTF-8
+    // encoding, never the UTF-16 string length.
+    const DEDUP_PATH_MAX = 127;
+    const DEDUP_MESSAGE_MAX = 255;
+    if (options.trackerPath && encodeText(options.trackerPath).length > DEDUP_PATH_MAX) {
+      throw new Error(`blueprint.addOpType: trackerPath exceeds ${DEDUP_PATH_MAX} bytes`);
+    }
+    if (options.flagPath && encodeText(options.flagPath).length > DEDUP_PATH_MAX) {
+      throw new Error(`blueprint.addOpType: flagPath exceeds ${DEDUP_PATH_MAX} bytes`);
+    }
+    if (options.rejectionMessage && encodeText(options.rejectionMessage).length > DEDUP_MESSAGE_MAX) {
+      throw new Error(`blueprint.addOpType: rejectionMessage exceeds ${DEDUP_MESSAGE_MAX} bytes`);
+    }
+    const opTypePtr = writeString(M, opType);
+    const trackerPtr = options.trackerPath ? writeString(M, options.trackerPath) : 0;
+    const flagPtr = options.flagPath ? writeString(M, options.flagPath) : 0;
+    const messagePtr = options.rejectionMessage ? writeString(M, options.rejectionMessage) : 0;
+    const rc = M._crabs_wasm_lineage_blueprint_add_op_type(
+        this._ptr, opTypePtr, dedupType, trackerPtr, flagPtr, messagePtr);
+    freeAll(M, opTypePtr, trackerPtr, flagPtr, messagePtr);
+    wrapRc(rc, 'blueprint.addOpType');
   }
 
   // Append an authorization policy: operation type + condition expression.
@@ -3367,6 +3458,92 @@ class Node {
     return out;
   }
 
+  // Rotate this machine's lineage parent key (lineage_key_rotate,
+  // lineage.h:285) and return the signed transition record: old_pk + new_pk
+  // + created_at + 64-byte ECDSA over the body. The C contract says the
+  // CALLER pairs the rotation with state_set_node_key — the wrapper does
+  // both, so a stashed record whose new private key never landed cannot
+  // happen. Every child bound to this parent takes the SAME record through
+  // lineageAcceptKeyTransition (the broadcast feature; A11-L1 says deliver
+  // to every child BEFORE minting the next rotation — one stash slot).
+  // Refusals surface typed (e.g. cryptographic_error when the machine
+  // carries no node key).
+  lineageRotateKey(newKey) {
+    const M = this._M;
+    if (!newKey || typeof newKey.privateKeyHex !== 'function' ||
+        typeof newKey.publicKeyHex !== 'function') {
+      throw new Error('lineageRotateKey: expected a KeyPair (KeyPair.generate())');
+    }
+    const priv = M._malloc(32);
+    const pub = M._malloc(33);
+    if (hexDecode(M, newKey.privateKeyHex(), priv, 32) !== 32 ||
+        hexDecode(M, newKey.publicKeyHex(), pub, 33) !== 33) {
+      freeAll(M, priv, pub);
+      throw new Error('lineageRotateKey: the new keypair did not decode');
+    }
+    const ser = M._crabs_wasm_lineage_key_rotate(this._am, priv, pub);
+    freeAll(M, priv, pub);
+    if (!ser) throw new Error('lineageRotateKey failed (the C gate refused — see the lineage_key_rotate contract)');
+    const len = M._crabs_wasm_buffer_len(ser);
+    const data = M._crabs_wasm_buffer_data(ser);
+    const out = new Uint8Array(M.HEAPU8.subarray(data, data + len));
+    M._crabs_wasm_buffer_destroy(ser);
+    return out;
+  }
+
+  // Child side: ingest a parent-minted transition record (the exact bytes
+  // lineageRotateKey returned, transported verbatim). The C gate owns every
+  // refusal (lineage_child_accept_key_transition, lineage.h:318) and they
+  // surface typed: invalid_param (malformed image, wrong parent_id,
+  // rollback/replay gap), unauthorized (machine not bound to a parent, or
+  // lineage dissolved), cryptographic_error (record not signed by the
+  // chain TIP, or tip-signature failure), already_performed (an exact
+  // re-delivery of an accepted record — A11-L5, matching the
+  // dissolve/withdraw/tombstone re-delivery siblings).
+  lineageAcceptKeyTransition(record) {
+    const M = this._M;
+    if (!(record instanceof Uint8Array) || record.length === 0) {
+      throw new Error('lineageAcceptKeyTransition: expected the transition record bytes (Uint8Array)');
+    }
+    const { ptr, len } = writeBytes(M, record);
+    const rc = M._crabs_wasm_lineage_child_accept_key_transition(this._am, ptr, len);
+    if (ptr) M._free(ptr);
+    wrapRc(rc, 'lineageAcceptKeyTransition');
+  }
+
+  // Parse a parent-issued attestation wire image (as produced by attest)
+  // into the field shape Operation.addAttestation consumes with NO verdict
+  // — parse-only (attestation_deserialize, lineage.h:666): verification
+  // happens at op attach/execution, where the executor re-checks the
+  // chain-TIP signature, both ids, the window, and attribute coverage.
+  // Malformed input refuses typed (never a partial parse).
+  attestationFromWire(bytes) {
+    const M = this._M;
+    if (!(bytes instanceof Uint8Array) || bytes.length === 0) {
+      throw new Error('attestationFromWire: expected the attestation wire bytes (Uint8Array)');
+    }
+    const { ptr, len } = writeBytes(M, bytes);
+    const attPtr = M._crabs_wasm_attestation_parse(ptr, len);
+    if (ptr) M._free(ptr);
+    if (!attPtr) {
+      throw new Error('attestationFromWire: malformed attestation wire image (structure check failed)');
+    }
+    const fields = {
+      parentId: readString(M, M._crabs_wasm_attestation_parent_id(attPtr)),
+      childId: readString(M, M._crabs_wasm_attestation_child_id(attPtr)),
+      userId: readString(M, M._crabs_wasm_attestation_user_id(attPtr)),
+      attributes: readString(M, M._crabs_wasm_attestation_attributes(attPtr)),
+      notBefore: M._crabs_wasm_attestation_not_before(attPtr),
+      expiresAt: M._crabs_wasm_attestation_expires_at(attPtr),
+      parentKeyVersion: M._crabs_wasm_attestation_parent_key_version(attPtr),
+      signatureHex: hexEncode(M.HEAPU8.subarray(
+        M._crabs_wasm_attestation_signature(attPtr),
+        M._crabs_wasm_attestation_signature(attPtr) + 64), 64),
+    };
+    M._crabs_wasm_attestation_free(attPtr);
+    return fields;
+  }
+
   // ============================================================
   // Raft ordering module (GROUP_ORDERED writes)
   // ============================================================
@@ -3804,7 +3981,7 @@ class RaftHost {
 // Module exports
 // ============================================================
 
-  return { Node, KeyPair, Operation, Blueprint, TRUST_MODE, DATA_TYPE, CRDT_TYPE, getModule, wireVersions };
+  return { Node, KeyPair, Operation, Blueprint, TRUST_MODE, DATA_TYPE, CRDT_TYPE, WRITE_DOMAIN, getModule, wireVersions };
 }
 
 // UMD: CommonJS for Node/bundlers; window.CRABSWasmCore for plain <script>

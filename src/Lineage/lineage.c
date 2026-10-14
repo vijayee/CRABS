@@ -17,6 +17,9 @@
 #include "../Attribute/attribute_machine.h"
 #include "../Condition/condition.h"
 #include "../Crypto/crypto.h"
+#include "../HLC/hlc.h"
+#include "../CRDT/crdt_merge.h"
+#include "../CRDT/one_shot.h"
 #include "../Serialization/serialization.h"
 #include "../StateMachine/state_machine.h"
 #include "../Util/allocator.h"
@@ -1377,6 +1380,35 @@ static crabs_error_e _spawn_apply_blueprint(state_t* child_state,
     crabs_error_e status = data_item_create_with_options(
         item->name, item->type, item->crdt_type, &options, &created);
     if (status != CRABS_SUCCESS) return status;
+    // Sets/flags materialize their EMPTY struct at genesis — the same
+    // invariant the state-wire load path enforces (the deserializer
+    // reconstructs these types even from a zero-length value slot, audit
+    // M-5, so a loaded state never carries a NULL struct value for them).
+    // Valueless shells would break readers that assume the struct: a
+    // carried DEDUP_PER_USER spec's tracker lookup (dedup.c), setContains,
+    // and the one-shot merge arms all dereference item->value.
+    if (created->value == NULL) {
+      switch (created->type) {
+        case DATA_TYPE_SET:
+          created->value = or_set_create();
+          created->value_repr = DATA_VALUE_REPR_CRDT_STRUCT;
+          break;
+        case DATA_TYPE_2P_SET:
+          created->value = two_p_set_create();
+          created->value_repr = DATA_VALUE_REPR_CRDT_STRUCT;
+          break;
+        case DATA_TYPE_ONE_SHOT_SET:
+          created->value = one_shot_set_create();
+          created->value_repr = DATA_VALUE_REPR_CRDT_STRUCT;
+          break;
+        case DATA_TYPE_ONE_SHOT_FLAG:
+          created->value = one_shot_flag_create();
+          created->value_repr = DATA_VALUE_REPR_CRDT_STRUCT;
+          break;
+        default:
+          break;   // remaining types keep the valueless-shell genesis
+      }
+    }
     status = state_add_item(child_state, created);
     if (status != CRABS_SUCCESS) {
       data_item_destroy(created);
@@ -1519,6 +1551,34 @@ crabs_error_e lineage_spawn_machine(state_t* parent,
   memcpy(child_state->lineage_key_chain[0].public_key,
          parent->node_public_key, 33);
   child_state->lineage_key_chain_count = 1;
+
+  // Ordering continuity: a spawned machine is a first-class machine and
+  // mints its OWN strictly-advancing ordering stamps (HLC node identity =
+  // its lineage_self_id), exactly like a genesis machine's create path
+  // (crabs_wasm_node_create / the CLI bootstrap). Without it every op the
+  // child signs goes out UNSTAMPED — two ops from the same signer both read
+  // as ordering stamp 0 and the executor's ordering-monotonicity check
+  // refuses the second as a replay long before the carried dedup specs
+  // (recipe 2 on a spawned child) ever get a word in. Runtime only: the
+  // genesis blob below neither reads nor changes this state (hlc stays out
+  // of the canonical state wire; restore re-seeds continuity separately).
+  {
+    crabs_ordering_config_t* child_ordering =
+        get_memory(sizeof(crabs_ordering_config_t));
+    if (child_ordering == NULL) {
+      // The key-chain slot above is the only heap residue — release it so
+      // attribute_machine_destroy stays a straight teardown.
+      free(child_state->lineage_key_chain);
+      child_state->lineage_key_chain = NULL;
+      child_state->lineage_key_chain_count = 0;
+      attribute_machine_destroy(child);
+      return CRABS_ERR_OOM;
+    }
+    crabs_ordering_config_init_hlc(child_ordering, HLC_STRATEGY_BOUNDED);
+    state_set_ordering_config(child_state, child_ordering);
+    crabs_hlc_state_init(&child_state->hlc_state, blueprint->child_id);
+    child_state->hlc_state_initialized = true;
+  }
 
   status = _spawn_apply_blueprint(child_state, blueprint);
   if (status == CRABS_SUCCESS) {

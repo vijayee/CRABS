@@ -520,6 +520,7 @@ public:
       StaticMethod("create", &Blueprint::Create),
       StaticMethod("deserialize", &Blueprint::Deserialize),
       InstanceMethod("addItem", &Blueprint::AddItem),
+      InstanceMethod("addOpType", &Blueprint::AddOpType),
       InstanceMethod("addPolicy", &Blueprint::AddPolicy),
       InstanceMethod("stampHash", &Blueprint::StampHash),
       InstanceMethod("serialize", &Blueprint::Serialize),
@@ -619,7 +620,7 @@ private:
     Napi::Env env = info.Env();
     EnsureAlive(env);
     if (info.Length() < 3 || !info[0].IsString())
-      throw Napi::TypeError::New(env, "Expected (name, dataType, crdtType)");
+      throw Napi::TypeError::New(env, "Expected (name, dataType, crdtType, opts?)");
     std::string name = info[0].As<Napi::String>().Utf8Value();
     data_type_e data_type;
     crdt_type_e crdt_type;
@@ -629,8 +630,144 @@ private:
     if (!crdt_type_from_js(info[2], &crdt_type))
       throw Napi::TypeError::New(env,
           "crdtType must be a CRDT_TYPE word ('g_counter', 'or_set', ...) or number");
-    crabs_error_e rc = blueprint_add_item(bp_, name.c_str(), data_type, crdt_type);
+    crabs_error_e rc;
+    // With a write-domain declaration ({ domain, writer? }) the item
+    // carries write-domains v1 authoring (blueprint_add_item_with_domain,
+    // lineage.h:147): a SOVEREIGN item needs its writer id and stays
+    // v1-restricted to COUNTER/REGISTER (the C gate refuses type_mismatch),
+    // a writer on any other domain refuses invalid_param. A writer with no
+    // explicit domain is authored against the DEFAULT domain (FREE) — the
+    // C helper refuses that pairing itself, exactly like defineItem's
+    // word mapping feeds its defaults through.
+    if (info.Length() > 3 && info[3].IsObject()) {
+      Napi::Object opts = info[3].As<Napi::Object>();
+      crabs_write_domain_e write_domain = CRABS_DOMAIN_FREE_MERGE;
+      if (opts.Has("domain")) {
+        std::string domain_word = to_lower_ascii(
+            require_js_string(opts.Get("domain"), "Blueprint.addItem", "domain"));
+        if (domain_word == "free") {
+          write_domain = CRABS_DOMAIN_FREE_MERGE;
+        } else if (domain_word == "sovereign") {
+          write_domain = CRABS_DOMAIN_SOVEREIGN;
+        } else if (domain_word == "group") {
+          write_domain = CRABS_DOMAIN_GROUP_ORDERED;
+        } else {
+          throw Napi::TypeError::New(env,
+              "Blueprint.addItem: domain must be 'free' | 'sovereign' | 'group'");
+        }
+      }
+      std::string writer;
+      if (opts.Has("writer")) {
+        writer = require_js_string(opts.Get("writer"), "Blueprint.addItem", "writer");
+      }
+      rc = blueprint_add_item_with_domain(bp_, name.c_str(), data_type,
+                                          crdt_type, write_domain,
+                                          writer.empty() ? nullptr
+                                                         : writer.c_str(),
+                                          0 /* v1: no ordering modules */);
+    } else {
+      rc = blueprint_add_item(bp_, name.c_str(), data_type, crdt_type);
+    }
     if (rc != CRABS_SUCCESS) throw crabs_error(env, rc, "Blueprint.addItem");
+    return env.Undefined();
+  }
+
+  // Carried dedup-spec authoring (blueprint_add_op_type_def, lineage.h:157)
+  // — the same shape Node::DefineOperationType registers machine-locally,
+  // authored into the CHILD's registry via the blueprint: at spawn the spec
+  // lands in the child's op-type registry and the executor enforces it
+  // there exactly like a local define would. Word/validation discipline
+  // mirrors DefineOperationType (the 'custom' shape stays C-native).
+  Napi::Value AddOpType(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    EnsureAlive(env);
+    if (info.Length() < 2 || !info[0].IsString() || !info[1].IsObject())
+      throw Napi::TypeError::New(env,
+          "Expected addOpType(opType, { dedup, trackerPath?, flagPath?, "
+          "rejectionMessage? })");
+    std::string op_type = require_js_string(info[0], "Blueprint.addOpType", "opType");
+    if (op_type.empty())
+      throw Napi::TypeError::New(env,
+          "Blueprint.addOpType: opType must be a non-empty string");
+    Napi::Object options = info[1].As<Napi::Object>();
+    std::string dedup_word = to_lower_ascii(
+        require_js_string(options.Get("dedup"), "Blueprint.addOpType", "dedup"));
+    dedup_type_e dedup_type;
+    if (dedup_word == "none") {
+      dedup_type = DEDUP_NONE;
+    } else if (dedup_word == "per-user") {
+      dedup_type = DEDUP_PER_USER;
+    } else if (dedup_word == "global") {
+      dedup_type = DEDUP_GLOBAL;
+    } else {
+      throw Napi::TypeError::New(env,
+          "Blueprint.addOpType: dedup must be 'per-user' | 'global' | 'none' "
+          "(the 'custom' shape is C-native and not surfaceable)");
+    }
+    std::string tracker_path;
+    std::string flag_path;
+    std::string rejection_message;
+    if (options.Has("trackerPath")) {
+      tracker_path = require_js_string(options.Get("trackerPath"),
+                                       "Blueprint.addOpType", "trackerPath");
+    }
+    if (options.Has("flagPath")) {
+      flag_path = require_js_string(options.Get("flagPath"),
+                                    "Blueprint.addOpType", "flagPath");
+    }
+    if (dedup_type == DEDUP_PER_USER && tracker_path.empty()) {
+      throw Napi::TypeError::New(env,
+          "Blueprint.addOpType: dedup 'per-user' requires a trackerPath "
+          "(the ONE_SHOT_SET once-record item, carried in the same blueprint)");
+    }
+    if (dedup_type == DEDUP_NONE &&
+        (!tracker_path.empty() || !flag_path.empty())) {
+      throw Napi::TypeError::New(env,
+          "Blueprint.addOpType: dedup 'none' takes no trackerPath/flagPath "
+          "(a 'none' definition removes the guard; nothing to track)");
+    }
+    if (dedup_type == DEDUP_GLOBAL && flag_path.empty()) {
+      throw Napi::TypeError::New(env,
+          "Blueprint.addOpType: dedup 'global' requires a flagPath "
+          "(the ONE_SHOT_FLAG once-record item, carried in the same blueprint)");
+    }
+    // The C spec fields are CRABS_MAX_DEDUP_PATH (128) / CRABS_MAX_DEDUP_MESSAGE
+    // (256) bytes — a longer string would be silently truncated into a
+    // tracker/flag lookup that never resolves (or a cut-off message), so
+    // refuse loudly instead.
+    if (tracker_path.length() >= CRABS_MAX_DEDUP_PATH) {
+      throw Napi::RangeError::New(env,
+          "Blueprint.addOpType: trackerPath exceeds 127 bytes");
+    }
+    if (flag_path.length() >= CRABS_MAX_DEDUP_PATH) {
+      throw Napi::RangeError::New(env,
+          "Blueprint.addOpType: flagPath exceeds 127 bytes");
+    }
+    if (options.Has("rejectionMessage")) {
+      rejection_message = require_js_string(
+          options.Get("rejectionMessage"), "Blueprint.addOpType",
+          "rejectionMessage");
+      if (rejection_message.length() >= CRABS_MAX_DEDUP_MESSAGE) {
+        throw Napi::RangeError::New(env,
+            "Blueprint.addOpType: rejectionMessage exceeds 255 bytes");
+      }
+    }
+    dedup_spec_t spec;
+    memset(&spec, 0, sizeof(spec));
+    spec.type = dedup_type;
+    if (!tracker_path.empty()) {
+      strncpy(spec.tracker_path, tracker_path.c_str(),
+              sizeof(spec.tracker_path) - 1);
+    }
+    if (!flag_path.empty()) {
+      strncpy(spec.flag_path, flag_path.c_str(), sizeof(spec.flag_path) - 1);
+    }
+    if (!rejection_message.empty()) {
+      strncpy(spec.rejection_message, rejection_message.c_str(),
+              sizeof(spec.rejection_message) - 1);
+    }
+    crabs_error_e rc = blueprint_add_op_type_def(bp_, op_type.c_str(), &spec);
+    if (rc != CRABS_SUCCESS) throw crabs_error(env, rc, "Blueprint.addOpType");
     return env.Undefined();
   }
 
@@ -1284,6 +1421,10 @@ public:
       InstanceMethod("lineageResidentChild", &Node::LineageResidentChild),
       InstanceMethod("lineageAttest", &Node::LineageAttest),
       InstanceMethod("lineageTombstone", &Node::LineageTombstone),
+      InstanceMethod("lineageRotateKey", &Node::LineageRotateKey),
+      InstanceMethod("lineageAcceptKeyTransition",
+                     &Node::LineageAcceptKeyTransition),
+      InstanceMethod("attestationFromWire", &Node::AttestationFromWire),
       // Authenticated time source (A10-L9 wiring)
       InstanceMethod("setTimeSource", &Node::SetTimeSource),
       InstanceMethod("getTimeSource", &Node::GetTimeSource),
@@ -5562,6 +5703,107 @@ private:
                                                      sizeof(wire), &wire_len);
     if (rc != CRABS_SUCCESS) throw crabs_error(env, rc, "lineageTombstone");
     return Napi::Buffer<uint8_t>::Copy(env, wire, wire_len);
+  }
+
+  // Rotate this machine's lineage parent key (lineage_key_rotate,
+  // lineage.h:285) and return the signed transition record Buffer:
+  // old_pk + new_pk + created_at + 64-byte ECDSA over the body. The C
+  // contract says the CALLER pairs the rotation with state_set_node_key —
+  // the wrapper does both, so a stashed record whose new private key never
+  // landed cannot happen. Every child bound to this parent takes the SAME
+  // record through lineageAcceptKeyTransition (the broadcast feature;
+  // A11-L1 says deliver to every child BEFORE minting the next rotation —
+  // one stash slot). now_ms stamps the record's informational created_at
+  // from the machine's own time source, exactly like lineageAttest.
+  Napi::Value LineageRotateKey(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 1 || !info[0].IsObject())
+      throw Napi::TypeError::New(env, "Expected lineageRotateKey(keyPair)");
+    KeyPair* key_pair = KeyPair::Unwrap(info[0].As<Napi::Object>());
+    if (key_pair == nullptr || key_pair->raw() == nullptr)
+      throw Napi::Error::New(env, "lineageRotateKey: expected a KeyPair");
+    uint64_t now_ms = 0;
+    if (!state_get_time_ms(&am_->base_state, &now_ms))
+      throw Napi::Error::New(env,
+          "lineageRotateKey: machine has no authenticated time source — call setTime first");
+    const ecdsa_keypair_t* new_key = key_pair->raw();
+    uint8_t* record = nullptr;
+    size_t record_len = 0;
+    crabs_error_e rc = lineage_key_rotate(&am_->base_state,
+                                          new_key->private_key,
+                                          new_key->public_key, now_ms,
+                                          &record, &record_len);
+    if (rc != CRABS_SUCCESS) throw crabs_error(env, rc, "lineageRotateKey");
+    state_set_node_key(&am_->base_state, new_key->private_key,
+                       new_key->public_key);
+    Napi::Buffer<uint8_t> out = Napi::Buffer<uint8_t>::Copy(env, record,
+                                                            record_len);
+    free(record);
+    return out;
+  }
+
+  // Child side: ingest a parent-minted transition record (the exact bytes
+  // lineageRotateKey returned, transported verbatim). The C gate owns every
+  // refusal and they surface typed: invalid_param (malformed image, wrong
+  // parent_id, rollback/replay gap), unauthorized (machine not bound to a
+  // parent, or lineage dissolved), cryptographic_error (record not signed
+  // by the chain TIP, or tip-signature failure), already_performed (an
+  // exact re-delivery of an accepted record, A11-L5).
+  Napi::Value LineageAcceptKeyTransition(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 1 || !info[0].IsBuffer())
+      throw Napi::TypeError::New(env,
+          "Expected lineageAcceptKeyTransition(recordBuffer)");
+    auto record = info[0].As<Napi::Buffer<uint8_t>>();
+    if (record.Length() == 0)
+      throw Napi::RangeError::New(env,
+          "lineageAcceptKeyTransition: the record buffer is empty");
+    crabs_error_e rc = lineage_child_accept_key_transition(
+        &am_->base_state, record.Data(),
+        (size_t)record.Length());
+    if (rc != CRABS_SUCCESS)
+      throw crabs_error(env, rc, "lineageAcceptKeyTransition");
+    return env.Undefined();
+  }
+
+  // Parse a parent-issued attestation wire image (as produced by
+  // lineageAttest) into the field shape Operation.addAttestation consumes
+  // with NO verdict — parse-only (attestation_deserialize, lineage.h:666):
+  // verification happens at op attach/execution, where the executor
+  // re-checks the chain-TIP signature, both ids, the window, and attribute
+  // coverage. Malformed input refuses typed (never a partial parse).
+  Napi::Value AttestationFromWire(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 1 || !info[0].IsBuffer())
+      throw Napi::TypeError::New(env,
+          "Expected attestationFromWire(attestationWireBuffer)");
+    auto wire = info[0].As<Napi::Buffer<uint8_t>>();
+    if (wire.Length() == 0)
+      throw Napi::RangeError::New(env,
+          "attestationFromWire: the wire buffer is empty");
+    attestation_t* attestation =
+        attestation_deserialize(wire.Data(), (size_t)wire.Length());
+    if (attestation == nullptr)
+      throw Napi::Error::New(env,
+          "attestationFromWire: malformed attestation wire image (structure check failed)");
+    Napi::Object fields = Napi::Object::New(env);
+    fields.Set("parentId", Napi::String::New(env, attestation->parent_id));
+    fields.Set("childId", Napi::String::New(env, attestation->child_id));
+    fields.Set("userId", Napi::String::New(env, attestation->user_id));
+    fields.Set("attributes", Napi::String::New(env, attestation->attributes));
+    // Stamps ride as JS safe-integer numbers (the node convention); the
+    // epoch-ms stamps the C body carries stay far below 2^53.
+    fields.Set("notBefore",
+               Napi::Number::New(env, (double)attestation->not_before));
+    fields.Set("expiresAt",
+               Napi::Number::New(env, (double)attestation->expires_at));
+    fields.Set("parentKeyVersion",
+               Napi::Number::New(env, (double)attestation->parent_key_version));
+    fields.Set("signatureHex",
+               Napi::String::New(env, hex_encode(attestation->signature,
+                                                 CRABS_SIG_SIZE)));
+    attestation_destroy(attestation);
+    return fields;
   }
 };
 
