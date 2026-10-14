@@ -2917,6 +2917,10 @@ private:
       throw crabs_error(env, CRABS_ERR_TYPE_MISMATCH, "getRegisterBytes");
     const lww_register_t* reg = (const lww_register_t*)item->value;
     if (!reg) throw crabs_error(env, CRABS_ERR_INTERNAL, "getRegisterBytes");
+    // An empty register's value pointer is NULL — construct the empty
+    // Buffer directly instead of Copy() over a NULL source.
+    if (reg->value_size == 0)
+      return Napi::Buffer<uint8_t>::New(env, 0);
     return Napi::Buffer<uint8_t>::Copy(env, reg->value, reg->value_size);
   }
 
