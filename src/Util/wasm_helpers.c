@@ -1519,8 +1519,15 @@ crabs_error_e crabs_wasm_ot_document_apply(
       break;
     }
     case CRABS_OT_OP_MERGE_SPANS: {
-      uint32_t span_count = crabs_ot_document_span_count(doc);
-      if (pos >= span_count || pos2 >= span_count || pos == pos2) {
+      // Span indexes are VISIBLE-span ordinals (crabs_apply_ot_op resolves
+      // them through _get_at_visible) — the C core's span_count includes
+      // tombstones and would admit a signed no-op past the visible tail.
+      uint32_t visible_spans = 0;
+      for (const crabs_span_t* span = doc->head; span != NULL;
+           span = span->next) {
+        if (!span->deleted) visible_spans++;
+      }
+      if (pos >= visible_spans || pos2 >= visible_spans || pos == pos2) {
         return CRABS_ERR_OT_POSITION_BOUNDS;
       }
       ot_op.visible_pos_2 = pos2;
