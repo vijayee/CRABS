@@ -361,12 +361,14 @@ TEST(OTSerialization, StateWithMultiRootTreeRoundTrip) {
   EXPECT_EQ(crabs_ot_tree_node_count(r_tree), 3u);
 
   // Both roots must sit on the root sibling chain, exactly as
-  // crabs_ot_tree_insert_node links them in memory.
+  // crabs_ot_tree_insert_node links them in memory — root-level ordinals
+  // are HONORED, so root2 (inserted at ordinal 0) restored as the chain head
+  // and the round trip preserves that order.
   crabs_tree_node_t* root = crabs_ot_tree_root(r_tree);
   ASSERT_NE(root, nullptr);
-  EXPECT_STREQ(root->id, "root1");
+  EXPECT_STREQ(root->id, "root2");
   ASSERT_NE(root->next_sibling, nullptr);
-  EXPECT_STREQ(root->next_sibling->id, "root2");
+  EXPECT_STREQ(root->next_sibling->id, "root1");
   EXPECT_EQ(root->next_sibling->prev_sibling, root);
   EXPECT_EQ(root->next_sibling->next_sibling, nullptr);
   EXPECT_EQ(root->parent, nullptr);
@@ -375,7 +377,7 @@ TEST(OTSerialization, StateWithMultiRootTreeRoundTrip) {
   // Declared-parent node must still link under its parent.
   crabs_tree_node_t* child = crabs_ot_tree_find(r_tree, "child1");
   ASSERT_NE(child, nullptr);
-  EXPECT_EQ(child->parent, root);
+  EXPECT_EQ(child->parent, root->next_sibling);
 
   state_destroy(restored);
   state_destroy(original);
@@ -410,11 +412,14 @@ TEST(OTSerialization, StateWithReparentedRootRoundTrip) {
   crabs_ot_tree_t* r_tree = (crabs_ot_tree_t*)r_item->value;
   EXPECT_EQ(crabs_ot_tree_node_count(r_tree), 2u);
 
+  // The reparent honored ordinal 0: child1 became the chain HEAD root, and
+  // the round trip preserves that honored order (the old root branch
+  // appended — root1 would have restored first).
   crabs_tree_node_t* root = crabs_ot_tree_root(r_tree);
   ASSERT_NE(root, nullptr);
-  EXPECT_STREQ(root->id, "root1");
+  EXPECT_STREQ(root->id, "child1");
   ASSERT_NE(root->next_sibling, nullptr);
-  EXPECT_STREQ(root->next_sibling->id, "child1");
+  EXPECT_STREQ(root->next_sibling->id, "root1");
   EXPECT_EQ(root->next_sibling->prev_sibling, root);
   EXPECT_EQ(root->next_sibling->parent, nullptr);
   EXPECT_EQ(root->next_sibling->parent_id[0], '\0');

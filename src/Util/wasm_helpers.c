@@ -1290,6 +1290,7 @@ static const crabs_tree_node_t* _ot_tree_visible_at(
   uint32_t cap = 0;
   uint32_t top = 0;
   uint32_t ordinal = 0;
+  uint32_t root_span_top = 0;
   for (crabs_tree_node_t* root = tree->root; root != NULL;
        root = root->next_sibling) {
     void* grown = realloc(stack, sizeof(crabs_tree_node_t*) * (cap + 1));
@@ -1297,6 +1298,15 @@ static const crabs_tree_node_t* _ot_tree_visible_at(
     stack = grown;
     cap++;
     stack[top++] = root;
+  }
+  // The stack pops what was pushed LAST — reverse the root span so the
+  // FIRST root pops first (multi-root trees would otherwise read back in
+  // reversed root order).
+  for (uint32_t left_index = root_span_top, right_index = top;
+       left_index < right_index; left_index++, right_index--) {
+    crabs_tree_node_t* swing = stack[left_index];
+    stack[left_index] = stack[right_index - 1];
+    stack[right_index - 1] = swing;
   }
   const crabs_tree_node_t* found = NULL;
   while (top > 0) {

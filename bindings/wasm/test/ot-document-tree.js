@@ -12,6 +12,17 @@
 const { Node } = require('..');
 
 (async () => {
+// Throw if `invoke` fails to throw a typed-error message containing
+// `fragment` (a refusal pin), naming the pin with `label`.
+const mustThrowWith = (invoke, fragment, label) => {
+  let caught = null;
+  try { invoke(); } catch (caughtError) { caught = caughtError; }
+  if (!caught) throw new Error(`${label}: expected a throw`);
+  if (!String(caught.message).includes(fragment)) {
+    throw new Error(`${label}: expected "${fragment}", got "${caught.message}"`);
+  }
+};
+
 // ============================================================
 // OT_DOCUMENT
 // ============================================================
@@ -139,14 +150,6 @@ if (treeNode.getOTTree('t').nodes.map((entry) => entry.id).join(',') !== 'r,a,c,
 }
 
 // ---- Argument guards -------------------------------------------------------
-const mustThrowWith = (invoke, fragment, label) => {
-  let caught = null;
-  try { invoke(); } catch (caughtError) { caught = caughtError; }
-  if (!caught) throw new Error(`${label}: expected a throw`);
-  if (!String(caught.message).includes(fragment)) {
-    throw new Error(`${label}: expected "${fragment}", got "${caught.message}"`);
-  }
-};
 mustThrowWith(() => treeNode.getOTTree('no-such-tree'),
   'resource_not_found', 'read unknown tree');
 mustThrowWith(() => treeNode.otInsertNode('t', 'ghost', 0, 'x', '',
@@ -155,6 +158,42 @@ mustThrowWith(() => treeNode.otInsertNode('t', 'ghost', 0, 'x', '',
 mustThrowWith(() => treeNode.otInsertNode('t', 'r', 0, 'r', '',
     { id: { node: 'ot-tree-a', seq: 7 } }),
   'invalid_param', 'duplicate node id');
+
+// ---- Root-level ordinals are HONORED ---------------------------------------
+// A fresh root at ordinal 0 lands FIRST (the root-chain analogue of the
+// nested path's position-0 prepend); the C core's root branches used to
+// walk to the last root sibling and append regardless of the request.
+treeNode.addOTTree('roots');
+const rootInsert = (nodeId, position, seq, value) => treeNode.otInsertNode(
+  'roots', '', position, nodeId, value,
+  { id: { node: 'ot-tree-a', seq, ts: 1000 } });
+rootInsert('r-first', 0, 8, 'one');
+rootInsert('r-last', 1, 9, 'two');
+rootInsert('r-prepended', 0, 10, 'zero');
+const rootsReadback = treeNode.getOTTree('roots');
+const respectedRootOrder = JSON.stringify(['r-prepended', 'r-first', 'r-last']);
+if (JSON.stringify(rootsReadback.nodes
+    .filter((entry) => entry.parentId === '').map((entry) => entry.id))
+    !== respectedRootOrder) {
+  throw new Error("root ordinals must be honored: ordinal-0 insert lands first");
+}
+// wasm-only convenience — documented in index.d.ts as absent from the node
+// binding's readback: it must mirror the visible root order.
+if (JSON.stringify(rootsReadback.rootIds) !== respectedRootOrder) {
+  throw new Error(`wasm-only rootIds must mirror the visible root order (got ${JSON.stringify(rootsReadback.rootIds)})`);
+}
+
+// Reparent to root at ordinal 1: r-kid lands BETWEEN r-first and r-last
+// (the old root branch also appended reparented roots at the tail).
+treeNode.otInsertNode('roots', 'r-first', 0, 'r-kid', 'kid',
+  { id: { node: 'ot-tree-a', seq: 11, ts: 1000 } });
+treeNode.otReparent('roots', 'r-kid', '', 1,
+  { id: { node: 'ot-tree-a', seq: 12, ts: 1000 } });
+if (JSON.stringify(treeNode.getOTTree('roots').nodes
+    .filter((entry) => entry.parentId === '').map((entry) => entry.id))
+    !== JSON.stringify(['r-prepended', 'r-kid', 'r-first', 'r-last'])) {
+  throw new Error('reparent-to-root ordinal must be honored');
+}
 
 // ---- Unpoliced machine refuses the op --------------------------------------
 const unpoliced = await Node.create('ot-doc-plain', { ordering: 'hlc' });

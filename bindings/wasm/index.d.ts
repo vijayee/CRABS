@@ -827,10 +827,16 @@ export interface Node {
    * subtree is skipped wholesale), each { id, parentId, value, childIds }.
    * An empty parentId marks a root; the array order IS the sibling order.
    * Throws resource_not_found for an unknown or non-tree name.
+   *
+   * Binding difference (known, deliberate): `rootIds` is a wasm-only
+   * convenience — the VISIBLE root ids in sibling order, pre-resolved from
+   * the DFS order. The node binding's readback has no `rootIds` field;
+   * consumers wanting parity derive the same list with
+   * nodes.filter((node) => node.parentId === '').map((node) => node.id).
    */
   getOTTree(name: string):
     { nodes: { id: string; parentId: string; value: string;
-               childIds: string[] }[] };
+               childIds: string[] }[] } & { rootIds: string[] };
   /**
    * Insert node `nodeId` under `parentId` ('' = a root node) at the child
    * ordinal `position` (0 prepends). The parent must exist and `nodeId`

@@ -137,13 +137,17 @@ crabs_ot_tree_t* crabs_extract_visible_tree(
     if (node == NULL) continue;
     const char* parent_id_arg = node->parent_id[0] ? node->parent_id : NULL;
     if (!node->deleted) {
-      // Count current visible children of the parent so we append in order.
+      // Count the node's current visible ordinal among its sibling list
+      // (root chain for parentless nodes — crabs_ot_tree_insert_node now
+      // honors root-level positions) so we append in order.
       uint32_t pos = 0;
       if (parent_id_arg != NULL) {
         crabs_tree_node_t* vp = crabs_ot_tree_find(visible, parent_id_arg);
         if (vp != NULL) {
           for (crabs_tree_node_t* c = vp->first_child; c != NULL; c = c->next_sibling) pos++;
         }
+      } else {
+        for (crabs_tree_node_t* r = visible->root; r != NULL; r = r->next_sibling) pos++;
       }
       crabs_ot_tree_insert_node(visible, parent_id_arg, pos,
                                  node->id, node->value, node->value_size);

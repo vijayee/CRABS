@@ -12,6 +12,13 @@
 const assert = require('assert');
 const { Node } = require('..');
 
+// Throw if `invoke` fails to throw a typed-error message containing
+// `fragment` (a refusal pin), naming the pin with `label`.
+const mustThrowWith = (invoke, fragment, label) => {
+  assert.throws(invoke, (caughtError) => String(caughtError.message).includes(fragment),
+    `${label}: expected a typed error containing "${fragment}"`);
+};
+
 // ============================================================
 // OT_DOCUMENT
 // ============================================================
@@ -128,6 +135,36 @@ assert.throws(() => treeNode.otInsertNode('t', 'ghost', 0, 'x', '',
 assert.throws(() => treeNode.otInsertNode('t', 'r', 0, 'r', '',
     { id: { node: 'ot-tree-a', seq: 7 } }),
   /invalid_param/, 'duplicate node id');
+
+// ---- Root-level ordinals are HONORED ---------------------------------------
+// A fresh root at ordinal 0 lands FIRST (the root-chain analogue of the
+// nested path's position-0 prepend); the C core's root branches used to
+// walk to the last root sibling and append regardless of the request.
+treeNode.addOTTree('roots');
+const rootInsert = (nodeId, position, seq, value) => treeNode.otInsertNode(
+  'roots', '', position, nodeId, value,
+  { id: { node: 'ot-tree-a', seq, ts: 1000 } });
+rootInsert('r-first', 0, 8, 'one');
+rootInsert('r-last', 1, 9, 'two');
+rootInsert('r-prepended', 0, 10, 'zero');
+const respectedRootOrder = ['r-prepended', 'r-first', 'r-last'];
+assert.deepStrictEqual(
+  treeNode.getOTTree('roots').nodes
+    .filter((entry) => entry.parentId === '').map((entry) => entry.id),
+  respectedRootOrder,
+  'root ordinals must be honored: ordinal-0 insert lands first');
+
+// Reparent to root at ordinal 1: r-kid lands BETWEEN r-first and r-last
+// (the old root branch also appended reparented roots at the tail).
+treeNode.otInsertNode('roots', 'r-first', 0, 'r-kid', 'kid',
+  { id: { node: 'ot-tree-a', seq: 11, ts: 1000 } });
+treeNode.otReparent('roots', 'r-kid', '', 1,
+  { id: { node: 'ot-tree-a', seq: 12, ts: 1000 } });
+assert.deepStrictEqual(
+  treeNode.getOTTree('roots').nodes
+    .filter((entry) => entry.parentId === '').map((entry) => entry.id),
+  ['r-prepended', 'r-kid', 'r-first', 'r-last'],
+  'reparent-to-root ordinal must be honored');
 
 // ---- Unpoliced machine refuses the op --------------------------------------
 const unpoliced = new Node('ot-doc-plain', { ordering: 'hlc' });

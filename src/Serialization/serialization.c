@@ -737,21 +737,27 @@ static bool _deserialize_ot_type_state(read_buf_t* buf, data_item_t* item,
 
       // Audit M-D: detect cycles and disconnected nodes from the parent links
       // (e.g. A→B and B→A from a crafted blob). Walk each declared-parent
-      // node's parent chain bounded by node_count+1; it must reach root, else
+      // node's parent chain bounded by node_count+1; it must reach A ROOT, else
       // the blob is cyclic or disconnected and downstream recursive walkers
       // would hang or overflow the stack. Empty-parent_id nodes were linked
       // as sibling roots above, so they have no parent chain to check.
+      // With root-level positions honored (and on any multi-root tree), a
+      // subtree legitimately roots at a SIBLING root — not just the chain
+      // head tree->root — so the anchor is "parentless", not tree->root.
       if (tree->root != NULL) {
         crabs_tree_node_t* walk_node = tree->node_pool;
         while (walk_node != NULL) {
           if (walk_node->parent_id[0] != '\0') {
             uint32_t steps = 0;
             crabs_tree_node_t* ancestor = walk_node->parent;
-            while (ancestor != NULL && ancestor != tree->root && steps <= node_count) {
+            while (ancestor != NULL && ancestor->parent != NULL &&
+                   steps <= node_count) {
               ancestor = ancestor->parent;
               steps++;
             }
-            if (ancestor != tree->root) return false; // cyclic or disconnected
+            // Cyclic (the bound expired without a parentless anchor) or
+            // disconnected (a declared parent_id that was never linked).
+            if (ancestor == NULL || ancestor->parent != NULL) return false;
           }
           walk_node = walk_node->pool_next;
         }

@@ -641,6 +641,11 @@ export interface Node {
    * subtree is skipped wholesale), each { id, parentId, value, childIds }.
    * An empty parentId marks a root; the array order IS the sibling order.
    * Throws resource_not_found for an unknown or non-tree name.
+   *
+   * Binding difference (known, deliberate): no `rootIds` field here — the
+   * wasm binding's readback returns one as a convenience. Consumers wanting
+   * parity derive the same list with
+   * nodes.filter((node) => node.parentId === '').map((node) => node.id).
    */
   getOTTree(name: string):
     { nodes: { id: string; parentId: string; value: string;

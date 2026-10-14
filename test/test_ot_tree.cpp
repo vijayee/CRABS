@@ -73,6 +73,54 @@ TEST(OTTree, InsertRootNode) {
   crabs_ot_tree_destroy(tree);
 }
 
+TEST(OTTree, InsertRootHonorsRequestedOrdinal) {
+  // Root-level positions are HONORED, mirroring the nested-path placement
+  // (InsertChildNodes pins r/a/b/c in requested order): a mid ordinal lands
+  // mid-chain and ordinal 0 prepends ahead of the current first root.
+  crabs_ot_tree_t* tree = crabs_ot_tree_create();
+  const uint8_t data[] = {0x01};
+
+  ASSERT_NE(crabs_ot_tree_insert_node(tree, NULL, 0, "r1", data, 1), nullptr);
+  ASSERT_NE(crabs_ot_tree_insert_node(tree, NULL, 1, "r3", data, 1), nullptr);
+  ASSERT_NE(crabs_ot_tree_insert_node(tree, NULL, 1, "r2", data, 1), nullptr);
+
+  // Ordinals are honored: r2 landed between r1 and r3.
+  EXPECT_STREQ(crabs_ot_tree_root(tree)->id, "r1");
+  EXPECT_STREQ(crabs_ot_tree_root(tree)->next_sibling->id, "r2");
+  EXPECT_STREQ(crabs_ot_tree_root(tree)->next_sibling->next_sibling->id, "r3");
+
+  // Ordinal 0 prepends (the root-chain analogue of the nested path's
+  // "child at position 0 is the first child").
+  ASSERT_NE(crabs_ot_tree_insert_node(tree, NULL, 0, "r0", data, 1), nullptr);
+  EXPECT_EQ(crabs_ot_tree_root(tree), crabs_ot_tree_find(tree, "r0"));
+  EXPECT_EQ(crabs_ot_tree_visible_count(tree), 4u);
+
+  crabs_ot_tree_destroy(tree);
+}
+
+TEST(OTTree, InsertRootOrdinalSkipsTombstonedRoots) {
+  // The requested ordinal counts VISIBLE roots: after tombstoning the first
+  // root, an ordinal-0 insert lands ahead of the surviving root, not behind
+  // the tombstone in the chain.
+  crabs_ot_tree_t* tree = crabs_ot_tree_create();
+  const uint8_t data[] = {0x01};
+
+  crabs_ot_tree_insert_node(tree, NULL, 0, "r1", data, 1);
+  crabs_ot_tree_insert_node(tree, NULL, 1, "r2", data, 1);
+  crabs_ot_tree_delete_node(tree, "r1");
+  ASSERT_NE(crabs_ot_tree_insert_node(tree, NULL, 0, "r0", data, 1), nullptr);
+
+  // The raw chain keeps the tombstone between the survivors; the visible
+  // walk (what every readback resolves) sees r0 then r2.
+  EXPECT_STREQ(crabs_ot_tree_root(tree)->id, "r0");
+  crabs_tree_node_t* cursor = crabs_ot_tree_root(tree)->next_sibling;
+  ASSERT_NE(cursor, nullptr);
+  EXPECT_TRUE(cursor->deleted);
+  EXPECT_STREQ(cursor->next_sibling->id, "r2");
+  EXPECT_EQ(crabs_ot_tree_visible_count(tree), 2u);
+  crabs_ot_tree_destroy(tree);
+}
+
 TEST(OTTree, InsertChildNodes) {
   crabs_ot_tree_t* tree = crabs_ot_tree_create();
   const uint8_t data[] = {0x01};
@@ -201,6 +249,32 @@ TEST(OTTree, ReparentToRoot) {
   crabs_tree_node_t* moved = crabs_ot_tree_reparent(tree, "A", "", 0);
   ASSERT_NE(moved, nullptr);
   EXPECT_STREQ(moved->parent_id, "");
+
+  crabs_ot_tree_destroy(tree);
+}
+
+TEST(OTTree, ReparentToRootHonorsRequestedOrdinal) {
+  // Root ordinals are HONORED on reparent too (mirrored from the
+  // nested-parent path's _get_child_at_visible placement): ordinal 0 lands
+  // FIRST (ahead of the current first root), ordinal 1 lands mid-chain.
+  crabs_ot_tree_t* tree = crabs_ot_tree_create();
+  const uint8_t data[] = {0x01};
+
+  crabs_ot_tree_insert_node(tree, NULL, 0, "r1", data, 1);
+  crabs_ot_tree_insert_node(tree, NULL, 1, "r2", data, 1);
+  crabs_ot_tree_insert_node(tree, "r1", 0, "c0", data, 1);
+  crabs_ot_tree_insert_node(tree, "r1", 1, "c1", data, 1);
+
+  // Reparent c0 to root at ordinal 0 — lands AHEAD of r1, not at the tail.
+  ASSERT_NE(crabs_ot_tree_reparent(tree, "c0", "", 0), nullptr);
+  EXPECT_EQ(crabs_ot_tree_root(tree), crabs_ot_tree_find(tree, "c0"));
+  EXPECT_STREQ(crabs_ot_tree_root(tree)->next_sibling->id, "r1");
+
+  // Reparent c1 to root at ordinal 1 — lands between c0 and r1.
+  ASSERT_NE(crabs_ot_tree_reparent(tree, "c1", "", 1), nullptr);
+  EXPECT_STREQ(crabs_ot_tree_root(tree)->id, "c0");
+  EXPECT_STREQ(crabs_ot_tree_root(tree)->next_sibling->id, "c1");
+  EXPECT_STREQ(crabs_ot_tree_root(tree)->next_sibling->next_sibling->id, "r1");
 
   crabs_ot_tree_destroy(tree);
 }

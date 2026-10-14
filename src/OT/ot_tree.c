@@ -158,6 +158,48 @@ static uint32_t _visible_child_count(crabs_tree_node_t* parent) {
   return count;
 }
 
+// Link a node into the root chain at the requested VISIBLE root ordinal —
+// the root chain's mirror of the nested-placement idiom in
+// crabs_ot_tree_insert_node's parent branch (_get_child_at_visible +
+// pointer surgery). Tombstoned roots are skipped when resolving `pos` and
+// a `pos` past the visible tail appends after the last visible root.
+static void _link_root_at_visible(crabs_ot_tree_t* tree, crabs_tree_node_t* node,
+                                  uint64_t pos) {
+  // Empty tree or a prepend: the node becomes the head of the root chain.
+  if (tree->root == NULL || pos == 0) {
+    node->next_sibling = tree->root;
+    if (tree->root != NULL) tree->root->prev_sibling = node;
+    tree->root = node;
+    return;
+  }
+
+  // Walk the visible roots to the (pos - 1)-th one and link after it.
+  crabs_tree_node_t* after = NULL;
+  uint64_t visible_index = 0;
+  for (crabs_tree_node_t* r = tree->root; r != NULL; r = r->next_sibling) {
+    if (r->deleted) continue;
+    if (visible_index == pos - 1) {
+      after = r;
+      break;
+    }
+    visible_index++;
+  }
+
+  if (after != NULL) {
+    node->prev_sibling = after;
+    node->next_sibling = after->next_sibling;
+    if (after->next_sibling) after->next_sibling->prev_sibling = node;
+    after->next_sibling = node;
+  } else {
+    // Past the visible tail (or only tombstones remain): append after the
+    // last root still chained.
+    crabs_tree_node_t* last = tree->root;
+    while (last->next_sibling != NULL) last = last->next_sibling;
+    last->next_sibling = node;
+    node->prev_sibling = last;
+  }
+}
+
 // ============================================================
 // Tree Operations (v1.5 §7.2)
 // ============================================================
@@ -228,18 +270,10 @@ crabs_tree_node_t* crabs_ot_tree_insert_node(
       }
     }
   } else {
-    // No parent — this is a root node
-    if (tree->root == NULL) {
-      tree->root = node;
-    } else {
-      // Multiple roots: add as sibling of current root
-      crabs_tree_node_t* last = tree->root;
-      while (last->next_sibling != NULL) {
-        last = last->next_sibling;
-      }
-      last->next_sibling = node;
-      node->prev_sibling = last;
-    }
+    // No parent — this is a root node: honor the requested root ordinal
+    // (`pos` counts VISIBLE roots, same semantics as the nested-child
+    // branch above).
+    _link_root_at_visible(tree, node, pos);
   }
 
   _add_to_pool(tree, node);
@@ -371,15 +405,9 @@ crabs_tree_node_t* crabs_ot_tree_reparent(
       }
     }
   } else {
-    // Becomes root
-    if (tree->root == NULL) {
-      tree->root = node;
-    } else {
-      crabs_tree_node_t* last = tree->root;
-      while (last->next_sibling != NULL) last = last->next_sibling;
-      last->next_sibling = node;
-      node->prev_sibling = last;
-    }
+    // Becomes a root: honor the requested root ordinal (`new_pos` counts
+    // VISIBLE roots, same semantics as the nested-parent branch above).
+    _link_root_at_visible(tree, node, new_pos);
   }
 
   return node;
