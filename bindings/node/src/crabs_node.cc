@@ -462,10 +462,16 @@ private:
     Napi::Object obj = inst->key_pair_ctor.New({});
     KeyPair* kp = KeyPair::Unwrap(obj);
     kp->kp_ = (ecdsa_keypair_t*)calloc(1, sizeof(ecdsa_keypair_t));
-    if (!hex_decode(hex, kp->kp_->private_key, 32))
+    if (!hex_decode(hex, kp->kp_->private_key, 32)) {
+      // Audit M-6: the std::string copy of the secret must never outlive the
+      // decode attempt uncleansed (GC-visible heap bytes; the DecryptKeyEnvelope
+      // pattern).
+      OPENSSL_cleanse(&hex[0], hex.size());
       throw Napi::Error::New(env, "Invalid private key hex (expected 64 chars)");
+    }
     // Derive public key from private key
     crabs_error_e rc = crypto_ecdsa_derive_public_key(kp->kp_->private_key, kp->kp_->public_key);
+    OPENSSL_cleanse(&hex[0], hex.size());
     if (rc != CRABS_SUCCESS) {
       free(kp->kp_);
       kp->kp_ = nullptr;
@@ -482,10 +488,12 @@ private:
     uint8_t priv[32], pub[33];
     if (!hex_decode(hex, priv, 32)) {
       OPENSSL_cleanse(priv, sizeof(priv));
+      OPENSSL_cleanse(&hex[0], hex.size());  // Audit M-6: cleanse the heap copy too
       throw Napi::Error::New(env, "Invalid private key hex");
     }
     crabs_error_e rc = crypto_ecdsa_derive_public_key(priv, pub);
     OPENSSL_cleanse(priv, sizeof(priv));  // key bytes never leave this frame
+    OPENSSL_cleanse(&hex[0], hex.size());  // Audit M-6: cleanse the heap copy too
     if (rc != CRABS_SUCCESS) {
       OPENSSL_cleanse(pub, sizeof(pub));
       throw crabs_error(env, rc, "derivePublicHex");
@@ -1165,6 +1173,7 @@ private:
     uint8_t token[CRABS_LOCK_TOKEN_SIZE];
     if (!hex_decode(token_hex, token, CRABS_LOCK_TOKEN_SIZE)) {
       OPENSSL_cleanse(token, CRABS_LOCK_TOKEN_SIZE);
+      OPENSSL_cleanse(&token_hex[0], token_hex.size());  // Audit M-6: heap copy too
       throw Napi::RangeError::New(env,
           "addLockClaim: tokenHex must be 64 hex chars (32 bytes)");
     }
@@ -1173,6 +1182,7 @@ private:
         (op_->lock_claim_count + 1) * sizeof(lock_claim_t));
     if (grown_claims == NULL) {
       OPENSSL_cleanse(token, CRABS_LOCK_TOKEN_SIZE);
+      OPENSSL_cleanse(&token_hex[0], token_hex.size());  // Audit M-6: heap copy too
       throw crabs_error(env, CRABS_ERR_OOM, "addLockClaim");
     }
     op_->lock_claims = grown_claims;
@@ -1180,6 +1190,7 @@ private:
     memset(claim, 0, sizeof(*claim));
     strncpy(claim->resource, resource.c_str(), CRABS_MAX_USER_ID - 1);
     memcpy(claim->lock_token, token, CRABS_LOCK_TOKEN_SIZE);
+    OPENSSL_cleanse(&token_hex[0], token_hex.size());  // Audit M-6: heap copy too
     OPENSSL_cleanse(token, CRABS_LOCK_TOKEN_SIZE);
     op_->lock_claim_count++;
     return info.This();
@@ -1392,19 +1403,25 @@ private:
     std::string hex = info[0].As<Napi::String>().Utf8Value();
     // A11-L7: cleanse even on the decode-failure throw — a partial decode
     // leaves a prefix of the caller's key bytes on the stack, and every other
-    // exit from this buffer is scrubbed.
+    // exit from this buffer is scrubbed. Audit M-6: the std::string is a
+    // SECOND heap copy of the same secret — cleanse it on every path too
+    // (the DecryptKeyEnvelope pattern), since GC-visible std::string bytes
+    // cannot be zeroized by JS.
     if (!hex_decode(hex, priv, 32)) {
       OPENSSL_cleanse(priv, 32);
+      OPENSSL_cleanse(&hex[0], hex.size());
       throw Napi::Error::New(env, "Invalid private key hex");
     }
     serialized_buffer_t* ser = crabs_serialize_for_signing(op_);
     if (!ser) {
       OPENSSL_cleanse(priv, 32);
+      OPENSSL_cleanse(&hex[0], hex.size());
       throw crabs_error(env, CRABS_ERR_SERIALIZATION_ERROR, "sign");
     }
     crabs_error_e rc = crypto_ecdsa_sign(priv, ser->data, ser->len, op_->signature);
     serialized_buffer_destroy(ser);
     OPENSSL_cleanse(priv, 32);
+    OPENSSL_cleanse(&hex[0], hex.size());
     if (rc != CRABS_SUCCESS) throw crabs_error(env, rc, "sign");
     return info.This();
   }
@@ -4349,19 +4366,24 @@ private:
       uint8_t priv[32];
       std::string hex = info[1].As<Napi::String>().Utf8Value();
       // A11-L7: cleanse even on the decode-failure throw — a partial decode
-      // leaves a prefix of the caller's key bytes on the stack.
+      // leaves a prefix of the caller's key bytes on the stack. Audit M-6:
+      // the std::string is a second heap copy of the secret — cleanse it on
+      // every path (the DecryptKeyEnvelope pattern).
       if (!hex_decode(hex, priv, 32)) {
         OPENSSL_cleanse(priv, 32);
+        OPENSSL_cleanse(&hex[0], hex.size());
         throw Napi::Error::New(env, "Invalid private key hex");
       }
       serialized_buffer_t* ser = crabs_serialize_for_signing(op->raw());
       if (!ser) {
         OPENSSL_cleanse(priv, 32);
+        OPENSSL_cleanse(&hex[0], hex.size());
         throw crabs_error(env, CRABS_ERR_SERIALIZATION_ERROR, "sign");
       }
       crabs_error_e rc = crypto_ecdsa_sign(priv, ser->data, ser->len, op->raw()->signature);
       serialized_buffer_destroy(ser);
       OPENSSL_cleanse(priv, 32);
+      OPENSSL_cleanse(&hex[0], hex.size());
       if (rc != CRABS_SUCCESS) throw crabs_error(env, rc, "sign");
     }
     return info.This();
@@ -5139,6 +5161,17 @@ private:
         sk = crypto_abe_user_key_deserialize(
             (const abe_master_key_t*)am_->base_state.abe_mk, plain, plain_len);
         rc = (sk != nullptr) ? CRABS_SUCCESS : CRABS_ERR_CRYPTOGRAPHIC_ERROR;
+      }
+    }
+    // Audit H-4: consume the envelope's signed state_version — the wasm export
+    // (wasm_helpers.c) refuses stale/replayed envelopes with key_stale; this
+    // binding previously imported them silently. The gate's monotonic
+    // watermark only advances once the recipient work completed.
+    if (rc == CRABS_SUCCESS) {
+      rc = attribute_machine_envelope_import_gate(am_, envelope);
+      if (rc != CRABS_SUCCESS) {
+        crypto_abe_user_key_destroy(sk);
+        sk = nullptr;
       }
     }
     // The recovered plaintext key bytes never linger past this frame.

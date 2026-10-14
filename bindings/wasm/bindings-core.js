@@ -2275,13 +2275,20 @@ class Node {
 
   sign(op, signingKey) {
     const M = this._M;
+    if (signingKey && typeof signingKey === 'object' && signingKey._ptr) {
+      // Audit M-7: the scalar already lives in THIS module's heap at _ptr —
+      // point at it directly instead of materializing a JS hex string (V8
+      // strings can't be zeroized, so the old round-trip minted an
+      // unwipeable copy of the private key on every signature). The C-side
+      // frame is the authority; heap growth detaches ArrayBuffer VIEWS, it
+      // never moves a live C allocation, so _ptr stays valid here.
+      const rc = M._crabs_wasm_sign_operation(this._am, op._ptr, signingKey._ptr);
+      wrapRc(rc, 'sign');
+      return;
+    }
     let privHex;
     if (typeof signingKey === 'string') {
       privHex = signingKey;
-    } else if (signingKey && signingKey._ptr) {
-      // Read the private key as a hex string now; the heap view stored on the
-      // KeyPair object can become detached after WASM memory growth.
-      privHex = signingKey.privateKeyHex();
     } else {
       throw new Error('Expected KeyPair or private key hex string');
     }
@@ -2422,7 +2429,12 @@ class Node {
     const { ptr: dPtr, len: dLen } = writeBytes(M, b);
     const pPtr = writeString(M, policy);
     const ct = M._crabs_wasm_abe_encrypt(this._am, dPtr, dLen, pPtr);
-    freeAll(M, dPtr, pPtr);
+    // Audit M-5: the staged plaintext is a secret on BOTH arms — before handoff
+    // (this copy) and after decrypt (the recovered key/bytes) — so it takes the
+    // same wipeFree as every other staging arm; freeAll's plain free hands the
+    // plaintext to dlmalloc's free list.
+    wipeFree(M, dPtr, dLen);
+    if (pPtr) M._free(pPtr);
     if (!ct) throw new Error('ABE encrypt failed');
 
     const policyStr = readString(M, M._crabs_wasm_abe_ciphertext_policy(ct));
