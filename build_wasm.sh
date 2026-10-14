@@ -212,6 +212,7 @@ build_variant() {
   EXTRA_DEFINES="$2"    # "" or "-DCRABS_ENABLE_DEVTOOLS"
   EXPORT_NAME="$3"
   EXPORTS_JSON="$4"
+  EXTRA_SFLAGS="$5"     # extra emcc -s link flags (dev-only runtime checks)
 
   VARIANT_DIR="$BUILD_DIR$VARIANT_SUFFIX"
   mkdir -p "$VARIANT_DIR"
@@ -243,6 +244,9 @@ build_variant() {
     -s ALLOW_TABLE_GROWTH=1 \
     -s ALLOW_MEMORY_GROWTH=1 \
     -s INITIAL_MEMORY=64MB \
+    -s STACK_SIZE=5MB \
+    -s STACK_OVERFLOW_CHECK=2 \
+    $EXTRA_SFLAGS \
     -s EXPORTED_FUNCTIONS="$EXPORTS_JSON" \
     -s EXPORTED_RUNTIME_METHODS='["ccall","cwrap","getValue","setValue","UTF8ToString","stringToUTF8","lengthBytesUTF8","addFunction","removeFunction","HEAP8","HEAPU8","HEAP16","HEAPU16","HEAP32","HEAPU32","HEAPF32","HEAPF64"]' \
     --js-library "$ROOT_DIR/src/TimeSource/wasm_time_library.js" \
@@ -251,10 +255,11 @@ build_variant() {
     2>&1
 }
 
-build_variant "" "" "createCRABSModule" "$BASE_EXPORTS"
+build_variant "" "" "createCRABSModule" "$BASE_EXPORTS" ""
 # Merge the two JSON arrays into one (emcc's -s parser splits on commas and
 # cannot handle a "],[" junction between the lists).
-build_variant ".dev" "-DCRABS_ENABLE_DEVTOOLS" "createCRABSModuleDev" "${BASE_EXPORTS%]},${DEVTOOLS_EXPORTS#[}"
+# The dev variant adds SAFE_HEAP=1 + ASSERTIONS=2 for memory-safety checking.
+build_variant ".dev" "-DCRABS_ENABLE_DEVTOOLS" "createCRABSModuleDev" "${BASE_EXPORTS%]},${DEVTOOLS_EXPORTS#[}" "-s SAFE_HEAP=1 -s ASSERTIONS=2"
 
 echo ""
 echo "=== CRABS WASM Build Complete ==="

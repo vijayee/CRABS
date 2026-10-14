@@ -68,6 +68,14 @@ if (BUILD_TESTING)
 
     add_dependencies(testcrabs crabs)
     target_link_libraries(testcrabs PRIVATE crabs)
+    # Hardening/sanitizer flags mirror the root CMakeLists (crabs target).
+    # Flags apply to the test sources only — the fetched googletest targets
+    # are untouched.
+    target_compile_options(testcrabs PRIVATE ${CRABS_WARNING_FLAGS} ${CRABS_HARDENING_FLAGS})
+    if(CRABS_SANITIZE)
+        target_compile_options(testcrabs PRIVATE ${CRABS_SANITIZE_FLAGS})
+        target_link_options(testcrabs PRIVATE ${CRABS_SANITIZE_FLAGS})
+    endif()
     target_link_libraries(testcrabs PRIVATE GTest::gtest_main)
     target_link_libraries(testcrabs PRIVATE GTest::gmock)
 
