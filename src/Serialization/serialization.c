@@ -2353,6 +2353,11 @@ static bool _deserialize_user(read_buf_t* buf, attribute_machine_t* machine) {
     if (!_read_uint64_le(buf, &attribute->expires_at)) goto fail;
   }
   if (!_read_bytes(buf, user->public_key, 33)) goto fail;
+  // Load is the only gate a (possibly unsigned) wire blob passes, so every
+  // secp256k1 key read from the registry is validated as a real curve point —
+  // not just at register_user. An invalid point is ECDH poison and ECDSA
+  // garbage; refuse rather than install.
+  if (!crypto_ecdsa_validate_public_key(user->public_key)) goto fail;
   if (!_read_string16(buf, user->default_key_id, CRABS_MAX_KEY_ID)) goto fail;
   if (!_read_uint32_le(buf, &user->key_count)) goto fail;
   if (user->key_count > CRABS_MAX_KEYS_PER_USER) goto fail;
@@ -2369,6 +2374,16 @@ static bool _deserialize_user(read_buf_t* buf, attribute_machine_t* machine) {
     if (!_read_uint32_le(buf, &key->public_key_len)) { free(key); goto fail; }
     if (key->public_key_len > CRABS_MAX_PUBLIC_KEY) { free(key); goto fail; }
     if (!_read_bytes(buf, key->public_key, key->public_key_len)) { free(key); goto fail; }
+    // Same on-curve gate as the user's primary key, for the secp256k1
+    // schemes whose keys are 33-byte compressed points. Other schemes'
+    // material is opaque to the ECDSA validator and is left to its own
+    // verification path.
+    if (key->public_key_len == 33 &&
+        (key->scheme == ECDSA_SECP256K1 || key->scheme == SCHNORR_SECP256K1) &&
+        !crypto_ecdsa_validate_public_key(key->public_key)) {
+      free(key);
+      goto fail;
+    }
     if (!_read_string16(buf, key->label, CRABS_MAX_KEY_LABEL)) { free(key); goto fail; }
     if (!_read_uint64_le(buf, &key->registered_at)) { free(key); goto fail; }
     if (!_read_uint64_le(buf, &key->last_used_at)) { free(key); goto fail; }
@@ -2400,6 +2415,13 @@ static bool _deserialize_user(read_buf_t* buf, attribute_machine_t* machine) {
     }
     *temp_tail = temp;
     temp_tail = &temp->next;
+  }
+  // register_user refuses duplicate ids on the live path; a crafted snapshot
+  // must not alias one user through two registry entries either (it would
+  // shadow Mode B trial order and duplicate attribute grants).
+  for (user_t* existing = machine->users; existing != NULL;
+       existing = existing->next) {
+    if (strcmp(existing->user_id, user->user_id) == 0) goto fail;
   }
   // Splice into the machine's list (the attribute machine is the owner).
   user_t** user_tail = &machine->users;

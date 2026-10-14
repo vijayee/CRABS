@@ -2480,14 +2480,16 @@ TEST(TestSerialization, V10UserRegistryRoundTripPreservesAttributesAndKeys) {
   writer->key_version = 3;
   strncpy(writer->attributes[0].value, "role:writer", CRABS_MAX_POLICY_EXPR - 1);
   writer->attribute_count = 1;
-  // Crypto random 33-byte key material is NOT validated here — serialization
-  // is a byte-level round trip; validation belongs to register_user.
+  // The registry reader validates secp256k1 key material at load, so this
+  // round-trip fixture carries a real keypair.
+  ecdsa_keypair_t* fixture_key = crypto_ecdsa_generate();
+  ASSERT_NE(fixture_key, nullptr);
+  memcpy(writer->public_key, fixture_key->public_key, 33);
   user_key_t* first_key = (user_key_t*)get_clear_memory(sizeof(user_key_t));
   strncpy(first_key->key_id, "k1", CRABS_MAX_KEY_ID - 1);
   first_key->scheme = ECDSA_SECP256K1;
   first_key->public_key_len = 33;
-  for (int byte_index = 0; byte_index < 33; byte_index++)
-    first_key->public_key[byte_index] = (uint8_t)(byte_index + 1);
+  memcpy(first_key->public_key, fixture_key->public_key, 33);
   first_key->status = KEY_ACTIVE;
   writer->keys = first_key;
   writer->key_count = 1;
@@ -2522,12 +2524,92 @@ TEST(TestSerialization, V10UserRegistryRoundTripPreservesAttributesAndKeys) {
   ASSERT_NE(restored_writer->keys, nullptr);
   EXPECT_STREQ(restored_writer->keys->key_id, "k1");
   EXPECT_EQ(restored_writer->keys->scheme, ECDSA_SECP256K1);
-  EXPECT_EQ(restored_writer->keys->public_key[0], 1);
+  EXPECT_EQ(memcmp(restored_writer->keys->public_key, fixture_key->public_key, 33), 0);
+
+  crypto_ecdsa_keypair_destroy(fixture_key);
 
   serialized_buffer_destroy(buf);
   // The restored state carries the deserializer-owned attribute machine shell;
   // state_destroy releases both the state fields and its user registry.
   state_destroy(restored);
+}
+
+// An UNSIGNED crafted snapshot must not be able to install ECDH-hostile key
+// material: register_user validates on the live path, but the load path is
+// the only gate a wire blob ever passes. Every secp256k1 key the registry
+// reads (user public key, and keyring keys) must be a real curve point.
+TEST(TestSerialization, RegistryLoadRefusesInvalidCurvePublicKey) {
+  state_t* state = state_create();
+  ASSERT_NE(state, nullptr);
+  state->attr_machine = (attribute_machine_t*)get_clear_memory(sizeof(attribute_machine_t));
+  state->attr_machine->base_state = *state;
+  user_t* writer = (user_t*)get_clear_memory(sizeof(user_t));
+  strncpy(writer->user_id, "mallory", CRABS_MAX_USER_ID - 1);
+  writer->status = USER_ACTIVE;
+  // 0x02 prefix + 32 zero bytes decodes to the point at infinity — not a
+  // usable ECDSA key (and poison for any ECDH against it).
+  writer->public_key[0] = 0x02;
+  state->attr_machine->users = writer;
+  state->attr_machine->user_count = 1;
+
+  serialized_buffer_t* buf = crabs_serialize_state(state);
+  ASSERT_NE(buf, nullptr);
+
+  state->attr_machine->users = NULL;
+  state->attr_machine->base_state.attr_machine = NULL;
+  state->attr_machine->base_state.abe_mk = NULL;
+  free(state->attr_machine);
+  state->attr_machine = NULL;
+  state_destroy(state);
+  free(writer);
+
+  EXPECT_EQ(crabs_deserialize_state(buf->data, buf->len), nullptr);
+  serialized_buffer_destroy(buf);
+}
+
+// Duplicate user_ids must be refused at load too: register_user rejects them
+// on the live path, and a crafted two-record snapshot would otherwise shadow
+// Mode B trial order / alias one user through two registry entries.
+TEST(TestSerialization, RegistryLoadRefusesDuplicateUserId) {
+  state_t* state = state_create();
+  ASSERT_NE(state, nullptr);
+  state->attr_machine = (attribute_machine_t*)get_clear_memory(sizeof(attribute_machine_t));
+  state->attr_machine->base_state = *state;
+
+  ecdsa_keypair_t* key_a = crypto_ecdsa_generate();
+  ASSERT_NE(key_a, nullptr);
+  ecdsa_keypair_t* key_b = crypto_ecdsa_generate();
+  ASSERT_NE(key_b, nullptr);
+
+  user_t* first = (user_t*)get_clear_memory(sizeof(user_t));
+  strncpy(first->user_id, "dupeuser", CRABS_MAX_USER_ID - 1);
+  first->status = USER_ACTIVE;
+  memcpy(first->public_key, key_a->public_key, 33);
+  user_t* second = (user_t*)get_clear_memory(sizeof(user_t));
+  strncpy(second->user_id, "dupeuser", CRABS_MAX_USER_ID - 1);
+  second->status = USER_ACTIVE;
+  memcpy(second->public_key, key_b->public_key, 33);
+  first->next = second;
+  state->attr_machine->users = first;
+  state->attr_machine->user_count = 2;
+
+  serialized_buffer_t* buf = crabs_serialize_state(state);
+  ASSERT_NE(buf, nullptr);
+
+  first->next = NULL;
+  state->attr_machine->users = NULL;
+  state->attr_machine->base_state.attr_machine = NULL;
+  state->attr_machine->base_state.abe_mk = NULL;
+  free(state->attr_machine);
+  state->attr_machine = NULL;
+  state_destroy(state);
+  free(first);
+  free(second);
+  crypto_ecdsa_keypair_destroy(key_a);
+  crypto_ecdsa_keypair_destroy(key_b);
+
+  EXPECT_EQ(crabs_deserialize_state(buf->data, buf->len), nullptr);
+  serialized_buffer_destroy(buf);
 }
 
 TEST(TestSerialization, V10SealedMskRoundTripRestoresAuthority) {
@@ -2590,10 +2672,17 @@ TEST(TestSerialization, V10CorruptUserEntryFailsWholeLoad) {
   writer->key_version = 3;
   strncpy(writer->attributes[0].value, "role:writer", CRABS_MAX_POLICY_EXPR - 1);
   writer->attribute_count = 1;
+  // The registry reader validates secp256k1 key material at load, so this
+  // fixture carries real key material (the corruption below is structural,
+  // not key-shaped).
+  ecdsa_keypair_t* fixture_key = crypto_ecdsa_generate();
+  ASSERT_NE(fixture_key, nullptr);
+  memcpy(writer->public_key, fixture_key->public_key, 33);
   user_key_t* first_key = (user_key_t*)get_clear_memory(sizeof(user_key_t));
   strncpy(first_key->key_id, "k1", CRABS_MAX_KEY_ID - 1);
   first_key->scheme = ECDSA_SECP256K1;
   first_key->public_key_len = 33;
+  memcpy(first_key->public_key, fixture_key->public_key, 33);
   first_key->status = KEY_ACTIVE;
   writer->keys = first_key;
   writer->key_count = 1;
@@ -2619,6 +2708,7 @@ TEST(TestSerialization, V10CorruptUserEntryFailsWholeLoad) {
   state_destroy(state);
   user_key_destroy_all(writer);
   free(writer);
+  crypto_ecdsa_keypair_destroy(fixture_key);
 
   // Deterministic corruption INSIDE the user entry. The user's key_count
   // field (u32, value 1) is located by its unique wire neighborhood:
