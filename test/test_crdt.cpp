@@ -1,10 +1,12 @@
 #include <gtest/gtest.h>
+#include <cstdlib>
 extern "C" {
 #include "../src/CRDT/crdt_merge.h"
 #include "../src/StateMachine/state_machine.h"
 #include "../src/OT/ot_types.h"
 #include "../src/OT/ot_ordered_set.h"
 #include "../src/OT/ot_document.h"
+#include "../src/Raft/raft_module.h"
 }
 
 // ============================================================
@@ -1844,6 +1846,231 @@ TEST(TestCRDTMerge, TestMergeStateOtMergeIsIdempotent) {
   EXPECT_EQ(crabs_ot_ordered_set_count(merged_set), 2u);
   EXPECT_TRUE(crabs_ot_op_id_equal(&merged_set->head->id, &first_id));
   EXPECT_TRUE(crabs_ot_op_id_equal(&merged_set->head->next->id, &second_id));
+
+  _destroy_state_values(dst);
+  _destroy_state_values(src);
+  state_destroy(dst);
+  state_destroy(src);
+}
+
+// Type-confusion pin (merge layer review F1): a crafted same-name FREE_MERGE
+// snapshot whose item is a COUNTER must NOT merge into an OT ordered set by
+// data-type cast — wire v18 is checksum-only authentication, so state blobs
+// are attacker-feedable. The arm holds with "__merge_type_mismatch__" +
+// CRABS_ERR_TYPE_MISMATCH (sovereign/group check style) and dst stays
+// untouched: same wrapper, same element, still readable.
+TEST(TestCRDTMerge, TestMergeStateOtTypeMismatchCounterVsSetHeld) {
+  state_t* dst = state_create();
+  state_t* src = state_create();
+  merge_event_capture_t capture = {};
+  state_set_change_hook(dst, _merge_event_hook, &capture);
+
+  data_item_t* dst_set = _make_free_ot_set_item("doc");
+  ASSERT_NE(dst_set, nullptr);
+  ASSERT_NE(_ot_set_apply_insert((crabs_ot_ordered_set_t*)dst_set->value,
+                                 0, "n1", 1, "keep"), nullptr);
+  ASSERT_EQ(state_add_item(dst, dst_set), CRABS_SUCCESS);
+
+  // The attacker's snapshot: a same-name FREE_MERGE g-counter item.
+  data_item_t* src_counter = data_item_create("doc", DATA_TYPE_COUNTER,
+                                              CRDT_G_COUNTER);
+  ASSERT_NE(src_counter, nullptr);
+  src_counter->value = g_counter_create();
+  src_counter->value_repr = (data_value_repr_t)DATA_VALUE_REPR_CRDT_STRUCT;
+  g_counter_increment((g_counter_t*)src_counter->value, "evil", 7);
+  ASSERT_EQ(state_add_item(src, src_counter), CRABS_SUCCESS);
+
+  const crabs_ot_ordered_set_t* dst_before =
+      (const crabs_ot_ordered_set_t*)dst_set->value;
+  const crabs_ordered_element_t* dst_element = dst_before->head;
+  ASSERT_NE(dst_element, nullptr);
+
+  EXPECT_EQ(crdt_merge_state(dst, src), CRABS_SUCCESS);
+
+  // Untouched: same wrapper, same sole element, payload readable.
+  EXPECT_EQ(dst_set->value, (void*)dst_before);
+  EXPECT_EQ(((const crabs_ot_ordered_set_t*)dst_set->value)->head, dst_element);
+  EXPECT_EQ(crabs_ot_ordered_set_count((crabs_ot_ordered_set_t*)dst_set->value), 1u);
+  EXPECT_EQ(crabs_ot_ordered_set_visible_count(
+                (crabs_ot_ordered_set_t*)dst_set->value), 1u);
+  ASSERT_NE(dst_element->value, nullptr);
+  EXPECT_EQ(memcmp(dst_element->value, "keep", 4), 0);
+  // The alias still points at the wrapper's own ot_data.
+  EXPECT_EQ(dst_set->ot_data,
+            ((const crabs_ot_ordered_set_t*)dst_set->value)->ot_data);
+  // Held, with the shape-conflict code (not the equivocation code).
+  ASSERT_EQ(capture.calls, 1);
+  EXPECT_EQ(capture.kind, CRABS_CHANGE_MERGE);
+  EXPECT_STREQ(capture.type, "__merge_type_mismatch__");
+  EXPECT_STREQ(capture.target, "doc");
+  EXPECT_EQ(capture.result, CRABS_ERR_TYPE_MISMATCH);
+
+  _destroy_state_values(dst);
+  _destroy_state_values(src);
+  state_destroy(dst);
+  state_destroy(src);
+}
+
+// Alias-liveness pin (F2, sovereign arm): a hand-planted sovereign OT item
+// (old snapshots could carry one) whose ahead snapshot displaces the value
+// must leave item->ot_data re-linked off the INSTALLED value — the executor
+// and v18 writer dereference the field directly, and the recomputable digest
+// proves the serializer read live (re-linked) content.
+TEST(TestCRDTMerge, TestMergeStateSovereignDisplacedOtValueRelinksAlias) {
+  state_t* dst = state_create();
+  state_t* src = state_create();
+  merge_event_capture_t capture = {};
+  state_set_change_hook(dst, _merge_event_hook, &capture);
+
+  data_item_t* dst_item = _make_free_ot_set_item("doc");
+  ASSERT_NE(dst_item, nullptr);
+  dst_item->write_domain = CRABS_DOMAIN_SOVEREIGN;
+  strncpy(dst_item->writer, "w1", sizeof(dst_item->writer) - 1);
+  ASSERT_NE(_ot_set_apply_insert((crabs_ot_ordered_set_t*)dst_item->value,
+                                 0, "w1", 1, "old"), nullptr);
+  dst_item->item_seq = 1;
+  ASSERT_EQ(state_item_digest_compute(dst_item, dst_item->item_digest),
+            CRABS_SUCCESS);
+  ASSERT_EQ(state_add_item(dst, dst_item), CRABS_SUCCESS);
+
+  data_item_t* src_item = _make_free_ot_set_item("doc");
+  ASSERT_NE(src_item, nullptr);
+  src_item->write_domain = CRABS_DOMAIN_SOVEREIGN;
+  memcpy(src_item->writer, dst_item->writer, sizeof(src_item->writer));
+  ASSERT_NE(_ot_set_apply_insert((crabs_ot_ordered_set_t*)src_item->value,
+                                 0, "w1", 2, "new"), nullptr);
+  src_item->item_seq = 2;
+  // The carried head must be honest: the sovereign arm recomputes and holds
+  // on mismatch (a different pin) — this pin is the displaced install.
+  ASSERT_EQ(state_item_digest_compute(src_item, src_item->item_digest),
+            CRABS_SUCCESS);
+  ASSERT_EQ(state_add_item(src, src_item), CRABS_SUCCESS);
+
+  EXPECT_EQ(crdt_merge_state(dst, src), CRABS_SUCCESS);
+
+  // Accepted, silent.
+  EXPECT_EQ(capture.calls, 0);
+  EXPECT_EQ(dst_item->item_seq, 2u);
+  // The installed value is src's content; the alias was re-linked off it.
+  crabs_ot_ordered_set_t* installed = (crabs_ot_ordered_set_t*)dst_item->value;
+  ASSERT_NE(installed, nullptr);
+  ASSERT_NE(dst_item->ot_data, nullptr);
+  EXPECT_EQ(dst_item->ot_data, installed->ot_data);
+  EXPECT_EQ(crabs_ot_ordered_set_count(installed), 1u);
+  crabs_ordered_element_t* element = crabs_ot_ordered_set_get(installed, 0);
+  ASSERT_NE(element, nullptr);
+  EXPECT_EQ(memcmp(element->value, "new", 3), 0);
+  // The stamped head still recomputes over the merged content — the alias
+  // the serializer reads is live, not the displaced value's freed ot_data.
+  uint8_t recomputed[CRABS_HASH_SIZE];
+  ASSERT_EQ(state_item_digest_compute(dst_item, recomputed), CRABS_SUCCESS);
+  EXPECT_EQ(memcmp(recomputed, dst_item->item_digest, CRABS_HASH_SIZE), 0);
+
+  _destroy_state_values(dst);
+  _destroy_state_values(src);
+  state_destroy(dst);
+  state_destroy(src);
+}
+
+// Alias-liveness pin (F2, group arm): a GROUP_ORDERED OT item whose module
+// tip is behind adopts the committed snapshot — the staged digest must be
+// hashed over the RE-LINKED alias (the item serializer reads item->ot_data
+// for an OT type's op-log section), the displaced value's ot_data must not
+// dangle after the destroy, and the stamped head must recompute.
+TEST(TestCRDTMerge, TestMergeStateGroupOrderedDisplacedOtValueRelinksAlias) {
+  state_t* dst = state_create();
+  state_t* src = state_create();
+  merge_event_capture_t capture = {};
+  state_set_change_hook(dst, _merge_event_hook, &capture);
+
+  // src carries a loaded v16 module snapshot with a committed tip of 1
+  // (loaded-but-not-yet-reimported form; the module object is not attached).
+  // dst is module-less: tip 0 — src_tip > dst_tip drives the adopt arm.
+  crabs_raft_module_state_t* src_module =
+      (crabs_raft_module_state_t*)calloc(1, sizeof(crabs_raft_module_state_t));
+  ASSERT_NE(src_module, nullptr);
+  src_module->commit_index = 1;
+  src->raft_module_state = src_module;  // state_destroy frees the snapshot
+
+  data_item_t* dst_item = _make_free_ot_set_item("ledger");
+  ASSERT_NE(dst_item, nullptr);
+  dst_item->write_domain = CRABS_DOMAIN_GROUP_ORDERED;
+  ASSERT_NE(_ot_set_apply_insert((crabs_ot_ordered_set_t*)dst_item->value,
+                                 0, "n1", 1, "old"), nullptr);
+  ASSERT_EQ(state_add_item(dst, dst_item), CRABS_SUCCESS);
+
+  data_item_t* src_item = _make_free_ot_set_item("ledger");
+  ASSERT_NE(src_item, nullptr);
+  src_item->write_domain = CRABS_DOMAIN_GROUP_ORDERED;
+  ASSERT_NE(_ot_set_apply_insert((crabs_ot_ordered_set_t*)src_item->value,
+                                 0, "n2", 1, "new"), nullptr);
+  ASSERT_EQ(state_add_item(src, src_item), CRABS_SUCCESS);
+
+  EXPECT_EQ(crdt_merge_state(dst, src), CRABS_SUCCESS);
+
+  // Adopted, silent.
+  EXPECT_EQ(capture.calls, 0);
+  crabs_ot_ordered_set_t* installed = (crabs_ot_ordered_set_t*)dst_item->value;
+  ASSERT_NE(installed, nullptr);
+  ASSERT_NE(dst_item->ot_data, nullptr);
+  EXPECT_EQ(dst_item->ot_data, installed->ot_data);
+  EXPECT_EQ(crabs_ot_ordered_set_count(installed), 1u);
+  crabs_ordered_element_t* element = crabs_ot_ordered_set_get(installed, 0);
+  ASSERT_NE(element, nullptr);
+  EXPECT_EQ(memcmp(element->value, "new", 3), 0);
+  // The stamped head recomputes over the committed content — including the
+  // re-linked alias the serializer's op-log section reads.
+  uint8_t recomputed[CRABS_HASH_SIZE];
+  ASSERT_EQ(state_item_digest_compute(dst_item, recomputed), CRABS_SUCCESS);
+  EXPECT_EQ(memcmp(recomputed, dst_item->item_digest, CRABS_HASH_SIZE), 0);
+
+  _destroy_state_values(dst);
+  _destroy_state_values(src);
+  state_destroy(dst);
+  state_destroy(src);
+}
+
+// Domain/type-rule pin (F2, fresh adopt): the merge's fresh-adopt arm
+// enforces the same domain/type legality data_item_create_with_options does
+// (state_add_item re-validates only the domain enum), so a crafted snapshot
+// cannot PLANT an OT ordered set declared SOVEREIGN — the item is held out
+// of dst with "__merge_type_mismatch__" + CRABS_ERR_TYPE_MISMATCH, and a
+// legal sovereign item in the same snapshot still adopts.
+TEST(TestCRDTMerge, TestMergeStateSovereignOtPlantHeld) {
+  state_t* dst = state_create();
+  state_t* src = state_create();
+  merge_event_capture_t capture = {};
+  state_set_change_hook(dst, _merge_event_hook, &capture);
+
+  // The plant: a real OT item, a domain the data model forbids for it.
+  data_item_t* plant = _make_free_ot_set_item("doc");
+  ASSERT_NE(plant, nullptr);
+  plant->write_domain = CRABS_DOMAIN_SOVEREIGN;
+  strncpy(plant->writer, "w1", sizeof(plant->writer) - 1);
+  ASSERT_NE(_ot_set_apply_insert((crabs_ot_ordered_set_t*)plant->value,
+                                 0, "w1", 1, "pwn"), nullptr);
+  ASSERT_EQ(state_add_item(src, plant), CRABS_SUCCESS);  // the P1 fail-closure gap
+
+  // A legal sovereign neighbor in the same snapshot still adopts.
+  data_item_t* legal = _make_sovereign_counter("hits", "w1", 3, 5);
+  ASSERT_NE(legal, nullptr);
+  ASSERT_EQ(state_add_item(src, legal), CRABS_SUCCESS);
+
+  EXPECT_EQ(crdt_merge_state(dst, src), CRABS_SUCCESS);
+
+  // No plant: dst never saw the OT item.
+  EXPECT_EQ(state_find_item(dst, "doc"), nullptr);
+  // The legal neighbor adopted normally, silently.
+  data_item_t* adopted = state_find_item(dst, "hits");
+  ASSERT_NE(adopted, nullptr);
+  EXPECT_EQ(adopted->write_domain, CRABS_DOMAIN_SOVEREIGN);
+  EXPECT_EQ(g_counter_value((g_counter_t*)adopted->value), 5);
+  // Exactly one event: the plant hold, with the shape-conflict code.
+  ASSERT_EQ(capture.calls, 1);
+  EXPECT_EQ(capture.kind, CRABS_CHANGE_MERGE);
+  EXPECT_STREQ(capture.type, "__merge_type_mismatch__");
+  EXPECT_STREQ(capture.target, "doc");
+  EXPECT_EQ(capture.result, CRABS_ERR_TYPE_MISMATCH);
 
   _destroy_state_values(dst);
   _destroy_state_values(src);

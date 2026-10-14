@@ -93,6 +93,22 @@ bool data_item_type_crdt_pair_canonical(data_type_e type,
          canonical_crdt == crdt_type;
 }
 
+bool data_item_type_legal_for_domain(crabs_write_domain_e write_domain,
+                                     data_type_e type) {
+  if (write_domain == CRABS_DOMAIN_SOVEREIGN) {
+    // v1 restricts SOVEREIGN to COUNTER/REGISTER: the v15 per-item
+    // serializer emits their struct content in a canonical order (counter
+    // entries sorted by node_id; register payload+timestamp+node), so the
+    // hash-chain digest is well-defined and content-comparable. Set/document
+    // types carry unbounded serializations whose canonical chain order is
+    // not pinned for v1 — widen only after defining one.
+    return type == DATA_TYPE_COUNTER || type == DATA_TYPE_REGISTER;
+  }
+  // FREE_MERGE accepts every type; GROUP_ORDERED has no type restriction in
+  // v1 (its ordering module, not the type set, governs commit legality).
+  return true;
+}
+
 data_item_t* data_item_create(const char* name, data_type_e type, crdt_type_e crdt_type) {
   data_item_t* item = get_clear_memory(sizeof(data_item_t));
   if (name != NULL) {
@@ -148,13 +164,15 @@ crabs_error_e data_item_create_with_options(const char* name,
   if (write_domain == CRABS_DOMAIN_SOVEREIGN) {
     if (!writer_set) return CRABS_ERR_INVALID_PARAM;
     if (strlen(writer) >= CRABS_MAX_USER_ID) return CRABS_ERR_INVALID_PARAM;
-    // v1 restricts SOVEREIGN to COUNTER/REGISTER: the v15 per-item
-    // serializer emits their struct content in a canonical order (counter
-    // entries sorted by node_id; register payload+timestamp+node), so the
-    // hash-chain digest is well-defined and content-comparable. Set/document
-    // types carry unbounded serializations whose canonical chain order is
-    // not pinned for v1 — widen only after defining one.
-    if (type != DATA_TYPE_COUNTER && type != DATA_TYPE_REGISTER) {
+    // v1 restricts SOVEREIGN to COUNTER/REGISTER (the rule shared through
+    // data_item_type_legal_for_domain — the merge layer's fresh-adopt arm
+    // re-checks it): the v15 per-item serializer emits their struct content
+    // in a canonical order (counter entries sorted by node_id; register
+    // payload+timestamp+node), so the hash-chain digest is well-defined and
+    // content-comparable. Set/document types carry unbounded serializations
+    // whose canonical chain order is not pinned for v1 — widen only after
+    // defining one.
+    if (!data_item_type_legal_for_domain(write_domain, type)) {
       return CRABS_ERR_TYPE_MISMATCH;
     }
   } else {

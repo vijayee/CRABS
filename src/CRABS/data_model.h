@@ -668,6 +668,15 @@ crabs_error_e data_item_canonical_crdt_for_type(data_type_e type,
 // True exactly when (type, crdt_type) is the canonical pair.
 bool data_item_type_crdt_pair_canonical(data_type_e type,
                                         crdt_type_e crdt_type);
+// The domain/type legality half of data_item_create_with_options's gate,
+// factored out so the merge layer's fresh-adopt arm re-checks the SAME rule
+// a wire-carried item must satisfy before planting (state_add_item
+// re-validates only the domain enum, not the type). SOVEREIGN v1 legal
+// types are COUNTER/REGISTER (the sovereign hash-chain digest canonically
+// orders only those serializations); FREE_MERGE and GROUP_ORDERED accept
+// every v1 data type.
+bool data_item_type_legal_for_domain(crabs_write_domain_e write_domain,
+                                     data_type_e type);
 
 // ============================================================
 // DataItem creation/destruction

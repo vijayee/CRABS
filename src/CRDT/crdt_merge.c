@@ -800,12 +800,17 @@ static void _merge_sovereign_item(state_t* dst, data_item_t* dst_item,
       return;
     }
     if (ahead_value != NULL) {
-      // Destroy per the OLD value's repr (a raw-repr legacy value must not
-      // be interpreted as a struct).
+      // The displaced value owns its ot_data: drop the alias BEFORE the
+      // destroy (a planted sovereign OT item's alias would otherwise dangle
+      // under the v18 writer/executor walks), then destroy per the OLD
+      // value's repr (a raw-repr legacy value must not be interpreted as a
+      // struct) and re-link the alias off the installed value.
+      dst_item->ot_data = NULL;
       _merge_destroy_item_value(dst_item, dst_item->value);
       dst_item->value = ahead_value;
       // ahead_value is the deep copy of src_item's value — same repr.
       dst_item->value_repr = src_item->value_repr;
+      _merge_link_ot_data(dst_item);
     }
     dst_item->item_seq = src_item->item_seq;
     // The merged head is the COMPUTED digest (== the carried one on any
@@ -914,14 +919,25 @@ static void _merge_group_ordered_item(state_t* dst, data_item_t* dst_item,
     if (src_value != NULL) {
       dst_item->value = src_value;
       dst_item->value_repr = DATA_VALUE_REPR_CRDT_STRUCT;
+      // Alias the staged content BEFORE the digest computation: the item
+      // serializer reads item->ot_data for an OT type's op-log section, so
+      // hashing the staged value under the OLD alias would stamp a head the
+      // committed content never produces.
+      _merge_link_ot_data(dst_item);
     }
     dst_item->item_seq = src_item->item_seq;
     uint8_t computed_digest[CRABS_HASH_SIZE];
     if (state_item_digest_compute(dst_item, computed_digest) !=
         CRABS_SUCCESS) {
       if (src_value != NULL) {
-        _merge_destroy_item_value(dst_item, src_value);
+        // Roll the stage back: restore the old content + alias FIRST (the
+        // staged value owns its ot_data; destroying it alive-aliased would
+        // dangle), then destroy the staged value while the repr tag still
+        // says CRDT_STRUCT (it is the struct the merge dispatch built), and
+        // flip the repr back to the old tag last.
         dst_item->value = old_value;
+        _merge_link_ot_data(dst_item);
+        _merge_destroy_item_value(dst_item, src_value);
         dst_item->value_repr = old_repr;
       }
       dst_item->item_seq = old_seq;
@@ -932,9 +948,18 @@ static void _merge_group_ordered_item(state_t* dst, data_item_t* dst_item,
     memcpy(dst_item->item_digest, computed_digest,
            sizeof(dst_item->item_digest));
     if (src_value != NULL) {
-      // Destroy the DISPLACED value per its OLD repr (a raw-repr legacy
-      // value must not be interpreted as a struct).
+      // Drop the alias BEFORE the destroy (the displaced value owns its
+      // ot_data — a live alias would dangle under the v18 writer/executor
+      // walks), then destroy the DISPLACED value per its OLD repr (a
+      // raw-repr legacy value must not be interpreted as a struct — the
+      // repr tag was already re-staged, so it flips back around the destroy
+      // and lands on CRDT_STRUCT after) and re-link the alias off the
+      // installed value.
+      dst_item->ot_data = NULL;
+      dst_item->value_repr = old_repr;
       _merge_destroy_item_value(dst_item, old_value);
+      dst_item->value_repr = DATA_VALUE_REPR_CRDT_STRUCT;
+      _merge_link_ot_data(dst_item);
     }
     return;
   }
@@ -970,6 +995,18 @@ static void _merge_group_ordered_item(state_t* dst, data_item_t* dst_item,
 // CRABS_SUCCESS.
 static void _merge_free_ot_ordered_set_item(state_t* dst, data_item_t* dst_item,
                                             const data_item_t* src_item) {
+  // Shape check BEFORE anything else: the OT merge below casts src's value
+  // to the dst item's type on the data type alone (sovereign/group arms
+  // verify their src the same way), so a same-named FREE_MERGE item of a
+  // different data type — a crafted snapshot can carry one, wire v18 is
+  // checksum-only authentication and state blobs are attacker-feedable —
+  // would merge garbage into the set preflight's walks. Hold with dst
+  // untouched (a lineage-corrupted pair, not a combinable CRDT).
+  if (src_item->type != dst_item->type) {
+    _merge_notify_divergence(dst, "__merge_type_mismatch__", dst_item->name,
+                             CRABS_ERR_TYPE_MISMATCH);
+    return;
+  }
   if (dst_item->value == NULL && src_item->value == NULL) {
     return; // both sides valueless — nothing to combine
   }
@@ -1002,6 +1039,23 @@ crabs_error_e crdt_merge_state(state_t* dst, const state_t* src) {
       // Item not in dst, add it
       data_item_t* new_item = _data_item_deep_copy(src_item);
       if (new_item == NULL) return CRABS_ERR_OOM;
+      // Write-domains v1: a fresh-adopted item must pass the SAME domain/
+      // type legality gate data_item_create_with_options enforces at
+      // creation (data_item_type_legal_for_domain). state_add_item
+      // re-validates only the domain enum, so without this check a crafted
+      // wire snapshot plants, e.g., an OT ordered set declared SOVEREIGN —
+      // a type the data model forbids on that domain (no canonical chain
+      // order), whose later merge walks the sovereign-accept arm. Fail
+      // closed: hold the item out of dst entirely. The copy's value is
+      // still NULL here (built below), so the destroy is wrapper-only.
+      if (!data_item_type_legal_for_domain(new_item->write_domain,
+                                           new_item->type)) {
+        _merge_notify_divergence(dst, "__merge_type_mismatch__",
+                                 new_item->name, CRABS_ERR_TYPE_MISMATCH);
+        data_item_destroy(new_item);
+        src_item = src_item->next;
+        continue;
+      }
       // Deep copy the CRDT value
       new_item->value = crdt_merge_value(src_item->type, src_item->crdt_type,
                                           NULL, src_item->value, NULL, src_item->name);
