@@ -212,10 +212,13 @@ Not guaranteed — the bearer-instrument boundary:
   > key_id-declaring sign path. The suspend/activate/rotate lifecycle is
   > JS-reachable now (parity-fill P2 — `suspendKey` / `activateKey` /
   > `rotateKey`, api-map §2; key_stale replays pin in P3's suspension
-  > surface). No portable reader-key bytes ship: `AbeKey` is a
-  > destroyable wrapper around the machine-derived key — the C-side
-  > serialize/deserialize pair remains outside the JS surface by design
-  > (the machine, not the file system, holds the key material).
+  > surface). Key transport is JS-reachable too (parity-fill P4, api-map
+  > §9): `AbeKey.toWire()` + `abeKeyFromWire` move a reader key as a
+  > self-sufficient bearer image (no built-in integrity — carry it
+  > authenticated), and `mintKeyEnvelope` / `decryptKeyEnvelope` provide the
+  > authenticated transport — a node-signed envelope whose key travels
+  > ECIES-wrapped to the recipient's registered public key. The raw
+  > reader-key wire is still the wrong tool for an untrusted channel.
 
 - *Fine demotion is JS-reachable now (parity-fill P3).* `revokeRole(userId,
   role, signerId?)` on BOTH bindings drives `attribute_machine_revoke_role`

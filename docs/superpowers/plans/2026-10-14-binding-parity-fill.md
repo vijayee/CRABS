@@ -69,10 +69,25 @@ Same TDD pattern; C: attribute_machine.h:147/149/168 (read the real signatures �
 ### Task P4: ABE key transport envelopes (SECURITY-CRITICAL — adversarial review mandatory)
 
 **Files:** `src/Util/wasm_helpers.c`, `bindings/wasm/bindings-core.js`, d.ts ×2; gtest if C changes.
-- [ ] **Step 1: Read the C transport block:** crypto.h:140-160 (`user_key_serialize/deserialize`, `master_key_serialize/deserialize`) + crypto.h:271-304 (`crypto_key_envelope_*` — READ all of it: what the envelope wraps, key derivation, how refresh_key materializes responses, state_machine.c:2797's refresh path).
-- [ ] **Step 2: Failing tests:** wasm + node: `abeKey.toWire() -> Buffer`; `node.abeKeyFromWire(bytes) -> AbeKey` (destroy idempotent); `node.mintKeyEnvelope(attrs..., recipientContext)` / `node.decryptKeyEnvelope(envelope)` — mirror the C envelope flow the tests use (grep envelope in test/). Round trip == same capability; tampered envelope refuses cleansed.
-- [ ] **Step 3:** implement; master-key serialize/deserialize EXPOSED ONLY as `Node.masterKeyToWire()/fromWire()` — document the trust step (the MSK at rest is the machine's crown jewel; the d.ts prose says exactly that), OR omit master key transport from the surface if the envelope flow covers recovery — DECIDE by the C tests' actual usage and the spec's intent (machine-owned MSK in v1: prefer envelope-only; if the C tests exercise master serialize for backup, surface it as PRESENT).
-- [ ] **Step 4:** green + battery + adversarial review (staging cleanse, GCM/tag checks, no MSK pointer escape). **Commit** `feat: ABE key envelopes and key transport from JS`.
+- [x] **Step 1: Read the C transport block:** crypto.h:140-160 (`user_key_serialize/deserialize`, `master_key_serialize/deserialize`) + crypto.h:271-304 (`crypto_key_envelope_*` — READ all of it: what the envelope wraps, key derivation, how refresh_key materializes responses, state_machine.c:2797's refresh path).
+- [x] **Step 2: Failing tests:** wasm + node: `abeKey.toWire() -> Buffer`; `node.abeKeyFromWire(bytes) -> AbeKey` (destroy idempotent); `node.mintKeyEnvelope(attrs..., recipientContext)` / `node.decryptKeyEnvelope(envelope)` — mirror the C envelope flow the tests use (grep envelope in test/). Round trip == same capability; tampered envelope refuses cleansed.
+- [x] **Step 3:** implement; master-key serialize/deserialize EXPOSED ONLY as `Node.masterKeyToWire()/fromWire()` — document the trust step (the MSK at rest is the machine's crown jewel; the d.ts prose says exactly that), OR omit master key transport from the surface if the envelope flow covers recovery — DECIDE by the C tests' actual usage and the spec's intent (machine-owned MSK in v1: prefer envelope-only; if the C tests exercise master serialize for backup, surface it as PRESENT).
+  - (Landed reality: C's battery DOES exercise master serialize for backup
+    (`TestDurability.MasterKeySerializeRoundTripPreservesAuthority`,
+    test_crypto.cpp:1199) and the sealed-snapshot restore already replants
+    the MSK (serialization.c:2862-2866), so key transport is surfaced as
+    PRESENT: `serializeMasterKey()` / `masterKeyFromWire()` on both bindings,
+    d.ts prose marking the CROWN JEWEL trust fact in both. The reader-key
+    wire pins the SELF-SUFFICIENT BEARER semantics cross-machine (OpenABE's
+    key import binds capability to the key's minting domain, not the
+    importing machine); envelopes pin both tamper fail-closed paths and the
+    refresh-path ACTIVE gate; expiry is stamped-but-integrator-enforced, as
+    in C. Staging: wasm exports cleanse the ECIES wire/plaintext frames; the
+    node binding cleanses the recipient private key + issuer hex strings on
+    every path; wasm's `masterKeyFromWire` LEAKS the replaced authority (the
+    `crabs_wasm_node_destroy` OpenABE-teardown hazard) while the native
+    destroy+cleanse runs — documented at the export and api-map.)
+- [x] **Step 4:** green + battery + adversarial review (staging cleanse, GCM/tag checks, no MSK pointer escape). **Commit** `feat: ABE key envelopes and key transport from JS`.
 
 ### Task P5: OT ordered-set merge layer (recipe 8 → COMPLETE)
 
