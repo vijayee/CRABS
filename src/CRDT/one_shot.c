@@ -100,7 +100,9 @@ one_shot_set_t* one_shot_set_merge(const one_shot_set_t* a, const one_shot_set_t
       if (!dup) union_elems[ucount++] = (char*)e;
     }
   }
-  qsort(union_elems, ucount, sizeof(char*), _cmp_str);
+  // ucount can be 0 with a NULL (clear-memory) array — satisfy the qsort
+  // nonnull base-pointer contract explicitly before the degenerate call.
+  if (ucount > 0) qsort(union_elems, ucount, sizeof(char*), _cmp_str);
 
   uint32_t keep = (ucount < CRABS_ONE_SHOT_SET_MAX) ? ucount : CRABS_ONE_SHOT_SET_MAX;
   for (uint32_t i = 0; i < keep; i++) {
