@@ -2803,6 +2803,18 @@ int32_t crabs_wasm_key_envelope_import(attribute_machine_t* am,
         (abe_master_key_t*)am->base_state.abe_mk, plain, plain_len);
     rc = (sk != NULL) ? CRABS_SUCCESS : CRABS_ERR_CRYPTOGRAPHIC_ERROR;
   }
+  // Audit M-2: the envelope's signed state_version is CONSUMED here — after
+  // signature verification and ECIES opening both succeeded, immediately
+  // before the key is handed out. A stale (replayed/rolled-back) envelope
+  // refuses with KEY_STALE and hands out nothing; the gate's monotonic
+  // watermark only advances once the recipient work completed.
+  if (rc == CRABS_SUCCESS) {
+    rc = attribute_machine_envelope_import_gate(am, envelope);
+    if (rc != CRABS_SUCCESS) {
+      crypto_abe_user_key_destroy(sk);
+      sk = NULL;
+    }
+  }
   // The recovered plaintext key bytes never linger past this frame — whether
   // the import succeeded, failed a gate, or never started.
   OPENSSL_cleanse(plain, sizeof(plain));
@@ -2956,6 +2968,31 @@ serialized_buffer_t* crabs_wasm_serialize_state_sealed_signed(
 static void _raft_module_registry_repoint(crabs_raft_module_t* module,
                                           attribute_machine_t* machine);
 
+// A restored-over machine stays allocated (wasm machines leak by policy) with
+// its JS reference dropped — its recoverable secrets must not linger in
+// linear memory for the process lifetime. Mirrors crabs_wasm_node_destroy's
+// cleanse, with one guard: resident SHARED_ROOT children borrow this
+// machine's authority POINTER — if any live resident child exists, the
+// authority is left alone (its serialized MSK/MPK wire copies stay usable for
+// the children's encrypt path, matching the REPLACE-and-forget contract);
+// only a childless abandoned machine gets the wire-copy cleanse. The node
+// private key copy is always cleansed (children borrow the authority and the
+// attribute registry, never the node's signing key), and the machine is
+// detached from the module-shared time-source attached-set so the leaked body
+// stops claiming liveness.
+static void _wasm_cleanse_abandoned_machine(attribute_machine_t* machine) {
+  if (machine == NULL) return;
+  state_set_time_source(&machine->base_state, NULL);
+  _time_source_unregister_machine(machine);
+  OPENSSL_cleanse(machine->base_state.node_private_key,
+                  sizeof(machine->base_state.node_private_key));
+  if (machine->base_state.abe_mk != NULL && !machine->base_state.abe_mk_borrowed &&
+      machine->base_state.resident_child_count == 0) {
+    crypto_abe_master_key_cleanse_wire_copies(
+        (abe_master_key_t*)machine->base_state.abe_mk);
+  }
+}
+
 // State snapshot restore: verify the node-key signature FIRST when
 // verify_signed is set (the ECDSA trailer covers the WHOLE sealed or plain
 // body — an attacker cannot mount a parse on unverified bytes), then parse
@@ -2964,9 +3001,14 @@ static void _raft_module_registry_repoint(crabs_raft_module_t* module,
 // report out-params surface whether authority actually came back (the
 // wrong-key path still loads a substrate-only machine, never NULL).
 //
-// The PREVIOUS machine is left untouched — wasm machines are never
+// The PREVIOUS machine's memory stays allocated — wasm machines are never
 // destroyed (crabs_wasm_node_destroy's leak policy) — and the caller drops
-// its JS reference. Continuity rewiring happens here so the wrapper keeps
+// its JS reference, so restore DETACHES it (time-source attached-set) and
+// CLEANSES its recoverable secrets in place (see
+// _wasm_cleanse_abandoned_machine): the abandoned machine's node key copy
+// and, when its authority is not lent to a live resident SHARED_ROOT child,
+// the authority's serialized MSK/MPK wire copies.
+// Continuity rewiring happens here so the wrapper keeps
 // its identity across the restore: node key from the previous machine (the
 // wire format serializes no secrets), change hook, the module-shared
 // attached time source, a live raft module (the new state's parsed v16
@@ -3087,6 +3129,9 @@ attribute_machine_t* crabs_wasm_deserialize_state(
                             previous->base_state.hlc_state.time_source_ops);
       _time_source_register_machine(restored_machine);
     }
+    // Every migration read from `previous` happened above; from here the
+    // abandoned machine no longer owns anything the restore needs.
+    _wasm_cleanse_abandoned_machine((attribute_machine_t*)previous);
   }
   state_set_change_hook(&restored_machine->base_state, _node_change_hook,
                         restored_machine);

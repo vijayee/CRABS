@@ -108,10 +108,19 @@ function hexEncode(bytes, len) {
     .map(b => b.toString(16).padStart(2, '0')).join('');
 }
 
-// NOTE: this helper trusts its input — a malformed hex string coerces to 0
-// via parseInt rather than failing. Every caller must pre-validate the hex
-// shape (the addAttestation/addLockClaim wrappers regex-gate before calling).
+// STRICT hex decode: throws on empty input, an odd character count, or any
+// non-hex character — the previous lenient form coerced garbage to 0 through
+// parseInt, so a malformed key could silently become a DIFFERENT byte string
+// than the caller intended. Callers that accept a specific key shape must
+// still pre-gate the exact length (64 hex private / 66 hex compressed
+// public / 128 hex signature) for an instructive error; this gate is the
+// floor beneath every call site. Note the decode still truncates at maxLen,
+// so callers verify the returned length against what they expect.
 function hexDecode(M, hex, ptr, maxLen) {
+  if (typeof hex !== 'string' || hex.length === 0 ||
+      hex.length % 2 !== 0 || !/^[0-9a-fA-F]+$/.test(hex)) {
+    throw new TypeError('hexDecode: expected a non-empty even-length hex string');
+  }
   const len = Math.min(hex.length / 2, maxLen);
   for (let i = 0; i < len; i++) {
     M.HEAPU8[ptr + i] = parseInt(hex.substr(i * 2, 2), 16);
@@ -433,6 +442,12 @@ class KeyPair {
   }
 
   static async fromPrivateHex(hex) {
+    // Exact-shape gate ahead of the strict decoder: a longer hex body would
+    // truncate into the 32-byte window and mint a DIFFERENT key than the
+    // caller named; a shorter one fails the length check below.
+    if (typeof hex !== 'string' || !/^[0-9a-fA-F]{64}$/.test(hex)) {
+      throw new TypeError('KeyPair.fromPrivateHex: hex must be 64 hex characters (32 bytes)');
+    }
     const M = await getModule();
     const ptr = M._malloc(65);
     const len = hexDecode(M, hex, ptr, 32);
@@ -445,6 +460,9 @@ class KeyPair {
   }
 
   static async derivePublicHex(hex) {
+    if (typeof hex !== 'string' || !/^[0-9a-fA-F]{64}$/.test(hex)) {
+      throw new TypeError('KeyPair.derivePublicHex: hex must be 64 hex characters (32 bytes)');
+    }
     const M = await getModule();
     const priv = M._malloc(32);
     const pub = M._malloc(33);
@@ -651,7 +669,11 @@ class Operation {
     const tokenPtr = M._malloc(32);
     hexDecode(M, tokenHex, tokenPtr, 32);
     const rc = M._crabs_wasm_op_add_lock_claim(this._ptr, resourcePtr, tokenPtr, 32);
-    freeAll(M, resourcePtr, tokenPtr);
+    // tokenPtr staged the 32-byte BEARER lock token — wipe before free so the
+    // live credential never sits on dlmalloc's free list (the getLockState
+    // readback already wipeFrees the same bytes).
+    wipeFree(M, tokenPtr, 32);
+    freeAll(M, resourcePtr);
     wrapRc(rc, 'addLockClaim');
     return this;
   }
@@ -698,8 +720,12 @@ class Operation {
     const stampToBigInt = (value, field) => {
       if (value === undefined || value === null) return 0n;
       if (typeof value === 'bigint') {
-        if (value < 0n) {
-          throw new RangeError(`addAttestation: ${field} must be >= 0`);
+        // The wire fields are u64le; a BigInt above 2^64-1 WRAPS through
+        // Emscripten's BigInt→i64 marshaling instead of failing, so the cap
+        // must live here.
+        if (value < 0n || value > 0xFFFFFFFFFFFFFFFFn) {
+          throw new RangeError(
+            `addAttestation: ${field} must be within the u64 range (0..2^64-1)`);
         }
         return value;
       }
@@ -1092,6 +1118,12 @@ class Node {
   }
 
   registerUser(userId, publicKeyHex, initialAttrs) {
+    // Exact compressed-secp256k1 shape ahead of the strict decoder — a longer
+    // body would truncate into the 33-byte window and register a DIFFERENT
+    // public key than the caller named.
+    if (typeof publicKeyHex !== 'string' || !/^[0-9a-fA-F]{66}$/.test(publicKeyHex)) {
+      throw new TypeError('registerUser: publicKeyHex must be 66 hex characters (33 bytes, compressed)');
+    }
     const M = this._M;
     const uidPtr = writeString(M, userId);
     const pkPtr = M._malloc(33);
@@ -2253,12 +2285,20 @@ class Node {
     } else {
       throw new Error('Expected KeyPair or private key hex string');
     }
+    if (typeof privHex !== 'string' || !/^[0-9a-fA-F]{64}$/.test(privHex)) {
+      throw new Error('sign: private key must be 64 hex chars (32 bytes)');
+    }
     const privPtr = M._malloc(32);
-    const len = hexDecode(M, privHex, privPtr, 32);
-    if (len !== 32) { M._free(privPtr); throw new Error('Invalid private key hex'); }
-    const rc = M._crabs_wasm_sign_operation(this._am, op._ptr, privPtr);
-    M._free(privPtr);
-    wrapRc(rc, 'sign');
+    try {
+      hexDecode(M, privHex, privPtr, 32);
+      const rc = M._crabs_wasm_sign_operation(this._am, op._ptr, privPtr);
+      wrapRc(rc, 'sign');
+    } finally {
+      // The staged 32-byte private scalar must never linger in wasm linear
+      // memory (the heap never shrinks and dlmalloc recycles chunks
+      // verbatim) — zeroize on the success path AND every error path.
+      wipeFree(M, privPtr, 32);
+    }
   }
 
   createTrigger(config) {
