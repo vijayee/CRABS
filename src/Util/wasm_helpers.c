@@ -2320,7 +2320,8 @@ attribute_machine_t* crabs_wasm_deserialize_state(
 
 // Foreign-snapshot merge into THIS machine: crdt_merge_state's item rules
 // (counters max-per-node/sum-across-nodes, register LWW, OR/2P-set union,
-// one-shot take-any, sovereign chain judgment). The source state is
+// one-shot take-any, sovereign chain judgment, ordered-set merge — recipe
+// 8's layer, in place via crabs_ot_ordered_set_merge). The source state is
 // deserialized fresh on every call and destroyed before returning — merge
 // leaves no C-side residue.
 EMSCRIPTEN_KEEPALIVE

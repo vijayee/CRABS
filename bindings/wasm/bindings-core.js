@@ -2287,12 +2287,17 @@ class Node {
 
   // Merge a foreign snapshot INTO this machine via crdt_merge_state (the
   // general item rules: counters max-per-node/sum-across-nodes, register
-  // LWW, OR/2P-set union, one-shot take-any — order via the merge's logs).
-  // This machine MUTATES toward the union; the source snapshot is untouched
-  // (it has no machine attached). Returns undefined; throws (machine
-  // untouched) on a malformed snapshot. Held items are NOT a failure: they
-  // surface as __merge_held__ divergences on the change hook and the merge
-  // returns SUCCESS.
+  // LWW, OR/2P-set union, one-shot take-any — order via the merge's logs —
+  // and, since parity-fill P5, ordered-set items merge in place through
+  // crabs_ot_ordered_set_merge: fresh items adopt, equivocating snapshots
+  // refuse). This machine MUTATES toward the union; the source snapshot is
+  // untouched (it has no machine attached). Returns undefined; throws
+  // (machine untouched) on a malformed snapshot. Held items are NOT a
+  // failure: they surface as __merge_held__ divergences on the change hook
+  // and the merge returns SUCCESS — OT ordered sets can still fire one (a
+  // same-op-id/different-payload refusal is CRABS_ERR_FORK_DETECTED), and
+  // OT document/tree/table/ordered-map items (no merge machinery yet) hold
+  // with CRABS_ERR_TYPE_MISMATCH.
   mergeState(wire) {
     const M = this._M;
     requireWireBytes(wire, 'mergeState');

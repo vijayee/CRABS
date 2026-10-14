@@ -4,6 +4,7 @@ extern "C" {
 #include "../src/StateMachine/state_machine.h"
 #include "../src/OT/ot_types.h"
 #include "../src/OT/ot_ordered_set.h"
+#include "../src/OT/ot_document.h"
 }
 
 // ============================================================
@@ -738,6 +739,50 @@ static data_item_t* _make_group_register(const char* name,
   return item;
 }
 
+// Build a FREE_MERGE OT ordered-set item exactly the way the JS adder
+// (crabs_wasm_add_ordered_set) does: CRDT_CUSTOM tag, the wrapper struct in
+// value, the wrapper's own ot_data aliased into item->ot_data, struct repr.
+static data_item_t* _make_free_ot_set_item(const char* name) {
+  data_item_t* item = data_item_create(name, (data_type_e)DATA_TYPE_OT_ORDERED_SET,
+                                       CRDT_CUSTOM);
+  EXPECT_NE(item, nullptr);
+  if (item == nullptr) return nullptr;
+  crabs_ot_ordered_set_t* set = crabs_ot_ordered_set_create();
+  EXPECT_NE(set, nullptr);
+  item->value = set;
+  if (set == nullptr) return item; // valueless husk — test must treat as failure
+  item->ot_data = set->ot_data;
+  item->value_repr = (data_value_repr_t)DATA_VALUE_REPR_CRDT_STRUCT;
+  return item;
+}
+
+// Apply an INSERT op (stack-allocated, payload owned here) against a set —
+// the same apply path the executor's ordered-set branch runs. Ops carry the
+// ts-1000 stamp like test_ot_ordered_set.cpp.
+static crabs_ordered_element_t* _ot_set_apply_insert(crabs_ot_ordered_set_t* set,
+                                                     uint64_t visible_pos,
+                                                     const char* node_id,
+                                                     uint64_t sequence_num,
+                                                     const char* payload) {
+  crabs_ot_operation_t insert_op;
+  crabs_ot_operation_init(&insert_op);
+  insert_op.op_type = CRABS_OT_OP_INSERT;
+  insert_op.visible_pos = visible_pos;
+  crabs_ot_op_id_init(&insert_op.id, node_id, sequence_num, 1000);
+  if (payload != NULL) {
+    crabs_ot_operation_set_payload(
+        &insert_op, (const uint8_t*)payload, (uint32_t)strlen(payload));
+  }
+  crabs_ordered_element_t* element =
+      crabs_ot_ordered_set_apply_insert(set, &insert_op);
+  if (insert_op.payload != NULL) {
+    free(insert_op.payload);
+    insert_op.payload = NULL;
+    insert_op.payload_size = 0;
+  }
+  return element;
+}
+
 // Capture of the last change event emitted during a merge.
 typedef struct {
   int                 calls;
@@ -765,11 +810,22 @@ static void _merge_event_hook(state_t* state, const crabs_change_event_t* event,
 }
 
 // Free every item value of a state via crdt_value_destroy (data_item_destroy's
-// default arm only frees the wrapper for counter/register types).
+// default arm only frees the wrapper for counter/register types) — OT items
+// dispatch the type-specific destroy instead (their crdt_type tag is not a
+// crdt_value_destroy key). The aliased ot_data dies with the wrapper, so
+// NULL the field to keep the later data_item_destroy idempotent.
 static void _destroy_state_values(state_t* state) {
   for (data_item_t* item = state->items; item != NULL; item = item->next) {
     if (item->value != NULL) {
-      crdt_value_destroy(item->crdt_type, item->value);
+      if (item->type == DATA_TYPE_OT_ORDERED_SET) {
+        crabs_ot_ordered_set_destroy((crabs_ot_ordered_set_t*)item->value);
+        item->ot_data = NULL;
+      } else if (item->type == DATA_TYPE_OT_DOCUMENT) {
+        crabs_ot_document_destroy((crabs_ot_document_t*)item->value);
+        item->ot_data = NULL;
+      } else {
+        crdt_value_destroy(item->crdt_type, item->value);
+      }
       item->value = NULL;
     }
   }
@@ -1399,12 +1455,14 @@ TEST(TestCRDTMerge, TestGroupOrderedMergeIdenticalNoOp) {
   state_destroy(src);
 }
 
-// A src-only item the merge layer cannot build (an OT type —
-// crdt_merge_value returns NULL for CRDT_CUSTOM) is HELD, not adopted as a
+// A src-only item the merge layer cannot build is HELD, not adopted as a
 // NULL-value husk: merge still returns CRABS_SUCCESS, dst surfaces one
 // CRABS_CHANGE_MERGE "__merge_held__" event with the type-mismatch result,
 // the item never crosses into dst, and the other items in the snapshot
-// still merge.
+// still merge. PARITY-FILL P5 update: the dispatch now covers the OT
+// ORDERED SET (crdt_merge_value's data-type arm), so the hold fixture
+// uses an OT DOCUMENT — document/table/tree/ordered-map keep no merge
+// machinery (P6's unblessed surfaces merge nothing).
 TEST(TestCRDTMerge, TestMergeHoldsUnmergeableOtItem) {
   state_t* dst = state_create();
   state_t* src = state_create();
@@ -1438,28 +1496,22 @@ TEST(TestCRDTMerge, TestMergeHoldsUnmergeableOtItem) {
   src_reg->value_repr = (data_value_repr_t)DATA_VALUE_REPR_CRDT_STRUCT;
   ASSERT_EQ(state_add_item(src, src_reg), CRABS_SUCCESS);
 
-  data_item_t* src_set = data_item_create("doc", (data_type_e)DATA_TYPE_OT_ORDERED_SET,
+  data_item_t* src_doc = data_item_create("notes",
+                                          (data_type_e)DATA_TYPE_OT_DOCUMENT,
                                           CRDT_CUSTOM);
-  ASSERT_NE(src_set, nullptr);
-  crabs_ot_ordered_set_t* set = crabs_ot_ordered_set_create();
-  ASSERT_NE(set, nullptr);
-  crabs_ot_operation_t insert_op = {};
-  strncpy(insert_op.id.node_id, "src", sizeof(insert_op.id.node_id) - 1);
-  insert_op.id.sequence_num = 1;
-  insert_op.id.timestamp = 1000;
-  insert_op.op_type = CRABS_OT_OP_INSERT;
-  insert_op.payload = (uint8_t*)"entry";
-  insert_op.payload_size = 5;
-  ASSERT_NE(crabs_ot_ordered_set_apply_insert(set, &insert_op), nullptr);
-  src_set->value = set;
-  src_set->ot_data = set->ot_data;
-  src_set->value_repr = (data_value_repr_t)DATA_VALUE_REPR_CRDT_STRUCT;
-  ASSERT_EQ(state_add_item(src, src_set), CRABS_SUCCESS);
+  ASSERT_NE(src_doc, nullptr);
+  crabs_ot_document_t* doc = crabs_ot_document_create();
+  ASSERT_NE(doc, nullptr);
+  // One span so the item carries real content the hold must NOT adopt.
+  src_doc->value = doc;
+  src_doc->ot_data = doc->ot_data;
+  src_doc->value_repr = (data_value_repr_t)DATA_VALUE_REPR_CRDT_STRUCT;
+  ASSERT_EQ(state_add_item(src, src_doc), CRABS_SUCCESS);
 
   EXPECT_EQ(crdt_merge_state(dst, src), CRABS_SUCCESS);
 
-  // The OT item never crossed: no husk with a NULL value in dst.
-  EXPECT_EQ(state_find_item(dst, "doc"), nullptr);
+  // The OT document never crossed: no husk item in dst.
+  EXPECT_EQ(state_find_item(dst, "notes"), nullptr);
   data_item_t* merged_counter = state_find_item(dst, "hits");
   ASSERT_NE(merged_counter, nullptr);
   // The counter in the same snapshot still merged (max per node, sum across
@@ -1473,8 +1525,325 @@ TEST(TestCRDTMerge, TestMergeHoldsUnmergeableOtItem) {
   ASSERT_EQ(capture.calls, 1);
   EXPECT_EQ(capture.kind, CRABS_CHANGE_MERGE);
   EXPECT_STREQ(capture.type, "__merge_held__");
-  EXPECT_STREQ(capture.target, "doc");
+  EXPECT_STREQ(capture.target, "notes");
   EXPECT_EQ(capture.result, CRABS_ERR_TYPE_MISMATCH);
+
+  _destroy_state_values(dst);
+  _destroy_state_values(src);
+  state_destroy(dst);
+  state_destroy(src);
+}
+// ============================================================
+// OT ordered-set state merge (parity-fill P5 — recipe 8's merge
+// layer reachable from JS via mergeState). Scenarios mirror
+// test/test_ot_ordered_set.cpp's merge battery at the STATE level.
+// ============================================================
+
+// Fresh adopt: a src-only ordered-set item now CROSSES the merge as a real
+// item — value plus the aliased ot_data the executor/wire writers need —
+// with no held event (this replaces P1's hold for the ordered set, which
+// was the merge gap, not a semantics choice).
+TEST(TestCRDTMerge, TestMergeStateOtFreshAdopt) {
+  state_t* dst = state_create();
+  state_t* src = state_create();
+  merge_event_capture_t capture = {};
+  state_set_change_hook(dst, _merge_event_hook, &capture);
+
+  data_item_t* src_set = _make_free_ot_set_item("doc");
+  ASSERT_NE(src_set, nullptr);
+  ASSERT_NE(_ot_set_apply_insert((crabs_ot_ordered_set_t*)src_set->value,
+                                 0, "src", 1, "entry"), nullptr);
+  ASSERT_EQ(state_add_item(src, src_set), CRABS_SUCCESS);
+
+  EXPECT_EQ(crdt_merge_state(dst, src), CRABS_SUCCESS);
+
+  data_item_t* adopted = state_find_item(dst, "doc");
+  ASSERT_NE(adopted, nullptr);
+  EXPECT_EQ(adopted->type, DATA_TYPE_OT_ORDERED_SET);
+  EXPECT_EQ(adopted->write_domain, CRABS_DOMAIN_FREE_MERGE);
+  crabs_ot_ordered_set_t* adopted_set = (crabs_ot_ordered_set_t*)adopted->value;
+  ASSERT_NE(adopted_set, nullptr);
+  // The aliased ot_data rode along (the executor dereferences item->ot_data).
+  ASSERT_NE(adopted->ot_data, nullptr);
+  EXPECT_EQ(adopted->ot_data, adopted_set->ot_data);
+  EXPECT_EQ(adopted->value_repr, DATA_VALUE_REPR_CRDT_STRUCT);
+  EXPECT_EQ(crabs_ot_ordered_set_visible_count(adopted_set), 1u);
+  crabs_ordered_element_t* element = crabs_ot_ordered_set_get(adopted_set, 0);
+  ASSERT_NE(element, nullptr);
+  ASSERT_NE(element->value, nullptr);
+  EXPECT_EQ(memcmp(element->value, "entry", 5), 0);
+  // A clean adopt is silent.
+  EXPECT_EQ(capture.calls, 0);
+
+  _destroy_state_values(dst);
+  _destroy_state_values(src);
+  state_destroy(dst);
+  state_destroy(src);
+}
+
+// Same-name FREE_MERGE ordered sets converge: src-only elements copy in.
+TEST(TestCRDTMerge, TestMergeStateOtCopiesSrcOnlyElements) {
+  state_t* dst = state_create();
+  state_t* src = state_create();
+
+  data_item_t* dst_set = _make_free_ot_set_item("doc");
+  data_item_t* src_set = _make_free_ot_set_item("doc");
+  ASSERT_NE(dst_set, nullptr);
+  ASSERT_NE(src_set, nullptr);
+  ASSERT_NE(_ot_set_apply_insert((crabs_ot_ordered_set_t*)dst_set->value,
+                                 0, "n1", 1, "a"), nullptr);
+  ASSERT_NE(_ot_set_apply_insert((crabs_ot_ordered_set_t*)src_set->value,
+                                 0, "n2", 1, "b"), nullptr);
+  state_add_item(dst, dst_set);
+  state_add_item(src, src_set);
+
+  EXPECT_EQ(crdt_merge_state(dst, src), CRABS_SUCCESS);
+
+  crabs_ot_ordered_set_t* merged_set = (crabs_ot_ordered_set_t*)dst_set->value;
+  EXPECT_EQ(crabs_ot_ordered_set_count(merged_set), 2u);
+  EXPECT_EQ(crabs_ot_ordered_set_visible_count(merged_set), 2u);
+  // Both payloads survived, whatever the materialized order.
+  crabs_ordered_element_t* src_only_element = crabs_ot_ordered_set_find(
+      merged_set, &((crabs_ot_ordered_set_t*)src_set->value)->head->id);
+  ASSERT_NE(src_only_element, nullptr);
+  EXPECT_EQ(memcmp(src_only_element->value, "b", 1), 0);
+
+  _destroy_state_values(dst);
+  _destroy_state_values(src);
+  state_destroy(dst);
+  state_destroy(src);
+}
+
+// Same-name FREE_MERGE ordered sets converge: the larger placement_id wins
+// per element (a re-stamped placement on src is adopted by dst).
+TEST(TestCRDTMerge, TestMergeStateOtLargerPlacementWins) {
+  state_t* dst = state_create();
+  state_t* src = state_create();
+
+  // dst: one element "a" placed by op (n1, 1).
+  data_item_t* dst_set = _make_free_ot_set_item("doc");
+  data_item_t* src_set = _make_free_ot_set_item("doc");
+  ASSERT_NE(dst_set, nullptr);
+  ASSERT_NE(src_set, nullptr);
+  ASSERT_NE(_ot_set_apply_insert((crabs_ot_ordered_set_t*)dst_set->value,
+                                 0, "n1", 1, "a"), nullptr);
+  // src: the same elements (element "a" carries the SAME op id and payload
+  // = same identity) whose placement was re-stamped by a second op (n1, 2)
+  // — a move of "a" after "b" (MOVE re-stamps every element's placement).
+  crabs_ot_ordered_set_t* src_only_set = (crabs_ot_ordered_set_t*)src_set->value;
+  crabs_ordered_element_t* moved_element =
+      _ot_set_apply_insert(src_only_set, 0, "n1", 1, "a");
+  ASSERT_NE(moved_element, nullptr);
+  ASSERT_NE(_ot_set_apply_insert(src_only_set, 1, "n1", 2, "b"), nullptr);
+  EXPECT_EQ(crabs_ot_ordered_set_find(src_only_set, &moved_element->id),
+            moved_element);
+  crabs_ot_operation_t move_op;
+  crabs_ot_operation_init(&move_op);
+  move_op.op_type = CRABS_OT_OP_MOVE;
+  move_op.visible_pos = 0;
+  move_op.visible_pos_2 = 1;
+  crabs_ot_op_id_init(&move_op.id, "n1", 3, 1000);
+  ASSERT_NE(crabs_ot_ordered_set_apply_move(src_only_set, &move_op), nullptr);
+
+  state_add_item(dst, dst_set);
+  state_add_item(src, src_set);
+
+  EXPECT_EQ(crdt_merge_state(dst, src), CRABS_SUCCESS);
+
+  crabs_ot_ordered_set_t* merged_set = (crabs_ot_ordered_set_t*)dst_set->value;
+  EXPECT_EQ(crabs_ot_ordered_set_count(merged_set), 2u);
+  crabs_ordered_element_t* merged_element =
+      crabs_ot_ordered_set_find(merged_set, &moved_element->id);
+  ASSERT_NE(merged_element, nullptr);
+  // dst adopted the LARGER placement (the move's id), not src's arrival.
+  EXPECT_EQ(merged_element->placement_id.sequence_num, 3u);
+  // ... and the adopted placement RE-ORDERS: "a" now sits after "b".
+  crabs_ordered_element_t* visible_0 = crabs_ot_ordered_set_get(merged_set, 0);
+  crabs_ordered_element_t* visible_1 = crabs_ot_ordered_set_get(merged_set, 1);
+  ASSERT_NE(visible_0, nullptr);
+  ASSERT_NE(visible_1, nullptr);
+  EXPECT_EQ(memcmp(visible_0->value, "b", 1), 0);
+  EXPECT_EQ(memcmp(visible_1->value, "a", 1), 0);
+
+  _destroy_state_values(dst);
+  _destroy_state_values(src);
+  state_destroy(dst);
+  state_destroy(src);
+}
+
+// Same-name FREE_MERGE ordered sets converge: deletion wins through the
+// merged position map.
+TEST(TestCRDTMerge, TestMergeStateOtDeletionWins) {
+  state_t* dst = state_create();
+  state_t* src = state_create();
+
+  data_item_t* dst_set = _make_free_ot_set_item("doc");
+  data_item_t* src_set = _make_free_ot_set_item("doc");
+  ASSERT_NE(dst_set, nullptr);
+  ASSERT_NE(src_set, nullptr);
+  // Same element identity on both sides (same op id, same payload).
+  ASSERT_NE(_ot_set_apply_insert((crabs_ot_ordered_set_t*)dst_set->value,
+                                 0, "n1", 1, "a"), nullptr);
+  ASSERT_NE(_ot_set_apply_insert((crabs_ot_ordered_set_t*)src_set->value,
+                                 0, "n1", 1, "a"), nullptr);
+  // And src deleted it.
+  crabs_ot_operation_t delete_op;
+  crabs_ot_operation_init(&delete_op);
+  delete_op.op_type = CRABS_OT_OP_DELETE;
+  delete_op.visible_pos = 0;
+  ASSERT_NE(crabs_ot_ordered_set_apply_delete(
+      (crabs_ot_ordered_set_t*)src_set->value, &delete_op), nullptr);
+
+  state_add_item(dst, dst_set);
+  state_add_item(src, src_set);
+
+  EXPECT_EQ(crdt_merge_state(dst, src), CRABS_SUCCESS);
+
+  crabs_ot_ordered_set_t* merged_set = (crabs_ot_ordered_set_t*)dst_set->value;
+  EXPECT_EQ(crabs_ot_ordered_set_count(merged_set), 1u);
+  crabs_ot_op_id_t element_id = ((crabs_ot_ordered_set_t*)src_set->value)->head->id;
+  crabs_ordered_element_t* merged_element =
+      crabs_ot_ordered_set_find(merged_set, &element_id);
+  ASSERT_NE(merged_element, nullptr);
+  EXPECT_TRUE(merged_element->deleted);
+  EXPECT_EQ(crabs_ot_ordered_set_visible_count(merged_set), 0u);
+
+  _destroy_state_values(dst);
+  _destroy_state_values(src);
+  state_destroy(dst);
+  state_destroy(src);
+}
+
+// Convergence is commutative at the state level: merging src's snapshot into
+// dst and dst's snapshot into src leave the SAME materialized order.
+TEST(TestCRDTMerge, TestMergeStateOtConvergenceCommutative) {
+  state_t* ab = state_create();
+  state_t* ba = state_create();
+  state_t* a = state_create();
+  state_t* b = state_create();
+
+  data_item_t* ab_set = _make_free_ot_set_item("doc");
+  data_item_t* a_set = _make_free_ot_set_item("doc");
+  data_item_t* ba_set = _make_free_ot_set_item("doc");
+  data_item_t* b_set = _make_free_ot_set_item("doc");
+  ASSERT_NE(ab_set, nullptr);
+  ASSERT_NE(a_set, nullptr);
+  ASSERT_NE(ba_set, nullptr);
+  ASSERT_NE(b_set, nullptr);
+  ASSERT_NE(_ot_set_apply_insert((crabs_ot_ordered_set_t*)ab_set->value,
+                                 0, "A", 1, "a"), nullptr);
+  ASSERT_NE(_ot_set_apply_insert((crabs_ot_ordered_set_t*)a_set->value,
+                                 0, "A", 1, "a"), nullptr);
+  ASSERT_NE(_ot_set_apply_insert((crabs_ot_ordered_set_t*)ba_set->value,
+                                 0, "B", 1, "b"), nullptr);
+  ASSERT_NE(_ot_set_apply_insert((crabs_ot_ordered_set_t*)b_set->value,
+                                 0, "B", 1, "b"), nullptr);
+  state_add_item(ab, ab_set);
+  state_add_item(a, a_set);
+  state_add_item(ba, ba_set);
+  state_add_item(b, b_set);
+
+  EXPECT_EQ(crdt_merge_state(ab, b), CRABS_SUCCESS);
+  EXPECT_EQ(crdt_merge_state(ba, a), CRABS_SUCCESS);
+
+  const crabs_ot_ordered_set_t* ab_only = (crabs_ot_ordered_set_t*)ab_set->value;
+  const crabs_ot_ordered_set_t* ba_only = (crabs_ot_ordered_set_t*)ba_set->value;
+  ASSERT_NE(ab_only->head, nullptr);
+  ASSERT_NE(ba_only->head, nullptr);
+  ASSERT_NE(ab_only->head->next, nullptr);
+  ASSERT_NE(ba_only->head->next, nullptr);
+  // One converged order — identical heads, not insertion order.
+  EXPECT_TRUE(crabs_ot_op_id_equal(&ab_only->head->id, &ba_only->head->id));
+  EXPECT_TRUE(crabs_ot_op_id_equal(&ab_only->head->next->id,
+                                   &ba_only->head->next->id));
+
+  _destroy_state_values(ab);
+  _destroy_state_values(ba);
+  _destroy_state_values(a);
+  _destroy_state_values(b);
+  state_destroy(ab);
+  state_destroy(ba);
+  state_destroy(a);
+  state_destroy(b);
+}
+
+// Preflight refusal: the same op id carrying a DIFFERENT payload is writer
+// equivocation across replicas. The merge returns SUCCESS, dst is UNTOUCHED
+// (its element keeps its own payload, the count is unchanged), and one
+// "__merge_held__" event names the conflict with the equivocation code
+// CRABS_ERR_FORK_DETECTED.
+TEST(TestCRDTMerge, TestMergeStateOtConflictingPayloadHeld) {
+  state_t* dst = state_create();
+  state_t* src = state_create();
+  merge_event_capture_t capture = {};
+  state_set_change_hook(dst, _merge_event_hook, &capture);
+
+  data_item_t* dst_set = _make_free_ot_set_item("doc");
+  data_item_t* src_set = _make_free_ot_set_item("doc");
+  ASSERT_NE(dst_set, nullptr);
+  ASSERT_NE(src_set, nullptr);
+  // SAME op id (n1, 1) on both sides — different payloads.
+  ASSERT_NE(_ot_set_apply_insert((crabs_ot_ordered_set_t*)dst_set->value,
+                                 0, "n1", 1, "first"), nullptr);
+  ASSERT_NE(_ot_set_apply_insert((crabs_ot_ordered_set_t*)src_set->value,
+                                 0, "n1", 1, "second"), nullptr);
+  state_add_item(dst, dst_set);
+  state_add_item(src, src_set);
+
+  crabs_ot_ordered_set_t* dst_only_set = (crabs_ot_ordered_set_t*)dst_set->value;
+  crabs_ordered_element_t* dst_element = dst_only_set->head;
+  ASSERT_NE(dst_element, nullptr);
+  const crabs_ot_ordered_set_t* dst_before = dst_only_set;
+
+  EXPECT_EQ(crdt_merge_state(dst, src), CRABS_SUCCESS);
+
+  // Untouched: same wrapper, same content, no new elements.
+  EXPECT_EQ(dst_only_set, dst_before);
+  EXPECT_EQ(dst_only_set->head, dst_element);
+  EXPECT_EQ(crabs_ot_ordered_set_count(dst_only_set), 1u);
+  ASSERT_NE(dst_element->value, nullptr);
+  EXPECT_EQ(memcmp(dst_element->value, "first", 5), 0);
+  ASSERT_EQ(capture.calls, 1);
+  EXPECT_EQ(capture.kind, CRABS_CHANGE_MERGE);
+  EXPECT_STREQ(capture.type, "__merge_held__");
+  EXPECT_STREQ(capture.target, "doc");
+  EXPECT_EQ(capture.result, CRABS_ERR_FORK_DETECTED);
+
+  _destroy_state_values(dst);
+  _destroy_state_values(src);
+  state_destroy(dst);
+  state_destroy(src);
+}
+
+// Idempotence across repeated merges: the same src snapshot merged twice
+// leaves the ordered set identical (same count + same order), the merge
+// state machinery's core requirement.
+TEST(TestCRDTMerge, TestMergeStateOtMergeIsIdempotent) {
+  state_t* dst = state_create();
+  state_t* src = state_create();
+
+  data_item_t* dst_set = _make_free_ot_set_item("doc");
+  data_item_t* src_set = _make_free_ot_set_item("doc");
+  ASSERT_NE(dst_set, nullptr);
+  ASSERT_NE(src_set, nullptr);
+  ASSERT_NE(_ot_set_apply_insert((crabs_ot_ordered_set_t*)dst_set->value,
+                                 0, "n1", 1, "a"), nullptr);
+  ASSERT_NE(_ot_set_apply_insert((crabs_ot_ordered_set_t*)src_set->value,
+                                 0, "n2", 1, "b"), nullptr);
+  state_add_item(dst, dst_set);
+  state_add_item(src, src_set);
+
+  EXPECT_EQ(crdt_merge_state(dst, src), CRABS_SUCCESS);
+  crabs_ot_ordered_set_t* merged_set = (crabs_ot_ordered_set_t*)dst_set->value;
+  EXPECT_EQ(crabs_ot_ordered_set_count(merged_set), 2u);
+  const crabs_ot_op_id_t first_id = merged_set->head->id;
+  const crabs_ot_op_id_t second_id = merged_set->head->next->id;
+
+  EXPECT_EQ(crdt_merge_state(dst, src), CRABS_SUCCESS);
+
+  EXPECT_EQ(crabs_ot_ordered_set_count(merged_set), 2u);
+  EXPECT_TRUE(crabs_ot_op_id_equal(&merged_set->head->id, &first_id));
+  EXPECT_TRUE(crabs_ot_op_id_equal(&merged_set->head->next->id, &second_id));
 
   _destroy_state_values(dst);
   _destroy_state_values(src);

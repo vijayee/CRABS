@@ -922,11 +922,17 @@ export interface Node {
    * take-any; op logs merge by lamport time and dedupe by uuid. This
    * machine MUTATES toward the union; the source snapshot is untouched (it
    * is never attached to a machine). Throws, machine untouched, on a
-   * malformed snapshot. Held items are NOT a failure: content the merge
-   * layer cannot apply (an OT item, any type without a merge dispatch)
-   * surfaces as a __merge_held__ change event on the machine's hook and
-   * the merge returns SUCCESS. NOT the OT path: ordered-set items
-   * need the dedicated ordered-set merge layer.
+   * malformed snapshot. Ordered-set items (recipe 8's merge layer) merge
+   * through crabs_ot_ordered_set_merge: a fresh item is adopted whole
+   * (value + op-log machinery), a same-name item merges in place (src-only
+   * elements, larger placement per element, deletions win), and a refusal
+   * — the same op id carrying a DIFFERENT payload (writer equivocation) —
+   * leaves this machine untouched and fires one __merge_held__ change
+   * event with result 0xA003 (CRABS_ERR_FORK_DETECTED). Other held items
+   * are NOT a failure: content the merge layer cannot apply (an OT
+   * document/tree/table/ordered-map item — no merge machinery yet — or any
+   * type without a dispatch) surfaces as a __merge_held__ change event on
+   * the machine's hook and the merge returns SUCCESS.
    */
   mergeState(wire: Uint8Array): void;
 

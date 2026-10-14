@@ -125,6 +125,16 @@ lww_register_t*  lww_register_merge(const lww_register_t* a, const lww_register_
 //   GROUP_ORDERED — v1 ships no ordering modules, so any content divergence
 //     is held (item_a kept) with a CRABS_CHANGE_MERGE "__merge_held__" event
 //     (CRABS_ERR_ORDERING_PATH); identical items are a no-op.
+//   OT ordered set — the state bridge to crabs_ot_ordered_set_merge
+//     (crdt_merge_value's DATA_TYPE_OT_ORDERED_SET arm): a fresh item is
+//     adopted by deep copy, a same-name FREE_MERGE item merges IN PLACE
+//     (src-only elements, larger placement_id per element, deletions win,
+//     re-materialized order), and a preflight refusal (same op id different
+//     payload — writer equivocation — or a conflicting placement) leaves dst
+//     untouched with a "__merge_held__" event (CRABS_ERR_FORK_DETECTED).
+//     The other OT types (document/table/tree/ordered map) have no merge
+//     machinery yet: fresh arrival is held ("__merge_held__",
+//     CRABS_ERR_TYPE_MISMATCH) and a same-name merge is a silent no-op.
 // Domain divergence is NOT a merge failure: merge converges and returns
 // CRABS_SUCCESS; what was withheld surfaces on dst's change hook. Errors are
 // only the pre-existing CRABS_ERR_INVALID_PARAM / CRABS_ERR_OOM.
@@ -133,6 +143,11 @@ crabs_error_e crdt_merge_state(state_t* dst, const state_t* src);
 // ============================================================
 // Per-value merge dispatch
 // ============================================================
+// OT ordered sets (DATA_TYPE_OT_ORDERED_SET) dispatch on the data type:
+// with value_a NULL the merge returns a deep copy of value_b (fresh adopt),
+// with both values present it merges IN PLACE and returns value_a; NULL
+// return is the ordered-set merge's preflight refusal (also the answer for
+// both values NULL). Every other type dispatches on crdt_type.
 void* crdt_merge_value(data_type_e type, crdt_type_e crdt_type,
                        void* value_a, void* value_b,
                        const char* node_id_a, const char* node_id_b);

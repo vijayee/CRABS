@@ -3995,12 +3995,16 @@ private:
 
   // Merge a foreign snapshot INTO this machine via crdt_merge_state (the
   // general item rules: counters max-per-node/sum-across-nodes, register
-  // LWW, OR/2P-set union, one-shot take-any; logs merge by lamport time and
-  // dedupe by uuid). This machine MUTATES toward the union; the source
-  // snapshot is untouched (it is never attached to a machine). Throws —
-  // machine untouched — on a malformed snapshot. Held items are NOT a
-  // failure: they surface as __merge_held__ divergences on the machine's
-  // change hook ('merge' events) and the merge returns SUCCESS.
+  // LWW, OR/2P-set union, one-shot take-any; ordered-set items merge in
+  // place through crabs_ot_ordered_set_merge — recipe 8's layer; logs merge
+  // by lamport time and dedupe by uuid). This machine MUTATES toward the
+  // union; the source snapshot is untouched (it is never attached to a
+  // machine). Throws — machine untouched — on a malformed snapshot. Held
+  // items are NOT a failure: they surface as __merge_held__ divergences on
+  // the machine's change hook ('merge' events) and the merge returns
+  // SUCCESS (a same-op-id/different-payload ordered-set refusal held is
+  // CRABS_ERR_FORK_DETECTED; OT document/tree/table/ordered-map items still
+  // hold with CRABS_ERR_TYPE_MISMATCH).
   Napi::Value MergeState(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
     if (info.Length() < 1 || !info[0].IsBuffer())

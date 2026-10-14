@@ -9,6 +9,10 @@
 #include "../Crypto/crypto.h"
 #include "../StateMachine/state_machine.h"
 #include "../Raft/raft_module.h"
+#include "../OT/ot_ordered_set.h"
+#include "../OT/ot_document.h"
+#include "../OT/ot_tree.h"
+#include "../Serialization/serialization.h"
 #include <string.h>
 #include <stdlib.h>
 
@@ -540,6 +544,112 @@ static int _compare_log_entries(const void* a, const void* b) {
   return strcmp(ea->node_id, eb->node_id);
 }
 
+// Destroy an item value the merge layer produced or displaced. OT types
+// carry non-CRDT structs — crdt_value_destroy dispatches on crdt_type, and
+// an OT item's crdt_type is a caller-chosen byte (CRDT_CUSTOM from the wasm
+// adder, whatever the wire carried) — so an OT struct would fall into the
+// default free arm and leak its internals. Dispatch the type-specific
+// destroy first; everything else follows the value_repr discipline (a
+// raw-repr legacy value must not be interpreted as a struct).
+static void _merge_destroy_item_value(const data_item_t* item, void* value) {
+  if (item == NULL || value == NULL) return;
+  if (item->type >= DATA_TYPE_OT_ORDERED_SET &&
+      item->type <= DATA_TYPE_OT_ORDERED_MAP) {
+    switch (item->type) {
+      case DATA_TYPE_OT_ORDERED_SET:
+        crabs_ot_ordered_set_destroy((crabs_ot_ordered_set_t*)value);
+        return;
+      case DATA_TYPE_OT_DOCUMENT:
+        crabs_ot_document_destroy((crabs_ot_document_t*)value);
+        return;
+      case DATA_TYPE_OT_TREE:
+        crabs_ot_tree_destroy((crabs_ot_tree_t*)value);
+        return;
+      default:
+        // OT_TABLE / OT_ORDERED_MAP have no value machinery — a value here
+        // never came from the merge layer; fall through to repr dispatch.
+        break;
+    }
+  }
+  if (item->value_repr == DATA_VALUE_REPR_CRDT_STRUCT) {
+    crdt_value_destroy(item->crdt_type, value);
+  } else {
+    free(value);
+  }
+}
+
+// Recipe 8's merge layer, fresh-adopt arm: a deep copy of an ordered-set
+// value. Elements are recreated one by one (identity, payload, deletion and
+// placement metadata); the wrapper's ot_data — the op log + position map +
+// priority counters a later merge reads — round trips through its own
+// serialization form, the same copy the state wire makes. Returns NULL on
+// any copy failure (the caller holds the item rather than adopting a husk).
+static crabs_ot_ordered_set_t* _ot_ordered_set_deep_copy(
+    const crabs_ot_ordered_set_t* src) {
+  if (src == NULL) return NULL;
+  crabs_ot_ordered_set_t* copy = crabs_ot_ordered_set_create();
+  if (copy == NULL) return NULL;
+  if (src->ot_data != NULL) {
+    serialized_buffer_t* ot_wire = crabs_serialize_ot_data(src->ot_data);
+    if (ot_wire == NULL) {
+      crabs_ot_ordered_set_destroy(copy);
+      return NULL;
+    }
+    crabs_ot_data_item_t* ot_copy = crabs_deserialize_ot_data(
+        ot_wire->data, ot_wire->len, src->ot_data->ot_type_id);
+    serialized_buffer_destroy(ot_wire);
+    if (ot_copy == NULL) {
+      crabs_ot_ordered_set_destroy(copy);
+      return NULL;
+    }
+    crabs_ot_data_item_destroy(copy->ot_data);
+    copy->ot_data = ot_copy;
+  }
+  crabs_ordered_element_t* copy_tail = NULL;
+  for (const crabs_ordered_element_t* src_elem = src->head; src_elem != NULL;
+       src_elem = src_elem->next) {
+    crabs_ordered_element_t* copy_elem = crabs_ordered_element_create(
+        &src_elem->id, src_elem->value, src_elem->value_size);
+    if (copy_elem == NULL) {
+      crabs_ot_ordered_set_destroy(copy);
+      return NULL;
+    }
+    copy_elem->deleted = src_elem->deleted;
+    copy_elem->has_anchor = src_elem->has_anchor;
+    copy_elem->anchor_id = src_elem->anchor_id;
+    copy_elem->placement_id = src_elem->placement_id;
+    copy_elem->prev = copy_tail;
+    if (copy_tail == NULL) copy->head = copy_elem;
+    else copy_tail->next = copy_elem;
+    copy_tail = copy_elem;
+    copy->count++;
+    if (!copy_elem->deleted) copy->visible_count++;
+  }
+  copy->tail = copy_tail;
+  return copy;
+}
+
+// Point a data_item's ot_data field at the OT wrapper struct the merge layer
+// just built — the alias crabs_wasm_add_ordered_set and the state reader
+// maintain (the executor and wire writers dereference item->ot_data
+// directly; data_item_destroy NULLs the aliased field after the set destroy).
+static void _merge_link_ot_data(data_item_t* item) {
+  if (item == NULL || item->value == NULL) return;
+  switch (item->type) {
+    case DATA_TYPE_OT_ORDERED_SET:
+      item->ot_data = ((crabs_ot_ordered_set_t*)item->value)->ot_data;
+      break;
+    case DATA_TYPE_OT_DOCUMENT:
+      item->ot_data = ((crabs_ot_document_t*)item->value)->ot_data;
+      break;
+    case DATA_TYPE_OT_TREE:
+      item->ot_data = ((crabs_ot_tree_t*)item->value)->ot_data;
+      break;
+    default:
+      break;
+  }
+}
+
 // ============================================================
 // Write-domain merge dispatch (write-domains v1, spec 2026-10-08
 // §Merge dispatch)
@@ -683,7 +793,7 @@ static void _merge_sovereign_item(state_t* dst, data_item_t* dst_item,
     if (state_item_digest_compute(src_item, computed_digest) != CRABS_SUCCESS ||
         memcmp(computed_digest, src_item->item_digest, CRABS_HASH_SIZE) != 0) {
       if (ahead_value != NULL) {
-        crdt_value_destroy(dst_item->crdt_type, ahead_value);
+        _merge_destroy_item_value(dst_item, ahead_value);
       }
       _merge_notify_divergence(dst, "__merge_held__", dst_item->name,
                                CRABS_ERR_PROTOCOL_VIOLATION);
@@ -692,11 +802,7 @@ static void _merge_sovereign_item(state_t* dst, data_item_t* dst_item,
     if (ahead_value != NULL) {
       // Destroy per the OLD value's repr (a raw-repr legacy value must not
       // be interpreted as a struct).
-      if (dst_item->value_repr == DATA_VALUE_REPR_CRDT_STRUCT) {
-        crdt_value_destroy(dst_item->crdt_type, dst_item->value);
-      } else {
-        free(dst_item->value);
-      }
+      _merge_destroy_item_value(dst_item, dst_item->value);
       dst_item->value = ahead_value;
       // ahead_value is the deep copy of src_item's value — same repr.
       dst_item->value_repr = src_item->value_repr;
@@ -814,7 +920,7 @@ static void _merge_group_ordered_item(state_t* dst, data_item_t* dst_item,
     if (state_item_digest_compute(dst_item, computed_digest) !=
         CRABS_SUCCESS) {
       if (src_value != NULL) {
-        crdt_value_destroy(dst_item->crdt_type, src_value);
+        _merge_destroy_item_value(dst_item, src_value);
         dst_item->value = old_value;
         dst_item->value_repr = old_repr;
       }
@@ -828,11 +934,7 @@ static void _merge_group_ordered_item(state_t* dst, data_item_t* dst_item,
     if (src_value != NULL) {
       // Destroy the DISPLACED value per its OLD repr (a raw-repr legacy
       // value must not be interpreted as a struct).
-      if (old_repr == DATA_VALUE_REPR_CRDT_STRUCT) {
-        crdt_value_destroy(dst_item->crdt_type, old_value);
-      } else {
-        free(old_value);
-      }
+      _merge_destroy_item_value(dst_item, old_value);
     }
     return;
   }
@@ -849,6 +951,44 @@ static void _merge_group_ordered_item(state_t* dst, data_item_t* dst_item,
     _merge_notify_divergence(dst, "__merge_held__", dst_item->name,
                              CRABS_ERR_ORDERING_PATH);
   }
+}
+
+// FREE_MERGE ordered-set items — the state bridge to crabs_ot_ordered_set_
+// merge (recipe 8's merge layer). The merge is IN PLACE:
+// crabs_ot_ordered_set_merge mutates dst's set (src-only elements copied
+// in, the larger placement_id wins per element, deletions win through the
+// merged position map, the order re-materializes from placement metadata)
+// and returns dst — so on success nothing is destroyed or re-assigned. A
+// NULL return is a preflight refusal (same op id different payload — writer
+// equivocation across replicas — or a conflicting placement, or the
+// capacity guard): dst is untouched; hold it, surface one CRABS_CHANGE_
+// MERGE "__merge_held__" event naming the divergence with
+// CRABS_ERR_FORK_DETECTED (the equivocation code — the C merge collapses
+// all preflight refusals to NULL), and do NOT combine. A valueless dst
+// under a valued src adopts a deep copy. Like every divergence here, the
+// refusal is NOT a merge failure — crdt_merge_state still returns
+// CRABS_SUCCESS.
+static void _merge_free_ot_ordered_set_item(state_t* dst, data_item_t* dst_item,
+                                            const data_item_t* src_item) {
+  if (dst_item->value == NULL && src_item->value == NULL) {
+    return; // both sides valueless — nothing to combine
+  }
+  void* merged_value = crdt_merge_value(dst_item->type, dst_item->crdt_type,
+                                        dst_item->value, src_item->value,
+                                        dst_item->name, src_item->name);
+  if (merged_value == NULL) {
+    // Preflight refusal (or an uncopyable value): dst untouched, held.
+    _merge_notify_divergence(dst, "__merge_held__", dst_item->name,
+                             CRABS_ERR_FORK_DETECTED);
+    return;
+  }
+  if (merged_value == dst_item->value) {
+    return; // in-place merge (or a no-op merge of src == dst) — converged
+  }
+  // dst was valueless while src carried a set: adopt the deep copy.
+  dst_item->value = merged_value;
+  dst_item->value_repr = DATA_VALUE_REPR_CRDT_STRUCT;
+  _merge_link_ot_data(dst_item);
 }
 
 crabs_error_e crdt_merge_state(state_t* dst, const state_t* src) {
@@ -868,6 +1008,12 @@ crabs_error_e crdt_merge_state(state_t* dst, const state_t* src) {
       if (new_item->value != NULL) {
         // crdt_merge_value builds structs for the CRDT types it handles.
         new_item->value_repr = DATA_VALUE_REPR_CRDT_STRUCT;
+      }
+      if (new_item->value != NULL) {
+        // OT items also alias their wrapper's ot_data (the executor and
+        // state writers dereference item->ot_data directly) — point the
+        // copy's field at the copy's own wrapper struct.
+        _merge_link_ot_data(new_item);
       }
       if (new_item->value == NULL && src_item->value != NULL) {
         // Merge-layer gap (an OT type, or any type the merge dispatch does
@@ -936,14 +1082,12 @@ crabs_error_e crdt_merge_state(state_t* dst, const state_t* src) {
         // types, so destroy the value first — per its repr, mirroring
         // data_item_destroy's dispatch; done here because the item must
         // survive long enough for any divergence event above to read its
-        // name.)
+        // name. An OT value's ot_data alias dies with the wrapper — NULL
+        // the field so data_item_destroy does not free it twice.)
         if (new_item->value != NULL) {
-          if (new_item->value_repr == DATA_VALUE_REPR_CRDT_STRUCT) {
-            crdt_value_destroy(new_item->crdt_type, new_item->value);
-          } else {
-            free(new_item->value);
-          }
+          _merge_destroy_item_value(new_item, new_item->value);
           new_item->value = NULL;
+          new_item->ot_data = NULL;
         }
         data_item_destroy(new_item);
       }
@@ -956,6 +1100,8 @@ crabs_error_e crdt_merge_state(state_t* dst, const state_t* src) {
       _merge_sovereign_item(dst, dst_item, src_item);
     } else if (dst_item->write_domain == CRABS_DOMAIN_GROUP_ORDERED) {
       _merge_group_ordered_item(dst, dst_item, src, src_item);
+    } else if (dst_item->type == DATA_TYPE_OT_ORDERED_SET) {
+      _merge_free_ot_ordered_set_item(dst, dst_item, src_item);
     } else {
       // FREE_MERGE: Item exists in dst, merge values (A5 type merge)
       void* merged_value = crdt_merge_value(dst_item->type, dst_item->crdt_type,
@@ -1033,6 +1179,21 @@ crabs_error_e crdt_merge_state(state_t* dst, const state_t* src) {
 void* crdt_merge_value(data_type_e type, crdt_type_e crdt_type,
                        void* value_a, void* value_b,
                        const char* node_id_a, const char* node_id_b) {
+  // OT ordered sets dispatch on the DATA type, not the crdt_type: OT items
+  // tag CRDT_CUSTOM (or whatever creation/wire carried) — the crdt_type
+  // switch below cannot key them. value_a NULL (fresh adopt / the
+  // ahead-snapshot deep copies) returns a deep copy; both values present
+  // merges IN PLACE and returns value_a; a NULL return is the ordered-set
+  // merge's refusal (see _merge_free_ot_ordered_set_item) or a copy failure.
+  if (type == DATA_TYPE_OT_ORDERED_SET) {
+    crabs_ot_ordered_set_t* merged_set = (crabs_ot_ordered_set_t*)value_a;
+    if (merged_set == NULL && value_b == NULL) return NULL;
+    if (merged_set == NULL) {
+      return _ot_ordered_set_deep_copy((const crabs_ot_ordered_set_t*)value_b);
+    }
+    return crabs_ot_ordered_set_merge(
+        merged_set, (const crabs_ot_ordered_set_t*)value_b);
+  }
   switch (crdt_type) {
     case CRDT_G_COUNTER: {
       g_counter_t* a = (g_counter_t*)value_a;

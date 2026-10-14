@@ -1047,9 +1047,10 @@ try {
 })();
 
 // ============================================================
-// P1 review follow-ups (parity-fill round 2): OT hold + OT round trip,
-// raft pairing across restore, HLC continuity. Async legs (raft polling)
-// run inside an async wrapper; the summary prints after they settle.
+// P1 review follow-ups (parity-fill round 2): OT round trip, ordered-set
+// merge state (P5 — the merge layer shipped), raft pairing across restore,
+// HLC continuity. Async legs (raft polling) run inside an async wrapper;
+// the summary prints after they settle.
 // ============================================================
 (async () => {
   function waitFor(predicate, what, timeoutMs = 30000) {
@@ -1063,10 +1064,9 @@ try {
     })();
   }
 
-  // ---- OT items: a machine WITH one round trips its own snapshot ----
-  // (serialize -> deserialize -> the SAME readback), and a merge HOLDS the
-  // item: no NULL-value husk crosses, the counter in the same snapshot
-  // still merges, and the hold surfaces as a __merge_held__ change event.
+  // ---- OT items: a machine WITH one round trips its own snapshot
+  // (serialize -> deserialize -> the SAME readback); merging is P5's story
+  // below. ----
   const otSource = new Node('ot-m1', { ordering: 'hlc' });
   otSource.setPolicy('__execute_ot__', 'role:admin');
   otSource.addOrderedSet('doc');
@@ -1088,25 +1088,88 @@ try {
   assert(otRestored.getOrderedSet('doc').elements.join(',') === 'a,b',
     're-serialized OT snapshot did not re-restore');
 
+  // ---- Ordered-set merge state (parity-fill P5): the ordered-set merge
+  // layer is shipped, so the snapshot's OT item now CROSSES a fresh merge —
+  // merger had no 'doc' and ADOPTS it value+ot_data whole (the P1-era hold
+  // was the missing dispatch, not a semantics choice); the counter in the
+  // same snapshot still merges. ----
   const otMerger = new Node('ot-m2', { ordering: 'hlc' });
   otMerger.addCounter('hits');
   otMerger.incrementCounter('hits', 1, 'ot-m2');
-  const mergeEvents = [];
-  otMerger.on('change', (event) => mergeEvents.push(event));
+  const adoptEvents = [];
+  otMerger.on('change', (event) => adoptEvents.push(event));
   otMerger.mergeState(otWire);
   assert(otMerger.getCounter('hits') === 5,
-    `merge of the held snapshot lost the counter (got ${otMerger.getCounter('hits')})`);
-  let huskRefused = false;
-  try { otMerger.getOrderedSet('doc'); }
-  catch (huskRefusal) { huskRefused = huskRefusal.message.includes('resource_not_found'); }
-  assert(huskRefused,
-    'the unmergeable OT item must NOT cross the merge (no husk expected)');
-  assert(mergeEvents.length === 1 &&
-    mergeEvents[0].kind === 'merge' &&
-    mergeEvents[0].type === '__merge_held__' &&
-    mergeEvents[0].target === 'doc' &&
-    mergeEvents[0].result === 0x3004 /* CRABS_ERR_TYPE_MISMATCH */,
-    `held divergence event missing (got ${JSON.stringify(mergeEvents)})`);
+    `merge of the snapshot lost the counter (got ${otMerger.getCounter('hits')})`);
+  assert(otMerger.getOrderedSet('doc').elements.join(',') === 'a,b',
+    `the ordered set must now merge across (got [${otMerger.getOrderedSet('doc').elements.join(',')}])`);
+  assert(!adoptEvents.some((event) => event.type === '__merge_held__'),
+    `a mergeable ordered set must not fire a hold (got ${JSON.stringify(adoptEvents)})`);
+  // The adopted item stays operational: the merger writes another op.
+  otMerger.setPolicy('__execute_ot__', 'role:admin');
+  otMerger.orderedInsert('doc', 'c', 2, { id: { node: 'ot-m2', seq: 1, ts: 1000 } });
+  assert(['a,b,c', 'a,c,b', 'c,a,b'].includes(
+      otMerger.getOrderedSet('doc').elements.join(',')),
+    'adopted ordered set stopped converging after the merge');
+
+  // Divergent replicas converge: two machines with DIFFERENT op logs over the
+  // same item name merge into one materialized order, and the reverse merge
+  // direction lands on the SAME order (the C suite pins this commutativity
+  // for merge directly; here it is pinned through mergeState).
+  const divergentSource = new Node('ot-m3', { ordering: 'hlc' });
+  divergentSource.setPolicy('__execute_ot__', 'role:admin');
+  divergentSource.addOrderedSet('doc');
+  divergentSource.orderedInsert('doc', 'x', 0, { id: { node: 'ot-m3', seq: 1, ts: 1000 } });
+  const divergentWire = divergentSource.serialize();
+
+  const mergerOne = new Node('ot-m4', { ordering: 'hlc' });
+  mergerOne.setPolicy('__execute_ot__', 'role:admin');
+  mergerOne.addOrderedSet('doc');
+  mergerOne.orderedInsert('doc', 'y', 0, { id: { node: 'ot-m4', seq: 1, ts: 1000 } });
+  mergerOne.mergeState(divergentWire);
+  const mergedOne = mergerOne.getOrderedSet('doc').elements.join(',');
+
+  const yOnly = new Node('ot-m6', { ordering: 'hlc' });
+  yOnly.setPolicy('__execute_ot__', 'role:admin');
+  yOnly.addOrderedSet('doc');
+  yOnly.orderedInsert('doc', 'y', 0, { id: { node: 'ot-m4', seq: 1, ts: 1000 } });
+  const mergerTwo = new Node('ot-m5', { ordering: 'hlc' });
+  mergerTwo.setPolicy('__execute_ot__', 'role:admin');
+  mergerTwo.addOrderedSet('doc');
+  mergerTwo.orderedInsert('doc', 'x', 0, { id: { node: 'ot-m3', seq: 1, ts: 1000 } });
+  mergerTwo.mergeState(yOnly.serialize());
+  const mergedTwo = mergerTwo.getOrderedSet('doc').elements.join(',');
+  assert(mergedOne === mergedTwo,
+    `divergent ordered sets did not converge to one order ([${mergedOne}] vs [${mergedTwo}])`);
+
+  // Conflicting payload refusal: the SAME op id with a DIFFERENT payload is
+  // writer equivocation — mergeState returns SUCCESS, dst is UNTOUCHED, and
+  // one __merge_held__ event names the conflict with the equivocation code
+  // CRABS_ERR_FORK_DETECTED (0xA003).
+  const conflictSource = new Node('ot-m7', { ordering: 'hlc' });
+  conflictSource.setPolicy('__execute_ot__', 'role:admin');
+  conflictSource.addOrderedSet('doc');
+  conflictSource.orderedInsert('doc', 'tamper', 0,
+    { id: { node: 'ot-m1', seq: 1, ts: 1000 } });
+  const conflictWire = conflictSource.serialize();
+
+  const conflictHolder = new Node('ot-m8', { ordering: 'hlc' });
+  conflictHolder.setPolicy('__execute_ot__', 'role:admin');
+  conflictHolder.addOrderedSet('doc');
+  conflictHolder.orderedInsert('doc', 'a', 0,
+    { id: { node: 'ot-m1', seq: 1, ts: 1000 } });
+  const conflictEvents = [];
+  conflictHolder.on('change', (event) => conflictEvents.push(event));
+  conflictHolder.mergeState(conflictWire);
+  assert(conflictHolder.getOrderedSet('doc').elements.join(',') === 'a',
+    'a refused merge must leave dst untouched');
+  const conflictHeld = conflictEvents.filter(
+    (event) => event.type === '__merge_held__');
+  assert(conflictHeld.length === 1 &&
+    conflictHeld[0].kind === 'merge' &&
+    conflictHeld[0].target === 'doc' &&
+    conflictHeld[0].result === 0xA003 /* CRABS_ERR_FORK_DETECTED */,
+    `conflict hold event missing (got ${JSON.stringify(conflictEvents)})`);
 
   // ---- Raft pairing across restore: the module re-attaches to the
   // restored machine with its imported term/commit tip, and the host keeps
