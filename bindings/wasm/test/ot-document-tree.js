@@ -84,6 +84,50 @@ if (node.getOTDocument('trimmed').text !== 'Hworld') {
   throw new Error('delete_range must remove the covered characters only');
 }
 
+// ---- Merge spans: VISIBLE ordinals, not tombstone-tail indexes ------------
+// The merge_spans validator counts VISIBLE spans: three inserts make three
+// spans, the middle one is tombstoned whole, and the survivors merge at
+// visible ordinals 0+1. A span index past the visible tail (2 — only the
+// tombstone tail would admit it) is REFUSED instead of signed as a logged
+// no-op against the tombstone.
+node.addOTDocument('merged');
+node.otInsertText('merged', 0, 'AAA', { id: { node: 'ot-doc-a', seq: 40, ts: 1000 } });
+node.otInsertText('merged', 3, 'BBB', { id: { node: 'ot-doc-a', seq: 41, ts: 1000 } });
+node.otInsertText('merged', 6, 'CCC', { id: { node: 'ot-doc-a', seq: 42, ts: 1000 } });
+node.otDeleteRange('merged', 3, 3, { id: { node: 'ot-doc-a', seq: 43, ts: 1000 } });
+if (node.getOTDocument('merged').text !== 'AAACCC') {
+  throw new Error(`the tombstoned middle span must vanish (got "${node.getOTDocument('merged').text}")`);
+}
+mustThrowWith(() => node.otMergeSpans('merged', 1, 2,
+    { id: { node: 'ot-doc-a', seq: 44, ts: 1000 } }),
+  'ot_position_bounds', 'merge past the visible span tail');
+node.otMergeSpans('merged', 0, 1, { id: { node: 'ot-doc-a', seq: 45, ts: 1000 } });
+const mergedDoc = node.getOTDocument('merged');
+if (mergedDoc.text !== 'AAACCC' || mergedDoc.charCount !== 6 ||
+    mergedDoc.spans.length !== 1) {
+  throw new Error(`merging the survivors must fuse them into ONE visible span (got ${JSON.stringify({ text: mergedDoc.text, charCount: mergedDoc.charCount, spans: mergedDoc.spans.length })})`);
+}
+
+// ---- Split: mid-span offsets split, boundaries are a TYPED refusal --------
+// 'Hello' ('splitme', first insert) + ' world' are two spans: offset 5 is a
+// span boundary (offset 0 within the next span) and offset 0 is the
+// document start — both are null ops in the C core and must be refused
+// before signing, not silently accepted; a mid-span offset splits.
+node.addOTDocument('splitme');
+node.otInsertText('splitme', 0, 'Hello', { id: { node: 'ot-doc-a', seq: 50, ts: 1000 } });
+node.otInsertText('splitme', 5, ' world', { id: { node: 'ot-doc-a', seq: 51, ts: 1000 } });
+mustThrowWith(() => node.otSplitSpan('splitme', 5,
+    { id: { node: 'ot-doc-a', seq: 52, ts: 1000 } }),
+  'ot_position_bounds', 'split at a span boundary');
+mustThrowWith(() => node.otSplitSpan('splitme', 0,
+    { id: { node: 'ot-doc-a', seq: 53, ts: 1000 } }),
+  'ot_position_bounds', 'split at the document start');
+node.otSplitSpan('splitme', 2, { id: { node: 'ot-doc-a', seq: 54, ts: 1000 } });
+const splitDoc = node.getOTDocument('splitme');
+if (splitDoc.text !== 'Hello world' || splitDoc.spans.length !== 3) {
+  throw new Error(`a mid-span split must add a span without changing the text (got ${JSON.stringify({ text: splitDoc.text, spans: splitDoc.spans.length })})`);
+}
+
 // ---- Merge: an OT_DOCUMENT snapshot is HELD, not adopted ------------------
 // OT_DOCUMENT has no merge machinery (crdt_merge.c): a fresh arrival is
 // held — one __merge_held__ change event with CRABS_ERR_TYPE_MISMATCH
