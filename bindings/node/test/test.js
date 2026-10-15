@@ -701,14 +701,18 @@ try {
 }
 
 // Wire-version diagnostics (consumption-fixes finding 5): the constants are
-// exposed (no JS mirror drift), frozen, and match the documented build
-// values. Operation.getWireVersion() reports the active op format on a
-// fresh op.
+// exposed (no JS mirror drift), frozen, and match the authoritative C
+// headers: state=19 — CRABS_SERIAL_VERSION in src/Serialization/serialization.h
+// (bump in 7c39506 added the child-manifest key_version_at_spawn +
+// retired-lineage-keys tail); op=6 — CRABS_OP_FORMAT_VERSION in
+// src/StateMachine/state_machine.h; signing=4 — CRABS_SIGNING_FORMAT_VERSION
+// in src/Serialization/serialization.h. Operation.getWireVersion() reports
+// the active op format on a fresh op.
 {
   assert(wireVersions && typeof wireVersions === 'object',
     'wireVersions should be exposed');
-  assert(wireVersions.state === 18,
-    `wireVersions.state=${wireVersions.state}, expected 18`);
+  assert(wireVersions.state === 19,
+    `wireVersions.state=${wireVersions.state}, expected 19`);
   assert(wireVersions.op === 6,
     `wireVersions.op=${wireVersions.op}, expected 6`);
   assert(wireVersions.signing === 4,

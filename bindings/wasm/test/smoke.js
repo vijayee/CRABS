@@ -40,12 +40,16 @@ const { Node, KeyPair, Operation } = require('..');
   const user = node.getUser('alice');
   const attrs = user ? user.attributes.map(a => a.value).join(',') : 'none';
 
-  // registerUser must reject a public key that is not 33 bytes of hex.
+  // registerUser must reject a public key that is not 33 bytes of hex. The
+  // exact-shape gate (bindings-core.js registerUser: TypeError before the
+  // hex decoder) reports the typed shape message.
   let invalidKeyRejected = false;
   try {
     node.registerUser('mallory', 'not-hex', 'adult');
   } catch (registerError) {
-    invalidKeyRejected = registerError.message.includes('Invalid public key hex');
+    invalidKeyRejected = registerError instanceof TypeError &&
+      registerError.message.includes(
+        'registerUser: publicKeyHex must be 66 hex characters');
   }
   if (!invalidKeyRejected) {
     throw new Error('registerUser must reject an invalid public key hex');

@@ -10,11 +10,14 @@ const { Operation, wireVersions } = require('..');
 (async () => {
   const versions = await wireVersions();
 
-  // Constants are exposed and match the documented build values
-  // (serialization.h CRABS_SERIAL_VERSION, state_machine.h
-  // CRABS_OP_FORMAT_VERSION, serialization.h CRABS_SIGNING_FORMAT_VERSION).
-  if (versions.state !== 18) {
-    throw new Error(`wireVersions.state=${versions.state}, expected 18`);
+  // Constants are exposed and match the authoritative C headers:
+  // state=19 — src/Serialization/serialization.h CRABS_SERIAL_VERSION
+  // (bump in 7c39506 added the child-manifest key_version_at_spawn +
+  // retired-lineage-keys tail); op=6 — src/StateMachine/state_machine.h
+  // CRABS_OP_FORMAT_VERSION; signing=4 — src/Serialization/serialization.h
+  // CRABS_SIGNING_FORMAT_VERSION (0x04).
+  if (versions.state !== 19) {
+    throw new Error(`wireVersions.state=${versions.state}, expected 19`);
   }
   if (versions.op !== 6) {
     throw new Error(`wireVersions.op=${versions.op}, expected 6`);
@@ -30,7 +33,7 @@ const { Operation, wireVersions } = require('..');
   try {
     versions.state = 0;  // silent no-op under freeze (sloppy mode)
   } catch (_) { /* strict-mode engines throw here — also acceptable */ }
-  if (versions.state !== 18) {
+  if (versions.state !== 19) {
     throw new Error('wireVersions was mutable');
   }
 
