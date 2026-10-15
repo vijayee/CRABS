@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 #include <cstring>
 #include <climits>
+#include <string>
 #include <vector>
 extern "C" {
 #include "../src/Crypto/crypto.h"
@@ -392,6 +393,21 @@ TEST(TestAbe, TestPolicyInfixAndComparison) {
   EXPECT_FALSE(crypto_abe_eval_policy("views >= 5", "views:3"));
   EXPECT_TRUE(crypto_abe_eval_policy("views < 5", "views:3"));
   EXPECT_FALSE(crypto_abe_eval_policy("views < 5", "views:10"));
+}
+
+TEST(CryptoPolicy, NestedPolicyBeyondDepthCapRefuses) {
+  // 200-deep nested parens around a valid attribute: evaluator must refuse
+  // (return false) instead of consuming unbounded stack.
+  std::string deep;
+  for (int depth = 0; depth < 200; depth++) deep += '(';
+  deep += "role:admin";
+  for (int depth = 0; depth < 200; depth++) deep += ')';
+  EXPECT_FALSE(crypto_abe_eval_policy(deep.c_str(), "role:admin"));
+}
+
+TEST(CryptoPolicy, NestedPolicyWithinDepthCapWorks) {
+  EXPECT_TRUE(crypto_abe_eval_policy("(((role:admin)))", "role:admin"));
+  EXPECT_TRUE(crypto_abe_eval_policy("role:admin AND role:writer", "role:admin,role:writer"));
 }
 
 // Gap-fill A5: a one-clause prefix policy "AND <clause>" was mis-parsed as a

@@ -604,7 +604,13 @@ static bool _attr_in_list(const char* attr, const char* attr_list) {
   return false;
 }
 
-static bool _eval_policy_expr(const char** pp, const char* attrs);
+// Audit pass-3 M: nested-paren policies recursed without bound — a megabyte
+// of '(' exhausts the stack from verify_operation_auth (op_len <= UINT32_MAX
+// is the only outer bound). 64 nested levels is far beyond any legitimate
+// policy; the cap returns fail-closed refusal.
+#define CRABS_POLICY_MAX_DEPTH 64
+
+static bool _eval_policy_expr(const char** pp, const char* attrs, uint32_t depth);
 
 // R7-09: evaluate a numeric comparison "name op value" against the attribute
 // string (comma-separated "name:value" tokens). The right operand is parsed as
@@ -646,12 +652,13 @@ static bool _eval_comparison(const char* name, const char* op, const char* value
 
 // Parse a primary policy term: an attribute token, a numeric comparison, or a
 // parenthesized expression. Advances *pp past the term.
-static bool _eval_policy_term(const char** pp, const char* attrs) {
+static bool _eval_policy_term(const char** pp, const char* attrs, uint32_t depth) {
+  if (depth > CRABS_POLICY_MAX_DEPTH) return false;
   while (**pp == ' ') (*pp)++;
 
   if (**pp == '(') {
     (*pp)++;
-    bool result = _eval_policy_expr(pp, attrs);
+    bool result = _eval_policy_expr(pp, attrs, depth + 1);
     while (**pp == ' ') (*pp)++;
     if (**pp == ')') (*pp)++;
     return result;
@@ -697,7 +704,8 @@ static bool _eval_policy_term(const char** pp, const char* attrs) {
   return _attr_in_list(left, attrs);
 }
 
-static bool _eval_policy_expr(const char** pp, const char* attrs) {
+static bool _eval_policy_expr(const char** pp, const char* attrs, uint32_t depth) {
+  if (depth > CRABS_POLICY_MAX_DEPTH) return false;
   while (**pp == ' ') (*pp)++;
 
   // Prefix operators (legacy form): AND <l> <r>, OR <l> <r>.
@@ -717,35 +725,35 @@ static bool _eval_policy_expr(const char** pp, const char* attrs) {
     while (*scan == ' ') scan++;
     bool single_clause = (*scan == '\0');
 
-    bool left = _eval_policy_expr(pp, attrs);
+    bool left = _eval_policy_expr(pp, attrs, depth + 1);
 
     while (**pp == ' ') (*pp)++;
     if (single_clause && **pp == '\0') return left;
-    bool right = _eval_policy_expr(pp, attrs);
+    bool right = _eval_policy_expr(pp, attrs, depth + 1);
     return left && right;
   }
 
   if (strncmp(*pp, "OR", 2) == 0 && !isalpha((unsigned char)(*pp)[2])) {
     *pp += 2;
     while (**pp == ' ') (*pp)++;
-    bool left = _eval_policy_expr(pp, attrs);
-    bool right = _eval_policy_expr(pp, attrs);
+    bool left = _eval_policy_expr(pp, attrs, depth + 1);
+    bool right = _eval_policy_expr(pp, attrs, depth + 1);
     return left || right;
   }
 
   // Parse a primary term, then handle infix operators (R7-09: the
   // preprocessor emits "left AND right" / "left OR right").
-  bool left = _eval_policy_term(pp, attrs);
+  bool left = _eval_policy_term(pp, attrs, depth + 1);
 
   while (**pp == ' ') (*pp)++;
   if (strncmp(*pp, "AND", 3) == 0 && !isalpha((unsigned char)(*pp)[3])) {
     *pp += 3;
-    bool right = _eval_policy_expr(pp, attrs);
+    bool right = _eval_policy_expr(pp, attrs, depth + 1);
     return left && right;
   }
   if (strncmp(*pp, "OR", 2) == 0 && !isalpha((unsigned char)(*pp)[2])) {
     *pp += 2;
-    bool right = _eval_policy_expr(pp, attrs);
+    bool right = _eval_policy_expr(pp, attrs, depth + 1);
     return left || right;
   }
   return left;
@@ -765,7 +773,7 @@ bool crypto_abe_eval_policy(const char* policy, const char* attrs) {
   if (strlen(policy) == 0) return false;
 
   const char* p = policy;
-  bool result = _eval_policy_expr(&p, attrs);
+  bool result = _eval_policy_expr(&p, attrs, 0);
   if (!result) return false;
 
   // Reject trailing garbage: the whole policy string must be consumed
