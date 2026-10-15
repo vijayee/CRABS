@@ -462,6 +462,13 @@ private:
     Napi::Object obj = inst->key_pair_ctor.New({});
     KeyPair* kp = KeyPair::Unwrap(obj);
     kp->kp_ = (ecdsa_keypair_t*)calloc(1, sizeof(ecdsa_keypair_t));
+    if (!kp->kp_) {
+      // OOM before any decode — nothing landed in the struct, but the hex
+      // copy still holds the caller's secret; cleanse before refusing
+      // (null deref guard: hex_decode below writes through kp->kp_).
+      OPENSSL_cleanse(&hex[0], hex.size());
+      throw crabs_error(env, CRABS_ERR_OOM, "KeyPair.fromPrivateHex");
+    }
     if (!hex_decode(hex, kp->kp_->private_key, 32)) {
       // Audit M-6: the std::string copy of the secret must never outlive the
       // decode attempt uncleansed (GC-visible heap bytes; the DecryptKeyEnvelope
