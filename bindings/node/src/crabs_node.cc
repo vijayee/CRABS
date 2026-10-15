@@ -473,6 +473,10 @@ private:
     crabs_error_e rc = crypto_ecdsa_derive_public_key(kp->kp_->private_key, kp->kp_->public_key);
     OPENSSL_cleanse(&hex[0], hex.size());
     if (rc != CRABS_SUCCESS) {
+      // Audit pass-3 (D1): the calloc'd keypair struct ALREADY holds the
+      // decoded secret in private_key[32] — free(kp->kp_) alone puts the
+      // scalar on libc's free list. Cleanse the whole struct before release.
+      OPENSSL_cleanse(kp->kp_, sizeof(ecdsa_keypair_t));
       free(kp->kp_);
       kp->kp_ = nullptr;
       throw crabs_error(env, rc, "KeyPair.fromPrivateHex");
