@@ -435,6 +435,68 @@ static bool _op_already_applied(const crabs_ot_data_item_t* ot_data,
   return false;
 }
 
+// Audit pass-3 M: causal admission. Returns true only when every declared
+// causal dependency of `op` is already recorded in THIS item's op log. Deps
+// are (node_id, sequence_num, timestamp) triples with no item scoping, so the
+// log of the item being transformed is the only sound check available; the
+// pending set below is therefore per-item and the flush re-checks against the
+// same log. Ops with no declared deps are trivially admissible (the pre-fix
+// behavior for all dep-less traffic is unchanged).
+static bool _op_deps_satisfied(const crabs_ot_data_item_t* ot_data,
+                               const crabs_ot_operation_t* op) {
+  for (uint32_t dep_index = 0; dep_index < op->dep_count &&
+       dep_index < CRABS_OT_MAX_DEPS; dep_index++) {
+    if (!_op_already_applied(ot_data, &op->deps[dep_index])) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// Park a deep copy of `op` on the item's pending set. Fails closed: hitting
+// the cap or an allocation failure returns false and the executor turns that
+// into CRABS_ERR_INTERNAL — silently dropping the op would let replicas
+// diverge. Re-delivery of an already-parked op is a no-op success (it will
+// flush when its deps arrive; queueing it twice would double-apply).
+static bool _ot_data_pending_push(crabs_ot_data_item_t* ot_data,
+                                  const crabs_ot_operation_t* op) {
+  for (uint32_t pending_index = 0; pending_index < ot_data->pending_count;
+       pending_index++) {
+    if (crabs_ot_op_id_equal(&ot_data->pending_ops[pending_index].id,
+                             &op->id)) {
+      return true; // already parked
+    }
+  }
+  if (ot_data->pending_count >= CRABS_OT_MAX_PENDING_OPS) return false;
+  if (ot_data->pending_count == ot_data->pending_capacity) {
+    uint32_t new_cap = ot_data->pending_capacity == 0
+                       ? 8 : ot_data->pending_capacity * 2;
+    if (new_cap > CRABS_OT_MAX_PENDING_OPS) {
+      new_cap = CRABS_OT_MAX_PENDING_OPS;
+    }
+    crabs_ot_operation_t* grown = (crabs_ot_operation_t*)realloc(
+        ot_data->pending_ops, sizeof(crabs_ot_operation_t) * new_cap);
+    if (grown == NULL) return false;
+    ot_data->pending_ops = grown;
+    ot_data->pending_capacity = new_cap;
+  }
+  crabs_ot_operation_t* slot = &ot_data->pending_ops[ot_data->pending_count];
+  crabs_ot_operation_init(slot);
+  // Mirror the log-append copy discipline: a full field copy (id, op_type,
+  // positions, priority, the inline deps array) with the payload re-owned as
+  // a fresh allocation — the caller keeps ownership of its own payload.
+  *slot = *op;
+  slot->payload = NULL;
+  slot->payload_size = 0;
+  if (op->payload != NULL && op->payload_size > 0) {
+    slot->payload = (uint8_t*)get_memory(op->payload_size);
+    memcpy(slot->payload, op->payload, op->payload_size);
+    slot->payload_size = op->payload_size;
+  }
+  ot_data->pending_count++;
+  return true;
+}
+
 // ============================================================
 // Apply OT Operation (v1.5 §8.2 step 7)
 // ============================================================
@@ -560,6 +622,135 @@ crabs_error_e crabs_apply_ot_op(data_item_t* item, crabs_ot_operation_t* op) {
   return CRABS_SUCCESS;
 }
 
+// Single-op pipeline shared by the main executor loop and the pending flush
+// (audit pass-3 M): replay-skip, transform against the log, position bounds,
+// apply, log-append with payload re-own, prune. A flushed op is therefore
+// indistinguishable from one that arrived in causal order. Returns
+// CRABS_SUCCESS when the op applied or was a replay (already in the log);
+// callers treat other errors per their context (the flush leaves the parked
+// op queued except on OOM/append failure).
+static crabs_error_e _apply_one_ot_op(data_item_t* item,
+                                      crabs_ot_operation_t* ot_op) {
+  crabs_ot_data_item_t* ot_data = (crabs_ot_data_item_t*)item->ot_data;
+
+  // Replay guard: an op already in the log has been applied — skip entirely
+  // (no transform, no re-apply) but count it as success. Kept inside the
+  // helper (not only in the main loop) because a parked op can reach the log
+  // through another delivery before the flush retries it.
+  if (_op_already_applied(ot_data, &ot_op->id)) {
+    return CRABS_SUCCESS;
+  }
+
+  // Transform against concurrent operations in the op log. The local_node_id
+  // argument is unused by crabs_transform_ot_op, so NULL is passed here.
+  crabs_error_e transform_err = crabs_transform_ot_op(
+    ot_op, ot_data, NULL, CRABS_OT_MAX_TRANSFORM_DEPTH);
+
+  if (transform_err != CRABS_SUCCESS) {
+    return transform_err;
+  }
+
+  // Position bounds checking
+  if (ot_op->visible_pos > 100000) {
+    // Basic sanity check for position values
+    return CRABS_ERR_OT_POSITION_BOUNDS;
+  }
+
+  // Apply the transformed operation
+  crabs_error_e apply_err = crabs_apply_ot_op(item, ot_op);
+  if (apply_err != CRABS_SUCCESS) {
+    return apply_err;
+  }
+
+  // Append a fresh slot to the op log. Audit H-I: check the return — on
+  // failure (capacity cap reached or OOM) append_op does NOT increment
+  // op_log_count, and the prior code then overwrote the last existing
+  // log entry (leaking its payload and destroying causal history). Abort
+  // the whole operation instead.
+  crabs_ot_operation_t* log_entry = crabs_ot_data_item_append_op(ot_data);
+  if (log_entry == NULL) {
+    return CRABS_ERR_OOM;
+  }
+  // Copy the transformed op into the log
+  *log_entry = *ot_op;
+  // Payload was allocated for the log entry, need to copy
+  if (ot_op->payload != NULL && ot_op->payload_size > 0) {
+    log_entry->payload = get_memory(ot_op->payload_size);
+    if (log_entry->payload == NULL) {
+      // Keep the log entry self-consistent (NULL payload, 0 size) so a
+      // later transform reading it doesn't dereference NULL.
+      log_entry->payload_size = 0;
+      return CRABS_ERR_OOM;
+    }
+    memcpy(log_entry->payload, ot_op->payload, ot_op->payload_size);
+    log_entry->payload_size = ot_op->payload_size;
+  } else {
+    log_entry->payload = NULL;
+    log_entry->payload_size = 0;
+  }
+
+  // Prune log if it exceeds max size
+  crabs_prune_ot_log(ot_data, CRABS_OT_MAX_OP_LOG_DEFAULT);
+
+  return CRABS_SUCCESS;
+}
+
+// Audit pass-3 M: retry the item's causally-deferred ops after new log entries
+// may have satisfied their deps. Pending ops stay in FIFO parking order; each
+// round scans the whole set and applies the ones whose deps are now met, then
+// repeats until a round makes no progress. The round cap (twice the parking
+// cap) bounds termination: each productive round removes at least one entry.
+// Fail-closed: a parked op that cannot be applied is NEVER dropped — only an
+// append/OOM failure propagates (the executor then fails the whole operation
+// rather than diverge silently); transform/bounds/apply failures leave the op
+// parked for a later pass.
+static crabs_error_e _flush_pending_ot_ops(data_item_t* item) {
+  crabs_ot_data_item_t* ot_data = (crabs_ot_data_item_t*)item->ot_data;
+  if (ot_data->pending_count == 0) return CRABS_SUCCESS;
+
+  bool flushed_any = true;
+  uint32_t flush_rounds = 0;
+  while (flushed_any && flush_rounds < 2 * CRABS_OT_MAX_PENDING_OPS) {
+    flushed_any = false;
+    flush_rounds++;
+    uint32_t pending_index = 0;
+    while (pending_index < ot_data->pending_count) {
+      crabs_ot_operation_t* parked = &ot_data->pending_ops[pending_index];
+      if (!_op_deps_satisfied(ot_data, parked)) {
+        pending_index++;
+        continue;
+      }
+      // Operate on a shallow copy so a failed attempt leaves the parked entry
+      // pristine — transforming the parked op in place would double-transform
+      // it on the next pass. The copy's payload aliases the parked payload;
+      // the helper never frees it (the log append re-owns its own copy).
+      crabs_ot_operation_t attempt = *parked;
+      crabs_error_e flush_err = _apply_one_ot_op(item, &attempt);
+      if (flush_err == CRABS_ERR_OOM) {
+        return flush_err;
+      }
+      if (flush_err == CRABS_SUCCESS) {
+        // Applied (or a replay of an already-logged op): drop from pending —
+        // free the parked payload (the log holds its own copy) and compact.
+        free(parked->payload);
+        uint32_t tail_count = ot_data->pending_count - pending_index - 1;
+        if (tail_count > 0) {
+          memmove(&ot_data->pending_ops[pending_index],
+                  &ot_data->pending_ops[pending_index + 1],
+                  sizeof(crabs_ot_operation_t) * tail_count);
+        }
+        ot_data->pending_count--;
+        flushed_any = true;
+        // Not incrementing: the next parked op shifted into this slot.
+        continue;
+      }
+      // Transform/bounds/apply failure: leave parked, try again next pass.
+      pending_index++;
+    }
+  }
+  return CRABS_SUCCESS;
+}
+
 // ============================================================
 // Execute OT Operation (v1.5 §8.2)
 // ============================================================
@@ -599,7 +790,9 @@ crabs_error_e crabs_execute_ot_operation(state_t* state, operation_t* op) {
       // Audit F-3: record this ingested OT op in the compaction engine's
       // local vector clock (if an engine is wired on the state) so the
       // STRONG/QUORUM compaction safety check can compare local progress
-      // against a peer VC.
+      // against a peer VC. Recorded at ingestion (including ops parked below)
+      // so the VC reflects what this node has SEEN; parked ops reach the VC
+      // exactly once, at delivery.
       if (state->compaction_engine != NULL) {
         crabs_compaction_engine_record_op(
             (crabs_compaction_engine_t*)state->compaction_engine,
@@ -613,60 +806,33 @@ crabs_error_e crabs_execute_ot_operation(state_t* state, operation_t* op) {
         continue;
       }
 
-      // Transform against concurrent operations in the op log
-      crabs_error_e transform_err = crabs_transform_ot_op(
-        &ot_ops[i], ot_data, op->node_id, CRABS_OT_MAX_TRANSFORM_DEPTH);
-
-      if (transform_err != CRABS_SUCCESS) {
-        crabs_ot_ops_free(ot_ops, ot_op_count);
-        return transform_err;
+      // Audit pass-3 M: causal admission. Before transforming, every declared
+      // dependency must already be in this item's log — transforming against
+      // partial history and applying anyway diverges replicas holding
+      // different partial logs. Park a deep copy; the flush below retries it
+      // once the log carries its causes.
+      if (!_op_deps_satisfied(ot_data, &ot_ops[i])) {
+        if (!_ot_data_pending_push(ot_data, &ot_ops[i])) {
+          crabs_ot_ops_free(ot_ops, ot_op_count);
+          return CRABS_ERR_INTERNAL;
+        }
+        continue;
       }
 
-      // Position bounds checking
-      if (ot_ops[i].visible_pos > 100000) {
-        // Basic sanity check for position values
-        crabs_ot_ops_free(ot_ops, ot_op_count);
-        return CRABS_ERR_OT_POSITION_BOUNDS;
-      }
-
-      // Apply the transformed operation
-      crabs_error_e apply_err = crabs_apply_ot_op(item, &ot_ops[i]);
+      crabs_error_e apply_err = _apply_one_ot_op(item, &ot_ops[i]);
       if (apply_err != CRABS_SUCCESS) {
         crabs_ot_ops_free(ot_ops, ot_op_count);
         return apply_err;
       }
+    }
 
-      // Append a fresh slot to the op log. Audit H-I: check the return — on
-      // failure (capacity cap reached or OOM) append_op does NOT increment
-      // op_log_count, and the prior code then overwrote the last existing
-      // log entry (leaking its payload and destroying causal history). Abort
-      // the whole operation instead.
-      crabs_ot_operation_t* log_entry = crabs_ot_data_item_append_op(ot_data);
-      if (log_entry == NULL) {
-        crabs_ot_ops_free(ot_ops, ot_op_count);
-        return CRABS_ERR_OOM;
-      }
-      // Copy the transformed op into the log
-      *log_entry = ot_ops[i];
-      // Payload was allocated for the log entry, need to copy
-      if (ot_ops[i].payload != NULL && ot_ops[i].payload_size > 0) {
-        log_entry->payload = get_memory(ot_ops[i].payload_size);
-        if (log_entry->payload == NULL) {
-          // Keep the log entry self-consistent (NULL payload, 0 size) so a
-          // later transform reading it doesn't dereference NULL.
-          log_entry->payload_size = 0;
-          crabs_ot_ops_free(ot_ops, ot_op_count);
-          return CRABS_ERR_OOM;
-        }
-        memcpy(log_entry->payload, ot_ops[i].payload, ot_ops[i].payload_size);
-        log_entry->payload_size = ot_ops[i].payload_size;
-      } else {
-        log_entry->payload = NULL;
-        log_entry->payload_size = 0;
-      }
-
-      // Prune log if it exceeds max size
-      crabs_prune_ot_log(ot_data, CRABS_OT_MAX_OP_LOG_DEFAULT);
+    // Audit pass-3 M: this resource's ops loop is complete; any log appends
+    // above may have satisfied the deps of parked ops. Flush them through the
+    // same apply pipeline.
+    crabs_error_e flush_err = _flush_pending_ot_ops(item);
+    if (flush_err != CRABS_SUCCESS) {
+      crabs_ot_ops_free(ot_ops, ot_op_count);
+      return flush_err;
     }
   }
 

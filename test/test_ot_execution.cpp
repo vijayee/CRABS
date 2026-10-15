@@ -576,3 +576,121 @@ TEST(OTExecution, ExecuteOtOrderedSetThroughExecutor) {
   EXPECT_EQ(ot_data->op_log_count, 4u);
   state_destroy(state);
 }
+
+// ============================================================
+// Causal Admission Tests (audit pass-3 M)
+// ============================================================
+
+// Encode one OT op to wire format and run it through the executor against a
+// single resource. Mirrors the bindings' delivery path.
+static crabs_error_e execute_one_ot_op(state_t* state, const char* resource,
+                                       crabs_ot_operation_t* ot_op) {
+  uint8_t wire[512];
+  uint32_t wire_size = crabs_ot_ops_to_wire(ot_op, 1, wire, sizeof(wire));
+  EXPECT_GT(wire_size, 0u);
+  if (wire_size == 0u) return CRABS_ERR_INTERNAL;
+
+  operation_t op;
+  memset(&op, 0, sizeof(op));
+  strncpy(op.type, CRABS_OP_EXECUTE_OT, CRABS_MAX_OP_NAME - 1);
+  op.payload = wire;
+  op.payload_size = wire_size;
+  op.resources = (char(*)[CRABS_MAX_USER_ID])get_clear_memory(
+    CRABS_MAX_USER_ID);
+  if (op.resources == nullptr) return CRABS_ERR_INTERNAL;
+  strncpy(op.resources[0], resource, CRABS_MAX_USER_ID - 1);
+  op.resource_count = 1;
+
+  crabs_error_e err = crabs_execute_ot_operation(state, &op);
+  free(op.resources);
+  return err;
+}
+
+// An op whose declared causal dependency is absent from the item's op log
+// must be deferred, NOT transformed against partial history and applied —
+// replicas holding different partial logs would transform it differently and
+// diverge permanently.
+TEST(OTExecution, OpWithMissingDependencyIsDeferredNotApplied) {
+  state_t* state = state_create();
+  data_item_t* item = crabs_register_ot_type(state, "list",
+    DATA_TYPE_OT_ORDERED_SET, nullptr);
+  ASSERT_NE(item, nullptr);
+  crabs_ot_data_item_t* ot_data = (crabs_ot_data_item_t*)item->ot_data;
+  ASSERT_NE(ot_data, nullptr);
+  crabs_ot_ordered_set_t* set = (crabs_ot_ordered_set_t*)item->value;
+  ASSERT_NE(set, nullptr);
+
+  // A dependent op: INSERT 'b' authored by n2, causally after n1's seq-1 op,
+  // which has NOT arrived at this replica.
+  crabs_ot_operation_t dependent;
+  crabs_ot_operation_init(&dependent);
+  dependent.op_type = CRABS_OT_OP_INSERT;
+  dependent.visible_pos = 0;
+  crabs_ot_op_id_init(&dependent.id, "n2", 1, 2000);
+  crabs_ot_op_id_t missing_dep = make_id("n1", 1, 1000);
+  ASSERT_TRUE(crabs_ot_operation_add_dep(&dependent, &missing_dep));
+  const uint8_t element_b = 'b';
+  ASSERT_TRUE(crabs_ot_operation_set_payload(&dependent, &element_b, 1));
+
+  // Deferral is a normal outcome, not an error, while the cause is in flight.
+  EXPECT_EQ(execute_one_ot_op(state, "list", &dependent), CRABS_SUCCESS);
+
+  // Not applied (element invisible), not logged (no transform history for it).
+  EXPECT_EQ(crabs_ot_ordered_set_visible_count(set), 0u);
+  EXPECT_EQ(ot_data->op_log_count, 0u);
+
+  // The missing cause arrives. Applying it must flush the parked dependent op.
+  crabs_ot_operation_t cause;
+  crabs_ot_operation_init(&cause);
+  cause.op_type = CRABS_OT_OP_INSERT;
+  cause.visible_pos = 0;
+  crabs_ot_op_id_init(&cause.id, "n1", 1, 1000);
+  const uint8_t element_a = 'a';
+  ASSERT_TRUE(crabs_ot_operation_set_payload(&cause, &element_a, 1));
+
+  EXPECT_EQ(execute_one_ot_op(state, "list", &cause), CRABS_SUCCESS);
+
+  // Both ops are now visible and logged: the cause applied directly, the
+  // dependent op applied via the flush pass against complete history.
+  EXPECT_EQ(crabs_ot_ordered_set_visible_count(set), 2u);
+  EXPECT_EQ(ot_data->op_log_count, 2u);
+
+  free(dependent.payload);
+  free(cause.payload);
+  state_destroy(state);
+}
+
+// An op whose dependency never arrives stays parked; re-delivering the same
+// op must not queue duplicates, and destroying the state must free the parked
+// payload (the sanitizer build catches a leak here).
+TEST(OTExecution, OpWithPermanentlyMissingDepStaysParkedWithoutDuplicates) {
+  state_t* state = state_create();
+  data_item_t* item = crabs_register_ot_type(state, "list",
+    DATA_TYPE_OT_ORDERED_SET, nullptr);
+  ASSERT_NE(item, nullptr);
+  crabs_ot_data_item_t* ot_data = (crabs_ot_data_item_t*)item->ot_data;
+  ASSERT_NE(ot_data, nullptr);
+  crabs_ot_ordered_set_t* set = (crabs_ot_ordered_set_t*)item->value;
+  ASSERT_NE(set, nullptr);
+
+  crabs_ot_operation_t stranded;
+  crabs_ot_operation_init(&stranded);
+  stranded.op_type = CRABS_OT_OP_INSERT;
+  stranded.visible_pos = 0;
+  crabs_ot_op_id_init(&stranded.id, "n2", 5, 3000);
+  crabs_ot_op_id_t never_arrives = make_id("ghost", 9, 9999);
+  ASSERT_TRUE(crabs_ot_operation_add_dep(&stranded, &never_arrives));
+  const uint8_t element = 'z';
+  ASSERT_TRUE(crabs_ot_operation_set_payload(&stranded, &element, 1));
+
+  // Deliver the same op repeatedly (state-sync re-delivery). Each delivery is
+  // a success but the op never applies and is parked at most once.
+  for (uint32_t delivery = 0; delivery < 3; delivery++) {
+    EXPECT_EQ(execute_one_ot_op(state, "list", &stranded), CRABS_SUCCESS);
+    EXPECT_EQ(crabs_ot_ordered_set_visible_count(set), 0u);
+    EXPECT_EQ(ot_data->op_log_count, 0u);
+  }
+
+  free(stranded.payload);
+  state_destroy(state);
+}

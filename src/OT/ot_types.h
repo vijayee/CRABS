@@ -89,6 +89,8 @@ typedef crabs_ot_operation_t* (*crabs_ot_transform_fn)(
 // Hard cap on the op-log capacity to avoid a huge allocation from untrusted
 // config (e.g. a malicious __change_config__ setting max_op_log_size to 1e9).
 #define CRABS_OT_OP_LOG_MAX 1048576
+// Audit pass-3 M: cap on causally-blocked buffered ops per item.
+#define CRABS_OT_MAX_PENDING_OPS 512
 
 typedef struct {
   uint32_t              ot_type_id;
@@ -96,6 +98,15 @@ typedef struct {
   crabs_ot_operation_t* op_log;
   uint32_t              op_log_count;
   uint32_t              op_log_capacity;
+  // Audit pass-3 M: causal admission. Ops whose declared deps are absent
+  // from the log must not transform against incomplete history. Deferred
+  // ops re-arm after every successful apply; the cap bounds a Byzantine
+  // peer's forever-pending garbage. In-memory only: a restart defers
+  // re-delivered ops again (state merges re-deliver op logs, so the queue
+  // refills from the merged log).
+  crabs_ot_operation_t* pending_ops;
+  uint32_t              pending_count;
+  uint32_t              pending_capacity;
   uint64_t*             priority_counters;
   uint32_t              priority_counter_count;
   crabs_ot_transform_fn transform_matrix[CRABS_OT_TRANSFORM_MATRIX_SIZE]

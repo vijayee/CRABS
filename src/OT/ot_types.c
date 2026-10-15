@@ -141,6 +141,16 @@ void crabs_ot_data_item_destroy(crabs_ot_data_item_t* item) {
     }
     free(item->op_log);
   }
+  // Audit pass-3 M: causally-deferred parked ops own their payloads.
+  if (item->pending_ops != NULL) {
+    for (uint32_t pending_index = 0; pending_index < item->pending_count;
+         pending_index++) {
+      if (item->pending_ops[pending_index].payload != NULL) {
+        free(item->pending_ops[pending_index].payload);
+      }
+    }
+    free(item->pending_ops);
+  }
   if (item->priority_counters != NULL) {
     free(item->priority_counters);
   }
