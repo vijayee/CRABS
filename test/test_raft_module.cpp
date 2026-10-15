@@ -817,7 +817,7 @@ TEST(RaftPersistedState, ImportRejectsForeignAndMalformedSections) {
 TEST(RaftModule, ImportStateRefusesListLongerThanCount) {
   // pass-3 LOW: the splice capacity is grown to log_count, but the splice
   // loop walks the FULL linked list — a section whose list outruns its
-  // declared count wrote past the-grown capacity. The import must refuse
+  // declared count wrote past that capacity. The import must refuse
   // BEFORE any module state is touched.
   crabs_raft_config_t config = make_single_config(42, 3);
   crabs_raft_module_t* module = crabs_raft_module_create(&config);
@@ -855,6 +855,9 @@ TEST(RaftModule, ImportStateRefusesListLongerThanCount) {
 
   crabs_raft_module_destroy(module);
 }
+
+// The full state-blob round-trip: attach → commit → serialize → deserialize
+// → the v16 section restores as a parse snapshot the host can import.
 TEST(RaftPersistedState, MachineBlobRoundTripCarriesModuleSection) {
   crabs_test_env_t env;
   crabs_test_env_init(&env);
