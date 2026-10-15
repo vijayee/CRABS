@@ -7,6 +7,7 @@
 #include <gtest/gtest.h>
 #include <cstdlib>
 #include <cstring>
+#include <vector>
 extern "C" {
 #include "../src/Serialization/serialization.h"
 #include "../src/CRABS/crabs.h"
@@ -563,5 +564,176 @@ TEST(OTSerialization, OtDataEmptyItem) {
 
   crabs_ot_data_item_destroy(restored);
   crabs_ot_data_item_destroy(item);
+  serialized_buffer_destroy(buf);
+}
+
+// ============================================================
+// pass-3 LOW Canonicality Gates
+// ============================================================
+
+// The wire-carried ot_type_id must agree with the type the caller expects.
+TEST(OTSerialization, OtDataRejectsTypeIdMismatch) {
+  crabs_ot_data_item_t* item = crabs_ot_data_item_create(DATA_TYPE_OT_ORDERED_SET);
+  ASSERT_NE(item, nullptr);
+  crabs_transform_matrix_init(item);
+
+  serialized_buffer_t* buf = crabs_serialize_ot_data(item);
+  ASSERT_NE(buf, nullptr);
+  ASSERT_GT(buf->len, (size_t)4);
+
+  // The ot_type_id is the first LE uint32 on the wire; flip it so the blob
+  // claims a different type than the caller requests.
+  buf->data[0] ^= 0xFF;
+
+  crabs_ot_data_item_t* restored =
+      crabs_deserialize_ot_data(buf->data, buf->len, DATA_TYPE_OT_ORDERED_SET);
+  EXPECT_EQ(restored, nullptr);
+  if (restored != nullptr) crabs_ot_data_item_destroy(restored);
+
+  crabs_ot_data_item_destroy(item);
+  serialized_buffer_destroy(buf);
+}
+
+// Trailing bytes past the ot_data payload are an unvalidated tail.
+TEST(OTSerialization, OtDataRejectsTrailingBytes) {
+  crabs_ot_data_item_t* item = crabs_ot_data_item_create(DATA_TYPE_OT_ORDERED_SET);
+  ASSERT_NE(item, nullptr);
+  crabs_transform_matrix_init(item);
+  item->position_map = crabs_bst_create(100);
+  item->position_map = crabs_bst_insert(item->position_map, 50);
+
+  serialized_buffer_t* buf = crabs_serialize_ot_data(item);
+  ASSERT_NE(buf, nullptr);
+
+  std::vector<uint8_t> padded(buf->data, buf->data + buf->len);
+  padded.insert(padded.end(), 4, 0x00);
+
+  crabs_ot_data_item_t* restored =
+      crabs_deserialize_ot_data(padded.data(), padded.size(), DATA_TYPE_OT_ORDERED_SET);
+  EXPECT_EQ(restored, nullptr);
+  if (restored != nullptr) crabs_ot_data_item_destroy(restored);
+
+  crabs_ot_data_item_destroy(item);
+  serialized_buffer_destroy(buf);
+}
+
+// Same discipline for the standalone OT op reader.
+TEST(OTSerialization, OtOpRejectsTrailingBytes) {
+  crabs_ot_operation_t op;
+  crabs_ot_operation_init(&op);
+  op.op_type = CRABS_OT_OP_INSERT;
+  crabs_ot_op_id_init(&op.id, "node1", 1, 1000);
+
+  serialized_buffer_t* buf = crabs_serialize_ot_op(&op);
+  ASSERT_NE(buf, nullptr);
+
+  std::vector<uint8_t> padded(buf->data, buf->data + buf->len);
+  padded.insert(padded.end(), 4, 0x00);
+
+  crabs_ot_operation_t* restored =
+      crabs_deserialize_ot_op(padded.data(), padded.size());
+  EXPECT_EQ(restored, nullptr);
+  if (restored != nullptr) crabs_ot_operation_destroy(restored);
+
+  serialized_buffer_destroy(buf);
+}
+
+// And for the op-log reader: expect a 0 count, a NULL out-param, and no leak.
+TEST(OTSerialization, OtOpLogRejectsTrailingBytes) {
+  crabs_ot_operation_t op;
+  crabs_ot_operation_init(&op);
+  op.op_type = CRABS_OT_OP_INSERT;
+  crabs_ot_op_id_init(&op.id, "node1", 1, 1000);
+
+  serialized_buffer_t* buf = crabs_serialize_ot_op_log(&op, 1);
+  ASSERT_NE(buf, nullptr);
+
+  std::vector<uint8_t> padded(buf->data, buf->data + buf->len);
+  padded.insert(padded.end(), 4, 0x00);
+
+  crabs_ot_operation_t* restored = nullptr;
+  uint32_t count =
+      crabs_deserialize_ot_op_log(padded.data(), padded.size(), &restored);
+  EXPECT_EQ(count, 0u);
+  EXPECT_EQ(restored, nullptr);
+  if (restored != nullptr) crabs_ot_ops_free(restored, count);
+
+  serialized_buffer_destroy(buf);
+}
+
+// The declared BST node count must equal the number of nodes actually parsed.
+TEST(OTSerialization, BstDeclaredCountMismatchRejected) {
+  crabs_bst_node_t* root = crabs_bst_create(50);
+  root = crabs_bst_insert(root, 25);
+  root = crabs_bst_insert(root, 75);
+
+  serialized_buffer_t* buf = crabs_serialize_bst(root);
+  ASSERT_NE(buf, nullptr);
+  ASSERT_GT(buf->len, (size_t)4);
+
+  // Under-declare: the header claims 1 node but the tree parses 3.
+  uint32_t under_declared = 1;
+  memcpy(buf->data, &under_declared, sizeof(under_declared));
+
+  crabs_bst_node_t* restored = crabs_deserialize_bst(buf->data, buf->len);
+  EXPECT_EQ(restored, nullptr);
+  if (restored != nullptr) crabs_bst_destroy(restored);
+
+  crabs_bst_destroy(root);
+  serialized_buffer_destroy(buf);
+}
+
+// Document spans must carry pairwise-distinct ids; a duplicate id aliases
+// one span onto another in id-keyed lookups.
+TEST(OTSerialization, DocumentRejectsDuplicateSpanIds) {
+  state_t* original = state_create();
+  original->version = 300;
+
+  data_item_t* item = crabs_register_ot_type(original, "doc1",
+    DATA_TYPE_OT_DOCUMENT, nullptr);
+  ASSERT_NE(item, nullptr);
+
+  crabs_ot_document_t* doc = (crabs_ot_document_t*)item->value;
+  crabs_ot_op_id_t id1;
+  crabs_ot_op_id_init(&id1, "n1", 1, 100);
+  crabs_ot_op_id_t id2;
+  crabs_ot_op_id_init(&id2, "n1", 2, 200);
+  crabs_ot_document_insert_text(doc, 0, (const uint8_t*)"hello", 5, &id1);
+  crabs_ot_document_insert_text(doc, 5, (const uint8_t*)"world", 5, &id2);
+
+  serialized_buffer_t* buf = crabs_serialize_state(original);
+  ASSERT_NE(buf, nullptr);
+
+  // A span id on the wire is a fixed-width CRABS_MAX_USER_ID node_id
+  // (null-padded) + LE u64 sequence_num + LE u64 timestamp. An op id is
+  // identified by (node_id, sequence_num) — patch every id whose node_id is
+  // "n1" and sequence_num is 2 down to sequence_num 1, so the second span
+  // claims the first span's id.
+  size_t patched = 0;
+  for (size_t byte_offset = 0;
+       byte_offset + CRABS_MAX_USER_ID + sizeof(uint64_t) <= buf->len;
+       byte_offset++) {
+    if (buf->data[byte_offset] == 'n' && buf->data[byte_offset + 1] == '1' &&
+        buf->data[byte_offset + 2] == 0x00) {
+      uint64_t seq = 0;
+      memcpy(&seq, buf->data + byte_offset + CRABS_MAX_USER_ID, sizeof(seq));
+      if (seq == 2u) {
+        uint64_t one = 1;
+        memcpy(buf->data + byte_offset + CRABS_MAX_USER_ID, &one, sizeof(one));
+        patched++;
+      }
+    }
+  }
+  ASSERT_GT(patched, (size_t)0);
+
+  // Recompute the SHA-256 checksum over the modified payload.
+  crypto_sha256(buf->data, buf->len - CRABS_HASH_SIZE,
+                buf->data + buf->len - CRABS_HASH_SIZE);
+
+  state_t* restored = crabs_deserialize_state(buf->data, buf->len);
+  EXPECT_EQ(restored, nullptr);
+  if (restored != nullptr) state_destroy(restored);
+
+  state_destroy(original);
   serialized_buffer_destroy(buf);
 }

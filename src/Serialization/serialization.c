@@ -371,7 +371,11 @@ static void _serialize_bst_recursive(write_buf_t* buf, const crabs_bst_node_t* r
 // trees. 256 levels comfortably holds any balanced tree of >2^256 nodes.
 #define CRABS_BST_MAX_DESERIALIZE_DEPTH 256
 
-static crabs_bst_node_t* _deserialize_bst_recursive(read_buf_t* buf, uint32_t depth) {
+// pass-3 LOW: parsed_nodes (nullable) accumulates the number of nodes
+// actually parsed so callers can compare against the blob's declared count —
+// a mismatch is a non-canonical blob and previously sailed through.
+static crabs_bst_node_t* _deserialize_bst_recursive(read_buf_t* buf, uint32_t depth,
+                                                    uint32_t* parsed_nodes) {
   if (depth > CRABS_BST_MAX_DESERIALIZE_DEPTH) return NULL;
   uint64_t value;
   if (!_read_uint64_le(buf, &value)) return NULL;
@@ -385,16 +389,17 @@ static crabs_bst_node_t* _deserialize_bst_recursive(read_buf_t* buf, uint32_t de
   crabs_bst_node_t* node = crabs_bst_create(value);
   if (node == NULL) return NULL;
   node->deleted = (deleted != 0);
+  if (parsed_nodes != NULL) (*parsed_nodes)++;
 
   if (has_left) {
-    node->left = _deserialize_bst_recursive(buf, depth + 1);
+    node->left = _deserialize_bst_recursive(buf, depth + 1, parsed_nodes);
     if (node->left == NULL) {
       crabs_bst_destroy(node);
       return NULL;
     }
   }
   if (has_right) {
-    node->right = _deserialize_bst_recursive(buf, depth + 1);
+    node->right = _deserialize_bst_recursive(buf, depth + 1, parsed_nodes);
     if (node->right == NULL) {
       crabs_bst_destroy(node);
       return NULL;
@@ -574,6 +579,15 @@ static bool _deserialize_ot_type_state(read_buf_t* buf, data_item_t* item,
         crabs_ot_op_id_t id;
         if (!_deserialize_ot_op_id(buf, &id)) return false;
 
+        // pass-3 LOW: reject duplicate span ids, mirroring the ordered-set
+        // element and tree-node scans. Id-keyed span lookups become
+        // ambiguous when two spans share an id, and a crafted blob could
+        // alias one span onto another.
+        for (crabs_span_t* seen_span = doc->head; seen_span != NULL;
+             seen_span = seen_span->next) {
+          if (crabs_ot_op_id_equal(&seen_span->id, &id)) return false;
+        }
+
         uint8_t* text = NULL;
         uint32_t text_size = 0;
         if (!_read_bytes32(buf, &text, &text_size)) return false;
@@ -658,8 +672,16 @@ static bool _deserialize_ot_type_state(read_buf_t* buf, data_item_t* item,
         uint32_t bst_count;
         if (!_read_uint32_le(buf, &bst_count)) { crabs_tree_node_destroy(node); return false; }
         if (bst_count > 0) {
-          node->child_position_map = _deserialize_bst_recursive(buf, 0);
-          if (node->child_position_map == NULL) { crabs_tree_node_destroy(node); return false; }
+          // pass-3 LOW: the declared position-map entry count MUST equal the
+          // number of BST nodes actually parsed — a mismatch is a
+          // non-canonical blob smuggling extra (or phantom) entries.
+          uint32_t parsed_nodes = 0;
+          node->child_position_map =
+              _deserialize_bst_recursive(buf, 0, &parsed_nodes);
+          if (node->child_position_map == NULL || parsed_nodes != bst_count) {
+            crabs_tree_node_destroy(node);
+            return false;
+          }
         }
 
         // Build pool linkage
@@ -3896,6 +3918,13 @@ crabs_ot_operation_t* crabs_deserialize_ot_op(const uint8_t* data, size_t len) {
     crabs_ot_operation_destroy(op);
     return NULL;
   }
+  // pass-3 LOW: full consumption — trailing bytes are an unvalidated tail
+  // (R7-L-6 discipline; the state-file and operation readers enforce this,
+  // the OT op reader did not).
+  if (buf.offset != buf.len) {
+    crabs_ot_operation_destroy(op);
+    return NULL;
+  }
   return op;
 }
 
@@ -3945,6 +3974,17 @@ uint32_t crabs_deserialize_ot_op_log(const uint8_t* data, size_t len,
     }
   }
 
+  // pass-3 LOW: full consumption — trailing bytes are an unvalidated tail
+  // (R7-L-6 discipline).
+  if (buf.offset != buf.len) {
+    for (uint32_t op_index = 0; op_index < count; op_index++) {
+      if (ops[op_index].payload != NULL) free(ops[op_index].payload);
+    }
+    free(ops);
+    *ops_out = NULL;
+    return 0;
+  }
+
   *ops_out = ops;
   return count;
 }
@@ -3976,7 +4016,18 @@ crabs_bst_node_t* crabs_deserialize_bst(const uint8_t* data, size_t len) {
   if (!_read_uint32_le(&buf, &node_count)) return NULL;
   if (node_count == 0) return NULL;
 
-  return _deserialize_bst_recursive(&buf, 0);
+  // pass-3 LOW: the declared node count MUST equal the number of nodes the
+  // tree actually parses to — a mismatch is a non-canonical blob (an
+  // under-declared count smuggles trailing structure; an over-declared one
+  // misreports the tree).
+  uint32_t parsed_nodes = 0;
+  crabs_bst_node_t* root = _deserialize_bst_recursive(&buf, 0, &parsed_nodes);
+  if (root == NULL) return NULL;
+  if (parsed_nodes != node_count) {
+    crabs_bst_destroy(root);
+    return NULL;
+  }
+  return root;
 }
 
 serialized_buffer_t* crabs_serialize_ot_data(const crabs_ot_data_item_t* item) {
@@ -4027,6 +4078,9 @@ crabs_ot_data_item_t* crabs_deserialize_ot_data(const uint8_t* data, size_t len,
   // ot_type_id
   uint32_t type_id;
   if (!_read_uint32_le(&buf, &type_id)) goto fail;
+  // pass-3 LOW: the wire-carried type id MUST agree with the caller's
+  // expected type — a disagreeing id is a smuggled cross-type blob.
+  if (type_id != (uint32_t)ot_type_id) goto fail;
 
   // op_log
   uint32_t op_count;
@@ -4057,8 +4111,13 @@ crabs_ot_data_item_t* crabs_deserialize_ot_data(const uint8_t* data, size_t len,
   uint32_t bst_count;
   if (!_read_uint32_le(&buf, &bst_count)) goto fail;
   if (bst_count > 0) {
-    item->position_map = _deserialize_bst_recursive(&buf, 0);
+    // pass-3 LOW: the declared position-map count MUST equal the number of
+    // BST nodes actually parsed (same canonicality gate as
+    // crabs_deserialize_bst).
+    uint32_t parsed_nodes = 0;
+    item->position_map = _deserialize_bst_recursive(&buf, 0, &parsed_nodes);
     if (item->position_map == NULL) goto fail;
+    if (parsed_nodes != bst_count) goto fail;
   }
 
   // priority_counters
@@ -4075,6 +4134,10 @@ crabs_ot_data_item_t* crabs_deserialize_ot_data(const uint8_t* data, size_t len,
       if (!_read_uint64_le(&buf, &item->priority_counters[i])) goto fail;
     }
   }
+
+  // pass-3 LOW: full consumption — trailing bytes are an unvalidated tail
+  // (R7-L-6 discipline; every other reader in this file enforces it).
+  if (buf.offset != buf.len) goto fail;
 
   // Initialize transform matrix for this type
   crabs_transform_matrix_init(item);
