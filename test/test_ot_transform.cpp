@@ -250,6 +250,46 @@ TEST(OTTransform, SwapDeleteAfter) {
   EXPECT_EQ(op1.visible_pos_2, 7u);
 }
 
+TEST(OTTransform, SwapSwapSamePositionsHigherPriorityFlips) {
+  crabs_ot_operation_t op1 = make_op(CRABS_OT_OP_SWAP, 3, 7);
+  crabs_ot_op_id_init(&op1.id, "nodeA", 1, 1000);
+  op1.priority = 2;
+  crabs_ot_operation_t op2 = make_op(CRABS_OT_OP_SWAP, 3, 7);
+  crabs_ot_op_id_init(&op2.id, "nodeB", 1, 1000);
+  op2.priority = 1;
+  // Audit pass-3 LOW: only the larger (priority, node_id) op flips.
+  crabs_transform_swap_swap(&op1, &op2);
+  EXPECT_EQ(op1.visible_pos, 7u);
+  EXPECT_EQ(op1.visible_pos_2, 3u);
+}
+
+TEST(OTTransform, SwapSwapSamePositionsLowerIdDoesNotFlip) {
+  crabs_ot_operation_t op1 = make_op(CRABS_OT_OP_SWAP, 3, 7);
+  crabs_ot_op_id_init(&op1.id, "nodeA", 1, 1000);
+  op1.priority = 1;
+  crabs_ot_operation_t op2 = make_op(CRABS_OT_OP_SWAP, 3, 7);
+  crabs_ot_op_id_init(&op2.id, "nodeZ", 1, 1000);
+  op2.priority = 1;
+  // Equal priority; "nodeZ" > "nodeA" so op1 loses and does NOT flip.
+  crabs_transform_swap_swap(&op1, &op2);
+  EXPECT_EQ(op1.visible_pos, 3u);
+  EXPECT_EQ(op1.visible_pos_2, 7u);
+}
+
+TEST(OTTransform, SwapSwapStrictlyLowerPriorityDoesNotFlip) {
+  // Antisymmetry guard: a `>=` comparator regression would flip op1 here
+  // (the F-4 bug class). The current code must NOT flip op1.
+  crabs_ot_operation_t op1 = make_op(CRABS_OT_OP_SWAP, 3, 7);
+  crabs_ot_op_id_init(&op1.id, "nodeA", 1, 1000);
+  op1.priority = 1;
+  crabs_ot_operation_t op2 = make_op(CRABS_OT_OP_SWAP, 3, 7);
+  crabs_ot_op_id_init(&op2.id, "nodeB", 1, 1000);
+  op2.priority = 3;
+  crabs_transform_swap_swap(&op1, &op2);
+  EXPECT_EQ(op1.visible_pos, 3u);
+  EXPECT_EQ(op1.visible_pos_2, 7u);
+}
+
 // ============================================================
 // Null Safety Tests
 // ============================================================

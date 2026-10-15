@@ -249,10 +249,25 @@ crabs_ot_operation_t* crabs_transform_delete_move(
 crabs_ot_operation_t* crabs_transform_swap_swap(
     crabs_ot_operation_t* op1, crabs_ot_operation_t* op2) {
   if (op1 == NULL || op2 == NULL) return op1;
-  // If both swaps touch the same positions, lower priority yields
+  // Audit pass-3 LOW: the prior `op1->priority >= op2->priority` flipped BOTH
+  // ops when priorities were equal — the same non-antisymmetric class as the
+  // F-4 insert/insert flaw (see crabs_transform_insert_insert). A strict
+  // (priority, node_id) order keeps exactly one op flipping per tie-case, so
+  // both replicas agree on the final position pair. (Today the flip is a
+  // semantic no-op — apply_swap is involutive and position-symmetric — but
+  // it is one transform-matrix change away from a divergence bug.)
   if (op1->visible_pos == op2->visible_pos &&
       op1->visible_pos_2 == op2->visible_pos_2) {
-    if (op1->priority >= op2->priority) {
+    bool flip;
+    if (op1->priority != op2->priority) {
+      flip = (op1->priority > op2->priority);
+    } else {
+      int cmp = strncmp(op1->id.node_id, op2->id.node_id, CRABS_MAX_USER_ID);
+      if (cmp > 0) flip = true;
+      else if (cmp < 0) flip = false;
+      else flip = true;  // equal ids: local reentry, flip is a semantic no-op
+    }
+    if (flip) {
       // Reverse the swap direction for tie-breaking
       uint64_t tmp = op1->visible_pos;
       op1->visible_pos = op1->visible_pos_2;
