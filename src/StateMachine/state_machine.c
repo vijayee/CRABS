@@ -1447,6 +1447,10 @@ static crabs_error_e _raft_shelf_attempt(state_t* state, uint64_t now_ms,
   // Poison-pill visibility (carried item C): every attempt past the poison
   // threshold surfaces a loud change notification — the stream STAYS
   // blocked (order preservation over availability of the group path).
+  // The notification requires op != NULL (it carries the op); an
+  // UNPARSEABLE shelf head (pass-3 H-3 parking) never enters this block —
+  // its loud surface is the pump's CRABS_ERR_SERIALIZATION_ERROR return on
+  // every invocation, and the stream stays blocked identically.
   if (op != NULL && shelf->attempt_count >= CRABS_RAFT_SHELF_POISON_ATTEMPTS) {
     char preview[CRABS_MAX_OP_NAME + CRABS_MAX_USER_ID + 24];
     snprintf(preview, sizeof(preview), "shelf-retry %u failing",
@@ -1491,9 +1495,29 @@ static crabs_error_e _raft_pump_notifications_at(state_t* state,
     operation_t* op = crabs_deserialize_operation(notification.op_bytes,
                                                   notification.op_len);
     if (op == NULL) {
-      // A committed op that cannot be deserialized is a hard corruption:
-      // the pump BLOCKS (fails loudly, notification stays queued) rather
-      // than skip an ordered entry it can never materialize.
+      // pass-3 H-3: the poll already CONSUMED the notification (the dequeue
+      // unlinks and frees the queue node — raft_module.c) — a bare error
+      // return would LOSE the entry, and every later pump would skip past
+      // an ordered slot this machine can never materialize (silent
+      // divergence; the old comment claimed "notification stays queued",
+      // which is false). Park the wire on the retry shelf instead: the
+      // shelf head BLOCKS the stream and each pump re-attempts the parse
+      // loudly — order preservation over availability, the same posture as
+      // an execute failure. The anchor mirrors the execute-failure shelf
+      // block below field for field.
+      raft_retry_shelf_t* shelf =
+          (raft_retry_shelf_t*)get_clear_memory(sizeof(raft_retry_shelf_t));
+      shelf->op_wire = (uint8_t*)get_memory(
+          notification.op_len > 0 ? notification.op_len : 1);
+      memcpy(shelf->op_wire, notification.op_bytes, notification.op_len);
+      shelf->op_len = notification.op_len;
+      shelf->attempt_count = 0;
+      // A clock-trusted pump anchors the backoff at now (first retry: the
+      // next pump call); a failed clock leaves the gate unset — the shelf
+      // head retries on every pump until real time returns.
+      shelf->retry_not_before_ms = clock_trusted ? now_ms : 0;
+      shelf->next = NULL;
+      state->raft_retry_shelf = shelf;
       return CRABS_ERR_SERIALIZATION_ERROR;
     }
     // The delivery marker is the ONLY credential a follower-side

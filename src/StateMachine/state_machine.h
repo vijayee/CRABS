@@ -279,7 +279,9 @@ crabs_error_e state_machine_execute_committed(state_t* state, operation_t* op);
 // changes are host concerns). Materialization semantics (carried item C):
 // the pump is STRICTLY ORDERED — a failed materialization retains its op in
 // the retry shelf and blocks every newer delivery (the committed log order
-// must be preserved machine-side); retries run on pump invocations with a
+// must be preserved machine-side); an UNPARSEABLE committed op is parked on
+// the same shelf (the poll consumed the module's notification — dropping it
+// would silently skip an ordered slot); retries run on pump invocations with a
 // bounded per-attempt backoff, and CRABS_RAFT_SHELF_POISON_ATTEMPTS
 // consecutive failures surface a loud change notification per attempt (the
 // stream stays blocked — availability halts, order never breaks).

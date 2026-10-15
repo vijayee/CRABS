@@ -1889,6 +1889,138 @@ TEST(RaftSimShelf, PoisonPillFailuresSurfaceNotificationsLoudly) {
   sim_single_fixture_destroy(&fixture);
 }
 
+TEST(RaftSimShelf, UnparseableCommittedOpBlocksStream) {
+  // pass-3 H-3: a COMMITTED op whose wire bytes cannot be deserialized must
+  // park on the retry shelf and BLOCK the stream — the poll already consumed
+  // the module's notification (the dequeue unlinks and frees the node), so a
+  // bare error return would silently skip an ordered slot (divergence).
+  // Follower fixture: a leader APPEND_REQ carries entry 1 with corrupt wire
+  // bytes and entry 2 with a VALID signed op that would materialize happily
+  // if the pump ever reached it.
+  ecdsa_keypair_t* keypair = crypto_ecdsa_generate();
+  state_t* state = state_create();
+  sim_setup_council_state(state);
+  attribute_machine_t* attr_machine = attribute_machine_create(
+      "admin", keypair->public_key);
+  state->attr_machine = attr_machine;
+  crabs_raft_config_t config;
+  crabs_raft_config_defaults(&config);
+  config.seed = 7;
+  strncpy(config.node_id, "nodeF", CRABS_MAX_USER_ID - 1);
+  strncpy(config.peer_ids[0], "nodeF", CRABS_MAX_USER_ID - 1);
+  strncpy(config.peer_ids[1], "nodeL", CRABS_MAX_USER_ID - 1);
+  config.peer_count = 2;
+  crabs_raft_module_t* follower = crabs_raft_module_create(&config);
+  ASSERT_NE(follower, nullptr);
+  ASSERT_EQ(state_attach_raft_module(state, follower), CRABS_SUCCESS);
+
+  // Entry 2: a well-formed signed council_write the follower never proposed
+  // (the commit-delivery marker is the only credential follower-side
+  // materialization needs).
+  operation_t* good_op = sim_build_write_op(state, keypair, "council_write",
+                                            "council", "late-ok", false);
+  ASSERT_NE(good_op, nullptr);
+  uint8_t good_uuid[CRABS_UUID_SIZE];
+  memcpy(good_uuid, good_op->uuid, CRABS_UUID_SIZE);
+  serialized_buffer_t* good_wire = crabs_serialize_operation(good_op);
+  operation_destroy(good_op);
+  ASSERT_NE(good_wire, nullptr);
+  ASSERT_GT(good_wire->len, 4u);
+
+  // Entry 1: valid-length garbage — the "CRAB" magic is clobbered so the
+  // parse gate refuses it (truncation would test framing, not corruption).
+  std::vector<uint8_t> corrupt(good_wire->len);
+  memcpy(corrupt.data(), good_wire->data, good_wire->len);
+  corrupt[0] ^= 0xFF;
+
+  // Hand-marshal an APPEND_REQ (the module's public wire contract — the
+  // same shape as test_raft_module's RaftWireRoundTrip): header magic 0x52,
+  // version 1, kind APPEND_REQ(3), term 5; leader "nodeL"; both entries
+  // committed by the leader ceiling.
+  std::vector<uint8_t> blob;
+  auto push_u8 = [&](uint8_t value) { blob.push_back(value); };
+  auto push_u64 = [&](uint64_t value) {
+    for (int byte_index = 0; byte_index < 8; byte_index++) {
+      push_u8((uint8_t)((value >> (byte_index * 8)) & 0xFF));
+    }
+  };
+  auto push_u32 = [&](uint32_t value) {
+    push_u8((uint8_t)(value & 0xFF));
+    push_u8((uint8_t)((value >> 8) & 0xFF));
+    push_u8((uint8_t)((value >> 16) & 0xFF));
+    push_u8((uint8_t)((value >> 24) & 0xFF));
+  };
+  auto push_str16 = [&](const char* text) {
+    uint16_t len = (uint16_t)strlen(text);
+    push_u8((uint8_t)(len & 0xFF));
+    push_u8((uint8_t)(len >> 8));
+    for (uint16_t char_index = 0; char_index < len; char_index++) {
+      push_u8((uint8_t)text[char_index]);
+    }
+  };
+  push_u8(0x52); push_u8(1); push_u8(3);
+  push_u64(5);
+  push_str16("nodeL");
+  push_u64(0);   // prev_term
+  push_u64(0);   // prev_index
+  push_u64(2);   // leader commit
+  push_u32(2);   // entry count
+  // entry 1 (term 4): the corrupt wire.
+  push_u64(4); push_u64(1);
+  push_u32((uint32_t)corrupt.size());
+  for (uint8_t byte : corrupt) push_u8(byte);
+  // entry 2 (term 4): the VALID op, ordered directly behind the corrupt one.
+  push_u64(4); push_u64(2);
+  push_u32((uint32_t)good_wire->len);
+  for (size_t byte_index = 0; byte_index < good_wire->len; byte_index++) {
+    push_u8(good_wire->data[byte_index]);
+  }
+
+  EXPECT_EQ(crabs_raft_module_inbound(follower, "nodeL", blob.data(),
+                                      blob.size(), 100), CRABS_SUCCESS);
+  EXPECT_EQ(crabs_raft_module_rejected_message_count(follower), 0u);
+  crabs_raft_persist_request_t persist;
+  ASSERT_TRUE(crabs_raft_module_poll_persist(follower, &persist));
+  EXPECT_EQ(crabs_raft_module_persist_complete(follower, persist.handle, true),
+            CRABS_SUCCESS);
+  EXPECT_EQ(crabs_raft_module_committed_tip(follower), 2u);
+
+  // Pump 1: the corrupt head fails the parse — a loud error, and the wire
+  // is parked on the retry shelf (the poll consumed the notification;
+  // dropping it would lose the ordered slot).
+  crabs_error_e pump_rc = state_raft_process_notifications_at(state, 200);
+  EXPECT_EQ(pump_rc, CRABS_ERR_SERIALIZATION_ERROR);
+  EXPECT_TRUE(state_raft_shelf_active(state));
+
+  // Pump 2 (well past the backoff window): the shelf head re-attempts the
+  // parse and blocks the stream — entry 2 must NOT apply, even though it
+  // parses and validates cleanly (a pump that skipped the corrupt slot
+  // would materialize it: divergence).
+  pump_rc = state_raft_process_notifications_at(state, 900000);
+  EXPECT_EQ(pump_rc, CRABS_ERR_SERIALIZATION_ERROR);
+  EXPECT_EQ(state_raft_shelf_attempt_count(state), 1u);
+  EXPECT_EQ(sim_state_uuid_occurrences(state, good_uuid), 0u);
+  EXPECT_EQ(state->log_count, (uint64_t)0);
+  const lww_register_t* council = sim_council_register(state);
+  ASSERT_NE(council, nullptr);
+  EXPECT_EQ(memcmp(council->value, "origin", 6), 0);
+
+  // And it stays parked: a corrupt committed entry can never materialize on
+  // this replica — order preservation over availability, for good.
+  pump_rc = state_raft_process_notifications_at(state, 1900000);
+  EXPECT_EQ(pump_rc, CRABS_ERR_SERIALIZATION_ERROR);
+  EXPECT_TRUE(state_raft_shelf_active(state));
+  EXPECT_EQ(sim_state_uuid_occurrences(state, good_uuid), 0u);
+
+  serialized_buffer_destroy(good_wire);
+  state_attach_raft_module(state, nullptr);
+  crabs_raft_module_destroy(follower);
+  state->attr_machine = NULL;
+  state_destroy(state);
+  attribute_machine_destroy(attr_machine);
+  crypto_ecdsa_keypair_destroy(keypair);
+}
+
 TEST(RaftSimShelf, PumpRetriesEveryInvocationWhenClockFails) {
   // The no-time pump bypasses the backoff gate ENTIRELY: a failed clock
   // must not install `0 + backoff` deadlines that later `0 < deadline`
