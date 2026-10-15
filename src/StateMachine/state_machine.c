@@ -3101,6 +3101,15 @@ crabs_error_e state_machine_op_refresh_key(state_t* state, operation_t* op,
 crabs_error_e state_machine_op_compact(state_t* state, operation_t* op) {
   if (state == NULL || op == NULL) return CRABS_ERR_INVALID_PARAM;
 
+  // pass-3 LOW: drive compaction's rate window + timestamp comparisons from
+  // the AUTHENTICATED platform clock (R8-T-1 discipline). Falling back to
+  // the engine wall clock keeps the API contract for clock-less hosts
+  // (matching the pump's clock-trusted/clock-untrusted convention).
+  uint64_t now_ms = 0;
+  if (!state_get_time_ms(state, &now_ms)) {
+    now_ms = crabs_engine_get_time_ms();
+  }
+
   // Audit N-20: use the state's persistent compaction engine if one is wired
   // so the local_vc accumulated from the OT execute path (via
   // crabs_compaction_engine_record_op) is preserved across __compact__
@@ -3109,15 +3118,15 @@ crabs_error_e state_machine_op_compact(state_t* state, operation_t* op) {
   // never be armed. If no persistent engine is set, fall back to a fresh
   // one (single-replica CRABS_SAFETY_FORCE mode).
   if (state->compaction_engine != NULL) {
-    return crabs_op_compact_now((crabs_compaction_engine_t*)state->compaction_engine,
-                                state);
+    return crabs_op_compact((crabs_compaction_engine_t*)state->compaction_engine,
+                            state, now_ms);
   }
 
   crabs_compaction_engine_t engine;
   crabs_compaction_engine_init(&engine, NULL);
   crabs_register_crdt_vtables(&engine.registry);
 
-  crabs_error_e err = crabs_op_compact_now(&engine, state);
+  crabs_error_e err = crabs_op_compact(&engine, state, now_ms);
   crabs_compaction_engine_destroy(&engine);
 
   return err;
