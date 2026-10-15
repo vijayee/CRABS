@@ -135,8 +135,10 @@ typedef struct {
 // host. RAFT_NOTIFY_COMMITTED_OP carries the committed op's SERIALIZED WIRE
 // bytes (crabs_serialize_operation form) — the host materializes it (the
 // pipeline seam deserializes and executes through the scheduled-
-// materialization path). Bytes/fields stay module-owned and valid until the
-// next poll notification returns.
+// materialization path). Bytes/fields are module-owned BORROWS: valid only
+// while the pump keeps using them — copy or deserialize them IMMEDIATELY;
+// crabs_raft_module_import_state and module destroy free the committed
+// op_wires, which would invalidate un-drained borrowed pointers.
 typedef enum {
   RAFT_NOTIFY_BECAME_LEADER      = 1,
   RAFT_NOTIFY_LOST_LEADERSHIP    = 2,

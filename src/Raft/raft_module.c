@@ -2504,12 +2504,21 @@ crabs_error_e crabs_raft_module_import_state(
       persisted->commit_index > persisted->log_count) {
     return CRABS_ERR_INVALID_PARAM;
   }
+  uint64_t node_count = 0;
   for (const crabs_raft_entry_persisted_t* node = persisted->log; node != NULL;
        node = node->next) {
     if (node->wire_len > CRABS_RAFT_MAX_OP_WIRE_BYTES) {
       return CRABS_ERR_INVALID_PARAM;
     }
+    node_count++;
   }
+  // pass-3 LOW: the splice capacity below is grown to log_count, but the
+  // splice loop walks the FULL linked list — a struct whose list outruns its
+  // declared count wrote past that capacity. A list SHORTER than log_count
+  // is just as malformed (the tail slots would be claimed as real entries).
+  // Fail closed BEFORE any mutation (input provenance is the signed machine
+  // blob; this is defense-in-depth against a corrupt struct).
+  if (node_count != persisted->log_count) return CRABS_ERR_INVALID_PARAM;
   // Joint membership: rebuild the address book from the boot config first,
   // then validate every config entry's payload against the imported log.
   module->member_n = 0;

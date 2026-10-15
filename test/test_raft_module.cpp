@@ -814,8 +814,47 @@ TEST(RaftPersistedState, ImportRejectsForeignAndMalformedSections) {
   crabs_raft_module_destroy(module);
 }
 
-// The full state-blob round-trip: attach → commit → serialize → deserialize
-// → the v16 section restores as a parse snapshot the host can import.
+TEST(RaftModule, ImportStateRefusesListLongerThanCount) {
+  // pass-3 LOW: the splice capacity is grown to log_count, but the splice
+  // loop walks the FULL linked list — a section whose list outruns its
+  // declared count wrote past the-grown capacity. The import must refuse
+  // BEFORE any module state is touched.
+  crabs_raft_config_t config = make_single_config(42, 3);
+  crabs_raft_module_t* module = crabs_raft_module_create(&config);
+  ASSERT_NE(module, nullptr);
+
+  uint8_t wire_byte = 0x00;   // below the config marker, so no config path
+  crabs_raft_entry_persisted_t second_node = {};
+  second_node.term = 1;
+  second_node.proposal_id = 2;
+  second_node.op_wire = &wire_byte;
+  second_node.wire_len = 1;
+  second_node.next = nullptr;
+
+  crabs_raft_entry_persisted_t first_node = {};
+  first_node.term = 1;
+  first_node.proposal_id = 1;
+  first_node.op_wire = &wire_byte;
+  first_node.wire_len = 1;
+  first_node.next = &second_node;
+
+  crabs_raft_module_state_t section = {};
+  section.module_id = 3;
+  section.term = 1;
+  section.commit_index = 0;
+  section.log_count = 1;        // declares ONE entry...
+  section.log = &first_node;    // ...but carries TWO nodes
+
+  EXPECT_EQ(crabs_raft_module_import_state(module, &section),
+            CRABS_ERR_INVALID_PARAM);
+  // Pre-count validation refuses before any mutation: the module state is
+  // unchanged.
+  EXPECT_EQ(crabs_raft_module_log_length(module), 0u);
+  EXPECT_EQ(crabs_raft_module_committed_tip(module), 0u);
+  EXPECT_FALSE(crabs_raft_module_is_leader(module));
+
+  crabs_raft_module_destroy(module);
+}
 TEST(RaftPersistedState, MachineBlobRoundTripCarriesModuleSection) {
   crabs_test_env_t env;
   crabs_test_env_init(&env);
