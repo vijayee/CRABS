@@ -1276,6 +1276,29 @@ static void _raft_pending_remove(state_t* state, const uint8_t uuid[CRABS_UUID_S
   }
 }
 
+// pass-3 LOW: purge EVERY pending proposal on leadership loss. A pending
+// only exists for a proposal THIS machine made as leader; after the role
+// is lost that proposal's log slot is truncated away before it can commit,
+// so no COMMITTED_OP will ever arrive to retire the record (remove runs
+// only from state_machine_execute_committed). Left in place, the stranded
+// records accumulate to CRABS_RAFT_MAX_PENDING_PROPOSALS and then wedge
+// ALL group proposals with ERR_INTERNAL. The purge is silent — the pending
+// record IS its own lifecycle record (no notification rides it), and the
+// host already observed the role change in the RAFT_NOTIFY_LOST_LEADERSHIP
+// event being drained. Re-proposals by the NEXT leadership of this machine
+// mint fresh pendings; follower-side committed ops never had pendings.
+static void _raft_pending_flush(state_t* state) {
+  raft_pending_proposal_t* entry =
+      (raft_pending_proposal_t*)state->raft_pending_proposals;
+  while (entry != NULL) {
+    raft_pending_proposal_t* next = entry->next;
+    free(entry->op_bytes);
+    free(entry);
+    entry = next;
+  }
+  state->raft_pending_proposals = NULL;
+}
+
 // Two-phase routing (scheduler pending-op precedent): serialize the op,
 // hand it to the module's propose path, and enqueue the uuid-keyed pending
 // proposal. Returns CRABS_ERR_ORDERING_PENDING — accepted into the module's
@@ -1364,14 +1387,7 @@ void* state_raft_module(const state_t* state) {
 
 void state_raft_destroy_pending(state_t* state) {
   if (state == NULL) return;
-  raft_pending_proposal_t* entry = (raft_pending_proposal_t*)state->raft_pending_proposals;
-  while (entry != NULL) {
-    raft_pending_proposal_t* next = entry->next;
-    free(entry->op_bytes);
-    free(entry);
-    entry = next;
-  }
-  state->raft_pending_proposals = NULL;
+  _raft_pending_flush(state);
   // The retry shelf is state-owned heap like the pendings (carried item C).
   raft_retry_shelf_t* shelf = (raft_retry_shelf_t*)state->raft_retry_shelf;
   while (shelf != NULL) {
@@ -1490,6 +1506,16 @@ static crabs_error_e _raft_pump_notifications_at(state_t* state,
   crabs_raft_notification_t notification;
   while (crabs_raft_module_poll_notification(module, &notification)) {
     if (notification.kind != RAFT_NOTIFY_COMMITTED_OP) {
+      // pass-3 LOW: a proposal truncated from the log before commit can
+      // never complete — its pending record would linger to the cap and
+      // wedge group proposals. On leadership loss the pending lifecycle
+      // for THIS module's proposals is over; purge them. Queue ordering
+      // (FIFO; _raft_step_down fires before any later election win
+      // enqueues BECAME_LEADER) guarantees the flush runs before any
+      // fresh leadership of this machine mints new pendings.
+      if (notification.kind == RAFT_NOTIFY_LOST_LEADERSHIP) {
+        _raft_pending_flush(state);
+      }
       continue;   // leadership changes are host concerns; module stays drained
     }
     operation_t* op = crabs_deserialize_operation(notification.op_bytes,

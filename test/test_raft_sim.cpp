@@ -1257,6 +1257,171 @@ TEST(RaftSimHarness, PartitionIsolatedLeaderHaltsMajorityCommitsAndHeals) {
   sim_host_destroy(&host);
 }
 
+// pass-3 LOW regression: a proposal truncated from the log before commit can
+// never complete — its pending record lingers in state->raft_pending_proposals
+// to the CRABS_RAFT_MAX_PENDING_PROPOSALS cap and then wedges EVERY later
+// group proposal with ERR_INTERNAL. Losing leadership must purge this
+// module's pendings (the new leader's re-proposals mint fresh ones).
+TEST(RaftSimHarness, LostLeadershipPurgesProposalPendings) {
+  sim_host_t host = sim_host_make();
+  sim_cluster_attach(&host, nullptr);
+  sim_run_until(&host, 100, 40, sim_pred_any_leader);
+  int old_leader = sim_find_leader(&host);
+  ASSERT_GE(old_leader, 0);
+  uint32_t peer_a = 0;
+  uint32_t peer_b = 0;
+  {
+    uint32_t next_free = 0;
+    for (uint32_t node_index = 0; node_index < 3; node_index++) {
+      if ((int)node_index == old_leader) continue;
+      if (next_free == 0) {
+        peer_a = node_index;
+        next_free = 1;
+      } else {
+        peer_b = node_index;
+      }
+    }
+  }
+
+  // Baseline commit with the whole cluster (tip 2: the §8 no-op + decree-1).
+  uint8_t decree_1_uuid[CRABS_UUID_SIZE];
+  ASSERT_EQ(sim_submit_write(&host, (uint32_t)old_leader, "council_write",
+                             "council", "decree-1", decree_1_uuid),
+            CRABS_ERR_ORDERING_PENDING);
+  sim_target_tip = 2;
+  sim_run_until(&host, 100, 20, sim_pred_target_tips);
+
+  // PARTITION: the leader is isolated from the two-node majority. It still
+  // believes it leads: its proposal is accepted into the module log and a
+  // PENDING record is minted — but with no quorum it can never commit.
+  host.nodes[old_leader].partition_group = 1;
+  host.nodes[peer_a].partition_group = 2;
+  host.nodes[peer_b].partition_group = 2;
+  uint8_t lost_uuid[CRABS_UUID_SIZE];
+  ASSERT_EQ(sim_submit_write(&host, (uint32_t)old_leader, "council_write",
+                             "council", "decree-lost", lost_uuid),
+            CRABS_ERR_ORDERING_PENDING);
+  for (uint32_t step = 0; step < 6; step++) {
+    sim_step(&host, 100, nullptr);
+  }
+  EXPECT_EQ(crabs_raft_module_committed_tip(host.nodes[old_leader].module), 2u);
+  EXPECT_NE(host.nodes[old_leader].state->raft_pending_proposals, nullptr);
+
+  // The majority elects its own leader and commits past the contested slot
+  // (its §8 no-op at 3 + decree-majority at 4).
+  int new_leader = -1;
+  for (uint32_t step = 0; step < 40 && new_leader < 0; step++) {
+    sim_step(&host, 100, nullptr);
+    new_leader = crabs_raft_module_is_leader(host.nodes[peer_a].module)
+                     ? (int)peer_a
+                     : (crabs_raft_module_is_leader(host.nodes[peer_b].module)
+                            ? (int)peer_b
+                            : -1);
+  }
+  ASSERT_GE(new_leader, 0);
+  ASSERT_NE(new_leader, old_leader);
+  uint8_t majority_uuid[CRABS_UUID_SIZE];
+  ASSERT_EQ(sim_submit_write(&host, (uint32_t)new_leader, "council_write",
+                             "council", "decree-majority", majority_uuid),
+            CRABS_ERR_ORDERING_PENDING);
+  {
+    uint32_t turns = 0;
+    while (crabs_raft_module_committed_tip(host.nodes[new_leader].module) != 4u &&
+           turns < 25) {
+      sim_step(&host, 100, nullptr);
+      turns++;
+    }
+    ASSERT_EQ(crabs_raft_module_committed_tip(host.nodes[new_leader].module), 4u);
+  }
+
+  // HEAL: the old leader receives the new leader's higher-term appends,
+  // steps down (LOST_LEADERSHIP), and its uncommitted 'decree-lost' entry
+  // is truncated out of the log — it can NEVER complete.
+  for (uint32_t node_index = 0; node_index < host.node_count; node_index++) {
+    host.nodes[node_index].partition_group = 0;
+  }
+  sim_target_tip = 4;
+  sim_run_until(&host, 100, 60, sim_pred_target_tips);
+  EXPECT_FALSE(crabs_raft_module_is_leader(host.nodes[old_leader].module));
+  EXPECT_EQ(sim_state_uuid_occurrences(host.nodes[old_leader].state,
+                                       lost_uuid), 0u);
+  // THE regression assertion: the stranded pending must not linger. Pre-fix
+  // it stays (every leadership loss adds another) until the list hits the
+  // cap and group proposals wedge with ERR_INTERNAL.
+  EXPECT_EQ(host.nodes[old_leader].state->raft_pending_proposals, nullptr);
+
+  // Lifecycle restart: re-elect the purged node DETERMINISTICALLY —
+  // partition the current leader away, then fire ONLY the purged node's
+  // election deadline with a manual tick (the SubmitCommits idiom) so it
+  // solicits first. The connected peer's log was repaired to the same tip
+  // across the first heal, so its grant is guaranteed and the pair is the
+  // quorum. A fresh group proposal must then route through the pending
+  // store — proof the purge did not wedge the proposal path.
+  uint32_t third = 3u - (uint32_t)old_leader - (uint32_t)new_leader;
+  host.nodes[new_leader].partition_group = 4;
+  host.nodes[old_leader].partition_group = 5;
+  host.nodes[third].partition_group = 5;
+  uint64_t reelect_deadline =
+      crabs_raft_module_next_election_deadline(host.nodes[old_leader].module);
+  if (reelect_deadline > host.now_ms) host.now_ms = reelect_deadline;
+  ASSERT_EQ(crabs_raft_module_tick(host.nodes[old_leader].module, host.now_ms),
+            CRABS_SUCCESS);
+  // The candidate's self-vote (and the peer's grant) ride their own header
+  // persist batches (carried item A): settle routed traffic, persistence
+  // and notifications until the promotion lands.
+  for (uint32_t settle = 0;
+       settle < 6 &&
+           !crabs_raft_module_is_leader(host.nodes[old_leader].module);
+       settle++) {
+    sim_pump_persist(&host);
+    sim_route_outbound(&host);
+    sim_settle_wire(&host);
+    sim_pump_notifications(&host, nullptr);
+  }
+  ASSERT_TRUE(crabs_raft_module_is_leader(host.nodes[old_leader].module));
+  uint8_t decree_re_uuid[CRABS_UUID_SIZE];
+  ASSERT_EQ(sim_submit_write(&host, (uint32_t)old_leader, "council_write",
+                             "council", "decree-re", decree_re_uuid),
+            CRABS_ERR_ORDERING_PENDING);
+  // A FRESH pending is minted for the new proposal...
+  EXPECT_NE(host.nodes[old_leader].state->raft_pending_proposals, nullptr);
+  // ...and consumed on commit (the new §8 no-op at 5 + decree-re at 6).
+  {
+    uint32_t turns = 0;
+    while (crabs_raft_module_committed_tip(host.nodes[old_leader].module) != 6u &&
+           turns < 25) {
+      sim_step(&host, 100, nullptr);
+      turns++;
+    }
+    ASSERT_EQ(crabs_raft_module_committed_tip(host.nodes[old_leader].module), 6u);
+  }
+  EXPECT_EQ(host.nodes[old_leader].state->raft_pending_proposals, nullptr);
+  const lww_register_t* reelected_value =
+      sim_council_register(host.nodes[old_leader].state);
+  ASSERT_NE(reelected_value, nullptr);
+  EXPECT_EQ(memcmp(reelected_value->value, "decree-re", 9), 0);
+
+  // Full heal: every replica converges on decree-re, exactly once each; the
+  // truncated decree-lost exists nowhere.
+  for (uint32_t node_index = 0; node_index < host.node_count; node_index++) {
+    host.nodes[node_index].partition_group = 0;
+  }
+  sim_target_tip = 6;
+  sim_run_until(&host, 100, 60, sim_pred_target_tips);
+  for (uint32_t node_index = 0; node_index < host.node_count; node_index++) {
+    EXPECT_EQ(sim_state_uuid_occurrences(host.nodes[node_index].state,
+                                         decree_re_uuid), 1u);
+    EXPECT_EQ(sim_state_uuid_occurrences(host.nodes[node_index].state,
+                                         lost_uuid), 0u);
+    const lww_register_t* healed_value =
+        sim_council_register(host.nodes[node_index].state);
+    ASSERT_NE(healed_value, nullptr);
+    EXPECT_EQ(memcmp(healed_value->value, "decree-re", 9), 0);
+  }
+
+  sim_host_destroy(&host);
+}
+
 TEST(RaftSimHarness, MessageFaultsDroppedDuplicatedReorderedConvergeIdempotently) {
   sim_host_t host = sim_host_make();
   sim_cluster_attach(&host, nullptr);
