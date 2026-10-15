@@ -331,7 +331,10 @@ void state_machine_generate_lock_token(uint8_t token[CRABS_LOCK_TOKEN_SIZE]) {
   // A failure here is a fatal error; we must never fall back to rand(),
   // which is unseeded and predictable. The caller treats an all-zero token
   // as "generation failed" and must abort the lock acquisition.
-  if (RAND_bytes(token, CRABS_LOCK_TOKEN_SIZE) != 1) {
+  // Audit pass-3 LOW: route through crypto_random_bytes — the fail-closed
+  // RAND_status() health probe guards lock-token entropy like every other
+  // random path (the direct RAND_bytes call skipped the DRBG gate).
+  if (crypto_random_bytes(token, CRABS_LOCK_TOKEN_SIZE) != CRABS_SUCCESS) {
     memset(token, 0, CRABS_LOCK_TOKEN_SIZE);
   }
 }
