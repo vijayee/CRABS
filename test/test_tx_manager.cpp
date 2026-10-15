@@ -91,6 +91,41 @@ TEST(TxManagerMemory, DifferentUuidsAreAccepted) {
   tx->vtable.destroy(tx);
 }
 
+TEST(TxManagerMemory, RestartAdoptsDurableLogUuids) {
+  // pass-3 LOW: the in-memory AVL dedup set is volatile — across a restart
+  // it starts empty and exactly-once rested solely on the R7-11 watermark
+  // (ordering stamps, not uuids). An authorized signer re-signing the SAME
+  // uuid with a FRESH lamport/HLC stamp slipped through. The manager must
+  // seed its set from the durable log at first accept: every logged uuid
+  // IS an executed op.
+  crabs_tx_manager_t* tx = crabs_tx_manager_memory(64);
+  state_t* state = state_create();
+
+  // Simulate a restart: the durable log already holds uuid U (an op
+  // executed before the restart), but the fresh AVL set is empty.
+  uint8_t logged_uuid[16];
+  memset(logged_uuid, 0x5A, 16);
+  state->log = (log_entry_t*)get_clear_memory(sizeof(log_entry_t));
+  state->log_count = 1;
+  memcpy(state->log[0].uuid, logged_uuid, CRABS_UUID_SIZE);
+
+  // Re-signing uuid U with a fresh ordering stamp after restart: the seed
+  // must catch it.
+  operation_t* op = operation_create("test");
+  memcpy(op->uuid, logged_uuid, CRABS_UUID_SIZE);
+  EXPECT_EQ(tx->vtable.accept(tx, state, op), CRABS_ERR_ALREADY_EXECUTED);
+  operation_destroy(op);
+
+  // No over-blocking: a genuinely fresh uuid is still accepted.
+  op = operation_create("test");
+  memset(op->uuid, 0x6B, 16);
+  EXPECT_EQ(tx->vtable.accept(tx, state, op), CRABS_SUCCESS);
+  operation_destroy(op);
+
+  state_destroy(state);  // frees the hand-built log array
+  tx->vtable.destroy(tx);
+}
+
 TEST(TxManagerMemory, LargeScaleNoFalseNegatives) {
   // Insert 10000 UUIDs and verify all are rejected on second attempt
   crabs_tx_manager_t* tx = crabs_tx_manager_memory(1024);
