@@ -507,6 +507,44 @@ bool crypto_ecdsa_verify_digest(const uint8_t public_key[33],
   return _ecdsa_verify_prepared_digest(public_key, digest, signature);
 }
 
+// Audit pass-3 findings 2/3: equal-work refusal evidence. Refuse paths that
+// previously skipped the ECDSA trial now verify the submitted signature
+// against a fixed dummy public key (secp256k1 generator — a valid on-curve
+// point, so the verify performs full modular work and fails on the math,
+// never on a cheap structural reject). Every unauthorized outcome then costs
+// exactly one ECDSA verify + policy evaluation; latency cannot enumerate
+// users, statuses, or keyring composition. In-tree, only ECDSA_SECP256K1 is
+// registered in the scheme registry, whose cost dominates; hosts registering
+// further schemes must apply the same refuse-path work discipline.
+static const uint8_t CRABS_CRYPTO_DUMMY_PK[33] = {
+    0x02, 0x79, 0xBE, 0x66, 0x7E, 0xF9, 0xDC, 0xBB, 0xAC, 0x55,
+    0xA0, 0x62, 0x95, 0xCE, 0x87, 0x0B, 0x07, 0x02, 0x9B, 0xFC,
+    0xDB, 0x2D, 0xCE, 0x28, 0xD9, 0x59, 0xF2, 0x81, 0x5B, 0x16,
+    0xF8, 0x17, 0x98};
+
+// Trial verify against the dummy key. The result is DISCARDED at the call
+// sites (it is near-certain failure); its cost is the point.
+// The submitted signature is staged into a fixed CRABS_SIG_SIZE buffer so the
+// trial never reads past the caller's allocation when signature_len is below
+// the legacy ECDSA size (the refuse path runs BEFORE the per-scheme length
+// gate that would otherwise guarantee 64 readable bytes); zero-padding keeps
+// the staged signature structurally parseable so the verify reaches the
+// modular math regardless of input length.
+static bool _dummy_signature_trial(const uint8_t* serialized_op,
+                                   size_t op_len,
+                                   const uint8_t* signature,
+                                   uint32_t signature_len) {
+  uint8_t staged_sig[CRABS_SIG_SIZE];
+  memset(staged_sig, 0, sizeof(staged_sig));
+  if (signature != NULL && signature_len > 0) {
+    size_t copy_len =
+        (signature_len > CRABS_SIG_SIZE) ? CRABS_SIG_SIZE : signature_len;
+    memcpy(staged_sig, signature, copy_len);
+  }
+  return crypto_ecdsa_verify(CRABS_CRYPTO_DUMMY_PK, serialized_op, op_len,
+                             staged_sig);
+}
+
 // ============================================================
 // SHA-256 Hash
 // ============================================================
@@ -1341,6 +1379,10 @@ verify_result_t crypto_verify_operation_auth(
     if (!user) {
       // R7-14: collapse to a single UNAUTHORIZED so an unauthenticated caller
       // cannot enumerate user IDs. The prior USER_NOT_FOUND leaked existence.
+      // Audit pass-3 finding 2: run the dummy ECDSA trial first so the
+      // user-not-found refuse costs the same verify work as the signed
+      // accept path — latency must not enumerate user existence.
+      _dummy_signature_trial(serialized_op, op_len, signature, CRABS_SIG_SIZE);
       result.error = CRABS_ERR_UNAUTHORIZED;
       return result;
     }
@@ -1348,7 +1390,11 @@ verify_result_t crypto_verify_operation_auth(
     // Fail closed: only ACTIVE users may authorize. SUSPENDED and REVOKED
     // users must be rejected. R7-14: collapse to a single UNAUTHORIZED so a
     // caller cannot learn a user's status.
+    // Audit pass-3 finding 2: dummy trial first — an inactive known user must
+    // cost the same verify work as an active one, so latency cannot leak
+    // user status.
     if (user->status != USER_ACTIVE) {
+      _dummy_signature_trial(serialized_op, op_len, signature, CRABS_SIG_SIZE);
       result.error = CRABS_ERR_UNAUTHORIZED;
       return result;
     }
@@ -1360,8 +1406,16 @@ verify_result_t crypto_verify_operation_auth(
     // R8-C-2: once a user has a keyring, the legacy bootstrap key is rejected
     // (same rule as _verify_user_signature). Otherwise a rotated-away legacy
     // key would keep authorizing via this path.
-    const bool sig_ok = (user->keys == NULL) &&
-                        crypto_ecdsa_verify(user->public_key, serialized_op, op_len, signature);
+    // Audit pass-3 finding 2: run the ECDSA trial unconditionally — the prior
+    // `(user->keys == NULL) && verify` short-circuit skipped the verify for
+    // keyring users, leaking keyring presence through latency. user->public_key
+    // is always a valid on-curve point (registration attribute_machine.c,
+    // rotation, and deserialization each validate it), so the trial always
+    // performs full modular work; only the RESULT combines.
+    const bool legacy_key_ok = (user->keys == NULL);
+    const bool sig_valid =
+        crypto_ecdsa_verify(user->public_key, serialized_op, op_len, signature);
+    const bool sig_ok = legacy_key_ok && sig_valid;
     bool policy_ok = true;
     if (has_attr_policy) {
       char attr_string[CRABS_ATTR_STRING_MAX];
@@ -1388,37 +1442,37 @@ verify_result_t crypto_verify_operation_auth(
     user_t* user = ((attribute_machine_t*)attr_machine)->users;
     bool matched = false;
     while (user != NULL) {
-      if (user->status == USER_ACTIVE) {
-        // R8-C-2: skip users with a keyring on the legacy path (see Mode A).
-        bool user_ok = false;
-        if (!has_attr_policy) {
-          user_ok = (user->keys == NULL) &&
-              crypto_ecdsa_verify(user->public_key, serialized_op, op_len, signature);
-        } else {
-          // Audit M-3: NO short-circuit — the `&&` chain skipped the ECDSA
-          // trial for users failing the policy, so per-candidate work varied
-          // by attribute match and a remote prover could distinguish which
-          // registered users satisfy the op's policy (attribute enumeration
-          // via timing), contradicting R7-L-8's equal-work claim below.
-          // Every factor is evaluated unconditionally; only the RESULT
-          // combines.
-          char attr_string[CRABS_ATTR_STRING_MAX];
-          _build_attr_string(user, attr_string, sizeof(attr_string), attr_machine->current_time_ms);
-          bool policy_ok = crypto_abe_eval_policy(abe_policy, attr_string);
-          bool key_ok = (user->keys == NULL);
-          bool sig_ok = crypto_ecdsa_verify(user->public_key, serialized_op, op_len, signature);
-          user_ok = policy_ok && key_ok && sig_ok;
-        }
-        // R7-L-8 for Mode B: no early exit — every active user's verification
-        // runs to the same total work regardless of where (or whether) the
-        // signer sits in the list, so latency cannot leak the registered-user
-        // count or the matching position. The FIRST matching user in
-        // registration order still fills signer_id.
-        if (user_ok && !matched) {
-          matched = true;
-          strncpy(result.signer_id, user->user_id, CRABS_MAX_USER_ID - 1);
-          result.signer_id[CRABS_MAX_USER_ID - 1] = '\0';
-        }
+      // Audit pass-3 finding 2: every candidate runs the FULL work — the
+      // old `(user->keys == NULL) && verify` chain in the no-policy branch
+      // varied per-candidate work with keyring presence, and the
+      // ACTIVE-status gate skipped inactive users entirely (status and
+      // position leaked via latency). Audit M-3: the `&&` chain must not
+      // gate the ECDSA trial on the policy result either. Evaluate every
+      // factor unconditionally (user->public_key is always a valid on-curve
+      // point — registration, rotation, and deserialization each validate
+      // it); only the RESULT combines.
+      bool status_ok = (user->status == USER_ACTIVE);
+      bool key_ok = (user->keys == NULL);  // R8-C-2: keyring users rejected on the legacy path
+      bool sig_ok = crypto_ecdsa_verify(user->public_key, serialized_op,
+                                        op_len, signature);
+      bool user_ok = false;
+      if (!has_attr_policy) {
+        user_ok = status_ok && key_ok && sig_ok;
+      } else {
+        char attr_string[CRABS_ATTR_STRING_MAX];
+        _build_attr_string(user, attr_string, sizeof(attr_string), attr_machine->current_time_ms);
+        bool policy_ok = crypto_abe_eval_policy(abe_policy, attr_string);
+        user_ok = status_ok && policy_ok && key_ok && sig_ok;
+      }
+      // R7-L-8 for Mode B: no early exit — every registered user's
+      // verification runs to the same total work regardless of where (or
+      // whether) the signer sits in the list, so latency cannot leak the
+      // registered-user count or the matching position. The FIRST matching
+      // user in registration order still fills signer_id.
+      if (user_ok && !matched) {
+        matched = true;
+        strncpy(result.signer_id, user->user_id, CRABS_MAX_USER_ID - 1);
+        result.signer_id[CRABS_MAX_USER_ID - 1] = '\0';
       }
       user = user->next;
     }
@@ -1466,12 +1520,18 @@ static crabs_error_e _verify_user_signature(
     uint64_t now_ms,
     const uint8_t* serialized_op, size_t op_len,
     const uint8_t* signature, uint32_t signature_len) {
+  // Audit pass-3 finding 2: every refuse path below first runs a full
+  // ECDSA trial against a fixed dummy public key (result discarded), so an
+  // unauthorized outcome costs exactly the same verify work as an authorized
+  // one and latency cannot enumerate key_ids, key statuses, expiries, or
+  // keyring presence.
   if (sig_scheme == SCHEME_UNSPECIFIED && (key_id == NULL || key_id[0] == '\0')) {
     // R7-04: once a user has a keyring, the legacy user->public_key path is
     // rejected. Otherwise a rotated-away legacy key would keep signing
     // operations as the user. Users with a keyring must identify the key
     // explicitly (key_id and/or sig_scheme).
     if (user->keys != NULL) {
+      _dummy_signature_trial(serialized_op, op_len, signature, signature_len);
       return CRABS_ERR_UNAUTHORIZED;
     }
     // Legacy path: use user's default ECDSA key
@@ -1484,8 +1544,14 @@ static crabs_error_e _verify_user_signature(
   // v1.3 path: resolve key from user's keyring
   if (key_id != NULL && key_id[0] != '\0') {
     user_key_t* key = user_key_find((user_t*)user, key_id);
-    if (key == NULL) return CRABS_ERR_RESOURCE_NOT_FOUND;
-    if (key->status != KEY_ACTIVE) return CRABS_ERR_UNAUTHORIZED;
+    if (key == NULL) {
+      _dummy_signature_trial(serialized_op, op_len, signature, signature_len);
+      return CRABS_ERR_RESOURCE_NOT_FOUND;
+    }
+    if (key->status != KEY_ACTIVE) {
+      _dummy_signature_trial(serialized_op, op_len, signature, signature_len);
+      return CRABS_ERR_UNAUTHORIZED;
+    }
     // Audit H-C: enforce key expiry. A key with expires_at set and past is
     // rejected. R7-10: now_ms == 0 means the platform has not injected a clock
     // yet — treat that as "expiry unknown" and fail closed rather than
@@ -1496,9 +1562,11 @@ static crabs_error_e _verify_user_signature(
     // attestation convention. now_ms == 0 (no clock injected) still fails
     // closed per R7-10.
     if (key->expires_at != 0 && (now_ms == 0 || now_ms > key->expires_at)) {
+      _dummy_signature_trial(serialized_op, op_len, signature, signature_len);
       return CRABS_ERR_UNAUTHORIZED;
     }
     if (sig_scheme != SCHEME_UNSPECIFIED && key->scheme != sig_scheme) {
+      _dummy_signature_trial(serialized_op, op_len, signature, signature_len);
       return CRABS_ERR_CRYPTOGRAPHIC_ERROR;
     }
     return _verify_sig_with_scheme(key->scheme,
@@ -1510,13 +1578,17 @@ static crabs_error_e _verify_user_signature(
   // No key_id but scheme specified: find user's default active key for that scheme
   if (sig_scheme != SCHEME_UNSPECIFIED) {
     user_key_t* key = user_key_find_active((user_t*)user, sig_scheme);
-    if (key == NULL) return CRABS_ERR_RESOURCE_NOT_FOUND;
+    if (key == NULL) {
+      _dummy_signature_trial(serialized_op, op_len, signature, signature_len);
+      return CRABS_ERR_RESOURCE_NOT_FOUND;
+    }
     // Expiry boundary semantics (audit): a key remains VALID at expires_at
     // itself and is expired only once now_ms > expires_at — matching the
     // envelope expiry convention (crypto_key_envelope_verify) and the lineage
     // attestation convention. now_ms == 0 (no clock injected) still fails
     // closed per R7-10.
     if (key->expires_at != 0 && (now_ms == 0 || now_ms > key->expires_at)) {
+      _dummy_signature_trial(serialized_op, op_len, signature, signature_len);
       return CRABS_ERR_UNAUTHORIZED;
     }
     return _verify_sig_with_scheme(key->scheme,
@@ -1568,12 +1640,19 @@ verify_result_t crypto_verify_operation_auth_v2(
     if (!user) {
       // R7-14: collapse to a single UNAUTHORIZED so an unauthenticated caller
       // cannot enumerate user IDs. The prior USER_NOT_FOUND leaked existence.
+      // Audit pass-3 finding 2: dummy ECDSA trial first, so the refuse costs
+      // the same verify work as an authorized attempt and latency cannot
+      // enumerate user existence.
+      _dummy_signature_trial(serialized_op, op_len, signature, signature_len);
       result.error = CRABS_ERR_UNAUTHORIZED;
       return result;
     }
     if (user->status != USER_ACTIVE) {
       // R7-14: collapse to a single UNAUTHORIZED so a caller cannot learn a
       // user's status (SUSPENDED vs REVOKED).
+      // Audit pass-3 finding 2: dummy ECDSA trial first — an inactive known
+      // user must cost the same verify work as an active one.
+      _dummy_signature_trial(serialized_op, op_len, signature, signature_len);
       result.error = CRABS_ERR_UNAUTHORIZED;
       return result;
     }
@@ -1611,42 +1690,44 @@ verify_result_t crypto_verify_operation_auth_v2(
     user_t* user = ((attribute_machine_t*)attr_machine)->users;
     bool matched = false;
     while (user != NULL) {
-      if (user->status == USER_ACTIVE) {
-        // Audit M-3: same equal-work discipline as v1 Mode B — the policy
-        // trial must not gate the signature attempt (`if (attr_ok)` skipped
-        // the ECDSA work for users failing the policy, leaking attribute
-        // matching through latency). Evaluate both unconditionally.
-        crabs_error_e sig_rc;
-        if (sig_scheme != SCHEME_UNSPECIFIED || (key_id != NULL && key_id[0] != '\0')) {
-          sig_rc = _verify_user_signature(user, key_id, sig_scheme,
-                                           attr_machine->current_time_ms,
-                                           serialized_op, op_len,
-                                           signature, signature_len);
-        } else {
-          // R8-C-2: route the legacy path through _verify_user_signature so
-          // a user with a keyring cannot authorize with the rotated-away
-          // bootstrap key.
-          sig_rc = _verify_user_signature(user, NULL, SCHEME_UNSPECIFIED,
-                                           attr_machine->current_time_ms,
-                                           serialized_op, op_len,
-                                           signature, signature_len);
-        }
-        bool attr_ok = true;
-        if (has_attr_policy) {
-          char attr_string[CRABS_ATTR_STRING_MAX];
-          _build_attr_string(user, attr_string, sizeof(attr_string), attr_machine->current_time_ms);
-          attr_ok = crypto_abe_eval_policy(abe_policy, attr_string);
-        }
-        // R7-L-8 for v2 Mode B (mirroring v1): no early exit — every active
-        // user's verification runs to the same total work regardless of
-        // where (or whether) the signer sits in the list, so latency cannot
-        // leak the registered-user count or the matching position. The FIRST
-        // matching user in registration order still fills signer_id.
-        if (attr_ok && sig_rc == CRABS_SUCCESS && !matched) {
-          matched = true;
-          strncpy(result.signer_id, user->user_id, CRABS_MAX_USER_ID - 1);
-          result.signer_id[CRABS_MAX_USER_ID - 1] = '\0';
-        }
+      // Audit M-3: equal-work discipline — the policy trial must not gate
+      // the signature attempt (`if (attr_ok)` skipped the ECDSA work for
+      // users failing the policy, leaking attribute matching through
+      // latency). Audit pass-3 finding 2: the OLD ACTIVE-status gate skipped
+      // inactive users entirely, leaking status and list composition through
+      // latency. Every registered user now runs the full candidate work;
+      // only the RESULT combines with its status.
+      bool status_ok = (user->status == USER_ACTIVE);
+      crabs_error_e sig_rc;
+      if (sig_scheme != SCHEME_UNSPECIFIED || (key_id != NULL && key_id[0] != '\0')) {
+        sig_rc = _verify_user_signature(user, key_id, sig_scheme,
+                                         attr_machine->current_time_ms,
+                                         serialized_op, op_len,
+                                         signature, signature_len);
+      } else {
+        // R8-C-2: route the legacy path through _verify_user_signature so
+        // a user with a keyring cannot authorize with the rotated-away
+        // bootstrap key.
+        sig_rc = _verify_user_signature(user, NULL, SCHEME_UNSPECIFIED,
+                                         attr_machine->current_time_ms,
+                                         serialized_op, op_len,
+                                         signature, signature_len);
+      }
+      bool attr_ok = true;
+      if (has_attr_policy) {
+        char attr_string[CRABS_ATTR_STRING_MAX];
+        _build_attr_string(user, attr_string, sizeof(attr_string), attr_machine->current_time_ms);
+        attr_ok = crypto_abe_eval_policy(abe_policy, attr_string);
+      }
+      // R7-L-8 for v2 Mode B (mirroring v1): no early exit — every user's
+      // verification runs to the same total work regardless of where (or
+      // whether) the signer sits in the list, so latency cannot leak the
+      // registered-user count or the matching position. The FIRST matching
+      // user in registration order still fills signer_id.
+      if (status_ok && attr_ok && sig_rc == CRABS_SUCCESS && !matched) {
+        matched = true;
+        strncpy(result.signer_id, user->user_id, CRABS_MAX_USER_ID - 1);
+        result.signer_id[CRABS_MAX_USER_ID - 1] = '\0';
       }
       user = user->next;
     }
@@ -1687,29 +1768,42 @@ crabs_error_e crypto_verify_co_signature(
   user_t* user = attribute_machine_find_user((attribute_machine_t*)attr_machine, signer_id);
   // R8-C-6: collapse user-not-found / suspended to UNAUTHORIZED so a caller
   // cannot probe for user existence or status (matching the R7-14 collapse in
-  // Mode A).
-  if (user == NULL) return CRABS_ERR_UNAUTHORIZED;
-  if (user->status != USER_ACTIVE) return CRABS_ERR_UNAUTHORIZED;
+  // Mode A). Audit pass-3 finding 2: run the dummy ECDSA trial before these
+  // refuses so existence/status cannot be enumerated through latency either
+  // (the unknown-user case cannot build an attribute string — trial only).
+  if (user == NULL) {
+    _dummy_signature_trial(serialized_op, op_len, signature, signature_len);
+    return CRABS_ERR_UNAUTHORIZED;
+  }
+  if (user->status != USER_ACTIVE) {
+    _dummy_signature_trial(serialized_op, op_len, signature, signature_len);
+    return CRABS_ERR_UNAUTHORIZED;
+  }
   // R7-L-9: a co-signer is an approver and must satisfy the op's ABE policy,
   // not merely be an active user with a valid signature. Otherwise a
   // threshold-2 "role:admin" policy is met by one admin plus any active user.
+  // Audit pass-3 finding 3: evaluate the policy and the signature
+  // INDEPENDENTLY and combine at the end — the prior code returned on policy
+  // failure BEFORE the signature verify, so latency distinguished
+  // "policy rejected" from "signature rejected" for a named co-signer.
+  bool policy_ok = true;
   if (abe_policy != NULL && abe_policy[0] != '\0') {
     char attr_string[CRABS_ATTR_STRING_MAX];
     _build_attr_string(user, attr_string, sizeof(attr_string), attr_machine->current_time_ms);
-    if (!crypto_abe_eval_policy(abe_policy, attr_string)) {
-      return CRABS_ERR_UNAUTHORIZED;
-    }
+    policy_ok = crypto_abe_eval_policy(abe_policy, attr_string);
   }
   // Audit LOW: collapse _verify_user_signature's distinct failures (unknown
   // key_id → RESOURCE_NOT_FOUND, inactive status, bad signature) to
   // UNAUTHORIZED — a direct library caller must not be able to probe which
   // key_ids exist on a co-signer's keyring.
-  return (_verify_user_signature(user, key_id, sig_scheme,
-                                 attr_machine->current_time_ms,
-                                 serialized_op, op_len,
-                                 signature, signature_len) == CRABS_SUCCESS)
-             ? CRABS_SUCCESS
-             : CRABS_ERR_UNAUTHORIZED;
+  bool sig_ok = (_verify_user_signature(user, key_id, sig_scheme,
+                                        attr_machine->current_time_ms,
+                                        serialized_op, op_len,
+                                        signature, signature_len) == CRABS_SUCCESS);
+  if (!policy_ok || !sig_ok) {
+    return CRABS_ERR_UNAUTHORIZED;
+  }
+  return CRABS_SUCCESS;
 }
 
 // Canonical envelope data for signing (variable-length sk_abe):

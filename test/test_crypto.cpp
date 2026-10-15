@@ -951,6 +951,197 @@ TEST_F(VerifyAuthTest, TempAttributeUsesFullNameColonToken) {
 }
 
 // ============================================================
+// Verify Timing-Oracle Regression Tests (audit pass-3 findings 2/3)
+// ============================================================
+// The pass-3 fix equalized refuse-path work through a dummy-key ECDSA trial,
+// restructuring every verify loop. Latency itself is not CI-assertable;
+// these tests pin the SEMANTICS that must survive the restructure: no false
+// accepts, no false rejects, and no residual dependence on which candidate
+// kind (keyring vs legacy, active vs suspended) sits in the list.
+
+TEST_F(VerifyAuthTest, CryptoVerifyTiming_V2ModeBRefusedStillAuthorizedSemantics) {
+  crypto_sig_scheme_init();
+
+  // One user with a keyring (registered, then rotated away).
+  ecdsa_keypair_t* ring_kp1 = crypto_ecdsa_generate();
+  ecdsa_keypair_t* ring_kp2 = crypto_ecdsa_generate();
+  ASSERT_NE(ring_kp1, nullptr);
+  ASSERT_NE(ring_kp2, nullptr);
+  ASSERT_EQ(crabs_test_register_user_with_role(am, "ring", ring_kp1->public_key,
+                                              "role", "admin"), CRABS_SUCCESS);
+  user_t* ring_user = attribute_machine_find_user(am, "ring");
+  ASSERT_NE(ring_user, nullptr);
+  ASSERT_EQ(user_key_register(ring_user, "rk1", ECDSA_SECP256K1,
+                              ring_kp1->public_key, 33, "primary"), CRABS_SUCCESS);
+  ASSERT_EQ(user_key_rotate(ring_user, "rk1", "rk2", ECDSA_SECP256K1,
+                            ring_kp2->public_key, 33, "rotated"), CRABS_SUCCESS);
+
+  // One legacy user (no keyring).
+  ecdsa_keypair_t* legacy_kp = crypto_ecdsa_generate();
+  ASSERT_NE(legacy_kp, nullptr);
+  ASSERT_EQ(crabs_test_register_user_with_role(am, "legacy", legacy_kp->public_key,
+                                              "role", "admin"), CRABS_SUCCESS);
+
+  // An op signed by NEITHER user.
+  ecdsa_keypair_t* mallory_kp = crypto_ecdsa_generate();
+  ASSERT_NE(mallory_kp, nullptr);
+  const uint8_t op_data[] = {0x07, 0x08, 0x09};
+  uint8_t foreign_sig[CRABS_SIG_SIZE];
+  ASSERT_EQ(crypto_sign_operation(mallory_kp->private_key, op_data, sizeof(op_data),
+                                  foreign_sig), CRABS_SUCCESS);
+
+  // Refuse path: explicit key_id that exists on NO user's keyring. The
+  // not-found refuse must still run the (dummy) signature trial and must not
+  // false-accept — same UNAUTHORIZED as any other refusal (R7-14 / pass-3 f.2).
+  verify_result_t vr = crypto_verify_operation_auth_v2(
+      mk, "role:admin", am, op_data, sizeof(op_data),
+      foreign_sig, CRABS_SIG_SIZE,
+      nullptr, "no-such-key", ECDSA_SECP256K1, VERIFY_MODE_B);
+  EXPECT_FALSE(vr.authorized);
+  EXPECT_EQ(vr.error, CRABS_ERR_UNAUTHORIZED);
+
+  // The part that distinguishes the fix from a break: an op signed by the
+  // legacy user's key via Mode B with key_id NULL (legacy scheme path) must
+  // still authorize even though a keyring user is also in the candidate list.
+  uint8_t legacy_sig[CRABS_SIG_SIZE];
+  ASSERT_EQ(crypto_sign_operation(legacy_kp->private_key, op_data, sizeof(op_data),
+                                  legacy_sig), CRABS_SUCCESS);
+  vr = crypto_verify_operation_auth_v2(
+      mk, "role:admin", am, op_data, sizeof(op_data),
+      legacy_sig, CRABS_SIG_SIZE,
+      nullptr, nullptr, SCHEME_UNSPECIFIED, VERIFY_MODE_B);
+  EXPECT_TRUE(vr.authorized);
+  EXPECT_EQ(vr.error, CRABS_SUCCESS);
+  EXPECT_STREQ(vr.signer_id, "legacy");
+
+  crypto_ecdsa_keypair_destroy(ring_kp1);
+  crypto_ecdsa_keypair_destroy(ring_kp2);
+  crypto_ecdsa_keypair_destroy(legacy_kp);
+  crypto_ecdsa_keypair_destroy(mallory_kp);
+  crypto_sig_scheme_cleanup();
+}
+
+TEST_F(VerifyAuthTest, CryptoVerifyTiming_V1ModeBKeyringUsersStillVerified) {
+  crypto_sig_scheme_init();
+
+  // Register the legacy signer FIRST so the keyring user (registered after,
+  // prepended to the list) is iterated ahead of it in Mode B. The pre-fix
+  // code short-circuited per-candidate work on keyring presence; the
+  // restructure evaluates every candidate fully — accept must not break.
+  ecdsa_keypair_t* legacy_kp = crypto_ecdsa_generate();
+  ASSERT_NE(legacy_kp, nullptr);
+  ASSERT_EQ(crabs_test_register_user_with_role(am, "legacy1", legacy_kp->public_key,
+                                              "role", "admin"), CRABS_SUCCESS);
+
+  ecdsa_keypair_t* ring_kp = crypto_ecdsa_generate();
+  ASSERT_NE(ring_kp, nullptr);
+  ASSERT_EQ(crabs_test_register_user_with_role(am, "kruser", ring_kp->public_key,
+                                              "role", "admin"), CRABS_SUCCESS);
+  user_t* kruser = attribute_machine_find_user(am, "kruser");
+  ASSERT_NE(kruser, nullptr);
+  ASSERT_EQ(user_key_register(kruser, "kk1", ECDSA_SECP256K1,
+                              ring_kp->public_key, 33, "primary"), CRABS_SUCCESS);
+
+  const uint8_t op_data[] = {0x0A, 0x0B};
+  uint8_t signature[CRABS_SIG_SIZE];
+  ASSERT_EQ(crypto_sign_operation(legacy_kp->private_key, op_data, sizeof(op_data),
+                                  signature), CRABS_SUCCESS);
+
+  // v1 Mode B without an attribute policy: the legacy signer must still
+  // match even with a keyring user ahead of it in registration order.
+  verify_result_t vr = crypto_verify_operation_auth(
+      mk, "", am, op_data, sizeof(op_data), signature, nullptr, VERIFY_MODE_B);
+  EXPECT_TRUE(vr.authorized);
+  EXPECT_EQ(vr.error, CRABS_SUCCESS);
+  EXPECT_STREQ(vr.signer_id, "legacy1");
+
+  // And an invalid signature must still be rejected with both user kinds
+  // present — the restructure keeps the reject.
+  memset(signature, 0x5A, sizeof(signature));
+  vr = crypto_verify_operation_auth(
+      mk, "", am, op_data, sizeof(op_data), signature, nullptr, VERIFY_MODE_B);
+  EXPECT_FALSE(vr.authorized);
+  EXPECT_EQ(vr.error, CRABS_ERR_UNAUTHORIZED);
+
+  crypto_ecdsa_keypair_destroy(legacy_kp);
+  crypto_ecdsa_keypair_destroy(ring_kp);
+  crypto_sig_scheme_cleanup();
+}
+
+TEST_F(VerifyAuthTest, CryptoVerifyTiming_ModeARefusalsKeepUniformContract) {
+  // v2 Mode A: unknown signer with a garbage signature stays UNAUTHORIZED,
+  // and a suspended user with a VALID signature stays UNAUTHORIZED. The
+  // dummy-trial equalization is structural (latency is not CI-assertable);
+  // these pin that no false-accept/false-reject crept in.
+  ecdsa_keypair_t* keypair = crypto_ecdsa_generate();
+  ASSERT_NE(keypair, nullptr);
+  ASSERT_EQ(crabs_test_register_user_with_role(am, "alice", keypair->public_key,
+                                              "role", "admin"), CRABS_SUCCESS);
+
+  const uint8_t op_data[] = {0x11, 0x22, 0x33};
+  uint8_t signature[CRABS_SIG_SIZE];
+  ASSERT_EQ(crypto_sign_operation(keypair->private_key, op_data, sizeof(op_data),
+                                  signature), CRABS_SUCCESS);
+
+  // Unknown signer + garbage signature.
+  uint8_t garbage[CRABS_SIG_SIZE];
+  memset(garbage, 0x77, sizeof(garbage));
+  verify_result_t vr = crypto_verify_operation_auth_v2(
+      mk, "role:admin", am, op_data, sizeof(op_data),
+      garbage, CRABS_SIG_SIZE,
+      "ghost", nullptr, SCHEME_UNSPECIFIED, VERIFY_MODE_A);
+  EXPECT_FALSE(vr.authorized);
+  EXPECT_EQ(vr.error, CRABS_ERR_UNAUTHORIZED);
+
+  // Suspended user + VALID signature.
+  ASSERT_EQ(attribute_machine_suspend_user(am, "alice", "admin"), CRABS_SUCCESS);
+  vr = crypto_verify_operation_auth_v2(
+      mk, "role:admin", am, op_data, sizeof(op_data),
+      signature, CRABS_SIG_SIZE,
+      "alice", nullptr, SCHEME_UNSPECIFIED, VERIFY_MODE_A);
+  EXPECT_FALSE(vr.authorized);
+  EXPECT_EQ(vr.error, CRABS_ERR_UNAUTHORIZED);
+
+  crypto_ecdsa_keypair_destroy(keypair);
+}
+
+TEST_F(VerifyAuthTest, CryptoVerifyTiming_CosignPolicyFailAndSigFailSameResult) {
+  // Co-sign: the pass-3 finding-3 fix merged the policy check and the
+  // signature check into independent evaluations, so both failures now run
+  // the same total work AND return the same code. The UNAUTHORIZED collapse
+  // predates (R8-C-6 / Audit LOW); this pins it through the restructure.
+  const uint8_t op_data[] = {0xC0, 0x51};
+
+  // Policy-unsatisfying signer (active, no role) + VALID signature.
+  ecdsa_keypair_t* mallory_kp = crypto_ecdsa_generate();
+  ASSERT_NE(mallory_kp, nullptr);
+  ASSERT_EQ(attribute_machine_register_user(am, "mallory", mallory_kp->public_key, ""),
+            CRABS_SUCCESS);
+  uint8_t valid_sig[CRABS_SIG_SIZE];
+  ASSERT_EQ(crypto_sign_operation(mallory_kp->private_key, op_data, sizeof(op_data),
+                                  valid_sig), CRABS_SUCCESS);
+  crabs_error_e rc = crypto_verify_co_signature(
+      am, "role:admin", "mallory", nullptr, SCHEME_UNSPECIFIED,
+      op_data, sizeof(op_data), valid_sig, CRABS_SIG_SIZE);
+  EXPECT_EQ(rc, CRABS_ERR_UNAUTHORIZED);
+
+  // Policy-satisfying signer + INVALID signature.
+  ecdsa_keypair_t* admin_kp = crypto_ecdsa_generate();
+  ASSERT_NE(admin_kp, nullptr);
+  ASSERT_EQ(crabs_test_register_user_with_role(am, "bob", admin_kp->public_key,
+                                              "role", "admin"), CRABS_SUCCESS);
+  uint8_t bad_sig[CRABS_SIG_SIZE];
+  memset(bad_sig, 0x33, sizeof(bad_sig));
+  rc = crypto_verify_co_signature(
+      am, "role:admin", "bob", nullptr, SCHEME_UNSPECIFIED,
+      op_data, sizeof(op_data), bad_sig, CRABS_SIG_SIZE);
+  EXPECT_EQ(rc, CRABS_ERR_UNAUTHORIZED);
+
+  crypto_ecdsa_keypair_destroy(mallory_kp);
+  crypto_ecdsa_keypair_destroy(admin_kp);
+}
+
+// ============================================================
 // Key Envelope Tests (§11.2)
 // ============================================================
 
