@@ -490,7 +490,8 @@ static bool _ot_data_pending_push(crabs_ot_data_item_t* ot_data,
   slot->payload_size = 0;
   if (op->payload != NULL && op->payload_size > 0) {
     slot->payload = (uint8_t*)get_memory(op->payload_size);
-    // Defensive parity with the log-copy path: get_memory can fail.
+    // Defensive parity with the log-copy path: get_memory aborts on OOM, so
+    // this branch is unreachable today — guarded for allocator-contract drift.
     if (slot->payload == NULL) return false;
     memcpy(slot->payload, op->payload, op->payload_size);
     slot->payload_size = op->payload_size;

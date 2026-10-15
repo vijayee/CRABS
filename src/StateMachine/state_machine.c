@@ -1530,7 +1530,10 @@ static crabs_error_e _raft_pump_notifications_at(state_t* state,
       // shelf head BLOCKS the stream and each pump re-attempts the parse
       // loudly — order preservation over availability, the same posture as
       // an execute failure. The anchor mirrors the execute-failure shelf
-      // block below field for field.
+      // block below field for field. Invariant coupling: the v17 state
+      // serializer requires shelf op_len >= 1 — safe because the module
+      // never enqueues COMMITTED_OP for wire_len == 0 entries; revisit the
+      // parked-shelf op_len if that module gate ever changes.
       raft_retry_shelf_t* shelf =
           (raft_retry_shelf_t*)get_clear_memory(sizeof(raft_retry_shelf_t));
       shelf->op_wire = (uint8_t*)get_memory(
