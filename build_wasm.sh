@@ -231,6 +231,13 @@ build_variant() {
   # wasm EC-group path overflows a few bytes per ECDSA keygen/sign and, unpadded,
   # corrupts dlmalloc chunk headers (the ot-document-tree.js OOB flake —
   # diagnosis in src/Util/wasm_alloc_pad.c and the test file).
+  # CRABS_WASM_ALLOC_PAD=0 drops the wrap shim (upgrade experiments only:
+  # tests MUST run the ec-soak canary before trusting an unpadded build).
+  if [ "${CRABS_WASM_ALLOC_PAD:-1}" = "1" ]; then
+    WRAP_FLAGS="-Wl,--wrap=malloc -Wl,--wrap=calloc"
+  else
+    WRAP_FLAGS=""
+  fi
   emcc $CFLAGS $EXTRA_DEFINES \
     $OBJECTS \
     "$OPENABE_WASM/liboabe_c_wasm.a" \
@@ -250,7 +257,7 @@ build_variant() {
     -s EXPORTED_FUNCTIONS="$EXPORTS_JSON" \
     -s EXPORTED_RUNTIME_METHODS='["ccall","cwrap","getValue","setValue","UTF8ToString","stringToUTF8","lengthBytesUTF8","addFunction","removeFunction","HEAP8","HEAPU8","HEAP16","HEAPU16","HEAP32","HEAPU32","HEAPF32","HEAPF64"]' \
     --js-library "$ROOT_DIR/src/TimeSource/wasm_time_library.js" \
-    -Wl,--wrap=malloc -Wl,--wrap=calloc \
+    $WRAP_FLAGS \
     -O2 \
     2>&1
 }

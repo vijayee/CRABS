@@ -42,9 +42,20 @@
 // compiles this file out (guarded by __EMSCRIPTEN__) and needs no padding —
 // glibc's own chunk granularity already absorbs the few-byte overflow.
 //
-// When the OpenSSL wasm build is regenerated against a version that fixes
-// the EC-group overflow, this shim and the build_wasm.sh wrap flags can be
-// dropped together (search: CRABS_WASM_ALLOC_PAD).
+// EXPERIMENT RESULT (2026-10-15): an OpenSSL upgrade does NOT fix it. The
+// wasm libcrypto was rebuilt at 3.5.9 (LTS; same linux-generic32 no-asm
+// flags, same emsdk); with the pad dropped the full-chain canary still
+// traps `memory access out of bounds` at the same point (bindings/wasm
+// state-restore.js, ~1 run in 4); a dedicated 20k-iteration keygen+sign
+// soak never tripped on EITHER version — the EC-keygen adjacency
+// attribution should be read as circumstantial. The scribble therefore
+// likely lives OUTSIDE the instrumented code: the RELIC and OpenABE wasm
+// static archives are not ASan-instrumentable by the same trick (P11 noted
+// instrumented objects never fire — the write never crossed an
+// instrumented allocation), or it is toolchain-level UB. The shim stays
+// until the culprit is isolated (e.g. an ASan-built RELIC/OpenABE archive
+// in a wasm canary, or emcc -fsanitize=address catching the dev-variant
+// chain). Search: CRABS_WASM_ALLOC_PAD.
 
 #ifdef __EMSCRIPTEN__
 

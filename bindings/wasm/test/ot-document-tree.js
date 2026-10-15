@@ -20,9 +20,13 @@
 // why the native binding (glibc's allocator) never reproduced it.
 // Mitigation shipped in build_wasm.sh: every allocation goes through
 // src/Util/wasm_alloc_pad.c (-Wl,--wrap=malloc/calloc, +32-byte pad), so
-// the overflow always lands in pad slack. Drop that shim together with
-// these flags when the wasm OpenSSL is regenerated against a fixed
-// version.
+// the overflow always lands in pad slack.
+// UPGRADE EXPERIMENT (2026-10-15): rebuilding the wasm OpenSSL at 3.5.9
+// LTS with the pad dropped did NOT fix the trap — same OOB at the same
+// point (this test stayed clean; the full-chain canary flapped ~1-in-4 at
+// state-restore.js on BOTH 3.4.0 and 3.5.9). The culprit is now tracked in
+// the uninstrumented RELIC/OpenABE archives or toolchain UB — see the
+// experiment note in src/Util/wasm_alloc_pad.c. Keep the shim.
 
 'use strict';
 
