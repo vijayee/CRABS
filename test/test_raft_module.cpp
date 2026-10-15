@@ -1275,3 +1275,200 @@ TEST(RaftWireRoundTrip, CommitReceiptBeyondLeaderLogTipTreatedAsRepair) {
   EXPECT_EQ(crabs_raft_module_committed_tip(module), tip_before);
   crabs_raft_module_destroy(module);
 }
+
+// ============================================================
+// Audit pass-3 defense-in-depth (consensus findings 4 and 5): the term
+// ceiling is never adopted and never wraps, and a same-(term, index) resend
+// must carry IDENTICAL content to count as an idempotent duplicate.
+// ============================================================
+
+// Consensus finding 4: a crafted APPEND_REQ with term == UINT64_MAX must not
+// move the node's term (adopting the ceiling would let the next election
+// increment wrap current_term to 0, resetting term monotonicity for stale
+// leaders). The caller re-check fails the message closed as stale, and a
+// later election timeout increments from the ORIGINAL term.
+TEST(RaftModule, TermCeilingNeverWraps) {
+  crabs_raft_config_t config = make_single_config(42, 0);
+  strncpy(config.node_id, "nodeF", CRABS_MAX_USER_ID - 1);
+  strncpy(config.peer_ids[0], "nodeF", CRABS_MAX_USER_ID - 1);
+  strncpy(config.peer_ids[1], "nodeL", CRABS_MAX_USER_ID - 1);
+  config.peer_count = 2;
+
+  crabs_raft_module_t* follower = crabs_raft_module_create(&config);
+  ASSERT_NE(follower, nullptr);
+
+  std::vector<uint8_t> blob;
+  auto push_u8 = [&](uint8_t value) { blob.push_back(value); };
+  auto push_u64 = [&](uint64_t value) {
+    for (int byte_index = 0; byte_index < 8; byte_index++) {
+      push_u8((uint8_t)((value >> (byte_index * 8)) & 0xFF));
+    }
+  };
+  auto push_u32 = [&](uint32_t value) {
+    push_u8((uint8_t)(value & 0xFF));
+    push_u8((uint8_t)((value >> 8) & 0xFF));
+    push_u8((uint8_t)((value >> 16) & 0xFF));
+    push_u8((uint8_t)((value >> 24) & 0xFF));
+  };
+  auto push_str16 = [&](const char* text) {
+    uint16_t len = (uint16_t)strlen(text);
+    push_u8((uint8_t)(len & 0xFF));
+    push_u8((uint8_t)(len >> 8));
+    for (uint16_t char_index = 0; char_index < len; char_index++) {
+      push_u8((uint8_t)text[char_index]);
+    }
+  };
+
+  // APPEND_REQ at the term ceiling: sender-bound leader "nodeL", empty
+  // range over an empty log.
+  push_u8(0x52); push_u8(1); push_u8(3);
+  push_u64(UINT64_MAX);
+  push_str16("nodeL");
+  push_u64(0);   // prev_term
+  push_u64(0);   // prev_index
+  push_u64(0);   // leader commit
+  push_u32(0);   // entry count
+
+  EXPECT_EQ(crabs_raft_module_inbound(follower, "nodeL", blob.data(),
+                                      blob.size(), 100), CRABS_SUCCESS);
+  // The ceiling is REFUSED: the term does not move and nothing is appended.
+  EXPECT_EQ(crabs_raft_module_current_term(follower), 0u);
+  EXPECT_EQ(crabs_raft_module_log_length(follower), 0u);
+  // Failed closed as stale (the append-request stale path): a failure
+  // response goes back to the claimed leader, nothing else leaves.
+  crabs_raft_outbound_message_t outbound;
+  ASSERT_TRUE(crabs_raft_module_poll_outbound(follower, &outbound));
+  EXPECT_EQ(outbound.kind, RAFT_MSG_APPEND_RESP);
+  EXPECT_STREQ(outbound.to_peer, "nodeL");
+  EXPECT_EQ(outbound.bytes[11], 0);   // body byte 0: success = false
+  free((void*)outbound.bytes);
+  EXPECT_FALSE(crabs_raft_module_poll_outbound(follower, &outbound));
+
+  // The election timeout fires on the public tick API: the term increments
+  // from the ORIGINAL value (0 -> 1) — never wrapping UINT64_MAX to 0.
+  uint64_t deadline = crabs_raft_module_next_election_deadline(follower);
+  EXPECT_EQ(crabs_raft_module_tick(follower, deadline), CRABS_SUCCESS);
+  EXPECT_EQ(crabs_raft_module_current_term(follower), 1u);
+
+  crabs_raft_module_destroy(follower);
+}
+
+// Consensus finding 5: same (term, index) with DIVERGENT content is an
+// equivocating leader, not an idempotent duplicate. A proposal-id mismatch
+// or a wire-bytes mismatch refuses the whole message (rejected count rises,
+// the held slot's original content stands); a byte-identical resend stays
+// idempotent.
+TEST(RaftModule, AppendEquivocationWithDivergentBytesRejected) {
+  crabs_raft_config_t config = make_single_config(42, 0);
+  strncpy(config.node_id, "nodeF", CRABS_MAX_USER_ID - 1);
+  strncpy(config.peer_ids[0], "nodeF", CRABS_MAX_USER_ID - 1);
+  strncpy(config.peer_ids[1], "nodeL", CRABS_MAX_USER_ID - 1);
+  config.peer_count = 2;
+
+  crabs_raft_module_t* follower = crabs_raft_module_create(&config);
+  ASSERT_NE(follower, nullptr);
+
+  // Build a one-entry APPEND_REQ (term 5 from leader "nodeL", empty prev,
+  // commit ceiling 1) with the entry's proposal id and wire bytes
+  // parameterized.
+  auto make_append = [&](uint64_t proposal_id,
+                         const std::vector<uint8_t>& wire_bytes) {
+    std::vector<uint8_t> blob;
+    auto push_u8 = [&](uint8_t value) { blob.push_back(value); };
+    auto push_u64 = [&](uint64_t value) {
+      for (int byte_index = 0; byte_index < 8; byte_index++) {
+        push_u8((uint8_t)((value >> (byte_index * 8)) & 0xFF));
+      }
+    };
+    auto push_u32 = [&](uint32_t value) {
+      push_u8((uint8_t)(value & 0xFF));
+      push_u8((uint8_t)((value >> 8) & 0xFF));
+      push_u8((uint8_t)((value >> 16) & 0xFF));
+      push_u8((uint8_t)((value >> 24) & 0xFF));
+    };
+    auto push_str16 = [&](const char* text) {
+      uint16_t len = (uint16_t)strlen(text);
+      push_u8((uint8_t)(len & 0xFF));
+      push_u8((uint8_t)(len >> 8));
+      for (uint16_t char_index = 0; char_index < len; char_index++) {
+        push_u8((uint8_t)text[char_index]);
+      }
+    };
+    push_u8(0x52); push_u8(1); push_u8(3);
+    push_u64(5);
+    push_str16("nodeL");
+    push_u64(0);   // prev_term
+    push_u64(0);   // prev_index
+    push_u64(1);   // leader commit (ceiling: entry 1)
+    push_u32(1);   // entry count
+    push_u64(5);              // entry term (the leader's current term)
+    push_u64(proposal_id);
+    push_u32((uint32_t)wire_bytes.size());
+    for (uint8_t wire_byte : wire_bytes) push_u8(wire_byte);
+    return blob;
+  };
+
+  const std::vector<uint8_t> original_wire = {'o', 'p', 'A'};
+
+  // First write at (term 5, index 1): accepted. The leader's ceiling (1)
+  // commits it behind the module's own durability line — the occupied-slot
+  // path only fires for slots the resend CANNOT truncate away (the
+  // committed prefix: truncation is gated on prev_index >= commit_index).
+  std::vector<uint8_t> first = make_append(7, original_wire);
+  EXPECT_EQ(crabs_raft_module_inbound(follower, "nodeL", first.data(),
+                                      first.size(), 100), CRABS_SUCCESS);
+  EXPECT_EQ(crabs_raft_module_rejected_message_count(follower), 0u);
+  EXPECT_EQ(crabs_raft_module_log_length(follower), 1u);
+  EXPECT_EQ(crabs_raft_module_current_term(follower), 5u);
+  crabs_raft_persist_request_t persist;
+  ASSERT_TRUE(crabs_raft_module_poll_persist(follower, &persist));
+  EXPECT_EQ(crabs_raft_module_persist_complete(follower, persist.handle, true),
+            CRABS_SUCCESS);
+  EXPECT_EQ(crabs_raft_module_committed_tip(follower), 1u);
+  drain_all_notifications(follower);
+
+  // Equivocation by proposal id (same bytes): refused.
+  std::vector<uint8_t> divergent_id = make_append(8, original_wire);
+  EXPECT_EQ(crabs_raft_module_inbound(follower, "nodeL", divergent_id.data(),
+                                      divergent_id.size(), 101), CRABS_SUCCESS);
+  EXPECT_EQ(crabs_raft_module_rejected_message_count(follower), 1u);
+  EXPECT_EQ(crabs_raft_module_log_length(follower), 1u);
+
+  // Equivocation by wire bytes (same proposal id): refused.
+  std::vector<uint8_t> divergent_bytes = make_append(7, {'o', 'p', 'B'});
+  EXPECT_EQ(crabs_raft_module_inbound(follower, "nodeL",
+                                      divergent_bytes.data(),
+                                      divergent_bytes.size(), 102),
+            CRABS_SUCCESS);
+  EXPECT_EQ(crabs_raft_module_rejected_message_count(follower), 2u);
+  EXPECT_EQ(crabs_raft_module_log_length(follower), 1u);
+
+  // Equivocation by length (a shared prefix over a longer wire): refused.
+  std::vector<uint8_t> divergent_len =
+      make_append(7, {'o', 'p', 'A', '-', 'e', 'x', 't', 'r', 'a'});
+  EXPECT_EQ(crabs_raft_module_inbound(follower, "nodeL", divergent_len.data(),
+                                      divergent_len.size(), 103),
+            CRABS_SUCCESS);
+  EXPECT_EQ(crabs_raft_module_rejected_message_count(follower), 3u);
+  EXPECT_EQ(crabs_raft_module_log_length(follower), 1u);
+
+  // The byte-identical resend is the honest idempotent duplicate: silently
+  // absorbed, no rejection.
+  std::vector<uint8_t> duplicate = make_append(7, original_wire);
+  EXPECT_EQ(crabs_raft_module_inbound(follower, "nodeL", duplicate.data(),
+                                      duplicate.size(), 104), CRABS_SUCCESS);
+  EXPECT_EQ(crabs_raft_module_rejected_message_count(follower), 3u);
+  EXPECT_EQ(crabs_raft_module_log_length(follower), 1u);
+
+  // The held slot kept the FIRST write's image throughout.
+  crabs_raft_module_state_t* exported = crabs_raft_module_export_state(follower);
+  ASSERT_NE(exported, nullptr);
+  ASSERT_NE(exported->log, nullptr);
+  EXPECT_EQ(exported->log->term, 5u);
+  EXPECT_EQ(exported->log->proposal_id, 7u);
+  ASSERT_EQ(exported->log->wire_len, 3u);
+  EXPECT_EQ(memcmp(exported->log->op_wire, original_wire.data(), 3), 0);
+  crabs_raft_module_state_destroy(exported);
+
+  crabs_raft_module_destroy(follower);
+}

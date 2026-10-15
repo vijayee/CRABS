@@ -1027,7 +1027,13 @@ static bool _raft_read_string16(raft_wire_reader_t* reader, char* out, size_t ou
 // §5.1). One vote per term is guarded by voted_for afterwards.
 static void _raft_step_down(crabs_raft_module_s* module, uint64_t term,
                             const char* new_leader_hint) {
-  if (term <= module->current_term) return;
+  // Audit pass-3 defense-in-depth (raft; finding 4): refuse the term CEILING
+  // — adopting UINT64_MAX would let the next _raft_begin_election increment
+  // wrap current_term to 0, resetting term monotonicity (stale leaders
+  // regain freshness against a zeroed term). The refusal is fail-closed:
+  // every caller re-checks `term == module->current_term` after this call
+  // and treats the refused-ceiling message as stale.
+  if (term == UINT64_MAX || term <= module->current_term) return;
   module->current_term = term;
   module->voted_for[0] = '\0';
   if (module->role == RAFT_ROLE_LEADER) {
@@ -1059,7 +1065,11 @@ static void _raft_handle_vote_request(crabs_raft_module_s* module,
   // grants only to a member of its OWN active committed config (§6: joint
   // phase members belong to the union of the two lists).
   _raft_step_down(module, term, candidate_id);
-  if (term < module->current_term) {
+  // pass-3 finding 4 companion: this is an EQUALITY re-check, not a `<` —
+  // step_down refuses the term ceiling WITHOUT adopting it, and such a
+  // solicitation must fail closed as stale (vote denied), not proceed on
+  // the original term into the grant evaluation.
+  if (term != module->current_term) {
     _raft_marshal_vote_response(module, candidate_id, module->current_term, false);
     return;
   }
@@ -1200,7 +1210,10 @@ static void _raft_handle_append_request(crabs_raft_module_s* module,
   // would be a stale-leader resurrection. Reply with a failure response so
   // the old leader (still thinking it leads) backtracks — harmless, it
   // cannot win a vote again with an out-of-date log.
-  if (term < module->current_term) {
+  // pass-3 finding 4 companion: an EQUALITY re-check — a ceiling term
+  // step_down just refused to adopt lands here too (never processed as a
+  // live leader's traffic).
+  if (term != module->current_term) {
     _raft_marshal_append_response(module, leader_id, false, 0);
     return;
   }
@@ -1295,8 +1308,29 @@ static void _raft_handle_append_request(crabs_raft_module_s* module,
         module->rejected_message_count++;
         return;
       }
-      // Same term at the same position: idempotent duplicate — skip. A
-      // duplicate CONFIG entry still registers its members (idempotent).
+      // Audit pass-3 defense-in-depth (raft; finding 5): term equality at a
+      // held slot is NOT proof of an idempotent duplicate — an equivocating
+      // leader can ship divergent bytes at the same (term, index) and
+      // first-write-wins would silently keep whichever image landed first.
+      // Compare the proposal id, then the wire image (shared prefix AND
+      // length — a prefix-extension is divergence too); any mismatch
+      // refuses the whole message and the slot's original content stands.
+      if (slot->proposal_id != entry_proposal_id) {
+        module->rejected_message_count++;
+        return;
+      }
+      size_t shared_prefix_len = slot->wire_len < entry_wire_len
+                                     ? (size_t)slot->wire_len
+                                     : (size_t)entry_wire_len;
+      if (slot->wire_len != entry_wire_len ||
+          (shared_prefix_len > 0 &&
+           memcmp(slot->op_wire, entry_wire, shared_prefix_len) != 0)) {
+        module->rejected_message_count++;
+        return;
+      }
+      // Same term, same proposal id, same wire bytes at the same position:
+      // idempotent duplicate — skip. A duplicate CONFIG entry still
+      // registers its members (idempotent).
       if (_raft_entry_is_config(&incoming)) {
         (void)_raft_config_register_members(module, &incoming);
       }
@@ -1370,6 +1404,13 @@ static void _raft_handle_config_excluded(crabs_raft_module_s* module,
   }
   if (term > module->current_term) {
     _raft_step_down(module, term, NULL);
+    // pass-3 finding 4 companion: step_down refuses the term ceiling — a
+    // refused step-down cannot settle membership either. Fail closed like
+    // the stale-term branch above.
+    if (term != module->current_term) {
+      module->rejected_message_count++;
+      return;
+    }
   }
   if (commit_ceiling > module->follower_commit_target) {
     module->follower_commit_target = commit_ceiling;
@@ -1764,6 +1805,15 @@ static bool _raft_emit_persist_request(crabs_raft_module_s* module) {
 // Role transitions
 // ============================================================
 static void _raft_begin_election(crabs_raft_module_s* module, uint64_t now_ms) {
+  // Audit pass-3 defense-in-depth (raft; finding 4): never let the increment
+  // WRAP the term ceiling into 0 — that would reset term monotonicity and
+  // let stale leaders regain freshness against the zeroed term. An
+  // already-ceilinged node turns inert instead: nothing is touched (role,
+  // term, voted_for all stay as they were, so the machine remains coherent
+  // — tick simply re-fires this inert path each deadline). The ceiling is
+  // unreachable through honest election traffic, and _raft_step_down also
+  // refuses to adopt it off the wire.
+  if (module->current_term >= UINT64_MAX) return;
   module->current_term++;
   module->voted_for[0] = '\0';
 
