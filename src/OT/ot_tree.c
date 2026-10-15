@@ -209,6 +209,15 @@ crabs_tree_node_t* crabs_ot_tree_insert_node(
     const char* node_id, const uint8_t* value, uint32_t value_size) {
   if (tree == NULL || node_id == NULL) return NULL;
 
+  // Audit pass-3 HIGH: pool duplicates make crabs_ot_tree_find pool-order
+  // dependent (arrival order legitimately differs across replicas), so
+  // DELETE_NODE/REPARENT hit different nodes per replica and the
+  // _rebuild_links max-id cycle-break tie argument silently fails. The
+  // state-file deserializer already rejects duplicate ids; the live op path
+  // must enforce the same invariant. Content-based refusal → every replica
+  // refuses the same op → convergent.
+  if (crabs_ot_tree_find(tree, node_id) != NULL) return NULL;
+
   crabs_tree_node_t* node = crabs_tree_node_create(node_id, parent_id, value, value_size);
   if (node == NULL) return NULL;
 

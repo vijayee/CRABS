@@ -503,10 +503,17 @@ crabs_error_e crabs_apply_ot_op(data_item_t* item, crabs_ot_operation_t* op) {
           char node_id[64] = {0};
           memcpy(parent_id, op->payload, 63);
           memcpy(node_id, op->payload + 64, 63);
-          crabs_ot_tree_insert_node(tree,
-            parent_id[0] ? parent_id : NULL,
-            op->visible_pos, node_id,
-            op->payload + 128, op->payload_size - 128);
+          // Audit pass-3 HIGH: an insert that fails (duplicate id, missing
+          // parent) must FAIL the op rather than silently apply-nothing —
+          // a logged-no-effect op turns pool state into input-dependent
+          // history. The executor converts this to an error return; the
+          // caller's ordering machinery owns the retry/defer semantics.
+          if (crabs_ot_tree_insert_node(tree,
+              parent_id[0] ? parent_id : NULL,
+              op->visible_pos, node_id,
+              op->payload + 128, op->payload_size - 128) == NULL) {
+            return CRABS_ERR_INVALID_PARAM;
+          }
           break;
         }
         case CRABS_OT_OP_DELETE_NODE: {

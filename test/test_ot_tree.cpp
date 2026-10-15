@@ -165,6 +165,22 @@ TEST(OTTree, InsertMissingParent) {
   crabs_ot_tree_destroy(tree);
 }
 
+TEST(OTTree, InsertRejectsDuplicateNodeId) {
+  crabs_ot_tree_t* tree = crabs_ot_tree_create();
+  ASSERT_NE(tree, nullptr);
+  crabs_tree_node_t* root =
+      crabs_ot_tree_insert_node(tree, NULL, 0, "n0", (const uint8_t*)"r", 1);
+  ASSERT_NE(root, nullptr);
+  // Audit pass-3 HIGH: pool duplicates make crabs_ot_tree_find pool-order
+  // dependent — DELETE_NODE/REPARENT would hit different nodes per replica.
+  // Content-based refusal → every replica refuses the same op → convergent.
+  crabs_tree_node_t* dup =
+      crabs_ot_tree_insert_node(tree, NULL, 0, "n0", (const uint8_t*)"r2", 2);
+  EXPECT_EQ(dup, nullptr);
+  EXPECT_EQ(crabs_ot_tree_find(tree, "n0"), root);
+  crabs_ot_tree_destroy(tree);
+}
+
 // ============================================================
 // Delete Node Tests
 // ============================================================
