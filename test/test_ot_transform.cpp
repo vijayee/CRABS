@@ -277,8 +277,9 @@ TEST(OTTransform, SwapSwapSamePositionsLowerIdDoesNotFlip) {
 }
 
 TEST(OTTransform, SwapSwapStrictlyLowerPriorityDoesNotFlip) {
-  // Antisymmetry guard: a `>=` comparator regression would flip op1 here
-  // (the F-4 bug class). The current code must NOT flip op1.
+  // This test guards a hypothetical REVERSED comparator (`<=`); the true
+  // `>=`-regression guard is the equal-priority case above (old code flips
+  // on equal priority, new code does not).
   crabs_ot_operation_t op1 = make_op(CRABS_OT_OP_SWAP, 3, 7);
   crabs_ot_op_id_init(&op1.id, "nodeA", 1, 1000);
   op1.priority = 1;
@@ -288,6 +289,19 @@ TEST(OTTransform, SwapSwapStrictlyLowerPriorityDoesNotFlip) {
   crabs_transform_swap_swap(&op1, &op2);
   EXPECT_EQ(op1.visible_pos, 3u);
   EXPECT_EQ(op1.visible_pos_2, 7u);
+}
+
+TEST(OTTransform, SwapSwapEqualPriorityHigherIdFlips) {
+  crabs_ot_operation_t op1 = make_op(CRABS_OT_OP_SWAP, 3, 7);
+  crabs_ot_op_id_init(&op1.id, "nodeZ", 1, 1000);
+  op1.priority = 1;
+  crabs_ot_operation_t op2 = make_op(CRABS_OT_OP_SWAP, 3, 7);
+  crabs_ot_op_id_init(&op2.id, "nodeA", 1, 1000);
+  op2.priority = 1;
+  // Equal priority; "nodeZ" > "nodeA": op1 flips per the strict tie-break.
+  crabs_transform_swap_swap(&op1, &op2);
+  EXPECT_EQ(op1.visible_pos, 7u);
+  EXPECT_EQ(op1.visible_pos_2, 3u);
 }
 
 // ============================================================
