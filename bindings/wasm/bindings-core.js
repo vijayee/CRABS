@@ -2275,7 +2275,13 @@ class Node {
 
   sign(op, signingKey) {
     const M = this._M;
-    if (signingKey && typeof signingKey === 'object' && signingKey._ptr) {
+    if (signingKey && typeof signingKey === 'object') {
+      if (!signingKey._ptr) throw new Error('Expected KeyPair or private key hex string');
+      if (signingKey._M !== this._M) {
+        // A KeyPair from ANOTHER module instance has a foreign-heap _ptr —
+        // reading it as if local would deref someone else's linear memory.
+        throw new Error('sign: the KeyPair was minted by a different module instance');
+      }
       // Audit M-7: the scalar already lives in THIS module's heap at _ptr —
       // point at it directly instead of materializing a JS hex string (V8
       // strings can't be zeroized, so the old round-trip minted an
@@ -3584,28 +3590,34 @@ class Node {
   // Refusals surface typed (e.g. cryptographic_error when the machine
   // carries no node key).
   lineageRotateKey(newKey) {
+    // Audit pass-3 M: the prior round-trip through newKey.privateKeyHex()
+    // minted a permanent V8 string copy of the fresh scalar (V8 strings
+    // can't be zeroized) — the exact seam the M-7 sign() fix closed. Read
+    // the 65 raw bytes (private_key[32] + public_key[33]; identical layout
+    // for the raw and keypair forms) from THIS module's heap and wipe the
+    // staging in a finally.
     const M = this._M;
-    if (!newKey || typeof newKey.privateKeyHex !== 'function' ||
-        typeof newKey.publicKeyHex !== 'function') {
-      throw new Error('lineageRotateKey: expected a KeyPair (KeyPair.generate())');
+    if (!newKey || !newKey._ptr || newKey._M !== this._M) {
+      throw new TypeError(
+          'lineageRotateKey: expected a KeyPair minted by THIS module instance');
     }
-    const priv = M._malloc(32);
-    const pub = M._malloc(33);
-    if (hexDecode(M, newKey.privateKeyHex(), priv, 32) !== 32 ||
-        hexDecode(M, newKey.publicKeyHex(), pub, 33) !== 33) {
-      M._free(pub);
-      wipeFree(M, priv, 32);
-      throw new Error('lineageRotateKey: the new keypair did not decode');
+    const staged = M._malloc(65);
+    try {
+      new Uint8Array(M.HEAPU8.buffer, staged, 65)
+          .set(new Uint8Array(M.HEAPU8.buffer, newKey._ptr, 65));
+      const ser = M._crabs_wasm_lineage_key_rotate(this._am, staged, staged + 32);
+      if (!ser) {
+        throw new Error(
+            'lineageRotateKey failed (the C gate refused — see the lineage_key_rotate contract)');
+      }
+      const len = M._crabs_wasm_buffer_len(ser);
+      const data = M._crabs_wasm_buffer_data(ser);
+      const out = new Uint8Array(M.HEAPU8.subarray(data, data + len));
+      M._crabs_wasm_buffer_destroy(ser);
+      return out;
+    } finally {
+      wipeFree(M, staged, 65);
     }
-    const ser = M._crabs_wasm_lineage_key_rotate(this._am, priv, pub);
-    M._free(pub);
-    wipeFree(M, priv, 32);
-    if (!ser) throw new Error('lineageRotateKey failed (the C gate refused — see the lineage_key_rotate contract)');
-    const len = M._crabs_wasm_buffer_len(ser);
-    const data = M._crabs_wasm_buffer_data(ser);
-    const out = new Uint8Array(M.HEAPU8.subarray(data, data + len));
-    M._crabs_wasm_buffer_destroy(ser);
-    return out;
   }
 
   // Child side: ingest a parent-minted transition record (the exact bytes

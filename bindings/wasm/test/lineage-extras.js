@@ -244,6 +244,45 @@ async function expectRefusal(runnable, expected, what) {
       /malformed/, 'one dropped trailing byte must refuse');
   }
 
+  // ============================================================
+  // D: lineageRotateKey key custody — heap-direct read (audit pass-3 M)
+  // ============================================================
+  {
+    const node = await Node.create('custody-root', { ordering: 'hlc' });
+    node.setTime(Date.now());
+
+    // (a) The raw KeyPair form (fromPrivateHex; _raw = true) reads through
+    // the SAME +0/+32 byte layout as the generated ecdsa_keypair_t form —
+    // the fix reads both straight off this instance's heap with no hex
+    // round-trip (a V8 string copy of the scalar would be unwipeable).
+    const donor = await KeyPair.generate();
+    const rawKey = await KeyPair.fromPrivateHex(donor.privateKeyHex());
+    const record = node.lineageRotateKey(rawKey);
+    assert(record instanceof Uint8Array && record.byteLength > 0,
+      'rotation of a raw-form KeyPair must return the transition record bytes');
+    rawKey.destroy();
+    donor.destroy();
+
+    // ...and the generated form keeps working (the layout parity the fix
+    // rests on — both must read through the same staged 65-byte frame).
+    const secondKey = await KeyPair.generate();
+    const secondRecord = node.lineageRotateKey(secondKey);
+    assert(secondRecord instanceof Uint8Array && secondRecord.byteLength > 0,
+      'rotation of a generated KeyPair must return the transition record bytes');
+    secondKey.destroy();
+
+    // (b) A KeyPair minted by a DIFFERENT module instance (the dev bundle
+    // loads its own wasm binary with its own linear memory) carries a
+    // foreign-heap _ptr — reading it as if local would deref someone else's
+    // memory. The machine must refuse instance-mismatched keys.
+    const devBindings = require('../dev');
+    const foreignKey = await devBindings.KeyPair.generate();
+    assert.throws(() => node.lineageRotateKey(foreignKey),
+      /expected a KeyPair minted by THIS module instance/,
+      'a foreign-module KeyPair must refuse at lineageRotateKey');
+    foreignKey.destroy();
+  }
+
   console.log('lineage-extras wasm: OK');
 })().catch((failure) => {
   console.error('lineage-extras wasm FAILED:', failure);
