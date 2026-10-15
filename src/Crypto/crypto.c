@@ -512,8 +512,8 @@ bool crypto_ecdsa_verify_digest(const uint8_t public_key[33],
 // against a fixed dummy public key (secp256k1 generator — a valid on-curve
 // point, so the verify performs full modular work and fails on the math,
 // never on a cheap structural reject). Every unauthorized outcome then costs
-// exactly one ECDSA verify + policy evaluation; latency cannot enumerate
-// users, statuses, or keyring composition. In-tree, only ECDSA_SECP256K1 is
+// exactly one ECDSA verify + policy evaluation (per candidate in Mode B: N
+// candidates → N trials); latency cannot enumerate users, statuses, or keyring composition. In-tree, only ECDSA_SECP256K1 is
 // registered in the scheme registry, whose cost dominates; hosts registering
 // further schemes must apply the same refuse-path work discipline.
 static const uint8_t CRABS_CRYPTO_DUMMY_PK[33] = {
@@ -1381,7 +1381,9 @@ verify_result_t crypto_verify_operation_auth(
       // cannot enumerate user IDs. The prior USER_NOT_FOUND leaked existence.
       // Audit pass-3 finding 2: run the dummy ECDSA trial first so the
       // user-not-found refuse costs the same verify work as the signed
-      // accept path — latency must not enumerate user existence.
+      // accept path — latency must not enumerate user existence. The trial's
+      // length argument is safe: v1's signature parameter is the fixed
+      // CRABS_SIG_SIZE array.
       _dummy_signature_trial(serialized_op, op_len, signature, CRABS_SIG_SIZE);
       result.error = CRABS_ERR_UNAUTHORIZED;
       return result;
