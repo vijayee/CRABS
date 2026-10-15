@@ -898,14 +898,14 @@ static void* _deserialize_crdt_value(const uint8_t* data, uint32_t len, data_typ
         s->tombstones = (or_set_entry_t*)realloc(s->tombstones, sizeof(or_set_entry_t) * tc);
         if (!s->tombstones) { or_set_destroy(s); return NULL; }
       }
-      for (uint32_t i = 0; i < tc; i++) {
+      for (uint32_t tombstone_index = 0; tombstone_index < tc; tombstone_index++) {
         char elem[CRABS_MAX_USER_ID]; char tag[CRABS_MAX_USER_ID];
         if (!_read_string16(&rb, elem, sizeof(elem)) || !_read_string16(&rb, tag, sizeof(tag))) { or_set_destroy(s); return NULL; }
         // Reconstruct tombstone directly (or_set_remove would consume by element only)
-        uint32_t idx = s->tombstone_count;
-        s->tombstones[idx].element = platform_strdup(elem);
-        s->tombstones[idx].tag = platform_strdup(tag);
-        s->tombstone_count = idx + 1;
+        uint32_t tombstone_slot = s->tombstone_count;
+        s->tombstones[tombstone_slot].element = platform_strdup(elem);
+        s->tombstones[tombstone_slot].tag = platform_strdup(tag);
+        s->tombstone_count = tombstone_slot + 1;
       }
       return s;
     }
@@ -930,6 +930,7 @@ static void* _deserialize_crdt_value(const uint8_t* data, uint32_t len, data_typ
       }
       uint32_t rc2;
       if (!_read_uint32_le(&rb, &rc2)) { two_p_set_destroy(s); return NULL; }
+      // same cap + wire bound as the add set (each entry >= 2 bytes)
       if ((uint64_t)rc2 > CRABS_DESER_MAX_SET_ELEMENTS ||
           (uint64_t)rc2 * 2u > rb.len - rb.offset) { two_p_set_destroy(s); return NULL; }
       if (rc2 > 0) {
