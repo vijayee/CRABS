@@ -683,9 +683,15 @@ TEST(OTSerialization, BstDeclaredCountMismatchRejected) {
   serialized_buffer_destroy(buf);
 }
 
-// Document spans must carry pairwise-distinct ids; a duplicate id aliases
-// one span onto another in id-keyed lookups.
-TEST(OTSerialization, DocumentRejectsDuplicateSpanIds) {
+// Split spans legitimately share the originating op's id between the split
+// halves, so a serialized document can (and normally does, after any split)
+// carry two spans with the same id. Deserialization must NOT refuse it. This
+// supersedes the removed duplicate-span-id refusal — the pass-3 B3 gate was
+// reverted as a REGRESSION: span ids are never id-keyed queried
+// (_find_span_at_char is the only lookup, and it is positional), and
+// crabs_ot_document_split_span / compaction share the origin id at 4 call
+// sites (ot_document.c, compact_op.c).
+TEST(OTSerialization, SplitIdsShareOriginRoundTrip) {
   state_t* original = state_create();
   original->version = 300;
 
@@ -696,44 +702,33 @@ TEST(OTSerialization, DocumentRejectsDuplicateSpanIds) {
   crabs_ot_document_t* doc = (crabs_ot_document_t*)item->value;
   crabs_ot_op_id_t id1;
   crabs_ot_op_id_init(&id1, "n1", 1, 100);
-  crabs_ot_op_id_t id2;
-  crabs_ot_op_id_init(&id2, "n1", 2, 200);
   crabs_ot_document_insert_text(doc, 0, (const uint8_t*)"hello", 5, &id1);
-  crabs_ot_document_insert_text(doc, 5, (const uint8_t*)"world", 5, &id2);
+  ASSERT_NE(crabs_ot_document_split_span(doc, 2), nullptr);
+  ASSERT_EQ(crabs_ot_document_span_count(doc), 2u);
 
   serialized_buffer_t* buf = crabs_serialize_state(original);
   ASSERT_NE(buf, nullptr);
 
-  // A span id on the wire is a fixed-width CRABS_MAX_USER_ID node_id
-  // (null-padded) + LE u64 sequence_num + LE u64 timestamp. An op id is
-  // identified by (node_id, sequence_num) — patch every id whose node_id is
-  // "n1" and sequence_num is 2 down to sequence_num 1, so the second span
-  // claims the first span's id.
-  size_t patched = 0;
-  for (size_t byte_offset = 0;
-       byte_offset + CRABS_MAX_USER_ID + sizeof(uint64_t) <= buf->len;
-       byte_offset++) {
-    if (buf->data[byte_offset] == 'n' && buf->data[byte_offset + 1] == '1' &&
-        buf->data[byte_offset + 2] == 0x00) {
-      uint64_t seq = 0;
-      memcpy(&seq, buf->data + byte_offset + CRABS_MAX_USER_ID, sizeof(seq));
-      if (seq == 2u) {
-        uint64_t one = 1;
-        memcpy(buf->data + byte_offset + CRABS_MAX_USER_ID, &one, sizeof(one));
-        patched++;
-      }
-    }
-  }
-  ASSERT_GT(patched, (size_t)0);
-
-  // Recompute the SHA-256 checksum over the modified payload.
-  crypto_sha256(buf->data, buf->len - CRABS_HASH_SIZE,
-                buf->data + buf->len - CRABS_HASH_SIZE);
-
   state_t* restored = crabs_deserialize_state(buf->data, buf->len);
-  EXPECT_EQ(restored, nullptr);
-  if (restored != nullptr) state_destroy(restored);
+  ASSERT_NE(restored, nullptr);
 
+  data_item_t* r_item = state_find_item(restored, "doc1");
+  ASSERT_NE(r_item, nullptr);
+  crabs_ot_document_t* r_doc = (crabs_ot_document_t*)r_item->value;
+  ASSERT_EQ(crabs_ot_document_span_count(r_doc), 2u);
+
+  // Both halves survive the round trip and still share the origin id.
+  crabs_span_t* first = crabs_ot_document_head(r_doc);
+  ASSERT_NE(first, nullptr);
+  crabs_span_t* second = first->next;
+  ASSERT_NE(second, nullptr);
+  EXPECT_TRUE(crabs_ot_op_id_equal(&first->id, &id1));
+  EXPECT_TRUE(crabs_ot_op_id_equal(&second->id, &id1));
+  EXPECT_EQ(first->text_size, 2u);
+  EXPECT_EQ(second->text_size, 3u);
+  EXPECT_EQ(second->next, nullptr);
+
+  state_destroy(restored);
   state_destroy(original);
   serialized_buffer_destroy(buf);
 }

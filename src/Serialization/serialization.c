@@ -573,12 +573,19 @@ static bool _deserialize_ot_type_state(read_buf_t* buf, data_item_t* item,
       uint32_t span_count;
       if (!_read_uint32_le(buf, &span_count)) return false;
       if (span_count > CRABS_DESER_MAX_LOG) return false;
-      // pass-3 LOW: bound the count to the remaining buffer (the dup-span
-      // scan below is O(n²); a multi-million-span declaration from a few
-      // bytes would spin it — the same ~10¹² strcmp shape R8-SER-2/3 caps
-      // for tree nodes). Each span costs >= 89 wire bytes: op id (64-byte
-      // node_id + u64 sequence + u64 timestamp = 80) + bytes32 text header
-      // (4, empty) + u32le style_count (4, zero styles) + u8 deleted (1).
+      // pass-3 LOW: bound the count to the remaining buffer so a
+      // multi-million-span declaration cannot be minted from a few bytes
+      // (the same shape R8-SER-2/3 caps for tree nodes). Each span costs
+      // >= 89 wire bytes: op id (64-byte node_id + u64 sequence + u64
+      // timestamp = 80) + bytes32 text header (4, empty) + u32le
+      // style_count (4, zero styles) + u8 deleted (1).
+      // NOTE: span ids are deliberately NOT uniqueness-gated here. They are
+      // never id-keyed queried (_find_span_at_char is the only lookup, and
+      // it is positional), and crabs_ot_document_split_span plus compaction
+      // legitimately share the originating op's id between the split halves
+      // (ot_document.c, compact_op.c). The pass-3 dup-span-id scan was
+      // reverted as a regression: it refused the project's own writer
+      // output for any document containing a split span.
       if (span_count > (buf->len - buf->offset) / 89) return false;
 
       crabs_span_t* tail = NULL;
@@ -586,15 +593,6 @@ static bool _deserialize_ot_type_state(read_buf_t* buf, data_item_t* item,
       for (uint32_t i = 0; i < span_count; i++) {
         crabs_ot_op_id_t id;
         if (!_deserialize_ot_op_id(buf, &id)) return false;
-
-        // pass-3 LOW: reject duplicate span ids, mirroring the ordered-set
-        // element and tree-node scans. Id-keyed span lookups become
-        // ambiguous when two spans share an id, and a crafted blob could
-        // alias one span onto another.
-        for (crabs_span_t* seen_span = doc->head; seen_span != NULL;
-             seen_span = seen_span->next) {
-          if (crabs_ot_op_id_equal(&seen_span->id, &id)) return false;
-        }
 
         uint8_t* text = NULL;
         uint32_t text_size = 0;
