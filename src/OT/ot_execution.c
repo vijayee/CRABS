@@ -649,8 +649,11 @@ static crabs_error_e _apply_one_ot_op(data_item_t* item,
   // can push the same op over the cap and diverge accept/reject). Gate the
   // WIRE-CARRIED position instead (content-determined, identical verdict on
   // every replica); the transformed position is then guarded by the apply
-  // functions' own content-derived bounds validation.
-  if (ot_op->visible_pos > 100000) {
+  // functions' own content-derived bounds validation. visible_pos_2 (move
+  // destination / swap target) is deliberately NOT gated: applies clamp or
+  // no-op on out-of-range targets (content-bounded), so no cap verdict
+  // attaches to it.
+  if (ot_op->visible_pos > CRABS_OT_MAX_VISIBLE_POSITION) {
     return CRABS_ERR_OT_POSITION_BOUNDS;
   }
 

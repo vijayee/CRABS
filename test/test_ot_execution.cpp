@@ -935,3 +935,55 @@ TEST(OTExecution, PositionCapAdmitsOpBelowCapRegardlessOfLogShift) {
   free(below_cap_long.payload);
   state_destroy(state_long);
 }
+
+// visible_pos == CRABS_OT_MAX_VISIBLE_POSITION on an empty item is at the cap
+// boundary: admitted by the pre-gate, and the apply clamps the position to the
+// tail of the (empty) ordered set. The op must apply successfully.
+TEST(OTExecution, PositionCapBoundaryExactlyMaxAdmitted) {
+  state_t* state = state_create();
+  data_item_t* item = crabs_register_ot_type(state, "list",
+    DATA_TYPE_OT_ORDERED_SET, nullptr);
+  ASSERT_NE(item, nullptr);
+  crabs_ot_ordered_set_t* set = (crabs_ot_ordered_set_t*)item->value;
+  ASSERT_NE(set, nullptr);
+
+  crabs_ot_operation_t at_cap;
+  crabs_ot_operation_init(&at_cap);
+  at_cap.op_type = CRABS_OT_OP_INSERT;
+  at_cap.visible_pos = CRABS_OT_MAX_VISIBLE_POSITION;
+  crabs_ot_op_id_init(&at_cap.id, "n2", 1, 2000);
+  const uint8_t element_x = 'x';
+  ASSERT_TRUE(crabs_ot_operation_set_payload(&at_cap, &element_x, 1));
+
+  crabs_error_e err = execute_one_ot_op(state, "list", &at_cap);
+  EXPECT_NE(err, CRABS_ERR_OT_POSITION_BOUNDS);
+  EXPECT_EQ(err, CRABS_SUCCESS);
+  EXPECT_EQ(crabs_ot_ordered_set_visible_count(set), 1u);
+  free(at_cap.payload);
+  state_destroy(state);
+}
+
+// visible_pos == CRABS_OT_MAX_VISIBLE_POSITION + 1 is one past the cap:
+// rejected with CRABS_ERR_OT_POSITION_BOUNDS before any transform or apply.
+TEST(OTExecution, PositionCapBoundaryOneBeyondRejected) {
+  state_t* state = state_create();
+  data_item_t* item = crabs_register_ot_type(state, "list",
+    DATA_TYPE_OT_ORDERED_SET, nullptr);
+  ASSERT_NE(item, nullptr);
+  crabs_ot_ordered_set_t* set = (crabs_ot_ordered_set_t*)item->value;
+  ASSERT_NE(set, nullptr);
+
+  crabs_ot_operation_t over_cap;
+  crabs_ot_operation_init(&over_cap);
+  over_cap.op_type = CRABS_OT_OP_INSERT;
+  over_cap.visible_pos = CRABS_OT_MAX_VISIBLE_POSITION + 1;
+  crabs_ot_op_id_init(&over_cap.id, "n2", 1, 2000);
+  const uint8_t element_x = 'x';
+  ASSERT_TRUE(crabs_ot_operation_set_payload(&over_cap, &element_x, 1));
+
+  EXPECT_EQ(execute_one_ot_op(state, "list", &over_cap),
+            CRABS_ERR_OT_POSITION_BOUNDS);
+  EXPECT_EQ(crabs_ot_ordered_set_visible_count(set), 0u);
+  free(over_cap.payload);
+  state_destroy(state);
+}

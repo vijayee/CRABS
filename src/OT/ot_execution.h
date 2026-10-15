@@ -22,6 +22,10 @@
 #define CRABS_OT_MAX_OP_LOG_DEFAULT  1000
 #define CRABS_OT_MAX_TRANSFORM_DEPTH 64
 
+// Audit pass-3 M: hard content-independent ceiling on an op's wire-carried
+// position (checked before transform so the verdict is replica-independent).
+#define CRABS_OT_MAX_VISIBLE_POSITION 100000
+
 typedef struct {
   uint32_t max_op_log_size;
   char     priority_node_id[CRABS_MAX_USER_ID];
