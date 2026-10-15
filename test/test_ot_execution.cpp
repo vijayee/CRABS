@@ -806,3 +806,132 @@ TEST(OTExecution, PendingSetCapRejectsOverflow) {
   free(overflow_op.payload);
   state_destroy(state);
 }
+
+// ============================================================
+// Position Cap Determinism Tests (audit pass-3 M)
+// ============================================================
+
+// The 100000-position cap must gate the WIRE-CARRIED position, before the op
+// is transformed against the local log. A post-transform check makes the
+// accept/reject verdict depend on the replica's own log length (a longer log
+// can push the same op over the cap) — replicas diverge. An op arriving at
+// 200000 is over the wire cap regardless of what the local log holds.
+TEST(OTExecution, PositionCapRejectsWirePositionRegardlessOfLog) {
+  // Case 1: empty log.
+  state_t* state_short = state_create();
+  data_item_t* item_short = crabs_register_ot_type(state_short, "list",
+    DATA_TYPE_OT_ORDERED_SET, nullptr);
+  ASSERT_NE(item_short, nullptr);
+
+  crabs_ot_operation_t over_cap;
+  crabs_ot_operation_init(&over_cap);
+  over_cap.op_type = CRABS_OT_OP_INSERT;
+  over_cap.visible_pos = 200000;
+  crabs_ot_op_id_init(&over_cap.id, "n2", 1, 2000);
+  const uint8_t element_x = 'x';
+  ASSERT_TRUE(crabs_ot_operation_set_payload(&over_cap, &element_x, 1));
+
+  EXPECT_EQ(execute_one_ot_op(state_short, "list", &over_cap),
+            CRABS_ERR_OT_POSITION_BOUNDS);
+  free(over_cap.payload);
+  state_destroy(state_short);
+
+  // Case 2: a longer log of lower inserts. The verdict must be identical —
+  // content-determined, not log-determined.
+  state_t* state_long = state_create();
+  data_item_t* item_long = crabs_register_ot_type(state_long, "list",
+    DATA_TYPE_OT_ORDERED_SET, nullptr);
+  ASSERT_NE(item_long, nullptr);
+
+  for (uint64_t sequence = 1; sequence <= 2; sequence++) {
+    crabs_ot_operation_t filler;
+    crabs_ot_operation_init(&filler);
+    filler.op_type = CRABS_OT_OP_INSERT;
+    filler.visible_pos = 0;
+    crabs_ot_op_id_init(&filler.id, "n1", sequence, 1000);
+    const uint8_t element_f = 'a' + (uint8_t)(sequence - 1);
+    ASSERT_TRUE(crabs_ot_operation_set_payload(&filler, &element_f, 1));
+    ASSERT_EQ(execute_one_ot_op(state_long, "list", &filler), CRABS_SUCCESS);
+    free(filler.payload);
+  }
+
+  crabs_ot_operation_t over_cap_long;
+  crabs_ot_operation_init(&over_cap_long);
+  over_cap_long.op_type = CRABS_OT_OP_INSERT;
+  over_cap_long.visible_pos = 200000;
+  crabs_ot_op_id_init(&over_cap_long.id, "n2", 1, 2000);
+  ASSERT_TRUE(crabs_ot_operation_set_payload(&over_cap_long, &element_x, 1));
+
+  EXPECT_EQ(execute_one_ot_op(state_long, "list", &over_cap_long),
+            CRABS_ERR_OT_POSITION_BOUNDS);
+  free(over_cap_long.payload);
+  state_destroy(state_long);
+}
+
+// The complement: a large-but-legitimate wire position (99999) must be ADMITTED
+// by the cap pre-gate even when the local log would transform it beyond the cap
+// (two logged inserts below it shift it to 100001 during transform). The
+// transformed position is guarded by the apply path's own content-derived
+// bounds (the ordered-set insert clamps to content), so the op applies and the
+// verdict is the same with an empty log and with the shifting log — no
+// CRABS_ERR_OT_POSITION_BOUNDS in either case.
+TEST(OTExecution, PositionCapAdmitsOpBelowCapRegardlessOfLogShift) {
+  // Case 1: empty log — no transform, wire position stands.
+  state_t* state_short = state_create();
+  data_item_t* item_short = crabs_register_ot_type(state_short, "list",
+    DATA_TYPE_OT_ORDERED_SET, nullptr);
+  ASSERT_NE(item_short, nullptr);
+  crabs_ot_ordered_set_t* set_short = (crabs_ot_ordered_set_t*)item_short->value;
+  ASSERT_NE(set_short, nullptr);
+
+  crabs_ot_operation_t below_cap;
+  crabs_ot_operation_init(&below_cap);
+  below_cap.op_type = CRABS_OT_OP_INSERT;
+  below_cap.visible_pos = 99999;
+  crabs_ot_op_id_init(&below_cap.id, "n2", 1, 2000);
+  const uint8_t element_x = 'x';
+  ASSERT_TRUE(crabs_ot_operation_set_payload(&below_cap, &element_x, 1));
+
+  crabs_error_e err_short = execute_one_ot_op(state_short, "list", &below_cap);
+  EXPECT_NE(err_short, CRABS_ERR_OT_POSITION_BOUNDS);
+  EXPECT_EQ(err_short, CRABS_SUCCESS);
+  EXPECT_EQ(crabs_ot_ordered_set_visible_count(set_short), 1u);
+  free(below_cap.payload);
+  state_destroy(state_short);
+
+  // Case 2: a 2-insert log whose transform would push the same op to
+  // 100001 (> cap). Pre-gate admits on the wire position; apply clamps.
+  state_t* state_long = state_create();
+  data_item_t* item_long = crabs_register_ot_type(state_long, "list",
+    DATA_TYPE_OT_ORDERED_SET, nullptr);
+  ASSERT_NE(item_long, nullptr);
+  crabs_ot_ordered_set_t* set_long = (crabs_ot_ordered_set_t*)item_long->value;
+  ASSERT_NE(set_long, nullptr);
+
+  for (uint64_t sequence = 1; sequence <= 2; sequence++) {
+    crabs_ot_operation_t filler;
+    crabs_ot_operation_init(&filler);
+    filler.op_type = CRABS_OT_OP_INSERT;
+    filler.visible_pos = 0;
+    crabs_ot_op_id_init(&filler.id, "n1", sequence, 1000);
+    const uint8_t element_f = 'a' + (uint8_t)(sequence - 1);
+    ASSERT_TRUE(crabs_ot_operation_set_payload(&filler, &element_f, 1));
+    ASSERT_EQ(execute_one_ot_op(state_long, "list", &filler), CRABS_SUCCESS);
+    free(filler.payload);
+  }
+
+  crabs_ot_operation_t below_cap_long;
+  crabs_ot_operation_init(&below_cap_long);
+  below_cap_long.op_type = CRABS_OT_OP_INSERT;
+  below_cap_long.visible_pos = 99999;
+  crabs_ot_op_id_init(&below_cap_long.id, "n2", 1, 2000);
+  ASSERT_TRUE(crabs_ot_operation_set_payload(&below_cap_long, &element_x, 1));
+
+  crabs_error_e err_long = execute_one_ot_op(state_long, "list",
+                                             &below_cap_long);
+  EXPECT_NE(err_long, CRABS_ERR_OT_POSITION_BOUNDS);
+  EXPECT_EQ(err_long, CRABS_SUCCESS);
+  EXPECT_EQ(crabs_ot_ordered_set_visible_count(set_long), 3u);
+  free(below_cap_long.payload);
+  state_destroy(state_long);
+}

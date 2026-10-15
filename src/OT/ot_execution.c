@@ -625,8 +625,9 @@ crabs_error_e crabs_apply_ot_op(data_item_t* item, crabs_ot_operation_t* op) {
 }
 
 // Single-op pipeline shared by the main executor loop and the pending flush
-// (audit pass-3 M): replay-skip, transform against the log, position bounds,
-// apply, log-append with payload re-own, prune. A flushed op is therefore
+// (audit pass-3 M): replay-skip, wire-position bounds (pre-transform so the
+// verdict is log-independent), transform against the log, apply, log-append
+// with payload re-own, prune. A flushed op is therefore
 // indistinguishable from one that arrived in causal order. Returns
 // CRABS_SUCCESS when the op applied or was a replay (already in the log);
 // callers treat other errors per their context (the flush leaves the parked
@@ -643,6 +644,16 @@ static crabs_error_e _apply_one_ot_op(data_item_t* item,
     return CRABS_SUCCESS;
   }
 
+  // Audit pass-3 M: the cap decision must not depend on the local log — a
+  // post-TRANSFORM check is replica-history-dependent (a longer local op log
+  // can push the same op over the cap and diverge accept/reject). Gate the
+  // WIRE-CARRIED position instead (content-determined, identical verdict on
+  // every replica); the transformed position is then guarded by the apply
+  // functions' own content-derived bounds validation.
+  if (ot_op->visible_pos > 100000) {
+    return CRABS_ERR_OT_POSITION_BOUNDS;
+  }
+
   // Transform against concurrent operations in the op log. The local_node_id
   // argument is unused by crabs_transform_ot_op, so NULL is passed here.
   crabs_error_e transform_err = crabs_transform_ot_op(
@@ -650,12 +661,6 @@ static crabs_error_e _apply_one_ot_op(data_item_t* item,
 
   if (transform_err != CRABS_SUCCESS) {
     return transform_err;
-  }
-
-  // Position bounds checking
-  if (ot_op->visible_pos > 100000) {
-    // Basic sanity check for position values
-    return CRABS_ERR_OT_POSITION_BOUNDS;
   }
 
   // Apply the transformed operation
