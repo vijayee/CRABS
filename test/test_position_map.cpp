@@ -5,6 +5,7 @@
 //
 
 #include <gtest/gtest.h>
+#include <cstdint>
 extern "C" {
 #include "../src/OT/position_map.h"
 }
@@ -234,6 +235,24 @@ TEST(PositionMap, XiWithDeletedPositions) {
   EXPECT_EQ(crabs_xi(root, 3), 2u);
   EXPECT_EQ(crabs_xi(root, 4), 3u);
 
+  crabs_bst_destroy(root);
+}
+
+TEST(PositionMap, XiRefusesFullyTombstonedPrefix) {
+  // Sanity (non-underflow): one tombstone before internal_pos=2 shifts by 1.
+  crabs_bst_node_t* sane = NULL;
+  sane = crabs_union_one(sane, 1);
+  EXPECT_EQ(crabs_xi(sane, 2u), 1u);
+  crabs_bst_destroy(sane);
+
+  // Underflow: every position at or before internal_pos is tombstoned, so
+  // offset (=1) exceeds internal_pos (=0). crabs_xi returns the explicit
+  // UINT64_MAX sentinel instead of silently wrapping (audit pass-3 LOW).
+  // Note: 0 - 1 wraps to UINT64_MAX too, so this pins the semantics that the
+  // guard makes explicit rather than a value change.
+  crabs_bst_node_t* root = NULL;
+  root = crabs_union_one(root, 0);
+  EXPECT_EQ(crabs_xi(root, 0u), UINT64_MAX);
   crabs_bst_destroy(root);
 }
 

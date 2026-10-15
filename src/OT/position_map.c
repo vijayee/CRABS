@@ -208,6 +208,11 @@ uint64_t crabs_xi(const crabs_bst_node_t* tree, uint64_t internal_pos) {
       tree = tree->right;
     }
   }
+  // Audit pass-3 LOW: internal_pos - offset wraps when every position at or
+  // before internal_pos is tombstoned (offset > internal_pos). Return an
+  // explicit sentinel instead (no in-tree caller today; any future caller
+  // tests against the sentinel).
+  if (offset > internal_pos) return UINT64_MAX;
   return internal_pos - offset;
 }
 

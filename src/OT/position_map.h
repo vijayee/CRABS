@@ -46,6 +46,8 @@ void              crabs_bst_mark_deleted(crabs_bst_node_t* root, uint64_t value)
 // ============================================================
 
 // xi: internal position -> visible position
+// Returns UINT64_MAX when every position at or before internal_pos is
+// tombstoned (no visible position exists); callers must check the sentinel.
 uint64_t crabs_xi(const crabs_bst_node_t* tree, uint64_t internal_pos);
 
 // xi_inv: visible position -> internal position
