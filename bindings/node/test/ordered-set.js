@@ -124,14 +124,23 @@ for (const machine of [nodeA, nodeB]) {
   machine.addOrderedSet('queue');
 }
 const seedDeps = [{ node: 'node-a', seq: 1 }, { node: 'node-a', seq: 2 }];
+// The pass-3 causal-admission gate (src/OT/ot_execution.c
+// _op_deps_satisfied / _ot_data_pending_push) makes deps load-bearing, not
+// just a transform hint: an op whose declared deps are not yet in the
+// item's log is parked until they arrive, and a dep that NEVER lands parks
+// the op forever (deterministically, on every replica). Deps must therefore
+// be the issuer's true causal context: 'n' (id seq 2) was issued having
+// seen seq 1 ONLY — declaring seq 2 would be a self-dependency no flush can
+// ever satisfy (an op cannot precede itself in the log).
+const nDeps = [seedDeps[0]];
 const insertOn = (machine, element, options) =>
   machine.orderedInsert('queue', element, 0, options);
 
 for (const machine of [nodeA, nodeB]) {
   insertOn(machine, 'm', { id: { node: 'node-a', seq: 1, ts: 2000 } });
 }
-insertOn(nodeA, 'n', { id: { node: 'node-a', seq: 2, ts: 2000 }, deps: seedDeps });
-insertOn(nodeB, 'n', { id: { node: 'node-a', seq: 2, ts: 2000 }, deps: seedDeps });
+insertOn(nodeA, 'n', { id: { node: 'node-a', seq: 2, ts: 2000 }, deps: nDeps });
+insertOn(nodeB, 'n', { id: { node: 'node-a', seq: 2, ts: 2000 }, deps: nDeps });
 
 insertOn(nodeA, 'p', {
   id: { node: 'node-a', seq: 4, ts: 4001 }, deps: [...seedDeps]
