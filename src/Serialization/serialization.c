@@ -371,9 +371,10 @@ static void _serialize_bst_recursive(write_buf_t* buf, const crabs_bst_node_t* r
 // trees. 256 levels comfortably holds any balanced tree of >2^256 nodes.
 #define CRABS_BST_MAX_DESERIALIZE_DEPTH 256
 
-// pass-3 LOW: parsed_nodes (nullable) accumulates the number of nodes
-// actually parsed so callers can compare against the blob's declared count —
-// a mismatch is a non-canonical blob and previously sailed through.
+// pass-3 LOW: parsed_nodes (out-param, always non-NULL) accumulates the
+// number of nodes actually parsed so callers can compare against the blob's
+// declared count — a mismatch is a non-canonical blob and previously sailed
+// through.
 static crabs_bst_node_t* _deserialize_bst_recursive(read_buf_t* buf, uint32_t depth,
                                                     uint32_t* parsed_nodes) {
   if (depth > CRABS_BST_MAX_DESERIALIZE_DEPTH) return NULL;
@@ -389,7 +390,7 @@ static crabs_bst_node_t* _deserialize_bst_recursive(read_buf_t* buf, uint32_t de
   crabs_bst_node_t* node = crabs_bst_create(value);
   if (node == NULL) return NULL;
   node->deleted = (deleted != 0);
-  if (parsed_nodes != NULL) (*parsed_nodes)++;
+  (*parsed_nodes)++;
 
   if (has_left) {
     node->left = _deserialize_bst_recursive(buf, depth + 1, parsed_nodes);
@@ -572,6 +573,13 @@ static bool _deserialize_ot_type_state(read_buf_t* buf, data_item_t* item,
       uint32_t span_count;
       if (!_read_uint32_le(buf, &span_count)) return false;
       if (span_count > CRABS_DESER_MAX_LOG) return false;
+      // pass-3 LOW: bound the count to the remaining buffer (the dup-span
+      // scan below is O(n²); a multi-million-span declaration from a few
+      // bytes would spin it — the same ~10¹² strcmp shape R8-SER-2/3 caps
+      // for tree nodes). Each span costs >= 89 wire bytes: op id (64-byte
+      // node_id + u64 sequence + u64 timestamp = 80) + bytes32 text header
+      // (4, empty) + u32le style_count (4, zero styles) + u8 deleted (1).
+      if (span_count > (buf->len - buf->offset) / 89) return false;
 
       crabs_span_t* tail = NULL;
       crabs_span_t* span = NULL;
@@ -4080,7 +4088,7 @@ crabs_ot_data_item_t* crabs_deserialize_ot_data(const uint8_t* data, size_t len,
   if (!_read_uint32_le(&buf, &type_id)) goto fail;
   // pass-3 LOW: the wire-carried type id MUST agree with the caller's
   // expected type — a disagreeing id is a smuggled cross-type blob.
-  if (type_id != (uint32_t)ot_type_id) goto fail;
+  if (type_id != ot_type_id) goto fail;
 
   // op_log
   uint32_t op_count;
