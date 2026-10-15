@@ -4491,3 +4491,78 @@ TEST(Serialization, OrSetDeserializerRejectsCountBeyondBuffer) {
       << "an element_count the remaining bytes cannot satisfy must be refused";
   if (item != nullptr) data_item_destroy(item);
 }
+
+// ============================================================
+// Audit pass-3 M (Task B2): the state-file item loop
+// (_deserialize_state_internal) skipped the canonical (type, crdt_type) gate
+// the single-item reader (crabs_deserialize_data_item) enforces. A crafted
+// state blob could mint e.g. (DATA_TYPE_COUNTER, CRDT_OR_SET): the value
+// slot parses as a raw int64 while every crdt-dispatched consumer
+// (crdt_merge_value) casts it to or_set_t* and dereferences attacker bytes.
+// The state loop must refuse the pair outright.
+// ============================================================
+
+TEST(Serialization, StateLoadRejectsNonCanonicalTypeCrdtPair) {
+  // Serialize a real state holding one plain COUNTER item with a live
+  // g-counter value, then surgically patch the item's crdt_type byte from
+  // CRDT_G_COUNTER to CRDT_OR_SET and re-seal the trailing SHA-256 checksum
+  // (the bare SHA is integrity-only — the file already patches+reseals in
+  // the keychain-wire tests above for exactly this).
+  state_t* state = state_create();
+  data_item_t* item =
+      data_item_create("victim-counter", DATA_TYPE_COUNTER, CRDT_G_COUNTER);
+  g_counter_t* counter = g_counter_create();
+  ASSERT_EQ(g_counter_increment(counter, "node1", 7), CRABS_SUCCESS);
+  item->value = counter;
+  item->value_repr = DATA_VALUE_REPR_CRDT_STRUCT;
+  state_add_item(state, item);
+
+  serialized_buffer_t* buf = crabs_serialize_state(state);
+  ASSERT_NE(buf, nullptr);
+  state_destroy(state);
+
+  // Sanity: the unpatched blob loads.
+  {
+    state_t* sane = crabs_deserialize_state(buf->data, buf->len);
+    ASSERT_NE(sane, nullptr);
+    state_destroy(sane);
+  }
+
+  // The items section opens at kV14ItemsOffset and the first (only) item
+  // leads with its string16 name, then the u8 type and u8 crdt_type bytes —
+  // the (string16 name, u8, u8) prefix _serialize_data_item emits.
+  const char item_name[] = "victim-counter";
+  const size_t name_field_offset = kV14ItemsOffset;
+  ASSERT_LT(name_field_offset + 2 + strlen(item_name) + 2,
+            buf->len - CRABS_HASH_SIZE);
+  uint16_t stored_name_len =
+      (uint16_t)(buf->data[name_field_offset] |
+                 ((uint16_t)buf->data[name_field_offset + 1] << 8));
+  ASSERT_EQ(stored_name_len, (uint16_t)strlen(item_name));
+  ASSERT_EQ(memcmp(buf->data + name_field_offset + 2, item_name,
+                   strlen(item_name)),
+            0);
+  const size_t type_offset = name_field_offset + 2 + strlen(item_name);
+  const size_t crdt_type_offset = type_offset + 1;
+  ASSERT_EQ(buf->data[type_offset], (uint8_t)DATA_TYPE_COUNTER);
+  ASSERT_EQ(buf->data[crdt_type_offset], (uint8_t)CRDT_G_COUNTER);
+
+  std::vector<uint8_t> tampered(buf->data, buf->data + buf->len);
+  tampered[crdt_type_offset] = (uint8_t)CRDT_OR_SET;
+  uint8_t recomputed_hash[CRABS_HASH_SIZE];
+  SHA256(tampered.data(), tampered.size() - CRABS_HASH_SIZE, recomputed_hash);
+  memcpy(tampered.data() + tampered.size() - CRABS_HASH_SIZE, recomputed_hash,
+         CRABS_HASH_SIZE);
+
+  // Pre-fix this blob LOADED (the raw-int64 value arm parses the counter's
+  // logical bytes fine), leaving an item a later merge would miscast as an
+  // or_set. On failure do NOT destroy the result there — the pre-fix item's
+  // value is an int64 tagged with a set crdt_type and destroy is itself one
+  // of the miscast consumers.
+  state_t* forged = crabs_deserialize_state(tampered.data(), tampered.size());
+  EXPECT_EQ(forged, nullptr)
+      << "a state item with a non-canonical (type, crdt_type) pair must be "
+         "refused at load";
+
+  serialized_buffer_destroy(buf);
+}

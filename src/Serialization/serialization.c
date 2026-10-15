@@ -2654,6 +2654,19 @@ static state_t* _deserialize_state_internal(const uint8_t* data, size_t len,
         goto fail;
       }
     }
+    // pass-3 M: the single-item reader refuses non-canonical (type,
+    // crdt_type) pairs (see crabs_deserialize_data_item) because every
+    // crdt-dispatched consumer (crdt_merge_value) miscasts the value slot.
+    // The state-file item loop skipped that gate, letting a crafted blob
+    // mint a raw int64 tagged as e.g. CRDT_OR_SET — merge then dereferences
+    // attacker bytes. NOTE: only the pair is gated here — persisted items
+    // legitimately carry protocol_state != PROTOCOL_IDLE (the lock pipeline
+    // mid-flight), so the single-item reader's protocol_state clause must
+    // NOT apply to the state file.
+    if (!data_item_type_crdt_pair_canonical(item->type, item->crdt_type)) {
+      data_item_destroy(item);
+      goto fail;
+    }
     if (state->items == NULL) {
       state->items = item;
       tail = item;
