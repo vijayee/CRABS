@@ -578,6 +578,128 @@ try {
   assert(node.getRegister('guard_slot') === -7, 'integer -7 should land');
 }
 
+// u64 entry gates (audit pass-3 LOW): every entry point that feeds a C
+// uint64 parameter must refuse an out-of-range JS value BEFORE the
+// double→uint64 conversion — a negative double is an out-of-range
+// float→int conversion (undefined behavior) and fractional/huge values
+// truncated or wrapped silently. All these gates run through the shared
+// require_u64_numeric helper (safe non-negative integer, or BigInt).
+{
+  const gateNode = new Node('gate-admin', { ordering: 'hlc' });
+  const mustGateThrow = (invoke, errorType, fragment, label) => {
+    let caught = null;
+    try { invoke(); } catch (caughtError) { caught = caughtError; }
+    assert(caught !== null, `${label}: expected a throw`);
+    assert(caught instanceof errorType,
+      `${label}: expected ${errorType.name}, got ` +
+      `${caught && caught.constructor.name}: "${caught && caught.message}"`);
+    assert(caught && caught.message.includes(fragment),
+      `${label}: expected message containing "${fragment}", ` +
+      `got "${caught && caught.message}"`);
+  };
+
+  // setTime nowMs: negative/fractional/non-number refuse; a BigInt is
+  // accepted (mirrors the schedule-id number|bigint convention).
+  mustGateThrow(() => gateNode.setTime(-1), RangeError,
+    'setTime: nowMs must be an integer 0..2^53-1', 'setTime(-1)');
+  mustGateThrow(() => gateNode.setTime(1.5), RangeError,
+    'setTime: nowMs must be an integer 0..2^53-1', 'setTime(1.5)');
+  mustGateThrow(() => gateNode.setTime('1000'), TypeError,
+    'setTime: nowMs must be a non-negative number or bigint',
+    'setTime(string)');
+  let bigintTimeAccepted = true;
+  let bigintTimeError = '';
+  try { gateNode.setTime((2n ** 64n) - 1n); }
+  catch (refusal) {
+    bigintTimeAccepted = false;
+    bigintTimeError = String(refusal && refusal.message);
+  }
+  assert(bigintTimeAccepted,
+    `setTime(BigInt(2^64-1)) should be accepted, got "${bigintTimeError}"`);
+  gateNode.setTime(1000);
+
+  // Blueprint ttlMs (4-arg constructor path).
+  mustGateThrow(
+    () => new Blueprint('gate-child', 'shared_root', 'gate-admin', -1),
+    RangeError, 'Blueprint: ttlMs must be an integer 0..2^53-1',
+    'Blueprint(ttlMs: -1)');
+  mustGateThrow(
+    () => new Blueprint('gate-child', 'shared_root', 'gate-admin', 0.5),
+    RangeError, 'Blueprint: ttlMs must be an integer 0..2^53-1',
+    'Blueprint(ttlMs: 0.5)');
+
+  // flagSet setAt.
+  gateNode.addOneShotFlag('gate_flag');
+  mustGateThrow(() => gateNode.flagSet('gate_flag', 'gate-admin', -5),
+    RangeError, 'flagSet: setAt must be an integer 0..2^53-1',
+    'flagSet(setAt: -5)');
+  mustGateThrow(() => gateNode.flagSet('gate_flag', 'gate-admin', 2.5),
+    RangeError, 'flagSet: setAt must be an integer 0..2^53-1',
+    'flagSet(setAt: 2.5)');
+  gateNode.flagSet('gate_flag', 'gate-admin', 7);
+  assert(gateNode.flagValue('gate_flag') === true,
+    'flagSet with a valid setAt still lands');
+
+  // attachRaft seed and the timers read through the now-gated read_u64
+  // lambda (a huge double formerly hit the out-of-range UB cast inside the
+  // value > 0 branch).
+  mustGateThrow(() => gateNode.attachRaft({ peers: ['gate-admin'], seed: -5 }),
+    RangeError, 'attachRaft: seed must be an integer 0..2^53-1',
+    'attachRaft({seed: -5})');
+  mustGateThrow(() => gateNode.attachRaft({ peers: ['gate-admin'], seed: 3.9 }),
+    RangeError, 'attachRaft: seed must be an integer 0..2^53-1',
+    'attachRaft({seed: 3.9})');
+  {
+    const timerGateNode = new Node('timer-gate');
+    mustGateThrow(() => timerGateNode.attachRaft(
+        { peers: ['timer-gate'], heartbeatMs: 1e300 }),
+      RangeError, 'attachRaft: heartbeatMs must be an integer 0..2^53-1',
+      'attachRaft({heartbeatMs: 1e300})');
+    mustGateThrow(() => timerGateNode.attachRaft(
+        { peers: ['timer-gate'], electionMinMs: 12.5 }),
+      RangeError, 'attachRaft: electionMinMs must be an integer 0..2^53-1',
+      'attachRaft({electionMinMs: 12.5})');
+    // Valid timers still attach.
+    const okRaftNode = new Node('ok-raft', { ordering: 'hlc' });
+    okRaftNode.attachRaft({
+      peers: ['ok-raft'], electionMinMs: 80, electionMaxMs: 160,
+      heartbeatMs: 50, seed: 0,
+    });
+    assert(okRaftNode.raftStatus() !== null,
+      'attachRaft with in-range config still attaches');
+  }
+
+  // createTrigger cooldownMs / durationMs.
+  const triggerGateNode = new Node('trigger-gate', { ordering: 'hlc' });
+  triggerGateNode.addCounter('reports');
+  triggerGateNode.setPolicy('__create_trigger__', 'role:admin');
+  const baseTrigger = {
+    triggerId: 'gate_trigger',
+    condition: 'reports >= 1',
+    effectType: 'issue_attribute',
+    issueAttribute: 'flagged',
+    targetRole: 'role',
+    attributeValue: 'member',
+  };
+  mustGateThrow(() => triggerGateNode.createTrigger(
+      { ...baseTrigger, cooldownMs: -1 }),
+    RangeError, 'createTrigger: cooldownMs must be an integer 0..2^53-1',
+    'createTrigger(cooldownMs: -1)');
+  mustGateThrow(() => triggerGateNode.createTrigger(
+      { ...baseTrigger, durationMs: 0.25 }),
+    RangeError, 'createTrigger: durationMs must be an integer 0..2^53-1',
+    'createTrigger(durationMs: 0.25)');
+
+  // encrypt payload: a non-Buffer is refused at the wrapper instead of
+  // flowing a failed napi_get_buffer_info (nullptr/0) into
+  // crypto_abe_encrypt and surfacing as a generic cryptographic error.
+  mustGateThrow(() => gateNode.encrypt('not-a-buffer', 'gate_admin'),
+    TypeError, 'encrypt: payload must be a Buffer',
+    'encrypt(string payload)');
+  mustGateThrow(() => gateNode.encrypt(42, 'gate_admin'), TypeError,
+    'encrypt: payload must be a Buffer', 'encrypt(number payload)');
+}
+
 // Wire-version diagnostics (consumption-fixes finding 5): the constants are
 // exposed (no JS mirror drift), frozen, and match the documented build
 // values. Operation.getWireVersion() reports the active op format on a

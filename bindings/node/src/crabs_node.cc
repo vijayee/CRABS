@@ -658,10 +658,11 @@ public:
       throw Napi::TypeError::New(env,
           "trustMode must be 'shared_root' | 'delegated_copy' | 'sovereign' "
           "or the matching TRUST_MODE number");
-    if (!info[3].IsNumber())
-      throw Napi::TypeError::New(env, "ttlMs must be a number");
-    uint64_t attestation_ttl_ms =
-        (uint64_t)info[3].As<Napi::Number>().DoubleValue();
+    // Gated BEFORE the double→uint64 conversion: a negative or fractional
+    // ttlMs is an out-of-range float→int conversion (UB) or a silent
+    // truncation; BigInts carry the full u64 range.
+    const uint64_t attestation_ttl_ms =
+        require_u64_numeric(info[3], "Blueprint", "ttlMs");
 
     bp_ = machine_blueprint_create();
     if (bp_ == nullptr) throw Napi::Error::New(env, "Failed to allocate blueprint");
@@ -1102,7 +1103,7 @@ private:
     return Napi::Number::New(info.Env(), (double)op_->op_version);
   }
   void SetLamportTime(const Napi::CallbackInfo& info, const Napi::Value& val) {
-    op_->lamport_time = (uint64_t)val.As<Napi::Number>().DoubleValue();
+    op_->lamport_time = require_u64_numeric(val, "lamportTime", "value");
   }
 
   // Append a resource name to the op — the shared wire-array growth helper
@@ -3072,7 +3073,8 @@ private:
     Napi::Env env = info.Env();
     std::string name = require_js_string(info[0], "flagSet", "name");
     std::string setBy = require_js_string(info[1], "flagSet", "setBy");
-    uint64_t setAt = info.Length() > 2 ? (uint64_t)info[2].As<Napi::Number>().DoubleValue() : 0;
+    uint64_t setAt = info.Length() > 2
+        ? require_u64_numeric(info[2], "flagSet", "setAt") : 0;
     data_item_t* item = state_find_item(&am_->base_state, name.c_str());
     if (!item) throw crabs_error(env, CRABS_ERR_RESOURCE_NOT_FOUND, "flagSet");
     one_shot_flag_set((one_shot_flag_t*)item->value, setBy.c_str(), setAt);
@@ -4604,7 +4606,9 @@ private:
     std::string description = cfg.Has("description")
         ? require_js_string(cfg.Get("description"), "createTrigger", "description")
         : "";
-    uint64_t cooldown = cfg.Has("cooldownMs") ? (uint64_t)cfg.Get("cooldownMs").As<Napi::Number>().DoubleValue() : 0;
+    uint64_t cooldown = cfg.Has("cooldownMs")
+        ? require_u64_numeric(cfg.Get("cooldownMs"), "createTrigger", "cooldownMs")
+        : 0;
     bool one_shot = cfg.Has("oneShot") ? cfg.Get("oneShot").As<Napi::Boolean>().Value() : false;
 
     // Build payload string. Audit 9 A-1: snprintf returns the WOULD-BE
@@ -4629,7 +4633,9 @@ private:
           cfg.Get("targetRole"), "createTrigger", "targetRole");
       std::string value = require_js_string(
           cfg.Get("attributeValue"), "createTrigger", "attributeValue");
-      uint64_t duration = cfg.Has("durationMs") ? (uint64_t)cfg.Get("durationMs").As<Napi::Number>().DoubleValue() : 0;
+      uint64_t duration = cfg.Has("durationMs")
+          ? require_u64_numeric(cfg.Get("durationMs"), "createTrigger", "durationMs")
+          : 0;
       written = snprintf(payload + pos, sizeof(payload) - pos,
         ";issue_attribute=%s;target_role=%s;attribute_value=%s;duration_ms=%llu",
         attr.c_str(), role.c_str(), value.c_str(), (unsigned long long)duration);
@@ -4846,6 +4852,11 @@ private:
     Napi::Env env = info.Env();
     if (info.Length() < 2)
       throw Napi::TypeError::New(env, "Expected (payload, policy)");
+    // Gate at the wrapper like the peer methods: a non-Buffer here fails
+    // napi_get_buffer_info with a vague "Invalid argument" Error instead of
+    // a typed refusal naming the argument.
+    if (!info[0].IsBuffer())
+      throw Napi::TypeError::New(env, "encrypt: payload must be a Buffer");
     auto buf = info[0].As<Napi::Buffer<uint8_t>>();
     std::string policy = require_js_string(info[1], "encrypt", "policy");
 
@@ -5590,7 +5601,9 @@ private:
 
   Napi::Value SetTime(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
-    uint64_t now_ms = info[0].As<Napi::Number>().DoubleValue();
+    if (info.Length() < 1)
+      throw Napi::TypeError::New(env, "setTime: nowMs is required");
+    const uint64_t now_ms = require_u64_numeric(info[0], "setTime", "nowMs");
     attribute_machine_set_time(am_, now_ms);
     return env.Undefined();
   }
@@ -5653,10 +5666,21 @@ private:
               CRABS_MAX_USER_ID - 1);
       config.peer_ids[index][CRABS_MAX_USER_ID - 1] = '\0';
     }
+    // read_u64: a missing/non-number/non-positive timer keeps the module
+    // default; a present positive value is gated BEFORE the double→uint64
+    // conversion (the old `value > 0 ? (uint64_t)value : fallback` cast a
+    // huge or fractional double straight through the value > 0 branch —
+    // out-of-range float→int UB or a silent truncation).
     auto read_u64 = [&](const char* key, uint64_t fallback) -> uint64_t {
       if (!opts.Has(key) || !opts.Get(key).IsNumber()) return fallback;
-      double value = opts.Get(key).As<Napi::Number>().DoubleValue();
-      return value > 0 ? (uint64_t)value : fallback;
+      const double value = opts.Get(key).As<Napi::Number>().DoubleValue();
+      if (value <= 0) return fallback;
+      if (!std::isfinite(value) || value >= 9007199254740992.0 ||
+          value != floor(value))
+        throw Napi::RangeError::New(env,
+            std::string("attachRaft: ") + key +
+            " must be an integer 0..2^53-1");
+      return (uint64_t)value;
     };
     config.election_timeout_min_ms = read_u64("electionMinMs",
                                               config.election_timeout_min_ms);
@@ -5664,8 +5688,8 @@ private:
                                               config.election_timeout_max_ms);
     config.heartbeat_interval_ms = read_u64("heartbeatMs",
                                             config.heartbeat_interval_ms);
-    if (opts.Has("seed") && opts.Get("seed").IsNumber())
-      config.seed = (uint64_t)opts.Get("seed").As<Napi::Number>().DoubleValue();
+    if (opts.Has("seed") && !opts.Get("seed").IsUndefined())
+      config.seed = require_u64_numeric(opts.Get("seed"), "attachRaft", "seed");
 
     crabs_raft_module_t* module = crabs_raft_module_create(&config);
     if (!module) throw Napi::Error::New(env, "attachRaft: module create failed");
@@ -5681,8 +5705,8 @@ private:
   Napi::Value RaftTick(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
     ensure_raft_attached(env, "raftTick");
-    uint64_t now_ms = info.Length() > 0 && info[0].IsNumber()
-        ? (uint64_t)info[0].As<Napi::Number>().DoubleValue()
+    uint64_t now_ms = info.Length() > 0 && !info[0].IsUndefined()
+        ? require_u64_numeric(info[0], "raftTick", "nowMs")
         : (uint64_t)(std::chrono::duration_cast<std::chrono::milliseconds>(
               std::chrono::system_clock::now().time_since_epoch()).count());
     auto rc = crabs_raft_module_tick(raft_module_, now_ms);
@@ -5708,10 +5732,11 @@ private:
     ensure_raft_attached(env, "raftPersistComplete");
     if (info.Length() < 2 || !info[1].IsBoolean())
       throw Napi::TypeError::New(env, "raftPersistComplete: (handle, ok:boolean)");
-    bool raft_handle_lossless = false;
-    uint64_t handle = info[0].IsBigInt()
-        ? info[0].As<Napi::BigInt>().Uint64Value(&raft_handle_lossless)
-        : (uint64_t)info[0].As<Napi::Number>().DoubleValue();
+    // require_u64_numeric covers the BigInt path WITH the lossless check
+    // (the old code captured it and ignored it) and the number path with a
+    // range/no-fraction gate before the conversion.
+    const uint64_t handle =
+        require_u64_numeric(info[0], "raftPersistComplete", "handle");
     crabs_error_e rc = crabs_raft_module_persist_complete(
         raft_module_, handle, info[1].As<Napi::Boolean>().Value());
     return Napi::Number::New(env, (double)rc);
@@ -5737,8 +5762,8 @@ private:
 
   Napi::Value RaftPump(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
-    uint64_t now_ms = info.Length() > 0 && info[0].IsNumber()
-        ? (uint64_t)info[0].As<Napi::Number>().DoubleValue()
+    uint64_t now_ms = info.Length() > 0 && !info[0].IsUndefined()
+        ? require_u64_numeric(info[0], "raftPump", "nowMs")
         : (uint64_t)(std::chrono::duration_cast<std::chrono::milliseconds>(
               std::chrono::system_clock::now().time_since_epoch()).count());
     auto rc = state_raft_process_notifications_at(&am_->base_state, now_ms);
