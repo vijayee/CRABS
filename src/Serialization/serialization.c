@@ -866,6 +866,21 @@ static void* _deserialize_crdt_value(const uint8_t* data, uint32_t len, data_typ
       if (!s) return NULL;
       uint32_t ec;
       if (!_read_uint32_le(&rb, &ec)) { or_set_destroy(s); return NULL; }
+      // Audit pass-3 M: cap (the ordered sets' rationale) AND a
+      // remaining-bytes bound: each observed element pair costs >= 4 wire
+      // bytes (two empty string16). Without these the parse loop is O(n^2)
+      // pair-dedup strcmp + realloc-per-add churn before the buffer
+      // exhaustion aborts it.
+      if ((uint64_t)ec > CRABS_DESER_MAX_SET_ELEMENTS ||
+          (uint64_t)ec * 4u > rb.len - rb.offset) { or_set_destroy(s); return NULL; }
+      // Pre-reserve: or_set_add reallocs the whole array per add (the
+      // pair-dedup scan stays — it is semantic). or_set_add's realloc to
+      // element_count+1 (<= ec) against the pre-grown block is a same-or-
+      // smaller realloc, so the growth churn collapses to no-op reallocs.
+      if (ec > 0) {
+        s->elements = (or_set_entry_t*)realloc(s->elements, sizeof(or_set_entry_t) * ec);
+        if (!s->elements) { or_set_destroy(s); return NULL; }
+      }
       for (uint32_t i = 0; i < ec; i++) {
         char elem[CRABS_MAX_USER_ID]; char tag[CRABS_MAX_USER_ID];
         if (!_read_string16(&rb, elem, sizeof(elem)) || !_read_string16(&rb, tag, sizeof(tag))) { or_set_destroy(s); return NULL; }
@@ -873,13 +888,21 @@ static void* _deserialize_crdt_value(const uint8_t* data, uint32_t len, data_typ
       }
       uint32_t tc;
       if (!_read_uint32_le(&rb, &tc)) { or_set_destroy(s); return NULL; }
+      // Same cap + byte-bound for the tombstone count (4 wire bytes per
+      // observed tombstone pair).
+      if ((uint64_t)tc > CRABS_DESER_MAX_SET_ELEMENTS ||
+          (uint64_t)tc * 4u > rb.len - rb.offset) { or_set_destroy(s); return NULL; }
+      // Pre-reserve the tombstone array once instead of the per-iteration
+      // realloc the reconstruction loop used to do.
+      if (tc > 0) {
+        s->tombstones = (or_set_entry_t*)realloc(s->tombstones, sizeof(or_set_entry_t) * tc);
+        if (!s->tombstones) { or_set_destroy(s); return NULL; }
+      }
       for (uint32_t i = 0; i < tc; i++) {
         char elem[CRABS_MAX_USER_ID]; char tag[CRABS_MAX_USER_ID];
         if (!_read_string16(&rb, elem, sizeof(elem)) || !_read_string16(&rb, tag, sizeof(tag))) { or_set_destroy(s); return NULL; }
         // Reconstruct tombstone directly (or_set_remove would consume by element only)
         uint32_t idx = s->tombstone_count;
-        s->tombstones = realloc(s->tombstones, (idx + 1) * sizeof(or_set_entry_t));
-        if (!s->tombstones) { or_set_destroy(s); return NULL; }
         s->tombstones[idx].element = platform_strdup(elem);
         s->tombstones[idx].tag = platform_strdup(tag);
         s->tombstone_count = idx + 1;
@@ -891,6 +914,15 @@ static void* _deserialize_crdt_value(const uint8_t* data, uint32_t len, data_typ
       if (!s) return NULL;
       uint32_t ac;
       if (!_read_uint32_le(&rb, &ac)) { two_p_set_destroy(s); return NULL; }
+      // Audit pass-3 M: cap + remaining-bytes bound (each add-set element is
+      // at least an empty string16 — 2 wire bytes) before the churning loop.
+      if ((uint64_t)ac > CRABS_DESER_MAX_SET_ELEMENTS ||
+          (uint64_t)ac * 2u > rb.len - rb.offset) { two_p_set_destroy(s); return NULL; }
+      // Pre-reserve: two_p_set_add reallocs to add_count+1 (<= ac) per add.
+      if (ac > 0) {
+        s->add_set = (char**)realloc(s->add_set, sizeof(char*) * ac);
+        if (!s->add_set) { two_p_set_destroy(s); return NULL; }
+      }
       for (uint32_t i = 0; i < ac; i++) {
         char e[CRABS_MAX_USER_ID];
         if (!_read_string16(&rb, e, sizeof(e))) { two_p_set_destroy(s); return NULL; }
@@ -898,6 +930,12 @@ static void* _deserialize_crdt_value(const uint8_t* data, uint32_t len, data_typ
       }
       uint32_t rc2;
       if (!_read_uint32_le(&rb, &rc2)) { two_p_set_destroy(s); return NULL; }
+      if ((uint64_t)rc2 > CRABS_DESER_MAX_SET_ELEMENTS ||
+          (uint64_t)rc2 * 2u > rb.len - rb.offset) { two_p_set_destroy(s); return NULL; }
+      if (rc2 > 0) {
+        s->remove_set = (char**)realloc(s->remove_set, sizeof(char*) * rc2);
+        if (!s->remove_set) { two_p_set_destroy(s); return NULL; }
+      }
       for (uint32_t i = 0; i < rc2; i++) {
         char e[CRABS_MAX_USER_ID];
         if (!_read_string16(&rb, e, sizeof(e))) { two_p_set_destroy(s); return NULL; }
@@ -910,6 +948,17 @@ static void* _deserialize_crdt_value(const uint8_t* data, uint32_t len, data_typ
       if (!s) return NULL;
       uint32_t ec;
       if (!_read_uint32_le(&rb, &ec)) { one_shot_set_destroy(s); return NULL; }
+      // Audit pass-3 M: cap + remaining-bytes bound (2 wire bytes per
+      // element). Past CRABS_ONE_SHOT_SET_MAX the adds are refused inside
+      // one_shot_set_add, but the loop would still read/dedup-scan ec
+      // entries without this gate.
+      if ((uint64_t)ec > CRABS_DESER_MAX_SET_ELEMENTS ||
+          (uint64_t)ec * 2u > rb.len - rb.offset) { one_shot_set_destroy(s); return NULL; }
+      // Pre-reserve: one_shot_set_add reallocs to element_count+1 (<= ec).
+      if (ec > 0) {
+        s->elements = (char**)realloc(s->elements, sizeof(char*) * ec);
+        if (!s->elements) { one_shot_set_destroy(s); return NULL; }
+      }
       for (uint32_t i = 0; i < ec; i++) {
         char e[CRABS_MAX_USER_ID];
         if (!_read_string16(&rb, e, sizeof(e))) { one_shot_set_destroy(s); return NULL; }

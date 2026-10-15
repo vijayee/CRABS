@@ -4388,3 +4388,106 @@ TEST(OTDataWire, OpLogCountBoundedAgainstRemainingWireBytes) {
   EXPECT_EQ(crabs_deserialize_ot_data(blob.data(), blob.size(), 1), nullptr)
       << "a few-byte packet must not pre-allocate ~1.4 GB of op log";
 }
+
+// ============================================================
+// Audit pass-3 M (Task B1): the OR-set / 2P-set / one-shot-set deserializers
+// read attacker-controlled element/tombstone counts with NO cap and NO
+// remaining-buffer bound (the ordered sets got CRABS_DESER_MAX_SET_ELEMENTS
+// for exactly this). Every or_set_add is an O(n) pair-dedup scan plus a
+// whole-array realloc, so a crafted count drives O(n^2) comparisons and
+// realloc churn before buffer exhaustion finally aborts the loop.
+// ============================================================
+
+// Builds the durable single-item wire form crabs_deserialize_data_item
+// parses (string16 name, u8 type, u8 crdt, u8 protocol_state, bytes32 value,
+// u8 invariant_count, u64 last_compaction_time) around a caller-crafted
+// DATA_TYPE_SET value payload.
+namespace {
+
+struct ItemWireBuilder {
+  std::vector<uint8_t> bytes;
+
+  void push_u8(uint8_t value) { bytes.push_back(value); }
+  void push_u16(uint16_t value) {
+    bytes.push_back((uint8_t)(value & 0xFF));
+    bytes.push_back((uint8_t)((value >> 8) & 0xFF));
+  }
+  void push_u32(uint32_t value) {
+    bytes.push_back((uint8_t)(value & 0xFF));
+    bytes.push_back((uint8_t)((value >> 8) & 0xFF));
+    bytes.push_back((uint8_t)((value >> 16) & 0xFF));
+    bytes.push_back((uint8_t)((value >> 24) & 0xFF));
+  }
+  void push_u64(uint64_t value) {
+    for (int shift = 0; shift < 8; shift++) {
+      bytes.push_back((uint8_t)((value >> (shift * 8)) & 0xFF));
+    }
+  }
+  void push_string16(const char* str) {
+    uint16_t length = (uint16_t)strlen(str);
+    push_u16(length);
+    bytes.insert(bytes.end(), str, str + length);
+  }
+};
+
+std::vector<uint8_t> BuildOrSetItemWire(const std::vector<uint8_t>& value_payload) {
+  ItemWireBuilder wire;
+  wire.push_string16("crafted");                 // name
+  wire.push_u8((uint8_t)DATA_TYPE_SET);          // type_id
+  wire.push_u8((uint8_t)CRDT_OR_SET);            // crdt_type_id
+  wire.push_u8((uint8_t)PROTOCOL_IDLE);          // protocol_state
+  wire.push_u32((uint32_t)value_payload.size()); // bytes32 value
+  wire.bytes.insert(wire.bytes.end(), value_payload.begin(), value_payload.end());
+  wire.push_u8(0);                               // invariant_count
+  wire.push_u64(0);                              // last_compaction_time
+  return wire.bytes;
+}
+
+} // namespace
+
+TEST(Serialization, OrSetDeserializerRejectsUnsatisfiableCount) {
+  // element_count sits ABOVE CRABS_DESER_MAX_SET_ELEMENTS (10000) with the
+  // full element data actually behind it — buffer exhaustion is not what
+  // stops this parse pre-fix; the count cap must. Empty (element, tag) pairs
+  // keep the pre-fix path fast (pair-dedup collapses them to one entry).
+  ItemWireBuilder value;
+  const uint32_t element_count = 10001;
+  value.push_u32(element_count);
+  for (uint32_t index = 0; index < element_count; index++) {
+    value.push_string16("");
+    value.push_string16("");
+  }
+  value.push_u32(0); // tombstone_count
+
+  std::vector<uint8_t> blob = BuildOrSetItemWire(value.bytes);
+  data_item_t* item = crabs_deserialize_data_item(blob.data(), blob.size());
+  // The cap refuses the value during _deserialize_crdt_value, leaving the
+  // item valueless (the item-shape reader tolerates a NULL CRDT value).
+  // Pre-fix the parse SUCCEEDED with a live or_set, so this is FALSE there.
+  EXPECT_TRUE(item == nullptr || item->value == nullptr)
+      << "an element_count above CRABS_DESER_MAX_SET_ELEMENTS must be refused";
+  if (item != nullptr) data_item_destroy(item);
+}
+
+TEST(Serialization, OrSetDeserializerRejectsCountBeyondBuffer) {
+  // element_count is UNDER the cap but declares 5000 pairs (= 20000 minimum
+  // wire bytes) behind only ~16 bytes of actual element data — the
+  // remaining-bytes bound must refuse it before the loop churns. (Pre-fix
+  // the loop also ends in a NULL value via buffer exhaustion, so this
+  // assertion holds on BOTH sides; it pins the behavior as a regression
+  // guard — the pre-fix defect is the O(n^2)/realloc churn on the way,
+  // which output assertions cannot discriminate.)
+  ItemWireBuilder value;
+  value.push_u32(5000);
+  for (int index = 0; index < 4; index++) {
+    value.push_string16("");
+    value.push_string16("");
+  }
+  value.push_u32(0); // tombstone_count
+
+  std::vector<uint8_t> blob = BuildOrSetItemWire(value.bytes);
+  data_item_t* item = crabs_deserialize_data_item(blob.data(), blob.size());
+  EXPECT_TRUE(item == nullptr || item->value == nullptr)
+      << "an element_count the remaining bytes cannot satisfy must be refused";
+  if (item != nullptr) data_item_destroy(item);
+}
