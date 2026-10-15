@@ -4515,7 +4515,7 @@ TEST(Serialization, StateLoadRejectsNonCanonicalTypeCrdtPair) {
   ASSERT_EQ(g_counter_increment(counter, "node1", 7), CRABS_SUCCESS);
   item->value = counter;
   item->value_repr = DATA_VALUE_REPR_CRDT_STRUCT;
-  state_add_item(state, item);
+  ASSERT_EQ(state_add_item(state, item), CRABS_SUCCESS);
 
   serialized_buffer_t* buf = crabs_serialize_state(state);
   ASSERT_NE(buf, nullptr);
