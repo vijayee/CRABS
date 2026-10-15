@@ -104,6 +104,11 @@ typedef struct {
   // peer's forever-pending garbage. In-memory only: a restart defers
   // re-delivered ops again (state merges re-deliver op logs, so the queue
   // refills from the merged log).
+  // Residual (quality review): the op-log pruner only retains ops named by
+  // RETAINED entries' declared deps — a parked op's deps are invisible to
+  // the pruner, so its cause can be pruned while it waits, stranding it
+  // (fail-closed, bounded by the cap). Fixing needs the pruner to walk the
+  // pending set too; defer until a pruning use-case needs it.
   crabs_ot_operation_t* pending_ops;
   uint32_t              pending_count;
   uint32_t              pending_capacity;

@@ -694,3 +694,115 @@ TEST(OTExecution, OpWithPermanentlyMissingDepStaysParkedWithoutDuplicates) {
   free(stranded.payload);
   state_destroy(state);
 }
+
+// A parked op can be the cause of another parked op: op B depends on op A,
+// and A depends on op C. While C is missing both A and B park. When C lands,
+// the flush loop applies A (round against the refreshed log) and then B —
+// the pending set drains completely instead of only one hop per delivery.
+TEST(OTExecution, ChainedParkedOpsFlushInOrder) {
+  state_t* state = state_create();
+  data_item_t* item = crabs_register_ot_type(state, "list",
+    DATA_TYPE_OT_ORDERED_SET, nullptr);
+  ASSERT_NE(item, nullptr);
+  crabs_ot_data_item_t* ot_data = (crabs_ot_data_item_t*)item->ot_data;
+  ASSERT_NE(ot_data, nullptr);
+  crabs_ot_ordered_set_t* set = (crabs_ot_ordered_set_t*)item->value;
+  ASSERT_NE(set, nullptr);
+
+  // Op A: depends on the (not-yet-arrived) cause C (n1 seq 1).
+  crabs_ot_operation_t op_a;
+  crabs_ot_operation_init(&op_a);
+  op_a.op_type = CRABS_OT_OP_INSERT;
+  op_a.visible_pos = 0;
+  crabs_ot_op_id_init(&op_a.id, "n2", 1, 2000);
+  crabs_ot_op_id_t cause_id = make_id("n1", 1, 1000);
+  ASSERT_TRUE(crabs_ot_operation_add_dep(&op_a, &cause_id));
+  const uint8_t element_a = 'a';
+  ASSERT_TRUE(crabs_ot_operation_set_payload(&op_a, &element_a, 1));
+
+  // Op B: depends on op A (n2 seq 1) — also not yet in the log.
+  crabs_ot_operation_t op_b;
+  crabs_ot_operation_init(&op_b);
+  op_b.op_type = CRABS_OT_OP_INSERT;
+  op_b.visible_pos = 0;
+  crabs_ot_op_id_init(&op_b.id, "n2", 2, 3000);
+  crabs_ot_op_id_t op_a_id = make_id("n2", 1, 2000);
+  ASSERT_TRUE(crabs_ot_operation_add_dep(&op_b, &op_a_id));
+  const uint8_t element_b = 'b';
+  ASSERT_TRUE(crabs_ot_operation_set_payload(&op_b, &element_b, 1));
+
+  // B arrives first and parks on A; A arrives and parks on C.
+  EXPECT_EQ(execute_one_ot_op(state, "list", &op_b), CRABS_SUCCESS);
+  EXPECT_EQ(execute_one_ot_op(state, "list", &op_a), CRABS_SUCCESS);
+  EXPECT_EQ(crabs_ot_ordered_set_visible_count(set), 0u);
+  EXPECT_EQ(ot_data->op_log_count, 0u);
+  EXPECT_EQ(ot_data->pending_count, 2u);
+
+  // C lands: applies directly; the flush pass applies A and then B.
+  crabs_ot_operation_t cause;
+  crabs_ot_operation_init(&cause);
+  cause.op_type = CRABS_OT_OP_INSERT;
+  cause.visible_pos = 0;
+  crabs_ot_op_id_init(&cause.id, "n1", 1, 1000);
+  const uint8_t element_c = 'c';
+  ASSERT_TRUE(crabs_ot_operation_set_payload(&cause, &element_c, 1));
+
+  EXPECT_EQ(execute_one_ot_op(state, "list", &cause), CRABS_SUCCESS);
+
+  EXPECT_EQ(crabs_ot_ordered_set_visible_count(set), 3u);
+  EXPECT_EQ(ot_data->op_log_count, 3u);
+  EXPECT_EQ(ot_data->pending_count, 0u);
+
+  free(op_a.payload);
+  free(op_b.payload);
+  free(cause.payload);
+  state_destroy(state);
+}
+
+// The pending-set cap (CRABS_OT_MAX_PENDING_OPS) bounds a Byzantine peer's
+// forever-pending garbage: the 513th distinct dep-blocked op must be refused
+// with an error rather than parked.
+TEST(OTExecution, PendingSetCapRejectsOverflow) {
+  state_t* state = state_create();
+  data_item_t* item = crabs_register_ot_type(state, "list",
+    DATA_TYPE_OT_ORDERED_SET, nullptr);
+  ASSERT_NE(item, nullptr);
+  crabs_ot_data_item_t* ot_data = (crabs_ot_data_item_t*)item->ot_data;
+  ASSERT_NE(ot_data, nullptr);
+
+  crabs_ot_op_id_t ghost_dep = make_id("ghost", 1, 9999);
+  const uint8_t element = 'x';
+
+  // Park the cap's worth of distinct dep-blocked ops — every deferral is a
+  // normal success while the cause is nominally in flight.
+  for (uint32_t sequence = 1; sequence <= CRABS_OT_MAX_PENDING_OPS;
+       sequence++) {
+    crabs_ot_operation_t parked_op;
+    crabs_ot_operation_init(&parked_op);
+    parked_op.op_type = CRABS_OT_OP_INSERT;
+    parked_op.visible_pos = 0;
+    crabs_ot_op_id_init(&parked_op.id, "n2", sequence, 1000);
+    ASSERT_TRUE(crabs_ot_operation_add_dep(&parked_op, &ghost_dep));
+    ASSERT_TRUE(crabs_ot_operation_set_payload(&parked_op, &element, 1));
+    EXPECT_EQ(execute_one_ot_op(state, "list", &parked_op), CRABS_SUCCESS)
+      << "sequence " << sequence;
+    free(parked_op.payload);
+  }
+  EXPECT_EQ(ot_data->pending_count, (uint32_t)CRABS_OT_MAX_PENDING_OPS);
+
+  // The next distinct deferral overflows the cap: the executor fails closed.
+  crabs_ot_operation_t overflow_op;
+  crabs_ot_operation_init(&overflow_op);
+  overflow_op.op_type = CRABS_OT_OP_INSERT;
+  overflow_op.visible_pos = 0;
+  crabs_ot_op_id_init(&overflow_op.id, "n2", CRABS_OT_MAX_PENDING_OPS + 1,
+                      1000);
+  ASSERT_TRUE(crabs_ot_operation_add_dep(&overflow_op, &ghost_dep));
+  ASSERT_TRUE(crabs_ot_operation_set_payload(&overflow_op, &element, 1));
+  EXPECT_EQ(execute_one_ot_op(state, "list", &overflow_op),
+            CRABS_ERR_INTERNAL);
+  EXPECT_EQ(ot_data->pending_count, (uint32_t)CRABS_OT_MAX_PENDING_OPS);
+
+  free(overflow_op.payload);
+  state_destroy(state);
+}
