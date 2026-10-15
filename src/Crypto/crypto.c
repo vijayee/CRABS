@@ -2040,7 +2040,13 @@ static size_t _ecies_encrypt_to_pub(const uint8_t recipient_pub[33],
   memcpy(out, eph->public_key, 33);  // eph_pub
   crypto_ecdsa_keypair_destroy(eph);
   uint8_t* iv = out + 33;
-  if (RAND_bytes(iv, 12) != 1) { OPENSSL_cleanse(shared, 32); return 0; }
+  // Audit pass-3 LOW: route through crypto_random_bytes so the fail-closed
+  // RAND_status() health probe guards this path like every other one (the
+  // direct RAND_bytes call skipped the DRBG gate).
+  if (crypto_random_bytes(iv, 12) != CRABS_SUCCESS) {
+    OPENSSL_cleanse(shared, 32);
+    return 0;
+  }
   uint8_t aes_key[32];
   if (_ecies_derive_key(shared, out, aes_key) != 0) {
     OPENSSL_cleanse(shared, 32); return 0;
