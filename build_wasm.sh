@@ -12,7 +12,9 @@
 set -e
 
 ROOT_DIR="$(cd "$(dirname "$0")" && pwd)"
-OPENABE_DIR="${OPENABE_DIR:-/home/victor/Workspace/src/github.com/vijayee/openabe-to-c/openabe-c}"
+# Default to the tracked submodule pin so artifacts always match deps/openabe-c.
+# Override only when building against an unbuilt dev workspace.
+OPENABE_DIR="${OPENABE_DIR:-$ROOT_DIR/deps/openabe-c}"
 RELIC_WASM="$OPENABE_DIR/deps/relic/build-wasm"
 OPENABE_WASM="$OPENABE_DIR/build-wasm"
 OPENSSL_SRC="${OPENSSL_SRC:-/tmp/openssl-3.4.0}"
@@ -297,6 +299,14 @@ if [ "${CRABS_WASM_ASAN:-0}" = "1" ]; then
   build_variant ".dev" "-DCRABS_ENABLE_DEVTOOLS" "createCRABSModuleDev" "${BASE_EXPORTS%]},${DEVTOOLS_EXPORTS#[}" "-s ASSERTIONS=2"
 else
   build_variant ".dev" "-DCRABS_ENABLE_DEVTOOLS" "createCRABSModuleDev" "${BASE_EXPORTS%]},${DEVTOOLS_EXPORTS#[}" "-s SAFE_HEAP=1 -s ASSERTIONS=2"
+fi
+
+# Copy artifacts into the binding package: tests load the bindings/wasm copies
+# FIRST, so a stale copy silently runs the old binary.
+BINDINGS_WASM="$ROOT_DIR/bindings/wasm"
+if [ -d "$BINDINGS_WASM" ]; then
+  cp "$BUILD_DIR/crabs.js" "$BUILD_DIR/crabs.wasm" \
+     "$BUILD_DIR.dev/crabs.dev.js" "$BUILD_DIR.dev/crabs.dev.wasm" "$BINDINGS_WASM/"
 fi
 
 echo ""

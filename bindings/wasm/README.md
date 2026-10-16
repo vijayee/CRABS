@@ -17,9 +17,13 @@ That's it — the pre-built `crabs.wasm` (1.7MB) ships with the package. No comp
 If you need to rebuild the WASM module from source:
 
 ```bash
-# Prerequisites: Emscripten SDK, OpenSSL source, openabe-to-c project
+# Prerequisites: Emscripten SDK, OpenSSL source, and the wasm archives from
+# the pinned dependency (see CLAUDE.md "JS/WASM artifact freshness").
+source /home/victor/emsdk/emsdk_env.sh
+# Rebuild the RELIC + OpenABE wasm archives from the pinned submodule first:
+bash deps/openabe-c/build_wasm.sh
 cd bindings/wasm
-npm run build   # runs ../../build_wasm.sh
+npm run build   # runs ../../build_wasm.sh (OPENABE_DIR defaults to the deps/openabe-c pin)
 ```
 
 `OPENSSL_SRC` must point at a WASM-built OpenSSL 3 tree (`libcrypto.a` +
@@ -29,7 +33,10 @@ linux-generic32 requirement is recorded in
 `docs/superpowers/plans/2026-10-09-consumption-fixes.md` (the generic64 BN
 path traps under emscripten). New
 wasm artifacts land in `build-wasm*/` and are copied into `bindings/wasm/`
-(the build script has no copy step).
+automatically by `build_wasm.sh` — the copies in `bindings/wasm/` are what
+tests load, and `examples/video_platform_p2p/public/` and
+`cookbook/site/dist/assets/wasm/` hold further copies that must be refreshed
+after a rebuild.
 
 ## Quick Start
 
