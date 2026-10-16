@@ -41,7 +41,18 @@ mkdir -p "$BUILD_DIR"
 
 CRABS_SRCS=$(find "$ROOT_DIR/src" -name '*.c' | sort)
 INCLUDES="-I$ROOT_DIR/src -I$OPENABE_DIR/include -I$RELIC_WASM/include -I$OPENABE_DIR/deps/relic/include -I$OPENSSL_SRC/include"
-CFLAGS="-std=c11 -O2 -DWITH_RELIC -DBP_WITH_OPENSSL -D_POSIX_C_SOURCE=200809L -include strings.h -D__GLIBC_PREREQ\(x,y\)=0 -fPIC"
+# CRABS_WASM_COPT: override the C optimization level (UB hunts: try -O0/-O1 —
+# the wasm OOB flake is codegen-sensitive; see src/Util/wasm_alloc_pad.c).
+CRABS_WASM_COPT="${CRABS_WASM_COPT:--O2}"
+CFLAGS="-std=c11 $CRABS_WASM_COPT -DWITH_RELIC -DBP_WITH_OPENSSL -D_POSIX_C_SOURCE=200809L -include strings.h -D__GLIBC_PREREQ\(x,y\)=0 -fPIC"
+# CRABS_WASM_ASAN=1: ASan-instrument CRABS (and the link) for OOB hunts.
+# Pair with CRABS_WASM_ALLOC_PAD=0 and ASan-built RELIC/OpenABE archives.
+if [ "${CRABS_WASM_ASAN:-0}" = "1" ]; then
+  CFLAGS="$CFLAGS -O1 -g -fsanitize=address -fno-omit-frame-pointer"
+  ASAN_LINK_FLAG="-fsanitize=address"
+else
+  ASAN_LINK_FLAG=""
+fi
 
 BASE_EXPORTS='[
   "_crypto_ecdsa_generate",
@@ -221,16 +232,24 @@ build_variant() {
   OBJECTS=""
   for src in $CRABS_SRCS; do
     obj="$VARIANT_DIR/$(basename ${src%.c}).o"
-    emcc $CFLAGS $EXTRA_DEFINES $INCLUDES -c "$src" -o "$obj" 2>&1
+    # CRABS_WASM_O2_LIST: space-separated basenames compiled at -O2 when the
+    # base $CRABS_WASM_COPT is lower — per-TU bisection for the wasm OOB hunt.
+    src_base="$(basename "$src")"
+    if [ -n "${CRABS_WASM_O2_LIST:-}" ] && echo " $CRABS_WASM_O2_LIST " | grep -q " ${src_base%.c} "; then
+      emcc "$(echo "$CFLAGS" | sed "s/$CRABS_WASM_COPT/-O2 -g/")" $EXTRA_DEFINES $INCLUDES -c "$src" -o "$obj" 2>&1
+    else
+      emcc $CFLAGS $EXTRA_DEFINES $INCLUDES -c "$src" -o "$obj" 2>&1
+    fi
     OBJECTS="$OBJECTS $obj"
   done
 
   echo "Linking WASM module (${VARIANT_SUFFIX:-prod})..."
   # -Wl,--wrap=malloc/calloc: every allocation in the module lands through
   # src/Util/wasm_alloc_pad.c, which pads by 32 bytes — the OpenSSL 3.4.0
-  # wasm EC-group path overflows a few bytes per ECDSA keygen/sign and, unpadded,
-  # corrupts dlmalloc chunk headers (the ot-document-tree.js OOB flake —
-  # diagnosis in src/Util/wasm_alloc_pad.c and the test file).
+  # CAUSE RESOLVED (2026-10-15): the OOB the pad absorbed was the OpenABE
+  # owned-alias refcount UAF (deps/openabe-c e158293) in the pre-Oct-14-16:42
+  # wasm archives — NOT OpenSSL. See src/Util/wasm_alloc_pad.c. The pad is
+  # kept as cheap insurance on the now UAF-free stack.
   # CRABS_WASM_ALLOC_PAD=0 drops the wrap shim (upgrade experiments only:
   # tests MUST run the ec-soak canary before trusting an unpadded build).
   if [ "${CRABS_WASM_ALLOC_PAD:-1}" = "1" ]; then
@@ -238,7 +257,11 @@ build_variant() {
   else
     WRAP_FLAGS=""
   fi
-  emcc $CFLAGS $EXTRA_DEFINES \
+  GUARD_DEFINE=""
+  if [ "${CRABS_WASM_ALLOC_PAD:-1}" = "1" ] && [ "${CRABS_WASM_ALLOC_GUARD:-0}" = "1" ]; then
+    GUARD_DEFINE="-DCRABS_WASM_ALLOC_GUARD"
+  fi
+  emcc $CFLAGS $GUARD_DEFINE $EXTRA_DEFINES \
     $OBJECTS \
     "$OPENABE_WASM/liboabe_c_wasm.a" \
     "$RELIC_WASM/lib/librelic_s.a" \
@@ -258,6 +281,7 @@ build_variant() {
     -s EXPORTED_RUNTIME_METHODS='["ccall","cwrap","getValue","setValue","UTF8ToString","stringToUTF8","lengthBytesUTF8","addFunction","removeFunction","HEAP8","HEAPU8","HEAP16","HEAPU16","HEAP32","HEAPU32","HEAPF32","HEAPF64"]' \
     --js-library "$ROOT_DIR/src/TimeSource/wasm_time_library.js" \
     $WRAP_FLAGS \
+    $ASAN_LINK_FLAG \
     -O2 \
     2>&1
 }
@@ -266,7 +290,14 @@ build_variant "" "" "createCRABSModule" "$BASE_EXPORTS" ""
 # Merge the two JSON arrays into one (emcc's -s parser splits on commas and
 # cannot handle a "],[" junction between the lists).
 # The dev variant adds SAFE_HEAP=1 + ASSERTIONS=2 for memory-safety checking.
-build_variant ".dev" "-DCRABS_ENABLE_DEVTOOLS" "createCRABSModuleDev" "${BASE_EXPORTS%]},${DEVTOOLS_EXPORTS#[}" "-s SAFE_HEAP=1 -s ASSERTIONS=2"
+# The dev variant adds SAFE_HEAP=1 + ASSERTIONS=2 for memory-safety checking.
+# SAFE_HEAP is incompatible with ASan (emcc hard-errors) — drop it on ASan
+# hunts; ASSERTIONS alone stays.
+if [ "${CRABS_WASM_ASAN:-0}" = "1" ]; then
+  build_variant ".dev" "-DCRABS_ENABLE_DEVTOOLS" "createCRABSModuleDev" "${BASE_EXPORTS%]},${DEVTOOLS_EXPORTS#[}" "-s ASSERTIONS=2"
+else
+  build_variant ".dev" "-DCRABS_ENABLE_DEVTOOLS" "createCRABSModuleDev" "${BASE_EXPORTS%]},${DEVTOOLS_EXPORTS#[}" "-s SAFE_HEAP=1 -s ASSERTIONS=2"
+fi
 
 echo ""
 echo "=== CRABS WASM Build Complete ==="

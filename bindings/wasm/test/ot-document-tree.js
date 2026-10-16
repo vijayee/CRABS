@@ -21,12 +21,23 @@
 // Mitigation shipped in build_wasm.sh: every allocation goes through
 // src/Util/wasm_alloc_pad.c (-Wl,--wrap=malloc/calloc, +32-byte pad), so
 // the overflow always lands in pad slack.
-// UPGRADE EXPERIMENT (2026-10-15): rebuilding the wasm OpenSSL at 3.5.9
-// LTS with the pad dropped did NOT fix the trap — same OOB at the same
-// point (this test stayed clean; the full-chain canary flapped ~1-in-4 at
-// state-restore.js on BOTH 3.4.0 and 3.5.9). The culprit is now tracked in
-// the uninstrumented RELIC/OpenABE archives or toolchain UB — see the
-// experiment note in src/Util/wasm_alloc_pad.c. Keep the shim.
+// RESOLVED ROOT CAUSE (2026-10-15 chase, definitive): the scribble was the
+// OpenABE owned-alias refcount UAF (deps/openabe-c e158293, 2026-10-14).
+// Proof: ASan-instrumented RELIC/OpenABE archives built at the PRE-e158293
+// repo revision (7f187a0) + ASan-linked CRABS module reproduce
+// `heap-use-after-free` on state-restore.js run 1 — a 4-byte WRITE into the
+// 728-byte group object freed by oabe_secret_key_destroy ->
+// oabe_zp_destroy -> oabe_group_destroy but still referenced by the CP
+// context (allocated in oabe_context_cp_new during crypto_abe_setup). The
+// same build against POST-fix archives is clean across every stress config
+// (full chains xN, standalone loops, ASan, guard allocator, -O0/-O1/-O2).
+// The earlier "OpenSSL 3.4.0 EC-group overflow" attribution was WRONG — the
+// Oct-14 wasm archives predated e158293, and the freed group's memory was
+// reused by ECDSA/BN allocations (hence the adjacency illusion), with the
+// stale-pointer WRITE of size 4 scribbling dlmalloc headers.
+// The OpenSSL upgrade experiment therefore showed no change because the
+// bug never lived there. Keep the pad shim as cheap insurance; the shipped
+// bundles are now rebuilt on post-e158293 archives (genuinely UAF-free).
 
 'use strict';
 

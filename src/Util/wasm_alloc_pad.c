@@ -1,71 +1,148 @@
 //
 // wasm_alloc_pad.c — allocator padding for the WASM build (parity-fill P11)
 //
-// WHY THIS EXISTS
+// ROOT CAUSE RESOLVED (2026-10-15 chase): the OOB this pad absorbed was the
+// OpenABE owned-alias refcount UAF (deps/openabe-c e158293, 2026-10-14) in
+// wasm archives built BEFORE that fix. ASan-instrumented archives at the
+// pre-fix revision reproduce heap-use-after-free immediately on
+// state-restore.js: a 4-byte WRITE into the 728-byte RELIC group object
+// that oabe_secret_key_destroy -> oabe_zp_destroy -> oabe_group_destroy
+// frees while the CP context still holds the alias (the context was built
+// by oabe_context_cp_new during crypto_abe_setup). The freed group's memory
+// is recycled by ECDSA/BN allocations — which is why every earlier probe
+// blamed "OpenSSL 3.4.0 EC-group construction" and why the write looked
+// like an EC-keygen-adjacent few-byte overflow scribbling dlmalloc headers
+// (the historical flake: RuntimeError: memory access out of bounds in
+// emscripten_builtin_malloc/free). An OpenSSL upgrade experiment (3.5.9,
+// pad dropped) correctly changed nothing. The Oct-14 13:13 archives
+// predated e158293 (16:42), so every shipped bundle until the 2026-10-15
+// rebuild carried a mitigated-only UAF; shipped bundles are now built on
+// post-fix archives (genuinely UAF-free) and the pad is kept as cheap
+// insurance. Historical P11 trail kept below for the record.
 //
-// The wasm build of OpenSSL 3.4.0 (linux-generic32, no-asm, emcc 6) performs
-// a small heap overflow during EC group construction: every
-// crypto_ecdsa_generate / crypto_ecdsa_sign drives EC_KEY_new_by_curve_name
-// → EC_GROUP_new_curve_GFp → ossl_ec_GFp_mont_group_set_curve →
-// BN_MONT_CTX_set, and a few-byte write past an allocation in that path
-// lands in the dlmalloc chunk slack or — when the allocation's usable size
-// has none — in the NEXT chunk's header. Corrupted dlmalloc headers make a
-// later large malloc/free walk unmapped memory, surfacing as
-// `RuntimeError: memory access out of bounds` inside
-// emscripten_builtin_malloc/free — the pre-existing wasm
-// ot-document-tree.js Node.create flake (see the diagnosis block in
-// bindings/wasm/test/ot-document-tree.js).
-//
-// P11 diagnosis trail, condensed:
-//   - canary-guarded allocator: the scribble appears from the SECOND ECDSA
-//     keygen of a process onward, inside EC_KEY_new_by_curve_name; per-op
-//     signing draws the same path, so long OT runs accumulate scribbles
-//     (monotonic failure gradient in op count).
-//   - every CRABS file plus OpenSSL crypto/{bn,ec,rand} and crypto/mem*.c
-//     was compiled with -fsanitize=address (objects before the archive) and
-//     never reported: the wild write's destination is adjacency-dependent,
-//     so a changed allocator layout moves it into live bytes silently.
-//   - the native binding passes clean under plain glibc and under
-//     MALLOC_CHECK_=3 + MALLOC_PERTURB_; not the C stack (8MB STACK_SIZE
-//     still fails), not memory growth (static 512MB no-growth still fails),
-//     not strict aliasing.
-//
-// THE FIX HERE
+// WHY THE SHIM EXISTS (insurance posture, post-resolution)
 //
 // `-Wl,--wrap=malloc -Wl,--wrap=calloc` in build_wasm.sh routes every
 // malloc/calloc allocation in the module — CRABS, OpenSSL, relic, OpenABE
 // alike — through this padding shim, which requests 32 extra bytes from
-// dlmalloc (realloc keeps dlmalloc's own path: the observed overflow comes
-// from zalloc/malloc-sized BN buffers). The overflow then always lands in
-// the pad, never in dlmalloc's metadata or a neighbor's live bytes. Cost:
-// 32 bytes per allocation. The native build
-// compiles this file out (guarded by __EMSCRIPTEN__) and needs no padding —
-// glibc's own chunk granularity already absorbs the few-byte overflow.
+// dlmalloc (realloc keeps dlmalloc's own path). A stray few-byte overflow
+// lands in the pad instead of dlmalloc's metadata or a neighbor. Cost:
+// 32 bytes per allocation. WASM-ONLY: the native build compiles this file
+// out (guarded by __EMSCRIPTEN__) — glibc's chunk granularity absorbed the
+// UAF's scribble window natively (the native binding passed plain glibc and
+// MALLOC_CHECK_=3/MALLOC_PERTURB_ runs).
 //
-// EXPERIMENT RESULT (2026-10-15): an OpenSSL upgrade does NOT fix it. The
-// wasm libcrypto was rebuilt at 3.5.9 (LTS; same linux-generic32 no-asm
-// flags, same emsdk); with the pad dropped the full-chain canary still
-// traps `memory access out of bounds` at the same point (bindings/wasm
-// state-restore.js, ~1 run in 4); a dedicated 20k-iteration keygen+sign
-// soak never tripped on EITHER version — the EC-keygen adjacency
-// attribution should be read as circumstantial. The scribble therefore
-// likely lives OUTSIDE the instrumented code: the RELIC and OpenABE wasm
-// static archives are not ASan-instrumentable by the same trick (P11 noted
-// instrumented objects never fire — the write never crossed an
-// instrumented allocation), or it is toolchain-level UB. The shim stays
-// until the culprit is isolated (e.g. an ASan-built RELIC/OpenABE archive
-// in a wasm canary, or emcc -fsanitize=address catching the dev-variant
-// chain). Search: CRABS_WASM_ALLOC_PAD.
+// HUNT TOOLING kept (proven during the chase):
+//   CRABS_WASM_ALLOC_PAD=0    drop the pad entirely (regression-canary)
+//   CRABS_WASM_ALLOC_GUARD=1  verify the pad as a lazy guard ring
+//                             (malloc/calloc wrap scope unchanged; caught
+//                             nothing — correct, the post-fix stack is clean)
+//   CRABS_WASM_ASAN=1         ASan-instrument CRABS + link (needs ASan-built
+//                             RELIC/OpenABE archives; pre-fix archives make
+//                             ASan report the UAF immediately — repro:
+//                             CRABS_WASM_ASAN=1 CRABS_WASM_ALLOC_PAD=0
+//                             OPENABE_DIR=<worktree-at-7f187a0> build)
+//   CRABS_WASM_COPT / CRABS_WASM_O2_LIST   optimization bisection gates
+// Archive sets cached outside the build tree: /home/victor/wasm-archives/{orig,asan}.
 
 #ifdef __EMSCRIPTEN__
 
 #include "allocator.h"
 #include "log.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 
 #define CRABS_WASM_ALLOC_PAD 32
 
 extern void* __real_malloc(size_t size);
 extern void* __real_calloc(size_t count, size_t size);
+
+// CRABS_WASM_ALLOC_GUARD=1 (baked at build): the pad becomes a VERIFIED
+// guard checked LAZILY — a static ring records the last 64 wrapped
+// allocations (pointer + user size), and every __wrap_malloc first
+// re-verifies their guard bytes. A run of writes past some recently-made
+// allocation is thus reported with the victim chunk's size and payload
+// address (plus the caller-visible moment) WITHOUT wrapping free/realloc —
+// the wrap scope stays exactly the shipped malloc/calloc pair. Allocation
+// ordering is dlmalloc-identical to the shipped pad build; only the 32-byte
+// pad is subdivided (8-byte size prefix + 24 guard bytes).
+#ifdef CRABS_WASM_ALLOC_GUARD
+
+#define CRABS_WASM_GUARD_BYTES 24
+#define CRABS_WASM_GUARD_RING  64
+
+typedef struct {
+  uint64_t user_size;
+} crabs_alloc_prefix_t;
+
+typedef struct {
+  void*   payload;
+  uint64_t user_size;
+} crabs_guard_ring_slot_t;
+
+static crabs_guard_ring_slot_t crabs_guard_ring[CRABS_WASM_GUARD_RING];
+static uint32_t crabs_guard_ring_next;
+
+static void _guard_fill(void* payload, uint64_t user_size) {
+  uint8_t* guard = (uint8_t*)payload + user_size;
+  for (uint64_t i = 0; i < CRABS_WASM_GUARD_BYTES; i++) guard[i] = 0xC3;
+}
+
+static void _guard_report(const void* payload, uint64_t user_size) {
+  fprintf(stderr,
+          "WASM GUARD HIT: victim payload=0x%p user_size=%llu\n",
+          payload, (unsigned long long)user_size);
+  fflush(stderr);
+  abort();
+}
+
+static void _guard_verify_ring(void) {
+  for (uint32_t slot_index = 0; slot_index < CRABS_WASM_GUARD_RING;
+       slot_index++) {
+    const crabs_guard_ring_slot_t* slot = &crabs_guard_ring[slot_index];
+    if (slot->payload == NULL) continue;
+    const uint8_t* guard = (const uint8_t*)slot->payload + slot->user_size;
+    for (uint64_t i = 0; i < CRABS_WASM_GUARD_BYTES; i++) {
+      if (guard[i] != 0xC3) {
+        fprintf(stderr,
+                "WASM GUARD HIT (ring slot %u): victim payload=0x%p "
+                "user_size=%llu, first dirty byte %llu = 0x%02x\n",
+                slot_index, slot->payload,
+                (unsigned long long)slot->user_size,
+                (unsigned long long)i, guard[i]);
+        fflush(stderr);
+        abort();
+      }
+    }
+  }
+}
+
+void* __wrap_malloc(size_t size) {
+  _guard_verify_ring();
+  size_t total = size + CRABS_WASM_GUARD_BYTES + sizeof(crabs_alloc_prefix_t);
+  crabs_alloc_prefix_t* prefix = (crabs_alloc_prefix_t*)__real_malloc(total);
+  if (prefix == NULL) return NULL;
+  prefix->user_size = size;
+  void* payload = (void*)(prefix + 1);
+  _guard_fill(payload, size);
+  crabs_guard_ring_slot_t* slot =
+      &crabs_guard_ring[crabs_guard_ring_next % CRABS_WASM_GUARD_RING];
+  slot->payload = payload;
+  slot->user_size = size;
+  crabs_guard_ring_next++;
+  return payload;
+}
+
+void* __wrap_calloc(size_t count, size_t size) {
+  size_t bytes = count * size;
+  void* payload = __wrap_malloc(bytes);
+  if (payload == NULL) return NULL;
+  memset(payload, 0, bytes);
+  return payload;
+}
+
+#else
 
 void* __wrap_malloc(size_t size) {
   return __real_malloc(size + CRABS_WASM_ALLOC_PAD);
@@ -74,6 +151,8 @@ void* __wrap_malloc(size_t size) {
 void* __wrap_calloc(size_t count, size_t size) {
   return __real_calloc(count, size + CRABS_WASM_ALLOC_PAD);
 }
+
+#endif // CRABS_WASM_ALLOC_GUARD
 
 #else
 
