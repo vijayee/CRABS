@@ -228,7 +228,7 @@ export interface OrderedSetOpId {
   ts?: number;
 }
 
-/** Options for the ordered*/ot* OT op sugars (the same id/deps contract). */
+/** Options for the ordered-set/OT op sugars (the same id/deps contract). */
 export interface OrderedSetApplyOptions {
   /** Required — the op's OT identity (see Node's ordered* docs). */
   id: OrderedSetOpId;
