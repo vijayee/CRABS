@@ -9,8 +9,9 @@ Use the de-wonk skill when completing an implementation
 - Keep commits focused and atomic - one logical change per commit
 
 ## Key Patterns
-- Reference-counted structs have `refcounter_t refcounter` as the first member
+- Ownership is direct create/destroy — `src/` does NOT use reference counting (no `refcounter_t` anywhere; an earlier revision of this file described one)
 - Types use `_t` suffix, functions follow `type_action()` naming
-- Create functions use `get_clear_memory()` and call `refcounter_init()` last
-- Destroy functions check count==0 before freeing
+- Create functions use `get_clear_memory()`
+- Destroy functions free owned members; they are NULL-tolerant (destroying NULL is a no-op)
+- Secret-bearing structs are cleansed (OPENSSL_cleanse) before free
 - Directories in `src/` are organized by semantic purpose (Buffer/, Workers/, Time/, etc.)

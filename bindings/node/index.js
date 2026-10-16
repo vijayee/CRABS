@@ -127,6 +127,17 @@ function createRaftHost(node, options = {}) {
 
     // The transport seam — drained control blobs go anywhere. Without one,
     // outbound messages deliberately stay queued (nothing is lost).
+    //
+    // RAFT TRANSPORT-AUTHENTICATION REQUIREMENT (the integrator's half of
+    // the trust model — see README "Trust model" and raft_module.h): every
+    // blob this fn sends must reach the named peer over a channel that
+    // AUTHENTICATES that peer's identity (mTLS with client certificates,
+    // SSH transport, a Noise/PSK MAC channel, ...), and the receiving side
+    // must pumpInbound() with the HANDSHAKE-VERIFIED peer id — never one
+    // from the wire. A follower materializes committed ops on the delivery
+    // marker alone (cross-machine replicas cannot re-verify a leader's
+    // signers), so an unauthenticated socket is a total log-forgery
+    // primitive: any network peer speaks as any other.
     setRaftTransport(fn) { this._transport = fn; },
     // The storage seam — persist windows stored anywhere durable. A
     // resolved promise acks the window (persist_complete true); a rejected
@@ -148,6 +159,10 @@ function createRaftHost(node, options = {}) {
     },
 
     // Transport receive half: inject one inbound raft blob from peerId.
+    // The `peerId` argument here is the module's sole credential for
+    // follower-side materialization (see the RAFT TRANSPORT-AUTHENTICATION
+    // REQUIREMENT on setRaftTransport): pass the identity your transport's
+    // handshake VERIFIED, never an id the wire claimed.
     pumpInbound(peerId, blob) {
       if (this._destroyed) throw new Error('RaftHost destroyed');
       const rc = node.raftDeliver(peerId, toBuffer(blob));

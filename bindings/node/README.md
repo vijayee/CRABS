@@ -227,7 +227,23 @@ windows stored anywhere durable; a resolved promise acks the window) —
 without a seam, drained blobs queue and persist polls throw. Incoming blobs
 return through `node.raftDeliver(peerId, blob)`; committed ops materialize
 through the machine's pipeline (`raftPump`), or drain raw at the wire with
-the `pumpNotifications: false` host mode. Raw surfaces
+the `pumpNotifications: false` host mode.
+
+**CRABS does not ship a transport — the authentication duty transfers to
+whoever provides one.** The `peerId` you pass to `raftDeliver` is the module's
+SOLE credential for follower-side materialization: cross-machine replicas
+cannot re-verify a leader's signers (each machine registers its own users
+under its own keys), so a committed op is materialized on the delivery marker
+alone. Your transport must therefore authenticate that identity per
+connection (mTLS with client certificates, SSH transport, a Noise/PSK MAC
+channel, ...) and you must pass the HANDSHAKE-VERIFIED id — never an id the
+wire claimed. Over an unauthenticated socket the module's sender bindings
+and equivocation checks are moot: any network peer speaks as any other and
+dictates followers' logs. See README "Trust model" and the same requirement
+documented at `setRaftTransport` / `pumpInbound` in `index.js` and at
+`crabs_raft_module_inbound` in `src/Raft/raft_module.h`.
+
+Raw surfaces
 (`node.raftPollOutbound`, `node.raftPollPersistRequest` + `raftPersistComplete`,
 `node.raftPollNotifications`, `node.raftTick`, `node.raftRecoverFromPersist`)
 and point diagnostics (`node.raftStatus()`) mirror the wasm binding's

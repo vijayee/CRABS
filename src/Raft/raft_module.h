@@ -196,6 +196,20 @@ void                 crabs_raft_module_destroy(crabs_raft_module_t* module);
 // Inbound events
 // ============================================================
 crabs_error_e crabs_raft_module_tick(crabs_raft_module_t* module, uint64_t now_ms);
+// TRANSPORT-AUTHENTICATION REQUIREMENT (the integrator's half of the trust
+// model): `peer_id` is the ONLY credential a follower-side materialization
+// consults — committed ops are materialized on the delivery marker alone,
+// because cross-machine follower replicas cannot re-verify a leader's
+// signers (each machine registers its own users under its own keys).
+// crabs_raft_module_inbound therefore trusts `peer_id` absolutely, and the
+// TRANSPORT must make it trustworthy: every blob handed here must have
+// arrived over an authenticated, integrity-protected channel that
+// cryptographically vouches for the sender's identity (mTLS with client
+// certificates, SSH transport, a Noise/PSK MAC channel, ...), whose
+// handshake identity is exactly the `peer_id` passed. An unauthenticated
+// socket makes the module's sender bindings and equivocation checks moot —
+// any network peer speaks as any other and dictates followers' logs. See
+// README "Trust model".
 crabs_error_e crabs_raft_module_inbound(crabs_raft_module_t* module,
                                         const char* peer_id,
                                         const uint8_t* blob, size_t len,
