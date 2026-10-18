@@ -109,6 +109,7 @@ protected:
     op->resources =
         (char(*)[CRABS_MAX_USER_ID])malloc(sizeof(char[CRABS_MAX_USER_ID]));
     strncpy(op->resources[0], resource_name, CRABS_MAX_USER_ID - 1);
+    op->resources[0][CRABS_MAX_USER_ID - 1] = '\0';
     op->resource_count = 1;
     op->required_state =
         (protocol_state_e*)malloc(sizeof(protocol_state_e));
@@ -2599,10 +2600,18 @@ TEST_F(TestStateMachine, DeserializedLogReArmsBarriersOnlyThroughAuthenticatedRe
 TEST_F(TestStateMachine, ReplayClampMaterializesHistoricOp) {
   set_skew_ordering(CRABS_HLC_REPLAY_CLAMP);
   operation_t* op = make_hlc_stamp_lock_op(-15, 0x42);
+  uint64_t log_count_before = state->log_count;
   EXPECT_EQ(state_machine_execute_replay(state, op), CRABS_SUCCESS);
   data_item_t* resource = state_find_item(state, "test_resource");
   ASSERT_NE(resource, nullptr);
   EXPECT_EQ(resource->protocol_state, PROTOCOL_LOCKED);
+  // The clamped op lands as a real audit/barrier entry.
+  EXPECT_EQ(state->log_count, log_count_before + 1);
+
+  // Re-replaying the same materialized op is an idempotent skip: the tx
+  // backstop refuses a second ingest, and no second log entry appears.
+  EXPECT_EQ(state_machine_execute_replay(state, op), CRABS_ERR_ALREADY_EXECUTED);
+  EXPECT_EQ(state->log_count, log_count_before + 1);
   operation_destroy(op);
 }
 
@@ -2651,5 +2660,15 @@ TEST_F(TestStateMachine, FutureStampRejectedOnBothPaths) {
   operation_t* op = make_hlc_stamp_lock_op(+15, 0x42);
   EXPECT_EQ(state_machine_execute(state, op), CRABS_ERR_PROTOCOL_VIOLATION);
   EXPECT_EQ(state_machine_execute_replay(state, op), CRABS_ERR_PROTOCOL_VIOLATION);
+  operation_destroy(op);
+}
+
+// The clamp policy governs ONLY the replay-ingest path. When the node's
+// replay policy is clamp, the LIVE path must still reject a past stamp —
+// opting in to bulk-history tolerance must not relax live freshness.
+TEST_F(TestStateMachine, ClampPolicyDoesNotRelaxLivePath) {
+  set_skew_ordering(CRABS_HLC_REPLAY_CLAMP);
+  operation_t* op = make_hlc_stamp_lock_op(-15, 0x42);
+  EXPECT_EQ(state_machine_execute(state, op), CRABS_ERR_PROTOCOL_VIOLATION);
   operation_destroy(op);
 }

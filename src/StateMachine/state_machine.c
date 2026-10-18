@@ -689,9 +689,12 @@ static crabs_error_e _validate_received_hlc(state_t* state, const operation_t* o
   probe_state.max_skew_ms = config->hlc.max_skew_ms;
   probe_state.strict_mode = config->hlc.strict_mode;
   // Replay ingest consults the config's SEPARATE replay policy: with
-  // CRABS_HLC_REPLAY_CLAMP a past-window historic stamp is clamped into the
-  // local HLC domain (accepted for ordering) instead of failing the whole
-  // op. The live path — and the replay path when no clamp was configured —
+  // CRABS_HLC_REPLAY_CLAMP a past-window historic stamp is accepted for
+  // ordering instead of failing the whole op. The acceptance is SILENT:
+  // the only observable effects are the acceptance itself and the op's
+  // original historic stamp in the audit log — the clamp marker
+  // (ACCEPTED_CLAMPED) is consumed here and is not surfaced further. The
+  // live path — and the replay path when no clamp was configured —
   // keep the plain windowed validation. The probe copy is discarded either
   // way: the real clock adopts nothing from ops (see above).
   crabs_hlc_receive_result_e receive_rc;

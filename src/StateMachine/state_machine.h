@@ -179,11 +179,13 @@ crabs_error_e  state_machine_execute(state_t* state, operation_t* op);
 // Replay ingest (bounded-skew replay fix): execute a signed op as BULK
 // HISTORY ingest governed by the ordering config's hlc.replay_policy
 // (CRABS_HLC_REPLAY_REJECT — byte-compatible default — or
-// CRABS_HLC_REPLAY_CLAMP: stamps older than max_skew_ms are accepted,
-// clamped into the local HLC domain, instead of
-// CRABS_ERR_PROTOCOL_VIOLATION). Future-stamped ops fail on both paths.
-// Authorization, dedup and ordering monotonicity behave exactly as
-// state_machine_execute.
+// CRABS_HLC_REPLAY_CLAMP: stamps older than max_skew_ms are accepted
+// for ordering instead of CRABS_ERR_PROTOCOL_VIOLATION — no observable
+// rewrite: the op keeps its as-authored stamp, the real clock adopts
+// nothing). Future-stamped ops fail on both paths under a WINDOWED
+// strategy (BOUNDED default); under NAIVE neither path rejects future
+// stamps (pre-existing behavior). Authorization, dedup and ordering
+// monotonicity behave exactly as state_machine_execute.
 crabs_error_e  state_machine_execute_replay(state_t* state, operation_t* op);
 
 // Authorization-only pipeline: signature + policy + key staleness + scheme +
