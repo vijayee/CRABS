@@ -820,6 +820,7 @@ export interface Node {
   // failed VALID op — failures return a skipped outcome so a bulk log
   // ingest can converge.
   replayOp(op: Operation): { status: 'applied' | 'pending' | 'skipped'; code?: number; message?: string };
+  replayOps(operations: Operation[]): { applied: number[]; skipped: { index: number; code: number; message: string }[] };
 
   // Timed transactions (v1) — mirror of the wasm surface
   // (bindings/wasm/index.d.ts:501-510). The submission-time authorization

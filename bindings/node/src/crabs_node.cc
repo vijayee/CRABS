@@ -154,11 +154,14 @@ static std::string crabs_error_name(crabs_error_e err) {
     case CRABS_ERR_CONDITION_NOT_MET:      return "condition_not_met";
     case CRABS_ERR_TRACKER_NOT_FOUND:      return "tracker_not_found";
     case CRABS_ERR_FLAG_NOT_FOUND:         return "flag_not_found";
+    case CRABS_ERR_SCHEDULE_INVALID:       return "schedule_invalid";
     case CRABS_ERR_SERIALIZATION_ERROR:    return "serialization_error";
     case CRABS_ERR_CRYPTOGRAPHIC_ERROR:    return "cryptographic_error";
     case CRABS_ERR_INTERNAL:               return "internal_error";
     case CRABS_ERR_OOM:                    return "out_of_memory";
     case CRABS_ERR_INVALID_PARAM:          return "invalid_param";
+    case CRABS_ERR_SCHEME_ALREADY_REGISTERED:
+                                           return "scheme_already_registered";
     case CRABS_ERR_NOT_ITEM_WRITER:        return "not_item_writer";
     case CRABS_ERR_SEQ_MISMATCH:           return "seq_mismatch";
     case CRABS_ERR_FORK_DETECTED:          return "fork_detected";
@@ -173,6 +176,11 @@ static std::string crabs_error_name(crabs_error_e err) {
     case CRABS_ERR_NOT_OT_TYPE:            return "not_ot_type";
     case CRABS_ERR_OT_TRANSFORM_DEPTH:     return "ot_transform_depth";
     case CRABS_ERR_OT_POSITION_BOUNDS:     return "ot_position_bounds";
+    // 0x9xxx: Compaction errors (v1.6 §6)
+    case CRABS_ERR_COMPACTION_NOT_SUPPORTED:
+                                           return "compaction_not_supported";
+    case CRABS_ERR_COMPACTION_NOT_SAFE:    return "compaction_not_safe";
+    case CRABS_ERR_COMPACTION_IN_PROGRESS: return "compaction_in_progress";
     default:                               return "unknown_error";
   }
 }
@@ -1659,40 +1667,47 @@ public:
         use_hlc = (ord == "hlc");
       }
       if (opts.Has("skew")) {
-        if (!opts.Get("skew").IsObject()) {
+        // Parity with the wasm wrapper (parseSkewOptions's `!options.skew`
+        // early return): a FALSY skew value (null, undefined, 0, '', false)
+        // is "no skew options"; only a truthy non-object value throws.
+        Napi::Value skew_option = opts.Get("skew");
+        if (!skew_option.ToBoolean().Value()) {
+          // Fall through to the C-side defaults (5s window, reject policy).
+        } else if (!skew_option.IsObject()) {
           // The wasm binding refuses a non-object skew ('skew must be an
           // options object') — a silently-ignored string would arm nothing
           // while the caller believes a window/policy is in force.
           throw Napi::TypeError::New(env, "Node: skew must be an options object");
-        }
-        Napi::Object skew = opts.Get("skew").As<Napi::Object>();
-        if (skew.Has("maxSkewMs")) {
-          Napi::Value skew_window = skew.Get("maxSkewMs");
-          // Safe non-negative integer (the wasm parseSkewOptions rule):
-          // fractional or above-MAX_SAFE_INTEGER doubles would truncate or
-          // have already collapsed in the double space (e.g. 2**53 + 1 IS
-          // 2**53), so the window must be exact before the uint64 cast.
-          if (!skew_window.IsNumber()) {
-            throw Napi::TypeError::New(
-                env, "Node: skew.maxSkewMs must be a non-negative safe integer");
+        } else {
+          Napi::Object skew = skew_option.As<Napi::Object>();
+          if (skew.Has("maxSkewMs")) {
+            Napi::Value skew_window = skew.Get("maxSkewMs");
+            // Safe non-negative integer (the wasm parseSkewOptions rule):
+            // fractional or above-MAX_SAFE_INTEGER doubles would truncate or
+            // have already collapsed in the double space (e.g. 2**53 + 1 IS
+            // 2**53), so the window must be exact before the uint64 cast.
+            if (!skew_window.IsNumber()) {
+              throw Napi::TypeError::New(
+                  env, "Node: skew.maxSkewMs must be a non-negative safe integer");
+            }
+            double window_value = skew_window.As<Napi::Number>().DoubleValue();
+            if (!(window_value >= 0) || window_value > 9007199254740991.0 ||
+                window_value != std::floor(window_value)) {
+              throw Napi::TypeError::New(
+                  env, "Node: skew.maxSkewMs must be a non-negative safe integer");
+            }
+            max_skew_ms = (uint64_t)window_value;
           }
-          double window_value = skew_window.As<Napi::Number>().DoubleValue();
-          if (!(window_value >= 0) || window_value > 9007199254740991.0 ||
-              window_value != std::floor(window_value)) {
-            throw Napi::TypeError::New(
-                env, "Node: skew.maxSkewMs must be a non-negative safe integer");
+          if (skew.Has("replayPolicy")) {
+            std::string policy = require_js_string(skew.Get("replayPolicy"),
+                                                   "Node", "skew.replayPolicy");
+            if (policy != "clamp" && policy != "reject") {
+              throw Napi::TypeError::New(
+                  env, "Node: skew.replayPolicy must be 'clamp' or 'reject'");
+            }
+            replay_policy = (policy == "clamp")
+                                ? CRABS_HLC_REPLAY_CLAMP : CRABS_HLC_REPLAY_REJECT;
           }
-          max_skew_ms = (uint64_t)window_value;
-        }
-        if (skew.Has("replayPolicy")) {
-          std::string policy = require_js_string(skew.Get("replayPolicy"),
-                                                 "Node", "skew.replayPolicy");
-          if (policy != "clamp" && policy != "reject") {
-            throw Napi::TypeError::New(
-                env, "Node: skew.replayPolicy must be 'clamp' or 'reject'");
-          }
-          replay_policy = (policy == "clamp")
-                              ? CRABS_HLC_REPLAY_CLAMP : CRABS_HLC_REPLAY_REJECT;
         }
       }
     }
@@ -4481,6 +4496,10 @@ private:
     // decision uses the node's replay policy (hlc.replay_policy) instead of
     // the live one. Never throws for a failed VALID op — failures return a
     // skipped outcome object so a bulk log ingest can converge.
+    // NOTE: a PENDING outcome (and every skip other than ALREADY_EXECUTED)
+    // still emits a 'change' event — the C layer notifies every
+    // non-ALREADY_EXECUTED result — the same replay-driven-event caveat as
+    // the wasm surface for N-API change listeners.
     crabs_error_e rc = state_machine_execute_replay(&am_->base_state, op->raw());
     Napi::Object outcome = Napi::Object::New(env);
     if (rc == CRABS_SUCCESS) {

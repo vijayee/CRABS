@@ -8,9 +8,12 @@
 // (wall-clock age, no forged stamps). crabs-node has no registerHandlerJs
 // surface, so the stateful op is the defineOperationType + per-user dedup
 // tracker shape (the setContains readback pins the materialization). Also
-// pins: bad skew options throw on the public surface, and re-ingesting an
+// pins: bad skew options throw on the public surface (while skew:null /
+// undefined are tolerated as "no options", wasm parity), re-ingesting an
 // executed op is a typed already_executed (0x7002) skip that does not
-// re-run the mutation.
+// re-run the mutation, and the replayOps batch survives per-op skips
+// (applied holds INDICES; a fresh-uuid second op clamp-materializes in the
+// same batch).
 //
 // The N-API binding is synchronous — the only async leg is the 6.1s aging
 // wait itself.
@@ -57,8 +60,15 @@ function mustThrowWith(invoke, fragment, label) {
     'skew must be an options object', 'non-object skew');
   mustThrowWith(() => new Node('bad', { skew: { maxSkewMs: 1.5 } }),
     'skew.maxSkewMs must be a non-negative safe integer', 'fractional maxSkewMs');
+  // Falsy skew VALUES are "no skew options" (wasm parseSkewOptions's
+  // `!options.skew` early return) — only truthy junk throws.
+  assert(new Node('skew-null', { skew: null }) !== null,
+    'skew:null tolerates as "no options"');
+  assert(new Node('skew-undefined', { skew: undefined }) !== undefined,
+    'skew:undefined tolerates as "no options"');
 
   const aliceKey = KeyPair.generate();
+  const bobKey = KeyPair.generate();
 
   // Shared registration + policy setup any replayer needs (the log replays
   // ops; the user registry arrives with the snapshot in real deployments).
@@ -70,6 +80,8 @@ function mustThrowWith(invoke, fragment, label) {
     const node = new Node(nodeName, nodeOptions);
     node.registerUser('alice', aliceKey.publicKeyHex(), '');
     node.grantRole('alice', 'role', 'member', nodeName);
+    node.registerUser('bob', bobKey.publicKeyHex(), '');
+    node.grantRole('bob', 'role', 'member', nodeName);
     node.addOneShotSet('proposal-42_voters');
     node.setPolicy('__define_operation_type__', 'role:admin');
     node.setPolicy('vote', 'role:member');
@@ -93,13 +105,30 @@ function mustThrowWith(invoke, fragment, label) {
     'author executed its own vote');
   const opWire = op.serialize();
 
+  // --- Second op, signed + serialized but NEVER executed anywhere: its
+  // clamp replay materializes in the mixed batch below, proving `applied`
+  // holds INDICES of ingested entries while the already-executed op stays
+  // skipped. A DIFFERENT signer avoids the per-user dedup guard (alice is
+  // already a voter once the aged op ingests) and its own fresh uuid keeps
+  // it out of the uuid-dedup set — the readback setContains('bob') pins the
+  // materialization. Its HLC was stamped at author-sign time (T0), also
+  // >5s old at replay, so only the clamp path lets it through.
+  const secondOp = new Operation('vote');
+  secondOp.signerId = 'bob';
+  secondOp.nodeId = 'author';
+  secondOp.addResource('proposal-42_voters');
+  author.sign(secondOp, bobKey);
+  const secondOpWire = secondOp.serialize();
+
   // --- Wait past the default 5s skew window (the N-API HLC stamps the WALL
   // clock at sign, same timing semantics as the wasm binding).
   await new Promise((resolve) => setTimeout(resolve, 6100));
 
-  // --- Fresh default node (reject policy): live execute of the aged op
-  // must fail closed with protocol_violation and mutate nothing.
-  const defaultReplayer = setupNode('default-replayer', { ordering: 'hlc' });
+  // --- Fresh node, 0-SENTINEL skew config (wasm parity): maxSkewMs 0 maps
+  // to the C-side default 5000ms window (NOT accept-all), so the aged op
+  // still fails closed on a live execute with protocol_violation and
+  // mutates nothing.
+  const defaultReplayer = setupNode('default-replayer', { skew: { maxSkewMs: 0 } });
   const defaultOp = Operation.deserialize(opWire);
   let defaultThrew = '';
   try { defaultReplayer.execute(defaultOp); }
@@ -112,6 +141,12 @@ function mustThrowWith(invoke, fragment, label) {
   // --- Fresh CLAMP node: replayOp materializes the historic op.
   const clampReplayer = setupNode(
     'clamp-replayer', { ordering: 'hlc', skew: { replayPolicy: 'clamp' } });
+
+  // --- Batch guard first: a non-array is structurally invalid input and
+  // throws (repair the input; a VALID batch never throws on per-op skips).
+  mustThrowWith(() => clampReplayer.replayOps('nonsense'),
+    'expected an array', 'non-array replayOps');
+
   const clampOutcome = clampReplayer.replayOp(Operation.deserialize(opWire));
   assert(clampOutcome.status === 'applied',
     `clamp replay must ingest the historic op (got ${JSON.stringify(clampOutcome)})`);
@@ -126,14 +161,33 @@ function mustThrowWith(invoke, fragment, label) {
     `re-ingest must be a skip (got ${JSON.stringify(reOutcome)})`);
   assert(reOutcome.code === 0x7002 /* CRABS_ERR_ALREADY_EXECUTED */,
     `re-ingest skip must carry already_executed 0x7002, got 0x${(reOutcome.code || 0).toString(16)}`);
-  assert(typeof reOutcome.message === 'string' &&
-         reOutcome.message.includes('already_executed'),
-    `re-ingest skip must name the error, got "${reOutcome.message}"`);
+  // Skip-shape parity pin: match the skip on `code` — message SHAPES differ
+  // across bindings (wasm wraps its error context, the N-API layer returns
+  // the bare error name), so only the string-ness is pinned here.
+  assert(reOutcome.code === 0x7002 && typeof reOutcome.message === 'string',
+    `re-ingest skip must carry a string message, got "${reOutcome.message}"`);
   assert(clampReplayer.setContains('proposal-42_voters', 'alice') === true,
     'the skip must not unwind the materialized membership');
 
+  // --- Mixed batch pin (wasm parity): index 0 is the already-executed op
+  // (skipped 0x7002), index 1 is the never-executed second op
+  // (clamp-materializes). `applied` must equal the INDICES array — not the
+  // op objects themselves — and the per-op skip must not abort the batch.
+  const mixed = clampReplayer.replayOps([
+    Operation.deserialize(opWire),
+    Operation.deserialize(secondOpWire),
+  ]);
+  assert(JSON.stringify(mixed.applied) === '[1]',
+    `mixed batch applied must equal [1] (indices), got ${JSON.stringify(mixed.applied)}`);
+  assert(mixed.skipped.length === 1 &&
+         mixed.skipped[0].index === 0 &&
+         mixed.skipped[0].code === 0x7002,
+    `mixed batch must skip entry 0 with already_executed, got ${JSON.stringify(mixed.skipped)}`);
+  assert(clampReplayer.setContains('proposal-42_voters', 'bob') === true,
+    'the never-executed second op materialized through clamp');
+
   console.log(`hlc-skew-replay OK: ${passed} passed, ${failed} failed — clamp ingest materializes, ` +
-    'default rejects the aged op live, skip is typed already_executed');
+    'default (and 0-sentinel) rejects the aged op live, batch survives with applied holding indices');
   process.exit(failed > 0 ? 1 : 0);
 })().catch((caughtError) => {
   console.error(caughtError);

@@ -49,6 +49,55 @@ const { Node, KeyPair, Operation, Blueprint, AbeKey, TRUST_MODE, DATA_TYPE, CRDT
 const frozenWireVersions = Object.freeze(wireVersions);
 
 // ============================================================
+// Replay ingest (HLC bounded-skew replay fix; wasm parity)
+// ============================================================
+// The native class's prototype slots are SEALED (read-only, not
+// configurable), so replayOp cannot be JS-wrapped in place the way wasm
+// wraps its own — the batch helper is ADDED as a new prototype method
+// instead, and performs the wasm binding's per-op module guard itself
+// (wasm's replayOp throws TypeError for a foreign-module Operation; on this
+// binding a foreign wrapper would unwrap into an unrelated pointer, so the
+// structural check must run BEFORE the native call).
+const nativeReplayOp = Node.prototype.replayOp;
+
+// Batch helper over Node#replayOp. Per-op replay FAILURES never abort the
+// batch — each skip is warned and returned with its index, so bulk history
+// ingest converges. Structurally INVALID input still throws (the per-entry
+// guard below throws TypeError for a non-Operation or foreign-module
+// Operation; the array guard handles non-arrays) — repair the input, the
+// batch is fine. applied HOLDS INDICES; pending (raft GROUP_ORDERED)
+// outcomes also land in applied — accepted into the ordering log, not yet
+// committed. Match skips on `code` (message shapes differ across bindings).
+// defineProperty keeps the JS method's descriptor shaped like the native
+// class's own (non-enumerable, not one of the read-only sealed slots).
+const replayOpsHelper = function (operations) {
+  if (!Array.isArray(operations)) {
+    throw new TypeError('replayOps: expected an array of Operations');
+  }
+  const applied = [];
+  const skipped = [];
+  operations.forEach((entryOperation, entryIndex) => {
+    if (!entryOperation || !(entryOperation instanceof Operation)) {
+      throw new TypeError(`replayOps[${entryIndex}]: expected an Operation from this module`);
+    }
+    const outcome = nativeReplayOp.call(this, entryOperation);
+    if (outcome.status !== 'skipped') {
+      applied.push(entryIndex);
+    } else {
+      console.warn(`crabs-node: replay skipped op[${entryIndex}]: ${outcome.message}`);
+      skipped.push({ index: entryIndex, code: outcome.code, message: outcome.message });
+    }
+  });
+  return { applied, skipped };
+};
+Object.defineProperty(Node.prototype, 'replayOps', {
+  value: replayOpsHelper,
+  writable: true,
+  configurable: true,
+  enumerable: false,
+});
+
+// ============================================================
 // Raft ordering module — reference host
 // ============================================================
 // Native surface: attach/tick/deliver/poll/pump on the Node class. This

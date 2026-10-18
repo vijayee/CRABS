@@ -365,7 +365,7 @@ const ERROR_MESSAGES = {
   0x6001: 'key_suspended', 0x6002: 'key_revoked', 0x6003: 'key_expired', 0x6004: 'key_not_active',
   0x6005: 'vault_unavailable',
   0x7001: 'already_performed', 0x7002: 'already_executed', 0x7003: 'condition_not_met',
-  0x7004: 'tracker_not_found', 0x7005: 'flag_not_found',
+  0x7004: 'tracker_not_found', 0x7005: 'flag_not_found', 0x7006: 'schedule_invalid',
   0xA001: 'not_item_writer', 0xA002: 'seq_mismatch', 0xA003: 'fork_detected',
   0xA004: 'ordering_path', 0xA005: 'quarantined',
   0xA006: 'ordering_pending', 0xA007: 'ordering_not_leader',
@@ -373,6 +373,9 @@ const ERROR_MESSAGES = {
   // 0x8xxx: OT errors (v1.5 §8)
   0x8001: 'no_ot_ops', 0x8002: 'not_ot_type', 0x8003: 'ot_transform_depth',
   0x8004: 'ot_position_bounds',
+  // 0x9xxx: Compaction errors (v1.6 §6)
+  0x9001: 'compaction_not_supported', 0x9002: 'compaction_not_safe',
+  0x9003: 'compaction_in_progress',
 };
 
 function crabsError(code, ctx) {
