@@ -398,6 +398,51 @@ function wipeFree(M, ptr, len) {
   M._free(ptr);
 }
 
+// Skew configuration surface (bounded-skew replay fix). Defaults mirror the
+// C library exactly (BOUNDED strategy / 5000ms window / reject on replay) so
+// Node.create(id) remains byte-identical to today's behavior.
+function parseSkewOptions(options) {
+  const skew = {
+    strategy: 0x01,       // HLC_STRATEGY_BOUNDED
+    maxSkewMs: 0,         // 0 keeps the C-side CRABS_HLC_DEFAULT_MAX_SKEW_MS (sentinel, NOT unbounded)
+    replayPolicy: 0,      // CRABS_HLC_REPLAY_REJECT
+  };
+  if (!options || !options.skew) return skew;
+  const skewInput = options.skew;
+  if (typeof skewInput !== 'object') {
+    throw new TypeError('Node.create: skew must be an options object');
+  }
+  if (skewInput.strategy !== undefined) {
+    const strategyNames = {
+      naive: 0x00, bounded: 0x01, quorum: 0x02, strict: 0x03, trusted: 0x04,
+    };
+    if (typeof skewInput.strategy !== 'string' || !(skewInput.strategy in strategyNames)) {
+      throw new TypeError(
+          "Node.create: skew.strategy must be one of 'naive'|'bounded'|'quorum'|'strict'|'trusted'");
+    }
+    skew.strategy = strategyNames[skewInput.strategy];
+  }
+  if (skewInput.maxSkewMs !== undefined) {
+    // Number.isSafeInteger, not Number.isInteger: max_skew_ms crosses the
+    // wasm ABI as an i64 (BigInt ABI), so the value must survive 2^53-exact
+    // BigInt coercion — anything wider silently rounds BEFORE the cast.
+    if (typeof skewInput.maxSkewMs !== 'number' || !Number.isSafeInteger(skewInput.maxSkewMs) ||
+        skewInput.maxSkewMs < 0) {
+      throw new TypeError('Node.create: skew.maxSkewMs must be a non-negative safe integer');
+    }
+    skew.maxSkewMs = skewInput.maxSkewMs;
+  }
+  if (skewInput.replayPolicy !== undefined) {
+    const replayNames = { reject: 0, clamp: 1 };
+    if (typeof skewInput.replayPolicy !== 'string' || !(skewInput.replayPolicy in replayNames)) {
+      throw new TypeError(
+          "Node.create: skew.replayPolicy must be 'reject' or 'clamp'");
+    }
+    skew.replayPolicy = replayNames[skewInput.replayPolicy];
+  }
+  return skew;
+}
+
 // Protocol states (protocol_state_e, src/CRABS/data_model.h:58-65) as the
 // JS words the recipes use; the executor consumes the numbers 0..4 in the
 // op's per-resource required_state / next_state arrays.
@@ -1100,7 +1145,14 @@ class Node {
   static async create(adminId, options = {}) {
     const M = await getModule();
     const adminPtr = writeString(M, adminId);
-    const amPtr = M._crabs_wasm_node_create(adminPtr);
+    // Skew configuration (bounded-skew replay fix): { strategy, maxSkewMs,
+    // replayPolicy }. Defaults produce the same config the 1-arg C entry
+    // always produced — Node.create(id) is byte-identical to today's.
+    const skew = parseSkewOptions(options);
+    // max_skew_ms crosses the wasm ABI as i64 → a BigInt is REQUIRED at the
+    // call site (a Number throws `Cannot convert N to a BigInt`)
+    const amPtr = M._crabs_wasm_node_create_ex(
+        adminPtr, skew.strategy, BigInt(skew.maxSkewMs), skew.replayPolicy);
     if (adminPtr) M._free(adminPtr);
     if (!amPtr) throw new Error('Node.create failed');
     const node = new Node(M, amPtr);
@@ -2271,6 +2323,48 @@ class Node {
     const rc = this._M._crabs_wasm_execute(this._am, op._ptr);
     if (rc === 0xA006) return;
     wrapRc(rc, 'execute');
+  }
+
+  // Replay ingest (bounded-skew replay fix): execute a signed op under this
+  // node's REPLAY skew policy (Node.create option skew.replayPolicy). Never
+  // throws for an individually failed op — returns an outcome so a log
+  // replay can converge by design:
+  //   { status: 'applied' | 'pending' } on success / raft-pending
+  //   { status: 'skipped', code, message } on failure (e.g. 0x1002
+  //   protocol_violation for a future stamp, 0x7002 already_executed on a
+  //   re-ingested op) — a skipped op mutates nothing.
+  // GROUP_ORDERED note: a pending outcome still emits a 'change' event on
+  // the node (the C layer notifies every non-ALREADY_EXECUTED result) — do
+  // not wire replay-driven events to live-UI mutation paths.
+  replayOp(op) {
+    const rc = this._M._crabs_wasm_execute_replay(this._am, op._ptr);
+    if (rc === 0) return { status: 'applied' };
+    if (rc === 0xA006) return { status: 'pending' };   // raft GROUP_ORDERED path
+    return { status: 'skipped', code: rc, message: crabsError(rc, 'replayOp').message };
+  }
+
+  // Bulk history ingest: replay a batch of ALREADY-DESERIALIZED Operations.
+  // Per-op failures never abort the batch — each skip is console.warn'd and
+  // returned with its index, so consumers converge (and can surface gaps)
+  // instead of dying on the first out-of-window or opaque entry.
+  // NOTE: raft-committed history recovers through the raft module's own
+  // persisted batches (raftRecoverFromPersist), NOT through this API.
+  replayOps(operations) {
+    if (!Array.isArray(operations)) {
+      throw new TypeError('replayOps: expected an array of Operations');
+    }
+    const applied = [];
+    const skipped = [];
+    operations.forEach((entryOperation, entryIndex) => {
+      const outcome = this.replayOp(entryOperation);
+      if (outcome.status !== 'skipped') {
+        applied.push(entryIndex);
+      } else {
+        console.warn(`crabs-wasm: replay skipped op[${entryIndex}]: ${outcome.message}`);
+        skipped.push({ index: entryIndex, code: outcome.code, message: outcome.message });
+      }
+    });
+    return { applied, skipped };
   }
 
   sign(op, signingKey) {

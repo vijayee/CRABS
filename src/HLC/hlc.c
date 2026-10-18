@@ -421,7 +421,8 @@ static crabs_hlc_receive_result_e _hlc_receive_impl(crabs_hlc_state_t* state,
           // historic stamp never regresses it); the executor's replay path
           // emits a per-op failure diagnostic (a change event carrying the
           // failure rc), while a clamped ACCEPTANCE is silent — the op's
-          // original historic stamp in the audit log is its marker. Ordering caveat: the materialized op
+          // original historic stamp in the audit log is its marker.
+          // Ordering caveat: the materialized op
           // keeps its ORIGINAL stamp, so it sorts before everything stamped
           // after it; the executor layer (replay ingest path) is responsible
           // for out-of-order tolerance; this clamp only guarantees it never
