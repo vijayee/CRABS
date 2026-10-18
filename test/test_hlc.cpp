@@ -2017,3 +2017,58 @@ TEST(HLCReceiveReplay, ClampMarkerOnlyUnderBounded) {
   EXPECT_EQ(result, CRABS_HLC_ACCEPTED);
   EXPECT_EQ(state.last.physical_seconds, 36000u);
 }
+
+// ============================================================
+// Replay-clamp age ceiling (opt-in ancient-stamp hardening)
+// ============================================================
+
+// With a clamp ceiling set, a past-window stamp OLDER than the horizon is
+// hard-rejected (treated like any other time-travel probe) even under clamp.
+// 29000ms > 8000ms ceiling → REJECTED_SKEW + the time-travel counter bumps.
+TEST(HLCReceiveReplay, ReplayClampCeilingRejectsAncient) {
+  crabs_hlc_state_t state = make_mock_state("alice", 36000, 0);
+  state.receive_strategy = HLC_STRATEGY_BOUNDED;
+  state.max_skew_ms = 5000;
+  state.replay_clamp_max_age_ms = 8000;
+
+  crabs_hlc_t received = {35971, 0, 0, "bob"};  // 29s behind local
+  uint64_t rejections_before = state.time_travel_attempts_rejected;
+  crabs_hlc_receive_result_e result = crabs_hlc_receive_replay(&state, &received);
+
+  EXPECT_EQ(result, CRABS_HLC_REJECTED_SKEW);
+  EXPECT_EQ(state.time_travel_attempts_rejected, rejections_before + 1);
+  // The local clock adopts nothing from a rejected stamp.
+  EXPECT_EQ(state.last.physical_seconds, 0u);
+}
+
+// The same ceiling admits a clamp-eligible stamp INSIDE the horizon: 7000ms
+// behind is past the 5000ms live window but ≤ the 8000ms ceiling → clamped.
+TEST(HLCReceiveReplay, ReplayClampCeilingAllowsRecent) {
+  crabs_hlc_state_t state = make_mock_state("alice", 36000, 0);
+  state.receive_strategy = HLC_STRATEGY_BOUNDED;
+  state.max_skew_ms = 5000;
+  state.replay_clamp_max_age_ms = 8000;
+
+  crabs_hlc_t received = {35993, 0, 0, "bob"};  // 7s behind local
+  crabs_hlc_receive_result_e result = crabs_hlc_receive_replay(&state, &received);
+
+  EXPECT_EQ(result, CRABS_HLC_ACCEPTED_CLAMPED);
+  EXPECT_EQ(state.time_travel_attempts_rejected, 0u);
+  // Clamp invariant: the historic stamp does not regress the local clock.
+  EXPECT_EQ(state.last.physical_seconds, 36000u);
+}
+
+// The DEFAULT (ceiling 0) is UNBOUNDED — shipped v1 behavior: a far-historic
+// stamp still clamps through. This pins that the hardening is opt-in only.
+TEST(HLCReceiveReplay, ReplayClampCeilingZeroIsUnbounded) {
+  crabs_hlc_state_t state = make_mock_state("alice", 36000, 0);
+  state.receive_strategy = HLC_STRATEGY_BOUNDED;
+  state.max_skew_ms = 5000;
+  // replay_clamp_max_age_ms left at its 0 = unbounded default.
+
+  crabs_hlc_t received = {35000, 0, 0, "old"};  // 60s behind local
+  crabs_hlc_receive_result_e result = crabs_hlc_receive_replay(&state, &received);
+
+  EXPECT_EQ(result, CRABS_HLC_ACCEPTED_CLAMPED);
+  EXPECT_EQ(state.time_travel_attempts_rejected, 0u);
+}

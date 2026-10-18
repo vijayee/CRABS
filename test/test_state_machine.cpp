@@ -131,12 +131,15 @@ protected:
 
   // Configure the machine's ordering to BOUNDED + given replay policy with a
   // live, initialized clock (mirrors crabs_wasm_node_create's setup).
-  void set_skew_ordering(crabs_hlc_replay_policy_e replay_policy) {
+  // replay_max_age_ms: optional replay-clamp age ceiling (0 = unbounded).
+  void set_skew_ordering(crabs_hlc_replay_policy_e replay_policy,
+                         uint64_t replay_max_age_ms = 0) {
     crabs_ordering_config_t* config =
         (crabs_ordering_config_t*)malloc(sizeof(crabs_ordering_config_t));
     ASSERT_NE(config, nullptr);
     crabs_ordering_config_init_hlc(config, HLC_STRATEGY_BOUNDED);
     config->hlc.replay_policy = replay_policy;
+    config->hlc.replay_clamp_max_age_ms = replay_max_age_ms;
     state_set_ordering_config(state, config);
     crabs_hlc_state_init(&state->hlc_state, "admin");
     state->hlc_state_initialized = true;
@@ -2672,4 +2675,29 @@ TEST_F(TestStateMachine, ClampPolicyDoesNotRelaxLivePath) {
   operation_t* op = make_hlc_stamp_lock_op(-15, 0x42);
   EXPECT_EQ(state_machine_execute(state, op), CRABS_ERR_PROTOCOL_VIOLATION);
   operation_destroy(op);
+}
+
+// The opt-in replay-clamp age ceiling (replay_clamp_max_age_ms) hard-rejects
+// a past-window stamp OLDER than the horizon even under clamp: -15s is
+// 15000ms behind the live clock, past the 8000ms ceiling → the replay ingest
+// fails with protocol_violation and the resource stays IDLE. A stamp INSIDE
+// the horizon (-7s = 7000ms ≤ 8000) still clamp-materializes.
+TEST_F(TestStateMachine, ReplayClampCeilingRejectsAncientOp) {
+  set_skew_ordering(CRABS_HLC_REPLAY_CLAMP, 8000);
+
+  operation_t* ancient_op = make_hlc_stamp_lock_op(-15, 0x42);
+  EXPECT_EQ(state_machine_execute_replay(state, ancient_op),
+            CRABS_ERR_PROTOCOL_VIOLATION);
+  data_item_t* resource = state_find_item(state, "test_resource");
+  ASSERT_NE(resource, nullptr);
+  EXPECT_EQ(resource->protocol_state, PROTOCOL_IDLE);
+  operation_destroy(ancient_op);
+
+  // Inside the horizon, the clamp path is unchanged.
+  operation_t* recent_op = make_hlc_stamp_lock_op(-7, 0x41);
+  EXPECT_EQ(state_machine_execute_replay(state, recent_op), CRABS_SUCCESS);
+  resource = state_find_item(state, "test_resource");
+  ASSERT_NE(resource, nullptr);
+  EXPECT_EQ(resource->protocol_state, PROTOCOL_LOCKED);
+  operation_destroy(recent_op);
 }

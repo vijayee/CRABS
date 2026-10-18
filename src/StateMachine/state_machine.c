@@ -688,6 +688,11 @@ static crabs_error_e _validate_received_hlc(state_t* state, const operation_t* o
   probe_state.receive_strategy = config->hlc.receive_strategy;
   probe_state.max_skew_ms = config->hlc.max_skew_ms;
   probe_state.strict_mode = config->hlc.strict_mode;
+  probe_state.replay_clamp_max_age_ms = config->hlc.replay_clamp_max_age_ms;
+  // The replay-clamp age horizon rides the probe from config too: with the
+  // CRABS_HLC_REPLAY_CLAMP policy an ancient stamp beyond the configured
+  // ceiling is rejected by the receive impl itself (live validation ignores
+  // the horizon entirely).
   // Replay ingest consults the config's SEPARATE replay policy: with
   // CRABS_HLC_REPLAY_CLAMP a past-window historic stamp is accepted for
   // ordering instead of failing the whole op. The acceptance is SILENT:

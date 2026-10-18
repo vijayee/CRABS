@@ -109,6 +109,9 @@ typedef struct {
   crabs_time_source_e    time_source;                // Physical time source
   crabs_hlc_strategy_e   receive_strategy;           // Attack mitigation strategy
   uint64_t               max_skew_ms;                // BOUNDED: max clock skew (default 5000)
+  // REPLAY clamp horizon: 0 = unbounded (shipped v1 behavior); a clamp-eligible
+  // stamp older than this horizon is hard-rejected. The live path ignores it.
+  uint64_t               replay_clamp_max_age_ms;
   uint32_t               quorum_size;                // QUORUM: confirmations needed (default 3)
   uint64_t               quorum_timeout_ms;          // QUORUM: confirmation timeout (default 1000)
   uint64_t               trusted_resync_ms;          // TRUSTED: resync interval (default 30000)
@@ -137,6 +140,9 @@ typedef struct {
     bool                 trusted_time_source;
     uint64_t             trusted_resync_ms;
     crabs_hlc_replay_policy_e replay_policy;
+    // REPLAY clamp horizon: 0 = unbounded (shipped v1 behavior); a clamp-eligible
+    // stamp older than this horizon is hard-rejected. The live path ignores it.
+    uint64_t             replay_clamp_max_age_ms;
   } hlc;
 } crabs_ordering_config_t;
 

@@ -27,6 +27,7 @@ void crabs_hlc_state_init(crabs_hlc_state_t* state, const char* node_id) {
   state->time_source = CRABS_TIME_SOURCE_SYSTEM_CLOCK;
   state->receive_strategy = HLC_STRATEGY_BOUNDED;
   state->max_skew_ms = CRABS_HLC_DEFAULT_MAX_SKEW_MS;
+  state->replay_clamp_max_age_ms = 0;  // 0 = unbounded replay-clamp horizon
   state->quorum_size = CRABS_HLC_DEFAULT_QUORUM_SIZE;
   state->quorum_timeout_ms = CRABS_HLC_DEFAULT_QUORUM_TIMEOUT_MS;
   state->trusted_resync_ms = CRABS_HLC_DEFAULT_TRUSTED_RESYNC_MS;
@@ -422,6 +423,27 @@ static crabs_hlc_receive_result_e _hlc_receive_impl(crabs_hlc_state_t* state,
           // emits a per-op failure diagnostic (a change event carrying the
           // failure rc), while a clamped ACCEPTANCE is silent — the op's
           // original historic stamp in the audit log is its marker.
+          // Opt-in age ceiling (ancient-stamp queue-jump hardening): a clamp
+          // node may bound how far back a historic stamp may order ahead of
+          // live work. 0 (the shipped v1 default) = unbounded; a stamp older
+          // than the ceiling is refused like any other time-travel probe.
+          // Audit R6-4 pattern: clamp the uint64 config to INT64_MAX before
+          // int64_t comparison.
+          uint64_t clamp_ceiling = (state->replay_clamp_max_age_ms > (uint64_t)INT64_MAX)
+                                       ? (uint64_t)INT64_MAX
+                                       : state->replay_clamp_max_age_ms;
+          // Negation safety: crabs_hlc_diff_ms saturates to [INT64_MIN,
+          // INT64_MAX], and INT64_MIN is a real saturation branch there (the
+          // reference clock at INT64_MAX ms). Negating INT64_MIN is UB, so a
+          // saturated-ancient stamp is pinned to INT64_MAX past-age — beyond
+          // any ceiling, and identical to the raw value whenever the raw
+          // negation is well-defined and exceeds INT64_MAX already.
+          int64_t past_age_ms = (skew_ms == INT64_MIN)
+                                    ? INT64_MAX : -skew_ms;
+          if (clamp_ceiling != 0 && past_age_ms > (int64_t)clamp_ceiling) {
+            state->time_travel_attempts_rejected += 1;
+            return CRABS_HLC_REJECTED_SKEW;
+          }
           // Ordering caveat: the materialized op
           // keeps its ORIGINAL stamp, so it sorts before everything stamped
           // after it; the executor layer (replay ingest path) is responsible
