@@ -183,8 +183,9 @@ crabs_error_e  state_machine_execute(state_t* state, operation_t* op);
 // for ordering instead of CRABS_ERR_PROTOCOL_VIOLATION — no observable
 // rewrite: the op keeps its as-authored stamp, the real clock adopts
 // nothing). Future-stamped ops fail on both paths under a WINDOWED
-// strategy (BOUNDED default); under NAIVE neither path rejects future
-// stamps (pre-existing behavior). Authorization, dedup and ordering
+// strategy (BOUNDED default); under NAIVE or STRICT neither path rejects
+// future stamps (STRICT accepts them as ACCEPTED_STRICT; NAIVE is the
+// pre-existing behavior). Authorization, dedup and ordering
 // monotonicity behave exactly as state_machine_execute.
 crabs_error_e  state_machine_execute_replay(state_t* state, operation_t* op);
 

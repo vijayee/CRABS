@@ -2608,8 +2608,9 @@ TEST_F(TestStateMachine, ReplayClampMaterializesHistoricOp) {
   // The clamped op lands as a real audit/barrier entry.
   EXPECT_EQ(state->log_count, log_count_before + 1);
 
-  // Re-replaying the same materialized op is an idempotent skip: the tx
-  // backstop refuses a second ingest, and no second log entry appears.
+  // Re-replaying the same materialized op is an idempotent skip: the
+  // R7-11 watermark backstop refuses a second ingest, and no second log
+  // entry appears.
   EXPECT_EQ(state_machine_execute_replay(state, op), CRABS_ERR_ALREADY_EXECUTED);
   EXPECT_EQ(state->log_count, log_count_before + 1);
   operation_destroy(op);

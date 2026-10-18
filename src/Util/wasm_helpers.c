@@ -238,8 +238,15 @@ static void _time_source_unregister_machine(attribute_machine_t* am) {
 // Node lifecycle (HLC-enabled)
 // ============================================================
 
-EMSCRIPTEN_KEEPALIVE
-attribute_machine_t* crabs_wasm_node_create(const char* admin_id) {
+// Shared node creation used by the fixed-default and skew-configured
+// keepalive entries below. The ordering-config fields (strategy window and
+// replay-ingest policy) are the caller's decision; everything else mirrors
+// the original crabs_wasm_node_create body verbatim.
+static attribute_machine_t* _wasm_node_create_configured(
+    const char* admin_id,
+    crabs_hlc_strategy_e strategy,
+    uint64_t max_skew_ms,
+    crabs_hlc_replay_policy_e replay_policy) {
   ecdsa_keypair_t* node_key = crypto_ecdsa_generate();
   if (!node_key) return NULL;
 
@@ -258,7 +265,10 @@ attribute_machine_t* crabs_wasm_node_create(const char* admin_id) {
     attribute_machine_destroy(am);
     return NULL;
   }
-  crabs_ordering_config_init_hlc(ordering_config, HLC_STRATEGY_BOUNDED);
+  crabs_ordering_config_init_hlc(ordering_config, strategy);
+  ordering_config->hlc.max_skew_ms =
+      max_skew_ms != 0 ? max_skew_ms : CRABS_HLC_DEFAULT_MAX_SKEW_MS;
+  ordering_config->hlc.replay_policy = replay_policy;
   state_set_ordering_config(&am->base_state, ordering_config);
 
   crabs_hlc_state_init(&am->base_state.hlc_state, admin_id);
@@ -268,6 +278,26 @@ attribute_machine_t* crabs_wasm_node_create(const char* admin_id) {
 
   crypto_ecdsa_keypair_destroy(node_key);
   return am;
+}
+
+EMSCRIPTEN_KEEPALIVE
+attribute_machine_t* crabs_wasm_node_create(const char* admin_id) {
+  // Defaults mirror the pre-skew-options behavior exactly (BOUNDED/5000/reject).
+  return _wasm_node_create_configured(admin_id, HLC_STRATEGY_BOUNDED,
+                                      CRABS_HLC_DEFAULT_MAX_SKEW_MS,
+                                      CRABS_HLC_REPLAY_REJECT);
+}
+
+// Skew-configured creation (bounded-skew replay fix):
+//   strategy      — HLC_STRATEGY_* enum value (0x00 naive … 0x04 trusted)
+//   max_skew_ms   — BOUNDED window in ms; 0 keeps the 5000 default
+//   replay_policy — CRABS_HLC_REPLAY_* replay-ingest policy
+EMSCRIPTEN_KEEPALIVE
+attribute_machine_t* crabs_wasm_node_create_ex(const char* admin_id,
+                                               crabs_hlc_strategy_e strategy,
+                                               uint64_t max_skew_ms,
+                                               crabs_hlc_replay_policy_e replay_policy) {
+  return _wasm_node_create_configured(admin_id, strategy, max_skew_ms, replay_policy);
 }
 
 EMSCRIPTEN_KEEPALIVE
@@ -452,6 +482,16 @@ EMSCRIPTEN_KEEPALIVE
 crabs_error_e crabs_wasm_execute(attribute_machine_t* am, operation_t* op) {
   if (!am || !op) return CRABS_ERR_INVALID_PARAM;
   return state_machine_execute(&am->base_state, op);
+}
+
+// Replay-ingest execution: feeds an ALREADY-EXECUTED historic op back through
+// the executor (crabs-wasm bounded-skew replay fix). The node's ordering
+// config decides the HLC disposition (crabs_hlc_replay_policy_e); the live
+// path above is untouched.
+EMSCRIPTEN_KEEPALIVE
+crabs_error_e crabs_wasm_execute_replay(attribute_machine_t* am, operation_t* op) {
+  if (!am || !op) return CRABS_ERR_INVALID_PARAM;
+  return state_machine_execute_replay(&am->base_state, op);
 }
 
 // Forward declaration: the op type registration below reuses the shared

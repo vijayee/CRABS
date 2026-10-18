@@ -210,7 +210,9 @@ BASE_EXPORTS='[
   "_crabs_wasm_raft_config_change_pending",
   "_crabs_wasm_raft_rejected_message_count",
   "_crabs_wasm_raft_committed_members",
-  "_crabs_wasm_raft_joint_members"
+  "_crabs_wasm_raft_joint_members",
+  "_crabs_wasm_node_create_ex",
+  "_crabs_wasm_execute_replay"
 ]'
 
 DEVTOOLS_EXPORTS='[
