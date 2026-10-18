@@ -1652,13 +1652,15 @@ public:
     std::string admin_id = info[0].As<Napi::String>().Utf8Value();
 
     // Parse options: { ordering: 'hlc' | 'lamport',
-    //                   skew: { maxSkewMs, replayPolicy } }
+    //                   skew: { maxSkewMs, replayPolicy, strategy } }
     bool use_hlc = true;  // Default to HLC (user requested hybrid time)
     // Skew configuration (bounded-skew replay fix, wasm-parity): the C seam
     // takes raw enum/uint values with no validation — THIS whitelist is the
     // enforcement point (mirror of the wasm binding's parseSkewOptions).
     uint64_t max_skew_ms = 0;  // 0 = keep the C-side default (5000); NOT "unbounded"
     crabs_hlc_replay_policy_e replay_policy = CRABS_HLC_REPLAY_REJECT;
+    // Default bounded — byte-compatible with the pre-parity hardcoded config.
+    crabs_hlc_strategy_e skew_strategy_enum = HLC_STRATEGY_BOUNDED;
     if (info.Length() > 1 && info[1].IsObject()) {
       Napi::Object opts = info[1].As<Napi::Object>();
       if (opts.Has("ordering")) {
@@ -1708,6 +1710,25 @@ public:
             replay_policy = (policy == "clamp")
                                 ? CRABS_HLC_REPLAY_CLAMP : CRABS_HLC_REPLAY_REJECT;
           }
+          if (skew.Has("strategy")) {
+            std::string skew_strategy = require_js_string(skew.Get("strategy"),
+                                                          "Node", "skew.strategy");
+            // Same whitelist as the wasm binding's parseSkewOptions.
+            if (skew_strategy == "naive") {
+              skew_strategy_enum = HLC_STRATEGY_NAIVE;
+            } else if (skew_strategy == "bounded") {
+              skew_strategy_enum = HLC_STRATEGY_BOUNDED;
+            } else if (skew_strategy == "quorum") {
+              skew_strategy_enum = HLC_STRATEGY_QUORUM;
+            } else if (skew_strategy == "strict") {
+              skew_strategy_enum = HLC_STRATEGY_STRICT;
+            } else if (skew_strategy == "trusted") {
+              skew_strategy_enum = HLC_STRATEGY_TRUSTED;
+            } else {
+              throw Napi::TypeError::New(
+                  env, "Node: skew.strategy must be one of 'naive'|'bounded'|'quorum'|'strict'|'trusted'");
+            }
+          }
         }
       }
     }
@@ -1729,7 +1750,7 @@ public:
 
     // Configure ordering
     if (use_hlc) {
-      crabs_ordering_config_init_hlc(&ordering_config_, HLC_STRATEGY_BOUNDED);
+      crabs_ordering_config_init_hlc(&ordering_config_, skew_strategy_enum);
       if (max_skew_ms != 0) ordering_config_.hlc.max_skew_ms = max_skew_ms;
       ordering_config_.hlc.replay_policy = replay_policy;
       state_set_ordering_config(&am_->base_state, &ordering_config_);

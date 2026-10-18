@@ -68,8 +68,8 @@ const nativeReplayOp = Node.prototype.replayOp;
 // batch is fine. applied HOLDS INDICES; pending (raft GROUP_ORDERED)
 // outcomes also land in applied — accepted into the ordering log, not yet
 // committed. Match skips on `code` (message shapes differ across bindings).
-// defineProperty keeps the JS method's descriptor shaped like the native
-// class's own (non-enumerable, not one of the read-only sealed slots).
+// defineProperty keeps the JS method's descriptor deliberately more permissive
+// than the native class's read-only sealed slots (writable + configurable).
 const replayOpsHelper = function (operations) {
   if (!Array.isArray(operations)) {
     throw new TypeError('replayOps: expected an array of Operations');

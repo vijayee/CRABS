@@ -368,7 +368,8 @@ export interface NodeOptions {
    *  non-negative integer; 0 keeps the C default (5000ms) — it is NOT
    *  "unbounded". replayPolicy 'reject' (default) refuses a beyond-window
    *  stamp; 'clamp' accepts aged stamps through the replayOp ingest path. */
-  skew?: { maxSkewMs?: number; replayPolicy?: 'reject' | 'clamp' };
+  skew?: { maxSkewMs?: number; replayPolicy?: 'reject' | 'clamp';
+           strategy?: 'naive' | 'bounded' | 'quorum' | 'strict' | 'trusted'; };
 }
 
 export interface TimeSourceOptions {

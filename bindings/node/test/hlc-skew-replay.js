@@ -60,6 +60,11 @@ function mustThrowWith(invoke, fragment, label) {
     'skew must be an options object', 'non-object skew');
   mustThrowWith(() => new Node('bad', { skew: { maxSkewMs: 1.5 } }),
     'skew.maxSkewMs must be a non-negative safe integer', 'fractional maxSkewMs');
+  // skew.strategy whitelist (full wasm parseSkewOptions parity): a junk
+  // strategy throws rather than silently falling back to the default.
+  mustThrowWith(() => new Node('bad', { skew: { strategy: 'bogus' } }),
+    "skew.strategy must be one of 'naive'|'bounded'|'quorum'|'strict'|'trusted'",
+    'unknown strategy');
   // Falsy skew VALUES are "no skew options" (wasm parseSkewOptions's
   // `!options.skew` early return) — only truthy junk throws.
   assert(new Node('skew-null', { skew: null }) !== null,
@@ -185,6 +190,19 @@ function mustThrowWith(invoke, fragment, label) {
     `mixed batch must skip entry 0 with already_executed, got ${JSON.stringify(mixed.skipped)}`);
   assert(clampReplayer.setContains('proposal-42_voters', 'bob') === true,
     'the never-executed second op materialized through clamp');
+
+  // --- skew.strategy positive pin (wasm parseSkewOptions parity): a node
+  // built with an explicit bounded strategy + clamp policy ACCEPTS and
+  // applies the aged op — proving the option is honored, not silently
+  // dropped (while an unknown strategy threw above).
+  const strategyReplayer = setupNode('strategy-replayer', {
+    ordering: 'hlc', skew: { strategy: 'bounded', maxSkewMs: 100, replayPolicy: 'clamp' },
+  });
+  const strategyOutcome = strategyReplayer.replayOp(Operation.deserialize(secondOpWire));
+  assert(strategyOutcome.status === 'applied',
+    `bounded-strategy node must apply the aged op (got ${JSON.stringify(strategyOutcome)})`);
+  assert(strategyReplayer.setContains('proposal-42_voters', 'bob') === true,
+    'bounded-strategy node must materialize the tracker membership');
 
   console.log(`hlc-skew-replay OK: ${passed} passed, ${failed} failed — clamp ingest materializes, ` +
     'default (and 0-sentinel) rejects the aged op live, batch survives with applied holding indices');
