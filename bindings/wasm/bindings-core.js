@@ -99,6 +99,10 @@ const TIME_SOURCE_DEFAULT_RESYNC_MS = 30000;
 const TIME_SOURCE_DEFAULT_TIMEOUT_MS = 1000;
 const TIME_SOURCE_DEFAULT_MAX_SKEW_MS = 5000;
 
+// replayOps(): individual per-op skip warns stop after this many; further
+// skips collapse into one summary line (the skipped[] entries stay complete).
+const REPLAY_SKIP_WARN_LIMIT = 10;
+
 // ============================================================
 // Helpers
 // ============================================================
@@ -2324,6 +2328,13 @@ class Node {
   }
 
   execute(op) {
+    // Audit M-7 parity with replayOp(): a foreign-module Operation's `_ptr`
+    // is a valid offset in a DIFFERENT address space — reading it here would
+    // be a memory-confusion read of someone else's heap; a destroyed op
+    // (`_ptr` 0) has nothing to execute either.
+    if (!op || !op._ptr || op._M !== this._M) {
+      throw new TypeError('execute: expected an Operation from this module');
+    }
     // RAFT ordering module path: a GROUP_ORDERED write through an attached
     // module returns ordering_pending (0xA006) — the op was ACCEPTED into
     // the module's log as a pending proposal and materializes on commit
@@ -2366,11 +2377,16 @@ class Node {
   }
 
   // Bulk history ingest: replay a batch of ALREADY-DESERIALIZED Operations.
-  // Per-op failures never abort the batch — each skip is console.warn'd and
-  // returned with its index, so consumers converge (and can surface gaps)
-  // instead of dying on the first out-of-window or opaque entry. `applied`
-  // holds INDICES; pending outcomes (raft GROUP_ORDERED) also land in
-  // `applied` — accepted into the ordering log, not yet committed.
+  // Per-op failures never abort the batch — each skip is returned with its
+  // index, so consumers converge (and can surface gaps) instead of dying on
+  // the first out-of-window or opaque entry. `applied` holds INDICES;
+  // pending outcomes (raft GROUP_ORDERED) also land in `applied` — accepted
+  // into the ordering log, not yet committed.
+  // Warn throttling: the first REPLAY_SKIP_WARN_LIMIT skips warn individually
+  // (`crabs-wasm: replay skipped op[N]: message`); on a bigger batch ONE
+  // summary line (`...and N more skipped (total K)`) follows — a 10k-op
+  // history must not flood the console. The `skipped` array STILL carries
+  // every skip entry; the throttle only trims console output.
   // NOTE: raft-committed history recovers through the raft module's own
   // persisted batches (raftRecoverFromPersist), NOT through this API.
   replayOps(operations) {
@@ -2379,19 +2395,34 @@ class Node {
     }
     const applied = [];
     const skipped = [];
+    let skipCount = 0;
     operations.forEach((entryOperation, entryIndex) => {
       const outcome = this.replayOp(entryOperation);
       if (outcome.status !== 'skipped') {
         applied.push(entryIndex);
-      } else {
+        return;
+      }
+      skipped.push({ index: entryIndex, code: outcome.code, message: outcome.message });
+      skipCount++;
+      if (skipCount <= REPLAY_SKIP_WARN_LIMIT) {
         console.warn(`crabs-wasm: replay skipped op[${entryIndex}]: ${outcome.message}`);
-        skipped.push({ index: entryIndex, code: outcome.code, message: outcome.message });
       }
     });
+    if (skipCount > REPLAY_SKIP_WARN_LIMIT) {
+      console.warn(`crabs-wasm: ...and ${skipCount - REPLAY_SKIP_WARN_LIMIT} more skipped `
+        + `(total ${skipCount})`);
+    }
     return { applied, skipped };
   }
 
   sign(op, signingKey) {
+    // Audit M-7 parity with replayOp(): a foreign-module Operation's `_ptr`
+    // is a valid offset in a DIFFERENT address space — reading it here would
+    // be a memory-confusion read of someone else's heap; a destroyed op
+    // (`_ptr` 0) has nothing to sign either.
+    if (!op || !op._ptr || op._M !== this._M) {
+      throw new TypeError('sign: expected an Operation from this module');
+    }
     const M = this._M;
     if (signingKey && typeof signingKey === 'object') {
       if (!signingKey._ptr) throw new Error('Expected KeyPair or private key hex string');

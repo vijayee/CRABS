@@ -283,7 +283,7 @@ Two trust caveats for clamp-enabled nodes:
    configuration. A future hardening may add an age ceiling even under
    clamp.
 2. **The clamp marker exists only under the BOUNDED strategy.**
-   `{strategy:"naive", replayPolicy:"clamp"}` behaves as plain NAIVE (no
+   `skew:{strategy:"naive", replayPolicy:"clamp"}` behaves as plain NAIVE (no
    historic marker, no future reject); QUORUM/TRUSTED remain fail-closed
    regardless of the replay policy. Clamp is meaningful only for BOUNDED
    nodes.

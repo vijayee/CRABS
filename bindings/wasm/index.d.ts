@@ -433,7 +433,6 @@ export interface NodeOptions {
   /** Skew configuration (HLC bounded-skew replay fix). Defaults mirror the
    *  C library: BOUNDED / 5000ms / 'reject' on replay. maxSkewMs 0 is a
    *  sentinel for the C default, not "unbounded". */
-  strategy?: 'naive' | 'bounded' | 'quorum' | 'strict' | 'trusted';
   skew?: {
     strategy?: 'naive' | 'bounded' | 'quorum' | 'strict' | 'trusted';
     maxSkewMs?: number;                 // non-negative safe integer; 0 = keep C default 5000
