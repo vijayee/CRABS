@@ -124,6 +124,10 @@ The enum tables `TRUST_MODE`, `DATA_TYPE`, `CRDT_TYPE` are exported alongside th
 - `new Node(adminId, options?)` — create a CRABS node with the given admin user
   - `options.ordering` — `'hlc'` (default) or `'lamport'`
   - `options.skew.strategy` — HLC receive strategy (`'bounded'` default)
+  - `options.skew.maxSkewMs` — the BOUNDED live window in ms (default 5000;
+    `0` is a sentinel for the default, not "unbounded")
+  - `options.skew.replayPolicy` — replay-ingest path policy (`'reject'`
+    default; `'clamp'` accepts stamps older than the live window)
   - `options.skew.maxReplayAgeMs` — replay-clamp age horizon for a node whose
     `replayPolicy` is `'clamp'`: stamps older than the horizon are refused
     (`protocol_violation`) instead of clamped; stamps still inside the live

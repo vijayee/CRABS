@@ -203,8 +203,8 @@ struct NodeAddonInstanceData {
 };
 
 // Class-checked unwrap (review follow-up): ObjectWrap::Unwrap is
-// class-AGNOSTIC — a plain object unwraps to nullptr (null-deref SIGSEGV)
-// and an object of a DIFFERENT wrapped class reinterprets THAT class's
+// class-AGNOSTIC — a plain object has no wrap data (Unwrap throws) and an
+// object of a DIFFERENT wrapped class reinterprets THAT class's
 // internal pointer (type-confused read fed straight into the executor or
 // signer). Verify the value is an instance of the wrapper's own constructor
 // before unwrapping; the per-class constructors live in the instance data.

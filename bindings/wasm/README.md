@@ -235,7 +235,7 @@ them as strings.
 
 ## Replay skew policy
 
-`Node.create(id, { skew: { strategy, maxSkewMs, replayPolicy } })` configures
+`Node.create(id, { skew: { strategy, maxSkewMs, replayPolicy, maxReplayAgeMs } })` configures
 the HLC skew handling. Defaults mirror the C library (BOUNDED / 5000ms /
 `'reject'`) — a node created without options behaves exactly as before.
 
