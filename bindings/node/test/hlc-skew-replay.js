@@ -64,6 +64,10 @@ function mustThrowWith(invoke, fragment, label) {
     'skew must be an options object', 'non-object skew');
   mustThrowWith(() => new Node('bad', { skew: { maxSkewMs: 1.5 } }),
     'skew.maxSkewMs must be a non-negative safe integer', 'fractional maxSkewMs');
+  mustThrowWith(() => new Node('bad', { skew: { maxReplayAgeMs: 2 ** 53 + 1 } }),
+    'skew.maxReplayAgeMs must be a non-negative safe integer', 'out-of-range maxReplayAgeMs');
+  mustThrowWith(() => new Node('bad', { skew: { maxReplayAgeMs: -1 } }),
+    'skew.maxReplayAgeMs must be a non-negative safe integer', 'negative maxReplayAgeMs');
   // skew.strategy whitelist (full wasm parseSkewOptions parity): a junk
   // strategy throws rather than silently falling back to the default.
   mustThrowWith(() => new Node('bad', { skew: { strategy: 'bogus' } }),
@@ -208,6 +212,23 @@ function mustThrowWith(invoke, fragment, label) {
   assert(strategyReplayer.setContains('proposal-42_voters', 'bob') === true,
     'bounded-strategy node must materialize the tracker membership');
 
+  // --- Replay-clamp age ceiling (opt-in ancient-stamp hardening): a clamp
+  // node with maxReplayAgeMs set refuses a stamp older than the horizon. The
+  // aged op is ~6.5s old here, far past the 2000ms ceiling — its replayOp
+  // skips with protocol_violation (0x1001) and the tracker stays empty,
+  // while the plain clamp replayer above applied the same op (the ceiling is
+  // opt-in only; default 0 = unbounded keeps shipped v1 behavior).
+  const ceilingReplayer = setupNode(
+    'ceiling-replayer', { skew: { replayPolicy: 'clamp', maxReplayAgeMs: 2000 } });
+  const ceilingOp = Operation.deserialize(opWire);
+  const ceilingOutcome = ceilingReplayer.replayOp(ceilingOp);
+  assert(ceilingOutcome.status === 'skipped',
+    `an op beyond the age ceiling must skip (got ${JSON.stringify(ceilingOutcome)})`);
+  assert(ceilingOutcome.code === 0x1001 /* CRABS_ERR_PROTOCOL_VIOLATION */,
+    `ceiling skip must carry protocol_violation 0x1001, got 0x${(ceilingOutcome.code || 0).toString(16)}`);
+  assert(!ceilingReplayer.setContains('proposal-42_voters', 'alice'),
+    'the ceiling refusal must not mutate the tracker');
+
   // --- Class-checked unwrap pins (review follow-up): ObjectWrap::Unwrap is
   // class-agnostic, so a plain object used to null-deref and a KeyPair
   // instance used to be a type-confused read fed into the executor. Both
@@ -253,7 +274,8 @@ function mustThrowWith(invoke, fragment, label) {
     'the 11th skip must NOT warn individually after the throttle');
 
   console.log(`hlc-skew-replay OK: ${passed} passed, ${failed} failed — clamp ingest materializes, ` +
-    'default (and 0-sentinel) rejects the aged op live, batch survives with applied holding indices');
+    'default (and 0-sentinel) rejects the aged op live, age ceiling refuses ancient stamps, ' +
+    'batch survives with applied holding indices');
   process.exit(failed > 0 ? 1 : 0);
 })().catch((caughtError) => {
   console.error(caughtError);

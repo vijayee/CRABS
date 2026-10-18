@@ -366,8 +366,11 @@ export interface NodeOptions {
   /** Bounded-skew replay fix (wasm parity): maxSkewMs must be a safe
    *  non-negative integer; 0 keeps the C default (5000ms) — it is NOT
    *  "unbounded". replayPolicy 'reject' (default) refuses a beyond-window
-   *  stamp; 'clamp' accepts aged stamps through the replayOp ingest path. */
+   *  stamp; 'clamp' accepts aged stamps through the replayOp ingest path.
+   *  maxReplayAgeMs opts a clamp node into an age ceiling (0 = unbounded,
+   *  the default). */
   skew?: { maxSkewMs?: number; replayPolicy?: 'reject' | 'clamp';
+           maxReplayAgeMs?: number;
            strategy?: 'naive' | 'bounded' | 'quorum' | 'strict' | 'trusted'; };
 }
 

@@ -413,6 +413,7 @@ function parseSkewOptions(options) {
     strategy: 0x01,       // HLC_STRATEGY_BOUNDED
     maxSkewMs: 0,         // 0 keeps the C-side CRABS_HLC_DEFAULT_MAX_SKEW_MS (sentinel, NOT unbounded)
     replayPolicy: 0,      // CRABS_HLC_REPLAY_REJECT
+    maxReplayAgeMs: 0,    // replay-clamp age horizon; 0 = unbounded (shipped v1 behavior)
   };
   if (!options || !options.skew) return skew;
   const skewInput = options.skew;
@@ -443,6 +444,16 @@ function parseSkewOptions(options) {
       throw new TypeError('Node.create: skew.maxSkewMs must be a non-negative safe integer');
     }
     skew.maxSkewMs = skewInput.maxSkewMs;
+  }
+  if (skewInput.maxReplayAgeMs !== undefined) {
+    // Same gate shape as maxSkewMs: both cross the wasm ABI as i64 (BigInt),
+    // so the value must survive 2^53-exact BigInt coercion.
+    if (typeof skewInput.maxReplayAgeMs !== 'number' ||
+        !Number.isSafeInteger(skewInput.maxReplayAgeMs) ||
+        skewInput.maxReplayAgeMs < 0) {
+      throw new TypeError('Node.create: skew.maxReplayAgeMs must be a non-negative safe integer');
+    }
+    skew.maxReplayAgeMs = skewInput.maxReplayAgeMs;
   }
   if (skewInput.replayPolicy !== undefined) {
     const replayNames = Object.assign(Object.create(null), { reject: 0, clamp: 1 });
@@ -1158,16 +1169,18 @@ class Node {
   static async create(adminId, options = {}) {
     const M = await getModule();
     // Skew configuration (bounded-skew replay fix): { strategy, maxSkewMs,
-    // replayPolicy }. Defaults produce the same config the 1-arg C entry
-    // always produced — Node.create(id) is byte-identical to today's.
-    // Validate options BEFORE staging the admin id: a rejected create must
-    // not leak the writeString allocation into the module heap.
+    // replayPolicy, maxReplayAgeMs }. Defaults produce the same config the
+    // 1-arg C entry always produced — Node.create(id) is byte-identical to
+    // today's. Validate options BEFORE staging the admin id: a rejected
+    // create must not leak the writeString allocation into the module heap.
     const skew = parseSkewOptions(options);
     const adminPtr = writeString(M, adminId);
-    // max_skew_ms crosses the wasm ABI as i64 → a BigInt is REQUIRED at the
-    // call site (a Number throws `Cannot convert N to a BigInt`)
+    // max_skew_ms and replay_max_age_ms cross the wasm ABI as i64 → a BigInt
+    // is REQUIRED at the call site (a Number throws `Cannot convert N to a
+    // BigInt`)
     const amPtr = M._crabs_wasm_node_create_ex(
-        adminPtr, skew.strategy, BigInt(skew.maxSkewMs), skew.replayPolicy);
+        adminPtr, skew.strategy, BigInt(skew.maxSkewMs), skew.replayPolicy,
+        BigInt(skew.maxReplayAgeMs));
     if (adminPtr) M._free(adminPtr);
     if (!amPtr) throw new Error('Node.create failed');
     const node = new Node(M, amPtr);

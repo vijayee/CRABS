@@ -1675,12 +1675,16 @@ public:
     std::string admin_id = info[0].As<Napi::String>().Utf8Value();
 
     // Parse options: { ordering: 'hlc' | 'lamport',
-    //                   skew: { maxSkewMs, replayPolicy, strategy } }
+    //                   skew: { maxSkewMs, maxReplayAgeMs, replayPolicy,
+    //                           strategy } }
     bool use_hlc = true;  // Default to HLC (user requested hybrid time)
     // Skew configuration (bounded-skew replay fix, wasm-parity): the C seam
     // takes raw enum/uint values with no validation — THIS whitelist is the
     // enforcement point (mirror of the wasm binding's parseSkewOptions).
     uint64_t max_skew_ms = 0;  // 0 = keep the C-side default (5000); NOT "unbounded"
+    // Replay-clamp age horizon (ancient-stamp hardening): 0 IS "unbounded"
+    // (the shipped v1 default) — assigned unconditionally below.
+    uint64_t max_replay_age_ms = 0;
     crabs_hlc_replay_policy_e replay_policy = CRABS_HLC_REPLAY_REJECT;
     // Default bounded — byte-compatible with the pre-parity hardcoded config.
     crabs_hlc_strategy_e skew_strategy_enum = HLC_STRATEGY_BOUNDED;
@@ -1722,6 +1726,23 @@ public:
                   env, "Node: skew.maxSkewMs must be a non-negative safe integer");
             }
             max_skew_ms = (uint64_t)window_value;
+          }
+          if (skew.Has("maxReplayAgeMs")) {
+            Napi::Value replay_horizon = skew.Get("maxReplayAgeMs");
+            // Same safe non-negative integer gate as maxSkewMs (the wasm
+            // parseSkewOptions rule): fractional or above-MAX_SAFE_INTEGER
+            // doubles must refuse before the uint64 cast.
+            if (!replay_horizon.IsNumber()) {
+              throw Napi::TypeError::New(
+                  env, "Node: skew.maxReplayAgeMs must be a non-negative safe integer");
+            }
+            double horizon_value = replay_horizon.As<Napi::Number>().DoubleValue();
+            if (!(horizon_value >= 0) || horizon_value > 9007199254740991.0 ||
+                horizon_value != std::floor(horizon_value)) {
+              throw Napi::TypeError::New(
+                  env, "Node: skew.maxReplayAgeMs must be a non-negative safe integer");
+            }
+            max_replay_age_ms = (uint64_t)horizon_value;
           }
           if (skew.Has("replayPolicy")) {
             std::string policy = require_js_string(skew.Get("replayPolicy"),
@@ -1776,6 +1797,9 @@ public:
       crabs_ordering_config_init_hlc(&ordering_config_, skew_strategy_enum);
       if (max_skew_ms != 0) ordering_config_.hlc.max_skew_ms = max_skew_ms;
       ordering_config_.hlc.replay_policy = replay_policy;
+      // Unconditional assign: the C-side default is already 0 = unbounded, so
+      // a JS-supplied 0 is a no-op rather than a distinct value.
+      ordering_config_.hlc.replay_clamp_max_age_ms = max_replay_age_ms;
       state_set_ordering_config(&am_->base_state, &ordering_config_);
       // Initialize HLC state with admin_id as node_id
       crabs_hlc_state_init(&am_->base_state.hlc_state, admin_id.c_str());

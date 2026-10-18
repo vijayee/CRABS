@@ -266,6 +266,9 @@ Notes for operators:
 - `maxSkewMs: 0` is a SENTINEL for the C-side default (5000), not
   "unbounded"; oversized windows are safe (the C consumer clamps to
   INT64_MAX) but choose the window deliberately.
+- `maxReplayAgeMs` — replay-clamp horizon for a `'clamp'` node: 0 =
+  unbounded (the shipped default); stamps OLDER than the horizon are refused
+  (`protocol_violation`) even under clamp.
 - Replayed GROUP_ORDERED ops surface as `{ status: 'pending' }`. They still
   emit a `'change'` event carrying the `ordering_pending` result — do not
   wire replay-driven events to live-UI mutation paths; a bulk re-ingest

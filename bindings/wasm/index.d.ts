@@ -437,6 +437,7 @@ export interface NodeOptions {
     strategy?: 'naive' | 'bounded' | 'quorum' | 'strict' | 'trusted';
     maxSkewMs?: number;                 // non-negative safe integer; 0 = keep C default 5000
     replayPolicy?: 'reject' | 'clamp';  // replay-ingest path policy
+    maxReplayAgeMs?: number;            // replay-clamp horizon; 0 = unbounded (default)
   };
 }
 

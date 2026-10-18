@@ -36,6 +36,8 @@ const assertEquals = (actual, expected, label) => {
   // rejections, so the helper awaits before asserting.
   await mustThrowWith(() => Node.create('bad', { skew: { maxSkewMs: 2 ** 53 } }),
     'skew.maxSkewMs must be a non-negative safe integer', 'unsafe maxSkewMs');
+  await mustThrowWith(() => Node.create('bad', { skew: { maxReplayAgeMs: 2 ** 53 } }),
+    'skew.maxReplayAgeMs must be a non-negative safe integer', 'unsafe maxReplayAgeMs');
   await mustThrowWith(() => Node.create('bad', { skew: { replayPolicy: 'bogus' } }),
     "skew.replayPolicy must be 'reject' or 'clamp'", 'unknown replayPolicy');
   await mustThrowWith(() => Node.create('bad', { skew: { strategy: 'bogus' } }),
@@ -163,6 +165,26 @@ const assertEquals = (actual, expected, label) => {
   assertEquals(mixed.skipped[0].code, 0x7002, 'mixed-batch skip carries already_executed');
   assertEquals(clampReplayer.getRegister('flips'), 2, 'never-executed op materialized through clamp');
 
+  // --- Replay-clamp age ceiling (opt-in ancient-stamp hardening): a clamp
+  // node with maxReplayAgeMs set refuses a stamp older than the horizon. The
+  // op is ~6.1s old here, far past the 2000ms ceiling — it skips with
+  // protocol_violation (0x1001) and the register stays at 0, while the plain
+  // clamp replayer above applied the same op (the ceiling is opt-in only).
+  const ceilingReplayer = await Node.create(
+      'ceiling-replayer', { skew: { replayPolicy: 'clamp', maxReplayAgeMs: 2000 } });
+  await registerUsersOn(ceilingReplayer);
+  ceilingReplayer.addRegister('flips', 0);
+  ceilingReplayer.registerHandlerJs(
+      'flip', (state) => { state.setRegister('flips', state.getRegister('flips') + 1); return 0; });
+  const ceilingOp = await Operation.deserialize(opWire);
+  const ceilingOutcome = ceilingReplayer.replayOp(ceilingOp);
+  assertEquals(ceilingOutcome.status, 'skipped', 'aged op is beyond the 2000ms ceiling');
+  if (ceilingOutcome.code !== 0x1001 /* CRABS_ERR_PROTOCOL_VIOLATION */) {
+    throw new Error(`ceiling skip expected protocol_violation (0x1001), got 0x${ceilingOutcome.code.toString(16)}`);
+  }
+  assertEquals(ceilingReplayer.getRegister('flips'), 0, 'ceiling refusal did not mutate');
+  ceilingOp.destroy();
+
   // --- Audit M-7 guards: a DESTROYED op refuses execute/sign/replayOp with
   // a TypeError (NOT the C-side invalid_param that dereferenced anyway).
   const doomedOp = await Operation.deserialize(opWire);
@@ -241,9 +263,11 @@ const assertEquals = (actual, expected, label) => {
   for (const floodOperation of floodOps) floodOperation.destroy();
 
   console.log('hlc-skew-replay OK: clamp ingest materializes, default (and 0-sentinel) reject, '
-      + 'batch survives, applied holds indices, op guards refuse, warns throttled');
+      + 'ceiling refuses ancient stamps, batch survives, applied holds indices, '
+      + 'op guards refuse, warns throttled');
   defaultReplayer.destroy();
   clampReplayer.destroy();
+  ceilingReplayer.destroy();
   aliceKey.destroy();
   for (const batchOperation of batchOps) batchOperation.destroy();
   for (const mixedOperation of mixedBatch) mixedOperation.destroy();
