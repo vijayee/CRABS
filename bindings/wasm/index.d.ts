@@ -430,7 +430,15 @@ export interface DefineOperationTypeOptions {
 
 export interface NodeOptions {
   ordering?: 'hlc' | 'lamport';
+  /** Skew configuration (HLC bounded-skew replay fix). Defaults mirror the
+   *  C library: BOUNDED / 5000ms / 'reject' on replay. maxSkewMs 0 is a
+   *  sentinel for the C default, not "unbounded". */
   strategy?: 'naive' | 'bounded' | 'quorum' | 'strict' | 'trusted';
+  skew?: {
+    strategy?: 'naive' | 'bounded' | 'quorum' | 'strict' | 'trusted';
+    maxSkewMs?: number;                 // non-negative safe integer; 0 = keep C default 5000
+    replayPolicy?: 'reject' | 'clamp';  // replay-ingest path policy
+  };
 }
 
 export interface TimeSourceOptions {
@@ -949,6 +957,11 @@ export interface Node {
    * materializes on commit, surfaced as a 'change' event by the pump.
    */
   execute(op: Operation): void;
+  /** Replay ingest (HLC bounded-skew replay fix; mirrors the C replay path). */
+  replayOp(op: Operation): { status: 'applied' | 'pending' | 'skipped'; code?: number; message?: string };
+  /** Bulk history ingest: per-op failures never abort; applied HOLDS INDICES;
+   *  pending (raft GROUP_ORDERED) outcomes also land in applied. */
+  replayOps(operations: Operation[]): { applied: number[]; skipped: { index: number; code: number; message: string }[] };
   sign(op: Operation, key: KeyPair | string): void;
   createTrigger(config: TriggerConfig): void;
 

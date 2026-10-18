@@ -233,6 +233,46 @@ Note: wasm string payloads reach JS handlers via
 payload buffer — write op payloads as `'text\x00'` when a handler must read
 them as strings.
 
+## Replay skew policy
+
+`Node.create(id, { skew: { strategy, maxSkewMs, replayPolicy } })` configures
+the HLC skew handling. Defaults mirror the C library (BOUNDED / 5000ms /
+`'reject'`) — a node created without options behaves exactly as before.
+
+Replaying a historic op log is a different situation from a live op: the 5s
+window defends the live path against well-behaved clocks running slow, which
+does not apply to bulk history ingest. On a node created with
+`skew.replayPolicy: 'clamp'`, `node.replayOp(op)` / `node.replayOps([...])`
+materialize ops stamped further back than the window (they keep their
+ORIGINAL signed stamps — never rewritten — so they sort before everything
+stamped after them); future-stamped ops stay hard-rejected on BOTH paths,
+and every per-op failure is a recorded skip, not a batch abort:
+
+```js
+const { applied, skipped } = node.replayOps(logOps);   // always continues
+for (const skip of skipped) report(`op[${skip.index}] ${skip.message}`);
+```
+
+`applied` holds INDICES into the input array; `pending` outcomes (raft
+GROUP_ORDERED) also land in `applied` — accepted into the ordering log, not
+yet committed. Per-op replay FAILURES never abort the batch; structurally
+INVALID entries do (a destroyed or foreign-module Operation throws — repair
+the input array). Skip-matching contract: match on `code` — skip `message`
+strings differ between this binding (`replayOp: <name>`) and crabs-node
+(bare `<name>`), but both contain the name and `code` is identical.
+
+Notes for operators:
+
+- `maxSkewMs: 0` is a SENTINEL for the C-side default (5000), not
+  "unbounded"; oversized windows are safe (the C consumer clamps to
+  INT64_MAX) but choose the window deliberately.
+- Replayed GROUP_ORDERED ops surface as `{ status: 'pending' }`. They still
+  emit a `'change'` event carrying the `ordering_pending` result — do not
+  wire replay-driven events to live-UI mutation paths; a bulk re-ingest
+  re-emits the entire history indistinguishably from live ones.
+- Raft-committed history recovers through the raft module's own persisted
+  batches (`raftRecoverFromPersist`), NOT through `replayOps`.
+
 ## Differences from crabs-node
 
 | | crabs-node (N-API) | crabs-wasm (this package) |

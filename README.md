@@ -262,6 +262,32 @@ The attached ordering module is a deterministic Raft reactor (`src/Raft/raft_mod
 
 **Trust model.** This is crash-fault order — the Raft security model (byzantine fault tolerance is a different machine class): commit means a durable majority of cluster members acked; a collusion of quorum members can commit anything they can sign. The signing/policy validation is not weakened (every submitted op still passes the full gate chain, and every committed op re-runs the registry-fact portion of the gate at materialization — full signature/policy re-verification is NOT repeated: signer keys are machine-local to the proposing node, so a follower cannot credential-check them); the transport is expected to authenticate member identity, and the ordering module binds every AppendEntries' claimed `leader_id` to the transport-authenticated sender. Materialization-time protection is therefore exactly: registry facts (registered, ACTIVE, key version, scheme) plus leader-identity binding — a BYZANTINE ordering peer that fabricates op content under a forged signer identity is outside this model by definition; availability and ordering safety rest on the Raft majority being honest and durable storage being honest.
 
+**HLC skew policy.** Live ops are validated against the receiver's clock
+(BOUNDED, 5s window) as before. Replay ingest of a historic op log is a
+separate path (`replayOp`/`replayOps`, or the C `state_machine_execute_replay`)
+whose policy is configuration, defaulting to the same reject rule; a
+consumer may switch it to clamp, which ACCEPTS stamps older than the window
+(a log is history, not a freshness race) while future-stamped ops remain
+hard-rejected on BOTH paths. Clamping never moves the node's clock backward
+and the clamped op keeps its original stamp in the audit log — it sorts
+before anything stamped after it. This is a convergence policy, not a trust
+extension: signed ops still carry author-stamped HLCs either way.
+
+Two trust caveats for clamp-enabled nodes:
+
+1. **Ancient-stamp queue jump.** A signer already authorized on the node
+   can stamp its OWN op arbitrarily far in the past and submit it through
+   the replay path, ordering it ahead of pending live ops (e.g. to win
+   lock/vote contention). Live-ops-only deployments should not enable
+   clamp; deployments that do accept insider-stamped ordering bias by
+   configuration. A future hardening may add an age ceiling even under
+   clamp.
+2. **The clamp marker exists only under the BOUNDED strategy.**
+   `{strategy:"naive", replayPolicy:"clamp"}` behaves as plain NAIVE (no
+   historic marker, no future reject); QUORUM/TRUSTED remain fail-closed
+   regardless of the replay policy. Clamp is meaningful only for BOUNDED
+   nodes.
+
 **Partition behavior mirrors Raft.** A node cut from the majority keeps its committed prefix exactly, halts its group-item writes (the module stops committing; proposals it holds stay pending), and surfaces the halt in the module diagnostics — the rest of that machine's items keep working. On heal it re-converges from the new leader's log. Evicted members (a committed membership change that drops them) are told once per leadership (`RAFT_MSG_CONFIG_EXCLUDED`) and finish committing what they durably hold. Membership changes themselves ride the module's own log through joint consensus (Raft §6): both peer lists vote during the transition, one change at a time.
 
 **Bound, not silently unbounded.** The module log holds at most 4096 entries × 16 KiB op wire; proposals beyond the cap are refused (`log_full`) and the committed prefix stays intact — a documented finite bound. Compaction-as-snapshot is deliberately deferred to a follow-up plan.
