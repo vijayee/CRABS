@@ -1,4 +1,5 @@
 #include <gtest/gtest.h>
+#include <time.h>
 extern "C" {
 #include "../src/CRABS/crabs.h"
 #include "../src/CRABS/data_model.h"
@@ -92,6 +93,52 @@ protected:
     if (signer != NULL) op->signer_key_version = signer->key_version;
     sign_operation(op);
     return op;
+  }
+
+  // Build a signed lock op carrying an explicit HLC stamp (seconds offset
+  // relative to the receiver's real clock at execute time, which IS the
+  // machine's live clock — no sleeping needed). uuid_fill distinguishes per
+  // test so the dedup guard never treats two test ops as the same op.
+  // op->ordering_system and op->hlc are INSIDE the signature (sign-format
+  // fields 17-18) — they must be stamped before sign_operation runs.
+  operation_t* make_hlc_stamp_lock_op(int64_t stamp_offset_seconds,
+                                      uint8_t uuid_fill,
+                                      const char* resource_name = "test_resource") {
+    operation_t* op = operation_create(CRABS_OP_LOCK);
+    memset(op->uuid, uuid_fill, CRABS_UUID_SIZE);
+    op->resources =
+        (char(*)[CRABS_MAX_USER_ID])malloc(sizeof(char[CRABS_MAX_USER_ID]));
+    strncpy(op->resources[0], resource_name, CRABS_MAX_USER_ID - 1);
+    op->resource_count = 1;
+    op->required_state =
+        (protocol_state_e*)malloc(sizeof(protocol_state_e));
+    op->required_state[0] = PROTOCOL_IDLE;
+    op->next_state = (protocol_state_e*)malloc(sizeof(protocol_state_e));
+    op->next_state[0] = PROTOCOL_LOCKED;
+    strncpy(op->signer_id, "alice", CRABS_MAX_USER_ID - 1);
+    set_signer_key_version(op);
+    op->ordering_system = CRABS_ORDERING_HLC;
+    memset(&op->hlc, 0, sizeof(crabs_hlc_t));
+    op->hlc.physical_seconds =
+        (uint64_t)((int64_t)time(NULL) + stamp_offset_seconds);
+    op->hlc.physical_nanos = 0;
+    op->hlc.logical_counter = 0;
+    strncpy(op->hlc.node_id, "alice", CRABS_HLC_NODE_ID_SIZE - 1);
+    sign_operation(op);
+    return op;
+  }
+
+  // Configure the machine's ordering to BOUNDED + given replay policy with a
+  // live, initialized clock (mirrors crabs_wasm_node_create's setup).
+  void set_skew_ordering(crabs_hlc_replay_policy_e replay_policy) {
+    crabs_ordering_config_t* config =
+        (crabs_ordering_config_t*)malloc(sizeof(crabs_ordering_config_t));
+    ASSERT_NE(config, nullptr);
+    crabs_ordering_config_init_hlc(config, HLC_STRATEGY_BOUNDED);
+    config->hlc.replay_policy = replay_policy;
+    state_set_ordering_config(state, config);
+    crabs_hlc_state_init(&state->hlc_state, "admin");
+    state->hlc_state_initialized = true;
   }
 
   // R7-04: ops must carry the signer's current key_version before signing.
@@ -2538,4 +2585,71 @@ TEST_F(TestStateMachine, DeserializedLogReArmsBarriersOnlyThroughAuthenticatedRe
 
   state_destroy(restored);
   serialized_buffer_destroy(buf);
+}
+
+// ============================================================
+// Bounded-skew replay ingest (2026-10-17 brief)
+// op->ordering_system and op->hlc are INSIDE the signature (sign-format
+// fields 17-18) — they must be stamped before sign_operation runs.
+// ============================================================
+
+// The walk scenario: a log op authored at T is replayed at T+15s by a node
+// with the clamp replay policy — the op MATERIALIZES (locked) instead of
+// aborting the replay.
+TEST_F(TestStateMachine, ReplayClampMaterializesHistoricOp) {
+  set_skew_ordering(CRABS_HLC_REPLAY_CLAMP);
+  operation_t* op = make_hlc_stamp_lock_op(-15, 0x42);
+  EXPECT_EQ(state_machine_execute_replay(state, op), CRABS_SUCCESS);
+  data_item_t* resource = state_find_item(state, "test_resource");
+  ASSERT_NE(resource, nullptr);
+  EXPECT_EQ(resource->protocol_state, PROTOCOL_LOCKED);
+  operation_destroy(op);
+}
+
+// After a clamped ingest the local HLC stays monotonic and a subsequent
+// CURRENT-time op (via the live path) still executes — the clamp did not
+// poison ordering.
+TEST_F(TestStateMachine, ReplayClampKeepsClockMonotonic) {
+  set_skew_ordering(CRABS_HLC_REPLAY_CLAMP);
+  // The historic op LOCKS test_resource, and a lock op may only apply to an
+  // IDLE resource — the follow-up live op needs its own fresh item (this test
+  // checks ordering monotonicity after a clamp, not re-locking).
+  data_item_t* spare_item =
+      data_item_create("replay_spare", DATA_TYPE_RESOURCE, CRDT_PN_COUNTER);
+  int64_t* spare_value = (int64_t*)malloc(sizeof(int64_t));
+  *spare_value = 0;
+  spare_item->value = spare_value;
+  state_add_item(state, spare_item);
+
+  operation_t* old_op = make_hlc_stamp_lock_op(-15, 0x42);
+  EXPECT_EQ(state_machine_execute_replay(state, old_op), CRABS_SUCCESS);
+  uint64_t clock_before = state->hlc_state.last.physical_seconds;
+  EXPECT_TRUE(clock_before >= (uint64_t)time(NULL) - 1);
+
+  // A second, current op from the same signer executes through the live path.
+  operation_t* current_op = make_hlc_stamp_lock_op(0, 0x41, "replay_spare");
+  EXPECT_EQ(state_machine_execute(state, current_op), CRABS_SUCCESS);
+  EXPECT_TRUE(state->hlc_state.last.physical_seconds >= clock_before);
+  operation_destroy(old_op);
+  operation_destroy(current_op);
+}
+
+// Default configuration is unchanged: live execute of a T-15s op still
+// returns protocol_violation, and the replay path WITHOUT the clamp opt-in
+// behaves byte-identically (REJECT policy).
+TEST_F(TestStateMachine, DefaultLiveStillRejectsOldStamp) {
+  set_skew_ordering(CRABS_HLC_REPLAY_REJECT);
+  operation_t* op = make_hlc_stamp_lock_op(-15, 0x42);
+  EXPECT_EQ(state_machine_execute(state, op), CRABS_ERR_PROTOCOL_VIOLATION);
+  EXPECT_EQ(state_machine_execute_replay(state, op), CRABS_ERR_PROTOCOL_VIOLATION);
+  operation_destroy(op);
+}
+
+// Future stamps are rejected on BOTH paths, default or clamp policy.
+TEST_F(TestStateMachine, FutureStampRejectedOnBothPaths) {
+  set_skew_ordering(CRABS_HLC_REPLAY_CLAMP);
+  operation_t* op = make_hlc_stamp_lock_op(+15, 0x42);
+  EXPECT_EQ(state_machine_execute(state, op), CRABS_ERR_PROTOCOL_VIOLATION);
+  EXPECT_EQ(state_machine_execute_replay(state, op), CRABS_ERR_PROTOCOL_VIOLATION);
+  operation_destroy(op);
 }

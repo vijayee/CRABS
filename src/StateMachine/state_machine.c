@@ -671,8 +671,12 @@ static bool state_signer_has_replay(const state_t* state, const operation_t* op)
 // counter) fail the op; ACCEPTED_STRICT counts as acceptance — STRICT orders
 // by the received timestamp but never adopts it. When the node has no
 // initialized local clock (lamport-only node receiving an HLC op) there is
-// nothing to compare against and validation is skipped.
-static crabs_error_e _validate_received_hlc(state_t* state, const operation_t* op) {
+// nothing to compare against and validation is skipped. Replay ingest
+// (state_machine_execute_replay) passes is_replay_ingest=true and delegates
+// the past-window decision to the config's replay_policy; ACCEPTED_CLAMPED
+// counts as acceptance.
+static crabs_error_e _validate_received_hlc(state_t* state, const operation_t* op,
+                                            bool is_replay_ingest) {
   crabs_ordering_config_t* config = state_get_ordering_config(state);
   if (op->ordering_system != CRABS_ORDERING_HLC ||
       !state->hlc_state_initialized ||
@@ -684,8 +688,21 @@ static crabs_error_e _validate_received_hlc(state_t* state, const operation_t* o
   probe_state.receive_strategy = config->hlc.receive_strategy;
   probe_state.max_skew_ms = config->hlc.max_skew_ms;
   probe_state.strict_mode = config->hlc.strict_mode;
-  crabs_hlc_receive_result_e receive_rc = crabs_hlc_receive(&probe_state, &op->hlc);
-  if (receive_rc == CRABS_HLC_ACCEPTED || receive_rc == CRABS_HLC_ACCEPTED_STRICT) {
+  // Replay ingest consults the config's SEPARATE replay policy: with
+  // CRABS_HLC_REPLAY_CLAMP a past-window historic stamp is clamped into the
+  // local HLC domain (accepted for ordering) instead of failing the whole
+  // op. The live path — and the replay path when no clamp was configured —
+  // keep the plain windowed validation. The probe copy is discarded either
+  // way: the real clock adopts nothing from ops (see above).
+  crabs_hlc_receive_result_e receive_rc;
+  if (is_replay_ingest && config->hlc.replay_policy == CRABS_HLC_REPLAY_CLAMP) {
+    receive_rc = crabs_hlc_receive_replay(&probe_state, &op->hlc);
+  } else {
+    receive_rc = crabs_hlc_receive(&probe_state, &op->hlc);
+  }
+  if (receive_rc == CRABS_HLC_ACCEPTED ||
+      receive_rc == CRABS_HLC_ACCEPTED_STRICT ||
+      receive_rc == CRABS_HLC_ACCEPTED_CLAMPED) {
     return CRABS_SUCCESS;
   }
   return CRABS_ERR_PROTOCOL_VIOLATION;
@@ -1235,7 +1252,8 @@ static crabs_error_e _apply_sovereign_bookkeeping(state_t* state,
 // ============================================================
 static crabs_error_e state_machine_execute_internal(state_t* state, operation_t* op,
                                                     bool skip_authorization,
-                                                    bool process_schedules);
+                                                    bool process_schedules,
+                                                    bool is_replay_ingest);
 
 // True when any named EXISTING resource is a GROUP_ORDERED item. The
 // attached-module check lives at the call site (Step 0): a detached module
@@ -1411,7 +1429,7 @@ crabs_error_e state_machine_execute_committed(state_t* state, operation_t* op) {
   memcpy(preview, "committed ", strlen("committed "));
   _op_preview(op, preview + strlen("committed "),
               sizeof(preview) - strlen("committed "));
-  crabs_error_e rc = state_machine_execute_internal(state, op, true, false);
+  crabs_error_e rc = state_machine_execute_internal(state, op, true, false, false);
   _raft_pending_remove(state, op->uuid);
   if (rc != CRABS_ERR_ALREADY_EXECUTED) {
     state_notify_change_for_op(state, CRABS_CHANGE_OP, op, preview, rc);
@@ -1609,7 +1627,8 @@ uint32_t state_raft_shelf_attempt_count(const state_t* state) {
 
 static crabs_error_e state_machine_execute_internal(state_t* state, operation_t* op,
                                                     bool skip_authorization,
-                                                    bool process_schedules) {
+                                                    bool process_schedules,
+                                                    bool is_replay_ingest) {
   if (state == NULL || op == NULL) return CRABS_ERR_INVALID_PARAM;
 
   // Step 0: Raft ordering module seam (raft-ordering plan, Phase 1). An op
@@ -1767,7 +1786,7 @@ static crabs_error_e state_machine_execute_internal(state_t* state, operation_t*
   // a recurring slot materialized later must not be judged against a moved
   // clock.
   if (!skip_authorization) {
-    crabs_error_e hlc_rc = _validate_received_hlc(state, op);
+    crabs_error_e hlc_rc = _validate_received_hlc(state, op, is_replay_ingest);
     if (hlc_rc != CRABS_SUCCESS) {
       return hlc_rc;
     }
@@ -2080,7 +2099,18 @@ static crabs_error_e state_machine_execute_internal(state_t* state, operation_t*
 crabs_error_e state_machine_execute(state_t* state, operation_t* op) {
   char preview[CRABS_MAX_OP_NAME + CRABS_MAX_USER_ID + 2];
   _op_preview(op, preview, sizeof(preview));
-  crabs_error_e rc = state_machine_execute_internal(state, op, false, true);
+  crabs_error_e rc = state_machine_execute_internal(state, op, false, true, false);
+  // CRABS_ERR_ALREADY_EXECUTED is an idempotent skip: no mutation, no event.
+  if (rc != CRABS_ERR_ALREADY_EXECUTED) {
+    state_notify_change_for_op(state, CRABS_CHANGE_OP, op, preview, rc);
+  }
+  return rc;
+}
+
+crabs_error_e state_machine_execute_replay(state_t* state, operation_t* op) {
+  char preview[CRABS_MAX_OP_NAME + CRABS_MAX_USER_ID + 2];
+  _op_preview(op, preview, sizeof(preview));
+  crabs_error_e rc = state_machine_execute_internal(state, op, false, true, true);
   // CRABS_ERR_ALREADY_EXECUTED is an idempotent skip: no mutation, no event.
   if (rc != CRABS_ERR_ALREADY_EXECUTED) {
     state_notify_change_for_op(state, CRABS_CHANGE_OP, op, preview, rc);
@@ -2093,7 +2123,7 @@ crabs_error_e state_machine_execute_scheduled(state_t* state, operation_t* op) {
   memcpy(preview, "scheduled ", strlen("scheduled "));
   _op_preview(op, preview + strlen("scheduled "),
               sizeof(preview) - strlen("scheduled "));
-  crabs_error_e rc = state_machine_execute_internal(state, op, true, false);
+  crabs_error_e rc = state_machine_execute_internal(state, op, true, false, false);
   if (rc != CRABS_ERR_ALREADY_EXECUTED) {
     state_notify_change_for_op(state, CRABS_CHANGE_SCHEDULE, op, preview, rc);
   }
@@ -2120,7 +2150,10 @@ crabs_error_e state_machine_validate(state_t* state, const operation_t* op) {
   // against the scheduling node's clock — this is the only chance, because
   // materialization re-runs without validation (execute_scheduled skips the
   // skew check; a slot fired later must not be judged against a moved clock).
-  rc = _validate_received_hlc(state, op);
+  // This scheduled-submission skew check is a live-authored op — live
+  // semantics apply at authorship time; only replay ingest uses the clamp
+  // policy, and it is decided per-execute-path (not per validate).
+  rc = _validate_received_hlc(state, op, false);
   if (rc != CRABS_SUCCESS) return rc;
   rc = _check_transitions(state, op);
   if (rc != CRABS_SUCCESS) return rc;
