@@ -1658,7 +1658,13 @@ public:
                                             "Node", "ordering");
         use_hlc = (ord == "hlc");
       }
-      if (opts.Has("skew") && opts.Get("skew").IsObject()) {
+      if (opts.Has("skew")) {
+        if (!opts.Get("skew").IsObject()) {
+          // The wasm binding refuses a non-object skew ('skew must be an
+          // options object') — a silently-ignored string would arm nothing
+          // while the caller believes a window/policy is in force.
+          throw Napi::TypeError::New(env, "Node: skew must be an options object");
+        }
         Napi::Object skew = opts.Get("skew").As<Napi::Object>();
         if (skew.Has("maxSkewMs")) {
           Napi::Value skew_window = skew.Get("maxSkewMs");

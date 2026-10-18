@@ -53,6 +53,10 @@ function mustThrowWith(invoke, fragment, label) {
   // huge (broken) window.
   mustThrowWith(() => new Node('bad', { skew: { maxSkewMs: 2 ** 53 + 1 } }),
     'skew.maxSkewMs must be a non-negative safe integer', 'out-of-range maxSkewMs');
+  mustThrowWith(() => new Node('bad', { skew: 'bogus' }),
+    'skew must be an options object', 'non-object skew');
+  mustThrowWith(() => new Node('bad', { skew: { maxSkewMs: 1.5 } }),
+    'skew.maxSkewMs must be a non-negative safe integer', 'fractional maxSkewMs');
 
   const aliceKey = KeyPair.generate();
 
