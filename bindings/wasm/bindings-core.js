@@ -413,10 +413,15 @@ function parseSkewOptions(options) {
     throw new TypeError('Node.create: skew must be an options object');
   }
   if (skewInput.strategy !== undefined) {
-    const strategyNames = {
+    // Object.create(null) + Object.hasOwn: an `in` check would accept
+    // prototype-chain strings like 'toString' and map a Function to the wasm
+    // i32 param (NaN→0 = HLC_STRATEGY_NAIVE, silently disarming the skew
+    // defense instead of throwing).
+    const strategyNames = Object.assign(Object.create(null), {
       naive: 0x00, bounded: 0x01, quorum: 0x02, strict: 0x03, trusted: 0x04,
-    };
-    if (typeof skewInput.strategy !== 'string' || !(skewInput.strategy in strategyNames)) {
+    });
+    if (typeof skewInput.strategy !== 'string' ||
+        !Object.hasOwn(strategyNames, skewInput.strategy)) {
       throw new TypeError(
           "Node.create: skew.strategy must be one of 'naive'|'bounded'|'quorum'|'strict'|'trusted'");
     }
@@ -433,8 +438,9 @@ function parseSkewOptions(options) {
     skew.maxSkewMs = skewInput.maxSkewMs;
   }
   if (skewInput.replayPolicy !== undefined) {
-    const replayNames = { reject: 0, clamp: 1 };
-    if (typeof skewInput.replayPolicy !== 'string' || !(skewInput.replayPolicy in replayNames)) {
+    const replayNames = Object.assign(Object.create(null), { reject: 0, clamp: 1 });
+    if (typeof skewInput.replayPolicy !== 'string' ||
+        !Object.hasOwn(replayNames, skewInput.replayPolicy)) {
       throw new TypeError(
           "Node.create: skew.replayPolicy must be 'reject' or 'clamp'");
     }
@@ -1144,11 +1150,13 @@ class Node {
 
   static async create(adminId, options = {}) {
     const M = await getModule();
-    const adminPtr = writeString(M, adminId);
     // Skew configuration (bounded-skew replay fix): { strategy, maxSkewMs,
     // replayPolicy }. Defaults produce the same config the 1-arg C entry
     // always produced — Node.create(id) is byte-identical to today's.
+    // Validate options BEFORE staging the admin id: a rejected create must
+    // not leak the writeString allocation into the module heap.
     const skew = parseSkewOptions(options);
+    const adminPtr = writeString(M, adminId);
     // max_skew_ms crosses the wasm ABI as i64 → a BigInt is REQUIRED at the
     // call site (a Number throws `Cannot convert N to a BigInt`)
     const amPtr = M._crabs_wasm_node_create_ex(
@@ -2326,17 +2334,28 @@ class Node {
   }
 
   // Replay ingest (bounded-skew replay fix): execute a signed op under this
-  // node's REPLAY skew policy (Node.create option skew.replayPolicy). Never
-  // throws for an individually failed op — returns an outcome so a log
-  // replay can converge by design:
+  // node's REPLAY skew policy (Node.create option skew.replayPolicy). For a
+  // VALID op it never throws — returns an outcome so a log replay can
+  // converge by design:
   //   { status: 'applied' | 'pending' } on success / raft-pending
   //   { status: 'skipped', code, message } on failure (e.g. 0x1002
   //   protocol_violation for a future stamp, 0x7002 already_executed on a
   //   re-ingested op) — a skipped op mutates nothing.
+  // A destroyed op (_ptr === 0) or an Operation minted by a DIFFERENT module
+  // instance throws TypeError: the destroyed case has nothing to replay, and
+  // a foreign-module op's `_ptr` is a valid offset in a different address
+  // space — feeding it here would be a memory-confusion read of someone
+  // else's heap.
   // GROUP_ORDERED note: a pending outcome still emits a 'change' event on
   // the node (the C layer notifies every non-ALREADY_EXECUTED result) — do
   // not wire replay-driven events to live-UI mutation paths.
   replayOp(op) {
+    // Audit M-7 parity with sign(): a foreign-module Operation's `_ptr` is a
+    // valid offset in a DIFFERENT address space — reading it here would be a
+    // memory-confusion read of someone else's heap.
+    if (!op || !op._ptr || op._M !== this._M) {
+      throw new TypeError('replayOp: expected an Operation from this module');
+    }
     const rc = this._M._crabs_wasm_execute_replay(this._am, op._ptr);
     if (rc === 0) return { status: 'applied' };
     if (rc === 0xA006) return { status: 'pending' };   // raft GROUP_ORDERED path
@@ -2346,7 +2365,9 @@ class Node {
   // Bulk history ingest: replay a batch of ALREADY-DESERIALIZED Operations.
   // Per-op failures never abort the batch — each skip is console.warn'd and
   // returned with its index, so consumers converge (and can surface gaps)
-  // instead of dying on the first out-of-window or opaque entry.
+  // instead of dying on the first out-of-window or opaque entry. `applied`
+  // holds INDICES; pending outcomes (raft GROUP_ORDERED) also land in
+  // `applied` — accepted into the ordering log, not yet committed.
   // NOTE: raft-committed history recovers through the raft module's own
   // persisted batches (raftRecoverFromPersist), NOT through this API.
   replayOps(operations) {

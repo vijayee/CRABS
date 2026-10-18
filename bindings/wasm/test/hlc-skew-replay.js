@@ -3,7 +3,9 @@
 // HLC bounded-skew replay fix e2e (brief 2026-10-17): replay of a
 // beyond-window op fails closed on the default config and CLAMPS through on
 // the replay-opt-in config. 6.1s wall-clock age crosses the 5s default
-// window (the 15s scenario is covered natively with forged stamps).
+// window (the 15s scenario is covered natively with forged stamps). Also
+// pins: maxSkewMs 0 is the C-default sentinel (not accept-all), prototype-
+// chain option names throw, and replayOps' `applied` carries INDICES.
 
 const { Node, Operation, KeyPair } = require('..');
 
@@ -34,6 +36,14 @@ const assertEquals = (actual, expected, label) => {
     "skew.strategy must be one of 'naive'|'bounded'|'quorum'|'strict'|'trusted'", 'unknown strategy');
   await mustThrowWith(() => Node.create('bad', { skew: 'bogus' }),
     'skew must be an options object', 'non-object skew');
+  // Prototype-chain pins: 'toString'/'valueOf' pass a naive `in` check and
+  // would map a Function into the wasm i32 param (NaN→0 = HLC_STRATEGY_NAIVE,
+  // silently disarming the skew defense) instead of throwing.
+  await mustThrowWith(() => Node.create('bad', { skew: { strategy: 'toString' } }),
+    "skew.strategy must be one of 'naive'|'bounded'|'quorum'|'strict'|'trusted'",
+    'prototype-chain strategy');
+  await mustThrowWith(() => Node.create('bad', { skew: { replayPolicy: 'valueOf' } }),
+    "skew.replayPolicy must be 'reject' or 'clamp'", 'prototype-chain replayPolicy');
 
   const aliceKey = await KeyPair.generate();
 
@@ -61,13 +71,28 @@ const assertEquals = (actual, expected, label) => {
   assertEquals(author.getRegister('flips'), 1, 'author executed its own op');
   const opWire = op.serialize();
   op.destroy();
+
+  // Second op, signed + serialized but NEVER executed anywhere: its clamp
+  // replay materializes in the mixed batch below, proving `applied` holds
+  // INDICES of ingested entries while the already-executed op stays skipped.
+  // Its HLC was stamped at author-sign time (T0) — also >5s old at replay,
+  // so the clamp path is exactly what lets it through.
+  const secondOp = await Operation.create('flip');
+  secondOp.signerId = 'alice';
+  secondOp.nodeId = 'author';
+  author.sign(secondOp, aliceKey.privateKeyHex());
+  const secondOpWire = secondOp.serialize();
+  secondOp.destroy();
   author.destroy();
 
   // --- Wait past the default 5s skew window.
   await new Promise((resolve) => setTimeout(resolve, 6100));
 
-  // --- Fresh node, DEFAULT skew config: live execute still fails closed.
-  const defaultReplayer = await Node.create('default-replayer');
+  // --- Fresh node, 0-SENTINEL skew config: maxSkewMs 0 maps to the C-side
+  // default 5000ms window (NOT accept-all), so the same aged op still
+  // fails closed on a live execute.
+  const defaultReplayer = await Node.create(
+      'default-replayer', { skew: { maxSkewMs: 0 } });
   await registerUsersOn(defaultReplayer);
   defaultReplayer.addRegister('flips', 0);
   defaultReplayer.registerHandlerJs(
@@ -89,17 +114,24 @@ const assertEquals = (actual, expected, label) => {
   clampReplayer.addRegister('flips', 0);
   clampReplayer.registerHandlerJs(
       'flip', (state) => { state.setRegister('flips', state.getRegister('flips') + 1); return 0; });
-  const clampOutcome = clampReplayer.replayOp(await Operation.deserialize(opWire));
+  await mustThrowWith(() => clampReplayer.replayOps('nonsense'),
+    'replayOps: expected an array of Operations', 'non-array replayOps');
+
+  const clampOp = await Operation.deserialize(opWire);
+  const clampOutcome = clampReplayer.replayOp(clampOp);
   assertEquals(clampOutcome.status, 'applied', 'clamp replay ingested the historic op');
   assertEquals(clampReplayer.getRegister('flips'), 1, 'handler materialized through clamp replay');
+  clampOp.destroy();
 
   // --- Re-ingest the same op: skipped, batch survives.
-  const reOutcome = clampReplayer.replayOp(await Operation.deserialize(opWire));
+  const reOp = await Operation.deserialize(opWire);
+  const reOutcome = clampReplayer.replayOp(reOp);
   assertEquals(reOutcome.status, 'skipped', 're-ingest is an idempotent skip');
   if (reOutcome.code !== 0x7002) {
     throw new Error(`re-ingest skip expected already_executed (0x7002), got 0x${reOutcome.code.toString(16)}`);
   }
   assertEquals(clampReplayer.getRegister('flips'), 1, 'skip did not re-run the handler');
+  reOp.destroy();
 
   // --- Batch API: per-op failures never abort the batch.
   const batchOps = [];
@@ -111,10 +143,26 @@ const assertEquals = (actual, expected, label) => {
   assertEquals(batch.skipped.length, 2, 'both skips are reported');
   assertEquals(batch.skipped[0].code, 0x7002, 'skip entry carries the error code');
 
-  console.log('hlc-skew-replay OK: clamp ingest materializes, default rejects, batch survives');
+  // --- Mixed batch pin: index 0 is the already-executed op (skipped
+  // 0x7002), index 1 is the never-executed second op (clamp-materializes).
+  // `applied` must equal the INDICES array — not the op objects themselves.
+  const mixedBatch = [
+    await Operation.deserialize(opWire),
+    await Operation.deserialize(secondOpWire),
+  ];
+  const mixed = clampReplayer.replayOps(mixedBatch);
+  assertEquals(mixed.applied, [1], 'applied holds indices, not operations');
+  assertEquals(mixed.skipped.length, 1, 'one skip in the mixed batch');
+  assertEquals(mixed.skipped[0].index, 0, 'the executed op is the skipped entry');
+  assertEquals(mixed.skipped[0].code, 0x7002, 'mixed-batch skip carries already_executed');
+  assertEquals(clampReplayer.getRegister('flips'), 2, 'never-executed op materialized through clamp');
+
+  console.log('hlc-skew-replay OK: clamp ingest materializes, default (and 0-sentinel) reject, '
+      + 'batch survives, applied holds indices');
   defaultReplayer.destroy();
   clampReplayer.destroy();
   aliceKey.destroy();
   for (const batchOperation of batchOps) batchOperation.destroy();
+  for (const mixedOperation of mixedBatch) mixedOperation.destroy();
   defaultOp.destroy();
 })().catch(e => { console.error(e); process.exit(1); });
