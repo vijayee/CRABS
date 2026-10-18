@@ -363,7 +363,6 @@ export interface DefineOperationTypeOptions {
 
 export interface NodeOptions {
   ordering?: 'hlc' | 'lamport';
-  strategy?: 'naive' | 'bounded' | 'quorum' | 'strict' | 'trusted';
   /** Bounded-skew replay fix (wasm parity): maxSkewMs must be a safe
    *  non-negative integer; 0 keeps the C default (5000ms) — it is NOT
    *  "unbounded". replayPolicy 'reject' (default) refuses a beyond-window

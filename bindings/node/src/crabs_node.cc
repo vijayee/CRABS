@@ -202,6 +202,26 @@ struct NodeAddonInstanceData {
   Napi::FunctionReference operation_ctor;
 };
 
+// Class-checked unwrap (review follow-up): ObjectWrap::Unwrap is
+// class-AGNOSTIC — a plain object unwraps to nullptr (null-deref SIGSEGV)
+// and an object of a DIFFERENT wrapped class reinterprets THAT class's
+// internal pointer (type-confused read fed straight into the executor or
+// signer). Verify the value is an instance of the wrapper's own constructor
+// before unwrapping; the per-class constructors live in the instance data.
+// (Wrapper only needs to be complete at the call site — the template
+// instantiates there, so this can sit above every wrapper class.)
+template <typename Wrapper>
+static Wrapper* UnwrapChecked(Napi::Env env, Napi::Value value,
+                              const Napi::FunctionReference& constructor,
+                              const char* expected_description) {
+  if (!value.IsObject() ||
+      !value.As<Napi::Object>().InstanceOf(constructor.Value())) {
+    throw Napi::TypeError::New(env,
+        std::string("expected ") + expected_description);
+  }
+  return Wrapper::Unwrap(value.As<Napi::Object>());
+}
+
 // Adoption packet carried through a Napi::External so the Node constructor
 // can wrap a machine it did NOT create (a spawned resident child) without
 // changing the JS construction signature. The External finalizer frees it.
@@ -1409,7 +1429,10 @@ private:
     Napi::Env env = info.Env();
     if (info.Length() < 1 || !info[0].IsObject())
       throw Napi::TypeError::New(env, "Expected KeyPair");
-    KeyPair* kp = KeyPair::Unwrap(info[0].As<Napi::Object>());
+    auto* instance_data = env.GetInstanceData<NodeAddonInstanceData>();
+    KeyPair* kp = UnwrapChecked<KeyPair>(env, info[0],
+                                         instance_data->key_pair_ctor,
+                                         "a KeyPair");
     serialized_buffer_t* ser = crabs_serialize_for_signing(op_);
     if (!ser) throw crabs_error(env, CRABS_ERR_SERIALIZATION_ERROR, "sign");
     crabs_error_e rc = crypto_ecdsa_sign(kp->raw()->private_key,
@@ -4432,7 +4455,10 @@ private:
     Napi::Env env = info.Env();
     if (info.Length() < 2 || !info[0].IsObject())
       throw Napi::TypeError::New(env, "Expected (Operation, KeyPair)");
-    Operation* op = Operation::Unwrap(info[0].As<Napi::Object>());
+    auto* instance_data = env.GetInstanceData<NodeAddonInstanceData>();
+    Operation* op = UnwrapChecked<Operation>(env, info[0],
+                                             instance_data->operation_ctor,
+                                             "an Operation");
 
     // Stamp HLC before signing so the signature covers the timestamp
     if (am_->base_state.hlc_state_initialized) {
@@ -4454,7 +4480,9 @@ private:
     // Sign
     if (info[1].IsObject()) {
       // KeyPair object
-      KeyPair* kp = KeyPair::Unwrap(info[1].As<Napi::Object>());
+      KeyPair* kp = UnwrapChecked<KeyPair>(env, info[1],
+                                           instance_data->key_pair_ctor,
+                                           "a KeyPair");
       serialized_buffer_t* ser = crabs_serialize_for_signing(op->raw());
       if (!ser) throw crabs_error(env, CRABS_ERR_SERIALIZATION_ERROR, "sign");
       crabs_error_e rc = crypto_ecdsa_sign(kp->raw()->private_key,
@@ -4493,7 +4521,10 @@ private:
     Napi::Env env = info.Env();
     if (info.Length() < 1 || !info[0].IsObject())
       throw Napi::TypeError::New(env, "Expected Operation");
-    Operation* op = Operation::Unwrap(info[0].As<Napi::Object>());
+    auto* instance_data = env.GetInstanceData<NodeAddonInstanceData>();
+    Operation* op = UnwrapChecked<Operation>(env, info[0],
+                                             instance_data->operation_ctor,
+                                             "an Operation");
     // Do NOT modify the operation here — it's already signed. Any modification
     // after signing invalidates the signature. Use node.sign(op, key) to stamp
     // HLC and sign in one step before calling execute.
@@ -4512,7 +4543,10 @@ private:
     if (info.Length() < 1 || !info[0].IsObject()) {
       throw Napi::TypeError::New(env, "Expected Operation");
     }
-    Operation* op = Operation::Unwrap(info[0].As<Napi::Object>());
+    auto* instance_data = env.GetInstanceData<NodeAddonInstanceData>();
+    Operation* op = UnwrapChecked<Operation>(env, info[0],
+                                             instance_data->operation_ctor,
+                                             "an Operation");
     // Replay ingest (parity with the wasm binding's replayOp): the HLC skew
     // decision uses the node's replay policy (hlc.replay_policy) instead of
     // the live one. Never throws for a failed VALID op — failures return a
@@ -4557,9 +4591,12 @@ private:
     Napi::Env env = info.Env();
     if (info.Length() < 2 || !info[0].IsObject())
       throw Napi::TypeError::New(env, "Expected schedule(Operation, executeAtMs)");
-    Operation* op = Operation::Unwrap(info[0].As<Napi::Object>());
-    if (op == nullptr)
-      throw Napi::TypeError::New(env, "schedule: expected an Operation");
+    auto* instance_data = env.GetInstanceData<NodeAddonInstanceData>();
+    // The checked unwrap guarantees a real Operation (and a non-null
+    // pointer), so the old post-unwrap nullptr probe is gone.
+    Operation* op = UnwrapChecked<Operation>(env, info[0],
+                                             instance_data->operation_ctor,
+                                             "an Operation");
     const uint64_t execute_at_ms =
         require_u64_numeric(info[1], "schedule", "executeAtMs");
     // Submission-time authorization (mirrors crabs_wasm_schedule). Read-only.
@@ -4589,9 +4626,12 @@ private:
       throw Napi::TypeError::New(
           env, "Expected scheduleRecurring(Operation, startAtMs, intervalMs, "
                "repeatCount, endAtMs)");
-    Operation* op = Operation::Unwrap(info[0].As<Napi::Object>());
-    if (op == nullptr)
-      throw Napi::TypeError::New(env, "scheduleRecurring: expected an Operation");
+    auto* instance_data = env.GetInstanceData<NodeAddonInstanceData>();
+    // The checked unwrap guarantees a real Operation (and a non-null
+    // pointer), so the old post-unwrap nullptr probe is gone.
+    Operation* op = UnwrapChecked<Operation>(env, info[0],
+                                             instance_data->operation_ctor,
+                                             "an Operation");
     // Argument bounds are checked BEFORE submission so a malformed arg can
     // never queue with a silently truncated cadence.
     const uint64_t start_at_ms =
@@ -5045,7 +5085,10 @@ private:
     if (info.Length() < 2 || !info[0].IsObject() || !info[1].IsBuffer())
       throw Napi::TypeError::New(env,
         "Expected (AbeKey, encrypted container Buffer)");
-    auto* key = AbeKey::Unwrap(info[0].As<Napi::Object>());
+    auto* instance_data = env.GetInstanceData<NodeAddonInstanceData>();
+    auto* key = UnwrapChecked<AbeKey>(env, info[0],
+                                      instance_data->abe_key_ctor,
+                                      "an AbeKey");
     if (key == nullptr || key->raw() == nullptr)
       throw Napi::Error::New(env,
         "abeDecrypt: expected a live AbeKey (a destroyed key refuses)");
@@ -6229,7 +6272,9 @@ private:
     Napi::Env env = info.Env();
     if (info.Length() < 1 || !info[0].IsObject())
       throw Napi::TypeError::New(env, "Expected Blueprint");
-    Blueprint* blueprint_wrapper = Blueprint::Unwrap(info[0].As<Napi::Object>());
+    auto* instance_data = env.GetInstanceData<NodeAddonInstanceData>();
+    Blueprint* blueprint_wrapper = UnwrapChecked<Blueprint>(
+        env, info[0], instance_data->blueprint_ctor, "a Blueprint");
     machine_blueprint_t* blueprint = blueprint_wrapper->raw();
     if (blueprint == nullptr)
       throw Napi::Error::New(env, "lineageSpawn: blueprint already destroyed");
@@ -6351,7 +6396,10 @@ private:
     Napi::Env env = info.Env();
     if (info.Length() < 1 || !info[0].IsObject())
       throw Napi::TypeError::New(env, "Expected lineageRotateKey(keyPair)");
-    KeyPair* key_pair = KeyPair::Unwrap(info[0].As<Napi::Object>());
+    auto* instance_data = env.GetInstanceData<NodeAddonInstanceData>();
+    KeyPair* key_pair = UnwrapChecked<KeyPair>(env, info[0],
+                                               instance_data->key_pair_ctor,
+                                               "a KeyPair");
     if (key_pair == nullptr || key_pair->raw() == nullptr)
       throw Napi::Error::New(env, "lineageRotateKey: expected a KeyPair");
     uint64_t now_ms = 0;

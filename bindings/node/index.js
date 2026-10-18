@@ -60,14 +60,25 @@ const frozenWireVersions = Object.freeze(wireVersions);
 // structural check must run BEFORE the native call).
 const nativeReplayOp = Node.prototype.replayOp;
 
+// Warn throttle (wasm parity — bindings-core.js:104): the first
+// REPLAY_SKIP_WARN_LIMIT skipped ops in a batch warn individually; on a
+// bigger batch ONE summary line replaces the rest — a 10k-op history must
+// not flood the console. The `skipped` array still carries every entry.
+const REPLAY_SKIP_WARN_LIMIT = 10;
+
 // Batch helper over Node#replayOp. Per-op replay FAILURES never abort the
-// batch — each skip is warned and returned with its index, so bulk history
-// ingest converges. Structurally INVALID input still throws (the per-entry
+// batch — each skip is returned with its index, so bulk history ingest
+// converges. Structurally INVALID input still throws (the per-entry
 // guard below throws TypeError for a non-Operation or foreign-module
 // Operation; the array guard handles non-arrays) — repair the input, the
 // batch is fine. applied HOLDS INDICES; pending (raft GROUP_ORDERED)
 // outcomes also land in applied — accepted into the ordering log, not yet
 // committed. Match skips on `code` (message shapes differ across bindings).
+// Warn throttling: the first REPLAY_SKIP_WARN_LIMIT skips warn individually
+// (`crabs-node: replay skipped op[N]: message`); on a bigger batch ONE
+// summary line (`...and N more skipped (total K)`) follows — a 10k-op
+// history must not flood the console. The `skipped` array STILL carries
+// every skip entry; the throttle only trims console output.
 // defineProperty keeps the JS method's descriptor deliberately more permissive
 // than the native class's read-only sealed slots (writable + configurable).
 const replayOpsHelper = function (operations) {
@@ -76,6 +87,7 @@ const replayOpsHelper = function (operations) {
   }
   const applied = [];
   const skipped = [];
+  let skipCount = 0;
   operations.forEach((entryOperation, entryIndex) => {
     if (!entryOperation || !(entryOperation instanceof Operation)) {
       throw new TypeError(`replayOps[${entryIndex}]: expected an Operation from this module`);
@@ -83,11 +95,18 @@ const replayOpsHelper = function (operations) {
     const outcome = nativeReplayOp.call(this, entryOperation);
     if (outcome.status !== 'skipped') {
       applied.push(entryIndex);
-    } else {
+      return;
+    }
+    skipped.push({ index: entryIndex, code: outcome.code, message: outcome.message });
+    skipCount++;
+    if (skipCount <= REPLAY_SKIP_WARN_LIMIT) {
       console.warn(`crabs-node: replay skipped op[${entryIndex}]: ${outcome.message}`);
-      skipped.push({ index: entryIndex, code: outcome.code, message: outcome.message });
     }
   });
+  if (skipCount > REPLAY_SKIP_WARN_LIMIT) {
+    console.warn(`crabs-node: ...and ${skipCount - REPLAY_SKIP_WARN_LIMIT} more skipped `
+      + `(total ${skipCount})`);
+  }
   return { applied, skipped };
 };
 Object.defineProperty(Node.prototype, 'replayOps', {

@@ -123,7 +123,7 @@ The enum tables `TRUST_MODE`, `DATA_TYPE`, `CRDT_TYPE` are exported alongside th
 
 - `new Node(adminId, options?)` — create a CRABS node with the given admin user
   - `options.ordering` — `'hlc'` (default) or `'lamport'`
-  - `options.strategy` — HLC receive strategy (`'bounded'` default)
+  - `options.skew.strategy` — HLC receive strategy (`'bounded'` default)
 
 #### User Management
 

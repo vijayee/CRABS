@@ -13,7 +13,11 @@
 // executed op is a typed already_executed (0x7002) skip that does not
 // re-run the mutation, and the replayOps batch survives per-op skips
 // (applied holds INDICES; a fresh-uuid second op clamp-materializes in the
-// same batch).
+// same batch). Also pins the class-checked Operation unwraps (a plain
+// object or a foreign wrapper instance refuses execute/replayOp with a
+// TypeError, before any native deref) and the replayOps warn throttle
+// (first 10 skips warn individually, then ONE summary line — while
+// `skipped` still carries every entry).
 //
 // The N-API binding is synchronous — the only async leg is the 6.1s aging
 // wait itself.
@@ -203,6 +207,50 @@ function mustThrowWith(invoke, fragment, label) {
     `bounded-strategy node must apply the aged op (got ${JSON.stringify(strategyOutcome)})`);
   assert(strategyReplayer.setContains('proposal-42_voters', 'bob') === true,
     'bounded-strategy node must materialize the tracker membership');
+
+  // --- Class-checked unwrap pins (review follow-up): ObjectWrap::Unwrap is
+  // class-agnostic, so a plain object used to null-deref and a KeyPair
+  // instance used to be a type-confused read fed into the executor. Both
+  // must now throw the typed TypeError instead (the guard fires BEFORE any
+  // native unwrap, so a wrong object never reaches the executor).
+  mustThrowWith(() => clampReplayer.execute({}),
+    'expected an Operation', 'execute with plain object');
+  mustThrowWith(() => clampReplayer.replayOp({}),
+    'expected an Operation', 'replayOp with plain object');
+  mustThrowWith(() => clampReplayer.replayOp(KeyPair.generate()),
+    'expected an Operation', 'replayOp with a KeyPair instance');
+
+  // --- Warn-throttle pin (wasm parity, 6deefd4): a 13-skip batch warns the
+  // first 10 skips individually, then ONE summary line — while `skipped`
+  // still carries ALL 13 entries (the historic op already applied above, so
+  // every copy re-ingests as a no-op already_executed dedup).
+  const floodOps = [];
+  for (let floodIndex = 0; floodIndex < 13; floodIndex++) {
+    floodOps.push(Operation.deserialize(opWire));
+  }
+  const capturedWarns = [];
+  const realWarn = console.warn;
+  console.warn = (...warnArgs) => capturedWarns.push(warnArgs.join(' '));
+  let floodBatch = null;
+  try {
+    floodBatch = clampReplayer.replayOps(floodOps);
+  } finally {
+    console.warn = realWarn;
+  }
+  assert(floodBatch.skipped.length === 13,
+    `every flood skip must still be reported, got ${floodBatch.skipped.length}`);
+  assert(floodBatch.applied.length === 0,
+    `no flood entry may apply, got ${JSON.stringify(floodBatch.applied)}`);
+  assert(capturedWarns.length === 10 + 1,
+    `throttled batch must emit exactly 11 warn lines (10 + summary), got ${capturedWarns.length}`);
+  assert(capturedWarns[0].includes('replay skipped op[0]: already_executed'),
+    `first individual warn must carry op[0], got "${capturedWarns[0]}"`);
+  assert(capturedWarns[9].includes('replay skipped op[9]: already_executed'),
+    `tenth individual warn must carry op[9], got "${capturedWarns[9]}"`);
+  assert(capturedWarns[10].includes('...and 3 more skipped (total 13)'),
+    `summary line must be "...and 3 more skipped (total 13)", got "${capturedWarns[10]}"`);
+  assert(!capturedWarns[10].includes('replay skipped op[10]'),
+    'the 11th skip must NOT warn individually after the throttle');
 
   console.log(`hlc-skew-replay OK: ${passed} passed, ${failed} failed — clamp ingest materializes, ` +
     'default (and 0-sentinel) rejects the aged op live, batch survives with applied holding indices');
