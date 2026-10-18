@@ -421,8 +421,9 @@ static crabs_hlc_receive_result_e _hlc_receive_impl(crabs_hlc_state_t* state,
           // historic stamp never regresses it); the executor emits the
           // per-op diagnostic. Ordering caveat: the materialized op keeps
           // its ORIGINAL stamp, so it sorts before everything stamped after
-          // it; a log replayed out of order yields ALREADY_EXECUTED for the
-          // older entry, never divergence of already-converged state.
+          // it; the executor layer (replay ingest path) is responsible for
+          // out-of-order tolerance; this clamp only guarantees it never
+          // regresses or pollutes the local clock.
           clamped_past = true;
           break;
         }

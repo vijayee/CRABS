@@ -312,6 +312,7 @@ TEST(HLCCore, ReceiveResultValues) {
   EXPECT_EQ(CRABS_HLC_REJECTED_QUORUM, 2);
   EXPECT_EQ(CRABS_HLC_REJECTED_TRUST, 3);
   EXPECT_EQ(CRABS_HLC_ACCEPTED_STRICT, 4);
+  EXPECT_EQ(CRABS_HLC_ACCEPTED_CLAMPED, 5);
 }
 
 // ============================================================
@@ -1892,6 +1893,9 @@ TEST(HLCReceiveReplay, ClampsPast) {
   // Clamp invariant: the historic stamp does not regress the local clock.
   EXPECT_EQ(state.last.physical_seconds, 36000u);
   EXPECT_EQ(state.last.physical_nanos, 0u);
+  // Clamp invariant: a clamped ACCEPT is not counted as a time-travel attack
+  // — only hard rejects bump the counter.
+  EXPECT_EQ(state.time_travel_attempts_rejected, 0u);
 }
 
 // Future stamps stay hard-rejected on the replay path: bulk ingest is not a
@@ -1939,4 +1943,77 @@ TEST(HLCReceiveReplay, InWindowAcceptsNormally) {
 
   EXPECT_EQ(result, CRABS_HLC_ACCEPTED);
   EXPECT_EQ(state.last.physical_seconds, 36002u);
+}
+
+// A clamped accept must not adopt the received logical counter. The attacker
+// picks one below the hard-reject bound; since the received physical time is
+// older than local, the max rule floors at local and the counter never leaks
+// into the local clock.
+TEST(HLCReceiveReplay, ClampDoesNotAdoptReceivedCounter) {
+  crabs_hlc_state_t state = make_mock_state("alice", 36000, 0);
+  state.receive_strategy = HLC_STRATEGY_BOUNDED;
+  state.max_skew_ms = 5000;
+
+  crabs_hlc_t received = {35985, 0, UINT64_MAX / 2 - 1, "bob"};  // 15s behind local
+  crabs_hlc_receive_result_e result = crabs_hlc_receive_replay(&state, &received);
+
+  EXPECT_EQ(result, CRABS_HLC_ACCEPTED_CLAMPED);
+  EXPECT_EQ(state.last.physical_seconds, 36000u);
+  EXPECT_EQ(state.last.physical_nanos, 0u);
+  EXPECT_EQ(state.last.logical_counter, 0u);
+}
+
+// The implausible-counter bound stays hard-rejected on the replay path: a
+// clamp marks a stamp as HISTORIC, it does not weaken the anti-DoS counter
+// check.
+TEST(HLCReceiveReplay, ClampStillRejectsImplausibleCounter) {
+  crabs_hlc_state_t state = make_mock_state("alice", 36000, 0);
+  state.receive_strategy = HLC_STRATEGY_BOUNDED;
+  state.max_skew_ms = 5000;
+
+  crabs_hlc_t received = {35985, 0, UINT64_MAX / 2, "attacker"};  // at the bound
+  uint64_t rejections_before = state.time_travel_attempts_rejected;
+  crabs_hlc_receive_result_e result = crabs_hlc_receive_replay(&state, &received);
+
+  EXPECT_EQ(result, CRABS_HLC_REJECTED_SKEW);
+  EXPECT_EQ(state.time_travel_attempts_rejected, rejections_before + 1);
+}
+
+// strict_mode short-circuits BEFORE the max-rule state update, so it swallows
+// the clamp marker: a strict-mode node reports ACCEPTED_STRICT for a clamped
+// past stamp and never adopts received state.
+TEST(HLCReceiveReplay, ClampWithStrictModeReturnsStrict) {
+  crabs_hlc_state_t state = make_mock_state("alice", 36000, 0);
+  state.receive_strategy = HLC_STRATEGY_BOUNDED;
+  state.max_skew_ms = 5000;
+  state.strict_mode = true;
+
+  // Set state to a known timestamp (same pattern as StrictNoUpdate)
+  state.last.physical_seconds = 36000;
+  state.last.physical_nanos = 500000000;
+  state.last.logical_counter = 3;
+
+  crabs_hlc_t received = {35985, 0, 0, "bob"};  // 15s behind local
+  crabs_hlc_receive_result_e result = crabs_hlc_receive_replay(&state, &received);
+
+  EXPECT_EQ(result, CRABS_HLC_ACCEPTED_STRICT);
+  // State should be UNCHANGED
+  EXPECT_EQ(state.last.physical_seconds, 36000u);
+  EXPECT_EQ(state.last.physical_nanos, 500000000u);
+  EXPECT_EQ(state.last.logical_counter, 3u);
+}
+
+// The clamp marker is BOUNDED-only: NAIVE has no skew window (nothing to
+// clamp into) and no clamp diagnostic, so the same historic stamp returns a
+// plain ACCEPT. The max rule still floors at local (36000 > 35985), so the
+// clock does not regress even without a window.
+TEST(HLCReceiveReplay, ClampMarkerOnlyUnderBounded) {
+  crabs_hlc_state_t state = make_mock_state("alice", 36000, 0);
+  state.receive_strategy = HLC_STRATEGY_NAIVE;
+
+  crabs_hlc_t received = {35985, 0, 0, "bob"};  // 15s behind local
+  crabs_hlc_receive_result_e result = crabs_hlc_receive_replay(&state, &received);
+
+  EXPECT_EQ(result, CRABS_HLC_ACCEPTED);
+  EXPECT_EQ(state.last.physical_seconds, 36000u);
 }
