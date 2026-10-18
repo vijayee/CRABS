@@ -350,8 +350,13 @@ crabs_hlc_t crabs_hlc_next(crabs_hlc_state_t* state) {
 // HLC Receive (v1.6 Amd6 §4.2, §5)
 // ============================================================
 
-crabs_hlc_receive_result_e crabs_hlc_receive(crabs_hlc_state_t* state,
-                                               const crabs_hlc_t* received) {
+// Shared receive implementation. The LIVE path (crabs_hlc_receive) passes
+// clamp_past = false; the REPLAY-ingest path (crabs_hlc_receive_replay)
+// passes clamp_past = true, which converts the BOUNDED strategy's
+// past-window reject into a clamp + accept without touching any other rule.
+static crabs_hlc_receive_result_e _hlc_receive_impl(crabs_hlc_state_t* state,
+                                                    const crabs_hlc_t* received,
+                                                    bool clamp_past) {
   if (state == NULL || received == NULL) {
     return CRABS_HLC_REJECTED_SKEW;
   }
@@ -372,6 +377,7 @@ crabs_hlc_receive_result_e crabs_hlc_receive(crabs_hlc_state_t* state,
   }
 
   // Step 1: Validate based on strategy
+  bool clamped_past = false;
   switch (state->receive_strategy) {
     case HLC_STRATEGY_NAIVE:
       // Accept everything blindly
@@ -405,6 +411,21 @@ crabs_hlc_receive_result_e crabs_hlc_receive(crabs_hlc_state_t* state,
       }
 
       if (skew_ms < -max_skew) {
+        if (clamp_past) {
+          // Replay ingest (bounded-skew replay fix): an op stamped further
+          // back than the live window is bulk HISTORY, not a freshness race
+          // — the window exists to defend the live path against well-behaved
+          // clocks running slow. Clamp into the local HLC domain: accept for
+          // ordering and fall through to the max rule below, which floors the
+          // local clock at local time (it can only move forward, so a
+          // historic stamp never regresses it); the executor emits the
+          // per-op diagnostic. Ordering caveat: the materialized op keeps
+          // its ORIGINAL stamp, so it sorts before everything stamped after
+          // it; a log replayed out of order yields ALREADY_EXECUTED for the
+          // older entry, never divergence of already-converged state.
+          clamped_past = true;
+          break;
+        }
         // Received timestamp too far in the past
         state->time_travel_attempts_rejected += 1;
         return CRABS_HLC_REJECTED_SKEW;
@@ -478,7 +499,20 @@ crabs_hlc_receive_result_e crabs_hlc_receive(crabs_hlc_state_t* state,
   }
   // else: max is behind last, keep last as-is (shouldn't happen normally)
 
-  return CRABS_HLC_ACCEPTED;
+  // A clamped replay stamp reaches the same final state as a live accept
+  // (the max rule already ran), it just reports a distinct result so callers
+  // can surface that the op was historic and clamped into the window.
+  return clamped_past ? CRABS_HLC_ACCEPTED_CLAMPED : CRABS_HLC_ACCEPTED;
+}
+
+crabs_hlc_receive_result_e crabs_hlc_receive(crabs_hlc_state_t* state,
+                                               const crabs_hlc_t* received) {
+  return _hlc_receive_impl(state, received, false);
+}
+
+crabs_hlc_receive_result_e crabs_hlc_receive_replay(crabs_hlc_state_t* state,
+                                                     const crabs_hlc_t* received) {
+  return _hlc_receive_impl(state, received, true);
 }
 
 // ============================================================

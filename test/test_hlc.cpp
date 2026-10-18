@@ -1872,3 +1872,71 @@ TEST(HLCReplay, ExtremeLogicalCounterRejectedAtExecute) {
   operation_destroy(op);
   crabs_test_env_destroy(&env);
 }
+
+// ============================================================
+// Replay ingest receive (bounded-skew replay fix, 2026-10-17 brief)
+// ============================================================
+
+// A replayed historic op (15s old, beyond the 5s live window) is CLAMPED:
+// accepted for ordering, not counted as a time-travel attack, and it must
+// not move the local clock backward.
+TEST(HLCReceiveReplay, ClampsPast) {
+  crabs_hlc_state_t state = make_mock_state("alice", 36000, 0);
+  state.receive_strategy = HLC_STRATEGY_BOUNDED;
+  state.max_skew_ms = 5000;
+
+  crabs_hlc_t received = {35985, 0, 0, "bob"};  // 15s behind local
+  crabs_hlc_receive_result_e result = crabs_hlc_receive_replay(&state, &received);
+
+  EXPECT_EQ(result, CRABS_HLC_ACCEPTED_CLAMPED);
+  // Clamp invariant: the historic stamp does not regress the local clock.
+  EXPECT_EQ(state.last.physical_seconds, 36000u);
+  EXPECT_EQ(state.last.physical_nanos, 0u);
+}
+
+// Future stamps stay hard-rejected on the replay path: bulk ingest is not a
+// license to force the clock forward.
+TEST(HLCReceiveReplay, StillRejectsFuture) {
+  crabs_hlc_state_t state = make_mock_state("alice", 36000, 0);
+  state.receive_strategy = HLC_STRATEGY_BOUNDED;
+  state.max_skew_ms = 5000;
+
+  crabs_hlc_t received = {99999, 0, 0, "malicious"};
+  uint64_t rejections_before = state.time_travel_attempts_rejected;
+  crabs_hlc_receive_result_e result = crabs_hlc_receive_replay(&state, &received);
+
+  EXPECT_EQ(result, CRABS_HLC_REJECTED_SKEW);
+  EXPECT_EQ(state.time_travel_attempts_rejected, rejections_before + 1);
+}
+
+// The plain receive path is untouched: a past-window stamp still rejects
+// (default compatibility for the live path).
+TEST(HLCReceiveReplay, PlainReceiveRejectsPast) {
+  crabs_hlc_state_t state = make_mock_state("alice", 36000, 0);
+  state.receive_strategy = HLC_STRATEGY_BOUNDED;
+  state.max_skew_ms = 5000;
+
+  // The BOUNDED past-window reject fires before the max rule, so the local
+  // clock is untouched: on a freshly initialized state `last` stays at its
+  // zeroed init value (mock time seeds the time source, not `last`).
+  crabs_hlc_t received = {35985, 0, 0, "old"};  // 15s behind local
+  crabs_hlc_receive_result_e result = crabs_hlc_receive(&state, &received);
+
+  EXPECT_EQ(result, CRABS_HLC_REJECTED_SKEW);
+  EXPECT_EQ(state.last.physical_seconds, 0u);
+  EXPECT_EQ(state.last.physical_nanos, 0u);
+}
+
+// In-window stamps accept NORMALLY on the replay path — same result as the
+// live path, no clamp marker.
+TEST(HLCReceiveReplay, InWindowAcceptsNormally) {
+  crabs_hlc_state_t state = make_mock_state("alice", 36000, 0);
+  state.receive_strategy = HLC_STRATEGY_BOUNDED;
+  state.max_skew_ms = 5000;
+
+  crabs_hlc_t received = {36002, 0, 0, "bob"};  // 2s ahead — inside window
+  crabs_hlc_receive_result_e result = crabs_hlc_receive_replay(&state, &received);
+
+  EXPECT_EQ(result, CRABS_HLC_ACCEPTED);
+  EXPECT_EQ(state.last.physical_seconds, 36002u);
+}

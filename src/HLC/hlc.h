@@ -85,8 +85,21 @@ typedef enum {
   CRABS_HLC_REJECTED_SKEW    = 1,  // BOUNDED: too far ahead/behind
   CRABS_HLC_REJECTED_QUORUM = 2,  // QUORUM: insufficient confirmations
   CRABS_HLC_REJECTED_TRUST  = 3,  // TRUSTED: verification failed
-  CRABS_HLC_ACCEPTED_STRICT = 4   // STRICT: accepted but state unchanged
+  CRABS_HLC_ACCEPTED_STRICT = 4,  // STRICT: accepted but state unchanged
+  CRABS_HLC_ACCEPTED_CLAMPED = 5  // REPLAY: past-window stamp clamped (accepted)
 } crabs_hlc_receive_result_e;
+
+// ============================================================
+// Replay Ingest Policy (bounded-skew replay fix)
+// ============================================================
+
+// Replay ingest skew policy (bounded-skew replay fix):
+// the LIVE path always follows receive_strategy; this policy governs the
+// dedicated replay-ingest execute path only.
+typedef enum {
+  CRABS_HLC_REPLAY_REJECT = 0,  // default: replay follows the live strategy (byte-compatible)
+  CRABS_HLC_REPLAY_CLAMP  = 1   // historic (past-window) stamps accepted + clamped; future still rejected
+} crabs_hlc_replay_policy_e;
 
 // ============================================================
 // HLC State (v1.6 Amd6 §3.1)
@@ -124,6 +137,7 @@ typedef struct {
     bool                 strict_mode;
     bool                 trusted_time_source;
     uint64_t             trusted_resync_ms;
+    crabs_hlc_replay_policy_e replay_policy;
   } hlc;
 } crabs_ordering_config_t;
 
@@ -218,6 +232,17 @@ crabs_hlc_t crabs_hlc_next(crabs_hlc_state_t* state);
 // Returns the result indicating acceptance or rejection reason.
 crabs_hlc_receive_result_e crabs_hlc_receive(crabs_hlc_state_t* state,
                                                const crabs_hlc_t* received);
+
+// Process a received HLC timestamp as REPLAY INGEST. Identical to
+// crabs_hlc_receive except that under BOUNDED a stamp OLDER than max_skew_ms
+// is CRABS_HLC_ACCEPTED_CLAMPED instead of rejected: a historic op is bulk
+// history, not a freshness race, so the live window's clock-skew defense
+// does not apply to it. The clamp never regresses the local clock (the max
+// rule can only move it forward), the implausible-counter bound and
+// future-stamp rejection stay hard errors, and every other strategy
+// behaves as in crabs_hlc_receive.
+crabs_hlc_receive_result_e crabs_hlc_receive_replay(crabs_hlc_state_t* state,
+                                                     const crabs_hlc_t* received);
 
 // ============================================================
 // HLC Lock Integration (v1.6 Amd6 §8)
