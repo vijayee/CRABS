@@ -364,6 +364,8 @@ export interface DefineOperationTypeOptions {
 export interface NodeOptions {
   ordering?: 'hlc' | 'lamport';
   strategy?: 'naive' | 'bounded' | 'quorum' | 'strict' | 'trusted';
+  /** Bounded-skew replay fix (wasm parity): maxSkewMs 0 keeps the C default (5000ms). */
+  skew?: { maxSkewMs?: number; replayPolicy?: 'reject' | 'clamp' };
 }
 
 export interface TimeSourceOptions {
@@ -810,6 +812,11 @@ export interface Node {
   defineOperationType(opType: string, options: DefineOperationTypeOptions): void;
   sign(op: Operation, key: KeyPair | string): void;
   execute(op: Operation): void;
+
+  // Replay ingest (bounded-skew replay fix; wasm parity). Never throws for a
+  // failed VALID op — failures return a skipped outcome so a bulk log
+  // ingest can converge.
+  replayOp(op: Operation): { status: 'applied' | 'pending' | 'skipped'; code?: number; message?: string };
 
   // Timed transactions (v1) — mirror of the wasm surface
   // (bindings/wasm/index.d.ts:501-510). The submission-time authorization

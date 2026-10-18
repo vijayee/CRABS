@@ -122,59 +122,63 @@ static bool hex_decode(const std::string& hex, uint8_t* out, size_t out_len) {
   return true;
 }
 
-static Napi::Error crabs_error(Napi::Env env, crabs_error_e err, const char* ctx) {
-  const char* msg;
+// The name table lifted verbatim from crabs_error's switch — ExecuteReplay
+// needs the NAME (not a thrown Error) for its outcome object.
+static std::string crabs_error_name(crabs_error_e err) {
   switch (err) {
-    case CRABS_SUCCESS:                    msg = "success"; break;
-    case CRABS_ERR_PROTOCOL_VIOLATION:     msg = "protocol_violation"; break;
-    case CRABS_ERR_LOCK_TOKEN_MISMATCH:    msg = "lock_token_mismatch"; break;
-    case CRABS_ERR_LOCK_OWNER_MISMATCH:    msg = "lock_owner_mismatch"; break;
-    case CRABS_ERR_LOCK_CONTENTION:        msg = "lock_contention"; break;
-    case CRABS_ERR_LOCK_NOT_EXPIRED:       msg = "lock_not_expired"; break;
-    case CRABS_ERR_MAX_EXTENSIONS_REACHED: msg = "max_extensions_reached"; break;
-    case CRABS_ERR_FORCE_UNLOCK_DISABLED:  msg = "force_unlock_disabled"; break;
-    case CRABS_ERR_UNAUTHORIZED:           msg = "unauthorized"; break;
-    case CRABS_ERR_KEY_STALE:             msg = "key_stale"; break;
-    case CRABS_ERR_USER_NOT_FOUND:         msg = "user_not_found"; break;
-    case CRABS_ERR_USER_SUSPENDED:         msg = "user_suspended"; break;
+    case CRABS_SUCCESS:                    return "success";
+    case CRABS_ERR_PROTOCOL_VIOLATION:     return "protocol_violation";
+    case CRABS_ERR_LOCK_TOKEN_MISMATCH:    return "lock_token_mismatch";
+    case CRABS_ERR_LOCK_OWNER_MISMATCH:    return "lock_owner_mismatch";
+    case CRABS_ERR_LOCK_CONTENTION:        return "lock_contention";
+    case CRABS_ERR_LOCK_NOT_EXPIRED:       return "lock_not_expired";
+    case CRABS_ERR_MAX_EXTENSIONS_REACHED: return "max_extensions_reached";
+    case CRABS_ERR_FORCE_UNLOCK_DISABLED:  return "force_unlock_disabled";
+    case CRABS_ERR_UNAUTHORIZED:           return "unauthorized";
+    case CRABS_ERR_KEY_STALE:              return "key_stale";
+    case CRABS_ERR_USER_NOT_FOUND:         return "user_not_found";
+    case CRABS_ERR_USER_SUSPENDED:         return "user_suspended";
     // v1.3 §9 keyring refusals (parity-fill P2): these were previously
     // unnamed in this switch and collapsed into "unknown_error".
-    case CRABS_ERR_KEY_SUSPENDED:          msg = "key_suspended"; break;
-    case CRABS_ERR_KEY_REVOKED:            msg = "key_revoked"; break;
-    case CRABS_ERR_KEY_EXPIRED:            msg = "key_expired"; break;
-    case CRABS_ERR_KEY_NOT_ACTIVE:         msg = "key_not_active"; break;
-    case CRABS_ERR_VAULT_UNAVAILABLE:      msg = "vault_unavailable"; break;
-    case CRABS_ERR_INVARIANT_VIOLATED:     msg = "invariant_violated"; break;
-    case CRABS_ERR_RESOURCE_NOT_FOUND:     msg = "resource_not_found"; break;
-    case CRABS_ERR_DUPLICATE_OPERATION:    msg = "duplicate_operation"; break;
-    case CRABS_ERR_TYPE_MISMATCH:          msg = "type_mismatch"; break;
-    case CRABS_ERR_ALREADY_PERFORMED:      msg = "already_performed"; break;
-    case CRABS_ERR_ALREADY_EXECUTED:       msg = "already_executed"; break;
-    case CRABS_ERR_CONDITION_NOT_MET:      msg = "condition_not_met"; break;
-    case CRABS_ERR_TRACKER_NOT_FOUND:      msg = "tracker_not_found"; break;
-    case CRABS_ERR_FLAG_NOT_FOUND:         msg = "flag_not_found"; break;
-    case CRABS_ERR_SERIALIZATION_ERROR:    msg = "serialization_error"; break;
-    case CRABS_ERR_CRYPTOGRAPHIC_ERROR:    msg = "cryptographic_error"; break;
-    case CRABS_ERR_INTERNAL:               msg = "internal_error"; break;
-    case CRABS_ERR_OOM:                    msg = "out_of_memory"; break;
-    case CRABS_ERR_INVALID_PARAM:          msg = "invalid_param"; break;
-    case CRABS_ERR_NOT_ITEM_WRITER:        msg = "not_item_writer"; break;
-    case CRABS_ERR_SEQ_MISMATCH:           msg = "seq_mismatch"; break;
-    case CRABS_ERR_FORK_DETECTED:          msg = "fork_detected"; break;
-    case CRABS_ERR_ORDERING_PATH:          msg = "ordering_path"; break;
-    case CRABS_ERR_ORDERING_PENDING:       msg = "ordering_pending"; break;
-    case CRABS_ERR_ORDERING_NOT_LEADER:    msg = "ordering_not_leader"; break;
+    case CRABS_ERR_KEY_SUSPENDED:          return "key_suspended";
+    case CRABS_ERR_KEY_REVOKED:            return "key_revoked";
+    case CRABS_ERR_KEY_EXPIRED:            return "key_expired";
+    case CRABS_ERR_KEY_NOT_ACTIVE:         return "key_not_active";
+    case CRABS_ERR_VAULT_UNAVAILABLE:      return "vault_unavailable";
+    case CRABS_ERR_INVARIANT_VIOLATED:     return "invariant_violated";
+    case CRABS_ERR_RESOURCE_NOT_FOUND:     return "resource_not_found";
+    case CRABS_ERR_DUPLICATE_OPERATION:    return "duplicate_operation";
+    case CRABS_ERR_TYPE_MISMATCH:          return "type_mismatch";
+    case CRABS_ERR_ALREADY_PERFORMED:      return "already_performed";
+    case CRABS_ERR_ALREADY_EXECUTED:       return "already_executed";
+    case CRABS_ERR_CONDITION_NOT_MET:      return "condition_not_met";
+    case CRABS_ERR_TRACKER_NOT_FOUND:      return "tracker_not_found";
+    case CRABS_ERR_FLAG_NOT_FOUND:         return "flag_not_found";
+    case CRABS_ERR_SERIALIZATION_ERROR:    return "serialization_error";
+    case CRABS_ERR_CRYPTOGRAPHIC_ERROR:    return "cryptographic_error";
+    case CRABS_ERR_INTERNAL:               return "internal_error";
+    case CRABS_ERR_OOM:                    return "out_of_memory";
+    case CRABS_ERR_INVALID_PARAM:          return "invalid_param";
+    case CRABS_ERR_NOT_ITEM_WRITER:        return "not_item_writer";
+    case CRABS_ERR_SEQ_MISMATCH:           return "seq_mismatch";
+    case CRABS_ERR_FORK_DETECTED:          return "fork_detected";
+    case CRABS_ERR_ORDERING_PATH:          return "ordering_path";
+    case CRABS_ERR_ORDERING_PENDING:       return "ordering_pending";
+    case CRABS_ERR_ORDERING_NOT_LEADER:    return "ordering_not_leader";
     case CRABS_ERR_ORDERING_CHANGE_IN_FLIGHT:
-                                           msg = "ordering_change_in_flight"; break;
-    case CRABS_ERR_QUARANTINED:            msg = "quarantined"; break;
+                                           return "ordering_change_in_flight";
+    case CRABS_ERR_QUARANTINED:            return "quarantined";
     // 0x8xxx: OT errors (v1.5 §8)
-    case CRABS_ERR_NO_OT_OPS:              msg = "no_ot_ops"; break;
-    case CRABS_ERR_NOT_OT_TYPE:            msg = "not_ot_type"; break;
-    case CRABS_ERR_OT_TRANSFORM_DEPTH:     msg = "ot_transform_depth"; break;
-    case CRABS_ERR_OT_POSITION_BOUNDS:     msg = "ot_position_bounds"; break;
-    default:                               msg = "unknown_error"; break;
+    case CRABS_ERR_NO_OT_OPS:              return "no_ot_ops";
+    case CRABS_ERR_NOT_OT_TYPE:            return "not_ot_type";
+    case CRABS_ERR_OT_TRANSFORM_DEPTH:     return "ot_transform_depth";
+    case CRABS_ERR_OT_POSITION_BOUNDS:     return "ot_position_bounds";
+    default:                               return "unknown_error";
   }
-  std::string full = std::string(ctx) + ": " + msg;
+}
+
+static Napi::Error crabs_error(Napi::Env env, crabs_error_e err, const char* ctx) {
+  std::string full = std::string(ctx) + ": " + crabs_error_name(err);
   return Napi::Error::New(env, full);
 }
 
@@ -1540,6 +1544,8 @@ public:
       InstanceMethod("setPolicy", &Node::SetPolicy),
       InstanceMethod("defineOperationType", &Node::DefineOperationType),
       InstanceMethod("execute", &Node::Execute),
+      // Replay ingest (bounded-skew replay fix) — wasm parity
+      InstanceMethod("replayOp", &Node::ExecuteReplay),
       // Timed transactions (v1) — mirror of the wasm surface
       // (bindings/wasm/index.d.ts:501-511)
       InstanceMethod("schedule", &Node::Schedule),
@@ -1637,14 +1643,51 @@ public:
 
     std::string admin_id = info[0].As<Napi::String>().Utf8Value();
 
-    // Parse options: { ordering: 'hlc' | 'lamport', strategy: 'bounded' | ... }
+    // Parse options: { ordering: 'hlc' | 'lamport',
+    //                   skew: { maxSkewMs, replayPolicy } }
     bool use_hlc = true;  // Default to HLC (user requested hybrid time)
+    // Skew configuration (bounded-skew replay fix, wasm-parity): the C seam
+    // takes raw enum/uint values with no validation — THIS whitelist is the
+    // enforcement point (mirror of the wasm binding's parseSkewOptions).
+    uint64_t max_skew_ms = 0;  // 0 = keep the C-side default (5000); NOT "unbounded"
+    crabs_hlc_replay_policy_e replay_policy = CRABS_HLC_REPLAY_REJECT;
     if (info.Length() > 1 && info[1].IsObject()) {
       Napi::Object opts = info[1].As<Napi::Object>();
       if (opts.Has("ordering")) {
         std::string ord = require_js_string(opts.Get("ordering"),
                                             "Node", "ordering");
         use_hlc = (ord == "hlc");
+      }
+      if (opts.Has("skew") && opts.Get("skew").IsObject()) {
+        Napi::Object skew = opts.Get("skew").As<Napi::Object>();
+        if (skew.Has("maxSkewMs")) {
+          Napi::Value skew_window = skew.Get("maxSkewMs");
+          // Safe non-negative integer (the wasm parseSkewOptions rule):
+          // fractional or above-MAX_SAFE_INTEGER doubles would truncate or
+          // have already collapsed in the double space (e.g. 2**53 + 1 IS
+          // 2**53), so the window must be exact before the uint64 cast.
+          if (!skew_window.IsNumber()) {
+            throw Napi::TypeError::New(
+                env, "Node: skew.maxSkewMs must be a non-negative safe integer");
+          }
+          double window_value = skew_window.As<Napi::Number>().DoubleValue();
+          if (!(window_value >= 0) || window_value > 9007199254740991.0 ||
+              window_value != std::floor(window_value)) {
+            throw Napi::TypeError::New(
+                env, "Node: skew.maxSkewMs must be a non-negative safe integer");
+          }
+          max_skew_ms = (uint64_t)window_value;
+        }
+        if (skew.Has("replayPolicy")) {
+          std::string policy = require_js_string(skew.Get("replayPolicy"),
+                                                 "Node", "skew.replayPolicy");
+          if (policy != "clamp" && policy != "reject") {
+            throw Napi::TypeError::New(
+                env, "Node: skew.replayPolicy must be 'clamp' or 'reject'");
+          }
+          replay_policy = (policy == "clamp")
+                              ? CRABS_HLC_REPLAY_CLAMP : CRABS_HLC_REPLAY_REJECT;
+        }
       }
     }
 
@@ -1666,6 +1709,8 @@ public:
     // Configure ordering
     if (use_hlc) {
       crabs_ordering_config_init_hlc(&ordering_config_, HLC_STRATEGY_BOUNDED);
+      if (max_skew_ms != 0) ordering_config_.hlc.max_skew_ms = max_skew_ms;
+      ordering_config_.hlc.replay_policy = replay_policy;
       state_set_ordering_config(&am_->base_state, &ordering_config_);
       // Initialize HLC state with admin_id as node_id
       crabs_hlc_state_init(&am_->base_state.hlc_state, admin_id.c_str());
@@ -4418,6 +4463,32 @@ private:
     if (rc != CRABS_SUCCESS && rc != CRABS_ERR_ORDERING_PENDING)
       throw crabs_error(env, rc, "execute");
     return env.Undefined();
+  }
+
+  Napi::Value ExecuteReplay(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 1 || !info[0].IsObject()) {
+      throw Napi::TypeError::New(env, "Expected Operation");
+    }
+    Operation* op = Operation::Unwrap(info[0].As<Napi::Object>());
+    // Replay ingest (parity with the wasm binding's replayOp): the HLC skew
+    // decision uses the node's replay policy (hlc.replay_policy) instead of
+    // the live one. Never throws for a failed VALID op — failures return a
+    // skipped outcome object so a bulk log ingest can converge.
+    crabs_error_e rc = state_machine_execute_replay(&am_->base_state, op->raw());
+    Napi::Object outcome = Napi::Object::New(env);
+    if (rc == CRABS_SUCCESS) {
+      outcome.Set("status", "applied");
+      return outcome;
+    }
+    if (rc == CRABS_ERR_ORDERING_PENDING) {
+      outcome.Set("status", "pending");
+      return outcome;
+    }
+    outcome.Set("status", "skipped");
+    outcome.Set("code", Napi::Number::New(env, (double)rc));
+    outcome.Set("message", crabs_error_name(rc));
+    return outcome;
   }
 
   // --- Timed transactions (v1) ---
