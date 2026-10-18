@@ -18,7 +18,7 @@ Node.create(adminId, { ordering: 'hlc', skew: {
   replayPolicy?: 'reject'|'clamp',   // default 'reject' (byte-compatible today)
 } })
 ```
-and ingests history with `node.replayOps(opWireBytes[])` or per-op `await Operation.deserialize(bytes)` + `node.replayOp(op)` → `{ status: 'applied'|'skipped'|'pending', code?, message? }`. `replayOps` never aborts the batch; it returns `{ applied: number[], skipped: {index, code, message}[] }` (also `console.warn`s each skip).
+and ingests history by deserializing each wire entry (`await Operation.deserialize(bytes)`) and calling `node.replayOps(deserializedOperations[])` or per-op `node.replayOp(op)` → `{ status: 'applied'|'skipped'|'pending', code?, message? }` (both bindings; N-API's `replayOps` attaches via the JS helper in bindings/node/index.js — sealed native prototype). `replayOps` never aborts the batch (structurally INVALID entries throw); it returns `{ applied: number[] /* indices */, skipped: {index, code, message}[] }` (also `console.warn`s each skip).
 
 Controller decisions from Task 2's quality review (2026-10-18):
 - **Clamp acceptance is silent in C** (`ACCEPTED_CLAMPED` is internal): no telemetry plumb-through. The binding-level skip diagnostics satisfy the brief's "per-op diagnostic and continue"; the clamped op's OBSERVABLE marker is its as-authored historic stamp in the audit log. Comments must say "accepted for ordering; the stamp is retained as-authored; the real clock adopts nothing" (no observable clamp).
@@ -936,7 +936,7 @@ and the `if (use_hlc)` block becomes:
     }
 ```
 
-(Note: `0x1002`-style future-stamp policy stays C-side; the N-API surfaces no strategy override here — parity with the wasm binding's skew surface except `strategy`, mirroring the pre-existing N-API shape which never exposed one. If the wasm side later needs it here, add it in the same shape.)
+(Note: `0x1002`-style future-stamp policy stays C-side. RESOLVED by commit bfd682f: the N-API binding now parses `skew.strategy` with the full naive|bounded|quorum|strict|trusted whitelist — complete parity with the wasm `parseSkewOptions`.)
 
 - [ ] **Step 3: `ExecuteReplay` method**
 

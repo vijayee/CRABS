@@ -2341,7 +2341,7 @@ class Node {
   // VALID op it never throws — returns an outcome so a log replay can
   // converge by design:
   //   { status: 'applied' | 'pending' } on success / raft-pending
-  //   { status: 'skipped', code, message } on failure (e.g. 0x1002
+  //   { status: 'skipped', code, message } on failure (e.g. 0x1001
   //   protocol_violation for a future stamp, 0x7002 already_executed on a
   //   re-ingested op) — a skipped op mutates nothing.
   // A destroyed op (_ptr === 0) or an Operation minted by a DIFFERENT module
