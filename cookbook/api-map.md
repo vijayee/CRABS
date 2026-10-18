@@ -35,7 +35,7 @@ Unless a row says otherwise, wasm and node share the symbol at the same d.ts lin
 | `Node.setPolicy` | method | `setPolicy(opType, expression)` | wasm :933, node :798 | STABLE (`smoke.js:17`) |
 | `Node.adminId` | property (wasm) | `readonly adminId: string` | `bindings/wasm/index.d.ts:1312` | STABLE (`test/raft.js` peers default via `adminId`; setPolicy paths) |
 
-`NodeOptions = { ordering: 'hlc'|'lamport', skew: { strategy: 'naive'|'bounded'|'quorum'|'strict'|'trusted', maxSkewMs?: number (0 = C default 5000, NOT unbounded), replayPolicy: 'reject'|'clamp' } }` — wasm `index.d.ts:431` / node `index.d.ts:364`; `{ordering:'hlc'}` tested (`smoke.js:6`, `test/test.js:31`), skew options tested (`bindings/wasm/test/hlc-skew-replay.js`). A legacy TOP-LEVEL `strategy` field was never read by either runtime (only `skew.strategy` is) and has been removed from both the wasm and node `.d.ts` (node side in the N-API follow-up).
+`NodeOptions = { ordering: 'hlc'|'lamport', skew: { strategy: 'naive'|'bounded'|'quorum'|'strict'|'trusted', maxSkewMs?: number (0 = C default 5000, NOT unbounded), maxReplayAgeMs?: number (replay-clamp horizon; 0 = unbounded default), replayPolicy: 'reject'|'clamp' } }` — wasm `index.d.ts:431` / node `index.d.ts:364`; `{ordering:'hlc'}` tested (`smoke.js:6`, `test/test.js:31`), skew options tested (`bindings/wasm/test/hlc-skew-replay.js`). A legacy TOP-LEVEL `strategy` field was never read by either runtime (only `skew.strategy` is) and has been removed from both the wasm and node `.d.ts` (node side in the N-API follow-up).
 
 ## 2. Users, roles, attributes (registerUser, tokens)
 

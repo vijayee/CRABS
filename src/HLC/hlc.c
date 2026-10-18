@@ -401,7 +401,9 @@ static crabs_hlc_receive_result_e _hlc_receive_impl(crabs_hlc_state_t* state,
       // to INT64_MAX makes the behavior predictable: a huge max_skew_ms means
       // "accept any skew up to INT64_MAX ms" (~292 million years), which is the
       // intent of setting a very large value. skew_ms itself is already
-      // saturated to [-INT64_MAX, INT64_MAX] by crabs_hlc_diff_ms.
+      // saturated to a finite range by crabs_hlc_diff_ms — note the
+      // deep-past saturation branch CAN reach INT64_MIN (see the clamp
+      // branch's past-age handling below, which never negates INT64_MIN).
       int64_t max_skew = (state->max_skew_ms > (uint64_t)INT64_MAX)
                          ? INT64_MAX : (int64_t)state->max_skew_ms;
 

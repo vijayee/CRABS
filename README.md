@@ -281,8 +281,9 @@ Two trust caveats for clamp-enabled nodes:
    lock/vote contention). Live-ops-only deployments should not enable
    clamp; deployments that do accept insider-stamped ordering bias by
    configuration. Shipped hardening: `skew.maxReplayAgeMs` opts a clamp node
-   into an age ceiling (stamps older than the horizon are refused; the
-   default 0 is unbounded).
+   into an age ceiling (stamps older than the horizon are refused in the
+   clamp band — a stamp still inside the live window is accepted normally;
+   the default 0 is unbounded).
 2. **The clamp marker exists only under the BOUNDED strategy.**
    `skew:{strategy:"naive", replayPolicy:"clamp"}` behaves as plain NAIVE (no
    historic marker, no future reject); QUORUM/TRUSTED remain fail-closed

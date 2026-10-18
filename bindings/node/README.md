@@ -126,8 +126,9 @@ The enum tables `TRUST_MODE`, `DATA_TYPE`, `CRDT_TYPE` are exported alongside th
   - `options.skew.strategy` — HLC receive strategy (`'bounded'` default)
   - `options.skew.maxReplayAgeMs` — replay-clamp age horizon for a node whose
     `replayPolicy` is `'clamp'`: stamps older than the horizon are refused
-    (`protocol_violation`) instead of clamped, even under clamp; 0 =
-    unbounded (the shipped default)
+    (`protocol_violation`) instead of clamped; stamps still inside the live
+    window are unaffected (accepted normally); 0 = unbounded (the shipped
+    default)
 
 #### User Management
 
